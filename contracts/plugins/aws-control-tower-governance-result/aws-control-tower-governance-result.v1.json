@@ -1,0 +1,172 @@
+{
+  "schemaVersion": "hartevo-aws-control-tower-governance-result/v1",
+  "contractVersion": "EXT-AWS-CONTROL-TOWER-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.controltower.governance.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo-aws-control-tower-governance-result/v1|layer=1|service=aws.controltower.governance.result|provider=aws.controltower.read|consumer=mission.aws-control-tower.consumer",
+  "contractDigest": "51b838b52a13752eb92d862eadc93b2a54eab456c07d3957ca368c9a24a05123",
+  "service": {
+    "id": "aws.controltower.governance.result",
+    "type": "AwsControlTowerGovernanceService",
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "liveExecution": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false,
+    "operations": [
+      "ListLandingZones",
+      "GetLandingZone",
+      "GetLandingZoneOperation",
+      "ListEnabledBaselines",
+      "Register",
+      "RevokeRegistration",
+      "ReverseRegistration"
+    ]
+  },
+  "provider": {
+    "id": "aws.controltower.read",
+    "type": "AwsControlTowerProvider",
+    "apiVersion": "2018-05-10",
+    "providerVersion": "aws-controltower-provider/v1",
+    "native": false,
+    "firstParty": false,
+    "connected": false,
+    "readOnly": true,
+    "providerReceipt": false,
+    "allowedOperations": [
+      "ListLandingZones",
+      "GetLandingZone",
+      "GetLandingZoneOperation",
+      "ListEnabledBaselines"
+    ],
+    "opaquePagination": true,
+    "operationRetentionDays": 90
+  },
+  "consumer": {
+    "id": "mission.aws-control-tower.consumer",
+    "type": "MissionAwsControlTowerConsumer",
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "effectiveAuthorization": false
+  },
+  "credentials": {
+    "type": "SigV4SecretReference",
+    "opaque": true,
+    "serializable": false,
+    "rawMaterialRetained": false
+  },
+  "scope": {
+    "exact": [
+      "accountId",
+      "homeRegion",
+      "landingZone",
+      "baselineIds",
+      "targetIds",
+      "operationIds",
+      "projectId",
+      "missionId",
+      "workProductId"
+    ],
+    "permissionDigest": true,
+    "scopeDigest": true,
+    "childBaselinesRequireExplicitScope": true
+  },
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "binds": [
+      "pluginVersion",
+      "providerVersion",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "evidenceDigest"
+    ]
+  },
+  "boundedReads": {
+    "ListLandingZones": {
+      "method": "POST",
+      "maxResults": 1,
+      "projection": "landingZoneArnDigest"
+    },
+    "GetLandingZone": {
+      "method": "POST",
+      "projection": "statusDriftVersionAndTimestampDigests"
+    },
+    "GetLandingZoneOperation": {
+      "method": "POST",
+      "projection": "operationStatusAndTimestampDigests",
+      "retentionDays": 90
+    },
+    "ListEnabledBaselines": {
+      "method": "POST",
+      "maxResults": 100,
+      "includeChildren": "explicitlyBound",
+      "projection": "baselineTargetStatusDriftAndVersionDigests"
+    }
+  },
+  "redaction": {
+    "retain": [
+      "accountDigest",
+      "homeRegionDigest",
+      "landingZoneArnDigest",
+      "baselineIdentifierDigest",
+      "targetIdentifierDigest",
+      "operationIdentifierDigest",
+      "statusDigest",
+      "driftStatusDigest",
+      "versionDigest",
+      "timestampDigest",
+      "paginationTokenDigest"
+    ],
+    "drop": [
+      "secretMaterial",
+      "rawSecretHandle",
+      "rawNextToken",
+      "manifest",
+      "remediationTypes",
+      "statusMessage",
+      "rawArns",
+      "rawVersions",
+      "rawTimestamps"
+    ]
+  },
+  "honesty": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "durableReceipt": false,
+    "complianceClaim": false,
+    "deploymentSuccessClaim": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "forbidden": [
+    "SetupLandingZone",
+    "ResetLandingZone",
+    "UpdateLandingZone",
+    "EnableBaseline",
+    "DisableBaseline",
+    "EnableControl",
+    "DisableControl",
+    "MutateOrganizationalUnits",
+    "MutateAccounts",
+    "MutateTags",
+    "ExposeRawParameters",
+    "ClaimCompliance",
+    "ClaimDeploymentSuccess"
+  ],
+  "layer2Gaps": [
+    "nativeSigV4Https",
+    "durableProviderReceipt",
+    "independentReadback",
+    "consentedGovernanceEffect"
+  ]
+}

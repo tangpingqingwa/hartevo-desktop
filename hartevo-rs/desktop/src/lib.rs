@@ -29,7 +29,12 @@ use rust_decimal::Decimal;
 use zeroize::Zeroizing;
 
 mod agent_operations;
+mod cordis_host;
+pub use cordis_host::{bind_live_domain_kernel, mount_cordis_host};
 pub mod data_plane;
+#[cfg(feature = "native-journey")]
+pub mod native_runtime_journey;
+mod result_adoption_surface;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
@@ -37,12 +42,19 @@ mod visual_fixture;
 
 use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
 use data_plane::{
-    DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
-    DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
-    DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopRuntimeCancellation,
-    DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
-    DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
-    ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
+    DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
+    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome,
+    DesktopMissionSubmission, DesktopRuntimeCancellation, DesktopRuntimeProgressEvent,
+    DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection, DesktopSnapshot,
+    DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
+    DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
+    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
+    RecoveryKitDraft,
+};
+use result_adoption_surface::{
+    ResultSurfaceAction, SelectedResultProjection, action_matches_current_projection,
+    selected_result_projection,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 use runtime_subscription::{
@@ -342,99 +354,144 @@ impl UiFailure {
         }
     }
 
+    fn coded(code: &str, message: &str) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     fn from_error(error: &DesktopDataError) -> Self {
         match error {
-            DesktopDataError::MissingDatabaseKey => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "本地数据库仍在，但 OS Vault 中的密钥不存在。Hartevo 不会生成新密钥覆盖现有数据；请进入恢复或支持流程。".into(),
-            },
-            DesktopDataError::ProjectEncryptionNotReady(_) => Self {
-                code: "NOT_IMPLEMENTED".into(),
-                message: "该项目尚无可用且无需轮换的加密 Keyring。安全 Recovery Kit 导出流程完成前，不会从 Desktop 创建 Mission。".into(),
-            },
-            DesktopDataError::ProjectContextRecoveryRequired(_) => Self {
-                code: "RECOVERY_REQUIRED".into(),
-                message: "Keyring 存在，但本机设备没有可用的 exact wrapping key。恢复或设备附加完成前不会创建 Mission 或打开项目内容。".into(),
-            },
-            DesktopDataError::ProjectContextBlockedEnvironment(_) => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "项目工作区当前无法安全打开；未读取 Context 内容，也未创建 Mission。".into(),
-            },
-            DesktopDataError::ProjectContextIntegrityError(_) => Self {
-                code: "INTEGRITY_ERROR".into(),
-                message: "项目 Keyring、SecretReference 或 encrypted Context 未通过完整性校验；Hartevo 已停止该项目执行。".into(),
-            },
-            DesktopDataError::EmptyMissionGoal | DesktopDataError::EmptyProjectName => Self {
-                code: "WAITING_USER".into(),
-                message: "项目名称与 Mission 目标不能为空。".into(),
-            },
-            DesktopDataError::InvalidCatalogMissionContract => Self {
-                code: "WAITING_USER".into(),
-                message: "请选择明确的 VM-00～VM-11 路由与允许的运行模式，并确认市场、语言、受众、时区、ISO 币种和非负 minor-unit 预算。未创建 Mission。".into(),
-            },
-            DesktopDataError::InvalidMissionContinuation => Self {
-                code: "WAITING_USER".into(),
-                message: "同一 Mission 的续写消息与稳定幂等键不能为空；未新增 Conversation 消息，也未运行 Runtime。".into(),
-            },
-            DesktopDataError::InvalidHumanCheckpointConfirmation => Self {
-                code: "WAITING_USER".into(),
-                message: "Human Checkpoint 确认必须绑定当前 Mission/Checkpoint revision、持久 Conversation、非空确认和稳定幂等键；未写入部分状态。".into(),
-            },
-            DesktopDataError::InvalidVm11OutcomeDecision => Self {
-                code: "WAITING_USER".into(),
-                message: "VM-11 决策必须选择一个当前可用的结构化动作，填写私密理由，并绑定冻结 Review 与当前 CAS revision；未写入部分状态。".into(),
-            },
-            DesktopDataError::InvalidRecoveryKey => Self {
-                code: "WAITING_USER".into(),
-                message: "Recovery Kit 必须是此前导出的 64 位十六进制密钥；Hartevo 不会代替用户保存或猜测恢复密钥。".into(),
-            },
-            DesktopDataError::RuntimeSubscriptionContextMismatch => Self {
-                code: "STALE_SELECTION".into(),
-                message: "Runtime 订阅句柄与当前 Tenant / Project 上下文不一致，请重新选择后重试；未读取正文或写入状态。".into(),
-            },
+            DesktopDataError::MissingDatabaseKey => Self::coded(
+                "BLOCKED_ENV",
+                "本地数据库仍在，但 OS Vault 中的密钥不存在。Hartevo 不会生成新密钥覆盖现有数据；请进入恢复或支持流程。",
+            ),
+            DesktopDataError::ProjectEncryptionNotReady(_) => Self::coded(
+                "NOT_IMPLEMENTED",
+                "该项目尚无可用且无需轮换的加密 Keyring。安全 Recovery Kit 导出流程完成前，不会从 Desktop 创建 Mission。",
+            ),
+            DesktopDataError::ProjectContextRecoveryRequired(_) => Self::coded(
+                "RECOVERY_REQUIRED",
+                "Keyring 存在，但本机设备没有可用的 exact wrapping key。恢复或设备附加完成前不会创建 Mission 或打开项目内容。",
+            ),
+            DesktopDataError::ProjectContextBlockedEnvironment(_) => Self::coded(
+                "BLOCKED_ENV",
+                "项目工作区当前无法安全打开；未读取 Context 内容，也未创建 Mission。",
+            ),
+            DesktopDataError::ProjectContextIntegrityError(_) => Self::coded(
+                "INTEGRITY_ERROR",
+                "项目 Keyring、SecretReference 或 encrypted Context 未通过完整性校验；Hartevo 已停止该项目执行。",
+            ),
+            DesktopDataError::EmptyMissionGoal | DesktopDataError::EmptyProjectName => {
+                Self::coded("WAITING_USER", "项目名称与 Mission 目标不能为空。")
+            }
+            DesktopDataError::InvalidCatalogMissionContract => Self::coded(
+                "WAITING_USER",
+                "请选择明确的 VM-00～VM-11 路由与允许的运行模式，并确认市场、语言、受众、时区、ISO 币种和非负 minor-unit 预算。未创建 Mission。",
+            ),
+            DesktopDataError::InvalidMissionContinuation => Self::coded(
+                "WAITING_USER",
+                "同一 Mission 的续写消息与稳定幂等键不能为空；未新增 Conversation 消息，也未运行 Runtime。",
+            ),
+            DesktopDataError::InvalidHumanCheckpointConfirmation => Self::coded(
+                "WAITING_USER",
+                "Human Checkpoint 确认必须绑定当前 Mission/Checkpoint revision、持久 Conversation、非空确认和稳定幂等键；未写入部分状态。",
+            ),
+            DesktopDataError::InvalidVm11OutcomeDecision
+            | DesktopDataError::InvalidVm11NextContractResolution
+            | DesktopDataError::InvalidWaitingApprovalGrant
+            | DesktopDataError::InvalidBrowserWorkspaceContinue => Self::coded(
+                "WAITING_USER",
+                "精确窗口动作必须绑定冻结 digest 与当前 CAS revision；未写入部分状态，也未执行 Effect。",
+            ),
+            DesktopDataError::BrowserWorkspaceUnavailable => Self::coded(
+                "EMPTY",
+                "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Continue。",
+            ),
+            DesktopDataError::BrowserWorkspaceContinueNotHeld => Self::coded(
+                "NOT_IMPLEMENTED",
+                "Continue 需要用户持有的 Browser Workspace lease；Take over 仍为 NOT_IMPLEMENTED，未签发新 Agent lease，也未执行 Effect。",
+            ),
+            DesktopDataError::InvalidRecoveryKey => Self::coded(
+                "WAITING_USER",
+                "Recovery Kit 必须是此前导出的 64 位十六进制密钥；Hartevo 不会代替用户保存或猜测恢复密钥。",
+            ),
+            DesktopDataError::RuntimeSubscriptionContextMismatch => Self::coded(
+                "STALE_SELECTION",
+                "Runtime 订阅句柄与当前 Tenant / Project 上下文不一致，请重新选择后重试；未读取正文或写入状态。",
+            ),
+            DesktopDataError::WorkProductActionStale => Self::coded(
+                "STALE_SELECTION",
+                "结果与当前 Project / Mission revision 不一致，请刷新后重新选择；未改变正文、证据或状态。",
+            ),
+            DesktopDataError::RuntimeLocalApprovalUnavailable => Self::coded(
+                "EMPTY",
+                "当前没有待窗口批准的 Runtime 本地写入；未自动拒绝，也未执行 Effect。",
+            ),
+            DesktopDataError::RuntimeLocalApprovalMismatch => Self::coded(
+                "STALE_SELECTION",
+                "Runtime 本地写入批准必须绑定当前冻结 digest 与 turn revision；未写入部分状态，也未执行 Effect。",
+            ),
             DesktopDataError::ProjectNotFound(_)
-            | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => Self {
-                code: "STALE_SELECTION".into(),
-                message: "当前项目已变化，请刷新后重试。".into(),
-            },
-            DesktopDataError::ProjectRecoveryNotApplicable(_) => Self {
-                code: "RECOVERY_UNAVAILABLE".into(),
-                message: "该项目不是可由单一用户自持 Recovery Kit 恢复的个人 Keyring；Hartevo 未尝试修改任何设备 envelope。".into(),
-            },
+            | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => {
+                Self::coded("STALE_SELECTION", "当前项目已变化，请刷新后重试。")
+            }
+            other => Self::from_integrity_or_application_error(other),
+        }
+    }
+
+    fn from_integrity_or_application_error(error: &DesktopDataError) -> Self {
+        match error {
+            DesktopDataError::ProjectRecoveryNotApplicable(_) => Self::coded(
+                "RECOVERY_UNAVAILABLE",
+                "该项目不是可由单一用户自持 Recovery Kit 恢复的个人 Keyring；Hartevo 未尝试修改任何设备 envelope。",
+            ),
             DesktopDataError::DataDirectoryUnavailable
             | DesktopDataError::InvalidDataRoot(_)
             | DesktopDataError::Io(_)
-            | DesktopDataError::SecretStore(_) => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "本机数据目录或 OS Secret Store 当前不可用；未写入任何项目或外部系统。".into(),
-            },
+            | DesktopDataError::SecretStore(_) => Self::coded(
+                "BLOCKED_ENV",
+                "本机数据目录或 OS Secret Store 当前不可用；未写入任何项目或外部系统。",
+            ),
             DesktopDataError::Application(ApplicationError::RuntimeProcessCleanupBlocked {
                 ..
-            }) => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "此前认领的本机 Runtime 进程无法被精确检查或终止。Hartevo 不会按 PID 猜测清理，也不会启动第二个 Runtime；请保留现场并进入支持恢复流程。".into(),
-            },
+            }) => Self::coded(
+                "BLOCKED_ENV",
+                "此前认领的本机 Runtime 进程无法被精确检查或终止。Hartevo 不会按 PID 猜测清理，也不会启动第二个 Runtime；请保留现场并进入支持恢复流程。",
+            ),
             DesktopDataError::Application(
                 ApplicationError::StructuredOutcomeDecisionRequired
-                | ApplicationError::StructuredOutcomeDecisionCommandMismatch,
-            ) => Self {
-                code: "WAITING_USER".into(),
-                message: "该 VM-11 Checkpoint 不接受自由文本冒充决策；请选择 Continue、Stop、Scale 或 Test，并填写理由。".into(),
-            },
+                | ApplicationError::StructuredOutcomeDecisionCommandMismatch
+                | ApplicationError::Vm11NextContractRouteSpecificCommandRequired,
+            ) => Self::coded(
+                "WAITING_USER",
+                "该 VM-11 Checkpoint 不接受自由文本或通用 Application 完成入口；请使用窗口中的 Continue/Stop/Scale/Test 动作。",
+            ),
             DesktopDataError::Application(
                 ApplicationError::StructuredOutcomeDecisionUnavailable
                 | ApplicationError::StructuredOutcomeDecisionReviewMismatch
-                | ApplicationError::StructuredOutcomeDecisionReplayMismatch,
-            ) => Self {
-                code: "STALE_DECISION".into(),
-                message: "冻结 Outcome Review 或 Mission/Conversation revision 已变化；请刷新后重新审阅，旧决策未被写入或重放。".into(),
-            },
-            DesktopDataError::Storage(_)
-            | DesktopDataError::Application(_)
-            | DesktopDataError::Catalog(_) => Self {
-                code: "INTEGRITY_ERROR".into(),
-                message: "持久状态或机器合同未通过完整性校验；Hartevo 已停止继续执行。".into(),
-            },
+                | ApplicationError::StructuredOutcomeDecisionReplayMismatch
+                | ApplicationError::Vm11NextContractCommandMismatch
+                | ApplicationError::Vm11NextContractReplayMismatch
+                | ApplicationError::ProposedEffectApprovalCommandMismatch
+                | ApplicationError::ProposedEffectApprovalUnavailable
+                | ApplicationError::ProposedEffectApprovalDigestMismatch
+                | ApplicationError::MissionRevisionMismatch { .. },
+            ) => Self::coded(
+                "STALE_DECISION",
+                "冻结 digest 或 CAS revision 已变化；请刷新后重新审阅，旧提交未被写入或重放，也未执行 Effect。",
+            ),
+            DesktopDataError::Application(
+                ApplicationError::BrowserHostReconciliationRequired { .. },
+            ) => Self::coded(
+                "RECOVERY_REQUIRED",
+                "Browser Workspace 已持久签发新 Agent lease，但 Host 仍更受限；需要显式 Host reconciliation，未执行 Effect，也未声明 Verification。",
+            ),
+            _ => Self::coded(
+                "INTEGRITY_ERROR",
+                "持久状态或机器合同未通过完整性校验；Hartevo 已停止继续执行。",
+            ),
         }
     }
 }
@@ -920,6 +977,9 @@ pub fn App() -> Element {
     let mut composer_expanded = use_signal(|| false);
     let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
+    let mut selected_result_id = use_signal(|| None::<WorkProductId>);
+    let mut selected_result_scope = use_signal(|| None::<(ProjectId, MissionId)>);
+    let mut result_action_pending = use_signal(|| false);
     let mut vm11_outcome_action = use_signal(|| None::<(MissionId, OutcomeDecision)>);
     let mut workpad_open = use_signal(initial_workpad_open);
     let mut global_search_query = use_signal(String::new);
@@ -1049,6 +1109,19 @@ pub fn App() -> Element {
             }
         });
     });
+    use_effect(move || {
+        let current_scope = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        if selected_result_scope.peek().as_ref() != current_scope.as_ref() {
+            selected_result_scope.set(current_scope);
+            selected_result_id.set(None);
+        }
+    });
     // Dioxus runs this effect after committing the render that consumed the
     // current signals. Only this post-render fence can exchange a prepared
     // phase-one receipt for non-Clone Runtime authority.
@@ -1123,6 +1196,13 @@ pub fn App() -> Element {
     let surface_context = surface_context_label(current_surface);
     let workpad_visible =
         workpad_open() && current_surface == Surface::Orchestrator && mission.is_some();
+    let selected_result_id_value = selected_result_id.read().clone();
+    let selected_result = project
+        .as_ref()
+        .zip(mission.as_ref())
+        .and_then(|(project, mission)| {
+            selected_result_projection(project, mission, selected_result_id_value.as_ref())
+        });
     let runtime_busy = mission_submitting() || runtime_retrying();
     let selected_runtime_scope = project
         .as_ref()
@@ -1289,6 +1369,29 @@ pub fn App() -> Element {
             && mission.current_checkpoint_revision.is_some()
             && mission.conversation_revision.is_some()
     });
+    let vm11_next_contract_route_active = mission.as_ref().is_some_and(|mission| {
+        mission.manifest_id.as_deref() == Some("VM-11")
+            && mission.current_checkpoint_id.as_deref() == Some("next_contract_or_valid_terminal")
+            && mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application)
+            && mission.current_checkpoint_application_handler_status
+                == Some(ApplicationCheckpointHandlerStatus::Implemented)
+            && mission.current_checkpoint_completion_policy
+                == Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+            && matches!(
+                mission.current_checkpoint_status,
+                Some(
+                    MissionCheckpointStatus::Running
+                        | MissionCheckpointStatus::Blocked
+                        | MissionCheckpointStatus::WaitingUser
+                )
+            )
+            && mission.current_checkpoint_revision.is_some()
+            && mission
+                .vm11_outcome_review
+                .as_ref()
+                .and_then(|projection| projection.decision.as_ref())
+                .is_some()
+    });
     let application_route_active = mission.as_ref().is_some_and(|mission| {
         mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application)
             && mission.current_checkpoint_application_handler_status
@@ -1300,6 +1403,7 @@ pub fn App() -> Element {
                 Some(MissionCheckpointStatus::Running | MissionCheckpointStatus::Blocked)
             )
             && mission.current_checkpoint_id.is_some()
+            && !vm11_next_contract_route_active
     });
     let application_route_not_implemented = mission.as_ref().is_some_and(|mission| {
         mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application)
@@ -1310,6 +1414,21 @@ pub fn App() -> Element {
         mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application)
             && mission.current_checkpoint_application_handler_status
                 == Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch)
+    });
+    let waiting_approval_grant_active = !visual_fixture_mode
+        && mission.as_ref().is_some_and(|mission| {
+            mission.stage == MissionStage::WaitingApproval
+                && mission
+                    .pending_effects
+                    .iter()
+                    .any(|effect| effect.scope_digest.len() == 64)
+        });
+    let pending_effect_grant = mission.as_ref().and_then(|mission| {
+        mission
+            .pending_effects
+            .iter()
+            .find(|effect| effect.scope_digest.len() == 64)
+            .cloned()
     });
     let runtime_progress_events = runtime_progress.read().clone();
     let recent_runtime_progress = runtime_progress_events
@@ -1327,6 +1446,10 @@ pub fn App() -> Element {
                 "Mission 与执行句柄已持久化，等待首个 Runtime turn"
             } else if runtime_retrying() {
                 "正在安全恢复本地 Runtime"
+            } else if vm11_next_contract_route_active {
+                "正在按冻结 Continue/Stop/Scale/Test 决议推进下一步合同"
+            } else if waiting_approval_grant_active {
+                "正在按冻结 Effect digest 写入 ApprovalGrant"
             } else if application_route_active {
                 "正在运行确定性 Application Checkpoint"
             } else if human_route_active {
@@ -1418,8 +1541,15 @@ pub fn App() -> Element {
         && !draft.read().trim().is_empty();
     let can_execute_application_route =
         project_can_start_mission && application_route_active && !runtime_busy;
+    let can_resolve_vm11_next_contract =
+        project_can_start_mission && vm11_next_contract_route_active && !runtime_busy;
+    let can_grant_waiting_approval = project_can_start_mission
+        && waiting_approval_grant_active
+        && pending_effect_grant.is_some()
+        && !runtime_busy;
     let can_edit_continuation = project_can_start_mission
         && !human_route_active
+        && !waiting_approval_grant_active
         && mission.as_ref().is_some_and(|mission| {
             mission.conversation_revision.is_some()
                 && matches!(
@@ -1440,11 +1570,24 @@ pub fn App() -> Element {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
     };
+    let live_runtime_cancellation = runtime_execution_paint
+        .read()
+        .live_cancellation_for_selection(
+            project
+                .as_ref()
+                .zip(mission.as_ref())
+                .map(|(project, mission)| (&project.project_id, &mission.mission_id)),
+        )
+        .or_else(|| runtime_cancellation.read().clone());
+    let held_local_approval = live_runtime_cancellation
+        .as_ref()
+        .and_then(DesktopRuntimeCancellation::held_local_approval);
     let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
         project.as_ref(),
         mission.as_ref(),
         runtime_activity.as_ref(),
         runtime_projection.as_ref(),
+        held_local_approval.as_ref(),
     );
     let operations_interrupt_available = runtime_busy && runtime_stop_available;
     let operations_interrupt_requested = runtime_stop_requested();
@@ -1474,6 +1617,166 @@ pub fn App() -> Element {
                     runtime_progress,
                     visual_streaming_fixture,
                 );
+            }
+        }
+    };
+    let request_operations_approve_local_runtime = move |()| {
+        let selected = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let Some(control) = runtime_execution_paint
+            .read()
+            .live_cancellation_for_selection(
+                selected
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+            )
+            .or_else(|| runtime_cancellation.read().clone())
+        else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有待窗口批准的 Runtime 本地写入；未自动拒绝，也未执行 Effect。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(held) = control.held_local_approval() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::RuntimeLocalApprovalUnavailable);
+            return;
+        };
+        match control.approve_held_local_write(
+            &held.project_id,
+            &held.turn_id,
+            held.expected_revision,
+            &held.request_digest,
+        ) {
+            Ok(()) => {}
+            Err(error) => model.write().set_notice(&error),
+        }
+    };
+    let request_operations_continue_browser = move |()| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Browser Workspace，也未执行 Continue。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(workspace) = mission.browser_workspace.as_ref() else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message:
+                    "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Continue。"
+                        .into(),
+            });
+            return;
+        };
+        let request = DesktopContinueBrowserWorkspaceRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover()
+                    .and_then(|plane| plane.continue_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    model.write().set_ready(snapshot, false);
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_CONTINUE_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Continue 协调异常结束；未执行 Effect，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
+    };
+    let on_result_action = move |action: ResultSurfaceAction| {
+        let (project, mission) = {
+            let current = model.read();
+            (
+                current.current_project().cloned(),
+                current.current_mission().cloned(),
+            )
+        };
+        let Some((project, mission)) = project.zip(mission) else {
+            model.write().notice = Some(UiFailure {
+                code: "STALE_SELECTION".into(),
+                message: "当前没有可用的 Project / Mission 结果上下文；未执行结果动作。".into(),
+            });
+            return;
+        };
+        if !action_matches_current_projection(&action, &project, &mission) {
+            model.write().notice = Some(UiFailure {
+                code: "STALE_SELECTION".into(),
+                message: "结果与当前 Project / Mission revision 不一致，请刷新后重新选择；未改变正文、证据或状态。".into(),
+            });
+            return;
+        }
+        match action {
+            ResultSurfaceAction::OpenArtifact(binding) => {
+                selected_result_id.set(Some(binding.result_id));
+                workpad_open.set(true);
+            }
+            ResultSurfaceAction::Adopt(binding) => {
+                if result_action_pending() {
+                    return;
+                }
+                result_action_pending.set(true);
+                model.write().notice = None;
+                spawn(async move {
+                    let request = DesktopWorkProductAdoptionRequest {
+                        project_id: binding.project_id,
+                        mission_id: binding.mission_id,
+                        work_product_id: binding.result_id,
+                        expected_mission_revision: binding.mission_revision,
+                        expected_work_product_revision: binding.result_revision,
+                        expected_manifest_version: binding.manifest_version,
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        DesktopDataPlane::discover()
+                            .and_then(|plane| plane.adopt_work_product_os(request, Utc::now()))
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(snapshot)) => {
+                            model.write().set_ready(snapshot, false);
+                            result_action_pending.set(false);
+                        }
+                        Ok(Err(error)) => {
+                            model.write().set_notice(&error);
+                            result_action_pending.set(false);
+                        }
+                        Err(_) => {
+                            model.write().notice = Some(UiFailure {
+                                code: "RESULT_ACTION_FAILED".into(),
+                                message: "结果采用协调任务异常结束；持久 WorkProduct 保持原状态，请刷新后重试。".into(),
+                            });
+                            result_action_pending.set(false);
+                        }
+                    }
+                });
             }
         }
     };
@@ -2055,6 +2358,8 @@ pub fn App() -> Element {
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
                                 runtime_has_unseen: rendered_runtime_has_unseen,
+                                selected_result: selected_result.clone(),
+                                result_action_pending: result_action_pending(),
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
@@ -2074,6 +2379,8 @@ pub fn App() -> Element {
                                     restore_ui_focus("mission-composer-input");
                                 },
                                 on_interrupt: request_operations_interrupt,
+                                on_continue_browser_workspace: request_operations_continue_browser,
+                                on_approve_local_runtime: request_operations_approve_local_runtime,
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
                                         let current = model.read();
@@ -2121,6 +2428,7 @@ pub fn App() -> Element {
                                     }
                                     scroll_mission_thread_to_latest();
                                 },
+                                on_result_action,
                             }
                         } else if current_surface == Surface::Current {
                             CurrentSurface { project: project.clone(), context_access: context_access.clone() }
@@ -2157,6 +2465,8 @@ pub fn App() -> Element {
                                     || runtime_busy
                                     || human_route_active
                                     || application_route_active
+                                    || vm11_next_contract_route_active
+                                    || waiting_approval_grant_active
                                     || application_route_not_implemented
                                     || application_route_catalog_mismatch
                                     || runtime_retry_needed
@@ -2484,6 +2794,22 @@ pub fn App() -> Element {
                                         span { "Mission 保持原 revision；不会运行模型、伪造 Oracle 证据或自动跳到下一 Checkpoint。" }
                                     }
                                 }
+                                if vm11_next_contract_route_active {
+                                    section { class: "human-checkpoint-confirmation", aria_label: "VM-11 下一步合同精确决议",
+                                        strong { "执行冻结的 Continue / Stop / Scale / Test" }
+                                        span {
+                                            "Checkpoint {application_checkpoint_id_label} · Oracle {human_oracle_label}"
+                                        }
+                                        if let Some(projection) = mission.as_ref().and_then(|mission| mission.vm11_outcome_review.as_ref()) {
+                                            if let Some(decision) = projection.decision.as_ref() {
+                                                span {
+                                                    "已冻结动作 {outcome_decision_label(&decision.action)} · 父合同 {short_digest(&projection.review.source_contract_digest)} · 父 Mission revision {decision.source_mission_revision}"
+                                                }
+                                                small { "该动作绑定冻结决策 digest 与父合同 digest；通用 Application 完成入口会被拒绝，也不会合成新合同或运行 Runtime。" }
+                                            }
+                                        }
+                                    }
+                                }
                                 if human_route_active {
                                     section { class: "human-checkpoint-confirmation", aria_label: "Human Checkpoint 精确确认",
                                         if vm11_outcome_decision_active {
@@ -2709,6 +3035,150 @@ pub fn App() -> Element {
                                         }
                                     }
                                     div { class: "composer-actions",
+                                        if waiting_approval_grant_active {
+                                            button {
+                                                class: "application-checkpoint-button",
+                                                disabled: !can_grant_waiting_approval,
+                                                aria_label: "按冻结 Effect digest 写入 Domain Kernel ApprovalGrant",
+                                                onclick: move |_| {
+                                                    let selection = {
+                                                        let model = model.read();
+                                                        model.selected_project_id.clone().zip(
+                                                            model.current_mission().and_then(|mission| {
+                                                                let effect = mission.pending_effects.iter().find(|effect| {
+                                                                    effect.scope_digest.len() == 64
+                                                                })?;
+                                                                Some((
+                                                                    mission.mission_id.clone(),
+                                                                    effect.effect_id.clone(),
+                                                                    effect.scope_digest.clone(),
+                                                                    mission.revision,
+                                                                ))
+                                                            }),
+                                                        )
+                                                    };
+                                                    let Some((project_id, (mission_id, effect_id, expected_scope_digest, expected_mission_revision))) = selection else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "BLOCKED_DATA".into(),
+                                                            message: "冻结 Effect digest 或当前 Mission CAS revision 不完整；未写入 ApprovalGrant，也未执行 Effect。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let request = DesktopWaitingApprovalGrantRequest {
+                                                        project_id,
+                                                        mission_id,
+                                                        effect_id,
+                                                        expected_scope_digest,
+                                                        expected_mission_revision,
+                                                    };
+                                                    mission_submitting.set(true);
+                                                    spawn(async move {
+                                                        let result = tokio::task::spawn_blocking(move || {
+                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                                plane.grant_waiting_approval_os(request, Utc::now())
+                                                            })
+                                                        })
+                                                        .await;
+                                                        match result {
+                                                            Ok(Ok(snapshot)) => {
+                                                                model.write().set_ready(snapshot, false);
+                                                            }
+                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Err(_) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "WAITING_APPROVAL_GRANT_COORDINATOR_FAILED".into(),
+                                                                    message: "ApprovalGrant 协调异常结束；冻结 digest 与 Mission CAS 仍然生效，未执行 Effect、未铸造 Receipt，也未声明 Verification。".into(),
+                                                                });
+                                                            }
+                                                        }
+                                                        mission_submitting.set(false);
+                                                    });
+                                                },
+                                                if mission_submitting() {
+                                                    "正在写入精确 ApprovalGrant…"
+                                                } else if let Some(effect) = pending_effect_grant.as_ref() {
+                                                    "批准冻结 digest {short_digest(&effect.scope_digest)}"
+                                                } else {
+                                                    "冻结 digest 不完整"
+                                                }
+                                            }
+                                        }
+                                        if vm11_next_contract_route_active {
+                                            button {
+                                                class: "application-checkpoint-button",
+                                                disabled: !can_resolve_vm11_next_contract,
+                                                aria_label: "按冻结 Continue Stop Scale Test 决议执行 VM-11 下一步合同",
+                                                onclick: move |_| {
+                                                    let selection = {
+                                                        let model = model.read();
+                                                        model.selected_project_id.clone().zip(
+                                                            model.current_mission().and_then(|mission| {
+                                                                let review = mission.vm11_outcome_review.as_ref()?;
+                                                                let decision = review.decision.as_ref()?;
+                                                                Some((
+                                                                    mission.mission_id.clone(),
+                                                                    mission.revision,
+                                                                    mission.current_checkpoint_revision?,
+                                                                    decision.digest().ok()?,
+                                                                    decision.source_mission_revision,
+                                                                    review.review.source_contract_digest.clone(),
+                                                                ))
+                                                            }),
+                                                        )
+                                                    };
+                                                    let Some((project_id, (mission_id, expected_mission_revision, expected_checkpoint_revision, expected_decision_digest, expected_parent_mission_revision, expected_parent_contract_digest))) = selection else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "BLOCKED_DATA".into(),
+                                                            message: "冻结决策 digest、父合同 digest 或当前 CAS revision 不完整；未执行下一步合同。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let request = DesktopVm11NextContractResolutionRequest {
+                                                        project_id,
+                                                        mission_id,
+                                                        expected_mission_revision,
+                                                        expected_checkpoint_revision,
+                                                        expected_decision_digest,
+                                                        expected_parent_mission_revision,
+                                                        expected_parent_contract_digest,
+                                                    };
+                                                    mission_submitting.set(true);
+                                                    spawn(async move {
+                                                        let result = tokio::task::spawn_blocking(move || {
+                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                                plane.resolve_vm11_next_contract_or_valid_terminal_os(
+                                                                    request,
+                                                                    Utc::now(),
+                                                                )
+                                                            })
+                                                        })
+                                                        .await;
+                                                        match result {
+                                                            Ok(Ok(submission)) => {
+                                                                model.write().set_ready(submission.snapshot, false);
+                                                            }
+                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Err(_) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "VM11_NEXT_CONTRACT_COORDINATOR_FAILED".into(),
+                                                                    message: "下一步合同协调异常结束；冻结决策、父合同 fence 与 Mission CAS 仍然生效，未构造 Runtime 或 Effect。".into(),
+                                                                });
+                                                            }
+                                                        }
+                                                        mission_submitting.set(false);
+                                                    });
+                                                },
+                                                if mission_submitting() {
+                                                    "正在按冻结决议推进下一步合同…"
+                                                } else if mission.as_ref().and_then(|mission| {
+                                                    mission.vm11_outcome_review.as_ref()?.decision.as_ref()
+                                                }).is_some() {
+                                                    "执行冻结的 Continue / Stop / Scale / Test"
+                                                } else {
+                                                    "冻结决策不完整"
+                                                }
+                                            }
+                                        }
                                         if application_route_active {
                                             button {
                                                 class: "application-checkpoint-button",
@@ -3294,6 +3764,7 @@ pub fn App() -> Element {
                         }
                         Workpad {
                             mission: mission.clone(),
+                            selected_work_product_id: selected_result_id.read().clone(),
                             context_access: context_access.clone(),
                             on_close: move |()| workpad_open.set(false),
                         }
@@ -4663,6 +5134,8 @@ fn AgentOperationsWorkbench(
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_continue_browser_workspace: EventHandler<()>,
+    on_approve_local_runtime: EventHandler<()>,
 ) -> Element {
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
     let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
@@ -4865,6 +5338,26 @@ fn AgentOperationsWorkbench(
                         div { small { "Verified effects" } strong { "{projection.approvals.verified_effect_count}" } span { "不会由本地 Runtime 状态代替" } }
                         div { small { "Local Runtime approval" } strong { "{projection.approvals.local_runtime_status.code()}" } span { "{projection.approvals.local_runtime_detail}" } }
                     }
+                    {
+                        let local_ready = projection.approvals.local_runtime_approve_status == OperationsStatus::Ready;
+                        let local_label = format!("Approve · {}", projection.approvals.local_runtime_approve_status.code());
+                        let local_title = match projection.approvals.local_runtime_approve_status {
+                            OperationsStatus::Ready => "通过 Application respond_context_runtime_local_approval 批准精确本地写入 digest",
+                            OperationsStatus::WaitingApproval => "本地写入仍在等待精确 digest；未自动拒绝",
+                            _ => "当前没有待窗口批准的 Runtime 本地写入",
+                        };
+                        rsx! {
+                            div { class: "operations-artifact-actions",
+                                button {
+                                    disabled: !local_ready,
+                                    aria_label: "批准 Runtime 本地写入",
+                                    title: local_title,
+                                    onclick: move |_| on_approve_local_runtime.call(()),
+                                    "{local_label}"
+                                }
+                            }
+                        }
+                    }
                 }
                 div { class: "operations-card operations-browser-card",
                     header { class: "operations-card-header",
@@ -4881,7 +5374,24 @@ fn AgentOperationsWorkbench(
                     }
                     div { class: "operations-artifact-actions",
                         button { disabled: true, aria_label: "接管 Browser Workspace", title: "等待 BW-01 owner API", "Take over · NOT_IMPLEMENTED" }
-                        button { disabled: true, aria_label: "继续 Browser Workspace", title: "等待 BW-01 owner API", "Continue · NOT_IMPLEMENTED" }
+                        {
+                            let continue_ready = projection.browser.continue_status == OperationsStatus::Ready;
+                            let continue_title = match projection.browser.continue_status {
+                                OperationsStatus::Ready => "通过 Application continue_browser_workspace 签发新 Agent lease",
+                                OperationsStatus::Empty => "当前 Mission 没有用户持有的 Browser Workspace",
+                                _ => "Continue 需要用户持有的 lease；Take over 仍为 NOT_IMPLEMENTED",
+                            };
+                            let continue_label = format!("Continue · {}", projection.browser.continue_status.code());
+                            rsx! {
+                                button {
+                                    disabled: !continue_ready,
+                                    aria_label: "继续 Browser Workspace",
+                                    title: "{continue_title}",
+                                    onclick: move |_| on_continue_browser_workspace.call(()),
+                                    "{continue_label}"
+                                }
+                            }
+                        }
                     }
                 }
                 div { class: "operations-card operations-recovery-card",
@@ -4946,10 +5456,13 @@ fn OrchestratorSurface(
     runtime_stream_is_fixture: bool,
     runtime_follow_latest: bool,
     runtime_has_unseen: bool,
+    selected_result: Option<SelectedResultProjection>,
+    result_action_pending: bool,
     context_access: Option<ProjectContextAccessProjection>,
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
     interrupt_requested: bool,
+    on_continue_browser_workspace: EventHandler<()>,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
@@ -4957,8 +5470,10 @@ fn OrchestratorSurface(
     on_open_workpad: EventHandler<()>,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_approve_local_runtime: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
+    on_result_action: EventHandler<ResultSurfaceAction>,
 ) -> Element {
     match backend {
         DesktopBackendState::Uninitialized(evidence) => rsx! {
@@ -5045,6 +5560,8 @@ fn OrchestratorSurface(
                             interrupt_requested: false,
                             on_quick_entry,
                             on_interrupt,
+                            on_continue_browser_workspace,
+                            on_approve_local_runtime,
                         }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
@@ -5169,11 +5686,20 @@ fn OrchestratorSurface(
                         interrupt_requested,
                         on_quick_entry,
                         on_interrupt,
+                        on_continue_browser_workspace,
+                        on_approve_local_runtime,
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
+                    }
+                    if let Some(result) = selected_result {
+                        SelectedResultSurface {
+                            result,
+                            action_pending: result_action_pending,
+                            on_action: on_result_action,
+                        }
                     }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
@@ -5255,6 +5781,58 @@ fn OrchestratorSurface(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn SelectedResultSurface(
+    result: SelectedResultProjection,
+    action_pending: bool,
+    on_action: EventHandler<ResultSurfaceAction>,
+) -> Element {
+    let adopt_enabled = result.can_adopt() && !action_pending;
+    let adopt_action = result.adopt_action();
+    let open_action = result.open_artifact_action();
+    let status_label = work_product_status_label(&result.adoption_status);
+    let evidence_label = result.evidence.label();
+    let evidence_count = result.evidence.count();
+    rsx! {
+        article {
+            class: "selected-result-surface",
+            aria_label: "当前 Mission 选定结果",
+            header { class: "selected-result-head",
+                div { class: "selected-result-title",
+                    span { class: "selected-result-kicker", "SELECTED RESULT · {result.kind.label()}" }
+                    strong { "{result.title}" }
+                    small { "{result.result_type} · revision {result.binding.result_revision} · manifest v{result.binding.manifest_version}" }
+                }
+                span { class: "selected-result-status", "{status_label}" }
+            }
+            div { class: "selected-result-evidence",
+                span { strong { "{evidence_label}" } small { "{evidence_count} 条已绑定证据" } }
+                span { strong { "{SelectedResultProjection::provenance_label()}" } small { "Project / Mission revision {result.binding.mission_revision}" } }
+                span { strong { "{result.preview_media_type}" } small { "manifest {short_digest(&result.manifest_digest)}" } }
+            }
+            footer { class: "selected-result-actions",
+                button {
+                    class: "quiet-button",
+                    disabled: !adopt_enabled,
+                    aria_label: if action_pending { "正在采用结果" } else { "采用当前结果" },
+                    onclick: move |_| on_action.call(adopt_action.clone()),
+                    UiIcon { name: UiIconName::Check, size: 13 }
+                    if action_pending { "采用中…" } else { "采用" }
+                }
+                button {
+                    class: "quiet-button",
+                    disabled: action_pending,
+                    aria_label: "在工作台打开当前结果",
+                    onclick: move |_| on_action.call(open_action.clone()),
+                    UiIcon { name: UiIconName::Panel, size: 13 }
+                    "打开产物"
+                }
+                small { "正文仅在按需工作台打开；这里不复制 Preview 内容。" }
             }
         }
     }
@@ -5536,7 +6114,7 @@ const fn mission_next_boundary_copy(kind: MissionNextBoundaryKind) -> MissionNex
         MissionNextBoundaryKind::WaitingApproval => MissionNextBoundaryCopy {
             code: "WAITING_APPROVAL",
             title: "等待精确审批",
-            detail: "只有完整 Effect digest 的 ApprovalGrant 才能继续；页面不会替代审批或执行外部动作。",
+            detail: "使用窗口中的冻结 Effect digest 写入 ApprovalGrant；批准不等于执行 Effect，也不构成 Receipt 或 Verification。",
             tone: "attention",
         },
         MissionNextBoundaryKind::WaitingUser => MissionNextBoundaryCopy {
@@ -6160,7 +6738,11 @@ fn MissionStateCard(
             } else if mission.stage == MissionStage::Running && mission.evidence_count == 0 {
                 div { class: "boundary-note", "NOT_STARTED：Mission 已持久化，但尚无 Runtime Turn；没有研究结果、Provider Receipt 或业务完成声明。" }
             } else if mission.stage == MissionStage::WaitingApproval {
-                div { class: "boundary-note", "审批数来自 Effect Ledger；Desktop 精确 digest 审批 UI 尚未接线，因此不会在此处制造批准。" }
+                if mission.pending_effects.is_empty() {
+                    div { class: "boundary-note", "Mission 处于 WaitingApproval，但当前投影没有可授予的 Proposed Effect digest；页面不会制造 SAMPLE 批准。" }
+                } else {
+                    div { class: "boundary-note", "使用下方精确 digest 动作写入 Domain Kernel ApprovalGrant；批准不会执行 Effect、铸造 Receipt 或声明 Verification。" }
+                }
             } else if mission.stage == MissionStage::Verifying {
                 div { class: "boundary-note", "Domain 正处于 Verifying；只有持久 Verification 能推进，页面按钮不能直接完成 Mission。" }
             } else if mission.stage == MissionStage::Scheduled {
@@ -7385,6 +7967,7 @@ fn PrototypeWorkpad(
 #[component]
 fn Workpad(
     mission: Option<MissionProjection>,
+    selected_work_product_id: Option<WorkProductId>,
     context_access: Option<ProjectContextAccessProjection>,
     on_close: EventHandler<()>,
 ) -> Element {
@@ -7417,7 +8000,12 @@ fn Workpad(
                     } else {
                         p { class: "document-lead", "以下 Preview 来自 SQLCipher 中通过 Application 完整校验的 WorkProductManifest；不是页面生成的示例内容。" }
                         for product in mission.work_products {
-                            article { class: "work-product-preview",
+                            {
+                                let selected = selected_work_product_id
+                                    .as_ref()
+                                    .is_some_and(|selected| selected == &product.work_product_id);
+                                rsx! {
+                            article { class: if selected { "work-product-preview selected" } else { "work-product-preview" },
                                 header {
                                     span { class: "file-mark", "WP" }
                                     span {
@@ -7432,6 +8020,8 @@ fn Workpad(
                                     span { "evidence {product.evidence_count}" }
                                     span { "editable {product.editable_scope_count}" }
                                     code { title: "{product.manifest_digest}", "manifest {short_digest(&product.manifest_digest)}" }
+                                }
+                            }
                                 }
                             }
                         }
@@ -8182,6 +8772,10 @@ const fn desktop_runtime_progress_label(phase: DesktopRuntimeProgressPhase) -> &
         DesktopRuntimeProgressPhase::ItemStarted => "正在处理下一项 Runtime 工作",
         DesktopRuntimeProgressPhase::ItemCompleted => "Runtime 工作项已完成",
         DesktopRuntimeProgressPhase::LocalActionDeclined => "本地写入请求已按默认策略拒绝",
+        DesktopRuntimeProgressPhase::WaitingLocalApproval => "本地写入请求等待窗口精确批准",
+        DesktopRuntimeProgressPhase::LocalActionApproved => {
+            "窗口已批准精确 Runtime 本地写入 digest"
+        }
         DesktopRuntimeProgressPhase::StopRequested => "停止请求已交给协调器",
         DesktopRuntimeProgressPhase::InterruptSent => "fenced interrupt 已发送",
         DesktopRuntimeProgressPhase::Completed => "Runtime turn 已完成，正在采纳最终产物",
@@ -8204,13 +8798,14 @@ const fn desktop_runtime_progress_display_label(
 
 const fn desktop_runtime_progress_class(phase: DesktopRuntimeProgressPhase) -> &'static str {
     match phase {
-        DesktopRuntimeProgressPhase::Completed | DesktopRuntimeProgressPhase::Interrupted => {
-            "terminal"
-        }
+        DesktopRuntimeProgressPhase::Completed
+        | DesktopRuntimeProgressPhase::Interrupted
+        | DesktopRuntimeProgressPhase::LocalActionApproved => "terminal",
         DesktopRuntimeProgressPhase::Failed | DesktopRuntimeProgressPhase::Uncertain => "danger",
         DesktopRuntimeProgressPhase::StopRequested
         | DesktopRuntimeProgressPhase::InterruptSent
-        | DesktopRuntimeProgressPhase::LocalActionDeclined => "attention",
+        | DesktopRuntimeProgressPhase::LocalActionDeclined
+        | DesktopRuntimeProgressPhase::WaitingLocalApproval => "attention",
         DesktopRuntimeProgressPhase::Preparing
         | DesktopRuntimeProgressPhase::Dispatched
         | DesktopRuntimeProgressPhase::TurnStarted
@@ -9847,6 +10442,55 @@ mod tests {
             mission_next_boundary_copy(MissionNextBoundaryKind::CatalogRevisionMismatch).code,
             "BLOCKED_CATALOG_REVISION"
         );
+    }
+
+    #[test]
+    fn fixture_waiting_approval_journey_still_refuses_to_mint_grants() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("未创建 ApprovalGrant，也未执行 Effect。"));
+        assert!(
+            source.contains(
+                "SAMPLE r{approval_digest_revision} · 不创建 ApprovalGrant / EffectIntent"
+            )
+        );
+        assert!(source.contains("预览批准后结构"));
+        assert!(source.contains("grant_waiting_approval_os"));
+        assert!(source.contains("!visual_fixture_mode"));
+        assert!(source.contains("批准冻结 digest {short_digest(&effect.scope_digest)}"));
+        assert!(source.contains("使用下方精确 digest 动作写入 Domain Kernel ApprovalGrant"));
+        assert!(source.contains("cfg(feature = \"visual-fixtures\")"));
+        let waiting = mission_next_boundary_copy(MissionNextBoundaryKind::WaitingApproval);
+        assert_eq!(waiting.code, "WAITING_APPROVAL");
+        assert!(waiting.detail.contains("ApprovalGrant"));
+        assert!(!waiting.detail.contains("尚未接线"));
+    }
+
+    #[test]
+    fn operations_continue_calls_application_continue_browser_workspace() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("continue_browser_workspace_os"));
+        assert!(source.contains("DesktopContinueBrowserWorkspaceRequest"));
+        assert!(source.contains("Take over · NOT_IMPLEMENTED"));
+        assert!(source.contains("format!(\"Continue · {}\""));
+        assert!(source.contains("on_continue_browser_workspace"));
+        assert!(source.contains("BrowserHostReconciliationRequired"));
+    }
+
+    #[test]
+    fn operations_approve_calls_application_respond_context_runtime_local_approval() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("approve_held_local_write"));
+        assert!(source.contains("respond_context_runtime_local_approval"));
+        assert!(source.contains("on_approve_local_runtime"));
+        assert!(source.contains("format!(\"Approve · {}\""));
+        assert!(source.contains("live_cancellation_for_selection"));
+        assert!(source.contains("coordinator.cancellation()"));
+        let data_plane = include_str!("data_plane.rs");
+        assert!(data_plane.contains("approved: true"));
+        assert!(data_plane.contains("WaitingLocalApproval"));
+        assert!(data_plane.contains("respond_context_runtime_local_approval"));
+        assert!(!data_plane.contains("approved: false"));
+        assert!(!data_plane.contains("LocalActionDeclined);"));
     }
 
     #[test]

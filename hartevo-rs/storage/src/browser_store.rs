@@ -8,7 +8,7 @@ use hartevo_browser_adapter::{
     BrowserControlState, BrowserControlTransition, BrowserProfile, BrowserProfileSource,
     BrowserProfileStatus, BrowserWorkspace,
 };
-use hartevo_domain_kernel::{BrowserProfileId, BrowserWorkspaceId, ProjectId};
+use hartevo_domain_kernel::{BrowserProfileId, BrowserWorkspaceId, MissionId, ProjectId};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
@@ -232,6 +232,48 @@ impl ProjectStore {
             return Err(StorageError::TenantScopeMismatch);
         }
         Ok(workspace)
+    }
+
+    /// Loads the single live Browser Workspace bound to one Project/Mission.
+    ///
+    /// Duplicate live rows or a projection/Mission mismatch fail closed rather
+    /// than inventing a workspace. Closed/completed workspaces are ignored so
+    /// callers can honestly report EMPTY.
+    pub fn load_live_browser_workspace_for_mission(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<Option<BrowserWorkspace>, StorageError> {
+        self.load_project(project_id)?;
+        self.load_mission(project_id, mission_id)?;
+        let ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT id FROM browser_workspaces
+                 WHERE project_id = ?1 AND mission_id = ?2
+                   AND control_state NOT IN ('completed', 'kept_for_user', 'closed')
+                 ORDER BY updated_at DESC, id",
+            )?;
+            statement
+                .query_map(params![project_id.as_str(), mission_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        match ids.as_slice() {
+            [] => Ok(None),
+            [id] => {
+                let workspace =
+                    self.load_browser_workspace(project_id, &BrowserWorkspaceId::from_stable(id))?;
+                if workspace.mission_id != *mission_id {
+                    return Err(StorageError::TenantScopeMismatch);
+                }
+                Ok(Some(workspace))
+            }
+            _ => Err(StorageError::ImmutableRecordMismatch {
+                kind: "browser workspace mission scope",
+                id: mission_id.to_string(),
+            }),
+        }
     }
 }
 
@@ -1259,6 +1301,56 @@ mod tests {
                 .load_browser_workspace(&fixture.workspace.project_id, &fixture.workspace.id),
             Err(StorageError::TenantScopeMismatch)
         ));
+    }
+
+    #[test]
+    fn live_workspace_for_mission_is_absent_until_persisted_and_unique() {
+        let mut fixture = fixture();
+        assert_eq!(
+            fixture
+                .store
+                .load_live_browser_workspace_for_mission(
+                    &fixture.workspace.project_id,
+                    &fixture.workspace.mission_id
+                )
+                .expect("empty live workspace"),
+            None
+        );
+        persist_fixture(&mut fixture);
+        let loaded = fixture
+            .store
+            .load_live_browser_workspace_for_mission(
+                &fixture.workspace.project_id,
+                &fixture.workspace.mission_id,
+            )
+            .expect("live workspace")
+            .expect("one Mission-bound workspace");
+        assert_eq!(loaded.id, fixture.workspace.id);
+        assert_eq!(loaded.mission_id, fixture.workspace.mission_id);
+        fixture
+            .workspace
+            .complete(
+                1,
+                1,
+                BrowserControlLeaseId::from("lease-browser-storage-complete"),
+                sha('5'),
+                now() + Duration::seconds(1),
+            )
+            .expect("complete");
+        fixture
+            .store
+            .update_browser_workspace_atomic(&fixture.workspace, 1)
+            .expect("persist complete");
+        assert_eq!(
+            fixture
+                .store
+                .load_live_browser_workspace_for_mission(
+                    &fixture.workspace.project_id,
+                    &fixture.workspace.mission_id
+                )
+                .expect("terminal workspace is not live"),
+            None
+        );
     }
 
     #[test]

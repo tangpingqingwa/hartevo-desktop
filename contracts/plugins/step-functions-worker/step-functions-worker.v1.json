@@ -1,0 +1,101 @@
+{
+  "schemaVersion": "hartevo-step-functions-worker-contract/v1",
+  "contractVersion": "aws-step-functions-worker/v1",
+  "evidenceLevel": "E1",
+  "providerId": "aws.step-functions.worker",
+  "serviceId": "aws.step-functions.worker.service",
+  "consumerId": "aws.step-functions.mission-result",
+  "transport": {
+    "protocol": "https",
+    "signing": "sigv4",
+    "credentialBoundary": "SecretReference",
+    "layerOneInvokesTransport": false
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "stateMachineArn",
+      "missionId"
+    ],
+    "receiptBinding": [
+      "awsAccountId",
+      "awsRegion",
+      "stateMachineArn",
+      "missionId",
+      "registrationDigest"
+    ]
+  },
+  "startExecution": {
+    "identity": [
+      "mode",
+      "executionName",
+      "inputDigest",
+      "idempotencyKeyDigest"
+    ],
+    "standard": {
+      "idempotentOnSameNameAndInput": true,
+      "differentInputIsExecutionAlreadyExists": true
+    },
+    "express": {
+      "idempotent": false
+    }
+  },
+  "describeExecutionStates": [
+    "RUNNING",
+    "SUCCEEDED",
+    "FAILED",
+    "TIMED_OUT",
+    "ABORTED",
+    "PENDING_REDRIVE",
+    "PROVIDER_UNKNOWN"
+  ],
+  "describeExecution": {
+    "eventualConsistencyIsExplicitEvidence": true,
+    "missingOutputIsNotSuccess": true,
+    "expressReadback": "layer_2_gap"
+  },
+  "taskTokenReceipt": {
+    "rawTokenAcceptedOnlyInMemory": true,
+    "receiptStoresTokenDigest": true,
+    "scopeBound": true,
+    "replayRejected": true,
+    "tamperRejected": true,
+    "layerOneSendsCallbacks": false
+  },
+  "missionResultAdoption": {
+    "bindingFields": [
+      "missionId",
+      "awsAccountId",
+      "awsRegion",
+      "stateMachineArn",
+      "executionArn",
+      "inputDigest",
+      "outputDigest",
+      "failureDigest",
+      "providerVersion",
+      "providerImplementationDigest",
+      "registrationDigest",
+      "evidenceDigest"
+    ],
+    "successRequiresOutputDigest": true,
+    "failureRequiresFailureDigest": true
+  },
+  "authority": {
+    "connected": false,
+    "nativeExecution": false,
+    "nativeTaskCallbacks": false,
+    "businessVerification": false,
+    "e4": false,
+    "blockedEnvStatus": "BLOCKED_ENV",
+    "fixtureAndLoopbackCannotClaimNative": true
+  },
+  "layerTwoGaps": [
+    "live StartExecution",
+    "durable execution receipt",
+    "bounded native DescribeExecution reconciliation",
+    "SendTaskSuccess and SendTaskFailure",
+    "independent output readback",
+    "ambiguous-start recovery"
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "138ed6097d2502271f91af60ffcb5e11d5f14f18",
+  "candidateCount": 4,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "138ed6097d2502271f91af60ffcb5e11d5f14f18",
+      "headBranch": "codex/platform-scheduler-runtime-fence-sched03",
+      "headCommit": "279ae96f2772d062b8df99ee81d07646a2590dea",
+      "number": 119,
+      "review": {
+        "authorTaskId": "01a03d25-2547-71f0-aabc-87aba07faddd",
+        "exactPaths": [
+          "Cargo.lock",
+          "hartevo-rs/runtime-adapter/Cargo.toml",
+          "hartevo-rs/runtime-adapter/src/lib.rs",
+          "hartevo-rs/runtime-adapter/src/scheduler_fence.rs"
+        ],
+        "receiptDigest": "f4bce296f94c3c7fca37109d6157a3d1c00c6e7a9661148ae629547eb006ccaa",
+        "receiptPath": ".github/governance/reviews/pr-119.json",
+        "reviewedHeadSha": "447126f79cb25719c377e005862540762d7e8824",
+        "reviewerTaskId": "01a03d32-1ecb-70b1-b4fa-4cf4ff69009f"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "138ed6097d2502271f91af60ffcb5e11d5f14f18",
+      "headBranch": "codex/re04-release-evaluator-separation",
+      "headCommit": "1a52ab9e4c6f68f1cf64060367e60cb7bc3a7a5e",
+      "number": 32,
+      "review": {
+        "authorTaskId": "01a03d25-2547-71f0-aabc-87aba07faddd",
+        "exactPaths": [
+          "contracts/release-evidence/schema.v2.3.json",
+          "hartevo-rs/catalog/src/evidence.rs",
+          "hartevo-rs/catalog/src/lib.rs",
+          "hartevo-rs/eval/src/release_reference.rs",
+          "hartevo-rs/eval/src/run_receipt.rs"
+        ],
+        "receiptDigest": "012de8b428594f84e6563e6df7bfaf96d1493b1c566181b233935c9cf7352971",
+        "receiptPath": ".github/governance/reviews/pr-32.json",
+        "reviewedHeadSha": "8148e0dc3f571f246abc3cdb4f7da999988a30be",
+        "reviewerTaskId": "01a03d32-1ecd-7671-82ae-d9b090e44fae"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "138ed6097d2502271f91af60ffcb5e11d5f14f18",
+      "headBranch": "codex/platform-cloud-cell-postgres-cell02",
+      "headCommit": "8eac68fcc95d0743558c729a6d70ded278c0329a",
+      "number": 111,
+      "review": {
+        "authorTaskId": "01a03d25-2547-71f0-aabc-87aba07faddd",
+        "exactPaths": [
+          "hartevo-rs/cloud-storage/src/lib.rs",
+          "hartevo-rs/cloud-storage/tests/cell_integration.rs"
+        ],
+        "receiptDigest": "7b5ff0ea901a4c3470c0d9a2e731fb323a0c190baa1f370a92b40a35c51caa39",
+        "receiptPath": ".github/governance/reviews/pr-111.json",
+        "reviewedHeadSha": "842f781c66d87d7b5e4bbf27d5449b4e98883f8e",
+        "reviewerTaskId": "01a03d32-1ecf-73a2-a186-d5ca31392952"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "138ed6097d2502271f91af60ffcb5e11d5f14f18",
+      "headBranch": "codex/bw01-workspace-control",
+      "headCommit": "5787971d195e50102720fde91e058b88af06dfe0",
+      "number": 130,
+      "review": {
+        "authorTaskId": "01a03d25-2547-71f0-aabc-87aba07faddd",
+        "exactPaths": [
+          "hartevo-rs/browser-adapter/src/control.rs",
+          "hartevo-rs/browser-adapter/src/lib.rs"
+        ],
+        "receiptDigest": "f7db5d854324225fa355f68167a315eb766a941063b820f3c256747e61d693b3",
+        "receiptPath": ".github/governance/reviews/pr-130.json",
+        "reviewedHeadSha": "947990577c22ebb34e74847a4b65dc8223ac691a",
+        "reviewerTaskId": "01a03d32-1ed0-7bd3-bf77-e64bcd88c2d2"
+      }
+    }
+  ],
+  "createdAt": "2026-08-26T09:18:36Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260826-0918"
+}
