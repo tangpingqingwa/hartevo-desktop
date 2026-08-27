@@ -1371,6 +1371,9 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::BrowserWorkspaceUnavailable
         | DesktopDataError::BrowserWorkspaceContinueNotHeld
+        | DesktopDataError::InvalidCreatorDeliverableReview
+        | DesktopDataError::CreatorDeliverableReviewUnavailable
+        | DesktopDataError::CreatorDeliverableReviewStale
         | DesktopDataError::EmptyProjectName
         | DesktopDataError::InvalidRecoveryKey
         | DesktopDataError::ProjectNotFound(_)

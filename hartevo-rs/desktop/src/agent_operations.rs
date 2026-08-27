@@ -933,6 +933,7 @@ mod tests {
             verified_effect_count: 0,
             outcome_summary: None,
             vm11_outcome_review: None,
+            creator_work: None,
         };
         let empty = browser_projection(Some(&mission));
         assert_eq!(empty.status, OperationsStatus::Empty);

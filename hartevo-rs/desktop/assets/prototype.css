@@ -2576,6 +2576,32 @@ body.resizing-workpad {
   background: var(--gold-soft);
 }
 
+.creator-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.creator-review-actions button {
+  min-height: 28px;
+  padding: 5px 8px;
+  color: #4d6156;
+  background: #f8faf7;
+  border: 1px solid #dce4dc;
+  border-radius: 7px;
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.creator-review-actions button:disabled {
+  color: #a4aea8;
+  background: #f1f3f0;
+  border-color: #e4e8e4;
+  cursor: not-allowed;
+}
+
 .policy-matrix {
   border-top: 1px solid var(--line);
   border-left: 1px solid var(--line);
