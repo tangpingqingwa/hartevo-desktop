@@ -1,0 +1,26 @@
+{
+  "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "baseSha": "a3931097c57fea4d4a7871b8162057e0e92b63c4",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/channel-adapters/Cargo.lock",
+    "hartevo-rs/channel-adapters/Cargo.toml",
+    "hartevo-rs/channel-adapters/README.md",
+    "hartevo-rs/channel-adapters/src/lib.rs",
+    "hartevo-rs/channel-adapters/src/tiktok/consumer.rs",
+    "hartevo-rs/channel-adapters/src/tiktok/mod.rs",
+    "hartevo-rs/channel-adapters/src/tiktok/provider.rs",
+    "hartevo-rs/channel-adapters/src/tiktok/service.rs",
+    "hartevo-rs/channel-adapters/src/tiktok/testkit.rs",
+    "hartevo-rs/channel-adapters/src/transport.rs",
+    "hartevo-rs/channel-adapters/tests/tiktok_authenticated_read.rs"
+  ],
+  "pr": 191,
+  "receiptDigest": "e016e5078d6a9cc2e26176838de492d1689618e89df10cb9e7c67770f1c758db",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-27T09:50:34Z",
+  "reviewedHeadSha": "a7bf537daebc1caa114c1088613752bee83f378c",
+  "reviewerTaskId": "01a0428b-27b3-7b02-84da-d3a648b3a184",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

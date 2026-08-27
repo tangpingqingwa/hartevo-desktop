@@ -7,6 +7,7 @@
 
 mod mission_memory;
 mod model_tokenizer;
+mod steering;
 pub mod worker_graph;
 
 pub use mission_memory::{
@@ -21,6 +22,14 @@ pub use mission_memory::{
 };
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
+};
+pub use steering::{
+    SteeringCancellationReason, SteeringCheckpoint, SteeringCompactionInput,
+    SteeringCompactionRebuild, SteeringConsumedInput, SteeringConsumer, SteeringConsumerOutcome,
+    SteeringConsumptionReceipt, SteeringDurableEvent, SteeringError, SteeringEventStatus,
+    SteeringInput, SteeringJournal, SteeringLifecycle, SteeringMicroCompaction,
+    SteeringPluginService, SteeringProvider, SteeringSafePoint, SteeringSubmitOutcome,
+    SteeringTurnFence,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

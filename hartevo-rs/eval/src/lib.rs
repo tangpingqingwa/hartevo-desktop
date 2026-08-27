@@ -5,6 +5,7 @@ extern crate self as hartevo_eval;
 #[path = "../examples/hartevo-browser-contract/digest.rs"]
 mod digest;
 mod distribution;
+mod evaluation_adoption;
 mod evaluation_plugin;
 mod harness_lab;
 #[path = "../examples/hartevo-browser-contract/model.rs"]
@@ -18,6 +19,10 @@ mod verifier;
 pub use distribution::{
     export_public_key, generate_keypair, sign_file, validate_gate, verify_file,
 };
+pub use evaluation_adoption::{
+    EVALUATION_ADOPTION_AUTHORITY, EVALUATION_ADOPTION_SCHEMA_VERSION, EvaluationAdoptionConsumer,
+    EvaluationAdoptionDecision, EvaluationAdoptionOutcome, EvaluationEvidenceRoots,
+};
 pub use evaluation_plugin::{
     DurableEvaluationResultProvider, DurableEvaluationService, EVALUATION_PLUGIN_AUTHORITY,
     EVALUATION_PLUGIN_RELEASE_DECISION, EVALUATION_PLUGIN_SCHEMA_VERSION, EvaluationEvaluator,
@@ -26,32 +31,50 @@ pub use evaluation_plugin::{
     EvaluationPluginState, EvaluationResult, EvaluationResultProvider,
 };
 pub use harness_lab::{
-    CandidateIdentity as HarnessCandidateIdentity, CaseObservation as HarnessCaseObservation,
-    ComparisonRole as HarnessComparisonRole, CrossLaneLeakageFlags as HarnessCrossLaneLeakageFlags,
-    DecisionStatus as HarnessDecisionStatus, EvaluationInput as HarnessEvaluationInput,
-    EvaluationLane as HarnessEvaluationLane, EvidenceKind as HarnessEvidenceKind,
-    GateThresholds as HarnessGateThresholds, GoalFlags as HarnessGoalFlags, HarnessFamily,
-    HarnessLabReport, LAB_AUTHORITY as HARNESS_LAB_AUTHORITY,
-    LAB_DOCUMENT_TYPE as HARNESS_LAB_DOCUMENT_TYPE,
+    CandidateIdentity as HarnessCandidateIdentity,
+    CandidateIdentityFreeze as HarnessCandidateIdentityFreeze,
+    CaseObservation as HarnessCaseObservation, ComparisonRole as HarnessComparisonRole,
+    CrossLaneLeakageFlags as HarnessCrossLaneLeakageFlags,
+    CurrentCommitReceipt as HarnessCurrentCommitReceipt, DecisionStatus as HarnessDecisionStatus,
+    EvaluationInput as HarnessEvaluationInput, EvaluationLane as HarnessEvaluationLane,
+    EvidenceKind as HarnessEvidenceKind, GateThresholds as HarnessGateThresholds,
+    GoalFlags as HarnessGoalFlags, HarnessFamily, HarnessLabReport,
+    LAB_AUTHORITY as HARNESS_LAB_AUTHORITY, LAB_DOCUMENT_TYPE as HARNESS_LAB_DOCUMENT_TYPE,
     LAB_SCHEMA_VERSION as HARNESS_LAB_SCHEMA_VERSION, LabPlan as HarnessLabPlan,
     LaneSummary as HarnessLaneSummary, LeakageCheck as HarnessLeakageCheck,
     MatrixEntry as HarnessMatrixEntry, MetricSnapshot as HarnessMetricSnapshot,
-    OutcomeFlags as HarnessOutcomeFlags, PlanInputs as HarnessPlanInputs,
+    OutcomeFlags as HarnessOutcomeFlags, PROMOTION_AUTHORITY as HARNESS_PROMOTION_AUTHORITY,
+    PROMOTION_CONTRACT_PATH as HARNESS_PROMOTION_CONTRACT_PATH,
+    PROMOTION_RELEASE_DECISION as HARNESS_PROMOTION_RELEASE_DECISION,
+    PROMOTION_SCHEMA_VERSION as HARNESS_PROMOTION_SCHEMA_VERSION, PlanInputs as HarnessPlanInputs,
     PrivateLeakageFlags as HarnessPrivateLeakageFlags, ProcessFlags as HarnessProcessFlags,
     PromotionAction as HarnessPromotionAction, PromotionDecision as HarnessPromotionDecision,
-    PromotionKey as HarnessPromotionKey, ProviderMode as HarnessProviderMode,
+    PromotionKey as HarnessPromotionKey, PromotionState as HarnessPromotionState,
+    PromotionStateDecision as HarnessPromotionStateDecision,
+    PromotionStateMachine as HarnessPromotionStateMachine,
+    PromotionTransition as HarnessPromotionTransition, ProviderMode as HarnessProviderMode,
     RELEASE_DECISION as HARNESS_LAB_RELEASE_DECISION, RUN_AUTHORITY as HARNESS_LAB_RUN_AUTHORITY,
     ReplayPack as HarnessReplayPack, RunResult as HarnessRunResult,
     RunnerDisposition as HarnessRunnerDisposition,
     SAFETY_INVARIANT_IDS as HARNESS_LAB_SAFETY_INVARIANT_IDS,
     SignedPromotionRecord as HarnessSignedPromotionRecord, WorkspaceScope as HarnessWorkspaceScope,
+    build_current_commit_receipt as build_harness_current_commit_receipt,
     build_frozen_plan as build_harness_lab_plan, build_run_result as build_harness_lab_run_result,
+    candidate_identity_digest as harness_candidate_identity_digest,
     contract_digest as harness_lab_contract_digest,
     current_source_commit as harness_lab_source_commit, evaluate as evaluate_harness_lab,
+    freeze_candidate_identity as freeze_harness_candidate_identity,
+    promotion_contract_digest as harness_promotion_contract_digest,
     promotion_payload_digest as harness_lab_promotion_payload_digest,
     promotion_signing_bytes as harness_lab_promotion_signing_bytes,
     validate_plan as validate_harness_lab_plan,
     validate_plan_with_bindings as validate_harness_lab_plan_with_bindings,
+    verify_current_commit_receipt as verify_harness_current_commit_receipt,
+    verify_current_commit_receipt_against_run as verify_harness_current_commit_receipt_against_run,
+    verify_frozen_candidate_identity as verify_harness_frozen_candidate_identity,
+    verify_live_current_commit_receipt as verify_harness_live_current_commit_receipt,
+    verify_live_promotion_state_machine as verify_harness_live_promotion_state_machine,
+    verify_promotion_state_machine as verify_harness_promotion_state_machine,
     verify_signed_record as verify_harness_lab_signature,
 };
 pub use progress_trace::{

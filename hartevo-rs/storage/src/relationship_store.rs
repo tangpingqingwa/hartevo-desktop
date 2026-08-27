@@ -178,6 +178,25 @@ impl ProjectStore {
         Ok(conversation)
     }
 
+    /// Reloads every Conversation for one Project from its durable record.
+    /// The list query is not treated as authoritative state.
+    pub fn conversations_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Conversation>, StorageError> {
+        self.load_project(project_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM conversations
+             WHERE project_id = ?1 ORDER BY created_at, id",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.load_conversation(project_id, &ConversationId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_campaign(
         &mut self,
         campaign: &Campaign,

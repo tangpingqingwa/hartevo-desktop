@@ -3,6 +3,7 @@
 //! Runtime threads, model output, and provider responses are projections into this
 //! kernel. They are never accepted as business truth without a domain command.
 
+mod attribution_evidence_query;
 mod attribution_outcome_adoption;
 mod attribution_spine;
 mod connection;
@@ -13,6 +14,7 @@ mod creator_hiring;
 mod creator_work;
 mod deletion;
 mod identity;
+mod identity_team_plugin;
 mod ids;
 mod key_management;
 mod market_evidence;
@@ -29,6 +31,22 @@ mod runtime_turn;
 mod truth;
 mod work_product;
 
+pub use attribution_evidence_query::{
+    ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_MOUNT_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_REVOKE_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_CONTRACT_VERSION, ATTRIBUTION_EVIDENCE_QUERY_FEEDBACK_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_REQUEST_EVENT_TYPE, ATTRIBUTION_EVIDENCE_QUERY_SCHEMA_VERSION,
+    AttributionEvidenceAdoptionDecision, AttributionEvidenceAdoptionFeedback,
+    AttributionEvidenceConfidence, AttributionEvidenceCounterevidence,
+    AttributionEvidenceFreshness, AttributionEvidenceFreshnessState,
+    AttributionEvidenceQueryConsumer, AttributionEvidenceQueryConsumerRecord,
+    AttributionEvidenceQueryConsumerState, AttributionEvidenceQueryError,
+    AttributionEvidenceQueryId, AttributionEvidenceQueryProvider, AttributionEvidenceQueryRecord,
+    AttributionEvidenceQueryRequest, AttributionEvidenceQueryResponse,
+    AttributionEvidenceQueryScope, AttributionEvidenceQueryService,
+    AttributionEvidenceQuerySnapshot, AttributionEvidenceQueryWindow,
+    AttributionEvidenceSourceCoverage,
+};
 pub use attribution_outcome_adoption::{
     ATTRIBUTION_ADOPTION_CANDIDATE_EVENT_TYPE, ATTRIBUTION_ADOPTION_CONSUMER_MOUNT_EVENT_TYPE,
     ATTRIBUTION_ADOPTION_CONSUMER_REVOKE_EVENT_TYPE,
@@ -89,6 +107,18 @@ pub use identity::{
     ExternalIdentity, IdentityError, IdentityLink, IdentityLinkDecision, IdentityLinkStatus,
     IdentitySubject, LegalBasis, Partner, PartnerSupplyClass, Person,
 };
+pub use identity_team_plugin::{
+    CapabilityPolicyInput, IdentityCapabilityPolicyConsumer, IdentityCapabilityPolicyInput,
+    IdentityCapabilityPolicyProvider, IdentityCapabilityPolicyRoles, IdentityCapabilityRequirement,
+    IdentityMembershipReceipt, IdentityMembershipReceiptKind, IdentityMissionScope,
+    IdentityOfflineMembershipCache, IdentityOidcSession, IdentityPluginHandle,
+    IdentityPluginMountRequest, IdentityPluginPolicyDecision, IdentityPluginSessionFacts,
+    IdentitySessionAccessMode, IdentitySessionHead, IdentitySessionHeadStatus,
+    IdentityTeamMembership, IdentityTeamMembershipBinding, IdentityTeamMembershipConsumer,
+    IdentityTeamMembershipError, IdentityTeamMembershipProvider, IdentityTeamMembershipService,
+    IdentityTeamMembershipStatus, IdentityTeamRole, OidcIdentityTeamMembershipService,
+    ProjectMissionIdentityService,
+};
 pub use ids::{
     AccountId, ActorId, ApprovalId, AttributionId, BrowserActionBatchId, BrowserControlLeaseId,
     BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserSnapshotId,
@@ -99,10 +129,11 @@ pub use ids::{
     ConversationId, CreatorApplicationId, CreatorHiringId, CreatorId, CreatorMilestoneId,
     CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
     DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
-    KeyEnvelopeId, MemberId, MessageId, MissionConversationId, MissionConversationMessageId,
-    MissionId, MissionScheduleId, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId,
-    PersonId, ProjectId, ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId,
-    RuntimeTurnAttemptId, TaskId, TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+    IdentityMembershipReceiptId, IdentitySessionId, KeyEnvelopeId, MemberId, MessageId,
+    MissionConversationId, MissionConversationMessageId, MissionId, MissionScheduleId,
+    OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId, PersonId, ProjectId, ReceiptId,
+    RefundId, ReviewId, RuntimeRecoveryAttemptId, RuntimeTurnAttemptId, TaskId, TeamId, TenantId,
+    VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
 };
 pub use key_management::{
     DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,
