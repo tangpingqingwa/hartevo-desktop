@@ -51,6 +51,22 @@ pub fn youtube_video_response() -> ProviderResponse {
     )
 }
 
+pub fn youtube_uploads_response() -> ProviderResponse {
+    response(
+        200,
+        r#"{
+          "nextPageToken":"uploads-page-2",
+          "items":[{
+            "id":"playlist-item-01",
+            "etag":"playlist-item-etag-1",
+            "snippet":{"channelId":"UCchannel01"},
+            "contentDetails":{"videoId":"video01","videoPublishedAt":"2026-01-01T00:00:00Z"},
+            "status":{"privacyStatus":"public"}
+          }]
+        }"#,
+    )
+}
+
 pub fn youtube_comment_response() -> ProviderResponse {
     response(
         200,

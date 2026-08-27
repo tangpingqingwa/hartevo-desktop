@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.openinterpreter-native-acceptance/v1",
+  "title": "Hartevo OpenInterpreter native acceptance capture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "documentType",
+    "authority",
+    "releaseDecision",
+    "sourceCommit",
+    "runId",
+    "project",
+    "mission",
+    "model",
+    "provider",
+    "dispatch",
+    "durableLog",
+    "toolCalls",
+    "effects",
+    "terminalResult",
+    "adoption",
+    "recovery",
+    "bundleRoot"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.openinterpreter-native-acceptance/v1" },
+    "documentType": { "const": "openinterpreter_native_acceptance" },
+    "authority": { "const": "openinterpreter_native_acceptance_only" },
+    "releaseDecision": { "const": "NOT_EVALUATED" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "runId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "project": { "$ref": "#/$defs/project" },
+    "mission": { "$ref": "#/$defs/mission" },
+    "model": { "$ref": "#/$defs/model" },
+    "provider": { "$ref": "#/$defs/provider" },
+    "dispatch": { "$ref": "#/$defs/dispatch" },
+    "durableLog": { "$ref": "#/$defs/durableLog" },
+    "toolCalls": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/toolCall" }
+    },
+    "effects": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/effect" }
+    },
+    "terminalResult": { "$ref": "#/$defs/terminalResult" },
+    "adoption": { "$ref": "#/$defs/adoption" },
+    "recovery": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/recovery" }
+    },
+    "bundleRoot": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectId", "missionId", "scopeDigest"],
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "scopeDigest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "scopeDigest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "provider", "model", "revision", "sourceCommit", "scope", "identityDigest", "artifactDigest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "revision": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "identityDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "artifactDigest": { "type": "string", "pattern": "^([0-9a-f]{64})?$" }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "mode", "runnerId", "runnerDigest", "protocolSchemaDigest", "credentials", "outputPresent", "outputDigest", "sourceCommit", "scope", "identityDigest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "mode": { "enum": ["native", "simulator", "fixture", "blocked_env", "missing"] },
+        "runnerId": { "type": "string" },
+        "runnerDigest": { "type": "string", "pattern": "^([0-9a-f]{64})?$" },
+        "protocolSchemaDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "credentials": { "enum": ["verified", "missing", "blocked_env", "not_evaluated"] },
+        "outputPresent": { "type": "boolean" },
+        "outputDigest": { "type": "string", "pattern": "^([0-9a-f]{64})?$" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "identityDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "dispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "sourceCommit", "scope", "capability", "requestDigest", "status", "dispatchedAt"],
+      "properties": {
+        "sequence": { "const": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "capability": { "type": "string", "minLength": 1 },
+        "requestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "status": { "const": "dispatched" },
+        "dispatchedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "logEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "kind", "sourceCommit", "occurredAt", "payloadDigest"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "kind": { "enum": ["dispatch", "model_visible_delta", "tool_call", "terminal"] },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "payloadDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "secretScan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "scannedEventCount", "secretCount", "redactionDigest"],
+      "properties": {
+        "status": { "enum": ["clean", "findings"] },
+        "scannedEventCount": { "type": "integer", "minimum": 0 },
+        "secretCount": { "type": "integer", "minimum": 0 },
+        "redactionDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "durableLog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCommit", "scope", "revision", "entries", "firstModelVisibleSequence", "durable", "modelVisible", "secretScan", "logDigest"],
+      "properties": {
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "entries": {
+          "type": "array",
+          "minItems": 4,
+          "items": { "$ref": "#/$defs/logEntry" }
+        },
+        "firstModelVisibleSequence": { "type": "integer", "minimum": 1 },
+        "durable": { "const": true },
+        "modelVisible": { "const": true },
+        "secretScan": { "$ref": "#/$defs/secretScan" },
+        "logDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "toolCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "callId", "capability", "sourceCommit", "scope", "requestDigest", "responseDigest", "startedAt", "completedAt", "status"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "callId": { "type": "string", "minLength": 1 },
+        "capability": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "requestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "responseDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "status": { "const": "completed" }
+      }
+    },
+    "effectVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "status", "verifiedAt", "verificationDigest"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["verified", "failed"] },
+        "verifiedAt": { "type": "string", "format": "date-time" },
+        "verificationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "effectId", "capability", "sourceCommit", "scope", "requestedAt", "receiptAt", "status", "receiptDigest", "verification"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "effectId": { "type": "string", "minLength": 1 },
+        "capability": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "requestedAt": { "type": "string", "format": "date-time" },
+        "receiptAt": { "type": "string", "format": "date-time" },
+        "status": { "enum": ["applied", "failed"] },
+        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "verification": { "$ref": "#/$defs/effectVerification" }
+      }
+    },
+    "terminalResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCommit", "scope", "revision", "status", "provenance", "resultDigest", "evidenceRoot", "completedAt"],
+      "properties": {
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["completed", "failed", "not_evaluated"] },
+        "provenance": { "enum": ["native_provider", "simulator", "fixture", "blocked_env", "missing"] },
+        "resultDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "evidenceRoot": { "type": "string", "pattern": "^([0-9a-f]{64})?$" },
+        "completedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "adoption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCommit", "scope", "revision", "decision", "resultDigest", "evidenceRoot", "decisionDigest", "decidedAt"],
+      "properties": {
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "decision": { "enum": ["adopt", "reject", "not_evaluated"] },
+        "resultDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "evidenceRoot": { "type": "string", "pattern": "^([0-9a-f]{64})?$" },
+        "decisionDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "decidedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "hook", "status", "sourceCommit", "scope", "occurredAt", "receiptDigest", "oldEvaluatorAccepted", "oldDecisionPromotable"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "hook": { "enum": ["stop", "revoke", "crash", "relaunch"] },
+        "status": { "const": "recovered" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "oldEvaluatorAccepted": { "const": false },
+        "oldDecisionPromotable": { "const": false }
+      }
+    }
+  }
+}

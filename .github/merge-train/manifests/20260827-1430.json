@@ -1,0 +1,102 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+  "candidateCount": 4,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+      "headBranch": "codex/openinterpreter-native-acceptance-01",
+      "headCommit": "919a3382818e3677be868eb32ac71f3e7458589d",
+      "number": 195,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "contracts/openinterpreter/native-acceptance.v1.json",
+          "hartevo-rs/eval/examples/hartevo-openinterpreter-native-acceptance/digest.rs",
+          "hartevo-rs/eval/examples/hartevo-openinterpreter-native-acceptance/main.rs",
+          "hartevo-rs/eval/examples/hartevo-openinterpreter-native-acceptance/model.rs",
+          "hartevo-rs/eval/examples/hartevo-openinterpreter-native-acceptance/verifier.rs"
+        ],
+        "receiptDigest": "fdcb8fe3fe9974c8fa2605488374030218618a6d94b1cae251c66e897fd20e1b",
+        "receiptPath": ".github/governance/reviews/pr-195.json",
+        "reviewedHeadSha": "cdc365656f34c9af10aba9dfcf32f03d4083b165",
+        "reviewerTaskId": "01a04379-d596-7d22-a462-91d30c20e947"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+      "headBranch": "codex/result01-work-product-outcome-handoff",
+      "headCommit": "20824687a2e08354ffc5d46b59e168df9d2958a2",
+      "number": 137,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/application/src/lib.rs",
+          "hartevo-rs/application/src/work_product_outcome.rs",
+          "hartevo-rs/domain-kernel/src/lib.rs",
+          "hartevo-rs/domain-kernel/src/work_product_outcome.rs",
+          "hartevo-rs/storage/src/lib.rs",
+          "hartevo-rs/storage/src/work_product_outcome_store.rs"
+        ],
+        "receiptDigest": "2a6afa71594e78842aaf36edcf082c297c24050803d235d79d89a5731cc4447a",
+        "receiptPath": ".github/governance/reviews/pr-137.json",
+        "reviewedHeadSha": "9436ed88f110b02a57f6df73b105497c41ca9fe1",
+        "reviewerTaskId": "01a04379-d596-7d22-a462-91e63498099c"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+      "headBranch": "codex/connectors-channel-channel02",
+      "headCommit": "919537868096986c184a7b65b09772fa53822e25",
+      "number": 132,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/channel-adapters/src/lib.rs",
+          "hartevo-rs/channel-adapters/src/testkit.rs",
+          "hartevo-rs/channel-adapters/src/transport.rs",
+          "hartevo-rs/channel-adapters/src/youtube.rs",
+          "hartevo-rs/channel-adapters/src/youtube_sync.rs",
+          "hartevo-rs/channel-adapters/tests/channel02_reconciliation.rs"
+        ],
+        "receiptDigest": "59e1f50f2d2da4cbff0cdf3e0a82d81399ee4bb5bacf787a58ef415c85236c91",
+        "receiptPath": ".github/governance/reviews/pr-132.json",
+        "reviewedHeadSha": "58071fcccd6f29b0851f45929229e43ea2f422ab",
+        "reviewerTaskId": "01a04379-d596-7d22-a462-91f91215a749"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+      "headBranch": "codex/memory-plugin-context-01",
+      "headCommit": "3d9b37add064998fd43c7d70751d96615175f16b",
+      "number": 162,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/context-fabric/src/lib.rs",
+          "hartevo-rs/context-fabric/src/mission_memory.rs"
+        ],
+        "receiptDigest": "01565f7b9fd4179a599589b83717636f0d949e5f5265001b04aa0bfcf6a9b241",
+        "receiptPath": ".github/governance/reviews/pr-162.json",
+        "reviewedHeadSha": "3708b666069d8ce025a409fbf40980d1b56a3db2",
+        "reviewerTaskId": "01a04379-d596-7d22-a462-9207a8b51a03"
+      }
+    }
+  ],
+  "createdAt": "2026-08-27T14:31:56Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260827-1430"
+}

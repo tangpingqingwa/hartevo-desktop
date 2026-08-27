@@ -3,6 +3,7 @@
 mod observation_evidence_pack;
 mod plugin_invocation_timeline;
 mod runtime_text_subscription;
+mod work_product_outcome;
 
 pub use observation_evidence_pack::{
     ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
@@ -25,6 +26,10 @@ pub use runtime_text_subscription::{
     RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,
     RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionDelta, RuntimeTextSubscriptionError,
     RuntimeTextSubscriptionPage, RuntimeTextSubscriptionTurn,
+};
+pub use work_product_outcome::{
+    AcceptResultPacket, DecideWorkProductAdoption, LinkVerifiedOutcome, ReviseWorkProductResult,
+    WorkProductOutcomeApplicationError, WorkProductOutcomeHandoff,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
