@@ -25,11 +25,13 @@ PACKAGES = {
     "commerce-connector": "hartevo-commerce-connector",
     "connector-sdk": "hartevo-connector-sdk",
     "context-fabric": "hartevo-context-fabric",
+    "cordis": "hartevo-cordis",
     "desktop": "hartevo-desktop",
     "domain-kernel": "hartevo-domain-kernel",
     "effect-broker": "hartevo-effect-broker",
     "eval": "hartevo-eval",
     "mission-scheduler": "hartevo-mission-scheduler",
+    "plugin-runtime": "hartevo-plugin-runtime",
     "runtime-adapter": "hartevo-runtime-adapter",
     "storage": "hartevo-storage",
 }
@@ -184,6 +186,14 @@ def self_test() -> None:
     commerce = plan_for_files(["hartevo-rs/commerce-connector/src/lib.rs"])
     assert commerce["full"] is False
     assert commerce["packages"] == ["hartevo-commerce-connector"]
+
+    plugin_runtime = plan_for_files(["hartevo-rs/plugin-runtime/src/lib.rs"])
+    assert plugin_runtime["full"] is False
+    assert plugin_runtime["packages"] == ["hartevo-plugin-runtime"]
+
+    cordis = plan_for_files(["hartevo-rs/cordis/src/lib.rs"])
+    assert cordis["full"] is False
+    assert cordis["packages"] == ["hartevo-cordis"]
 
     docs = plan_for_files(["docs/quality/example.md"])
     assert docs["full"] is False and docs["rust"] is False and docs["docs"] is True

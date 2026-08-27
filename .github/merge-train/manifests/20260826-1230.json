@@ -1,0 +1,38 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "c35af5fc4f0248f0aa39824b9033ebbbb0da54b7",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "c35af5fc4f0248f0aa39824b9033ebbbb0da54b7",
+      "headBranch": "codex/platform-scheduler-runtime-permit-sched04",
+      "headCommit": "d81193837d8c8965edd9a5e6951e4463a3be4bba",
+      "number": 976,
+      "review": {
+        "authorTaskId": "01a03df6-8c98-7c12-a08b-ef0c7faaf086",
+        "exactPaths": [
+          "hartevo-rs/application/src/lib.rs",
+          "hartevo-rs/runtime-adapter/src/lib.rs",
+          "hartevo-rs/runtime-adapter/src/scheduler_fence.rs"
+        ],
+        "receiptDigest": "4211168af25d5b7a47200425a9f19a15b5609527108fa7b6526c380f0c81817b",
+        "receiptPath": ".github/governance/reviews/pr-976.json",
+        "reviewedHeadSha": "85907a77469f7c1fc242477a46d83ea25048b04d",
+        "reviewerTaskId": "01a03dfa-4be3-7e63-bd21-031a4bf2772a"
+      }
+    }
+  ],
+  "createdAt": "2026-08-26T12:34:35Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260826-1230"
+}

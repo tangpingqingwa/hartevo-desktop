@@ -134,6 +134,34 @@
                     "properties": {
                       "thresholdStatus": {"not": {"const": "evaluated_passed"}}
                     }
+                  },
+                  {
+                    "required": ["evidenceKind"],
+                    "properties": {
+                      "evidenceKind": {"not": {"const": "evaluation_run_result"}}
+                    }
+                  },
+                  {
+                    "required": ["evaluatorAuthority"],
+                    "properties": {
+                      "evaluatorAuthority": {
+                        "not": {"const": "hartevo_evaluation_run_validator_v1"}
+                      }
+                    }
+                  },
+                  {
+                    "required": ["executionStatus"],
+                    "properties": {
+                      "executionStatus": {"not": {"const": "EXECUTED"}}
+                    }
+                  },
+                  {
+                    "required": ["authorityScope"],
+                    "properties": {
+                      "authorityScope": {
+                        "not": {"const": "evaluation_results_only"}
+                      }
+                    }
                   }
                 ]
               }
@@ -316,6 +344,42 @@
     "evaluationPartition": {
       "enum": ["V0", "V1", "V2", "cross_cutting"]
     },
+    "evaluatorEvidenceKind": {
+      "enum": [
+        "evaluation_run_result",
+        "browser_evaluation_result",
+        "integration_build_provenance",
+        "local_fallback_receipt",
+        "fixture",
+        "simulator",
+        "source_audit",
+        "ignored_result"
+      ]
+    },
+    "evaluatorEvidenceAuthority": {
+      "enum": [
+        "hartevo_evaluation_run_validator_v1",
+        "hartevo_browser_contract_validator_v1",
+        "INTEGRATION_BUILD_PROVENANCE_ONLY",
+        "LOCAL_FALLBACK_RECEIPT_ONLY",
+        "FIXTURE_EVIDENCE_ONLY",
+        "SIMULATOR_EVIDENCE_ONLY",
+        "SOURCE_AUDIT_ONLY",
+        "IGNORED_RESULT_ONLY"
+      ]
+    },
+    "evaluatorExecutionStatus": {
+      "enum": [
+        "EXECUTED",
+        "NOT_EXECUTED",
+        "CI_NOT_EXECUTED",
+        "BLOCKED_EXTERNAL_BILLING",
+        "IGNORED"
+      ]
+    },
+    "evaluatorAuthorityScope": {
+      "enum": ["evaluation_results_only", "audit_only"]
+    },
     "evaluationReferenceRunProfile": {
       "oneOf": [
         {
@@ -376,6 +440,10 @@
       "required": [
         "validationAuthority",
         "evidenceAuthority",
+        "evidenceKind",
+        "evaluatorAuthority",
+        "executionStatus",
+        "authorityScope",
         "releaseCommit",
         "catalogDigest",
         "releaseSchemaDigest",
@@ -402,6 +470,10 @@
       "properties": {
         "validationAuthority": {"const": "hartevo_evaluation_run_validator_v1"},
         "evidenceAuthority": {"const": "run_evidence_only"},
+        "evidenceKind": {"$ref": "#/$defs/evaluatorEvidenceKind"},
+        "evaluatorAuthority": {"$ref": "#/$defs/evaluatorEvidenceAuthority"},
+        "executionStatus": {"$ref": "#/$defs/evaluatorExecutionStatus"},
+        "authorityScope": {"$ref": "#/$defs/evaluatorAuthorityScope"},
         "releaseCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
         "catalogDigest": {"$ref": "#/$defs/digest"},
         "releaseSchemaDigest": {"$ref": "#/$defs/digest"},
@@ -452,6 +524,10 @@
         {"$ref": "#/$defs/evaluationRunResultReference"},
         {
           "properties": {
+            "evidenceKind": {"const": "evaluation_run_result"},
+            "evaluatorAuthority": {"const": "hartevo_evaluation_run_validator_v1"},
+            "executionStatus": {"const": "EXECUTED"},
+            "authorityScope": {"const": "evaluation_results_only"},
             "structurallyComplete": {"const": true},
             "partitionComplete": {"const": true},
             "thresholdStatus": {"const": "evaluated_passed"},
@@ -474,6 +550,10 @@
       "type": "object",
       "required": [
         "validationAuthority",
+        "evidenceKind",
+        "evaluatorAuthority",
+        "executionStatus",
+        "authorityScope",
         "receiptSchemaVersion",
         "receiptAuthority",
         "releaseDecision",
@@ -502,6 +582,10 @@
       ],
       "properties": {
         "validationAuthority": {"const": "hartevo_browser_contract_validator_v1"},
+        "evidenceKind": {"$ref": "#/$defs/evaluatorEvidenceKind"},
+        "evaluatorAuthority": {"$ref": "#/$defs/evaluatorEvidenceAuthority"},
+        "executionStatus": {"$ref": "#/$defs/evaluatorExecutionStatus"},
+        "authorityScope": {"$ref": "#/$defs/evaluatorAuthorityScope"},
         "receiptSchemaVersion": {"const": "hartevo-browser-run-receipt/v1"},
         "receiptAuthority": {"const": "browser_harness_evidence_only"},
         "releaseDecision": {"const": "NOT_EVALUATED"},
@@ -540,6 +624,10 @@
         {"$ref": "#/$defs/browserEvaluationResultReference"},
         {
           "properties": {
+            "evidenceKind": {"const": "browser_evaluation_result"},
+            "evaluatorAuthority": {"const": "hartevo_browser_contract_validator_v1"},
+            "executionStatus": {"const": "EXECUTED"},
+            "authorityScope": {"const": "evaluation_results_only"},
             "providerMode": {"const": "native_browser_account"},
             "evidenceClasses": {
               "items": {
@@ -560,6 +648,28 @@
     },
     "ineligibleBrowserEvaluationResultReference": {
       "anyOf": [
+        {
+          "required": ["evidenceKind"],
+          "properties": {"evidenceKind": {"not": {"const": "browser_evaluation_result"}}}
+        },
+        {
+          "required": ["evaluatorAuthority"],
+          "properties": {
+            "evaluatorAuthority": {
+              "not": {"const": "hartevo_browser_contract_validator_v1"}
+            }
+          }
+        },
+        {
+          "required": ["executionStatus"],
+          "properties": {"executionStatus": {"not": {"const": "EXECUTED"}}}
+        },
+        {
+          "required": ["authorityScope"],
+          "properties": {
+            "authorityScope": {"not": {"const": "evaluation_results_only"}}
+          }
+        },
         {
           "required": ["providerMode"],
           "properties": {"providerMode": {"const": "controlled_simulator"}}
@@ -584,7 +694,7 @@
       "type": "object",
       "required": ["schemaVersion", "referenceSetDigest", "run", "browserResults"],
       "properties": {
-        "schemaVersion": {"const": "hartevo-release-evaluation-result-references/v1"},
+        "schemaVersion": {"const": "hartevo-release-evaluation-result-references/v2"},
         "referenceSetDigest": {"$ref": "#/$defs/digest"},
         "run": {
           "oneOf": [
