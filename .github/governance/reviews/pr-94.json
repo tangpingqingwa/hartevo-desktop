@@ -1,0 +1,31 @@
+{
+  "authorTaskId": "01a03be4-1433-7470-b942-d4295a2ce474",
+  "baseSha": "be202200c453d0eff3f39ca7e9a12aaf59774706",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "Cargo.lock",
+    "hartevo-rs/partner-adapters/Cargo.lock",
+    "hartevo-rs/partner-adapters/Cargo.toml",
+    "hartevo-rs/partner-adapters/src/awin.rs",
+    "hartevo-rs/partner-adapters/src/callback.rs",
+    "hartevo-rs/partner-adapters/src/cj_legacy.rs",
+    "hartevo-rs/partner-adapters/src/contract.rs",
+    "hartevo-rs/partner-adapters/src/fixture.rs",
+    "hartevo-rs/partner-adapters/src/ids.rs",
+    "hartevo-rs/partner-adapters/src/impact.rs",
+    "hartevo-rs/partner-adapters/src/lib.rs",
+    "hartevo-rs/partner-adapters/src/replay.rs",
+    "hartevo-rs/partner-adapters/src/sdk.rs",
+    "hartevo-rs/partner-adapters/src/state.rs",
+    "hartevo-rs/partner-adapters/src/support.rs",
+    "hartevo-rs/partner-adapters/src/tests.rs"
+  ],
+  "pr": 94,
+  "receiptDigest": "69bb2438d89cde72ee8e07beaf6056bd09ad493f966d825b0c041a140381772a",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T02:54:58Z",
+  "reviewedHeadSha": "3c9365ae4d7090a3927c3f34e132cdf3f870d603",
+  "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
