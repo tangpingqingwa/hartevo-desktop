@@ -130,6 +130,25 @@ impl ProjectStore {
         .map_err(|error| StorageError::DomainDecode(error.to_string()))
     }
 
+    /// Reloads every Connection for one Project from its durable record.
+    /// The list query is not treated as authoritative state.
+    pub fn connections_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Connection>, StorageError> {
+        self.load_project(project_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM connections
+             WHERE project_id = ?1 ORDER BY created_at, id",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.load_connection(project_id, &ConnectionId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_consent_record(
         &mut self,
         record: &ConsentRecord,

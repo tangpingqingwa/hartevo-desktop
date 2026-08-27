@@ -313,6 +313,7 @@ mod tests {
             outcome_summary: None,
             vm11_outcome_review: None,
             creator_work: None,
+            relationship_conversation: None,
         };
         let project = DesktopProjectProjection {
             tenant_id,

@@ -10,6 +10,12 @@ use crate::model::{
     PluginManifest, PluginRegistry, ProjectMissionScope, ProviderDefinition, ReadinessPolicy,
     RegistryPolicy, ScopeKind, ServiceDefinition, SurfaceDefinition, parse_strict_json,
 };
+use crate::package::{
+    AssetBinding, BinaryBinding, EntrypointBinding, ExtensionPackageManifest, HostApiBinding,
+    PackageLifecycle, PackageObservation, PackageReadinessPolicy, PackageReceipt,
+    PackageReceiptFixture, ReceiptFailure, RequestedAuthorities, RequestedScope, RollbackRecord,
+    RunnerPolicy, SignaturePolicy,
+};
 
 pub const MANIFEST_PATH: &str = "contracts/plugins/manifest.v1.json";
 pub const REGISTRY_PATH: &str = "contracts/plugins/registry.v1.json";
@@ -19,6 +25,9 @@ pub const AUTHORITY: &str = "plugin_contract_validation_only";
 pub const RELEASE_DECISION: &str = "NOT_EVALUATED";
 pub const NOT_EVALUATED: &str = "NOT_EVALUATED";
 pub const REAL_PROVIDER_REASON: &str = "REAL_PROVIDER_REGISTRATION_EMPTY";
+pub const PACKAGE_PATH: &str = "contracts/plugins/package.v1.json";
+pub const PACKAGE_FIXTURE_PATH: &str = "contracts/plugins/package-fixture.v1.json";
+pub const PACKAGE_NOT_EVALUATED_REASON: &str = "REAL_SIGNATURE_KEY_OR_RUNNER_UNAVAILABLE";
 
 // These are deliberately checked-in after the contract bytes are frozen. The
 // evaluator therefore cannot silently validate a different manifest, registry,
@@ -29,6 +38,10 @@ pub const REGISTRY_RAW_SHA256: &str =
     "af606202bcbd6a06335959a1538ac8ba317520859259a78d06a91a3dc472c4bd";
 pub const FIXTURE_RAW_SHA256: &str =
     "1e1d5f63278b66476c0486dcb49766f1e4c3271c619e4f9df8bcde5f4cd85053";
+pub const PACKAGE_RAW_SHA256: &str =
+    "6d66eef85c2c87abce9fa98fe5a414aebd6d9a1609f4a70e873172556c8c558e";
+pub const PACKAGE_FIXTURE_RAW_SHA256: &str =
+    "2bf98558546572663a452778d78f6b6ff52e208ea5b2a335d0bedcc7eba131ca";
 
 const PLUGIN_ID: &str = "hartevo.readonly.market-evidence";
 const PLUGIN_VERSION: &str = "1.0.0";
@@ -46,6 +59,25 @@ const SCOPE_DIGEST_DOMAIN: &str = "hartevo-plugin-scope/v1";
 const MOUNT_RECEIPT_DOMAIN: &str = "hartevo-plugin-mount-receipt/v1";
 const UNMOUNT_RECEIPT_DOMAIN: &str = "hartevo-plugin-unmount-receipt/v1";
 const EVENT_DIGEST_DOMAIN: &str = "hartevo-plugin-durable-event/v1";
+const PACKAGE_DEFINITION_DOMAIN: &str = "hartevo-plugin-package-definition/v1";
+const PACKAGE_BINARY_DOMAIN: &str = "hartevo-plugin-binary/v1";
+const PACKAGE_ASSET_PATH_DOMAIN: &str = "hartevo-plugin-asset-path/v1";
+const PACKAGE_ASSET_CONTENT_DOMAIN: &str = "hartevo-plugin-asset-content/v1";
+const PACKAGE_ASSET_DOMAIN: &str = "hartevo-plugin-asset/v1";
+const PACKAGE_BUNDLE_DOMAIN: &str = "hartevo-plugin-bundle/v1";
+const PACKAGE_HOST_API_DOMAIN: &str = "hartevo-plugin-host-api/v1";
+const PACKAGE_SCOPE_DOMAIN: &str = "hartevo-plugin-package-scope/v1";
+const PACKAGE_AUTHORITY_DOMAIN: &str = "hartevo-plugin-authority/v1";
+const PACKAGE_SYMBOL_DOMAIN: &str = "hartevo-plugin-entrypoint-symbol/v1";
+const PACKAGE_ENTRYPOINT_DOMAIN: &str = "hartevo-plugin-entrypoint/v1";
+const PACKAGE_LIFECYCLE_DOMAIN: &str = "hartevo-plugin-lifecycle/v1";
+const PACKAGE_KEY_DOMAIN: &str = "hartevo-plugin-signing-key/v1";
+const PACKAGE_SIGNATURE_DOMAIN: &str = "hartevo-plugin-signature-evidence/v1";
+const PACKAGE_PAYLOAD_DOMAIN: &str = "hartevo-plugin-signed-payload/v1";
+const PACKAGE_MIGRATION_DOMAIN: &str = "hartevo-plugin-migration/v1";
+const PACKAGE_ROLLBACK_DOMAIN: &str = "hartevo-plugin-rollback/v1";
+const PACKAGE_FAILURE_DOMAIN: &str = "hartevo-plugin-receipt-failure/v1";
+const PACKAGE_RECEIPT_DOMAIN: &str = "hartevo-plugin-receipt/v1";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +104,30 @@ pub struct ValidationReport {
     pub lifecycle_reversible: bool,
     pub durable_log_replayable: bool,
     pub direct_authority_granted: bool,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageValidationReport {
+    pub schema_version: &'static str,
+    pub authority: &'static str,
+    pub validator_status: &'static str,
+    pub readiness_status: &'static str,
+    pub reason_code: &'static str,
+    pub package_id: String,
+    pub package_version: String,
+    pub operation_count: usize,
+    pub receipt_count: usize,
+    pub signature_key_available: bool,
+    pub runner_available: bool,
+    pub native_calls: usize,
+    pub signatures_verified: bool,
+    pub lifecycle_receipts_validated: bool,
+    pub capability_evaluated: bool,
+    pub release_decision: &'static str,
+    pub package_digest: String,
+    pub fixture_digest: String,
 }
 
 pub fn validate_contracts(
@@ -157,6 +213,515 @@ fn validate_raw_digest(bytes: &[u8], expected: &str, label: &str) -> Result<()> 
         actual == expected,
         "{label} raw digest drift: expected {expected}, got {actual}"
     );
+    Ok(())
+}
+
+pub fn validate_package_contracts(
+    base_manifest_bytes: &[u8],
+    package_bytes: &[u8],
+    package_fixture_bytes: &[u8],
+) -> Result<PackageValidationReport> {
+    validate_raw_digest(
+        base_manifest_bytes,
+        MANIFEST_RAW_SHA256,
+        "base plugin manifest",
+    )?;
+    validate_raw_digest(package_bytes, PACKAGE_RAW_SHA256, "extension package")?;
+    validate_raw_digest(
+        package_fixture_bytes,
+        PACKAGE_FIXTURE_RAW_SHA256,
+        "extension package fixture",
+    )?;
+    let manifest = parse_strict_json::<PluginManifest>(base_manifest_bytes)
+        .context("base plugin manifest is not strict typed JSON")?;
+    let package = parse_strict_json::<ExtensionPackageManifest>(package_bytes)
+        .context("extension package manifest is not strict typed JSON")?;
+    let fixture = parse_strict_json::<PackageReceiptFixture>(package_fixture_bytes)
+        .context("extension package fixture is not strict typed JSON")?;
+    validate_manifest(&manifest)?;
+    validate_package_manifest(&package, &manifest)?;
+    validate_package_fixture(&fixture, &package)?;
+    Ok(PackageValidationReport {
+        schema_version: VALIDATION_SCHEMA_VERSION,
+        authority: AUTHORITY,
+        validator_status: "PACKAGE_CONTRACT_VALIDATED",
+        readiness_status: NOT_EVALUATED,
+        reason_code: PACKAGE_NOT_EVALUATED_REASON,
+        package_id: package.package_id,
+        package_version: package.package_version,
+        operation_count: 5,
+        receipt_count: fixture.receipts.len(),
+        signature_key_available: fixture.observation.signature_key_available,
+        runner_available: fixture.observation.runner_available,
+        native_calls: fixture.observation.native_calls,
+        signatures_verified: false,
+        lifecycle_receipts_validated: true,
+        capability_evaluated: false,
+        release_decision: RELEASE_DECISION,
+        package_digest: sha256_hex(package_bytes),
+        fixture_digest: sha256_hex(package_fixture_bytes),
+    })
+}
+
+fn validate_package_manifest(
+    package: &ExtensionPackageManifest,
+    manifest: &PluginManifest,
+) -> Result<()> {
+    ensure!(package.schema_version == "hartevo-plugin-package/v1");
+    ensure!(package.contract_version == "plugin-contract-closure-01/package/v1");
+    ensure!(package.package_id == manifest.plugin.plugin_id && package.package_id == PLUGIN_ID);
+    ensure!(
+        package.package_version == manifest.plugin.version
+            && package.package_version == PLUGIN_VERSION
+    );
+    ensure!(package.manifest_revision == 1);
+    ensure!(package.base_manifest_digest == MANIFEST_RAW_SHA256);
+    ensure!(package.service_definition_digest == manifest.service_definitions[0].definition_digest);
+    ensure!(package.provider_definition_digest == manifest.providers[0].definition_digest);
+    ensure!(package.consumer_definition_digest == manifest.consumers[0].definition_digest);
+    validate_package_binary(&package.binary, package)?;
+    validate_host_api(&package.host_api)?;
+    ensure!(package.requested_scopes.len() == 1);
+    validate_package_scope(&package.requested_scopes[0])?;
+    validate_requested_authorities(&package.requested_authorities)?;
+    validate_entrypoint(&package.entrypoint, package, manifest)?;
+    validate_package_lifecycle(&package.lifecycle)?;
+    let expected_definition = package_definition_digest(package);
+    ensure!(package.definition_digest == expected_definition);
+    validate_signature_policy(&package.signature_policy, package)?;
+    validate_runner_policy(&package.runner_policy)?;
+    validate_package_readiness(&package.readiness_policy)?;
+    Ok(())
+}
+
+fn validate_package_binary(
+    binary: &BinaryBinding,
+    package: &ExtensionPackageManifest,
+) -> Result<()> {
+    ensure!(binary.entrypoint == "hartevo_plugin_service_provider_v1");
+    ensure!(binary.binary_format == "native");
+    ensure!(binary.assets.len() == 1);
+    let expected_binary = domain_digest(
+        PACKAGE_BINARY_DOMAIN,
+        &[
+            package.package_id.as_str(),
+            package.package_version.as_str(),
+            "unavailable",
+        ],
+    );
+    ensure!(binary.binary_digest == expected_binary);
+    let asset = &binary.assets[0];
+    validate_asset(asset)?;
+    let expected_bundle = domain_digest(
+        PACKAGE_BUNDLE_DOMAIN,
+        &[
+            binary.binary_format.as_str(),
+            binary.binary_digest.as_str(),
+            binary.entrypoint.as_str(),
+            &asset.asset_digest,
+        ],
+    );
+    ensure!(binary.bundle_digest == expected_bundle);
+    Ok(())
+}
+
+fn validate_asset(asset: &AssetBinding) -> Result<()> {
+    ensure!(asset.asset_id == "market-evidence-schema");
+    ensure!(asset.byte_count == 4096);
+    let expected_path = domain_digest(PACKAGE_ASSET_PATH_DOMAIN, &[asset.asset_id.as_str()]);
+    let expected_content = domain_digest(
+        PACKAGE_ASSET_CONTENT_DOMAIN,
+        &[asset.asset_id.as_str(), "unavailable"],
+    );
+    ensure!(asset.path_digest == expected_path && asset.content_digest == expected_content);
+    let expected_asset = domain_digest(
+        PACKAGE_ASSET_DOMAIN,
+        &[
+            asset.asset_id.as_str(),
+            asset.path_digest.as_str(),
+            asset.content_digest.as_str(),
+            &asset.byte_count.to_string(),
+        ],
+    );
+    ensure!(asset.asset_digest == expected_asset);
+    Ok(())
+}
+
+fn validate_host_api(api: &HostApiBinding) -> Result<()> {
+    ensure!(api.api_id == "hartevo.plugin.host");
+    ensure!(api.major == 1 && api.minor == 0);
+    let expected = domain_digest(
+        PACKAGE_HOST_API_DOMAIN,
+        &[
+            api.api_id.as_str(),
+            &api.major.to_string(),
+            &api.minor.to_string(),
+        ],
+    );
+    ensure!(api.api_digest == expected);
+    Ok(())
+}
+
+fn validate_package_scope(scope: &RequestedScope) -> Result<()> {
+    ensure!(scope.scope_kind == ScopeKind::ProjectMission);
+    ensure!(
+        scope.scope_digest == "15b4d31832f6165508833f47e9e52a459bd93af17280d64705f2d0207aae744c"
+    );
+    ensure!(scope.capabilities == ["consumer.model_visible", "service.read_only"]);
+    let expected = domain_digest(
+        PACKAGE_SCOPE_DOMAIN,
+        &[
+            scope_kind_text(scope.scope_kind),
+            scope.scope_digest.as_str(),
+            &scope.capabilities.join(","),
+        ],
+    );
+    ensure!(scope.scope_binding_digest == expected);
+    Ok(())
+}
+
+fn validate_requested_authorities(authorities: &RequestedAuthorities) -> Result<()> {
+    ensure!(authorities.store == "forbidden");
+    ensure!(authorities.keyring == "forbidden");
+    ensure!(authorities.browser_profile == "forbidden");
+    ensure!(authorities.effect == "forbidden");
+    ensure!(
+        authorities.allowed
+            == [
+                "durable_log_append",
+                "model_input_output",
+                "provider_read_only"
+            ]
+    );
+    ensure!(authorities.unknown_authority_policy == "deny");
+    let expected = domain_digest(
+        PACKAGE_AUTHORITY_DOMAIN,
+        &[
+            authorities.store.as_str(),
+            authorities.keyring.as_str(),
+            authorities.browser_profile.as_str(),
+            authorities.effect.as_str(),
+            &authorities.allowed.join(","),
+            authorities.unknown_authority_policy.as_str(),
+        ],
+    );
+    ensure!(authorities.authority_digest == expected);
+    Ok(())
+}
+
+fn validate_entrypoint(
+    entrypoint: &EntrypointBinding,
+    package: &ExtensionPackageManifest,
+    manifest: &PluginManifest,
+) -> Result<()> {
+    ensure!(entrypoint.kind == "service_provider");
+    ensure!(entrypoint.symbol == package.binary.entrypoint);
+    ensure!(entrypoint.invocation == "host_dispatch");
+    ensure!(
+        entrypoint.return_contract_digest == manifest.service_definitions[0].output_schema_digest
+    );
+    let expected_symbol = domain_digest(PACKAGE_SYMBOL_DOMAIN, &[entrypoint.symbol.as_str()]);
+    ensure!(entrypoint.symbol_digest == expected_symbol);
+    let expected_entrypoint = domain_digest(
+        PACKAGE_ENTRYPOINT_DOMAIN,
+        &[
+            entrypoint.kind.as_str(),
+            entrypoint.symbol_digest.as_str(),
+            entrypoint.invocation.as_str(),
+            entrypoint.return_contract_digest.as_str(),
+        ],
+    );
+    ensure!(entrypoint.entrypoint_digest == expected_entrypoint);
+    Ok(())
+}
+
+fn validate_package_lifecycle(lifecycle: &PackageLifecycle) -> Result<()> {
+    ensure!(lifecycle.mount == "atomic_registration_receipt");
+    ensure!(lifecycle.unmount == "reverse_order_atomic");
+    ensure!(lifecycle.upgrade == "install_then_cutover");
+    ensure!(lifecycle.downgrade == "install_then_cutover");
+    ensure!(lifecycle.revoke == "stop_revoke_unmount");
+    ensure!(lifecycle.crash_recovery == "rollback_to_previous_or_stopped");
+    ensure!(lifecycle.migration_policy == "none");
+    ensure!(lifecycle.migration_reversible);
+    ensure!(lifecycle.rollback_required && lifecycle.receipt_required);
+    ensure!(lifecycle.unknown_transition == "deny");
+    let expected = domain_digest(
+        PACKAGE_LIFECYCLE_DOMAIN,
+        &[
+            lifecycle.mount.as_str(),
+            lifecycle.unmount.as_str(),
+            lifecycle.upgrade.as_str(),
+            lifecycle.downgrade.as_str(),
+            lifecycle.revoke.as_str(),
+            lifecycle.crash_recovery.as_str(),
+            lifecycle.migration_policy.as_str(),
+            bool_text(lifecycle.migration_reversible),
+            bool_text(lifecycle.rollback_required),
+            bool_text(lifecycle.receipt_required),
+            lifecycle.unknown_transition.as_str(),
+        ],
+    );
+    ensure!(lifecycle.lifecycle_digest == expected);
+    Ok(())
+}
+
+fn validate_signature_policy(
+    signature: &SignaturePolicy,
+    package: &ExtensionPackageManifest,
+) -> Result<()> {
+    ensure!(signature.algorithm == "ed25519" && signature.required);
+    ensure!(signature.key_registry_epoch == 0);
+    ensure!(signature.signature_status == NOT_EVALUATED);
+    ensure!(signature.signature_hex.is_none());
+    let expected_key = domain_digest(
+        PACKAGE_KEY_DOMAIN,
+        &[package.package_id.as_str(), "unprovisioned"],
+    );
+    ensure!(signature.key_id_digest == expected_key);
+    let expected_payload = package_signed_payload_digest(package);
+    ensure!(signature.signed_payload_digest == expected_payload);
+    let expected_signature = domain_digest(
+        PACKAGE_SIGNATURE_DOMAIN,
+        &[
+            signature.key_id_digest.as_str(),
+            signature.signed_payload_digest.as_str(),
+            signature.signature_status.as_str(),
+        ],
+    );
+    ensure!(signature.signature_digest == expected_signature);
+    Ok(())
+}
+
+fn validate_runner_policy(runner: &RunnerPolicy) -> Result<()> {
+    ensure!(runner.required);
+    ensure!(runner.registry_status == "EMPTY");
+    ensure!(runner.runner_id_digest.is_none() && runner.runner_binary_digest.is_none());
+    ensure!(runner.runner_signature_status == NOT_EVALUATED);
+    Ok(())
+}
+
+fn validate_package_readiness(policy: &PackageReadinessPolicy) -> Result<()> {
+    ensure!(policy.real_signature_key_required && policy.real_runner_required);
+    ensure!(policy.empty_registry_status == NOT_EVALUATED);
+    ensure!(policy.fixture_does_not_count);
+    ensure!(policy.release_decision == RELEASE_DECISION);
+    Ok(())
+}
+
+fn package_definition_digest(package: &ExtensionPackageManifest) -> String {
+    domain_digest(
+        PACKAGE_DEFINITION_DOMAIN,
+        &[
+            package.package_id.as_str(),
+            package.package_version.as_str(),
+            &package.manifest_revision.to_string(),
+            package.base_manifest_digest.as_str(),
+            package.service_definition_digest.as_str(),
+            package.provider_definition_digest.as_str(),
+            package.consumer_definition_digest.as_str(),
+            package.binary.bundle_digest.as_str(),
+            package.host_api.api_digest.as_str(),
+            package.requested_scopes[0].scope_binding_digest.as_str(),
+            package.requested_authorities.authority_digest.as_str(),
+            package.entrypoint.entrypoint_digest.as_str(),
+            package.lifecycle.lifecycle_digest.as_str(),
+        ],
+    )
+}
+
+fn package_signed_payload_digest(package: &ExtensionPackageManifest) -> String {
+    domain_digest(
+        PACKAGE_PAYLOAD_DOMAIN,
+        &[
+            package.definition_digest.as_str(),
+            package.host_api.api_digest.as_str(),
+            package.requested_scopes[0].scope_binding_digest.as_str(),
+            package.requested_authorities.authority_digest.as_str(),
+            package.entrypoint.entrypoint_digest.as_str(),
+            package.lifecycle.lifecycle_digest.as_str(),
+        ],
+    )
+}
+
+fn validate_package_fixture(
+    fixture: &PackageReceiptFixture,
+    package: &ExtensionPackageManifest,
+) -> Result<()> {
+    ensure!(fixture.schema_version == "hartevo-plugin-package-fixture/v1");
+    ensure!(fixture.fixture_id == "readonly-market-package-lifecycle/v1");
+    ensure!(fixture.package_id == package.package_id);
+    ensure!(fixture.package_version == package.package_version);
+    ensure!(fixture.package_definition_digest == package.definition_digest);
+    validate_package_scope(&fixture.scope)?;
+    ensure!(fixture.scope == package.requested_scopes[0]);
+    ensure!(fixture.receipts.len() == 5);
+    let expected_operations = [
+        "install",
+        "upgrade",
+        "downgrade",
+        "revoke",
+        "crash_recovery",
+    ];
+    let mut receipt_ids = BTreeSet::new();
+    for (index, receipt) in fixture.receipts.iter().enumerate() {
+        ensure!(receipt_ids.insert(receipt.receipt_id.clone()));
+        validate_package_receipt(
+            receipt,
+            package,
+            index as u64 + 1,
+            expected_operations[index],
+        )?;
+    }
+    validate_package_observation(&fixture.observation)
+}
+
+fn validate_package_receipt(
+    receipt: &PackageReceipt,
+    package: &ExtensionPackageManifest,
+    expected_sequence: u64,
+    expected_operation: &str,
+) -> Result<()> {
+    ensure!(receipt.sequence == expected_sequence);
+    ensure!(receipt.operation == expected_operation);
+    ensure!(receipt.status == NOT_EVALUATED);
+    ensure!(receipt.package_definition_digest == package.definition_digest);
+    ensure!(receipt.scope_digest == package.requested_scopes[0].scope_digest);
+    ensure!(receipt.generation == expected_sequence);
+    ensure!(receipt.signature_verification == NOT_EVALUATED);
+    ensure!(receipt.runner_verification == NOT_EVALUATED);
+    let (from, to, before, after, failure_code) = match expected_operation {
+        "install" => (
+            None,
+            Some("1.0.0"),
+            LifecycleState::Defined,
+            LifecycleState::Stopped,
+            "REAL_SIGNATURE_KEY_UNAVAILABLE",
+        ),
+        "upgrade" => (
+            Some("1.0.0"),
+            Some("1.1.0"),
+            LifecycleState::Mounted,
+            LifecycleState::Stopped,
+            "REAL_SIGNATURE_KEY_UNAVAILABLE",
+        ),
+        "downgrade" => (
+            Some("1.1.0"),
+            Some("1.0.0"),
+            LifecycleState::Mounted,
+            LifecycleState::Stopped,
+            "REAL_SIGNATURE_KEY_UNAVAILABLE",
+        ),
+        "revoke" => (
+            Some("1.0.0"),
+            None,
+            LifecycleState::Mounted,
+            LifecycleState::Revoked,
+            "REAL_SIGNATURE_KEY_UNAVAILABLE",
+        ),
+        "crash_recovery" => (
+            Some("1.0.0"),
+            Some("1.0.0"),
+            LifecycleState::Mounted,
+            LifecycleState::Stopped,
+            "REAL_RUNNER_UNAVAILABLE",
+        ),
+        _ => return Err(anyhow::anyhow!("unknown package operation")),
+    };
+    ensure!(receipt.from_version.as_deref() == from);
+    ensure!(receipt.to_version.as_deref() == to);
+    ensure!(receipt.lifecycle_before == before && receipt.lifecycle_after == after);
+    validate_migration(&receipt.migration, package, expected_operation)?;
+    validate_rollback(&receipt.rollback, receipt, package)?;
+    validate_receipt_failure(&receipt.failure, expected_operation, failure_code)?;
+    let expected_digest = package_receipt_digest(receipt);
+    ensure!(receipt.receipt_digest == expected_digest);
+    Ok(())
+}
+
+fn validate_migration(
+    migration: &crate::package::MigrationRecord,
+    package: &ExtensionPackageManifest,
+    operation: &str,
+) -> Result<()> {
+    ensure!(migration.kind == "none" && migration.reversible);
+    let expected = domain_digest(
+        PACKAGE_MIGRATION_DOMAIN,
+        &[package.package_id.as_str(), operation, "none"],
+    );
+    ensure!(migration.migration_digest == expected);
+    Ok(())
+}
+
+fn validate_rollback(
+    rollback: &RollbackRecord,
+    receipt: &PackageReceipt,
+    package: &ExtensionPackageManifest,
+) -> Result<()> {
+    ensure!(rollback.required && rollback.attempted && rollback.succeeded);
+    ensure!(rollback.remaining_registration_count == 0);
+    let expected = domain_digest(
+        PACKAGE_ROLLBACK_DOMAIN,
+        &[
+            receipt.receipt_id.as_str(),
+            &receipt.sequence.to_string(),
+            package.definition_digest.as_str(),
+            receipt.scope_digest.as_str(),
+            "remaining:0",
+            "succeeded:true",
+        ],
+    );
+    ensure!(rollback.rollback_digest == expected);
+    Ok(())
+}
+
+fn validate_receipt_failure(
+    failure: &ReceiptFailure,
+    operation: &str,
+    expected_code: &str,
+) -> Result<()> {
+    ensure!(failure.code == expected_code);
+    let expected_observation = domain_digest(
+        PACKAGE_FAILURE_DOMAIN,
+        &[operation, expected_code, "observation"],
+    );
+    let expected_exit = domain_digest(PACKAGE_FAILURE_DOMAIN, &[operation, expected_code, "exit"]);
+    ensure!(failure.observation_digest == expected_observation);
+    ensure!(failure.exit_condition_digest == expected_exit);
+    Ok(())
+}
+
+fn package_receipt_digest(receipt: &PackageReceipt) -> String {
+    domain_digest(
+        PACKAGE_RECEIPT_DOMAIN,
+        &[
+            receipt.receipt_id.as_str(),
+            &receipt.sequence.to_string(),
+            receipt.operation.as_str(),
+            receipt.status.as_str(),
+            receipt.package_definition_digest.as_str(),
+            receipt.scope_digest.as_str(),
+            &receipt.generation.to_string(),
+            receipt.from_version.as_deref().unwrap_or("none"),
+            receipt.to_version.as_deref().unwrap_or("none"),
+            receipt.signature_verification.as_str(),
+            receipt.runner_verification.as_str(),
+            lifecycle_state_text(receipt.lifecycle_before),
+            lifecycle_state_text(receipt.lifecycle_after),
+            receipt.migration.migration_digest.as_str(),
+            receipt.rollback.rollback_digest.as_str(),
+            receipt.failure.code.as_str(),
+            receipt.failure.observation_digest.as_str(),
+            receipt.failure.exit_condition_digest.as_str(),
+        ],
+    )
+}
+
+fn validate_package_observation(observation: &PackageObservation) -> Result<()> {
+    ensure!(!observation.signature_key_available && !observation.runner_available);
+    ensure!(observation.native_calls == 0);
+    ensure!(observation.status == NOT_EVALUATED);
+    ensure!(observation.release_decision == RELEASE_DECISION);
     Ok(())
 }
 
@@ -696,6 +1261,17 @@ fn scope_kind_text(scope: ScopeKind) -> &'static str {
     }
 }
 
+fn lifecycle_state_text(state: LifecycleState) -> &'static str {
+    match state {
+        LifecycleState::Defined => "defined",
+        LifecycleState::Mounted => "mounted",
+        LifecycleState::Stopping => "stopping",
+        LifecycleState::Stopped => "stopped",
+        LifecycleState::Revoked => "revoked",
+        LifecycleState::Failed => "failed",
+    }
+}
+
 fn validate_observation(observation: &FixtureObservation) -> Result<()> {
     ensure!(observation.registration_count == 0);
     ensure!(observation.real_provider_count == 0);
@@ -708,15 +1284,82 @@ fn validate_observation(observation: &FixtureObservation) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIXTURE_RAW_SHA256, MANIFEST_RAW_SHA256, REGISTRY_RAW_SHA256, validate_contracts};
+    use super::{
+        FIXTURE_RAW_SHA256, MANIFEST_RAW_SHA256, PACKAGE_FIXTURE_RAW_SHA256, PACKAGE_RAW_SHA256,
+        REGISTRY_RAW_SHA256, validate_contracts, validate_package_contracts,
+        validate_package_fixture, validate_package_manifest,
+    };
     use crate::model::{PluginFixture, PluginManifest, PluginRegistry, parse_strict_json};
+    use crate::package::{ExtensionPackageManifest, PackageReceiptFixture};
 
     const MANIFEST: &[u8] = include_bytes!("../../../../contracts/plugins/manifest.v1.json");
     const REGISTRY: &[u8] = include_bytes!("../../../../contracts/plugins/registry.v1.json");
     const FIXTURE: &[u8] = include_bytes!("../../../../contracts/plugins/fixture.v1.json");
+    const PACKAGE: &[u8] = include_bytes!("../../../../contracts/plugins/package.v1.json");
+    const PACKAGE_FIXTURE: &[u8] =
+        include_bytes!("../../../../contracts/plugins/package-fixture.v1.json");
 
     fn validated() -> super::ValidationReport {
         validate_contracts(MANIFEST, REGISTRY, FIXTURE).expect("plugin contract validates")
+    }
+
+    fn package_validated() -> super::PackageValidationReport {
+        validate_package_contracts(MANIFEST, PACKAGE, PACKAGE_FIXTURE)
+            .expect("extension package contract validates")
+    }
+
+    #[test]
+    fn package_contract_is_typed_but_not_native_capability() {
+        let report = package_validated();
+        assert_eq!(report.validator_status, "PACKAGE_CONTRACT_VALIDATED");
+        assert_eq!(report.readiness_status, super::NOT_EVALUATED);
+        assert_eq!(report.reason_code, super::PACKAGE_NOT_EVALUATED_REASON);
+        assert_eq!(report.package_id, "hartevo.readonly.market-evidence");
+        assert_eq!(report.package_version, "1.0.0");
+        assert_eq!(report.operation_count, 5);
+        assert_eq!(report.receipt_count, 5);
+        assert!(!report.signature_key_available);
+        assert!(!report.runner_available);
+        assert_eq!(report.native_calls, 0);
+        assert!(!report.signatures_verified);
+        assert!(report.lifecycle_receipts_validated);
+        assert!(!report.capability_evaluated);
+        assert_eq!(report.release_decision, super::RELEASE_DECISION);
+        assert_eq!(report.package_digest, PACKAGE_RAW_SHA256);
+        assert_eq!(report.fixture_digest, PACKAGE_FIXTURE_RAW_SHA256);
+    }
+
+    #[test]
+    fn package_raw_byte_drift_is_rejected_before_typed_validation() {
+        let mut package = PACKAGE.to_vec();
+        package.push(b'\n');
+        assert!(validate_package_contracts(MANIFEST, &package, PACKAGE_FIXTURE).is_err());
+    }
+
+    #[test]
+    fn unknown_requested_authority_fails_closed() {
+        let manifest = parse_strict_json::<PluginManifest>(MANIFEST).expect("manifest");
+        let mut package = parse_strict_json::<ExtensionPackageManifest>(PACKAGE).expect("package");
+        package.requested_authorities.allowed = vec!["host.secret_store".to_owned()];
+        assert!(validate_package_manifest(&package, &manifest).is_err());
+    }
+
+    #[test]
+    fn irreversible_migration_fails_closed() {
+        let manifest = parse_strict_json::<PluginManifest>(MANIFEST).expect("manifest");
+        let mut package = parse_strict_json::<ExtensionPackageManifest>(PACKAGE).expect("package");
+        package.lifecycle.migration_policy = "custom".to_owned();
+        package.lifecycle.migration_reversible = false;
+        assert!(validate_package_manifest(&package, &manifest).is_err());
+    }
+
+    #[test]
+    fn fixture_status_cannot_be_promoted_to_pass() {
+        let package = parse_strict_json::<ExtensionPackageManifest>(PACKAGE).expect("package");
+        let mut fixture =
+            parse_strict_json::<PackageReceiptFixture>(PACKAGE_FIXTURE).expect("fixture");
+        fixture.receipts[0].status = "PASS".to_owned();
+        assert!(validate_package_fixture(&fixture, &package).is_err());
     }
 
     #[test]
