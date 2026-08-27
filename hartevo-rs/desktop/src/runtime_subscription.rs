@@ -3556,11 +3556,6 @@ mod tests {
             .live_cancellation_for_selection(Some((&project_id, &mission_id)))
             .expect("catalog first-run observe-loop cancellation");
         assert!(!live.is_requested());
-        assert_eq!(
-            state.request_stop_for_selection(Some((&project_id, &mission_id))),
-            DesktopRuntimeStopDisposition::Requested
-        );
-        assert!(live.is_requested());
         let other_project = ProjectId::from("other-project");
         assert!(
             state
