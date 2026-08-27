@@ -1,14 +1,16 @@
-//! YouTube read-only channel contracts.
+//! YouTube read-only channel contracts plus the controlled publish adapter.
 //!
-//! This root owns the shared typed channel request/identity boundary and the
-//! YouTube Data API/Analytics vertical. It intentionally does not implement
-//! the generic Connector SDK lifecycle from CONN-01, a central registry, or
-//! any publish/reply effect path. TikTok and Reddit adapters are independent
-//! sibling roots.
+//! The publish vertical stops at a provider-specific dispatch/readback
+//! boundary. It does not depend on, implement, or grant Effect authority.
+//! The protected bootstrap read-only identity and transport contracts remain
+//! available to the YouTube read service and Mission consumer.
+
+#![forbid(unsafe_code)]
 
 pub mod identity;
 pub mod testkit;
 pub mod transport;
+#[path = "youtube/mod.rs"]
 pub mod youtube;
 pub mod youtube_read;
 
@@ -18,4 +20,21 @@ pub use identity::{
 pub use transport::{
     AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderReadRequest,
     ProviderResponse, ReadOnlyTransport, ReadOperation, ScopeName, TransportError,
+    YouTubeSecretReference,
+};
+
+pub use youtube::{
+    DraftVideoPublishRequest, MissionYouTubePublishConsumer, YouTubeAccountId,
+    YouTubeApprovalRevision, YouTubeAssetDescriptor, YouTubeAssetDigest, YouTubeAuthenticatedProbe,
+    YouTubeBusinessId, YouTubeChannelId, YouTubeCredential, YouTubeCredentialInvalidationReason,
+    YouTubeDataApiProvider, YouTubeDispatchOperation, YouTubeError, YouTubeEvidenceProvenance,
+    YouTubeHttpMethod, YouTubeIdempotencyKey, YouTubeMissionAcceptedPublish, YouTubeOAuthScope,
+    YouTubeProductionTransport, YouTubeProviderId, YouTubeProviderReceipt, YouTubeProviderRequest,
+    YouTubeProviderResponse, YouTubePublishBinding, YouTubePublishCheckpoint,
+    YouTubePublishDispatchResult, YouTubePublishPhase, YouTubePublishService,
+    YouTubePublishTransport, YouTubePublishedVideo, YouTubeQuotaBucket, YouTubeQuotaLedger,
+    YouTubeReadbackReceipt, YouTubeRealPublishGate, YouTubeReconciliationReason,
+    YouTubeReconciliationReceipt, YouTubeRetryAfterReceipt, YouTubeSchedule, YouTubeTenantId,
+    YouTubeUploadProgress, YouTubeUploadSessionReference, YouTubeVideoId,
+    YouTubeVideoProcessingState, YouTubeVisibility, execute_real_publish_gate,
 };
