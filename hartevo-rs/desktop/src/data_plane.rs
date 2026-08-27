@@ -45,7 +45,7 @@ use hartevo_domain_kernel::{
     RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
-use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand};
+use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
 use hartevo_storage::{
     ContextMaterialStoreError, DatabaseKey, KeyMaterial, OsSecretStore, ProjectStore,
     RuntimeTurnStartupReconciliation, SecretBytes, SecretReference, SecretStore, SecretStoreError,
@@ -212,6 +212,8 @@ pub enum DesktopRuntimeProgressPhase {
     ItemStarted,
     ItemCompleted,
     LocalActionDeclined,
+    WaitingLocalApproval,
+    LocalActionApproved,
     StopRequested,
     InterruptSent,
     Completed,
@@ -245,6 +247,17 @@ struct DesktopRuntimeProgressFeed {
 pub struct DesktopRuntimeCancellation {
     requested: Arc<AtomicBool>,
     progress: Arc<Mutex<DesktopRuntimeProgressFeed>>,
+    local_approval: Arc<Mutex<Option<DesktopHeldLocalApproval>>>,
+    local_approval_decision: Arc<Mutex<Option<bool>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopHeldLocalApproval {
+    pub project_id: ProjectId,
+    pub turn_id: RuntimeTurnAttemptId,
+    pub expected_revision: u64,
+    pub request_digest: String,
+    pub kind: RuntimeLocalApprovalKind,
 }
 
 impl DesktopRuntimeCancellation {
@@ -256,6 +269,78 @@ impl DesktopRuntimeCancellation {
 
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    pub fn held_local_approval(&self) -> Option<DesktopHeldLocalApproval> {
+        self.local_approval
+            .lock()
+            .ok()
+            .and_then(|held| held.clone())
+    }
+
+    pub fn approve_held_local_write(
+        &self,
+        project_id: &ProjectId,
+        turn_id: &RuntimeTurnAttemptId,
+        expected_revision: u64,
+        request_digest: &str,
+    ) -> Result<(), DesktopDataError> {
+        self.decide_held_local_write(project_id, turn_id, expected_revision, request_digest, true)
+    }
+
+    fn decide_held_local_write(
+        &self,
+        project_id: &ProjectId,
+        turn_id: &RuntimeTurnAttemptId,
+        expected_revision: u64,
+        request_digest: &str,
+        approved: bool,
+    ) -> Result<(), DesktopDataError> {
+        let held = self
+            .held_local_approval()
+            .ok_or(DesktopDataError::RuntimeLocalApprovalUnavailable)?;
+        if &held.project_id != project_id
+            || &held.turn_id != turn_id
+            || held.expected_revision != expected_revision
+            || held.request_digest != request_digest
+        {
+            return Err(DesktopDataError::RuntimeLocalApprovalMismatch);
+        }
+        let mut decision = self
+            .local_approval_decision
+            .lock()
+            .map_err(|_| DesktopDataError::RuntimeLocalApprovalUnavailable)?;
+        if decision.is_some() {
+            return Err(DesktopDataError::RuntimeLocalApprovalUnavailable);
+        }
+        *decision = Some(approved);
+        Ok(())
+    }
+
+    fn hold_local_approval(&self, held: DesktopHeldLocalApproval) {
+        if let Ok(mut slot) = self.local_approval.lock() {
+            *slot = Some(held);
+        }
+        if let Ok(mut decision) = self.local_approval_decision.lock() {
+            *decision = None;
+        }
+        self.record_progress(DesktopRuntimeProgressPhase::WaitingLocalApproval);
+    }
+
+    fn take_local_approval_decision(&self) -> Option<bool> {
+        self.local_approval_decision
+            .lock()
+            .ok()
+            .and_then(|mut decision| decision.take())
+    }
+
+    fn clear_held_local_approval(&self) {
+        if let Ok(mut slot) = self.local_approval.lock() {
+            *slot = None;
+        }
+        if let Ok(mut decision) = self.local_approval_decision.lock() {
+            *decision = None;
+        }
     }
 
     pub fn progress_since(&self, sequence: u64) -> Vec<DesktopRuntimeProgressEvent> {
@@ -2453,8 +2538,34 @@ impl DesktopDataPlane {
                 }
             }
             if let Some(request) = observation.local_approval_request {
-                if let Some(control) = cancellation {
-                    control.record_progress(DesktopRuntimeProgressPhase::LocalActionDeclined);
+                let Some(control) = cancellation else {
+                    return Err(DesktopDataError::RuntimeLocalApprovalUnavailable);
+                };
+                control.hold_local_approval(DesktopHeldLocalApproval {
+                    project_id: project_id.clone(),
+                    turn_id: turn_id.clone(),
+                    expected_revision: attempt.revision,
+                    request_digest: request.request_digest.clone(),
+                    kind: request.kind,
+                });
+                let approved = loop {
+                    if control.is_requested() {
+                        control.clear_held_local_approval();
+                        break None;
+                    }
+                    if let Some(decision) = control.take_local_approval_decision() {
+                        break Some(decision);
+                    }
+                    std::thread::sleep(StdDuration::from_millis(50));
+                };
+                let Some(approved) = approved else {
+                    consecutive_timeouts = 0;
+                    continue;
+                };
+                if !approved {
+                    control.clear_held_local_approval();
+                    consecutive_timeouts = 0;
+                    continue;
                 }
                 logical_millis += 1;
                 attempt = service.respond_context_runtime_local_approval(
@@ -2464,10 +2575,12 @@ impl DesktopDataPlane {
                         id: turn_id.clone(),
                         expected_revision: attempt.revision,
                         request,
-                        approved: false,
+                        approved: true,
                     },
                     now + Duration::milliseconds(logical_millis),
                 )?;
+                control.clear_held_local_approval();
+                control.record_progress(DesktopRuntimeProgressPhase::LocalActionApproved);
                 consecutive_timeouts = 0;
                 continue;
             }
@@ -3627,6 +3740,10 @@ pub enum DesktopDataError {
     RuntimeSubscriptionContextMismatch,
     #[error("the selected WorkProduct revision no longer matches the current Mission projection")]
     WorkProductActionStale,
+    #[error("no live Runtime local-write approval is held for this Desktop turn")]
+    RuntimeLocalApprovalUnavailable,
+    #[error("Runtime local-write approval must match the exact held digest and revision")]
+    RuntimeLocalApprovalMismatch,
     #[error(transparent)]
     Cordis(#[from] CordisError),
     #[error(transparent)]
@@ -4366,7 +4483,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn runtime_fixture_completion_messages() -> [String; 6] {
+    fn runtime_fixture_completion_messages() -> [String; 5] {
         let thread_id = "desktop-fixture-thread";
         let turn_id = "desktop-fixture-turn";
         [
@@ -4403,18 +4520,6 @@ mod tests {
                     "turnId": turn_id,
                     "itemId": "desktop-fixture-item",
                     "delta": "draft; no external effect occurred.",
-                },
-            })
-            .to_string(),
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "desktop-fixture-local-approval",
-                "method": "item/fileChange/requestApproval",
-                "params": {
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "itemId": "desktop-fixture-item",
-                    "path": "must-not-be-written.txt",
                 },
             })
             .to_string(),
@@ -4465,7 +4570,6 @@ mod tests {
             item_started,
             first_delta,
             second_delta,
-            approval_request,
             item_completed,
             turn_completed,
         ] = runtime_fixture_completion_messages();
@@ -4486,10 +4590,7 @@ printf '%s\n' "$5"
 printf '%s\n' "$6"
 printf '%s\n' "$7"
 printf '%s\n' "$8"
-IFS= read -r decision
-case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"decline"'*) ;; *) exit 34 ;; esac
 printf '%s\n' "$9"
-printf '%s\n' "${10}"
 sleep 30"#
                 .into(),
             "hartevo-desktop-runtime-fixture".into(),
@@ -4500,7 +4601,6 @@ sleep 30"#
             item_started,
             first_delta,
             second_delta,
-            approval_request,
             item_completed,
             turn_completed,
         ];
@@ -4590,6 +4690,95 @@ sleep 30"#
             provider: "fixture-provider".into(),
             model: "fixture-model".into(),
             command_builder: Box::new(interruptible_runtime_fixture_command),
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_write_approve_runtime_fixture_command(
+        project_root: &Path,
+        runtime_home: &Path,
+    ) -> RuntimeCommand {
+        let project_root = project_root
+            .canonicalize()
+            .expect("canonical fixture project root");
+        let runtime_home = runtime_home
+            .canonicalize()
+            .expect("canonical fixture runtime home");
+        let [
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+        ] = runtime_fixture_start_messages(&project_root, &runtime_home);
+        let [
+            item_started,
+            first_delta,
+            second_delta,
+            item_completed,
+            turn_completed,
+        ] = runtime_fixture_completion_messages();
+        let approval_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "desktop-fixture-local-approval",
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "desktop-fixture-thread",
+                "turnId": "desktop-fixture-turn",
+                "itemId": "desktop-fixture-item",
+                "path": "must-not-be-written.txt",
+            },
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), &project_root);
+        command.args = vec![
+            "-c".into(),
+            r#"IFS= read -r initialize
+case "$initialize" in *'"method":"initialize"'*) ;; *) exit 61 ;; esac
+printf '%s\n' "$1"
+IFS= read -r thread
+case "$thread" in *'"method":"thread/start"'*'"model":"fixture-model"'*) ;; *) exit 62 ;; esac
+printf '%s\n' "$2"
+IFS= read -r turn
+case "$turn" in *'"method":"turn/start"'*'"clientUserMessageId"'*) ;; *) exit 63 ;; esac
+printf '%s\n' "$3"
+printf '%s\n' "$4"
+printf '%s\n' "$5"
+printf '%s\n' "$6"
+printf '%s\n' "$7"
+printf '%s\n' "$8"
+IFS= read -r decision
+case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"accept"'*) ;; *) exit 64 ;; esac
+printf '%s\n' "$9"
+printf '%s\n' "${10}"
+sleep 30"#
+                .into(),
+            "hartevo-desktop-local-write-approve-runtime-fixture".into(),
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+            item_started,
+            first_delta,
+            second_delta,
+            approval_request,
+            item_completed,
+            turn_completed,
+        ];
+        command.environment.insert(
+            "INTERPRETER_HOME".into(),
+            runtime_home.to_string_lossy().into_owned(),
+        );
+        command.openinterpreter_home = Some(runtime_home);
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn local_write_approve_runtime_fixture_source() -> DesktopRuntimeSource {
+        DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(local_write_approve_runtime_fixture_command),
         }
     }
 
@@ -7297,6 +7486,116 @@ sleep 30"#;
                 .expect("private message query")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn held_local_write_approve_matches_exact_digest_and_rejects_stale() {
+        let control = DesktopRuntimeCancellation::default();
+        let project_id = ProjectId::from("project-local-approve");
+        let turn_id = RuntimeTurnAttemptId::from("turn-local-approve");
+        control.hold_local_approval(DesktopHeldLocalApproval {
+            project_id: project_id.clone(),
+            turn_id: turn_id.clone(),
+            expected_revision: 4,
+            request_digest: "digest-local-write".into(),
+            kind: RuntimeLocalApprovalKind::FileChange,
+        });
+        assert_eq!(
+            control
+                .held_local_approval()
+                .expect("held request")
+                .request_digest,
+            "digest-local-write"
+        );
+        assert!(matches!(
+            control.approve_held_local_write(&project_id, &turn_id, 4, "stale-digest",),
+            Err(DesktopDataError::RuntimeLocalApprovalMismatch)
+        ));
+        control
+            .approve_held_local_write(&project_id, &turn_id, 4, "digest-local-write")
+            .expect("exact digest approve");
+        assert!(matches!(
+            control.approve_held_local_write(&project_id, &turn_id, 4, "digest-local-write"),
+            Err(DesktopDataError::RuntimeLocalApprovalUnavailable)
+        ));
+        assert_eq!(control.take_local_approval_decision(), Some(true));
+        control.clear_held_local_approval();
+        assert!(control.held_local_approval().is_none());
+        assert!(matches!(
+            control.approve_held_local_write(&project_id, &turn_id, 4, "digest-local-write"),
+            Err(DesktopDataError::RuntimeLocalApprovalUnavailable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn window_approve_issues_respond_context_runtime_local_approval() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let cancellation = DesktopRuntimeCancellation::default();
+        let approver = {
+            let control = cancellation.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if let Some(held) = control.held_local_approval() {
+                        control
+                            .approve_held_local_write(
+                                &held.project_id,
+                                &held.turn_id,
+                                held.expected_revision,
+                                &held.request_digest,
+                            )
+                            .expect("window Approve of exact held digest");
+                        return;
+                    }
+                    std::thread::sleep(StdDuration::from_millis(50));
+                }
+                panic!("window Approve never saw a held Runtime local-write request");
+            })
+        };
+        let submission = plane
+            .start_catalog_mission_and_run_with_cancellation(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Window Approve local write".into()),
+                    goal: "Hold one exact local write for window Approve".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(local_write_approve_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                Some(&cancellation),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("window Approve completes the live Runtime turn");
+        approver.join().expect("approver thread");
+        assert!(matches!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        let phases = cancellation
+            .progress_since(0)
+            .into_iter()
+            .map(|event| event.phase)
+            .collect::<Vec<_>>();
+        assert!(
+            phases.contains(&DesktopRuntimeProgressPhase::WaitingLocalApproval),
+            "missing WaitingLocalApproval in {phases:?}"
+        );
+        assert!(
+            phases.contains(&DesktopRuntimeProgressPhase::LocalActionApproved),
+            "missing LocalActionApproved in {phases:?}"
+        );
+        assert!(!phases.contains(&DesktopRuntimeProgressPhase::LocalActionDeclined));
+        assert!(cancellation.held_local_approval().is_none());
     }
 
     #[cfg(unix)]

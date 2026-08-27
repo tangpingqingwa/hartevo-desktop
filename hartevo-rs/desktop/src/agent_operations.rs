@@ -16,7 +16,7 @@ use hartevo_domain_kernel::{
     RuntimeTurnStatus, WorkProductStatus,
 };
 
-use crate::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+use crate::{DesktopHeldLocalApproval, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationsStatus {
@@ -149,6 +149,8 @@ pub struct ApprovalEffectProjection {
     pub external_status: OperationsStatus,
     pub local_runtime_status: OperationsStatus,
     pub local_runtime_detail: String,
+    pub local_runtime_approve_status: OperationsStatus,
+    pub local_runtime_request_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +197,7 @@ impl AgentOperationsWorkbenchProjection {
         mission: Option<&MissionProjection>,
         runtime_activity: Option<&MissionRuntimeProjection>,
         runtime: Option<&DesktopRuntimeProjection>,
+        held_local_approval: Option<&DesktopHeldLocalApproval>,
     ) -> Self {
         let project_name =
             project.map_or_else(|| "未选择 Project".into(), |project| project.name.clone());
@@ -208,7 +211,7 @@ impl AgentOperationsWorkbenchProjection {
                 .map(artifact_projection)
                 .collect()
         });
-        let approvals = approval_projection(mission, runtime_activity);
+        let approvals = approval_projection(mission, runtime_activity, held_local_approval);
         let browser = browser_projection(mission);
         let recovery = recovery_projection(runtime_activity);
         let quick_entry = QuickEntryProjection {
@@ -560,15 +563,15 @@ fn artifact_status(status: &WorkProductStatus) -> OperationsStatus {
 fn approval_projection(
     mission: Option<&MissionProjection>,
     runtime_activity: Option<&MissionRuntimeProjection>,
+    held_local_approval: Option<&DesktopHeldLocalApproval>,
 ) -> ApprovalEffectProjection {
     let external_approval_count = mission.map_or(0, |mission| mission.pending_approval_count);
     let verified_effect_count = mission.map_or(0, |mission| mission.verified_effect_count);
-    let local_runtime_status = match runtime_activity.and_then(|activity| activity.turn_status) {
-        Some(RuntimeTurnStatus::WaitingLocalApproval | RuntimeTurnStatus::ApprovalResponding) => {
-            OperationsStatus::WaitingApproval
-        }
-        Some(_) | None => OperationsStatus::Empty,
-    };
+    let waiting_local = matches!(
+        runtime_activity.and_then(|activity| activity.turn_status),
+        Some(RuntimeTurnStatus::WaitingLocalApproval | RuntimeTurnStatus::ApprovalResponding)
+    ) || held_local_approval.is_some();
+    let local_runtime_approve_ready = held_local_approval.is_some();
     ApprovalEffectProjection {
         external_approval_count,
         verified_effect_count,
@@ -577,9 +580,28 @@ fn approval_projection(
         } else {
             OperationsStatus::Empty
         },
-        local_runtime_status,
-        local_runtime_detail: "Local Runtime approval is separate from external Effect approval."
-            .into(),
+        local_runtime_status: if waiting_local {
+            OperationsStatus::WaitingApproval
+        } else {
+            OperationsStatus::Empty
+        },
+        local_runtime_detail: if local_runtime_approve_ready {
+            "Approve issues Application respond_context_runtime_local_approval for the exact held digest."
+                .into()
+        } else if waiting_local {
+            "Local Runtime write is waiting; the live turn must hold an exact digest before Approve."
+                .into()
+        } else {
+            "Local Runtime approval is separate from external Effect approval.".into()
+        },
+        local_runtime_approve_status: if local_runtime_approve_ready {
+            OperationsStatus::Ready
+        } else if waiting_local {
+            OperationsStatus::WaitingApproval
+        } else {
+            OperationsStatus::Empty
+        },
+        local_runtime_request_digest: held_local_approval.map(|held| held.request_digest.clone()),
     }
 }
 
@@ -798,13 +820,56 @@ mod tests {
             last_updated_at: None,
             requires_reconciliation: false,
         };
-        let approval = approval_projection(None, Some(&activity));
+        let approval = approval_projection(None, Some(&activity), None);
         assert_eq!(approval.external_status, OperationsStatus::Empty);
         assert_eq!(
             approval.local_runtime_status,
             OperationsStatus::WaitingApproval
         );
-        assert!(approval.local_runtime_detail.contains("separate"));
+        assert_eq!(
+            approval.local_runtime_approve_status,
+            OperationsStatus::WaitingApproval
+        );
+        assert!(approval.local_runtime_detail.contains("exact digest"));
+    }
+
+    #[test]
+    fn held_local_runtime_digest_makes_window_approve_ready() {
+        let activity = MissionRuntimeProjection {
+            project_id: "project".into(),
+            mission_id: "mission".into(),
+            process_claim_status: None,
+            process_cleanup_attempt_count: 0,
+            recovery_status: None,
+            recovery_failure_count: 0,
+            recovery_process_attempt: None,
+            turn_status: Some(RuntimeTurnStatus::WaitingLocalApproval),
+            turn_failure_count: 0,
+            turn_evidence_count: 0,
+            last_updated_at: None,
+            requires_reconciliation: false,
+        };
+        let held = DesktopHeldLocalApproval {
+            project_id: hartevo_domain_kernel::ProjectId::from("project"),
+            turn_id: hartevo_domain_kernel::RuntimeTurnAttemptId::from("turn"),
+            expected_revision: 7,
+            request_digest: "digest-local-write".into(),
+            kind: hartevo_runtime_adapter::RuntimeLocalApprovalKind::FileChange,
+        };
+        let approval = approval_projection(None, Some(&activity), Some(&held));
+        assert_eq!(
+            approval.local_runtime_approve_status,
+            OperationsStatus::Ready
+        );
+        assert_eq!(
+            approval.local_runtime_request_digest.as_deref(),
+            Some("digest-local-write")
+        );
+        assert!(
+            approval
+                .local_runtime_detail
+                .contains("respond_context_runtime_local_approval")
+        );
     }
 
     #[test]
