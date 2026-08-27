@@ -1,0 +1,21 @@
+{
+  "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "baseSha": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/application/src/lib.rs",
+    "hartevo-rs/application/src/work_product_outcome.rs",
+    "hartevo-rs/domain-kernel/src/lib.rs",
+    "hartevo-rs/domain-kernel/src/work_product_outcome.rs",
+    "hartevo-rs/storage/src/lib.rs",
+    "hartevo-rs/storage/src/work_product_outcome_store.rs"
+  ],
+  "pr": 137,
+  "receiptDigest": "2a6afa71594e78842aaf36edcf082c297c24050803d235d79d89a5731cc4447a",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-27T14:06:45Z",
+  "reviewedHeadSha": "9436ed88f110b02a57f6df73b105497c41ca9fe1",
+  "reviewerTaskId": "01a04379-d596-7d22-a462-91e63498099c",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

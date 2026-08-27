@@ -36,6 +36,7 @@ mod runtime_recovery_store;
 mod runtime_turn_store;
 mod secure_store;
 mod sync_store;
+mod work_product_outcome_store;
 mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
