@@ -1,0 +1,38 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "99118e9db04f79737e5d62f56a06cd61ab92aaa2",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "99118e9db04f79737e5d62f56a06cd61ab92aaa2",
+      "headBranch": "codex/governance-inventory-snapshot-lifecycle-fallback-02",
+      "headCommit": "12038676a3d292bb3e7f05cdf2b945da716307f7",
+      "number": 938,
+      "review": {
+        "authorTaskId": "codex-root-governance-snapshot-repair",
+        "exactPaths": [
+          "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+          "scripts/repository_governance.py",
+          "scripts/tests/test_repository_governance.py"
+        ],
+        "receiptDigest": "8ccdc95615d0358672fcdc6b519bb8769d264cfbf558d2e5048ccd478e83716e",
+        "receiptPath": ".github/governance/reviews/pr-938.json",
+        "reviewedHeadSha": "20bd41dba482adff2534b2139b655cb59d7bc852",
+        "reviewerTaskId": "github-actions-run-32574193842"
+      }
+    }
+  ],
+  "createdAt": "2026-08-22T12:58:29Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260822-2100-pr938"
+}

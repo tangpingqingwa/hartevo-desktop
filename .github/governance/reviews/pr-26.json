@@ -1,0 +1,21 @@
+{
+  "authorTaskId": "01a03c2e-adce-7d81-82b4-ded5839feb5a",
+  "baseSha": "c1fe488fb13046db652ba4c8fd2dce3c174736df",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/desktop/Cargo.toml",
+    "hartevo-rs/desktop/src/data_plane.rs",
+    "hartevo-rs/desktop/src/lib.rs",
+    "hartevo-rs/desktop/src/main.rs",
+    "hartevo-rs/desktop/src/native_runtime_journey.rs",
+    "scripts/run-desktop-native-runtime-journey.sh"
+  ],
+  "pr": 26,
+  "receiptDigest": "94e5d367b08461e224ac7353ac33c04e961d8017790448267b95d5624abcbf0e",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T04:05:45Z",
+  "reviewedHeadSha": "14a367a3ba5023161a5d0443903b92541034ea05",
+  "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

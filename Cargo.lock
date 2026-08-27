@@ -2224,6 +2224,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-channel-adapters"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "hartevo-cloud-storage"
 version = "0.1.0"
 dependencies = [
@@ -2282,6 +2294,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-cordis"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "hartevo-desktop"
 version = "0.1.0"
 dependencies = [
@@ -2290,9 +2311,12 @@ dependencies = [
  "dioxus",
  "dioxus-icons",
  "hartevo-application",
+ "hartevo-browser-adapter",
  "hartevo-catalog",
  "hartevo-context-fabric",
+ "hartevo-cordis",
  "hartevo-domain-kernel",
+ "hartevo-effect-broker",
  "hartevo-runtime-adapter",
  "hartevo-storage",
  "hex",
@@ -2370,6 +2394,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-partner-adapters"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hartevo-connector-sdk",
+ "hartevo-domain-kernel",
+ "hartevo-effect-broker",
+ "hex",
+ "ring",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "ureq",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "hartevo-plugin-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2390,6 +2434,7 @@ version = "0.1.0"
 dependencies = [
  "command-group",
  "crossbeam-channel",
+ "hartevo-mission-scheduler",
  "hex",
  "serde",
  "serde_json",

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/capabilities/execution/v1",
+  "title": "Hartevo Tool Self-Recovery Execution v1",
+  "description": "Deterministic gateway execution policy and receipt. Only bounded read recovery may be automatic; local mutation recovery is explicit and uncertain external Effects are reconcile-only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "policy", "result", "receipt"],
+  "properties": {
+    "schema": {"const": "hartevo.capability-execution/v1"},
+    "policy": {"$ref": "#/$defs/policy"},
+    "result": {"type": "object", "required": ["schema", "requestId", "capabilityId", "class", "scope", "generation", "manifestDigest", "provenance", "budgetUse", "payload"]},
+    "receipt": {"$ref": "#/$defs/receipt"}
+  },
+  "$defs": {
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxReadRetries"],
+      "properties": {
+        "maxReadRetries": {"type": "integer", "minimum": 0, "maximum": 8}
+      }
+    },
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amountMinor", "currency"],
+      "properties": {
+        "amountMinor": {"type": "integer", "minimum": 0},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"}
+      }
+    },
+    "budgetUse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestBytes", "resultBytes", "estimatedTokens", "estimatedCost", "externalEffectCount"],
+      "properties": {
+        "requestBytes": {"type": "integer", "minimum": 0},
+        "resultBytes": {"type": "integer", "minimum": 0},
+        "estimatedTokens": {"type": "integer", "minimum": 0},
+        "estimatedCost": {"$ref": "#/$defs/cost"},
+        "externalEffectCount": {"type": "integer", "minimum": 0}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapterInvocations", "automaticReadRetries", "cumulativeBudgetUse"],
+      "properties": {
+        "adapterInvocations": {"type": "integer", "minimum": 1, "maximum": 9},
+        "automaticReadRetries": {"type": "integer", "minimum": 0, "maximum": 8},
+        "cumulativeBudgetUse": {"$ref": "#/$defs/budgetUse"}
+      }
+    }
+  }
+}
