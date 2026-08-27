@@ -155,33 +155,54 @@ jobs:
             ${{ inputs.full_workspace && '--full' || '' }} \
             --packages '${{ inputs.rust_packages }}'
 
-  test:
-    name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})
+  test-ubuntu-shards:
+    name: ${{ inputs.check_prefix }} / test shard ${{ matrix.shard }} of 2 (ubuntu-24.04)
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os == 'macos-15' && !inputs.run_macos && 'ubuntu-24.04' || matrix.os }}
+        shard: [0, 1]
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
       contents: read
     steps:
       - name: Planned scope skip marker
-        if: ${{ !inputs.run_rust || (matrix.os == 'macos-15' && !inputs.run_macos) }}
-        run: |
-          if [[ "${{ inputs.run_rust }}" != true ]]; then
-            echo "Rust scope is empty; planned Rust checks are not executed."
-          else
-            echo "macOS is reserved for merge-group, repository merge-train, and Integration runs; this required context is an Ubuntu planned skip."
-          fi
+        if: ${{ !inputs.run_rust }}
+        run: echo "Rust scope is empty; planned Rust checks are not executed."
       - name: Checkout reviewed source
-        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
+        if: inputs.run_rust
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - id: shard-plan
+        name: Plan deterministic Rust shard
+        if: inputs.run_rust
+        env:
+          FULL_WORKSPACE: ${{ inputs.full_workspace }}
+          RUST_PACKAGES: ${{ inputs.rust_packages }}
+        run: |
+          mkdir -p target/ci
+          python3 scripts/ci-rust-test-shards.py plan \
+            --repo "$GITHUB_WORKSPACE" \
+            --shard "${{ matrix.shard }}" \
+            --shard-count 2 \
+            --full-workspace "$FULL_WORKSPACE" \
+            --packages "$RUST_PACKAGES" \
+            --output "target/ci/rust-test-shard-${{ matrix.shard }}.json" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Verify deterministic Rust shard
+        if: inputs.run_rust
+        run: |
+          python3 scripts/ci-rust-test-shards.py verify \
+            --repo "$GITHUB_WORKSPACE" \
+            --plan "target/ci/rust-test-shard-${{ matrix.shard }}.json"
+      - name: Planned-empty shard marker
+        if: inputs.run_rust && steps.shard-plan.outputs.has_packages == 'false'
+        run: echo "This Rust shard has an explicit planned-empty package intersection; Cargo is not executed."
       - name: Install Ubuntu desktop development libraries
-        if: inputs.run_rust && matrix.os == 'ubuntu-24.04'
+        if: inputs.run_rust && steps.shard-plan.outputs.has_packages == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
@@ -201,7 +222,71 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
       - name: Cache Cargo and Rust toolchain
-        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
+        if: inputs.run_rust && steps.shard-plan.outputs.has_packages == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          enableCrossOsArchive: false
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: hartevo-rust-cache-v3-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-shard-${{ matrix.shard }}-layout-${{ steps.shard-plan.outputs.layout_digest }}-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            hartevo-rust-cache-v3-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-shard-${{ matrix.shard }}-layout-${{ steps.shard-plan.outputs.layout_digest }}-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-
+            hartevo-rust-cache-v3-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-shard-${{ matrix.shard }}-layout-${{ steps.shard-plan.outputs.layout_digest }}-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-
+            hartevo-rust-cache-v3-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-shard-${{ matrix.shard }}-layout-${{ steps.shard-plan.outputs.layout_digest }}-all-targets-all-features-
+      - name: Install the locked Rust components
+        if: inputs.run_rust && steps.shard-plan.outputs.has_packages == 'true'
+        run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+      - name: Locked Rust shard test gate
+        if: inputs.run_rust
+        run: bash scripts/ci-rust-gate.sh test --plan "target/ci/rust-test-shard-${{ matrix.shard }}.json"
+
+  test-ubuntu-result:
+    name: ${{ inputs.check_prefix }} / test (ubuntu-24.04)
+    needs: test-ubuntu-shards
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Planned scope skip marker
+        if: ${{ !inputs.run_rust }}
+        run: echo "Rust scope is empty; the Ubuntu aggregate confirms the planned shard markers only."
+      - name: Require successful Ubuntu shards
+        if: inputs.run_rust
+        run: |
+          if [[ "${{ needs.test-ubuntu-shards.result }}" != success ]]; then
+            echo "Ubuntu Rust shard aggregate is fail-closed: ${{ needs.test-ubuntu-shards.result }}"
+            exit 1
+          fi
+
+  test-macos:
+    name: ${{ inputs.check_prefix }} / test (macos-15)
+    runs-on: ${{ !inputs.run_macos && 'ubuntu-24.04' || 'macos-15' }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Planned scope skip marker
+        if: ${{ !inputs.run_rust || !inputs.run_macos }}
+        run: |
+          if [[ "${{ inputs.run_rust }}" != true ]]; then
+            echo "Rust scope is empty; planned Rust checks are not executed."
+          else
+            echo "macOS is reserved for merge-group, repository merge-train, and Integration runs; this required context is an Ubuntu planned skip."
+          fi
+      - name: Checkout reviewed source
+        if: inputs.run_rust && inputs.run_macos
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Cache Cargo and Rust toolchain
+        if: inputs.run_rust && inputs.run_macos
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           enableCrossOsArchive: false
@@ -217,11 +302,8 @@ jobs:
             hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-target-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-
             hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-target-all-targets-all-features-
       - name: Install the locked Rust components
-        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
+        if: inputs.run_rust && inputs.run_macos
         run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
-      - name: Locked Rust test gate
-        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
-        run: |
-          bash scripts/ci-rust-gate.sh test \
-            ${{ inputs.full_workspace && '--full' || '' }} \
-            --packages '${{ inputs.rust_packages }}'
+      - name: Locked full-workspace Rust test gate
+        if: inputs.run_rust && inputs.run_macos
+        run: bash scripts/ci-rust-gate.sh test --full

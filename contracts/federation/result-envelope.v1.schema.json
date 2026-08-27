@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/federation/result-envelope.v1.schema.json",
+  "title": "Hartevo Federation result envelope",
+  "description": "A typed, signed, Project/Mission-scoped remote-worker result return. It carries roots and links only; it never carries Project content or authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "envelopeId",
+    "origin",
+    "remoteWorker",
+    "roots",
+    "sequence",
+    "replayNonce",
+    "effectReceipt",
+    "verification",
+    "outcome",
+    "currentCommit",
+    "envelopeDigest",
+    "signature",
+    "workerEvidence"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-federation-result-envelope/v1"},
+    "envelopeId": {"$ref": "#/$defs/token"},
+    "origin": {"$ref": "#/$defs/origin"},
+    "remoteWorker": {"$ref": "#/$defs/remoteWorker"},
+    "roots": {"$ref": "#/$defs/roots"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "replayNonce": {"$ref": "#/$defs/sha256"},
+    "effectReceipt": {"$ref": "#/$defs/link"},
+    "verification": {"$ref": "#/$defs/verificationLink"},
+    "outcome": {"$ref": "#/$defs/link"},
+    "currentCommit": {"$ref": "#/$defs/commit"},
+    "envelopeDigest": {"$ref": "#/$defs/sha256"},
+    "signature": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/signature"}
+      ]
+    },
+    "workerEvidence": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/workerEvidence"}
+      ]
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectId", "missionId", "turn"],
+      "properties": {
+        "projectId": {"$ref": "#/$defs/token"},
+        "missionId": {"$ref": "#/$defs/token"},
+        "turn": {"type": "integer", "minimum": 1}
+      }
+    },
+    "remoteWorker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workerId", "serviceId", "providerDigest"],
+      "properties": {
+        "workerId": {"$ref": "#/$defs/token"},
+        "serviceId": {"$ref": "#/$defs/token"},
+        "providerDigest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "roots": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputRoot", "outputRoot", "evidenceRoot"],
+      "properties": {
+        "inputRoot": {"$ref": "#/$defs/sha256"},
+        "outputRoot": {"$ref": "#/$defs/sha256"},
+        "evidenceRoot": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["linkId", "digest"],
+      "properties": {
+        "linkId": {"$ref": "#/$defs/token"},
+        "digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "verificationLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["linkId", "digest", "state"],
+      "properties": {
+        "linkId": {"$ref": "#/$defs/token"},
+        "digest": {"$ref": "#/$defs/sha256"},
+        "state": {"enum": ["verified", "pending", "rejected"]}
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "publicKeyHex", "signatureHex", "signatureDigest"],
+      "properties": {
+        "algorithm": {"const": "ed25519"},
+        "publicKeyHex": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "signatureHex": {"type": "string", "pattern": "^[0-9a-f]{128}$"},
+        "signatureDigest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "workerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "workerId", "workerRunId", "attestationDigest", "evidenceDigest"],
+      "properties": {
+        "kind": {"const": "native_remote_worker"},
+        "workerId": {"$ref": "#/$defs/token"},
+        "workerRunId": {"$ref": "#/$defs/token"},
+        "attestationDigest": {"$ref": "#/$defs/sha256"},
+        "evidenceDigest": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

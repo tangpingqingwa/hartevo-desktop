@@ -1,0 +1,40 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "53749e336135426768c1d0680def8a453e7e8cca",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "53749e336135426768c1d0680def8a453e7e8cca",
+      "headBranch": "feat/desktop-waiting-approval-grant-53749e3-1787708310",
+      "headCommit": "3254b2640cdead99aaac9e1815ab5a69a2fa6ace",
+      "number": 968,
+      "review": {
+        "authorTaskId": "01a03ba6-2667-7720-81e8-42785d1ac9f0",
+        "exactPaths": [
+          "hartevo-rs/application/src/lib.rs",
+          "hartevo-rs/desktop/Cargo.toml",
+          "hartevo-rs/desktop/src/data_plane.rs",
+          "hartevo-rs/desktop/src/lib.rs",
+          "hartevo-rs/desktop/src/visual_fixture.rs"
+        ],
+        "receiptDigest": "136949a099153489b1c18e3bdf59ea23059d4c6f23e8b510dbf513858fc9f938",
+        "receiptPath": ".github/governance/reviews/pr-968.json",
+        "reviewedHeadSha": "80a4c22e27ae5d95b4d53372ecb2ebb8cca0f0cc",
+        "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737"
+      }
+    }
+  ],
+  "createdAt": "2026-08-26T01:58:43Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260826-0158"
+}

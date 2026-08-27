@@ -46,7 +46,7 @@
         "fresh_shadow_workspace"
       ]
     },
-    "promotionAction": {"enum": ["promote", "rollback", "revoke"]},
+    "promotionAction": {"enum": ["canary", "promote", "rollback", "revoke"]},
     "decisionStatus": {
       "enum": ["DENIED", "APPROVED", "BLOCKED_ENV", "NOT_IMPLEMENTED"]
     },
