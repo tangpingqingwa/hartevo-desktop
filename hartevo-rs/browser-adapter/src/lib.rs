@@ -18,6 +18,7 @@ mod artifact;
 #[cfg(unix)]
 mod chromium_host;
 mod consumer;
+mod control;
 mod fake_host;
 mod file_broker;
 mod handoff;
@@ -56,6 +57,9 @@ pub use chromium_host::{
     ManagedChromiumTextInputExecutor,
 };
 pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
+pub use control::{
+    BrowserControlHandoff, BrowserQueuedBatch, BrowserQueuedBatchState, BrowserWorkspaceControl,
+};
 pub use fake_host::{
     BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost, FakeBrowserPage,
 };

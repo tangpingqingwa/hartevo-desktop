@@ -120,12 +120,10 @@
     {
       "id": "desktop_vm11_eighth_caller",
       "source": {
-        "kind": "directory_literal_absent",
-        "directory": "hartevo-rs/desktop/src",
-        "extensions": [
-          ".rs"
-        ],
-        "needle": "resolve_vm11_next_contract_or_valid_terminal("
+        "kind": "symbol_present",
+        "file": "hartevo-rs/desktop/src/lib.rs",
+        "symbol": "plane.resolve_vm11_next_contract_or_valid_terminal_os(",
+        "minimumOccurrences": 1
       }
     }
   ],
@@ -226,7 +224,7 @@
       "claimId": "DMT-DESKTOP-VM11-EIGHTH-CALLER-01",
       "factId": "desktop_vm11_eighth_caller",
       "status": "current",
-      "expectedValue": false
+      "expectedValue": true
     }
   ],
   "requiredClaimIds": [

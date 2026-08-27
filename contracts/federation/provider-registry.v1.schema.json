@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/federation/provider-registry.v1.schema.json",
+  "title": "Hartevo Federation provider registry",
+  "description": "A digest-bound provider allowlist. Registry presence does not make a remote result native-evaluated; the worker verifier gate remains explicit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "registryId",
+    "nativeWorkerVerifierAvailable",
+    "providers",
+    "releaseDecision"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-federation-provider-registry/v1"},
+    "registryId": {"$ref": "#/$defs/token"},
+    "nativeWorkerVerifierAvailable": {"type": "boolean"},
+    "providers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {"$ref": "#/$defs/provider"}
+    },
+    "releaseDecision": {"const": "NOT_EVALUATED"}
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerId",
+        "workerId",
+        "serviceId",
+        "providerDigest",
+        "workerAttestationDigest",
+        "status"
+      ],
+      "properties": {
+        "providerId": {"$ref": "#/$defs/token"},
+        "workerId": {"$ref": "#/$defs/token"},
+        "serviceId": {"$ref": "#/$defs/token"},
+        "providerDigest": {"$ref": "#/$defs/sha256"},
+        "workerAttestationDigest": {"$ref": "#/$defs/sha256"},
+        "status": {"enum": ["active", "revoked"]}
+      }
+    }
+  }
+}

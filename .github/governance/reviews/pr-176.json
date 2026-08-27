@@ -1,0 +1,20 @@
+{
+  "authorTaskId": "01a03d77-5ca5-7d01-9f84-da44eedb2064",
+  "baseSha": "11ad52fa6686d96fa8a503bddf6e42f248b06123",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "contracts/plugins/plugin-session-acceptance.v1.json",
+    "hartevo-rs/eval/examples/hartevo-plugin-session-acceptance/digest.rs",
+    "hartevo-rs/eval/examples/hartevo-plugin-session-acceptance/main.rs",
+    "hartevo-rs/eval/examples/hartevo-plugin-session-acceptance/model.rs",
+    "hartevo-rs/eval/examples/hartevo-plugin-session-acceptance/verifier.rs"
+  ],
+  "pr": 176,
+  "receiptDigest": "8763b72f563b6e018039749ba37824e6356c02af65f0d86c4a534bcd459a290e",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T10:44:24Z",
+  "reviewedHeadSha": "55fd66a211e32b2c71adf85786e32635404747d2",
+  "reviewerTaskId": "01a03d99-4e7d-7eb0-91ca-c0fb0785ee4d",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

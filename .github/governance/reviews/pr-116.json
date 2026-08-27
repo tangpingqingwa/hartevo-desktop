@@ -1,0 +1,22 @@
+{
+  "authorTaskId": "01a03c94-31e4-7ea2-8b1c-920e6fb247d4",
+  "baseSha": "e054d12f389db0ba62dba3a0242a3c2139f67997",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "contracts/harness/candidate-lab.v1.json",
+    "contracts/harness/promotion-state.v1.json",
+    "hartevo-rs/eval/src/harness_lab/mod.rs",
+    "hartevo-rs/eval/src/harness_lab/model.rs",
+    "hartevo-rs/eval/src/harness_lab/promotion.rs",
+    "hartevo-rs/eval/src/harness_lab/verifier.rs",
+    "hartevo-rs/eval/src/lib.rs"
+  ],
+  "pr": 116,
+  "receiptDigest": "c68d73fb536b7eefd1c286b8f64f3afa460218e035dd18fef3e78d72e9ac1c72",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T06:05:12Z",
+  "reviewedHeadSha": "c889569bc04e539b21423613ef84b1e9cfe2f453",
+  "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
