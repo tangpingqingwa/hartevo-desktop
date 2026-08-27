@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "hartevo-plugin-package/v1",
+  "contractVersion": "plugin-contract-closure-01/package/v1",
+  "packageId": "hartevo.readonly.market-evidence",
+  "packageVersion": "1.0.0",
+  "manifestRevision": 1,
+  "definitionDigest": "18566662969206742d1d4d177fdf072fdb63b4f4570b72a9b42bb78a702d17b8",
+  "baseManifestDigest": "f0e785c6bc0eed7c9e0d1670917fc4ce64702310d7f91d52b2e6c802bc766327",
+  "serviceDefinitionDigest": "abac1eddcfc82d68d51ea7f99881c4bd837111c274c8f439c7a57a46d5a4f409",
+  "providerDefinitionDigest": "55fe9774d10c7dd97c7dc836e4bfc19ba56409423f73f28420fb1fa3c4d7b81a",
+  "consumerDefinitionDigest": "f15c61b8333ebbd7e1df035c2020cd74fb64b1ed46dbc9f176cc200f0399b261",
+  "binary": {
+    "entrypoint": "hartevo_plugin_service_provider_v1",
+    "binaryFormat": "native",
+    "binaryDigest": "49819789a0eb767d872cad887234e16f430ab673dfe72919f9a47a5c664853af",
+    "assets": [
+      {
+        "assetId": "market-evidence-schema",
+        "pathDigest": "3cb00bdce6958acbde9aee9a22cb9ce5c6cd54958d67cfe1b9d915b8cea686b8",
+        "contentDigest": "fd2734a00eec306b438e5c8b0712f39baa89f622ca2859ed0aef754e5ea55389",
+        "byteCount": 4096,
+        "assetDigest": "2d1a6eb8e20e630b4bc91a5a29c1f23e0aa3342ceae0b42c770e9dd2a14340ba"
+      }
+    ],
+    "bundleDigest": "f0cc382d82302f64fc0de42680691d493d772330cb17934f8621d9aaa82fa072"
+  },
+  "hostApi": {
+    "apiId": "hartevo.plugin.host",
+    "major": 1,
+    "minor": 0,
+    "apiDigest": "ff75eb888df1de4d836c907da1b0e5b3e7ceaa8381bd48d0ae167df02794ec49"
+  },
+  "requestedScopes": [
+    {
+      "scopeKind": "project_mission",
+      "scopeDigest": "15b4d31832f6165508833f47e9e52a459bd93af17280d64705f2d0207aae744c",
+      "capabilities": ["consumer.model_visible", "service.read_only"],
+      "scopeBindingDigest": "bc69c28bdd55e73e0ad54b70dd1496ade7b0956de1d24cd63c2f5c171cfbb140"
+    }
+  ],
+  "requestedAuthorities": {
+    "store": "forbidden",
+    "keyring": "forbidden",
+    "browserProfile": "forbidden",
+    "effect": "forbidden",
+    "allowed": ["durable_log_append", "model_input_output", "provider_read_only"],
+    "unknownAuthorityPolicy": "deny",
+    "authorityDigest": "72b2d0cffc1bbeb1d66e1aaa8f9e3bf52b0e3ca992315f1a0fc6e15081747741"
+  },
+  "entrypoint": {
+    "kind": "service_provider",
+    "symbol": "hartevo_plugin_service_provider_v1",
+    "symbolDigest": "5b248f23a1019dbc1bceee8ce37b42138d6c577ad6b4b95be35079448a5fc560",
+    "invocation": "host_dispatch",
+    "returnContractDigest": "25b4c904a719960d4c5e0258eb2811db768ab654dc410648c1d84fa7e7130e18",
+    "entrypointDigest": "d7517fcad0c8e42dd9e6050d51087255269a1d496a3461ece54a605cd89845f8"
+  },
+  "lifecycle": {
+    "mount": "atomic_registration_receipt",
+    "unmount": "reverse_order_atomic",
+    "upgrade": "install_then_cutover",
+    "downgrade": "install_then_cutover",
+    "revoke": "stop_revoke_unmount",
+    "crashRecovery": "rollback_to_previous_or_stopped",
+    "migrationPolicy": "none",
+    "migrationReversible": true,
+    "rollbackRequired": true,
+    "receiptRequired": true,
+    "unknownTransition": "deny",
+    "lifecycleDigest": "e8379363afe83286021e470f5fc82be5d66b722acc0b1ab3201ecf793c082102"
+  },
+  "signaturePolicy": {
+    "algorithm": "ed25519",
+    "required": true,
+    "keyIdDigest": "8217e117c38f8e336ace069090388b8f5d733d74f03522fbb2be3c90564a8ccd",
+    "keyRegistryEpoch": 0,
+    "signatureStatus": "NOT_EVALUATED",
+    "signedPayloadDigest": "58bfd1cedcc88faa15b6cbefd9fd434dc74926a381f8a1deacb5aabd37680c80",
+    "signatureDigest": "266362cf86ce9f72c422f5b6a144c9edcef73db434b15bcd049b4f74fb406feb",
+    "signatureHex": null
+  },
+  "runnerPolicy": {
+    "required": true,
+    "registryStatus": "EMPTY",
+    "runnerIdDigest": null,
+    "runnerBinaryDigest": null,
+    "runnerSignatureStatus": "NOT_EVALUATED"
+  },
+  "readinessPolicy": {
+    "realSignatureKeyRequired": true,
+    "realRunnerRequired": true,
+    "emptyRegistryStatus": "NOT_EVALUATED",
+    "fixtureDoesNotCount": true,
+    "releaseDecision": "NOT_EVALUATED"
+  }
+}
