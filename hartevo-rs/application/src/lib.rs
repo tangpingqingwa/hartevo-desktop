@@ -73,10 +73,11 @@ use hartevo_domain_kernel::{
     CreatorCandidate, CreatorContactEffectGuard, CreatorDeliverableInput, CreatorEligibility,
     CreatorExternalProof, CreatorHiring, CreatorHiringError, CreatorHiringId, CreatorHiringSpec,
     CreatorId, CreatorIdentitySnapshot, CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask,
-    CreatorTaskId, CreatorTaskSpec, CreatorWorkError, CurrencyCode, DeletionError, DeletionId,
-    DeletionReason, DeletionTombstone, DeliverableId, DeliverableReviewInput, DeviceAttachment,
-    DeviceAttachmentId, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim,
-    DeviceHandoffContext, DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
+    CreatorTaskId, CreatorTaskSpec, CreatorTaskStatus, CreatorWorkError, CurrencyCode,
+    DeletionError, DeletionId, DeletionReason, DeletionTombstone, DeliverableId,
+    DeliverableReviewInput, DeliverableStatus, DeviceAttachment, DeviceAttachmentId,
+    DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
+    DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
@@ -615,8 +616,11 @@ pub struct SubmitCreatorDeliverable {
 #[derive(Clone, Debug)]
 pub struct ReviewCreatorDeliverable {
     pub project_id: ProjectId,
+    pub mission_id: MissionId,
     pub task_id: CreatorTaskId,
     pub deliverable_id: DeliverableId,
+    pub expected_task_revision: u64,
+    pub expected_deliverable_revision: u32,
     pub review_id: ReviewId,
     pub reviewer_id: ActorId,
     pub decision: ReviewDecision,
@@ -4386,6 +4390,35 @@ pub struct MissionProjection {
     pub outcome_summary: Option<String>,
     #[serde(default)]
     pub vm11_outcome_review: Option<Vm11OutcomeReviewDecisionProjection>,
+    /// Content-free Creator Work facts for this Mission. Artifact bytes never
+    /// cross this projection; window Review uses only exact ids, CAS revision,
+    /// digest, and the frozen acceptance checklist.
+    #[serde(default)]
+    pub creator_work: Option<CreatorWorkProjection>,
+}
+
+/// Content-free Creator Task facts for one Mission. Review is not Verification
+/// and this projection never implies a payout or Effect.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorWorkProjection {
+    pub task_id: CreatorTaskId,
+    pub status: CreatorTaskStatus,
+    pub expected_task_revision: u64,
+    pub reviewable: Option<CreatorDeliverableReviewProjection>,
+    pub accepted_deliverable_count: usize,
+    pub payout_verified: bool,
+}
+
+/// Exact uploaded deliverable awaiting a typed ReviewDecision. The window
+/// cannot substitute another digest or invent checklist rows.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorDeliverableReviewProjection {
+    pub deliverable_id: DeliverableId,
+    pub expected_deliverable_revision: u32,
+    pub content_digest: String,
+    pub acceptance_checks: Vec<String>,
 }
 
 /// Content-free Browser Workspace facts for one Mission. Lease identifiers and
@@ -11767,6 +11800,27 @@ impl ApplicationService {
         Ok(self.store.load_creator_hiring(project_id, hiring_id)?)
     }
 
+    pub fn persist_created_creator_task(
+        &mut self,
+        task: CreatorTask,
+        now: DateTime<Utc>,
+    ) -> Result<CreatorTask, ApplicationError> {
+        if task.state_revision != 1 {
+            return Err(ApplicationError::CreatorStateInvariant);
+        }
+        self.store.create_creator_task(
+            &task,
+            "creator_task.created",
+            &serde_json::json!({
+                "taskId": task.id,
+                "contractRevision": task.contract_revision,
+                "contractDigest": task.contract_digest(),
+            }),
+            now,
+        )?;
+        Ok(task)
+    }
+
     pub fn create_creator_task(
         &mut self,
         spec: CreatorTaskSpec,
@@ -11898,9 +11952,39 @@ impl ApplicationService {
         command: ReviewCreatorDeliverable,
         now: DateTime<Utc>,
     ) -> Result<CreatorTask, ApplicationError> {
+        if command.expected_task_revision == 0
+            || command.expected_deliverable_revision == 0
+            || command.review_id.as_str().trim().is_empty()
+            || command.reviewer_id.as_str().trim().is_empty()
+            || !matches!(
+                command.decision,
+                ReviewDecision::Accept | ReviewDecision::RequestRevision
+            )
+        {
+            return Err(ApplicationError::CreatorDeliverableReviewCommandMismatch);
+        }
         let mut task = self
             .store
             .load_creator_task(&command.project_id, &command.task_id)?;
+        if task.project_id != command.project_id || task.mission_id != command.mission_id {
+            return Err(ApplicationError::CreatorDeliverableReviewCommandMismatch);
+        }
+        if task.state_revision != command.expected_task_revision {
+            return Err(ApplicationError::CreatorTaskRevisionMismatch {
+                expected: command.expected_task_revision,
+                actual: task.state_revision,
+            });
+        }
+        let deliverable = task
+            .deliverables
+            .iter()
+            .find(|item| item.id == command.deliverable_id)
+            .ok_or(ApplicationError::CreatorDeliverableReviewUnavailable)?;
+        if deliverable.revision != command.expected_deliverable_revision
+            || deliverable.status != DeliverableStatus::ReadyForReview
+        {
+            return Err(ApplicationError::CreatorDeliverableReviewUnavailable);
+        }
         let expected_revision = task.state_revision;
         task.review_deliverable(
             &command.deliverable_id,
@@ -18311,6 +18395,7 @@ fn mission_projection(
             .count()
     });
     let vm11_outcome_review = vm11_outcome_review_decision_projection(store, &mission)?;
+    let creator_work = creator_work_projection(store, &mission)?;
     let browser_workspace = store
         .load_live_browser_workspace_for_mission(&mission.project_id, &mission.id)?
         .map(|workspace| BrowserWorkspaceProjection {
@@ -18397,7 +18482,63 @@ fn mission_projection(
             .count(),
         outcome_summary,
         vm11_outcome_review,
+        creator_work,
     })
+}
+
+fn creator_work_projection(
+    store: &ProjectStore,
+    mission: &Mission,
+) -> Result<Option<CreatorWorkProjection>, ApplicationError> {
+    let mut matching = store
+        .creator_tasks_for_project(&mission.project_id)?
+        .into_iter()
+        .filter(|task| task.mission_id == mission.id)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    matching.sort_by(|left, right| {
+        (left.updated_at, left.state_revision, left.id.as_str()).cmp(&(
+            right.updated_at,
+            right.state_revision,
+            right.id.as_str(),
+        ))
+    });
+    let task = matching
+        .pop()
+        .ok_or(ApplicationError::CreatorStateInvariant)?;
+    if task.tenant_id != mission.tenant_id || task.project_id != mission.project_id {
+        return Err(ApplicationError::CreatorStateInvariant);
+    }
+    let reviewable = task
+        .deliverables
+        .iter()
+        .rev()
+        .find(|deliverable| deliverable.status == DeliverableStatus::ReadyForReview)
+        .map(|deliverable| CreatorDeliverableReviewProjection {
+            deliverable_id: deliverable.id.clone(),
+            expected_deliverable_revision: deliverable.revision,
+            content_digest: deliverable.content_digest.clone(),
+            acceptance_checks: task
+                .acceptance_criteria
+                .iter()
+                .chain(task.deliverable_requirements.iter())
+                .cloned()
+                .collect(),
+        });
+    Ok(Some(CreatorWorkProjection {
+        task_id: task.id,
+        status: task.status,
+        expected_task_revision: task.state_revision,
+        reviewable,
+        accepted_deliverable_count: task
+            .deliverables
+            .iter()
+            .filter(|deliverable| deliverable.status == DeliverableStatus::Accepted)
+            .count(),
+        payout_verified: !task.payouts.is_empty(),
+    }))
 }
 
 fn vm11_outcome_review_decision_projection(
@@ -22177,6 +22318,14 @@ pub enum ApplicationError {
     ProposedEffectApprovalUnavailable,
     #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
     ProposedEffectApprovalDigestMismatch,
+    #[error(
+        "Creator Deliverable Review requires the exact Project, Mission, task, deliverable, CAS revision, and a typed ReviewDecision"
+    )]
+    CreatorDeliverableReviewCommandMismatch,
+    #[error("creator task revision changed: expected {expected}, actual {actual}")]
+    CreatorTaskRevisionMismatch { expected: u64, actual: u64 },
+    #[error("the current Creator Task has no matching uploaded deliverable ready for Review")]
+    CreatorDeliverableReviewUnavailable,
     #[error(
         "Catalog Mission route, mode, market, language, audience, timezone, or budget is invalid"
     )]
@@ -31009,6 +31158,149 @@ sleep 30"#
             unlocked.missions[0].goal,
             "研究真实项目状态，但不执行外部动作"
         );
+        assert!(unlocked.missions[0].creator_work.is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fail-closed Review fence is asserted as one exact Offer-to-Review journey"
+    )]
+    fn review_creator_deliverable_fails_closed_on_stale_revision_and_wrong_decision() {
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        let ids = CreatorRecoveryIds {
+            tenant_id: TenantId::from("tenant-review-fence"),
+            project_id: ProjectId::from("project-review-fence"),
+            mission_id: MissionId::from("mission-review-fence"),
+            task_id: CreatorTaskId::from("task-review-fence"),
+            milestone_id: CreatorMilestoneId::from("milestone-review-fence"),
+            deliverable_id: DeliverableId::from("deliverable-review-fence"),
+            creator_id: CreatorId::from("creator-review-fence"),
+            connection_id: ConnectionId::from("connection-review-fence"),
+            effect: EffectId::from("effect-review-fence"),
+        };
+        let base = now();
+        create_creator_recovery_scope(&mut service, &ids, base);
+        register_creator_recovery_connection(&mut service, &ids, base);
+        fund_and_accept_creator_recovery_task(&mut service, &ids, base);
+        service
+            .submit_creator_deliverable(
+                SubmitCreatorDeliverable {
+                    project_id: ids.project_id.clone(),
+                    task_id: ids.task_id.clone(),
+                    deliverable: CreatorDeliverableInput {
+                        id: ids.deliverable_id.clone(),
+                        milestone_id: ids.milestone_id.clone(),
+                        artifact_uri: "cas://creator/review-fence".into(),
+                        media_type: "application/zip".into(),
+                        size_bytes: 1_024,
+                        content_digest: "7".repeat(64),
+                        uploaded_at: base + Duration::minutes(4),
+                        assessment: DeliverableAssessment {
+                            scanner: "review-fence-scanner".into(),
+                            clean: true,
+                            assessed_at: base + Duration::minutes(4),
+                            evidence_digest: "8".repeat(64),
+                        },
+                        rights: RightsAttestation {
+                            ownership_or_license: "creator original".into(),
+                            source_manifest_digest: "9".repeat(64),
+                            permitted_use: "campaign recovery use".into(),
+                            verified: true,
+                        },
+                    },
+                },
+                base + Duration::minutes(4),
+            )
+            .expect("submit review-fence deliverable");
+        let submitted = service
+            .load_creator_task(&ids.project_id, &ids.task_id)
+            .expect("submitted review-fence task");
+        let projected = service
+            .projection(&ids.project_id, &ids.mission_id, WorkSurface::Orchestrator)
+            .expect("review-fence projection");
+        let creator_work = projected
+            .creator_work
+            .as_ref()
+            .expect("creator work projection");
+        let reviewable = creator_work
+            .reviewable
+            .as_ref()
+            .expect("uploaded deliverable is reviewable");
+        assert_eq!(creator_work.task_id, ids.task_id);
+        assert_eq!(
+            creator_work.expected_task_revision,
+            submitted.state_revision
+        );
+        assert_eq!(reviewable.deliverable_id, ids.deliverable_id);
+        assert_eq!(reviewable.expected_deliverable_revision, 1);
+        assert_eq!(reviewable.content_digest, "7".repeat(64));
+        assert_eq!(
+            reviewable.acceptance_checks,
+            vec![
+                "Matches the approved scope".to_owned(),
+                "Includes the source manifest".to_owned(),
+            ]
+        );
+
+        let mut command = ReviewCreatorDeliverable {
+            project_id: ids.project_id.clone(),
+            mission_id: ids.mission_id.clone(),
+            task_id: ids.task_id.clone(),
+            deliverable_id: ids.deliverable_id.clone(),
+            expected_task_revision: submitted.state_revision,
+            expected_deliverable_revision: 1,
+            review_id: ReviewId::from("review-fence"),
+            reviewer_id: ActorId::from("review-fence-reviewer"),
+            decision: ReviewDecision::Reject,
+            acceptance_checks: vec![
+                AcceptanceCheck {
+                    requirement: "Matches the approved scope".into(),
+                    satisfied: true,
+                    evidence: "scope-check".into(),
+                },
+                AcceptanceCheck {
+                    requirement: "Includes the source manifest".into(),
+                    satisfied: true,
+                    evidence: "manifest-check".into(),
+                },
+            ],
+            notes: "typed ReviewDecision only".into(),
+        };
+        assert!(matches!(
+            service.review_creator_deliverable(command.clone(), base + Duration::minutes(5)),
+            Err(ApplicationError::CreatorDeliverableReviewCommandMismatch)
+        ));
+        command.decision = ReviewDecision::Accept;
+        command.expected_task_revision = submitted.state_revision.saturating_sub(1);
+        assert!(matches!(
+            service.review_creator_deliverable(command.clone(), base + Duration::minutes(5)),
+            Err(ApplicationError::CreatorTaskRevisionMismatch { expected, actual })
+                if expected == submitted.state_revision.saturating_sub(1)
+                    && actual == submitted.state_revision
+        ));
+        command.expected_task_revision = submitted.state_revision;
+        command.deliverable_id = DeliverableId::from("deliverable-does-not-exist");
+        assert!(matches!(
+            service.review_creator_deliverable(command.clone(), base + Duration::minutes(5)),
+            Err(ApplicationError::CreatorDeliverableReviewUnavailable)
+        ));
+        command.deliverable_id = ids.deliverable_id.clone();
+        service
+            .review_creator_deliverable(command, base + Duration::minutes(5))
+            .expect("accept exact uploaded revision");
+        let accepted = service
+            .projection(&ids.project_id, &ids.mission_id, WorkSurface::Orchestrator)
+            .expect("accepted projection")
+            .creator_work
+            .expect("accepted creator work");
+        assert!(accepted.reviewable.is_none());
+        assert_eq!(accepted.accepted_deliverable_count, 1);
+        assert!(!accepted.payout_verified);
+        assert_eq!(
+            accepted.status,
+            hartevo_domain_kernel::CreatorTaskStatus::SettlementPending
+        );
     }
 
     #[test]
@@ -31768,13 +32060,7 @@ sleep 30"#
         )
         .expect("creator recovery task");
         service
-            .store
-            .create_creator_task(
-                &task,
-                "creator_task.created",
-                &serde_json::json!({"taskId": task.id}),
-                base,
-            )
+            .persist_created_creator_task(task, base)
             .expect("persist creator recovery task");
     }
 
@@ -31906,8 +32192,14 @@ sleep 30"#
             .review_creator_deliverable(
                 ReviewCreatorDeliverable {
                     project_id: ids.project_id.clone(),
+                    mission_id: ids.mission_id.clone(),
                     task_id: ids.task_id.clone(),
                     deliverable_id: ids.deliverable_id.clone(),
+                    expected_task_revision: service
+                        .load_creator_task(&ids.project_id, &ids.task_id)
+                        .expect("submitted creator recovery task")
+                        .state_revision,
+                    expected_deliverable_revision: 1,
                     review_id: ReviewId::from("creator-recovery-review"),
                     reviewer_id: ActorId::from("creator-recovery-reviewer"),
                     decision: ReviewDecision::Accept,
@@ -39161,8 +39453,14 @@ sleep 30"#
             .review_creator_deliverable(
                 ReviewCreatorDeliverable {
                     project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
                     task_id: task_id.clone(),
                     deliverable_id: DeliverableId::from("deliverable-1"),
+                    expected_task_revision: service
+                        .load_creator_task(&project_id, &task_id)
+                        .expect("submitted creator task")
+                        .state_revision,
+                    expected_deliverable_revision: 1,
                     review_id: ReviewId::from("review-1"),
                     reviewer_id: ActorId::from("user-1"),
                     decision: ReviewDecision::Accept,

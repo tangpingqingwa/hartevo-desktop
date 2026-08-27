@@ -12,18 +12,19 @@ use dioxus_icons::lucide::{
     WalletCards, Workflow, X,
 };
 use hartevo_application::{
-    ApplicationCheckpointHandlerStatus, ApplicationError, DesktopProjectProjection,
-    MissionProjection, MissionRuntimeProjection, ProjectEncryptionReadiness,
+    ApplicationCheckpointHandlerStatus, ApplicationError, CreatorWorkProjection,
+    DesktopProjectProjection, MissionProjection, MissionRuntimeProjection,
+    ProjectEncryptionReadiness,
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    CadenceTriggerKind, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
-    MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
-    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
-    RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode,
-    WorkProductId, WorkProductStatus,
+    AcceptanceCheck, CadenceTriggerKind, CreatorTaskStatus, KpiContract, KpiDirection,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode, OutcomeDecision,
+    OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
+    ProjectEncryptionMode, ProjectId, ReviewDecision, RuntimeProcessClaimStatus,
+    RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
@@ -45,9 +46,9 @@ use data_plane::{
     DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
     DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
     DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome,
-    DesktopMissionSubmission, DesktopRuntimeCancellation, DesktopRuntimeProgressEvent,
-    DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection, DesktopSnapshot,
-    DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
+    DesktopMissionSubmission, DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
+    DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
+    DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
     DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
     ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
     RecoveryKitDraft,
@@ -401,9 +402,18 @@ impl UiFailure {
             DesktopDataError::InvalidVm11OutcomeDecision
             | DesktopDataError::InvalidVm11NextContractResolution
             | DesktopDataError::InvalidWaitingApprovalGrant
-            | DesktopDataError::InvalidBrowserWorkspaceContinue => Self::coded(
+            | DesktopDataError::InvalidBrowserWorkspaceContinue
+            | DesktopDataError::InvalidCreatorDeliverableReview => Self::coded(
                 "WAITING_USER",
                 "精确窗口动作必须绑定冻结 digest 与当前 CAS revision；未写入部分状态，也未执行 Effect。",
+            ),
+            DesktopDataError::CreatorDeliverableReviewUnavailable => Self::coded(
+                "EMPTY",
+                "当前没有可审阅的已上传 Creator Deliverable；未发明交付物，也未执行 Review、Effect 或 Payout。",
+            ),
+            DesktopDataError::CreatorDeliverableReviewStale => Self::coded(
+                "STALE_SELECTION",
+                "Creator Deliverable Review 必须绑定当前任务 CAS revision 与 exact uploaded digest；未写入部分状态，也未执行 Effect 或 Payout。",
             ),
             DesktopDataError::BrowserWorkspaceUnavailable => Self::coded(
                 "EMPTY",
@@ -477,6 +487,9 @@ impl UiFailure {
                 | ApplicationError::ProposedEffectApprovalCommandMismatch
                 | ApplicationError::ProposedEffectApprovalUnavailable
                 | ApplicationError::ProposedEffectApprovalDigestMismatch
+                | ApplicationError::CreatorDeliverableReviewCommandMismatch
+                | ApplicationError::CreatorDeliverableReviewUnavailable
+                | ApplicationError::CreatorTaskRevisionMismatch { .. }
                 | ApplicationError::MissionRevisionMismatch { .. },
             ) => Self::coded(
                 "STALE_DECISION",
@@ -1712,6 +1725,85 @@ pub fn App() -> Element {
             }
         });
     };
+    let request_partners_review_creator_deliverable = move |decision: ReviewDecision| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Creator Deliverable，也未执行 Review。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(creator_work) = mission.creator_work.as_ref() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CreatorDeliverableReviewUnavailable);
+            return;
+        };
+        let Some(reviewable) = creator_work.reviewable.as_ref() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CreatorDeliverableReviewUnavailable);
+            return;
+        };
+        if !matches!(
+            decision,
+            ReviewDecision::Accept | ReviewDecision::RequestRevision
+        ) {
+            model
+                .write()
+                .set_notice(&DesktopDataError::InvalidCreatorDeliverableReview);
+            return;
+        }
+        let acceptance_checks = reviewable
+            .acceptance_checks
+            .iter()
+            .map(|requirement| AcceptanceCheck {
+                requirement: requirement.clone(),
+                satisfied: decision == ReviewDecision::Accept,
+                evidence: format!(
+                    "window-review:{}:{}",
+                    reviewable.deliverable_id, reviewable.content_digest
+                ),
+            })
+            .collect();
+        let request = DesktopReviewCreatorDeliverableRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            task_id: creator_work.task_id.clone(),
+            deliverable_id: reviewable.deliverable_id.clone(),
+            expected_task_revision: creator_work.expected_task_revision,
+            expected_deliverable_revision: reviewable.expected_deliverable_revision,
+            decision,
+            acceptance_checks,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover()
+                    .and_then(|plane| plane.review_creator_deliverable_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    model.write().set_ready(snapshot, false);
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "CREATOR_REVIEW_COORDINATOR_FAILED".into(),
+                        message: "Creator Deliverable Review 协调异常结束；未执行 Effect，未准备 Payout，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
+    };
     let on_result_action = move |action: ResultSurfaceAction| {
         let (project, mission) = {
             let current = model.read();
@@ -2442,7 +2534,11 @@ pub fn App() -> Element {
                         } else if current_surface == Surface::Relationships {
                             RelationshipsSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Partners {
-                            PartnersSurface { project: project.clone(), mission: mission.clone() }
+                            PartnersSurface {
+                                project: project.clone(),
+                                mission: mission.clone(),
+                                on_review_creator_deliverable: request_partners_review_creator_deliverable,
+                            }
                         } else if current_surface == Surface::Connections {
                             ConnectionsSurface { project: project.clone(), context_access: context_access.clone() }
                         } else if current_surface == Surface::Outcomes {
@@ -7272,6 +7368,7 @@ fn RelationshipsSurface(
 fn PartnersSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
+    on_review_creator_deliverable: EventHandler<ReviewDecision>,
 ) -> Element {
     #[cfg(feature = "visual-fixtures")]
     if let Some(page) = visual_fixture::page("partners") {
@@ -7291,6 +7388,20 @@ fn PartnersSurface(
     let selected_mission = mission
         .as_ref()
         .map_or("未选择 Mission", |mission| mission.title.as_str());
+    let creator_work = mission
+        .as_ref()
+        .and_then(|mission| mission.creator_work.as_ref());
+    let reviewable = creator_work.and_then(|work| work.reviewable.as_ref());
+    let review_ready = reviewable.is_some();
+    let in_progress_count = usize::from(creator_work.is_some_and(|work| {
+        matches!(
+            work.status,
+            CreatorTaskStatus::Accepted
+                | CreatorTaskStatus::InProgress
+                | CreatorTaskStatus::Submitted
+                | CreatorTaskStatus::RevisionRequested
+        )
+    }));
     rsx! {
         div { class: "surface-scroll business-surface partners-surface",
             header { class: "surface-head",
@@ -7299,7 +7410,7 @@ fn PartnersSurface(
                     h1 { "达人与联盟" }
                     p { "从身份与许可开始，覆盖建联、雇佣、悬赏任务、真实交付、Review、权益接受与付款。" }
                 }
-                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                span { class: "honesty-badge", if creator_work.is_some() { "APPLICATION" } else { "NOT_IMPLEMENTED" } }
             }
             nav { class: "surface-tabs", aria_label: "达人与联盟视图",
                 button { class: if active_tab() == "supply" { "active" } else { "" }, onclick: move |_| active_tab.set("supply"), "供给" }
@@ -7308,13 +7419,16 @@ fn PartnersSurface(
                 button { class: if active_tab() == "programs" { "active" } else { "" }, onclick: move |_| active_tab.set("programs"), "项目" }
                 button { class: if active_tab() == "economics" { "active" } else { "" }, onclick: move |_| active_tab.set("economics"), "结算" }
             }
-            section { class: "readiness-strip blocked",
+            section { class: if creator_work.is_some() { "readiness-strip" } else { "readiness-strip blocked" },
                 div { class: "readiness-intro",
                     span { class: "readiness-mark", UiIcon { name: UiIconName::Handshake, size: 18 } }
-                    span { strong { "Partner / Creator Projection 尚未接线" } small { "公开候选只允许研究；没有 Contact Permission 时不得自动触达。" } }
+                    span {
+                        strong { if creator_work.is_some() { "Creator Work 来自 Application Projection" } else { "Partner / Creator Projection 尚未接线" } }
+                        small { "公开候选只允许研究；没有 Contact Permission 时不得自动触达。Review 不是 Verification，也不会准备 Payout。" }
+                    }
                 }
                 div { class: "readiness-stat", b { "0" } small { "已验证 Partner" } }
-                div { class: "readiness-stat", b { "0" } small { "进行中任务" } }
+                div { class: "readiness-stat", b { "{in_progress_count}" } small { "进行中任务" } }
                 div { class: "readiness-stat", b { "0" } small { "待付款" } }
             }
             if active_tab() == "work" {
@@ -7324,14 +7438,47 @@ fn PartnersSurface(
                         for (index, step) in CREATOR_WORK_STAGES.iter().enumerate() {
                             div { class: "creator-work-step",
                                 i { "{index + 1}" }
-                                span { strong { "{step}" } small { "CONTRACT · 尚无实例" } }
+                                span { strong { "{step}" } small { "{creator_work_stage_status(index, creator_work)}" } }
                             }
                         }
                     }
                     div { class: "creator-review-boundary",
                         UiIcon { name: UiIconName::FileCheck, size: 18 }
-                        span { strong { "交付与付款必须分离" } small { "只有真实 Deliverable digest、用户 Review/Acceptance、权益记录和精确 Payout 审批齐全，才能进入付款验证。" } }
-                        em { "NOT_IMPLEMENTED" }
+                        span {
+                            strong { if review_ready { "窗口 Review 绑定 exact uploaded digest" } else { "交付与付款必须分离" } }
+                            small {
+                                if let Some(reviewable) = reviewable {
+                                    "r{reviewable.expected_deliverable_revision} · digest {short_digest(&reviewable.content_digest)} · 通过 Application review_creator_deliverable 写入 typed ReviewDecision；不是 Verification，也不准备 Payout。"
+                                } else {
+                                    "只有真实 Deliverable digest、用户 Review/Acceptance、权益记录和精确 Payout 审批齐全，才能进入付款验证。"
+                                }
+                            }
+                        }
+                        em { if review_ready { "WAITING_USER" } else { "NOT_IMPLEMENTED" } }
+                    }
+                    div { class: "creator-review-actions",
+                        button {
+                            disabled: !review_ready,
+                            aria_label: "接受精确 uploaded Creator Deliverable",
+                            title: if review_ready {
+                                "通过 Application review_creator_deliverable 接受当前 digest"
+                            } else {
+                                "当前没有 ReadyForReview 的 uploaded Creator Deliverable"
+                            },
+                            onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::Accept),
+                            if review_ready { "Accept · WAITING_USER" } else { "Accept · NOT_IMPLEMENTED" }
+                        }
+                        button {
+                            disabled: !review_ready,
+                            aria_label: "对精确 uploaded Creator Deliverable 请求修订",
+                            title: if review_ready {
+                                "通过 Application review_creator_deliverable 请求修订当前 digest"
+                            } else {
+                                "当前没有 ReadyForReview 的 uploaded Creator Deliverable"
+                            },
+                            onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::RequestRevision),
+                            if review_ready { "Request revision · WAITING_USER" } else { "Request revision · NOT_IMPLEMENTED" }
+                        }
                     }
                 }
             } else {
@@ -9403,6 +9550,47 @@ const fn mission_evidence_status_label(status: MissionEvidenceStatus) -> &'stati
     }
 }
 
+fn creator_work_stage_status(index: usize, creator_work: Option<&CreatorWorkProjection>) -> String {
+    let Some(work) = creator_work else {
+        return "CONTRACT · 尚无实例".into();
+    };
+    let reviewable = work.reviewable.is_some();
+    let accepted = work.accepted_deliverable_count > 0;
+    let revision_requested = work.status == CreatorTaskStatus::RevisionRequested;
+    let reached = match index {
+        0..=5 => true,
+        6 => reviewable || accepted || revision_requested || work.payout_verified,
+        7 => reviewable,
+        8 => revision_requested,
+        9 => accepted,
+        10 => accepted && !work.payout_verified,
+        11 => work.payout_verified,
+        _ => false,
+    };
+    if reached {
+        format!("APPLICATION · {}", creator_task_status_label(&work.status))
+    } else {
+        "CONTRACT · 尚无实例".into()
+    }
+}
+
+const fn creator_task_status_label(status: &CreatorTaskStatus) -> &'static str {
+    match status {
+        CreatorTaskStatus::Draft => "DRAFT",
+        CreatorTaskStatus::Published => "PUBLISHED",
+        CreatorTaskStatus::Accepted => "ACCEPTED",
+        CreatorTaskStatus::InProgress => "IN_PROGRESS",
+        CreatorTaskStatus::Submitted => "SUBMITTED",
+        CreatorTaskStatus::RevisionRequested => "REVISION_REQUESTED",
+        CreatorTaskStatus::SettlementPending => "SETTLEMENT_PENDING",
+        CreatorTaskStatus::PartiallyPaid => "PARTIALLY_PAID",
+        CreatorTaskStatus::Paid => "PAID",
+        CreatorTaskStatus::Rejected => "REJECTED",
+        CreatorTaskStatus::Disputed => "DISPUTED",
+        CreatorTaskStatus::Cancelled => "CANCELLED",
+    }
+}
+
 fn short_digest(digest: &str) -> &str {
     digest.get(..12).unwrap_or(digest)
 }
@@ -10477,6 +10665,31 @@ mod tests {
     }
 
     #[test]
+    fn partners_review_calls_application_review_creator_deliverable() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("review_creator_deliverable_os"));
+        assert!(source.contains("DesktopReviewCreatorDeliverableRequest"));
+        assert!(source.contains("on_review_creator_deliverable"));
+        assert!(source.contains("ReviewDecision::Accept"));
+        assert!(source.contains("ReviewDecision::RequestRevision"));
+        assert!(source.contains("Accept · WAITING_USER"));
+        assert!(source.contains("Request revision · WAITING_USER"));
+        assert!(source.contains("CREATOR_REVIEW_COORDINATOR_FAILED"));
+        assert!(source.contains(
+            "onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::Accept),"
+        ));
+        assert!(source.contains(
+            "onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::RequestRevision),"
+        ));
+        let data_plane = include_str!("data_plane.rs");
+        assert!(data_plane.contains("review_creator_deliverable_os"));
+        assert!(data_plane.contains("ReviewCreatorDeliverable"));
+        assert!(data_plane.contains("window Accept of the exact uploaded Creator Deliverable"));
+        assert!(!data_plane.contains("prepare_creator_payout"));
+        assert!(data_plane.contains("ReviewDecision::Reject | ReviewDecision::Dispute"));
+    }
+
+    #[test]
     fn operations_approve_calls_application_respond_context_runtime_local_approval() {
         let source = include_str!("lib.rs");
         assert!(source.contains("approve_held_local_write"));
@@ -10585,6 +10798,35 @@ mod tests {
         assert_eq!(CREATOR_WORK_STAGES[9], "Accepted");
         assert_eq!(CREATOR_WORK_STAGES[10], "Rights Recorded");
         assert_eq!(CREATOR_WORK_STAGES[11], "Payout Verified");
+        assert_eq!(creator_work_stage_status(7, None), "CONTRACT · 尚无实例");
+        let reviewable = hartevo_application::CreatorWorkProjection {
+            task_id: hartevo_domain_kernel::CreatorTaskId::from("task-review"),
+            status: CreatorTaskStatus::Submitted,
+            expected_task_revision: 6,
+            reviewable: Some(hartevo_application::CreatorDeliverableReviewProjection {
+                deliverable_id: hartevo_domain_kernel::DeliverableId::from("deliverable-review"),
+                expected_deliverable_revision: 1,
+                content_digest: "7".repeat(64),
+                acceptance_checks: vec!["Matches the approved scope".into()],
+            }),
+            accepted_deliverable_count: 0,
+            payout_verified: false,
+        };
+        assert!(creator_work_stage_status(7, Some(&reviewable)).contains("APPLICATION"));
+        assert_eq!(
+            creator_work_stage_status(11, Some(&reviewable)),
+            "CONTRACT · 尚无实例"
+        );
+        let invalid_reject =
+            UiFailure::from_error(&DesktopDataError::InvalidCreatorDeliverableReview);
+        assert_eq!(invalid_reject.code, "WAITING_USER");
+        assert!(invalid_reject.message.contains("未执行 Effect"));
+        let missing = UiFailure::from_error(&DesktopDataError::CreatorDeliverableReviewUnavailable);
+        assert_eq!(missing.code, "EMPTY");
+        assert!(missing.message.contains("未发明交付物"));
+        let stale = UiFailure::from_error(&DesktopDataError::CreatorDeliverableReviewStale);
+        assert_eq!(stale.code, "STALE_SELECTION");
+        assert!(stale.message.contains("CAS revision"));
     }
 
     #[test]

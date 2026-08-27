@@ -312,6 +312,7 @@ mod tests {
             verified_effect_count: 0,
             outcome_summary: None,
             vm11_outcome_review: None,
+            creator_work: None,
         };
         let project = DesktopProjectProjection {
             tenant_id,
