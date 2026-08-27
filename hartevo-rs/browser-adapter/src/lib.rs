@@ -14,6 +14,7 @@
 //! independent verification.
 
 mod action;
+mod artifact;
 #[cfg(unix)]
 mod chromium_host;
 mod consumer;
@@ -40,6 +41,15 @@ pub use action::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionResult, BrowserActionRisk,
     BrowserActionSurface, BrowserBatchReceipt, BrowserBatchReceiptState, BrowserEffectBinding,
     BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
+};
+pub use artifact::{
+    BrowserArtifactAdoptionState, BrowserArtifactCapture, BrowserArtifactCaptureInput,
+    BrowserArtifactFileInspectionRequest, BrowserArtifactFileInspectionResult,
+    BrowserArtifactFrameObservation, BrowserArtifactFrameRevision, BrowserArtifactHost,
+    BrowserArtifactInspectionEvidence, BrowserArtifactInspectionVerdict, BrowserArtifactInspector,
+    BrowserArtifactPlugin, BrowserArtifactProviderState, BrowserArtifactQuarantineReceipt,
+    BrowserArtifactResultLog, BrowserArtifactResultSink, BrowserArtifactSafeForAdoption,
+    BrowserArtifactScope, UnavailableBrowserArtifactHost, UnavailableBrowserArtifactInspector,
 };
 #[cfg(unix)]
 pub use chromium_host::{
@@ -243,6 +253,32 @@ pub enum BrowserError {
     NavigationFailed,
     #[error("browser navigation attempted to produce a download outside the File Broker")]
     NavigationDownloadBlocked,
+    #[error("browser artifact metadata, bytes, source, or receipt is malformed")]
+    InvalidArtifact,
+    #[error("browser artifact is outside the exact Mission, profile, workspace, or frame scope")]
+    ArtifactScopeMismatch,
+    #[error("browser artifact has already been captured or delivered")]
+    ArtifactDuplicate,
+    #[error("browser artifact provider is no longer mounted")]
+    ArtifactProviderUnavailable,
+    #[error("browser artifact frame, loader, navigation, or source changed during capture")]
+    ArtifactFrameStale,
+    #[error("browser artifact provider was revoked")]
+    ArtifactProviderRevoked,
+    #[error("browser artifact provider was restarted and its old cursor is invalid")]
+    ArtifactProviderRestarted,
+    #[error("browser artifact File Inspection request or result is malformed")]
+    ArtifactInspectionInvalid,
+    #[error("browser artifact File Inspection scanner was unavailable")]
+    ArtifactInspectionUnavailable,
+    #[error("browser artifact File Inspection did not produce a clean verdict")]
+    ArtifactInspectionRejected,
+    #[error("browser artifact File Inspection request was already closed or replayed")]
+    ArtifactInspectionReopened,
+    #[error("browser artifact File Inspection request or result was duplicated")]
+    ArtifactInspectionDuplicate,
+    #[error("browser artifact is not currently SafeForAdoption")]
+    ArtifactNotSafeForAdoption,
     #[error("browser file is outside every canonical project root or crosses a symlink")]
     FileOutsideProject,
     #[error("browser file is empty or exceeds the configured size boundary")]
@@ -343,6 +379,19 @@ impl BrowserError {
             Self::NavigationRequestBlocked => "BROWSER_NAVIGATION_REQUEST_BLOCKED",
             Self::NavigationFailed => "BROWSER_NAVIGATION_FAILED",
             Self::NavigationDownloadBlocked => "BROWSER_NAVIGATION_DOWNLOAD_BLOCKED",
+            Self::InvalidArtifact => "BROWSER_INVALID_ARTIFACT",
+            Self::ArtifactScopeMismatch => "BROWSER_ARTIFACT_SCOPE_MISMATCH",
+            Self::ArtifactDuplicate => "BROWSER_ARTIFACT_DUPLICATE",
+            Self::ArtifactProviderUnavailable => "BROWSER_ARTIFACT_PROVIDER_UNAVAILABLE",
+            Self::ArtifactFrameStale => "BROWSER_ARTIFACT_FRAME_STALE",
+            Self::ArtifactProviderRevoked => "BROWSER_ARTIFACT_PROVIDER_REVOKED",
+            Self::ArtifactProviderRestarted => "BROWSER_ARTIFACT_PROVIDER_RESTARTED",
+            Self::ArtifactInspectionInvalid => "BROWSER_ARTIFACT_INSPECTION_INVALID",
+            Self::ArtifactInspectionUnavailable => "BROWSER_ARTIFACT_INSPECTION_UNAVAILABLE",
+            Self::ArtifactInspectionRejected => "BROWSER_ARTIFACT_INSPECTION_REJECTED",
+            Self::ArtifactInspectionReopened => "BROWSER_ARTIFACT_INSPECTION_REOPENED",
+            Self::ArtifactInspectionDuplicate => "BROWSER_ARTIFACT_INSPECTION_DUPLICATE",
+            Self::ArtifactNotSafeForAdoption => "BROWSER_ARTIFACT_NOT_SAFE_FOR_ADOPTION",
             Self::FileOutsideProject => "BROWSER_FILE_OUTSIDE_PROJECT",
             Self::FileSizeRejected => "BROWSER_FILE_SIZE_REJECTED",
             Self::FileTypeRejected => "BROWSER_FILE_TYPE_REJECTED",

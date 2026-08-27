@@ -12,18 +12,19 @@ use dioxus_icons::lucide::{
     WalletCards, Workflow, X,
 };
 use hartevo_application::{
-    ApplicationCheckpointHandlerStatus, ApplicationError, DesktopProjectProjection,
-    MissionProjection, MissionRuntimeProjection, ProjectEncryptionReadiness,
+    ApplicationCheckpointHandlerStatus, ApplicationError, CreatorWorkProjection,
+    DesktopProjectProjection, MissionProjection, MissionRuntimeProjection,
+    ProjectEncryptionReadiness,
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    CadenceTriggerKind, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
-    MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
-    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
-    RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode,
-    WorkProductId, WorkProductStatus,
+    AcceptanceCheck, CadenceTriggerKind, CreatorTaskStatus, KpiContract, KpiDirection,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode, OutcomeDecision,
+    OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
+    ProjectEncryptionMode, ProjectId, ReviewDecision, RuntimeProcessClaimStatus,
+    RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
@@ -42,9 +43,10 @@ mod visual_fixture;
 
 use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
 use data_plane::{
-    DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
-    DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
-    DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopRuntimeCancellation,
+    DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
+    DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
+    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome,
+    DesktopMissionSubmission, DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
     DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
     DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
@@ -399,9 +401,27 @@ impl UiFailure {
             ),
             DesktopDataError::InvalidVm11OutcomeDecision
             | DesktopDataError::InvalidVm11NextContractResolution
-            | DesktopDataError::InvalidWaitingApprovalGrant => Self::coded(
+            | DesktopDataError::InvalidWaitingApprovalGrant
+            | DesktopDataError::InvalidBrowserWorkspaceContinue
+            | DesktopDataError::InvalidCreatorDeliverableReview => Self::coded(
                 "WAITING_USER",
                 "精确窗口动作必须绑定冻结 digest 与当前 CAS revision；未写入部分状态，也未执行 Effect。",
+            ),
+            DesktopDataError::CreatorDeliverableReviewUnavailable => Self::coded(
+                "EMPTY",
+                "当前没有可审阅的已上传 Creator Deliverable；未发明交付物，也未执行 Review、Effect 或 Payout。",
+            ),
+            DesktopDataError::CreatorDeliverableReviewStale => Self::coded(
+                "STALE_SELECTION",
+                "Creator Deliverable Review 必须绑定当前任务 CAS revision 与 exact uploaded digest；未写入部分状态，也未执行 Effect 或 Payout。",
+            ),
+            DesktopDataError::BrowserWorkspaceUnavailable => Self::coded(
+                "EMPTY",
+                "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Continue。",
+            ),
+            DesktopDataError::BrowserWorkspaceContinueNotHeld => Self::coded(
+                "NOT_IMPLEMENTED",
+                "Continue 需要用户持有的 Browser Workspace lease；Take over 仍为 NOT_IMPLEMENTED，未签发新 Agent lease，也未执行 Effect。",
             ),
             DesktopDataError::InvalidRecoveryKey => Self::coded(
                 "WAITING_USER",
@@ -414,6 +434,14 @@ impl UiFailure {
             DesktopDataError::WorkProductActionStale => Self::coded(
                 "STALE_SELECTION",
                 "结果与当前 Project / Mission revision 不一致，请刷新后重新选择；未改变正文、证据或状态。",
+            ),
+            DesktopDataError::RuntimeLocalApprovalUnavailable => Self::coded(
+                "EMPTY",
+                "当前没有待窗口批准的 Runtime 本地写入；未自动拒绝，也未执行 Effect。",
+            ),
+            DesktopDataError::RuntimeLocalApprovalMismatch => Self::coded(
+                "STALE_SELECTION",
+                "Runtime 本地写入批准必须绑定当前冻结 digest 与 turn revision；未写入部分状态，也未执行 Effect。",
             ),
             DesktopDataError::ProjectNotFound(_)
             | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => {
@@ -459,10 +487,19 @@ impl UiFailure {
                 | ApplicationError::ProposedEffectApprovalCommandMismatch
                 | ApplicationError::ProposedEffectApprovalUnavailable
                 | ApplicationError::ProposedEffectApprovalDigestMismatch
+                | ApplicationError::CreatorDeliverableReviewCommandMismatch
+                | ApplicationError::CreatorDeliverableReviewUnavailable
+                | ApplicationError::CreatorTaskRevisionMismatch { .. }
                 | ApplicationError::MissionRevisionMismatch { .. },
             ) => Self::coded(
                 "STALE_DECISION",
                 "冻结 digest 或 CAS revision 已变化；请刷新后重新审阅，旧提交未被写入或重放，也未执行 Effect。",
+            ),
+            DesktopDataError::Application(
+                ApplicationError::BrowserHostReconciliationRequired { .. },
+            ) => Self::coded(
+                "RECOVERY_REQUIRED",
+                "Browser Workspace 已持久签发新 Agent lease，但 Host 仍更受限；需要显式 Host reconciliation，未执行 Effect，也未声明 Verification。",
             ),
             _ => Self::coded(
                 "INTEGRITY_ERROR",
@@ -1546,11 +1583,24 @@ pub fn App() -> Element {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
     };
+    let live_runtime_cancellation = runtime_execution_paint
+        .read()
+        .live_cancellation_for_selection(
+            project
+                .as_ref()
+                .zip(mission.as_ref())
+                .map(|(project, mission)| (&project.project_id, &mission.mission_id)),
+        )
+        .or_else(|| runtime_cancellation.read().clone());
+    let held_local_approval = live_runtime_cancellation
+        .as_ref()
+        .and_then(DesktopRuntimeCancellation::held_local_approval);
     let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
         project.as_ref(),
         mission.as_ref(),
         runtime_activity.as_ref(),
         runtime_projection.as_ref(),
+        held_local_approval.as_ref(),
     );
     let operations_interrupt_available = runtime_busy && runtime_stop_available;
     let operations_interrupt_requested = runtime_stop_requested();
@@ -1582,6 +1632,177 @@ pub fn App() -> Element {
                 );
             }
         }
+    };
+    let request_operations_approve_local_runtime = move |()| {
+        let selected = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let Some(control) = runtime_execution_paint
+            .read()
+            .live_cancellation_for_selection(
+                selected
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+            )
+            .or_else(|| runtime_cancellation.read().clone())
+        else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有待窗口批准的 Runtime 本地写入；未自动拒绝，也未执行 Effect。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(held) = control.held_local_approval() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::RuntimeLocalApprovalUnavailable);
+            return;
+        };
+        match control.approve_held_local_write(
+            &held.project_id,
+            &held.turn_id,
+            held.expected_revision,
+            &held.request_digest,
+        ) {
+            Ok(()) => {}
+            Err(error) => model.write().set_notice(&error),
+        }
+    };
+    let request_operations_continue_browser = move |()| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Browser Workspace，也未执行 Continue。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(workspace) = mission.browser_workspace.as_ref() else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message:
+                    "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Continue。"
+                        .into(),
+            });
+            return;
+        };
+        let request = DesktopContinueBrowserWorkspaceRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover()
+                    .and_then(|plane| plane.continue_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    model.write().set_ready(snapshot, false);
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_CONTINUE_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Continue 协调异常结束；未执行 Effect，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
+    };
+    let request_partners_review_creator_deliverable = move |decision: ReviewDecision| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Creator Deliverable，也未执行 Review。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(creator_work) = mission.creator_work.as_ref() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CreatorDeliverableReviewUnavailable);
+            return;
+        };
+        let Some(reviewable) = creator_work.reviewable.as_ref() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CreatorDeliverableReviewUnavailable);
+            return;
+        };
+        if !matches!(
+            decision,
+            ReviewDecision::Accept | ReviewDecision::RequestRevision
+        ) {
+            model
+                .write()
+                .set_notice(&DesktopDataError::InvalidCreatorDeliverableReview);
+            return;
+        }
+        let acceptance_checks = reviewable
+            .acceptance_checks
+            .iter()
+            .map(|requirement| AcceptanceCheck {
+                requirement: requirement.clone(),
+                satisfied: decision == ReviewDecision::Accept,
+                evidence: format!(
+                    "window-review:{}:{}",
+                    reviewable.deliverable_id, reviewable.content_digest
+                ),
+            })
+            .collect();
+        let request = DesktopReviewCreatorDeliverableRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            task_id: creator_work.task_id.clone(),
+            deliverable_id: reviewable.deliverable_id.clone(),
+            expected_task_revision: creator_work.expected_task_revision,
+            expected_deliverable_revision: reviewable.expected_deliverable_revision,
+            decision,
+            acceptance_checks,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover()
+                    .and_then(|plane| plane.review_creator_deliverable_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    model.write().set_ready(snapshot, false);
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "CREATOR_REVIEW_COORDINATOR_FAILED".into(),
+                        message: "Creator Deliverable Review 协调异常结束；未执行 Effect，未准备 Payout，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
     };
     let on_result_action = move |action: ResultSurfaceAction| {
         let (project, mission) = {
@@ -2250,6 +2471,8 @@ pub fn App() -> Element {
                                     restore_ui_focus("mission-composer-input");
                                 },
                                 on_interrupt: request_operations_interrupt,
+                                on_continue_browser_workspace: request_operations_continue_browser,
+                                on_approve_local_runtime: request_operations_approve_local_runtime,
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
                                         let current = model.read();
@@ -2311,7 +2534,11 @@ pub fn App() -> Element {
                         } else if current_surface == Surface::Relationships {
                             RelationshipsSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Partners {
-                            PartnersSurface { project: project.clone(), mission: mission.clone() }
+                            PartnersSurface {
+                                project: project.clone(),
+                                mission: mission.clone(),
+                                on_review_creator_deliverable: request_partners_review_creator_deliverable,
+                            }
                         } else if current_surface == Surface::Connections {
                             ConnectionsSurface { project: project.clone(), context_access: context_access.clone() }
                         } else if current_surface == Surface::Outcomes {
@@ -5003,6 +5230,8 @@ fn AgentOperationsWorkbench(
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_continue_browser_workspace: EventHandler<()>,
+    on_approve_local_runtime: EventHandler<()>,
 ) -> Element {
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
     let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
@@ -5205,6 +5434,26 @@ fn AgentOperationsWorkbench(
                         div { small { "Verified effects" } strong { "{projection.approvals.verified_effect_count}" } span { "不会由本地 Runtime 状态代替" } }
                         div { small { "Local Runtime approval" } strong { "{projection.approvals.local_runtime_status.code()}" } span { "{projection.approvals.local_runtime_detail}" } }
                     }
+                    {
+                        let local_ready = projection.approvals.local_runtime_approve_status == OperationsStatus::Ready;
+                        let local_label = format!("Approve · {}", projection.approvals.local_runtime_approve_status.code());
+                        let local_title = match projection.approvals.local_runtime_approve_status {
+                            OperationsStatus::Ready => "通过 Application respond_context_runtime_local_approval 批准精确本地写入 digest",
+                            OperationsStatus::WaitingApproval => "本地写入仍在等待精确 digest；未自动拒绝",
+                            _ => "当前没有待窗口批准的 Runtime 本地写入",
+                        };
+                        rsx! {
+                            div { class: "operations-artifact-actions",
+                                button {
+                                    disabled: !local_ready,
+                                    aria_label: "批准 Runtime 本地写入",
+                                    title: local_title,
+                                    onclick: move |_| on_approve_local_runtime.call(()),
+                                    "{local_label}"
+                                }
+                            }
+                        }
+                    }
                 }
                 div { class: "operations-card operations-browser-card",
                     header { class: "operations-card-header",
@@ -5221,7 +5470,24 @@ fn AgentOperationsWorkbench(
                     }
                     div { class: "operations-artifact-actions",
                         button { disabled: true, aria_label: "接管 Browser Workspace", title: "等待 BW-01 owner API", "Take over · NOT_IMPLEMENTED" }
-                        button { disabled: true, aria_label: "继续 Browser Workspace", title: "等待 BW-01 owner API", "Continue · NOT_IMPLEMENTED" }
+                        {
+                            let continue_ready = projection.browser.continue_status == OperationsStatus::Ready;
+                            let continue_title = match projection.browser.continue_status {
+                                OperationsStatus::Ready => "通过 Application continue_browser_workspace 签发新 Agent lease",
+                                OperationsStatus::Empty => "当前 Mission 没有用户持有的 Browser Workspace",
+                                _ => "Continue 需要用户持有的 lease；Take over 仍为 NOT_IMPLEMENTED",
+                            };
+                            let continue_label = format!("Continue · {}", projection.browser.continue_status.code());
+                            rsx! {
+                                button {
+                                    disabled: !continue_ready,
+                                    aria_label: "继续 Browser Workspace",
+                                    title: "{continue_title}",
+                                    onclick: move |_| on_continue_browser_workspace.call(()),
+                                    "{continue_label}"
+                                }
+                            }
+                        }
                     }
                 }
                 div { class: "operations-card operations-recovery-card",
@@ -5292,6 +5558,7 @@ fn OrchestratorSurface(
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
     interrupt_requested: bool,
+    on_continue_browser_workspace: EventHandler<()>,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
@@ -5299,6 +5566,7 @@ fn OrchestratorSurface(
     on_open_workpad: EventHandler<()>,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_approve_local_runtime: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
     on_result_action: EventHandler<ResultSurfaceAction>,
@@ -5388,6 +5656,8 @@ fn OrchestratorSurface(
                             interrupt_requested: false,
                             on_quick_entry,
                             on_interrupt,
+                            on_continue_browser_workspace,
+                            on_approve_local_runtime,
                         }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
@@ -5512,6 +5782,8 @@ fn OrchestratorSurface(
                         interrupt_requested,
                         on_quick_entry,
                         on_interrupt,
+                        on_continue_browser_workspace,
+                        on_approve_local_runtime,
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
@@ -7096,6 +7368,7 @@ fn RelationshipsSurface(
 fn PartnersSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
+    on_review_creator_deliverable: EventHandler<ReviewDecision>,
 ) -> Element {
     #[cfg(feature = "visual-fixtures")]
     if let Some(page) = visual_fixture::page("partners") {
@@ -7115,6 +7388,20 @@ fn PartnersSurface(
     let selected_mission = mission
         .as_ref()
         .map_or("未选择 Mission", |mission| mission.title.as_str());
+    let creator_work = mission
+        .as_ref()
+        .and_then(|mission| mission.creator_work.as_ref());
+    let reviewable = creator_work.and_then(|work| work.reviewable.as_ref());
+    let review_ready = reviewable.is_some();
+    let in_progress_count = usize::from(creator_work.is_some_and(|work| {
+        matches!(
+            work.status,
+            CreatorTaskStatus::Accepted
+                | CreatorTaskStatus::InProgress
+                | CreatorTaskStatus::Submitted
+                | CreatorTaskStatus::RevisionRequested
+        )
+    }));
     rsx! {
         div { class: "surface-scroll business-surface partners-surface",
             header { class: "surface-head",
@@ -7123,7 +7410,7 @@ fn PartnersSurface(
                     h1 { "达人与联盟" }
                     p { "从身份与许可开始，覆盖建联、雇佣、悬赏任务、真实交付、Review、权益接受与付款。" }
                 }
-                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                span { class: "honesty-badge", if creator_work.is_some() { "APPLICATION" } else { "NOT_IMPLEMENTED" } }
             }
             nav { class: "surface-tabs", aria_label: "达人与联盟视图",
                 button { class: if active_tab() == "supply" { "active" } else { "" }, onclick: move |_| active_tab.set("supply"), "供给" }
@@ -7132,13 +7419,16 @@ fn PartnersSurface(
                 button { class: if active_tab() == "programs" { "active" } else { "" }, onclick: move |_| active_tab.set("programs"), "项目" }
                 button { class: if active_tab() == "economics" { "active" } else { "" }, onclick: move |_| active_tab.set("economics"), "结算" }
             }
-            section { class: "readiness-strip blocked",
+            section { class: if creator_work.is_some() { "readiness-strip" } else { "readiness-strip blocked" },
                 div { class: "readiness-intro",
                     span { class: "readiness-mark", UiIcon { name: UiIconName::Handshake, size: 18 } }
-                    span { strong { "Partner / Creator Projection 尚未接线" } small { "公开候选只允许研究；没有 Contact Permission 时不得自动触达。" } }
+                    span {
+                        strong { if creator_work.is_some() { "Creator Work 来自 Application Projection" } else { "Partner / Creator Projection 尚未接线" } }
+                        small { "公开候选只允许研究；没有 Contact Permission 时不得自动触达。Review 不是 Verification，也不会准备 Payout。" }
+                    }
                 }
                 div { class: "readiness-stat", b { "0" } small { "已验证 Partner" } }
-                div { class: "readiness-stat", b { "0" } small { "进行中任务" } }
+                div { class: "readiness-stat", b { "{in_progress_count}" } small { "进行中任务" } }
                 div { class: "readiness-stat", b { "0" } small { "待付款" } }
             }
             if active_tab() == "work" {
@@ -7148,14 +7438,47 @@ fn PartnersSurface(
                         for (index, step) in CREATOR_WORK_STAGES.iter().enumerate() {
                             div { class: "creator-work-step",
                                 i { "{index + 1}" }
-                                span { strong { "{step}" } small { "CONTRACT · 尚无实例" } }
+                                span { strong { "{step}" } small { "{creator_work_stage_status(index, creator_work)}" } }
                             }
                         }
                     }
                     div { class: "creator-review-boundary",
                         UiIcon { name: UiIconName::FileCheck, size: 18 }
-                        span { strong { "交付与付款必须分离" } small { "只有真实 Deliverable digest、用户 Review/Acceptance、权益记录和精确 Payout 审批齐全，才能进入付款验证。" } }
-                        em { "NOT_IMPLEMENTED" }
+                        span {
+                            strong { if review_ready { "窗口 Review 绑定 exact uploaded digest" } else { "交付与付款必须分离" } }
+                            small {
+                                if let Some(reviewable) = reviewable {
+                                    "r{reviewable.expected_deliverable_revision} · digest {short_digest(&reviewable.content_digest)} · 通过 Application review_creator_deliverable 写入 typed ReviewDecision；不是 Verification，也不准备 Payout。"
+                                } else {
+                                    "只有真实 Deliverable digest、用户 Review/Acceptance、权益记录和精确 Payout 审批齐全，才能进入付款验证。"
+                                }
+                            }
+                        }
+                        em { if review_ready { "WAITING_USER" } else { "NOT_IMPLEMENTED" } }
+                    }
+                    div { class: "creator-review-actions",
+                        button {
+                            disabled: !review_ready,
+                            aria_label: "接受精确 uploaded Creator Deliverable",
+                            title: if review_ready {
+                                "通过 Application review_creator_deliverable 接受当前 digest"
+                            } else {
+                                "当前没有 ReadyForReview 的 uploaded Creator Deliverable"
+                            },
+                            onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::Accept),
+                            if review_ready { "Accept · WAITING_USER" } else { "Accept · NOT_IMPLEMENTED" }
+                        }
+                        button {
+                            disabled: !review_ready,
+                            aria_label: "对精确 uploaded Creator Deliverable 请求修订",
+                            title: if review_ready {
+                                "通过 Application review_creator_deliverable 请求修订当前 digest"
+                            } else {
+                                "当前没有 ReadyForReview 的 uploaded Creator Deliverable"
+                            },
+                            onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::RequestRevision),
+                            if review_ready { "Request revision · WAITING_USER" } else { "Request revision · NOT_IMPLEMENTED" }
+                        }
                     }
                 }
             } else {
@@ -8596,6 +8919,10 @@ const fn desktop_runtime_progress_label(phase: DesktopRuntimeProgressPhase) -> &
         DesktopRuntimeProgressPhase::ItemStarted => "正在处理下一项 Runtime 工作",
         DesktopRuntimeProgressPhase::ItemCompleted => "Runtime 工作项已完成",
         DesktopRuntimeProgressPhase::LocalActionDeclined => "本地写入请求已按默认策略拒绝",
+        DesktopRuntimeProgressPhase::WaitingLocalApproval => "本地写入请求等待窗口精确批准",
+        DesktopRuntimeProgressPhase::LocalActionApproved => {
+            "窗口已批准精确 Runtime 本地写入 digest"
+        }
         DesktopRuntimeProgressPhase::StopRequested => "停止请求已交给协调器",
         DesktopRuntimeProgressPhase::InterruptSent => "fenced interrupt 已发送",
         DesktopRuntimeProgressPhase::Completed => "Runtime turn 已完成，正在采纳最终产物",
@@ -8618,13 +8945,14 @@ const fn desktop_runtime_progress_display_label(
 
 const fn desktop_runtime_progress_class(phase: DesktopRuntimeProgressPhase) -> &'static str {
     match phase {
-        DesktopRuntimeProgressPhase::Completed | DesktopRuntimeProgressPhase::Interrupted => {
-            "terminal"
-        }
+        DesktopRuntimeProgressPhase::Completed
+        | DesktopRuntimeProgressPhase::Interrupted
+        | DesktopRuntimeProgressPhase::LocalActionApproved => "terminal",
         DesktopRuntimeProgressPhase::Failed | DesktopRuntimeProgressPhase::Uncertain => "danger",
         DesktopRuntimeProgressPhase::StopRequested
         | DesktopRuntimeProgressPhase::InterruptSent
-        | DesktopRuntimeProgressPhase::LocalActionDeclined => "attention",
+        | DesktopRuntimeProgressPhase::LocalActionDeclined
+        | DesktopRuntimeProgressPhase::WaitingLocalApproval => "attention",
         DesktopRuntimeProgressPhase::Preparing
         | DesktopRuntimeProgressPhase::Dispatched
         | DesktopRuntimeProgressPhase::TurnStarted
@@ -9219,6 +9547,47 @@ const fn mission_evidence_status_label(status: MissionEvidenceStatus) -> &'stati
         MissionEvidenceStatus::Partial => "PARTIAL",
         MissionEvidenceStatus::ExpectedRefusal => "EXPECTED_REFUSAL",
         MissionEvidenceStatus::Pass => "PASS",
+    }
+}
+
+fn creator_work_stage_status(index: usize, creator_work: Option<&CreatorWorkProjection>) -> String {
+    let Some(work) = creator_work else {
+        return "CONTRACT · 尚无实例".into();
+    };
+    let reviewable = work.reviewable.is_some();
+    let accepted = work.accepted_deliverable_count > 0;
+    let revision_requested = work.status == CreatorTaskStatus::RevisionRequested;
+    let reached = match index {
+        0..=5 => true,
+        6 => reviewable || accepted || revision_requested || work.payout_verified,
+        7 => reviewable,
+        8 => revision_requested,
+        9 => accepted,
+        10 => accepted && !work.payout_verified,
+        11 => work.payout_verified,
+        _ => false,
+    };
+    if reached {
+        format!("APPLICATION · {}", creator_task_status_label(&work.status))
+    } else {
+        "CONTRACT · 尚无实例".into()
+    }
+}
+
+const fn creator_task_status_label(status: &CreatorTaskStatus) -> &'static str {
+    match status {
+        CreatorTaskStatus::Draft => "DRAFT",
+        CreatorTaskStatus::Published => "PUBLISHED",
+        CreatorTaskStatus::Accepted => "ACCEPTED",
+        CreatorTaskStatus::InProgress => "IN_PROGRESS",
+        CreatorTaskStatus::Submitted => "SUBMITTED",
+        CreatorTaskStatus::RevisionRequested => "REVISION_REQUESTED",
+        CreatorTaskStatus::SettlementPending => "SETTLEMENT_PENDING",
+        CreatorTaskStatus::PartiallyPaid => "PARTIALLY_PAID",
+        CreatorTaskStatus::Paid => "PAID",
+        CreatorTaskStatus::Rejected => "REJECTED",
+        CreatorTaskStatus::Disputed => "DISPUTED",
+        CreatorTaskStatus::Cancelled => "CANCELLED",
     }
 }
 
@@ -10285,6 +10654,59 @@ mod tests {
     }
 
     #[test]
+    fn operations_continue_calls_application_continue_browser_workspace() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("continue_browser_workspace_os"));
+        assert!(source.contains("DesktopContinueBrowserWorkspaceRequest"));
+        assert!(source.contains("Take over · NOT_IMPLEMENTED"));
+        assert!(source.contains("format!(\"Continue · {}\""));
+        assert!(source.contains("on_continue_browser_workspace"));
+        assert!(source.contains("BrowserHostReconciliationRequired"));
+    }
+
+    #[test]
+    fn partners_review_calls_application_review_creator_deliverable() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("review_creator_deliverable_os"));
+        assert!(source.contains("DesktopReviewCreatorDeliverableRequest"));
+        assert!(source.contains("on_review_creator_deliverable"));
+        assert!(source.contains("ReviewDecision::Accept"));
+        assert!(source.contains("ReviewDecision::RequestRevision"));
+        assert!(source.contains("Accept · WAITING_USER"));
+        assert!(source.contains("Request revision · WAITING_USER"));
+        assert!(source.contains("CREATOR_REVIEW_COORDINATOR_FAILED"));
+        assert!(source.contains(
+            "onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::Accept),"
+        ));
+        assert!(source.contains(
+            "onclick: move |_| on_review_creator_deliverable.call(ReviewDecision::RequestRevision),"
+        ));
+        let data_plane = include_str!("data_plane.rs");
+        assert!(data_plane.contains("review_creator_deliverable_os"));
+        assert!(data_plane.contains("ReviewCreatorDeliverable"));
+        assert!(data_plane.contains("window Accept of the exact uploaded Creator Deliverable"));
+        assert!(!data_plane.contains("prepare_creator_payout"));
+        assert!(data_plane.contains("ReviewDecision::Reject | ReviewDecision::Dispute"));
+    }
+
+    #[test]
+    fn operations_approve_calls_application_respond_context_runtime_local_approval() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("approve_held_local_write"));
+        assert!(source.contains("respond_context_runtime_local_approval"));
+        assert!(source.contains("on_approve_local_runtime"));
+        assert!(source.contains("format!(\"Approve · {}\""));
+        assert!(source.contains("live_cancellation_for_selection"));
+        assert!(source.contains("coordinator.cancellation()"));
+        let data_plane = include_str!("data_plane.rs");
+        assert!(data_plane.contains("approved: true"));
+        assert!(data_plane.contains("WaitingLocalApproval"));
+        assert!(data_plane.contains("respond_context_runtime_local_approval"));
+        assert!(!data_plane.contains("approved: false"));
+        assert!(!data_plane.contains("LocalActionDeclined);"));
+    }
+
+    #[test]
     fn runtime_stream_paragraphs_are_append_stable_and_terminal_dedupe_is_exact() {
         assert_eq!(
             runtime_stream_paragraphs("第一段\n仍是第一段\n\n第二段"),
@@ -10376,6 +10798,35 @@ mod tests {
         assert_eq!(CREATOR_WORK_STAGES[9], "Accepted");
         assert_eq!(CREATOR_WORK_STAGES[10], "Rights Recorded");
         assert_eq!(CREATOR_WORK_STAGES[11], "Payout Verified");
+        assert_eq!(creator_work_stage_status(7, None), "CONTRACT · 尚无实例");
+        let reviewable = hartevo_application::CreatorWorkProjection {
+            task_id: hartevo_domain_kernel::CreatorTaskId::from("task-review"),
+            status: CreatorTaskStatus::Submitted,
+            expected_task_revision: 6,
+            reviewable: Some(hartevo_application::CreatorDeliverableReviewProjection {
+                deliverable_id: hartevo_domain_kernel::DeliverableId::from("deliverable-review"),
+                expected_deliverable_revision: 1,
+                content_digest: "7".repeat(64),
+                acceptance_checks: vec!["Matches the approved scope".into()],
+            }),
+            accepted_deliverable_count: 0,
+            payout_verified: false,
+        };
+        assert!(creator_work_stage_status(7, Some(&reviewable)).contains("APPLICATION"));
+        assert_eq!(
+            creator_work_stage_status(11, Some(&reviewable)),
+            "CONTRACT · 尚无实例"
+        );
+        let invalid_reject =
+            UiFailure::from_error(&DesktopDataError::InvalidCreatorDeliverableReview);
+        assert_eq!(invalid_reject.code, "WAITING_USER");
+        assert!(invalid_reject.message.contains("未执行 Effect"));
+        let missing = UiFailure::from_error(&DesktopDataError::CreatorDeliverableReviewUnavailable);
+        assert_eq!(missing.code, "EMPTY");
+        assert!(missing.message.contains("未发明交付物"));
+        let stale = UiFailure::from_error(&DesktopDataError::CreatorDeliverableReviewStale);
+        assert_eq!(stale.code, "STALE_SELECTION");
+        assert!(stale.message.contains("CAS revision"));
     }
 
     #[test]

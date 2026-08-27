@@ -294,6 +294,7 @@ mod tests {
             current_checkpoint_application_handler_id: None,
             current_checkpoint_oracle_ids: std::collections::BTreeSet::default(),
             current_checkpoint_completion_policy: None,
+            browser_workspace: None,
             completed_checkpoint_count: 0,
             checkpoint_count: 8,
             cycle: 0,
@@ -311,6 +312,7 @@ mod tests {
             verified_effect_count: 0,
             outcome_summary: None,
             vm11_outcome_review: None,
+            creator_work: None,
         };
         let project = DesktopProjectProjection {
             tenant_id,

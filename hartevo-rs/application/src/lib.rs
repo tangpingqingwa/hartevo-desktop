@@ -34,12 +34,12 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_browser_adapter::{
-    BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost, BrowserError,
-    BrowserFileGrant, BrowserFileType, BrowserIdentity, BrowserLeaseProof,
-    BrowserLocatorResolution, BrowserProfile, BrowserRecipeActivation, BrowserRecipeCandidate,
-    BrowserRecipePreparedPlan, BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace,
-    FileBroker, FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle,
-    TrustedBrowserRecipeKey,
+    BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost,
+    BrowserControlState, BrowserError, BrowserFileGrant, BrowserFileType, BrowserIdentity,
+    BrowserLeaseProof, BrowserLocatorResolution, BrowserProfile, BrowserRecipeActivation,
+    BrowserRecipeCandidate, BrowserRecipePreparedPlan, BrowserRecipeRelease,
+    BrowserRecipeResolvedAction, BrowserWorkspace, FileBroker, FileBrokerReconciliation,
+    FileSafetyScanner, FileUploadHandle, TrustedBrowserRecipeKey,
 };
 use hartevo_catalog::{CapabilityManifest, Catalog, CatalogError, MissionManifest};
 use hartevo_cloud_storage::{
@@ -73,10 +73,11 @@ use hartevo_domain_kernel::{
     CreatorCandidate, CreatorContactEffectGuard, CreatorDeliverableInput, CreatorEligibility,
     CreatorExternalProof, CreatorHiring, CreatorHiringError, CreatorHiringId, CreatorHiringSpec,
     CreatorId, CreatorIdentitySnapshot, CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask,
-    CreatorTaskId, CreatorTaskSpec, CreatorWorkError, CurrencyCode, DeletionError, DeletionId,
-    DeletionReason, DeletionTombstone, DeliverableId, DeliverableReviewInput, DeviceAttachment,
-    DeviceAttachmentId, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim,
-    DeviceHandoffContext, DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
+    CreatorTaskId, CreatorTaskSpec, CreatorTaskStatus, CreatorWorkError, CurrencyCode,
+    DeletionError, DeletionId, DeletionReason, DeletionTombstone, DeliverableId,
+    DeliverableReviewInput, DeliverableStatus, DeviceAttachment, DeviceAttachmentId,
+    DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
+    DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
@@ -118,9 +119,11 @@ use hartevo_effect_broker::{
     EffectExecutor, EffectReconciler, EffectVerifier,
 };
 use hartevo_runtime_adapter::{
-    AdapterError, MappedTurnEventKind, ObservedRuntimeProcessIdentity, ProcessCleanupDisposition,
-    RuntimeAgentMessage, RuntimeAgentMessageDelta, RuntimeCommand, RuntimeLocalApprovalRequest,
-    RuntimeMapping, RuntimeProcessCleanupTarget, RuntimeTurnCompletionStatus, StdioRuntime,
+    AdapterError, LeaseFence, MappedTurnEventKind, ObservedRuntimeProcessIdentity,
+    ProcessCleanupDisposition, RuntimeAgentMessage, RuntimeAgentMessageDelta, RuntimeAttemptPermit,
+    RuntimeAttemptStatus, RuntimeCommand, RuntimeLocalApprovalRequest, RuntimeMapping,
+    RuntimeProcessCleanupTarget, RuntimeScheduleBinding, RuntimeSchedulerError,
+    RuntimeSchedulerGate, RuntimeTurnCompletionStatus, RuntimeTurnDispatch, StdioRuntime,
     cleanup_runtime_process, generate_runtime_launch_token, prepare_runtime_launch,
 };
 use hartevo_storage::{
@@ -613,8 +616,11 @@ pub struct SubmitCreatorDeliverable {
 #[derive(Clone, Debug)]
 pub struct ReviewCreatorDeliverable {
     pub project_id: ProjectId,
+    pub mission_id: MissionId,
     pub task_id: CreatorTaskId,
     pub deliverable_id: DeliverableId,
+    pub expected_task_revision: u64,
+    pub expected_deliverable_revision: u32,
     pub review_id: ReviewId,
     pub reviewer_id: ActorId,
     pub decision: ReviewDecision,
@@ -1345,6 +1351,8 @@ pub struct ManagedContextRuntime {
     pub handle: WorkerHandle,
     pub mailbox: WorkerMailbox,
     pub runtime: StdioRuntime,
+    pub scheduler_gate: RuntimeSchedulerGate,
+    pub scheduler_permit: Option<RuntimeAttemptPermit>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -4361,6 +4369,8 @@ pub struct MissionProjection {
     pub current_checkpoint_oracle_ids: BTreeSet<String>,
     #[serde(default)]
     pub current_checkpoint_completion_policy: Option<MissionCheckpointCompletionPolicy>,
+    #[serde(default)]
+    pub browser_workspace: Option<BrowserWorkspaceProjection>,
     pub completed_checkpoint_count: usize,
     pub checkpoint_count: usize,
     pub cycle: u64,
@@ -4380,6 +4390,49 @@ pub struct MissionProjection {
     pub outcome_summary: Option<String>,
     #[serde(default)]
     pub vm11_outcome_review: Option<Vm11OutcomeReviewDecisionProjection>,
+    /// Content-free Creator Work facts for this Mission. Artifact bytes never
+    /// cross this projection; window Review uses only exact ids, CAS revision,
+    /// digest, and the frozen acceptance checklist.
+    #[serde(default)]
+    pub creator_work: Option<CreatorWorkProjection>,
+}
+
+/// Content-free Creator Task facts for one Mission. Review is not Verification
+/// and this projection never implies a payout or Effect.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorWorkProjection {
+    pub task_id: CreatorTaskId,
+    pub status: CreatorTaskStatus,
+    pub expected_task_revision: u64,
+    pub reviewable: Option<CreatorDeliverableReviewProjection>,
+    pub accepted_deliverable_count: usize,
+    pub payout_verified: bool,
+}
+
+/// Exact uploaded deliverable awaiting a typed ReviewDecision. The window
+/// cannot substitute another digest or invent checklist rows.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorDeliverableReviewProjection {
+    pub deliverable_id: DeliverableId,
+    pub expected_deliverable_revision: u32,
+    pub content_digest: String,
+    pub acceptance_checks: Vec<String>,
+}
+
+/// Content-free Browser Workspace facts for one Mission. Lease identifiers and
+/// Host session state never cross this projection; Continue uses only the
+/// durable ids, revision, generation, and control owner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserWorkspaceProjection {
+    pub workspace_id: BrowserWorkspaceId,
+    pub profile_id: BrowserProfileId,
+    pub identity_digest: String,
+    pub control_state: BrowserControlState,
+    pub revision: u64,
+    pub lease_generation: u64,
 }
 
 /// Exact decision material shown by Desktop for VM-11. The review and both
@@ -4852,6 +4905,16 @@ impl ApplicationService {
         Ok(self
             .store
             .load_browser_workspace(project_id, workspace_id)?)
+    }
+
+    pub fn load_live_browser_workspace_for_mission(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<Option<BrowserWorkspace>, ApplicationError> {
+        Ok(self
+            .store
+            .load_live_browser_workspace_for_mission(project_id, mission_id)?)
     }
 
     pub fn acknowledge_browser_batch_receipt(
@@ -11737,6 +11800,27 @@ impl ApplicationService {
         Ok(self.store.load_creator_hiring(project_id, hiring_id)?)
     }
 
+    pub fn persist_created_creator_task(
+        &mut self,
+        task: CreatorTask,
+        now: DateTime<Utc>,
+    ) -> Result<CreatorTask, ApplicationError> {
+        if task.state_revision != 1 {
+            return Err(ApplicationError::CreatorStateInvariant);
+        }
+        self.store.create_creator_task(
+            &task,
+            "creator_task.created",
+            &serde_json::json!({
+                "taskId": task.id,
+                "contractRevision": task.contract_revision,
+                "contractDigest": task.contract_digest(),
+            }),
+            now,
+        )?;
+        Ok(task)
+    }
+
     pub fn create_creator_task(
         &mut self,
         spec: CreatorTaskSpec,
@@ -11868,9 +11952,39 @@ impl ApplicationService {
         command: ReviewCreatorDeliverable,
         now: DateTime<Utc>,
     ) -> Result<CreatorTask, ApplicationError> {
+        if command.expected_task_revision == 0
+            || command.expected_deliverable_revision == 0
+            || command.review_id.as_str().trim().is_empty()
+            || command.reviewer_id.as_str().trim().is_empty()
+            || !matches!(
+                command.decision,
+                ReviewDecision::Accept | ReviewDecision::RequestRevision
+            )
+        {
+            return Err(ApplicationError::CreatorDeliverableReviewCommandMismatch);
+        }
         let mut task = self
             .store
             .load_creator_task(&command.project_id, &command.task_id)?;
+        if task.project_id != command.project_id || task.mission_id != command.mission_id {
+            return Err(ApplicationError::CreatorDeliverableReviewCommandMismatch);
+        }
+        if task.state_revision != command.expected_task_revision {
+            return Err(ApplicationError::CreatorTaskRevisionMismatch {
+                expected: command.expected_task_revision,
+                actual: task.state_revision,
+            });
+        }
+        let deliverable = task
+            .deliverables
+            .iter()
+            .find(|item| item.id == command.deliverable_id)
+            .ok_or(ApplicationError::CreatorDeliverableReviewUnavailable)?;
+        if deliverable.revision != command.expected_deliverable_revision
+            || deliverable.status != DeliverableStatus::ReadyForReview
+        {
+            return Err(ApplicationError::CreatorDeliverableReviewUnavailable);
+        }
         let expected_revision = task.state_revision;
         task.review_deliverable(
             &command.deliverable_id,
@@ -15051,7 +15165,31 @@ impl ApplicationService {
         self.store
             .update_runtime_turn_attempt(&attempt, expected_revision)?;
 
-        match managed.runtime.start_mapped_turn(
+        let attempt_digest = runtime_turn_attempt_digest(&attempt.id);
+        let permit = match authorize_runtime_scheduler_turn(
+            &mut managed.scheduler_gate,
+            &attempt_digest,
+            &managed.mapping,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let expected_revision = attempt.revision;
+                attempt.fail_dispatch(
+                    RuntimeTurnFailureClass::DispatchNotSent,
+                    sha256(format!("{error:?}").as_bytes()),
+                    true,
+                    now,
+                )?;
+                self.store
+                    .update_runtime_turn_attempt(&attempt, expected_revision)?;
+                return Err(error);
+            }
+        };
+        managed.scheduler_permit = Some(permit.clone());
+
+        match managed.runtime.start_mapped_turn_authorized(
+            &managed.scheduler_gate,
+            &permit,
             &managed.mapping,
             attempt.id.as_str(),
             &prompt,
@@ -15068,6 +15206,10 @@ impl ApplicationService {
                     && runtime_mapping_base_digest(&dispatch.mapping)?
                         == attempt.scope.runtime_mapping_digest;
                 let Some(runtime_turn_id) = dispatch.mapping.runtime_turn_id.clone() else {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
                     let expected_revision = attempt.revision;
                     attempt.freeze_uncertain(
                         RuntimeTurnFailureClass::Protocol,
@@ -15082,6 +15224,10 @@ impl ApplicationService {
                     });
                 };
                 if !mapping_matches {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
                     let expected_revision = attempt.revision;
                     attempt.freeze_uncertain(
                         RuntimeTurnFailureClass::Protocol,
@@ -15095,6 +15241,7 @@ impl ApplicationService {
                         disposition: RuntimeTurnDispatchDisposition::Uncertain,
                     });
                 }
+                managed.scheduler_gate.accept_dispatch(&permit, &dispatch)?;
                 managed.mapping = dispatch.mapping;
                 let expected_revision = attempt.revision;
                 attempt.accept_dispatch(
@@ -15112,6 +15259,17 @@ impl ApplicationService {
             }
             Err(error) => {
                 let (class, definitive) = classify_runtime_turn_dispatch_error(&error);
+                if definitive {
+                    record_runtime_scheduler_failed(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
+                } else {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
+                }
                 let expected_revision = attempt.revision;
                 attempt.fail_dispatch(
                     class,
@@ -15166,6 +15324,10 @@ impl ApplicationService {
             }
             Err(error) => {
                 if attempt.status != RuntimeTurnStatus::Uncertain {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
                     let expected_revision = attempt.revision;
                     attempt.freeze_uncertain(
                         classify_runtime_turn_stream_error(&error),
@@ -15203,6 +15365,10 @@ impl ApplicationService {
                     .collect::<String>(),
             );
             if !streamed_body.is_empty() && streamed_body.as_str() != message.as_str() {
+                record_runtime_scheduler_uncertain(
+                    &mut managed.scheduler_gate,
+                    managed.scheduler_permit.as_ref(),
+                )?;
                 attempt.freeze_uncertain(
                     RuntimeTurnFailureClass::Protocol,
                     event.event_digest,
@@ -15320,7 +15486,34 @@ impl ApplicationService {
                 .update_runtime_turn_attempt(&attempt, expected_revision)?;
         }
         if attempt.status.is_terminal() {
+            match attempt.status {
+                RuntimeTurnStatus::Completed => {
+                    record_runtime_scheduler_completed(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                        &runtime_turn_dispatch_for_gate(
+                            &managed.mapping,
+                            attempt
+                                .dispatch_request_digest
+                                .clone()
+                                .unwrap_or_else(|| sha256(b"runtime-turn-missing-request-digest")),
+                            attempt
+                                .dispatch_response_digest
+                                .clone()
+                                .unwrap_or_else(|| sha256(b"runtime-turn-missing-response-digest")),
+                        ),
+                    )?;
+                }
+                RuntimeTurnStatus::Failed | RuntimeTurnStatus::Interrupted => {
+                    record_runtime_scheduler_failed(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
+                }
+                _ => {}
+            }
             managed.mapping.runtime_turn_id = None;
+            managed.scheduler_permit = None;
         }
         Ok(ContextRuntimeTurnObservation {
             attempt,
@@ -15378,6 +15571,10 @@ impl ApplicationService {
                     .update_runtime_turn_attempt(&attempt, expected_revision)?;
             }
             Err(error) => {
+                record_runtime_scheduler_uncertain(
+                    &mut managed.scheduler_gate,
+                    managed.scheduler_permit.as_ref(),
+                )?;
                 let expected_revision = attempt.revision;
                 attempt.freeze_uncertain(
                     RuntimeTurnFailureClass::ApprovalResponseUncertain,
@@ -15419,6 +15616,10 @@ impl ApplicationService {
                     .update_runtime_turn_attempt(&attempt, expected_revision)?;
             }
             Err(error) => {
+                record_runtime_scheduler_uncertain(
+                    &mut managed.scheduler_gate,
+                    managed.scheduler_permit.as_ref(),
+                )?;
                 let expected_revision = attempt.revision;
                 attempt.freeze_uncertain(
                     RuntimeTurnFailureClass::InterruptUncertain,
@@ -15614,9 +15815,55 @@ impl ApplicationService {
             )],
             now,
         )?;
-        let mut runtime = match StdioRuntime::spawn_prepared(runtime_command, &runtime_launch) {
+        let lease = self
+            .store
+            .load_worker_lease(&attempt.project_id, &handle.lease_id)?;
+        let spawn_mapping = RuntimeMapping::new(
+            attempt.project_id.as_str(),
+            attempt.mission_id.as_str(),
+            attempt.target_attachment_epoch,
+            process_claim.launch_token_digest.clone(),
+            model.unwrap_or("unspecified-runtime-model"),
+            "unspecified-runtime-provider",
+            format!("runtime-spawn-{}", attempt.process_attempt),
+        )?;
+        let mut scheduler_gate = bind_runtime_scheduler_gate(
+            &lease,
+            &spawn_mapping,
+            runtime_scheduler_schedule_digest(&attempt, &process_claim),
+        )?;
+        let spawn_permit = match authorize_runtime_scheduler_turn(
+            &mut scheduler_gate,
+            &runtime_scheduler_spawn_attempt_digest(&attempt, &process_claim),
+            &spawn_mapping,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.reconcile_runtime_process_claim(
+                    &mut process_claim,
+                    "context.runtime_process_spawn_reconciled",
+                    now,
+                )?;
+                if let ApplicationError::RuntimeScheduler(scheduler_error) = &error {
+                    self.persist_runtime_process_failure(
+                        &mut attempt,
+                        RuntimeRecoveryFailureClass::Spawn,
+                        &AdapterError::Scheduler(scheduler_error.clone()),
+                        now,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        let mut runtime = match StdioRuntime::spawn_prepared_authorized(
+            runtime_command,
+            &runtime_launch,
+            &scheduler_gate,
+            &spawn_permit,
+        ) {
             Ok(runtime) => runtime,
             Err(error) => {
+                scheduler_gate.record_failed(&spawn_permit)?;
                 self.reconcile_runtime_process_claim(
                     &mut process_claim,
                     "context.runtime_process_spawn_reconciled",
@@ -15789,6 +16036,12 @@ impl ApplicationService {
             )],
             now,
         )?;
+        scheduler_gate.record_failed(&spawn_permit)?;
+        let scheduler_gate = bind_runtime_scheduler_gate(
+            &lease,
+            &mapping,
+            runtime_scheduler_schedule_digest(&attempt, &process_claim),
+        )?;
         Ok(ManagedContextRuntime {
             recovery: attempt,
             process_claim,
@@ -15796,6 +16049,8 @@ impl ApplicationService {
             handle,
             mailbox,
             runtime,
+            scheduler_gate,
+            scheduler_permit: None,
         })
     }
 
@@ -15909,8 +16164,17 @@ impl ApplicationService {
         let ManagedContextRuntime {
             runtime,
             mut process_claim,
+            mut scheduler_gate,
+            scheduler_permit,
             ..
         } = managed;
+        if let Some(permit) = scheduler_permit.as_ref()
+            && scheduler_gate
+                .attempt(permit.attempt_id_digest())
+                .is_ok_and(|view| view.status == RuntimeAttemptStatus::Running)
+        {
+            scheduler_gate.record_uncertain(permit)?;
+        }
         self.shutdown_runtime_process_claim(
             runtime,
             &mut process_claim,
@@ -18131,6 +18395,17 @@ fn mission_projection(
             .count()
     });
     let vm11_outcome_review = vm11_outcome_review_decision_projection(store, &mission)?;
+    let creator_work = creator_work_projection(store, &mission)?;
+    let browser_workspace = store
+        .load_live_browser_workspace_for_mission(&mission.project_id, &mission.id)?
+        .map(|workspace| BrowserWorkspaceProjection {
+            workspace_id: workspace.id,
+            profile_id: workspace.profile_id,
+            identity_digest: workspace.expected_identity_digest,
+            control_state: workspace.control_state,
+            revision: workspace.revision,
+            lease_generation: workspace.lease_generation,
+        });
     let title = if include_work_product_previews {
         mission.title
     } else {
@@ -18169,6 +18444,7 @@ fn mission_projection(
         current_checkpoint_application_handler_id,
         current_checkpoint_oracle_ids,
         current_checkpoint_completion_policy,
+        browser_workspace,
         completed_checkpoint_count,
         checkpoint_count,
         cycle,
@@ -18206,7 +18482,63 @@ fn mission_projection(
             .count(),
         outcome_summary,
         vm11_outcome_review,
+        creator_work,
     })
+}
+
+fn creator_work_projection(
+    store: &ProjectStore,
+    mission: &Mission,
+) -> Result<Option<CreatorWorkProjection>, ApplicationError> {
+    let mut matching = store
+        .creator_tasks_for_project(&mission.project_id)?
+        .into_iter()
+        .filter(|task| task.mission_id == mission.id)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    matching.sort_by(|left, right| {
+        (left.updated_at, left.state_revision, left.id.as_str()).cmp(&(
+            right.updated_at,
+            right.state_revision,
+            right.id.as_str(),
+        ))
+    });
+    let task = matching
+        .pop()
+        .ok_or(ApplicationError::CreatorStateInvariant)?;
+    if task.tenant_id != mission.tenant_id || task.project_id != mission.project_id {
+        return Err(ApplicationError::CreatorStateInvariant);
+    }
+    let reviewable = task
+        .deliverables
+        .iter()
+        .rev()
+        .find(|deliverable| deliverable.status == DeliverableStatus::ReadyForReview)
+        .map(|deliverable| CreatorDeliverableReviewProjection {
+            deliverable_id: deliverable.id.clone(),
+            expected_deliverable_revision: deliverable.revision,
+            content_digest: deliverable.content_digest.clone(),
+            acceptance_checks: task
+                .acceptance_criteria
+                .iter()
+                .chain(task.deliverable_requirements.iter())
+                .cloned()
+                .collect(),
+        });
+    Ok(Some(CreatorWorkProjection {
+        task_id: task.id,
+        status: task.status,
+        expected_task_revision: task.state_revision,
+        reviewable,
+        accepted_deliverable_count: task
+            .deliverables
+            .iter()
+            .filter(|deliverable| deliverable.status == DeliverableStatus::Accepted)
+            .count(),
+        payout_verified: !task.payouts.is_empty(),
+    }))
 }
 
 fn vm11_outcome_review_decision_projection(
@@ -21552,12 +21884,134 @@ fn runtime_mapping_base_digest(mapping: &RuntimeMapping) -> Result<String, Adapt
     base.digest()
 }
 
+fn runtime_scheduler_lease_fence(lease: &WorkerLease) -> Result<LeaseFence, ApplicationError> {
+    let fence = LeaseFence {
+        owner_digest: sha256(lease.id.as_str().as_bytes()),
+        token_digest: lease.lease_token_digest.clone(),
+        generation: lease.generation,
+    };
+    fence
+        .validate()
+        .map_err(|_| ApplicationError::RuntimeSchedulerPermitRequired)?;
+    Ok(fence)
+}
+
+fn runtime_scheduler_schedule_digest(
+    attempt: &RuntimeRecoveryAttempt,
+    process_claim: &RuntimeProcessClaim,
+) -> String {
+    sha256(
+        format!(
+            "runtime-schedule:{}:{}:{}:{}",
+            attempt.id,
+            attempt.process_attempt,
+            process_claim.launch_token_digest,
+            process_claim.launch_executable_path_digest
+        )
+        .as_bytes(),
+    )
+}
+
+fn runtime_scheduler_spawn_attempt_digest(
+    attempt: &RuntimeRecoveryAttempt,
+    process_claim: &RuntimeProcessClaim,
+) -> String {
+    sha256(
+        format!(
+            "runtime-spawn:{}:{}:{}",
+            attempt.id, attempt.process_attempt, process_claim.launch_token_digest
+        )
+        .as_bytes(),
+    )
+}
+
+fn runtime_turn_attempt_digest(attempt_id: &RuntimeTurnAttemptId) -> String {
+    sha256(attempt_id.as_str().as_bytes())
+}
+
+fn thread_mapping_for_scheduler(
+    mapping: &RuntimeMapping,
+) -> Result<RuntimeMapping, ApplicationError> {
+    let mut thread_mapping = mapping.clone();
+    thread_mapping.runtime_turn_id = None;
+    thread_mapping
+        .validate()
+        .map_err(|_| ApplicationError::RuntimeTurnScopeMismatch)?;
+    Ok(thread_mapping)
+}
+
+fn bind_runtime_scheduler_gate(
+    lease: &WorkerLease,
+    mapping: &RuntimeMapping,
+    schedule_id_digest: String,
+) -> Result<RuntimeSchedulerGate, ApplicationError> {
+    let binding = RuntimeScheduleBinding::new(
+        schedule_id_digest,
+        runtime_scheduler_lease_fence(lease)?,
+        thread_mapping_for_scheduler(mapping)?,
+    )?;
+    Ok(RuntimeSchedulerGate::new(binding))
+}
+
+fn authorize_runtime_scheduler_turn(
+    gate: &mut RuntimeSchedulerGate,
+    attempt_id_digest: &str,
+    mapping: &RuntimeMapping,
+) -> Result<RuntimeAttemptPermit, ApplicationError> {
+    Ok(gate.authorize_turn(attempt_id_digest, &thread_mapping_for_scheduler(mapping)?)?)
+}
+
+fn record_runtime_scheduler_failed(
+    gate: &mut RuntimeSchedulerGate,
+    permit: Option<&RuntimeAttemptPermit>,
+) -> Result<(), ApplicationError> {
+    if let Some(permit) = permit {
+        gate.record_failed(permit)?;
+    }
+    Ok(())
+}
+
+fn record_runtime_scheduler_uncertain(
+    gate: &mut RuntimeSchedulerGate,
+    permit: Option<&RuntimeAttemptPermit>,
+) -> Result<(), ApplicationError> {
+    if let Some(permit) = permit {
+        gate.record_uncertain(permit)?;
+    }
+    Ok(())
+}
+
+fn record_runtime_scheduler_completed(
+    gate: &mut RuntimeSchedulerGate,
+    permit: Option<&RuntimeAttemptPermit>,
+    dispatch: &RuntimeTurnDispatch,
+) -> Result<(), ApplicationError> {
+    if let Some(permit) = permit {
+        gate.record_completed(permit, dispatch)?;
+    }
+    Ok(())
+}
+
+fn runtime_turn_dispatch_for_gate(
+    mapping: &RuntimeMapping,
+    request_digest: impl Into<String>,
+    response_digest: impl Into<String>,
+) -> RuntimeTurnDispatch {
+    RuntimeTurnDispatch {
+        mapping: mapping.clone(),
+        request_digest: request_digest.into(),
+        response_digest: response_digest.into(),
+        elapsed: StdDuration::from_millis(0),
+    }
+}
+
 fn classify_runtime_turn_dispatch_error(error: &AdapterError) -> (RuntimeTurnFailureClass, bool) {
     match error {
         AdapterError::TurnRequestRejected { .. } => {
             (RuntimeTurnFailureClass::DispatchRejected, true)
         }
-        AdapterError::InvalidRuntimeMapping
+        AdapterError::Scheduler(_)
+        | AdapterError::InvalidRuntimeMapping
         | AdapterError::InvalidTurnRequest
         | AdapterError::OutboundMessageTooLarge { .. }
         | AdapterError::UnsupportedClientMethod(_)
@@ -21642,6 +22096,8 @@ pub enum ApplicationError {
     CloudStorage(#[from] CloudStorageError),
     #[error(transparent)]
     Runtime(#[from] AdapterError),
+    #[error(transparent)]
+    RuntimeScheduler(#[from] RuntimeSchedulerError),
     #[error(transparent)]
     RuntimeTurn(#[from] RuntimeTurnError),
     #[error(transparent)]
@@ -21863,6 +22319,14 @@ pub enum ApplicationError {
     #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
     ProposedEffectApprovalDigestMismatch,
     #[error(
+        "Creator Deliverable Review requires the exact Project, Mission, task, deliverable, CAS revision, and a typed ReviewDecision"
+    )]
+    CreatorDeliverableReviewCommandMismatch,
+    #[error("creator task revision changed: expected {expected}, actual {actual}")]
+    CreatorTaskRevisionMismatch { expected: u64, actual: u64 },
+    #[error("the current Creator Task has no matching uploaded deliverable ready for Review")]
+    CreatorDeliverableReviewUnavailable,
+    #[error(
         "Catalog Mission route, mode, market, language, audience, timezone, or budget is invalid"
     )]
     InvalidCatalogMissionInput,
@@ -21968,6 +22432,8 @@ pub enum ApplicationError {
     InvalidConversationReplyEffect,
     #[error("the durable effect reconciliation cannot be projected into the bound conversation")]
     InvalidEffectReconciliationProjection,
+    #[error("runtime spawn or turn requires a current scheduler permit")]
+    RuntimeSchedulerPermitRequired,
 }
 
 #[cfg(test)]
@@ -29311,6 +29777,18 @@ sleep 30"#
             uncertain_outcome.attempt.failures[0].class,
             RuntimeTurnFailureClass::DispatchUncertain
         );
+        let uncertain_permit = uncertain
+            .managed
+            .scheduler_permit
+            .clone()
+            .expect("uncertain permit");
+        assert!(matches!(
+            uncertain
+                .managed
+                .scheduler_gate
+                .require_current_permit(&uncertain_permit),
+            Err(RuntimeSchedulerError::UncertainReplaySuppressed)
+        ));
         let second_command = dispatch_command(
             &uncertain,
             "turn-attempt-forbidden-replay",
@@ -29340,6 +29818,193 @@ sleep 30"#
         assert_eq!(fenced, uncertain_outcome.attempt);
         assert!(
             uncertain
+                .managed
+                .runtime
+                .shutdown()
+                .expect("shutdown")
+                .forced
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one replay proves stale, taken-over, uncertain, completed, and fresh-retry permit fencing"
+    )]
+    fn runtime_turn_requires_a_current_scheduler_permit_and_retries_only_with_a_fresh_one() {
+        let mut rejected = ready_runtime_turn_fixture(|workspace| {
+            turn_dispatch_fault_runtime_command(
+                workspace,
+                "private-runtime-thread-scheduler-rejected",
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "error": {"code": -32001, "message": "PRIVATE-REJECTION"}
+                })),
+            )
+        });
+        let rejected_command = dispatch_command(
+            &rejected,
+            "turn-attempt-scheduler-rejected",
+            StdDuration::from_secs(1),
+        );
+        let rejected_outcome = rejected
+            .fixture
+            .service
+            .dispatch_context_runtime_turn(
+                &mut rejected.managed,
+                rejected_command,
+                &rejected.envelope,
+                now() + Duration::seconds(6),
+            )
+            .expect("durable rejection");
+        assert_eq!(
+            rejected_outcome.disposition,
+            RuntimeTurnDispatchDisposition::Failed
+        );
+        let stale_permit = rejected
+            .managed
+            .scheduler_permit
+            .clone()
+            .expect("failed dispatch keeps the consumed permit until retry");
+        assert!(matches!(
+            rejected
+                .managed
+                .scheduler_gate
+                .require_current_permit(&stale_permit),
+            Err(RuntimeSchedulerError::AttemptPermitLost)
+        ));
+        let mapping = rejected.managed.scheduler_gate.binding().mapping().clone();
+        let retry_permit = rejected
+            .managed
+            .scheduler_gate
+            .authorize_turn(stale_permit.attempt_id_digest(), &mapping)
+            .expect("failed retry uses a fresh permit only");
+        assert_ne!(stale_permit, retry_permit);
+        assert!(matches!(
+            rejected
+                .managed
+                .scheduler_gate
+                .require_current_permit(&stale_permit),
+            Err(RuntimeSchedulerError::AttemptPermitLost)
+        ));
+        rejected
+            .managed
+            .scheduler_gate
+            .require_current_permit(&retry_permit)
+            .expect("fresh permit is current");
+        rejected
+            .managed
+            .scheduler_gate
+            .record_failed(&retry_permit)
+            .expect("close fresh permit");
+        assert!(
+            rejected
+                .managed
+                .runtime
+                .shutdown()
+                .expect("shutdown")
+                .forced
+        );
+
+        let mut completed = ready_runtime_turn_fixture(|workspace| {
+            completed_stream_fake_runtime_command(
+                workspace,
+                "private-runtime-thread-scheduler-complete",
+                "private-runtime-turn-scheduler-complete",
+                "PRIVATE-SCHEDULER-COMPLETE",
+                "PRIVATE-SCHEDULER-COMPLETE",
+            )
+        });
+        let completed_turn_id = RuntimeTurnAttemptId::from("turn-attempt-scheduler-complete");
+        let completed_command = dispatch_command(
+            &completed,
+            completed_turn_id.as_str(),
+            StdDuration::from_secs(1),
+        );
+        let dispatch = completed
+            .fixture
+            .service
+            .dispatch_context_runtime_turn(
+                &mut completed.managed,
+                completed_command,
+                &completed.envelope,
+                now() + Duration::seconds(6),
+            )
+            .expect("completed stream dispatch");
+        let current_permit = completed
+            .managed
+            .scheduler_permit
+            .clone()
+            .expect("running permit");
+        completed
+            .managed
+            .scheduler_gate
+            .require_current_permit(&current_permit)
+            .expect("running permit is current");
+        let mut revision = dispatch.attempt.revision;
+        for index in 0..5 {
+            let observation = completed
+                .fixture
+                .service
+                .observe_context_runtime_turn(
+                    &mut completed.managed,
+                    &ObserveContextRuntimeTurn {
+                        project_id: completed.fixture.project_id.clone(),
+                        id: completed_turn_id.clone(),
+                        expected_revision: revision,
+                        event_timeout: StdDuration::from_secs(1),
+                    },
+                    now() + Duration::seconds(7 + index),
+                )
+                .expect("completed stream observation");
+            revision = observation.attempt.revision;
+        }
+        assert_eq!(
+            completed
+                .fixture
+                .service
+                .runtime_turn_attempt(&completed.fixture.project_id, &completed_turn_id)
+                .expect("completed turn")
+                .status,
+            RuntimeTurnStatus::Completed
+        );
+        assert!(matches!(
+            completed
+                .managed
+                .scheduler_gate
+                .require_current_permit(&current_permit),
+            Err(RuntimeSchedulerError::CompletedReplaySuppressed)
+        ));
+        completed
+            .managed
+            .scheduler_gate
+            .take_over(
+                LeaseFence {
+                    owner_digest: sha256(b"taken-over-owner"),
+                    token_digest: sha256(b"taken-over-token"),
+                    generation: current_permit.fence().generation + 1,
+                },
+                {
+                    let mut next = completed.managed.mapping.clone();
+                    next.runtime_turn_id = None;
+                    next.runtime_generation += 1;
+                    next.runtime_instance_digest = sha256(b"taken-over-instance");
+                    next.runtime_thread_id = "taken-over-thread".into();
+                    next
+                },
+            )
+            .expect("takeover");
+        assert!(matches!(
+            completed
+                .managed
+                .scheduler_gate
+                .require_current_permit(&current_permit),
+            Err(RuntimeSchedulerError::LeaseFenceLost)
+        ));
+        assert!(
+            completed
                 .managed
                 .runtime
                 .shutdown()
@@ -30493,6 +31158,149 @@ sleep 30"#
             unlocked.missions[0].goal,
             "研究真实项目状态，但不执行外部动作"
         );
+        assert!(unlocked.missions[0].creator_work.is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fail-closed Review fence is asserted as one exact Offer-to-Review journey"
+    )]
+    fn review_creator_deliverable_fails_closed_on_stale_revision_and_wrong_decision() {
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        let ids = CreatorRecoveryIds {
+            tenant_id: TenantId::from("tenant-review-fence"),
+            project_id: ProjectId::from("project-review-fence"),
+            mission_id: MissionId::from("mission-review-fence"),
+            task_id: CreatorTaskId::from("task-review-fence"),
+            milestone_id: CreatorMilestoneId::from("milestone-review-fence"),
+            deliverable_id: DeliverableId::from("deliverable-review-fence"),
+            creator_id: CreatorId::from("creator-review-fence"),
+            connection_id: ConnectionId::from("connection-review-fence"),
+            effect: EffectId::from("effect-review-fence"),
+        };
+        let base = now();
+        create_creator_recovery_scope(&mut service, &ids, base);
+        register_creator_recovery_connection(&mut service, &ids, base);
+        fund_and_accept_creator_recovery_task(&mut service, &ids, base);
+        service
+            .submit_creator_deliverable(
+                SubmitCreatorDeliverable {
+                    project_id: ids.project_id.clone(),
+                    task_id: ids.task_id.clone(),
+                    deliverable: CreatorDeliverableInput {
+                        id: ids.deliverable_id.clone(),
+                        milestone_id: ids.milestone_id.clone(),
+                        artifact_uri: "cas://creator/review-fence".into(),
+                        media_type: "application/zip".into(),
+                        size_bytes: 1_024,
+                        content_digest: "7".repeat(64),
+                        uploaded_at: base + Duration::minutes(4),
+                        assessment: DeliverableAssessment {
+                            scanner: "review-fence-scanner".into(),
+                            clean: true,
+                            assessed_at: base + Duration::minutes(4),
+                            evidence_digest: "8".repeat(64),
+                        },
+                        rights: RightsAttestation {
+                            ownership_or_license: "creator original".into(),
+                            source_manifest_digest: "9".repeat(64),
+                            permitted_use: "campaign recovery use".into(),
+                            verified: true,
+                        },
+                    },
+                },
+                base + Duration::minutes(4),
+            )
+            .expect("submit review-fence deliverable");
+        let submitted = service
+            .load_creator_task(&ids.project_id, &ids.task_id)
+            .expect("submitted review-fence task");
+        let projected = service
+            .projection(&ids.project_id, &ids.mission_id, WorkSurface::Orchestrator)
+            .expect("review-fence projection");
+        let creator_work = projected
+            .creator_work
+            .as_ref()
+            .expect("creator work projection");
+        let reviewable = creator_work
+            .reviewable
+            .as_ref()
+            .expect("uploaded deliverable is reviewable");
+        assert_eq!(creator_work.task_id, ids.task_id);
+        assert_eq!(
+            creator_work.expected_task_revision,
+            submitted.state_revision
+        );
+        assert_eq!(reviewable.deliverable_id, ids.deliverable_id);
+        assert_eq!(reviewable.expected_deliverable_revision, 1);
+        assert_eq!(reviewable.content_digest, "7".repeat(64));
+        assert_eq!(
+            reviewable.acceptance_checks,
+            vec![
+                "Matches the approved scope".to_owned(),
+                "Includes the source manifest".to_owned(),
+            ]
+        );
+
+        let mut command = ReviewCreatorDeliverable {
+            project_id: ids.project_id.clone(),
+            mission_id: ids.mission_id.clone(),
+            task_id: ids.task_id.clone(),
+            deliverable_id: ids.deliverable_id.clone(),
+            expected_task_revision: submitted.state_revision,
+            expected_deliverable_revision: 1,
+            review_id: ReviewId::from("review-fence"),
+            reviewer_id: ActorId::from("review-fence-reviewer"),
+            decision: ReviewDecision::Reject,
+            acceptance_checks: vec![
+                AcceptanceCheck {
+                    requirement: "Matches the approved scope".into(),
+                    satisfied: true,
+                    evidence: "scope-check".into(),
+                },
+                AcceptanceCheck {
+                    requirement: "Includes the source manifest".into(),
+                    satisfied: true,
+                    evidence: "manifest-check".into(),
+                },
+            ],
+            notes: "typed ReviewDecision only".into(),
+        };
+        assert!(matches!(
+            service.review_creator_deliverable(command.clone(), base + Duration::minutes(5)),
+            Err(ApplicationError::CreatorDeliverableReviewCommandMismatch)
+        ));
+        command.decision = ReviewDecision::Accept;
+        command.expected_task_revision = submitted.state_revision.saturating_sub(1);
+        assert!(matches!(
+            service.review_creator_deliverable(command.clone(), base + Duration::minutes(5)),
+            Err(ApplicationError::CreatorTaskRevisionMismatch { expected, actual })
+                if expected == submitted.state_revision.saturating_sub(1)
+                    && actual == submitted.state_revision
+        ));
+        command.expected_task_revision = submitted.state_revision;
+        command.deliverable_id = DeliverableId::from("deliverable-does-not-exist");
+        assert!(matches!(
+            service.review_creator_deliverable(command.clone(), base + Duration::minutes(5)),
+            Err(ApplicationError::CreatorDeliverableReviewUnavailable)
+        ));
+        command.deliverable_id = ids.deliverable_id.clone();
+        service
+            .review_creator_deliverable(command, base + Duration::minutes(5))
+            .expect("accept exact uploaded revision");
+        let accepted = service
+            .projection(&ids.project_id, &ids.mission_id, WorkSurface::Orchestrator)
+            .expect("accepted projection")
+            .creator_work
+            .expect("accepted creator work");
+        assert!(accepted.reviewable.is_none());
+        assert_eq!(accepted.accepted_deliverable_count, 1);
+        assert!(!accepted.payout_verified);
+        assert_eq!(
+            accepted.status,
+            hartevo_domain_kernel::CreatorTaskStatus::SettlementPending
+        );
     }
 
     #[test]
@@ -31252,13 +32060,7 @@ sleep 30"#
         )
         .expect("creator recovery task");
         service
-            .store
-            .create_creator_task(
-                &task,
-                "creator_task.created",
-                &serde_json::json!({"taskId": task.id}),
-                base,
-            )
+            .persist_created_creator_task(task, base)
             .expect("persist creator recovery task");
     }
 
@@ -31390,8 +32192,14 @@ sleep 30"#
             .review_creator_deliverable(
                 ReviewCreatorDeliverable {
                     project_id: ids.project_id.clone(),
+                    mission_id: ids.mission_id.clone(),
                     task_id: ids.task_id.clone(),
                     deliverable_id: ids.deliverable_id.clone(),
+                    expected_task_revision: service
+                        .load_creator_task(&ids.project_id, &ids.task_id)
+                        .expect("submitted creator recovery task")
+                        .state_revision,
+                    expected_deliverable_revision: 1,
                     review_id: ReviewId::from("creator-recovery-review"),
                     reviewer_id: ActorId::from("creator-recovery-reviewer"),
                     decision: ReviewDecision::Accept,
@@ -38645,8 +39453,14 @@ sleep 30"#
             .review_creator_deliverable(
                 ReviewCreatorDeliverable {
                     project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
                     task_id: task_id.clone(),
                     deliverable_id: DeliverableId::from("deliverable-1"),
+                    expected_task_revision: service
+                        .load_creator_task(&project_id, &task_id)
+                        .expect("submitted creator task")
+                        .state_revision,
+                    expected_deliverable_revision: 1,
                     review_id: ReviewId::from("review-1"),
                     reviewer_id: ActorId::from("user-1"),
                     decision: ReviewDecision::Accept,
@@ -39701,6 +40515,16 @@ sleep 30"#
                 .expect_err("old in-flight cursor is hard-stopped")
                 .code(),
             "BROWSER_CONTROL_LEASE_LOST"
+        );
+
+        assert_eq!(
+            fixture
+                .service
+                .load_live_browser_workspace_for_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("live workspace after takeover")
+                .expect("one Mission-bound workspace")
+                .id,
+            fixture.workspace.id
         );
 
         let continued = fixture

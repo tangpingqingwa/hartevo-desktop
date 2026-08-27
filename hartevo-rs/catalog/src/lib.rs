@@ -12,6 +12,7 @@ use thiserror::Error;
 
 mod evidence;
 mod mission_contract;
+mod planning_plugin;
 mod provider_closure;
 mod route_graph;
 mod route_runtime_authority;
@@ -29,6 +30,17 @@ pub use evidence::{
 };
 pub use mission_contract::{
     EXPECTED_CAPABILITY_COUNT, EXPECTED_CHECKPOINT_ROUTE_COUNT, validate_mission_contract_closure,
+};
+pub use planning_plugin::{
+    CapabilityAvailabilityBinding, CapabilityAvailabilitySnapshot, CapabilityRouteProposal,
+    DurableDispatchRecord, DurablePlanAcceptance, DurablePlanDecline, DurablePlanLog,
+    DurablePlanReplan, MAX_PLANNING_BUDGET_UNITS, MAX_PLANNING_OBJECTIVE_BYTES,
+    MAX_PLANNING_ROUTE_STEPS, MAX_PLANNING_TEXT_BYTES, MissionPlanningConsumer,
+    MissionRouteDispatch, PLANNING_PLUGIN_ROUTE_SCHEMA_VERSION, PlanDeclineReason, PlanLogEntry,
+    PlanLogEvent, PlanReplanReason, PlanningCancellation, PlanningCapabilityId, PlanningError,
+    PlanningObjective, PlanningProvider, PlanningProviderDescriptor, PlanningProviderError,
+    PlanningProviderRegistration, PlanningProviderRoute, PlanningReplanRequest, PlanningRouteStep,
+    PlanningScope, PlanningService, ProviderLifecycleState, ScopedProviderRegistry,
 };
 use provider_closure::EFFECT_READBACK_ROUTE_CONTRACT_JSON;
 pub use provider_closure::{

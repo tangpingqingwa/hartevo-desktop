@@ -2311,6 +2311,7 @@ dependencies = [
  "dioxus",
  "dioxus-icons",
  "hartevo-application",
+ "hartevo-browser-adapter",
  "hartevo-catalog",
  "hartevo-context-fabric",
  "hartevo-cordis",

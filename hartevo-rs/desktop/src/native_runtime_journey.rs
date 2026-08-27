@@ -1368,6 +1368,12 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidVm11OutcomeDecision
         | DesktopDataError::InvalidVm11NextContractResolution
         | DesktopDataError::InvalidWaitingApprovalGrant
+        | DesktopDataError::InvalidBrowserWorkspaceContinue
+        | DesktopDataError::BrowserWorkspaceUnavailable
+        | DesktopDataError::BrowserWorkspaceContinueNotHeld
+        | DesktopDataError::InvalidCreatorDeliverableReview
+        | DesktopDataError::CreatorDeliverableReviewUnavailable
+        | DesktopDataError::CreatorDeliverableReviewStale
         | DesktopDataError::EmptyProjectName
         | DesktopDataError::InvalidRecoveryKey
         | DesktopDataError::ProjectNotFound(_)
@@ -1379,6 +1385,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::ProjectContextIntegrityError(_)
         | DesktopDataError::RuntimeSubscriptionContextMismatch
         | DesktopDataError::WorkProductActionStale
+        | DesktopDataError::RuntimeLocalApprovalUnavailable
+        | DesktopDataError::RuntimeLocalApprovalMismatch
         | DesktopDataError::Cordis(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
     };
     NativeJourneyError::new(code)

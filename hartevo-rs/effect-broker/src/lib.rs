@@ -3,6 +3,7 @@
 pub mod approval_authority;
 pub mod provider_auth;
 pub mod provider_contract;
+pub mod secret_broker;
 
 pub use approval_authority::{
     ApprovalAuthority, ApprovalAuthorityError, ApprovalAuthorityKind, ApprovalRecordAuthorization,
@@ -31,6 +32,13 @@ pub use provider_contract::{
     ProviderCapabilityEvidenceClaim, ProviderCapabilityKey, ProviderCapabilitySupport,
     ProviderContractError, ProviderEvidenceAuthority, ProviderEvidenceClass,
     ProviderEvidenceSupport, ProviderProvenanceClass, ValidatedProviderEvidenceBinding,
+};
+
+pub use secret_broker::{
+    MissionSecretReference, MissionSecretScope, SecretBrokerConsumer, SecretBrokerError,
+    SecretBrokerEvent, SecretBrokerEventKind, SecretBrokerProvider, SecretBrokerService,
+    SecretBrokerServiceDefinition, SecretBrokerState, SecretProviderDispatch, SecretProviderError,
+    SecretScope, SecretUseAuthority, SecretUseHandle, SecretUseReceipt,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
