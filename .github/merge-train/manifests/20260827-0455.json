@@ -1,0 +1,92 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "92db1c896479af9a5cf0129349a8da136d244d5e",
+  "candidateCount": 4,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "92db1c896479af9a5cf0129349a8da136d244d5e",
+      "headBranch": "codex/planning-plugin-route-01",
+      "headCommit": "fe011c89a156af70c7a322bf4f4e34498b1a9fc1",
+      "number": 161,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/catalog/src/lib.rs",
+          "hartevo-rs/catalog/src/planning_plugin.rs",
+          "hartevo-rs/catalog/tests/planning_plugin_route.rs"
+        ],
+        "receiptDigest": "1a886f02089ac89d92896b3650f797f3e097b133ed1b97baafd8682a5c64a4db",
+        "receiptPath": ".github/governance/reviews/pr-161.json",
+        "reviewedHeadSha": "c4071de288c739fb834a78dd0c21492ef080a199",
+        "reviewerTaskId": "01a04184-d51b-7f50-a4b3-3f16fafb9968"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "92db1c896479af9a5cf0129349a8da136d244d5e",
+      "headBranch": "codex/secret-broker-plugin-01",
+      "headCommit": "eeacb9bcc8a55c3f4074d5004bb39f9562d1a705",
+      "number": 166,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/effect-broker/src/lib.rs",
+          "hartevo-rs/effect-broker/src/secret_broker.rs"
+        ],
+        "receiptDigest": "38d8a297bf22db39ed294c4fbb1efb140db9598ff0091f34f3c1b3c3967e12b6",
+        "receiptPath": ".github/governance/reviews/pr-166.json",
+        "reviewedHeadSha": "8724c9e8005a049f24d890c67f21f2072faa1fc9",
+        "reviewerTaskId": "01a04184-d51b-7f50-a4b3-3f29a13cea62"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "92db1c896479af9a5cf0129349a8da136d244d5e",
+      "headBranch": "codex/steer-plugin-durable-input-01",
+      "headCommit": "9653ebf8297cf9894b76e04191f9cfc38d7d8b00",
+      "number": 177,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/context-fabric/src/lib.rs",
+          "hartevo-rs/context-fabric/src/steering.rs"
+        ],
+        "receiptDigest": "3ac23c0634735c2ce7bd1102874def5722cef3d65369d6ae9497a6dbb6b5432a",
+        "receiptPath": ".github/governance/reviews/pr-177.json",
+        "reviewedHeadSha": "ca82a6972f45f9af68d170de9e197ab2f24a5822",
+        "reviewerTaskId": "01a04184-d51b-7f50-a4b3-3f3442120e3d"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "92db1c896479af9a5cf0129349a8da136d244d5e",
+      "headBranch": "codex/scheduler-macos-wake-provider-01",
+      "headCommit": "9fda752fa3cc3e9042159f0b7b374e31ef8eef8b",
+      "number": 272,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/mission-scheduler/src/lib.rs",
+          "hartevo-rs/mission-scheduler/src/macos_wake_provider.rs"
+        ],
+        "receiptDigest": "19e8fa7eecf5ffb52653e2c5367407f97fe2c11bb43dc745413228f6bee46a68",
+        "receiptPath": ".github/governance/reviews/pr-272.json",
+        "reviewedHeadSha": "fa94b66fdbf926c34fc0fd0469f73ee241aaff57",
+        "reviewerTaskId": "01a04184-d51b-7f50-a4b3-3f4eacefc3b4"
+      }
+    }
+  ],
+  "createdAt": "2026-08-27T04:53:49Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260827-0455"
+}

@@ -3,6 +3,7 @@
 //! Runtime threads, model output, and provider responses are projections into this
 //! kernel. They are never accepted as business truth without a domain command.
 
+mod attribution_evidence_query;
 mod attribution_outcome_adoption;
 mod attribution_spine;
 mod connection;
@@ -29,6 +30,22 @@ mod runtime_turn;
 mod truth;
 mod work_product;
 
+pub use attribution_evidence_query::{
+    ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_MOUNT_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_REVOKE_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_CONTRACT_VERSION, ATTRIBUTION_EVIDENCE_QUERY_FEEDBACK_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_REQUEST_EVENT_TYPE, ATTRIBUTION_EVIDENCE_QUERY_SCHEMA_VERSION,
+    AttributionEvidenceAdoptionDecision, AttributionEvidenceAdoptionFeedback,
+    AttributionEvidenceConfidence, AttributionEvidenceCounterevidence,
+    AttributionEvidenceFreshness, AttributionEvidenceFreshnessState,
+    AttributionEvidenceQueryConsumer, AttributionEvidenceQueryConsumerRecord,
+    AttributionEvidenceQueryConsumerState, AttributionEvidenceQueryError,
+    AttributionEvidenceQueryId, AttributionEvidenceQueryProvider, AttributionEvidenceQueryRecord,
+    AttributionEvidenceQueryRequest, AttributionEvidenceQueryResponse,
+    AttributionEvidenceQueryScope, AttributionEvidenceQueryService,
+    AttributionEvidenceQuerySnapshot, AttributionEvidenceQueryWindow,
+    AttributionEvidenceSourceCoverage,
+};
 pub use attribution_outcome_adoption::{
     ATTRIBUTION_ADOPTION_CANDIDATE_EVENT_TYPE, ATTRIBUTION_ADOPTION_CONSUMER_MOUNT_EVENT_TYPE,
     ATTRIBUTION_ADOPTION_CONSUMER_REVOKE_EVENT_TYPE,

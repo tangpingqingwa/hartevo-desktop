@@ -656,6 +656,7 @@ fn mission_projection(project_id: &ProjectId, source: VisualMission) -> MissionP
         current_checkpoint_application_handler_id: None,
         current_checkpoint_oracle_ids: BTreeSet::from(["work_product".into()]),
         current_checkpoint_completion_policy: Some(MissionCheckpointCompletionPolicy::WorkProduct),
+        browser_workspace: None,
         completed_checkpoint_count: source.completed_checkpoints,
         checkpoint_count: source.checkpoint_count,
         cycle: source.cycle,
@@ -672,9 +673,11 @@ fn mission_projection(project_id: &ProjectId, source: VisualMission) -> MissionP
         work_product_count: work_products.len(),
         work_products,
         pending_approval_count: source.pending_approvals,
+        pending_effects: Vec::new(),
         verified_effect_count: 0,
         outcome_summary: None,
         vm11_outcome_review: None,
+        creator_work: None,
     }
 }
 

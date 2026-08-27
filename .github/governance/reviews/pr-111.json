@@ -1,0 +1,17 @@
+{
+  "authorTaskId": "01a03d25-2547-71f0-aabc-87aba07faddd",
+  "baseSha": "138ed6097d2502271f91af60ffcb5e11d5f14f18",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/cloud-storage/src/lib.rs",
+    "hartevo-rs/cloud-storage/tests/cell_integration.rs"
+  ],
+  "pr": 111,
+  "receiptDigest": "7b5ff0ea901a4c3470c0d9a2e731fb323a0c190baa1f370a92b40a35c51caa39",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T08:41:26Z",
+  "reviewedHeadSha": "842f781c66d87d7b5e4bbf27d5449b4e98883f8e",
+  "reviewerTaskId": "01a03d32-1ecf-73a2-a186-d5ca31392952",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
