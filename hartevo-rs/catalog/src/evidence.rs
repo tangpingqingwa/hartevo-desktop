@@ -21,9 +21,9 @@ const REQUIRED_E5_MARKETS: usize = 3;
 const REQUIRED_GA_OBSERVATION_DAYS: usize = 30;
 const REQUIRED_E5_OBSERVATION_DAYS: usize = 90;
 const EVALUATION_RESULT_REFERENCES_SCHEMA_VERSION: &str =
-    "hartevo-release-evaluation-result-references/v1";
+    "hartevo-release-evaluation-result-references/v2";
 const EVALUATION_RESULT_REFERENCES_DIGEST_DOMAIN: &str =
-    "hartevo-release-evaluation-result-reference-set/v1";
+    "hartevo-release-evaluation-result-reference-set/v2";
 
 const REQUIRED_SAFETY_INVARIANTS: [&str; 28] = [
     "approval_bypass",
@@ -149,6 +149,56 @@ pub enum EvaluationRunEvidenceAuthority {
     RunEvidenceOnly,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluatorEvidenceKind {
+    EvaluationRunResult,
+    BrowserEvaluationResult,
+    IntegrationBuildProvenance,
+    LocalFallbackReceipt,
+    Fixture,
+    Simulator,
+    SourceAudit,
+    IgnoredResult,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EvaluatorEvidenceAuthority {
+    #[serde(rename = "hartevo_evaluation_run_validator_v1")]
+    HartevoEvaluationRunValidatorV1,
+    #[serde(rename = "hartevo_browser_contract_validator_v1")]
+    HartevoBrowserContractValidatorV1,
+    #[serde(rename = "INTEGRATION_BUILD_PROVENANCE_ONLY")]
+    IntegrationBuildProvenanceOnly,
+    #[serde(rename = "LOCAL_FALLBACK_RECEIPT_ONLY")]
+    LocalFallbackReceiptOnly,
+    #[serde(rename = "FIXTURE_EVIDENCE_ONLY")]
+    FixtureEvidenceOnly,
+    #[serde(rename = "SIMULATOR_EVIDENCE_ONLY")]
+    SimulatorEvidenceOnly,
+    #[serde(rename = "SOURCE_AUDIT_ONLY")]
+    SourceAuditOnly,
+    #[serde(rename = "IGNORED_RESULT_ONLY")]
+    IgnoredResultOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EvaluatorExecutionStatus {
+    Executed,
+    NotExecuted,
+    CiNotExecuted,
+    BlockedExternalBilling,
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluatorAuthorityScope {
+    EvaluationResultsOnly,
+    AuditOnly,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EvaluationSafetyMappingStatus {
@@ -166,6 +216,10 @@ pub enum EvaluationPrivateAttestationStatus {
 pub struct EvaluationRunResultReference {
     pub validation_authority: EvaluationRunValidationAuthority,
     pub evidence_authority: EvaluationRunEvidenceAuthority,
+    pub evidence_kind: EvaluatorEvidenceKind,
+    pub evaluator_authority: EvaluatorEvidenceAuthority,
+    pub execution_status: EvaluatorExecutionStatus,
+    pub authority_scope: EvaluatorAuthorityScope,
     pub release_commit: String,
     pub catalog_digest: String,
     pub release_schema_digest: String,
@@ -227,6 +281,10 @@ pub enum BrowserReferenceVerdict {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserEvaluationResultReference {
     pub validation_authority: BrowserReferenceValidationAuthority,
+    pub evidence_kind: EvaluatorEvidenceKind,
+    pub evaluator_authority: EvaluatorEvidenceAuthority,
+    pub execution_status: EvaluatorExecutionStatus,
+    pub authority_scope: EvaluatorAuthorityScope,
     pub receipt_schema_version: String,
     pub receipt_authority: String,
     pub release_decision: String,
@@ -583,13 +641,32 @@ impl EvaluationRunResultReferences {
         run: Option<EvaluationRunResultReference>,
         mut browser_results: Vec<BrowserEvaluationResultReference>,
     ) -> Result<Self, String> {
-        browser_results.sort_by(|left, right| {
-            (&left.case_id, &left.receipt_digest).cmp(&(&right.case_id, &right.receipt_digest))
-        });
-        for reference in &mut browser_results {
-            reference.evidence_classes.sort_unstable();
-            reference.evidence_classes.dedup();
+        let mut case_ids = BTreeSet::new();
+        let mut receipt_digests = BTreeSet::new();
+        let mut validation_digests = BTreeSet::new();
+        for reference in &browser_results {
+            let evidence_classes = reference
+                .evidence_classes
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if evidence_classes.len() != reference.evidence_classes.len() {
+                return Err(format!(
+                    "Browser reference {} repeats an evidence class",
+                    reference.case_id
+                ));
+            }
+            if !case_ids.insert(reference.case_id.clone())
+                || !receipt_digests.insert(reference.receipt_digest.clone())
+                || !validation_digests.insert(reference.validation_result_digest.clone())
+            {
+                return Err(
+                    "Browser references require unique case, receipt and validation identities"
+                        .into(),
+                );
+            }
         }
+        browser_results.sort_by(|left, right| left.case_id.cmp(&right.case_id));
         let mut references = Self {
             schema_version: EVALUATION_RESULT_REFERENCES_SCHEMA_VERSION.into(),
             reference_set_digest: String::new(),
@@ -616,9 +693,61 @@ impl EvaluationRunResultReferences {
     }
 }
 
+const fn expected_evaluator_provenance(
+    kind: EvaluatorEvidenceKind,
+) -> (EvaluatorEvidenceAuthority, EvaluatorAuthorityScope) {
+    match kind {
+        EvaluatorEvidenceKind::EvaluationRunResult => (
+            EvaluatorEvidenceAuthority::HartevoEvaluationRunValidatorV1,
+            EvaluatorAuthorityScope::EvaluationResultsOnly,
+        ),
+        EvaluatorEvidenceKind::BrowserEvaluationResult => (
+            EvaluatorEvidenceAuthority::HartevoBrowserContractValidatorV1,
+            EvaluatorAuthorityScope::EvaluationResultsOnly,
+        ),
+        EvaluatorEvidenceKind::IntegrationBuildProvenance => (
+            EvaluatorEvidenceAuthority::IntegrationBuildProvenanceOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::LocalFallbackReceipt => (
+            EvaluatorEvidenceAuthority::LocalFallbackReceiptOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::Fixture => (
+            EvaluatorEvidenceAuthority::FixtureEvidenceOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::Simulator => (
+            EvaluatorEvidenceAuthority::SimulatorEvidenceOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::SourceAudit => (
+            EvaluatorEvidenceAuthority::SourceAuditOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::IgnoredResult => (
+            EvaluatorEvidenceAuthority::IgnoredResultOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+    }
+}
+
+fn evaluator_provenance_is_exact(
+    kind: EvaluatorEvidenceKind,
+    authority: EvaluatorEvidenceAuthority,
+    scope: EvaluatorAuthorityScope,
+) -> bool {
+    expected_evaluator_provenance(kind) == (authority, scope)
+}
+
 impl BrowserEvaluationResultReference {
     fn is_release_eligible(&self) -> bool {
-        self.provider_mode == BrowserReferenceProviderMode::NativeBrowserAccount
+        self.evidence_kind == EvaluatorEvidenceKind::BrowserEvaluationResult
+            && self.evaluator_authority
+                == EvaluatorEvidenceAuthority::HartevoBrowserContractValidatorV1
+            && self.execution_status == EvaluatorExecutionStatus::Executed
+            && self.authority_scope == EvaluatorAuthorityScope::EvaluationResultsOnly
+            && self.provider_mode == BrowserReferenceProviderMode::NativeBrowserAccount
             && !self.evidence_classes.is_empty()
             && self.evidence_classes.iter().all(|class| {
                 matches!(
@@ -876,33 +1005,8 @@ impl ReleaseEvidence {
         run: &EvaluationRunResultReference,
         violations: &mut Vec<String>,
     ) {
-        for (value, label) in [
-            (&run.catalog_digest, "Catalog digest"),
-            (&run.release_schema_digest, "Release schema digest"),
-            (&run.environment_digest, "environment digest"),
-            (&run.run_id, "runId"),
-            (&run.plan_digest, "plan digest"),
-            (&run.result_set_digest, "result-set digest"),
-            (&run.receipt_digest, "receipt digest"),
-        ] {
-            if !is_lower_hex_digest(value, 64) {
-                violations.push(format!(
-                    "evaluation RUN reference {label} must be a 64-hex digest"
-                ));
-            }
-        }
-        if !is_lower_hex_digest(&run.release_commit, 40) {
-            violations
-                .push("evaluation RUN reference releaseCommit must be a 40-hex commit".into());
-        }
-        if run.release_commit != self.release_commit
-            || run.catalog_digest != self.catalog_digest
-            || run.release_schema_digest != self.schema_digest
-        {
-            violations.push(
-                "evaluation RUN reference must bind this Release commit, Catalog and schema".into(),
-            );
-        }
+        self.validate_run_reference_identity(run, violations);
+        Self::validate_run_execution_status(run, violations);
         match run.run_profile.expected_scope() {
             Ok((expected_missions, expected_partitions)) => {
                 if run.mission_ids != expected_missions || run.partitions != expected_partitions {
@@ -957,90 +1061,88 @@ impl ReleaseEvidence {
         }
     }
 
-    fn validate_browser_result_reference_shapes(&self, violations: &mut Vec<String>) {
-        let references = &self.evaluation_run_result_references;
-        let ordering = references.browser_results.windows(2).all(|pair| {
-            (&pair[0].case_id, &pair[0].receipt_digest)
-                < (&pair[1].case_id, &pair[1].receipt_digest)
-        });
-        if !ordering {
+    fn validate_run_reference_identity(
+        &self,
+        run: &EvaluationRunResultReference,
+        violations: &mut Vec<String>,
+    ) {
+        if !evaluator_provenance_is_exact(
+            run.evidence_kind,
+            run.evaluator_authority,
+            run.authority_scope,
+        ) || run.evidence_kind == EvaluatorEvidenceKind::BrowserEvaluationResult
+        {
             violations.push(
-                "Browser evaluation references must be uniquely sorted by case and receipt digest"
+                "evaluation RUN evidence kind, evaluator authority and authority scope must be an exact non-escalating pair"
                     .into(),
             );
         }
+        for (value, label) in [
+            (&run.catalog_digest, "Catalog digest"),
+            (&run.release_schema_digest, "Release schema digest"),
+            (&run.environment_digest, "environment digest"),
+            (&run.run_id, "runId"),
+            (&run.plan_digest, "plan digest"),
+            (&run.result_set_digest, "result-set digest"),
+            (&run.receipt_digest, "receipt digest"),
+        ] {
+            if !is_lower_hex_digest(value, 64) {
+                violations.push(format!(
+                    "evaluation RUN reference {label} must be a 64-hex digest"
+                ));
+            }
+        }
+        if !is_lower_hex_digest(&run.release_commit, 40) {
+            violations
+                .push("evaluation RUN reference releaseCommit must be a 40-hex commit".into());
+        }
+        if run.release_commit != self.release_commit
+            || run.catalog_digest != self.catalog_digest
+            || run.release_schema_digest != self.schema_digest
+        {
+            violations.push(
+                "evaluation RUN reference must bind this Release commit, Catalog and schema".into(),
+            );
+        }
+    }
+
+    fn validate_run_execution_status(
+        run: &EvaluationRunResultReference,
+        violations: &mut Vec<String>,
+    ) {
+        match run.execution_status {
+            EvaluatorExecutionStatus::Executed if run.executed_case_count == 0 => violations.push(
+                "EXECUTED evaluation RUN reference must contain at least one executed case".into(),
+            ),
+            EvaluatorExecutionStatus::NotExecuted
+            | EvaluatorExecutionStatus::CiNotExecuted
+            | EvaluatorExecutionStatus::BlockedExternalBilling
+            | EvaluatorExecutionStatus::Ignored
+                if run.executed_case_count != 0 || run.successful_case_count != 0 =>
+            {
+                violations.push(
+                    "non-executed evaluation RUN provenance cannot contain executed or successful cases"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        if (run.evidence_kind == EvaluatorEvidenceKind::IgnoredResult)
+            != (run.execution_status == EvaluatorExecutionStatus::Ignored)
+        {
+            violations.push(
+                "ignored evaluation RUN provenance requires the exact ignored evidence kind and status pair"
+                    .into(),
+            );
+        }
+    }
+
+    fn validate_browser_result_reference_shapes(&self, violations: &mut Vec<String>) {
+        let references = &self.evaluation_run_result_references;
+        Self::validate_browser_reference_set_uniqueness(&references.browser_results, violations);
         for browser in &references.browser_results {
-            for (value, label) in [
-                (&browser.catalog_digest, "Catalog digest"),
-                (&browser.release_schema_digest, "Release schema digest"),
-                (&browser.environment_digest, "environment digest"),
-                (&browser.run_id, "runId"),
-                (&browser.result_set_digest, "result-set digest"),
-                (&browser.receipt_digest, "receipt digest"),
-                (
-                    &browser.validation_result_digest,
-                    "validation result digest",
-                ),
-            ] {
-                if !is_lower_hex_digest(value, 64) {
-                    violations.push(format!(
-                        "Browser evaluation reference {label} must be a 64-hex digest"
-                    ));
-                }
-            }
-            if browser.receipt_schema_version != "hartevo-browser-run-receipt/v1"
-                || browser.receipt_authority != "browser_harness_evidence_only"
-                || browser.release_decision != "NOT_EVALUATED"
-                || browser.case_id.trim().is_empty()
-                || !is_lower_hex_digest(&browser.release_commit, 40)
-                || browser.release_commit != self.release_commit
-                || browser.catalog_digest != self.catalog_digest
-                || browser.release_schema_digest != self.schema_digest
-                || browser.release_evidence_authority
-                || browser.e_level_ceiling != "E1_MAX"
-            {
-                violations.push(
-                    "Browser evaluation reference contract or Release binding is invalid".into(),
-                );
-            }
-            let classes = browser
-                .evidence_classes
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            if classes.is_empty()
-                || classes.len() != browser.evidence_classes.len()
-                || classes.into_iter().collect::<Vec<_>>() != browser.evidence_classes
-            {
-                violations.push(
-                    "Browser evidence classes must be a non-empty, uniquely sorted exact set"
-                        .into(),
-                );
-            }
-            if browser.configured_attempt_count == 0
-                || browser.recorded_attempt_count > browser.configured_attempt_count
-                || browser.executed_attempt_count > browser.recorded_attempt_count
-                || browser.successful_attempt_count > browser.executed_attempt_count
-                || browser.execution_started_attempt_count > browser.recorded_attempt_count
-                || browser.test_mode_attempt_count > browser.recorded_attempt_count
-                || browser.mock_attempt_count > browser.recorded_attempt_count
-                || browser.ignored_test_attempt_count > browser.recorded_attempt_count
-            {
-                violations.push(
-                    "Browser reference counts must satisfy successful <= executed <= recorded <= configured"
-                        .into(),
-                );
-            }
-            if browser.verdict == BrowserReferenceVerdict::Pass
-                && (browser.recorded_attempt_count != browser.configured_attempt_count
-                    || browser.executed_attempt_count != browser.configured_attempt_count
-                    || browser.successful_attempt_count != browser.configured_attempt_count)
-            {
-                violations.push(
-                    "PASS Browser reference must have exact configured/recorded/executed/successful counts"
-                        .into(),
-                );
-            }
+            self.validate_browser_reference_identity(browser, violations);
+            Self::validate_browser_reference_execution(browser, violations);
             if let Some(run) = &references.run
                 && (browser.run_id != run.run_id
                     || browser.result_set_digest != run.result_set_digest
@@ -1053,6 +1155,159 @@ impl ReleaseEvidence {
         }
     }
 
+    fn validate_browser_reference_set_uniqueness(
+        references: &[BrowserEvaluationResultReference],
+        violations: &mut Vec<String>,
+    ) {
+        let ordering = references
+            .windows(2)
+            .all(|pair| pair[0].case_id < pair[1].case_id);
+        if !ordering {
+            violations
+                .push("Browser evaluation references must be uniquely sorted by case id".into());
+        }
+        let unique_receipts = references
+            .iter()
+            .map(|reference| reference.receipt_digest.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == references.len();
+        let unique_validations = references
+            .iter()
+            .map(|reference| reference.validation_result_digest.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == references.len();
+        if !unique_receipts || !unique_validations {
+            violations.push(
+                "Browser evaluation references require unique receipt and validation digests"
+                    .into(),
+            );
+        }
+    }
+
+    fn validate_browser_reference_identity(
+        &self,
+        browser: &BrowserEvaluationResultReference,
+        violations: &mut Vec<String>,
+    ) {
+        if !evaluator_provenance_is_exact(
+            browser.evidence_kind,
+            browser.evaluator_authority,
+            browser.authority_scope,
+        ) || browser.evidence_kind == EvaluatorEvidenceKind::EvaluationRunResult
+        {
+            violations.push(
+                "Browser evidence kind, evaluator authority and authority scope must be an exact non-escalating pair"
+                    .into(),
+            );
+        }
+        for (value, label) in [
+            (&browser.catalog_digest, "Catalog digest"),
+            (&browser.release_schema_digest, "Release schema digest"),
+            (&browser.environment_digest, "environment digest"),
+            (&browser.run_id, "runId"),
+            (&browser.result_set_digest, "result-set digest"),
+            (&browser.receipt_digest, "receipt digest"),
+            (
+                &browser.validation_result_digest,
+                "validation result digest",
+            ),
+        ] {
+            if !is_lower_hex_digest(value, 64) {
+                violations.push(format!(
+                    "Browser evaluation reference {label} must be a 64-hex digest"
+                ));
+            }
+        }
+        if browser.receipt_schema_version != "hartevo-browser-run-receipt/v1"
+            || browser.receipt_authority != "browser_harness_evidence_only"
+            || browser.release_decision != "NOT_EVALUATED"
+            || browser.case_id.trim().is_empty()
+            || !is_lower_hex_digest(&browser.release_commit, 40)
+            || browser.release_commit != self.release_commit
+            || browser.catalog_digest != self.catalog_digest
+            || browser.release_schema_digest != self.schema_digest
+            || browser.release_evidence_authority
+            || browser.e_level_ceiling != "E1_MAX"
+        {
+            violations
+                .push("Browser evaluation reference contract or Release binding is invalid".into());
+        }
+        let classes = browser
+            .evidence_classes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if classes.is_empty()
+            || classes.len() != browser.evidence_classes.len()
+            || classes.into_iter().collect::<Vec<_>>() != browser.evidence_classes
+        {
+            violations.push(
+                "Browser evidence classes must be a non-empty, uniquely sorted exact set".into(),
+            );
+        }
+    }
+
+    fn validate_browser_reference_execution(
+        browser: &BrowserEvaluationResultReference,
+        violations: &mut Vec<String>,
+    ) {
+        if browser.configured_attempt_count == 0
+            || browser.recorded_attempt_count > browser.configured_attempt_count
+            || browser.executed_attempt_count > browser.recorded_attempt_count
+            || browser.successful_attempt_count > browser.executed_attempt_count
+            || browser.execution_started_attempt_count > browser.recorded_attempt_count
+            || browser.test_mode_attempt_count > browser.recorded_attempt_count
+            || browser.mock_attempt_count > browser.recorded_attempt_count
+            || browser.ignored_test_attempt_count > browser.recorded_attempt_count
+        {
+            violations.push(
+                "Browser reference counts must satisfy successful <= executed <= recorded <= configured"
+                    .into(),
+            );
+        }
+        match browser.execution_status {
+            EvaluatorExecutionStatus::Executed if browser.execution_started_attempt_count == 0 => {
+                violations.push(
+                    "EXECUTED Browser reference must contain an execution-started attempt".into(),
+                );
+            }
+            EvaluatorExecutionStatus::NotExecuted
+            | EvaluatorExecutionStatus::CiNotExecuted
+            | EvaluatorExecutionStatus::BlockedExternalBilling
+            | EvaluatorExecutionStatus::Ignored
+                if browser.execution_started_attempt_count != 0
+                    || browser.executed_attempt_count != 0
+                    || browser.successful_attempt_count != 0 =>
+            {
+                violations.push(
+                    "non-executed Browser provenance cannot contain execution-started, executed or successful attempts"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        if (browser.evidence_kind == EvaluatorEvidenceKind::IgnoredResult)
+            != (browser.execution_status == EvaluatorExecutionStatus::Ignored)
+        {
+            violations.push(
+                "ignored Browser provenance requires the exact ignored evidence kind and status pair"
+                    .into(),
+            );
+        }
+        if browser.verdict == BrowserReferenceVerdict::Pass
+            && (browser.recorded_attempt_count != browser.configured_attempt_count
+                || browser.executed_attempt_count != browser.configured_attempt_count
+                || browser.successful_attempt_count != browser.configured_attempt_count)
+        {
+            violations.push(
+                "PASS Browser reference must have exact configured/recorded/executed/successful counts"
+                    .into(),
+            );
+        }
+    }
+
     fn evaluation_result_references_are_release_eligible(&self) -> bool {
         if !self.evaluation_reference_structure_violations().is_empty() {
             return false;
@@ -1061,7 +1316,12 @@ impl ReleaseEvidence {
         let Some(run) = &references.run else {
             return false;
         };
-        run.run_profile.matches_stage(self.requested_stage)
+        run.evidence_kind == EvaluatorEvidenceKind::EvaluationRunResult
+            && run.evaluator_authority
+                == EvaluatorEvidenceAuthority::HartevoEvaluationRunValidatorV1
+            && run.execution_status == EvaluatorExecutionStatus::Executed
+            && run.authority_scope == EvaluatorAuthorityScope::EvaluationResultsOnly
+            && run.run_profile.matches_stage(self.requested_stage)
             && run.partition_complete
             && run.completed_partition_count == run.required_partition_count
             && run.executed_case_count == run.configured_case_count
@@ -1714,6 +1974,10 @@ mod tests {
         EvaluationRunResultReference {
             validation_authority: EvaluationRunValidationAuthority::HartevoEvaluationRunValidatorV1,
             evidence_authority: EvaluationRunEvidenceAuthority::RunEvidenceOnly,
+            evidence_kind: EvaluatorEvidenceKind::EvaluationRunResult,
+            evaluator_authority: EvaluatorEvidenceAuthority::HartevoEvaluationRunValidatorV1,
+            execution_status: EvaluatorExecutionStatus::Executed,
+            authority_scope: EvaluatorAuthorityScope::EvaluationResultsOnly,
             release_commit: evidence.release_commit.clone(),
             catalog_digest: evidence.catalog_digest.clone(),
             release_schema_digest: evidence.schema_digest.clone(),
@@ -1747,9 +2011,34 @@ mod tests {
         verdict: BrowserReferenceVerdict,
     ) -> BrowserEvaluationResultReference {
         let passed = usize::from(verdict == BrowserReferenceVerdict::Pass);
+        let (evidence_kind, evaluator_authority, authority_scope) = match evidence_class {
+            BrowserReferenceEvidenceClass::SourceAudit => (
+                EvaluatorEvidenceKind::SourceAudit,
+                EvaluatorEvidenceAuthority::SourceAuditOnly,
+                EvaluatorAuthorityScope::AuditOnly,
+            ),
+            BrowserReferenceEvidenceClass::DeterministicSimulator => (
+                EvaluatorEvidenceKind::Simulator,
+                EvaluatorEvidenceAuthority::SimulatorEvidenceOnly,
+                EvaluatorAuthorityScope::AuditOnly,
+            ),
+            _ => (
+                EvaluatorEvidenceKind::BrowserEvaluationResult,
+                EvaluatorEvidenceAuthority::HartevoBrowserContractValidatorV1,
+                EvaluatorAuthorityScope::EvaluationResultsOnly,
+            ),
+        };
         BrowserEvaluationResultReference {
             validation_authority:
                 BrowserReferenceValidationAuthority::HartevoBrowserContractValidatorV1,
+            evidence_kind,
+            evaluator_authority,
+            execution_status: if passed == 1 {
+                EvaluatorExecutionStatus::Executed
+            } else {
+                EvaluatorExecutionStatus::NotExecuted
+            },
+            authority_scope,
             receipt_schema_version: "hartevo-browser-run-receipt/v1".into(),
             receipt_authority: "browser_harness_evidence_only".into(),
             release_decision: "NOT_EVALUATED".into(),
@@ -1780,6 +2069,15 @@ mod tests {
             release_evidence_authority: false,
             e_level_ceiling: "E1_MAX".into(),
         }
+    }
+
+    fn make_non_executed(run: &mut EvaluationRunResultReference, status: EvaluatorExecutionStatus) {
+        run.completed_partition_count = 0;
+        run.executed_case_count = 0;
+        run.successful_case_count = 0;
+        run.partition_complete = false;
+        run.threshold_status = EvaluationReferenceThresholdStatus::NotEvaluatedIncompletePartition;
+        run.execution_status = status;
     }
 
     fn has_violation(evidence: &ReleaseEvidence, needle: &str) -> bool {
@@ -1919,7 +2217,7 @@ mod tests {
         );
     }
 
-    fn assert_schema_evaluation_reference_contract(
+    fn assert_schema_reference_object_closure(
         evidence: &ReleaseEvidence,
         schema: &serde_json::Value,
     ) {
@@ -1963,6 +2261,162 @@ mod tests {
                 schema_property_names(schema, &format!("/$defs/{definition}/properties"));
             assert_eq!(required, properties, "{definition} key closure");
         }
+    }
+
+    fn assert_reference_serializer_keys(
+        value: &serde_json::Value,
+        schema: &serde_json::Value,
+        definition: &str,
+    ) {
+        let keys = value
+            .as_object()
+            .expect("reference object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            schema_property_names(schema, &format!("/$defs/{definition}/properties")),
+            "{definition} serializer keys"
+        );
+    }
+
+    fn assert_eligible_evaluator_fields(
+        value: &serde_json::Value,
+        schema: &serde_json::Value,
+        eligible_definition: &str,
+        label: &str,
+    ) {
+        for field in [
+            "evidenceKind",
+            "evaluatorAuthority",
+            "executionStatus",
+            "authorityScope",
+        ] {
+            assert_eq!(
+                value.pointer(&format!("/{field}")),
+                schema.pointer(&format!(
+                    "/$defs/{eligible_definition}/allOf/1/properties/{field}/const"
+                )),
+                "eligible {label} {field} vocabulary"
+            );
+        }
+    }
+
+    fn assert_schema_run_reference_contract(
+        run: &EvaluationRunResultReference,
+        schema: &serde_json::Value,
+    ) {
+        let value = serde_json::to_value(run).expect("RUN reference JSON");
+        assert_reference_serializer_keys(&value, schema, "evaluationRunResultReference");
+        assert_eq!(
+            value.pointer("/validationAuthority"),
+            schema.pointer(
+                "/$defs/evaluationRunResultReference/properties/validationAuthority/const"
+            )
+        );
+        assert_eq!(
+            value.pointer("/evidenceAuthority"),
+            schema
+                .pointer("/$defs/evaluationRunResultReference/properties/evidenceAuthority/const")
+        );
+        assert_eligible_evaluator_fields(
+            &value,
+            schema,
+            "eligibleEvaluationRunResultReference",
+            "RUN",
+        );
+    }
+
+    fn assert_schema_browser_reference_contract(
+        browser: &BrowserEvaluationResultReference,
+        schema: &serde_json::Value,
+    ) {
+        let value = serde_json::to_value(browser).expect("Browser reference JSON");
+        assert_reference_serializer_keys(&value, schema, "browserEvaluationResultReference");
+        assert_eq!(
+            value.pointer("/validationAuthority"),
+            schema.pointer(
+                "/$defs/browserEvaluationResultReference/properties/validationAuthority/const"
+            )
+        );
+        assert_eq!(
+            value.pointer("/receiptAuthority"),
+            schema.pointer(
+                "/$defs/browserEvaluationResultReference/properties/receiptAuthority/const"
+            )
+        );
+        assert_eligible_evaluator_fields(
+            &value,
+            schema,
+            "eligibleBrowserEvaluationResultReference",
+            "Browser",
+        );
+    }
+
+    fn assert_schema_enum(schema: &serde_json::Value, definition: &str, expected: &[&str]) {
+        let actual = schema
+            .pointer(&format!("/$defs/{definition}/enum"))
+            .and_then(serde_json::Value::as_array)
+            .expect("schema enum")
+            .iter()
+            .map(|value| value.as_str().expect("enum string"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected.iter().copied().collect(), "{definition}");
+    }
+
+    fn assert_schema_evaluator_vocabulary(schema: &serde_json::Value) {
+        assert_schema_enum(
+            schema,
+            "evaluatorEvidenceKind",
+            &[
+                "evaluation_run_result",
+                "browser_evaluation_result",
+                "integration_build_provenance",
+                "local_fallback_receipt",
+                "fixture",
+                "simulator",
+                "source_audit",
+                "ignored_result",
+            ],
+        );
+        assert_schema_enum(
+            schema,
+            "evaluatorEvidenceAuthority",
+            &[
+                "hartevo_evaluation_run_validator_v1",
+                "hartevo_browser_contract_validator_v1",
+                "INTEGRATION_BUILD_PROVENANCE_ONLY",
+                "LOCAL_FALLBACK_RECEIPT_ONLY",
+                "FIXTURE_EVIDENCE_ONLY",
+                "SIMULATOR_EVIDENCE_ONLY",
+                "SOURCE_AUDIT_ONLY",
+                "IGNORED_RESULT_ONLY",
+            ],
+        );
+        assert_schema_enum(
+            schema,
+            "evaluatorExecutionStatus",
+            &[
+                "EXECUTED",
+                "NOT_EXECUTED",
+                "CI_NOT_EXECUTED",
+                "BLOCKED_EXTERNAL_BILLING",
+                "IGNORED",
+            ],
+        );
+        assert_schema_enum(
+            schema,
+            "evaluatorAuthorityScope",
+            &["evaluation_results_only", "audit_only"],
+        );
+    }
+
+    fn assert_schema_evaluation_reference_contract(
+        evidence: &ReleaseEvidence,
+        schema: &serde_json::Value,
+    ) {
+        assert_schema_reference_object_closure(evidence, schema);
 
         let run = run_reference(
             evidence,
@@ -1976,53 +2430,9 @@ mod tests {
             BrowserReferenceProviderMode::NativeBrowserAccount,
             BrowserReferenceVerdict::Pass,
         );
-        for (value, definition) in [
-            (
-                serde_json::to_value(&run).expect("RUN reference JSON"),
-                "evaluationRunResultReference",
-            ),
-            (
-                serde_json::to_value(&browser).expect("Browser reference JSON"),
-                "browserEvaluationResultReference",
-            ),
-        ] {
-            let keys = value
-                .as_object()
-                .expect("reference object")
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>();
-            assert_eq!(
-                keys,
-                schema_property_names(schema, &format!("/$defs/{definition}/properties")),
-                "{definition} serializer keys"
-            );
-        }
-        let run_value = serde_json::to_value(run).expect("RUN reference JSON");
-        assert_eq!(
-            run_value.pointer("/validationAuthority"),
-            schema.pointer(
-                "/$defs/evaluationRunResultReference/properties/validationAuthority/const"
-            )
-        );
-        assert_eq!(
-            run_value.pointer("/evidenceAuthority"),
-            schema
-                .pointer("/$defs/evaluationRunResultReference/properties/evidenceAuthority/const")
-        );
-        let browser_value = serde_json::to_value(browser).expect("Browser reference JSON");
-        assert_eq!(
-            browser_value.pointer("/validationAuthority"),
-            schema.pointer(
-                "/$defs/browserEvaluationResultReference/properties/validationAuthority/const"
-            )
-        );
-        assert_eq!(
-            browser_value.pointer("/receiptAuthority"),
-            schema.pointer(
-                "/$defs/browserEvaluationResultReference/properties/receiptAuthority/const"
-            )
-        );
+        assert_schema_run_reference_contract(&run, schema);
+        assert_schema_browser_reference_contract(&browser, schema);
+        assert_schema_evaluator_vocabulary(schema);
     }
 
     #[test]
@@ -2383,6 +2793,193 @@ mod tests {
             evidence.passed = true;
             assert!(evidence.validate_fail_closed().is_err());
         }
+    }
+
+    #[test]
+    fn audit_provenance_and_nonexecuted_ci_statuses_never_gain_release_authority() {
+        let audit_provenance = [
+            (
+                EvaluatorEvidenceKind::IntegrationBuildProvenance,
+                EvaluatorEvidenceAuthority::IntegrationBuildProvenanceOnly,
+                EvaluatorExecutionStatus::Executed,
+            ),
+            (
+                EvaluatorEvidenceKind::LocalFallbackReceipt,
+                EvaluatorEvidenceAuthority::LocalFallbackReceiptOnly,
+                EvaluatorExecutionStatus::Executed,
+            ),
+            (
+                EvaluatorEvidenceKind::Fixture,
+                EvaluatorEvidenceAuthority::FixtureEvidenceOnly,
+                EvaluatorExecutionStatus::Executed,
+            ),
+            (
+                EvaluatorEvidenceKind::Simulator,
+                EvaluatorEvidenceAuthority::SimulatorEvidenceOnly,
+                EvaluatorExecutionStatus::Executed,
+            ),
+            (
+                EvaluatorEvidenceKind::SourceAudit,
+                EvaluatorEvidenceAuthority::SourceAuditOnly,
+                EvaluatorExecutionStatus::Executed,
+            ),
+            (
+                EvaluatorEvidenceKind::IgnoredResult,
+                EvaluatorEvidenceAuthority::IgnoredResultOnly,
+                EvaluatorExecutionStatus::Ignored,
+            ),
+        ];
+        for (kind, authority, status) in audit_provenance {
+            let mut evidence = representable_candidate(ReleaseStage::ControlledBeta);
+            let mission_results = evidence.mission_results.clone();
+            let mut run = run_reference(&evidence, EvaluationReferenceRunProfile::ControlledBeta);
+            run.evidence_kind = kind;
+            run.evaluator_authority = authority;
+            run.authority_scope = EvaluatorAuthorityScope::AuditOnly;
+            if status == EvaluatorExecutionStatus::Ignored {
+                make_non_executed(&mut run, status);
+            }
+            let references =
+                EvaluationRunResultReferences::new(Some(run), Vec::new()).expect("audit set");
+            evidence
+                .record_evaluation_run_result_references(references)
+                .expect("record exact audit provenance");
+            assert_eq!(evidence.mission_results, mission_results);
+            assert_eq!(
+                evidence.missing_required_evidence,
+                vec![
+                    MISSING_EVAL_RUN_EVIDENCE.to_owned(),
+                    MISSING_STAGE_ROUTE_EVIDENCE.to_owned(),
+                    MISSING_PROVIDER_E4_EVIDENCE.to_owned(),
+                ],
+                "{kind:?} must not close an evaluator, route or Provider gate"
+            );
+            assert!(!evidence.derived_passed());
+            assert!(evidence.validate_fail_closed().is_ok());
+        }
+
+        for status in [
+            EvaluatorExecutionStatus::NotExecuted,
+            EvaluatorExecutionStatus::CiNotExecuted,
+            EvaluatorExecutionStatus::BlockedExternalBilling,
+        ] {
+            let mut evidence = representable_candidate(ReleaseStage::ControlledBeta);
+            let mut run = run_reference(&evidence, EvaluationReferenceRunProfile::ControlledBeta);
+            make_non_executed(&mut run, status);
+            let references = EvaluationRunResultReferences::new(Some(run), Vec::new())
+                .expect("non-executed set");
+            evidence
+                .record_evaluation_run_result_references(references)
+                .expect("record honest non-execution status");
+            assert!(
+                evidence
+                    .missing_required_evidence
+                    .contains(&MISSING_EVAL_RUN_EVIDENCE.to_owned()),
+                "{status:?} cannot count as executed evaluation evidence"
+            );
+            assert!(
+                evidence
+                    .missing_required_evidence
+                    .contains(&MISSING_STAGE_ROUTE_EVIDENCE.to_owned())
+            );
+            assert!(
+                evidence
+                    .missing_required_evidence
+                    .contains(&MISSING_PROVIDER_E4_EVIDENCE.to_owned())
+            );
+            assert!(!evidence.derived_passed());
+            assert!(evidence.validate_fail_closed().is_ok());
+        }
+    }
+
+    #[test]
+    fn evaluator_scope_and_authority_escalation_are_rejected() {
+        let evidence = representable_candidate(ReleaseStage::EngineeringFoundation);
+        let run = run_reference(&evidence, run_profile_for_stage(evidence.requested_stage));
+        let serialized = serde_json::to_value(&run).expect("RUN reference JSON");
+        for forged_scope in ["provider_e2", "provider_e4", "stage_route", "release_pass"] {
+            let mut forged = serialized.clone();
+            forged["authorityScope"] = serde_json::Value::String(forged_scope.into());
+            assert!(serde_json::from_value::<EvaluationRunResultReference>(forged).is_err());
+        }
+
+        let mut mismatched = run;
+        mismatched.evaluator_authority = EvaluatorEvidenceAuthority::IntegrationBuildProvenanceOnly;
+        let references = EvaluationRunResultReferences::new(Some(mismatched), Vec::new())
+            .expect("digest-bound mismatched authority");
+        let mut candidate = evidence;
+        assert!(
+            candidate
+                .record_evaluation_run_result_references(references)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_stale_and_cross_commit_references_fail_closed() {
+        let evidence = representable_candidate(ReleaseStage::EngineeringFoundation);
+        let run = run_reference(&evidence, run_profile_for_stage(evidence.requested_stage));
+        let browser = browser_reference(
+            &run,
+            BrowserReferenceEvidenceClass::NativeBrowserAccountReadback,
+            BrowserReferenceProviderMode::NativeBrowserAccount,
+            BrowserReferenceVerdict::Pass,
+        );
+
+        let mut duplicate_case = browser.clone();
+        duplicate_case.receipt_digest = "8".repeat(64);
+        duplicate_case.validation_result_digest = "9".repeat(64);
+        assert!(
+            EvaluationRunResultReferences::new(
+                Some(run.clone()),
+                vec![browser.clone(), duplicate_case]
+            )
+            .is_err()
+        );
+
+        let mut duplicate_receipt = browser.clone();
+        duplicate_receipt.case_id = "BROWSER-REC-002".into();
+        duplicate_receipt.validation_result_digest = "9".repeat(64);
+        assert!(
+            EvaluationRunResultReferences::new(
+                Some(run.clone()),
+                vec![browser.clone(), duplicate_receipt]
+            )
+            .is_err()
+        );
+
+        let mut duplicate_validation = browser.clone();
+        duplicate_validation.case_id = "BROWSER-REC-002".into();
+        duplicate_validation.receipt_digest = "8".repeat(64);
+        assert!(
+            EvaluationRunResultReferences::new(
+                Some(run.clone()),
+                vec![browser.clone(), duplicate_validation]
+            )
+            .is_err()
+        );
+
+        let mut stale_run = run.clone();
+        stale_run.release_commit = "a".repeat(40);
+        let stale = EvaluationRunResultReferences::new(Some(stale_run), Vec::new())
+            .expect("stale reference set");
+        let mut candidate = evidence.clone();
+        assert!(
+            candidate
+                .record_evaluation_run_result_references(stale)
+                .is_err()
+        );
+
+        let mut cross_commit_browser = browser;
+        cross_commit_browser.release_commit = "b".repeat(40);
+        let cross_commit =
+            EvaluationRunResultReferences::new(Some(run), vec![cross_commit_browser])
+                .expect("cross-commit reference set");
+        assert!(
+            candidate
+                .record_evaluation_run_result_references(cross_commit)
+                .is_err()
+        );
     }
 
     #[test]

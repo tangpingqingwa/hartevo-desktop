@@ -50,9 +50,10 @@ async fn claim() -> HarnessResult {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no remote task available"))?;
     let lease = result.lease;
     println!(
-        "CLAIM|{}|{}|{}|{}|{}|{}|{}|{}",
+        "CLAIM|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         result.duplicate,
         lease.task_id.as_str(),
+        lease.key_generation,
         lease.lease_id.as_str(),
         lease.lease_generation,
         lease.lease_owner,
@@ -68,6 +69,7 @@ async fn complete() -> HarnessResult {
     let scope = scope()?;
     let project_id = ProjectId::from_stable(required("HARTEVO_CELL_PROJECT")?);
     let task_id = TaskId::from_stable(required("HARTEVO_CELL_TASK")?);
+    let key_generation = required("HARTEVO_CELL_KEY_GENERATION")?.parse::<u64>()?;
     let lease_id = WorkerLeaseId::from_stable(required("HARTEVO_CELL_LEASE_ID")?);
     let lease_generation = required("HARTEVO_CELL_LEASE_GENERATION")?.parse::<u64>()?;
     let lease_owner = required("HARTEVO_CELL_LEASE_OWNER")?;
@@ -83,6 +85,7 @@ async fn complete() -> HarnessResult {
                 scope,
                 project_id,
                 task_id,
+                key_generation,
                 lease_id,
                 lease_generation,
                 lease_owner,

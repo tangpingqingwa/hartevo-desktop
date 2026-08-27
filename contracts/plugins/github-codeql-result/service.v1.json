@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/github-codeql-result/service.v1.json",
+  "schemaVersion": "hartevo.github-codeql-result/v1",
+  "contractVersion": "github-codeql-result-01-layer-1/v1",
+  "pluginId": "github.codeql-result",
+  "pluginVersion": "0.1.0",
+  "contractDigestInput": "hartevo.github-codeql-result/v1|github-codeql-result-01-layer-1/v1|github.codeql-result|security.github.codeql.result.read|github.codeql.result.recording|mission.github-codeql-result.consumer",
+  "contractDigest": "5ccc09e618acd120bb0539d5db36c617140ff8db74b31f116dac6d19a5805163",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "officialReferences": [
+    "https://docs.github.com/en/rest/code-scanning/code-scanning",
+    "https://docs.github.com/en/rest/code-scanning/code-scanning#get-a-code-scanning-alert",
+    "https://docs.github.com/en/rest/code-scanning/code-scanning#list-code-scanning-alerts-for-a-repository"
+  ],
+  "service": {
+    "type": "GithubCodeqlResultService",
+    "id": "security.github.codeql.result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "read_code_scanning_alerts",
+      "read_code_scanning_analyses",
+      "compile_codeql_result_proposal",
+      "record_codeql_result",
+      "verify_codeql_recording"
+    ],
+    "liveExecution": false,
+    "proposalsBelowKernel": true
+  },
+  "provider": {
+    "type": "GithubCodeScanningProvider",
+    "id": "github.codeql.result.recording",
+    "apiRevision": "github-code-scanning-read-v1",
+    "operations": [
+      "list_code_scanning_alerts",
+      "get_code_scanning_alert",
+      "list_code_scanning_analyses"
+    ],
+    "allowedEndpoints": [
+      "/repos/{owner}/{repo}/code-scanning/alerts",
+      "/repos/{owner}/{repo}/code-scanning/alerts/{alertNumber}",
+      "/repos/{owner}/{repo}/code-scanning/analyses"
+    ],
+    "allowedTransportProvenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "native": false,
+    "mutations": {
+      "dismissAlert": false,
+      "fixAlert": false,
+      "uploadSarif": false,
+      "triggerAnalysis": false,
+      "mutateBranch": false,
+      "mutatePullRequest": false,
+      "resolveSecret": false,
+      "adoptOutcome": false
+    },
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "unprocessable": 422,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    }
+  },
+  "consumer": {
+    "type": "MissionGithubCodeqlConsumer",
+    "id": "mission.github-codeql-result.consumer",
+    "authority": "below-kernel-proposal-and-recording",
+    "scope": [
+      "installationId",
+      "repository",
+      "ref",
+      "commit",
+      "analysisId",
+      "tool",
+      "rule",
+      "alertNumber",
+      "alertFingerprint",
+      "alertState",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsKernelOutcome": false
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "acceptedKinds": [
+      "app",
+      "oauth"
+    ],
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "permissions": {
+    "required": [
+      "security_events:read",
+      "metadata:read"
+    ],
+    "writePermissions": false
+  },
+  "scope": {
+    "required": [
+      "installationId",
+      "repository",
+      "ref",
+      "commit",
+      "analysisId",
+      "tool",
+      "rule",
+      "ruleAllowlist",
+      "alertNumber",
+      "alertFingerprint",
+      "expectedAlertState",
+      "permissionDigest",
+      "evidencePolicyDigest",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "installationDigest",
+      "repositoryDigest",
+      "refDigest",
+      "commitDigest",
+      "analysisDigest",
+      "toolDigest",
+      "ruleDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "alertDigest",
+      "evidencePolicyDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": [
+      "active"
+    ],
+    "unmountedStatuses": [
+      "unmounted"
+    ],
+    "terminalStatuses": [
+      "revoked"
+    ]
+  },
+  "bounds": {
+    "maxAlertPages": 16,
+    "maxAnalysisPages": 16,
+    "maxPageSize": 50,
+    "maxAlerts": 1024,
+    "maxLocations": 64,
+    "maxResponseBytes": 1048576,
+    "opaquePageTokens": true,
+    "repeatedPage": "fail_closed",
+    "duplicateAlert": "fail_closed",
+    "truncatedEvidenceIsAdoptable": false
+  },
+  "evidence": {
+    "alertNumber": true,
+    "fingerprint": true,
+    "state": true,
+    "severity": true,
+    "tool": true,
+    "rule": true,
+    "repository": true,
+    "ref": true,
+    "commit": true,
+    "analysis": true,
+    "location": "digest_only_path_and_region_with_bounded_lines",
+    "rawSource": false,
+    "rawSarif": false,
+    "userIdentity": false,
+    "secretValue": false,
+    "unboundedLocations": false,
+    "registrationDigest": true,
+    "redactionDigest": true
+  },
+  "provenance": {
+    "fixture": "non_native_non_connected_non_first_party",
+    "recording": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "BLOCKED_ENV": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "durableProviderReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed GitHub CodeQL service/provider/consumer",
+      "exact installation/repository/ref/commit/analysis/tool/rule/alert scope",
+      "bounded alert and analysis reads",
+      "opaque SecretReference shape",
+      "redacted evidence and local proposal/record/verify seams",
+      "version/provider/API/permission/scope/evidence registration fences"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native App/OAuth resolution",
+      "live HTTPS execution",
+      "alert dismissal or fixing",
+      "SARIF upload",
+      "scan trigger",
+      "branch mutation",
+      "pull request mutation",
+      "source or raw SARIF retention",
+      "release approval"
+    ]
+  },
+  "honestNativeGap": "Native App/OAuth resolution, live HTTPS reads, durable provider receipts, independent repeat-read/reconciliation, verified Work Product adoption, and consented remediation effects remain Layer-2 work; fixture, recording, loopback, and BLOCKED_ENV never claim Connected or native."
+}

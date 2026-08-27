@@ -1,0 +1,61 @@
+//! Provider-specific official partner-network adapters for VM-06/VM-11.
+//!
+//! This crate deliberately owns only the partner-network vertical contract:
+//! typed network identities, account/program scope, provider-native reads,
+//! signed callbacks and deterministic fixture worlds. The generic lifecycle
+//! is the merged CONN-01 Connector SDK; [`ConnectorAdapterBridge`] only maps
+//! this provider-native contract into that SDK and does not define a second
+//! worker, auth, probe, read, or webhook authority.
+//! It does not create Hartevo Opt-in consent, employment, escrow, or hiring
+//! payout facts; those remain separate domain/effect-broker concerns.
+
+mod callback;
+mod contract;
+mod fixture;
+mod ids;
+mod replay;
+mod sdk;
+mod state;
+mod support;
+
+pub mod awin;
+pub mod cj;
+pub mod cj_legacy;
+pub mod impact;
+
+pub use hartevo_connector_sdk::{
+    ConnectorAdapter, ConnectorDescriptor, ConnectorError, ConnectorScope, ProviderAdapterIdentity,
+};
+pub use sdk::ConnectorAdapterBridge;
+
+pub use callback::{
+    CallbackChannel, CallbackDisposition, CallbackEvent, CallbackEventKind, CallbackKeyLease,
+    CallbackObservation, CallbackRequest, CallbackSignatureScheme,
+};
+pub use contract::{
+    ActionRecord, ActionState, AuthorizationGrant, AuthorizationObservation, AuthorizationState,
+    BlockedEnvironmentReason, ClickRecord, CommissionRecord, CommissionState, ContractRecord,
+    ContractState, ConversionRecord, ConversionState, EvidenceLevel, FixtureScenario,
+    MissionOutcomeBinding, MissionOutcomeClassification, MissionOutcomeReceipt, NativeCanaryPlan,
+    NativeCanaryReceipt, NativeCanaryStatus, NetworkCapability, NetworkProbeObservation,
+    NetworkProbeRequest, NetworkProbeStatus, NetworkProvenance, NetworkProvider,
+    NetworkReadBudgetReceipt, NetworkReadData, NetworkReadObservation, NetworkReadRequest,
+    NetworkResource, NetworkScope, OpaqueSecretReference, PARTNER_ADAPTER_VERSION,
+    PARTNER_NETWORK_CONTRACT_SCHEMA, PARTNER_NETWORK_CONTRACT_SCHEMA_VERSION,
+    PARTNER_NETWORK_CONTRACT_VERSION, PartnerMissionConsumer, PartnerNetworkError, PartnerRecord,
+    PartnerRelationshipState, PayoutRecord, PayoutState, ProgramExpectation, ProgramRecord,
+    ProgramState, ReadCursor, ReadPage, ReportRecord, ReportRow, ReportSettlementState,
+    ReversalRecord, ReversalState, SettlementPeriod, TrackingLinkRecord,
+    TypedPartnerNetworkAdapter, deserialize_partner_contract, deserialize_partner_read_observation,
+    native_canary_plan, partner_registration_identity, validate_partner_read_observation,
+    validate_published_partner_schema,
+};
+pub use ids::{
+    ActionId, CallbackEventId, ClickId, CommissionId, ContractId, ConversionId, LinkId,
+    NetworkAccountId, NetworkIdentityError, NetworkOrderId, PartnerId, PayoutId, ProgramId,
+    ReportId, ReversalId,
+};
+pub use state::{DurableReceipt, DurableStateStore};
+
+#[cfg(test)]
+mod tests;

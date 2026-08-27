@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/build-manifest/1.0.0",
+  "title": "Hartevo current-commit build manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "manifestId",
+    "releaseDecision",
+    "releaseEligible",
+    "source",
+    "toolchain",
+    "build",
+    "catalog",
+    "schemas",
+    "artifacts",
+    "sbom",
+    "platform",
+    "nativeEvidence"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-build-manifest/v1"},
+    "manifestId": {"type": "string", "pattern": "^commit-[0-9a-f]{40}$"},
+    "releaseDecision": {"const": "NOT_EVALUATED"},
+    "releaseEligible": {"const": false},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "tree", "treeSha256", "dirty", "repository", "sourceDateEpoch"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "treeSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "dirty": {"type": "boolean"},
+        "repository": {"type": "string", "pattern": "^https://[^/@]+/[^/@]+/[^/@]+(?:\\.git)?$"},
+        "sourceDateEpoch": {"type": "integer", "minimum": 0}
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rustc", "cargo", "target"],
+      "properties": {
+        "rustc": {"type": "string", "minLength": 1},
+        "cargo": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1}
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "target", "reproducible", "cargoLockSha256", "commands", "environment"],
+      "properties": {
+        "profile": {"enum": ["debug", "release"]},
+        "target": {"type": "string", "minLength": 1},
+        "reproducible": {"const": true},
+        "cargoLockSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "argv"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sourceDateEpoch", "networkPolicy"],
+          "properties": {
+            "sourceDateEpoch": {"type": "integer", "minimum": 0},
+            "networkPolicy": {"enum": ["offline", "locked-network"]}
+          }
+        }
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "schemaVersion", "applicationHandlerRegistryVersion", "releaseEvidenceSchemaVersion"],
+      "properties": {
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "schemaVersion": {"type": "string", "minLength": 1},
+        "applicationHandlerRegistryVersion": {"type": "string", "minLength": 1},
+        "releaseEvidenceSchemaVersion": {"type": "string", "const": "2.3.0"}
+      }
+    },
+    "schemas": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^contracts/distribution/[A-Za-z0-9._/-]+\\.json$"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "path", "sha256", "byteCount", "evidenceClass", "sourceCommit"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+          "kind": {"enum": ["APPLICATION", "SBOM", "MANIFEST", "UPDATE_METADATA", "RELEASE_EVIDENCE", "CONTRACT", "TEST_ONLY"]},
+          "path": {"type": "string", "pattern": "^(?!/)(?!.*\\.\\./)[^\\n]+$"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "byteCount": {"type": "integer", "minimum": 0},
+          "evidenceClass": {"enum": ["NATIVE", "DETERMINISTIC_SIMULATOR", "TEST_ONLY", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+          "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        }
+      }
+    },
+    "sbom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "componentCount", "licenseStatus", "vulnerabilityStatus"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "componentCount": {"type": "integer", "minimum": 1},
+        "licenseStatus": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "vulnerabilityStatus": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]}
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "architecture", "macosSigning", "macosNotarization", "windowsSigning"],
+      "properties": {
+        "os": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "macosSigning": {"enum": ["PASS", "BLOCKED_ENV", "CI_NOT_EXECUTED", "FAIL"]},
+        "macosNotarization": {"enum": ["PASS", "BLOCKED_ENV", "CI_NOT_EXECUTED", "FAIL"]},
+        "windowsSigning": {"enum": ["PASS", "BLOCKED_ENV", "CI_NOT_EXECUTED", "FAIL"]}
+      }
+    },
+    "nativeEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "required", "releaseEligible"],
+      "properties": {
+        "status": {"const": "NOT_PROVEN"},
+        "required": {"const": true},
+        "releaseEligible": {"const": false}
+      }
+    }
+  }
+}

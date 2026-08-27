@@ -2,20 +2,30 @@
   "schemaVersion": "hartevo-github-branch-ruleset-policy/v1",
   "repository": "tangpingqingwa/hartevo-desktop",
   "defaultBranch": "bootstrap/macos-r0",
-  "hostedEnforcement": "active",
+  "repositorySettings": {
+    "deleteBranchOnMerge": true,
+    "allowUpdateBranch": true,
+    "allowMergeCommit": true,
+    "allowSquashMerge": false,
+    "allowRebaseMerge": false,
+    "allowAutoMerge": false
+  },
+  "hostedEnforcement": "desired_active_not_yet_applied",
   "observedHostedStatus": {
     "branchProtectionApi": "NOT_REQUIRED_RULESET_IS_AUTHORITATIVE",
-    "rulesetApi": "ACTIVE",
+    "rulesetApi": "NOT_APPLIED_AT_CHECKIN",
     "rulesetId": 20797159,
     "rulesetName": "Hartevo protected integration branches",
     "requiredStatusCheckIntegrationId": 15368,
-    "verifiedAt": "2026-08-13T12:34:47Z"
+    "previousRulesetRemainsActive": true,
+    "activationFence": "merge governance-admission.yml into bootstrap/macos-r0, then run the idempotent apply command",
+    "verifiedAt": "2026-08-21T07:06:21Z"
   },
   "verification": {
     "localCommand": "python3 scripts/ci-branch-policy.py verify",
     "hostedCommand": "python3 scripts/ci-branch-policy.py probe --repo tangpingqingwa/hartevo-desktop",
     "applyCommand": "python3 scripts/ci-branch-policy.py apply --repo tangpingqingwa/hartevo-desktop",
-    "applySemantics": "idempotently enforce the default Integration branch and protected ruleset; apply hosted merge queue only when GitHub reports an eligible Organization owner; never bypass or delete protection"
+    "applySemantics": "idempotently enforce the default Integration branch, post-merge branch deletion, update-branch support, and protected ruleset; apply hosted merge queue only when GitHub reports an eligible Organization owner; never bypass or delete protection"
   },
   "branches": [
     {
@@ -29,6 +39,8 @@
       "allowDeletions": false,
       "requiredStatusChecks": [
         "PR / Workflow policy",
+        "Governance / PR admission",
+        "Governance / Train-only merge",
         "PR / Scope plan",
         "PR / Fast Rust matrix / PR / Fast Rust / fmt",
         "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
@@ -49,6 +61,8 @@
       "allowDeletions": false,
       "requiredStatusChecks": [
         "PR / Workflow policy",
+        "Governance / PR admission",
+        "Governance / Train-only merge",
         "PR / Scope plan",
         "PR / Fast Rust matrix / PR / Fast Rust / fmt",
         "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
@@ -73,7 +87,7 @@
       "ownerType": "User",
       "requiredOwnerType": "Organization",
       "apiError": "Invalid rule merge_queue",
-      "verifiedAt": "2026-08-14T04:27:01Z"
+      "verifiedAt": "2026-08-21T06:54:30Z"
     },
     "availabilityDocumentation": "https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/merging-a-pull-request-with-a-merge-queue#who-can-use-this-feature",
     "buildConcurrency": 4,
@@ -116,7 +130,7 @@
     "enforcement": "active",
     "reason": "GitHub hosted merge queue is unavailable to a public repository owned by a personal account.",
     "branchPrefix": "merge-train/",
-    "manifestPath": ".github/merge-train/current.json",
+    "manifestDirectory": ".github/merge-train/manifests",
     "baseBranch": "bootstrap/macos-r0",
     "maximumCandidateCount": 4,
     "candidateRequirements": [
@@ -124,7 +138,7 @@
       "ready",
       "root-bootstrap-base",
       "exact-current-head",
-      "required-checks-success"
+      "candidate-checks-success-excluding-intentional-train-only-block"
     ],
     "compositeRequirements": [
       "exact-first-parent-history",
@@ -172,6 +186,14 @@
           "required_status_checks": [
             {
               "context": "PR / Workflow policy",
+              "integration_id": 15368
+            },
+            {
+              "context": "Governance / PR admission",
+              "integration_id": 15368
+            },
+            {
+              "context": "Governance / Train-only merge",
               "integration_id": 15368
             },
             {
