@@ -8,21 +8,50 @@
 //! `hartevo-effect-broker` provider contract types; this crate does not create
 //! a second authority model.
 
+pub mod linkedin;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_effect_broker::{ConnectedAuthority, ConnectedAuthorization};
 pub use hartevo_effect_broker::{
     ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
     ProviderCapabilityKey, ProviderCapabilitySupport, ProviderContractError, ProviderEvidenceClass,
-    ProviderProvenanceClass,
+    ProviderEvidenceSupport, ProviderProvenanceClass,
+};
+pub use linkedin::{
+    CurlHttpsTransport, DurableObservationLog, EnvLinkedInCredentialResolver,
+    InMemoryLinkedInCredentialResolver, LINKEDIN_ACCESS_TOKEN_ENV, LINKEDIN_ADAPTER_ID,
+    LINKEDIN_ADAPTER_VERSION, LINKEDIN_DEFAULT_API_BASE_URL, LINKEDIN_DEFAULT_MARKETING_VERSION,
+    LINKEDIN_INSIGHT_READ_SCHEMA, LINKEDIN_REGISTRATIONS, LINKEDIN_RUN_PROBE_ENV,
+    LinkedInAccessToken, LinkedInAttribution, LinkedInCapabilityProjection, LinkedInCausalStatus,
+    LinkedInClassification, LinkedInConnectionState, LinkedInConnectorError, LinkedInCostReceipt,
+    LinkedInCredentialResolver, LinkedInCursorReceipt, LinkedInDigestReceipt,
+    LinkedInFreshnessReceipt, LinkedInHttpRequest, LinkedInHttpResponse, LinkedInHttpTransport,
+    LinkedInInsightObservation, LinkedInInsightProvider, LinkedInInsightReadRequest,
+    LinkedInInsightRecord, LinkedInInsightScope, LinkedInInsightTarget, LinkedInInsightTargetKind,
+    LinkedInMarketingConfig, LinkedInMarketingOrganizationAdapter, LinkedInMetricValue,
+    LinkedInMount, LinkedInPaginationCursor, LinkedInPermissionObservation,
+    LinkedInProbeObservation, LinkedInProbeRequest, LinkedInProviderPage, LinkedInQuotaReceipt,
+    LinkedInRateLimit, LinkedInReadPolicy, LinkedInRequestEvidence, LinkedInRetryReceipt,
+    LinkedInReviewState, LinkedInTransportError, MissionCapability, MissionCapabilityGrant,
+    MissionInsightResult, MissionPaidSocialInsightConsumer, PaidSocialInsightReadService,
+    env_gated_credentialed_probe,
 };
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
+
+pub mod authenticated_probe;
+mod contract;
+
+pub use contract::{ConnectorContract, ConnectorContractError};
+pub mod connection_center;
 
 pub const CONNECTOR_SDK_SCHEMA_VERSION: &str = "hartevo-connector-sdk/v1";
 pub const MAX_CREDENTIAL_LEASE_TTL_SECONDS: i64 = 900;
@@ -31,6 +60,46 @@ pub const MAX_PROBE_TTL_SECONDS: i64 = 120;
 pub const MAX_WORKER_LEASE_TTL_SECONDS: i64 = 900;
 pub const DEFAULT_PAGE_SIZE: u32 = 100;
 pub const MAX_PAGE_SIZE: u32 = 1_000;
+
+const NOT_REVOKED_MILLIS: i64 = i64::MIN;
+
+#[derive(Debug)]
+struct RevocationFence {
+    revoked_at_millis: AtomicI64,
+}
+
+impl RevocationFence {
+    fn new() -> Self {
+        Self {
+            revoked_at_millis: AtomicI64::new(NOT_REVOKED_MILLIS),
+        }
+    }
+
+    fn revoke(&self, revoked_at: DateTime<Utc>) -> Result<(), ConnectorError> {
+        let millis = revoked_at.timestamp_millis();
+        match self.revoked_at_millis.compare_exchange(
+            NOT_REVOKED_MILLIS,
+            millis,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(existing) if existing == millis => Ok(()),
+            Err(_) => Err(ConnectorError::AlreadyRevoked),
+        }
+    }
+
+    fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
+        let revoked_at = self.revoked_at_millis.load(Ordering::Acquire);
+        revoked_at != NOT_REVOKED_MILLIS && revoked_at <= now.timestamp_millis()
+    }
+
+    fn revoked_at_millis(&self) -> Option<i64> {
+        let value = self.revoked_at_millis.load(Ordering::Acquire);
+        (value != NOT_REVOKED_MILLIS).then_some(value)
+    }
+}
+pub mod meta;
 
 /// A tenant/project/provider/account scope.  The scope contains identifiers,
 /// never a secret or a provider payload.
@@ -114,7 +183,7 @@ pub struct SecretReference {
     reference_id: String,
     scope: ConnectorScope,
     credential_revision: u64,
-    revoked_at: Option<DateTime<Utc>>,
+    revocation: Arc<RevocationFence>,
 }
 
 impl Clone for SecretReference {
@@ -123,7 +192,7 @@ impl Clone for SecretReference {
             reference_id: self.reference_id.clone(),
             scope: self.scope.clone(),
             credential_revision: self.credential_revision,
-            revoked_at: self.revoked_at,
+            revocation: Arc::clone(&self.revocation),
         }
     }
 }
@@ -133,7 +202,7 @@ impl PartialEq for SecretReference {
         self.reference_id == other.reference_id
             && self.scope == other.scope
             && self.credential_revision == other.credential_revision
-            && self.revoked_at == other.revoked_at
+            && self.revocation.revoked_at_millis() == other.revocation.revoked_at_millis()
     }
 }
 
@@ -145,7 +214,7 @@ impl fmt::Debug for SecretReference {
             .debug_struct("SecretReference")
             .field("scope_digest", &self.scope.digest())
             .field("credential_revision", &self.credential_revision)
-            .field("revoked", &self.revoked_at.is_some())
+            .field("revoked", &self.revocation.revoked_at_millis().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -160,7 +229,7 @@ impl SecretReference {
             reference_id: reference_id.into(),
             scope,
             credential_revision,
-            revoked_at: None,
+            revocation: Arc::new(RevocationFence::new()),
         };
         reference.validate()?;
         Ok(reference)
@@ -179,15 +248,7 @@ impl SecretReference {
     }
 
     pub fn revoke(&mut self, revoked_at: DateTime<Utc>) -> Result<(), ConnectorError> {
-        if let Some(existing) = self.revoked_at {
-            return if existing == revoked_at {
-                Ok(())
-            } else {
-                Err(ConnectorError::AlreadyRevoked)
-            };
-        }
-        self.revoked_at = Some(revoked_at);
-        Ok(())
+        self.revocation.revoke(revoked_at)
     }
 
     fn validate(&self) -> Result<(), ConnectorError> {
@@ -199,14 +260,13 @@ impl SecretReference {
         self.scope.validate()
     }
 
-    fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
-        self.revoked_at.is_some_and(|revoked_at| revoked_at <= now)
+    pub fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
+        self.revocation.is_revoked_at(now)
     }
 }
 
 /// A credential lease contains only a keyring reference identity and scope.
 /// It has no conversion into provider credentials.
-#[derive(Eq, PartialEq)]
 pub struct CredentialLease {
     lease_id: String,
     secret_reference_id: String,
@@ -216,7 +276,8 @@ pub struct CredentialLease {
     lease_revision: u64,
     issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    revoked_at: Option<DateTime<Utc>>,
+    revocation: Arc<RevocationFence>,
+    lease_revocation: Arc<RevocationFence>,
 }
 
 impl Clone for CredentialLease {
@@ -230,10 +291,29 @@ impl Clone for CredentialLease {
             lease_revision: self.lease_revision,
             issued_at: self.issued_at,
             expires_at: self.expires_at,
-            revoked_at: self.revoked_at,
+            revocation: Arc::clone(&self.revocation),
+            lease_revocation: Arc::clone(&self.lease_revocation),
         }
     }
 }
+
+impl PartialEq for CredentialLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.lease_id == other.lease_id
+            && self.secret_reference_id == other.secret_reference_id
+            && self.scope == other.scope
+            && self.adapter == other.adapter
+            && self.credential_revision == other.credential_revision
+            && self.lease_revision == other.lease_revision
+            && self.issued_at == other.issued_at
+            && self.expires_at == other.expires_at
+            && self.revocation.revoked_at_millis() == other.revocation.revoked_at_millis()
+            && self.lease_revocation.revoked_at_millis()
+                == other.lease_revocation.revoked_at_millis()
+    }
+}
+
+impl Eq for CredentialLease {}
 
 impl fmt::Debug for CredentialLease {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -245,7 +325,11 @@ impl fmt::Debug for CredentialLease {
             .field("lease_revision", &self.lease_revision)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
-            .field("revoked", &self.revoked_at.is_some())
+            .field(
+                "revoked",
+                &(self.revocation.revoked_at_millis().is_some()
+                    || self.lease_revocation.revoked_at_millis().is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -283,15 +367,7 @@ impl CredentialLease {
         if revoked_at < self.issued_at {
             return Err(ConnectorError::InvalidRevocation);
         }
-        if let Some(existing) = self.revoked_at {
-            return if existing == revoked_at {
-                Ok(())
-            } else {
-                Err(ConnectorError::AlreadyRevoked)
-            };
-        }
-        self.revoked_at = Some(revoked_at);
-        Ok(())
+        self.lease_revocation.revoke(revoked_at)
     }
 
     fn validate(&self, secret: &SecretReference, now: DateTime<Utc>) -> Result<(), ConnectorError> {
@@ -304,7 +380,8 @@ impl CredentialLease {
             || self.expires_at <= self.issued_at
             || self.expires_at - self.issued_at
                 > Duration::seconds(MAX_CREDENTIAL_LEASE_TTL_SECONDS)
-            || self.is_revoked_at(now)
+            || self.revocation.is_revoked_at(now)
+            || self.lease_revocation.is_revoked_at(now)
             || now < self.issued_at
             || now >= self.expires_at
         {
@@ -313,14 +390,13 @@ impl CredentialLease {
         Ok(())
     }
 
-    fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
-        self.revoked_at.is_some_and(|revoked_at| revoked_at <= now)
+    pub fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
+        self.revocation.is_revoked_at(now) || self.lease_revocation.is_revoked_at(now)
     }
 }
 
 /// Authentication session metadata.  The actual OAuth/API secret remains in
 /// the OS/project secret store and never enters this struct.
-#[derive(Eq, PartialEq)]
 pub struct AuthSession {
     session_id: String,
     scope: ConnectorScope,
@@ -330,7 +406,8 @@ pub struct AuthSession {
     auth_revision: u64,
     issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    revoked_at: Option<DateTime<Utc>>,
+    revocation: Arc<RevocationFence>,
+    session_revocation: Arc<RevocationFence>,
 }
 
 impl Clone for AuthSession {
@@ -344,10 +421,29 @@ impl Clone for AuthSession {
             auth_revision: self.auth_revision,
             issued_at: self.issued_at,
             expires_at: self.expires_at,
-            revoked_at: self.revoked_at,
+            revocation: Arc::clone(&self.revocation),
+            session_revocation: Arc::clone(&self.session_revocation),
         }
     }
 }
+
+impl PartialEq for AuthSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.scope == other.scope
+            && self.adapter == other.adapter
+            && self.credential_revision == other.credential_revision
+            && self.lease_revision == other.lease_revision
+            && self.auth_revision == other.auth_revision
+            && self.issued_at == other.issued_at
+            && self.expires_at == other.expires_at
+            && self.revocation.revoked_at_millis() == other.revocation.revoked_at_millis()
+            && self.session_revocation.revoked_at_millis()
+                == other.session_revocation.revoked_at_millis()
+    }
+}
+
+impl Eq for AuthSession {}
 
 impl fmt::Debug for AuthSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -360,7 +456,11 @@ impl fmt::Debug for AuthSession {
             .field("auth_revision", &self.auth_revision)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
-            .field("revoked", &self.revoked_at.is_some())
+            .field(
+                "revoked",
+                &(self.revocation.revoked_at_millis().is_some()
+                    || self.session_revocation.revoked_at_millis().is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -402,15 +502,7 @@ impl AuthSession {
         if revoked_at < self.issued_at {
             return Err(ConnectorError::InvalidRevocation);
         }
-        if let Some(existing) = self.revoked_at {
-            return if existing == revoked_at {
-                Ok(())
-            } else {
-                Err(ConnectorError::AlreadyRevoked)
-            };
-        }
-        self.revoked_at = Some(revoked_at);
-        Ok(())
+        self.session_revocation.revoke(revoked_at)
     }
 
     fn validate(
@@ -427,7 +519,8 @@ impl AuthSession {
             || self.auth_revision == 0
             || self.expires_at <= self.issued_at
             || self.expires_at - self.issued_at > Duration::seconds(MAX_AUTH_SESSION_TTL_SECONDS)
-            || self.revoked_at.is_some_and(|revoked_at| revoked_at <= now)
+            || self.revocation.is_revoked_at(now)
+            || self.session_revocation.is_revoked_at(now)
             || now < self.issued_at
             || now >= self.expires_at
         {
@@ -484,7 +577,7 @@ impl ProbeObservation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
     result_id: String,
@@ -772,7 +865,8 @@ impl ConnectorAuth {
             lease_revision,
             issued_at,
             expires_at,
-            revoked_at: None,
+            revocation: Arc::clone(&secret.revocation),
+            lease_revocation: Arc::new(RevocationFence::new()),
         };
         lease.validate(secret, issued_at)?;
         Ok(lease)
@@ -796,7 +890,8 @@ impl ConnectorAuth {
             auth_revision,
             issued_at,
             expires_at,
-            revoked_at: None,
+            revocation: Arc::clone(&lease.revocation),
+            session_revocation: Arc::new(RevocationFence::new()),
         };
         if !valid_prefixed_identifier(&session.session_id, "auth-session-") {
             return Err(ConnectorError::InvalidAuthSession);
@@ -901,7 +996,8 @@ impl ConnectorDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Cursor {
     scope_digest: String,
     request_digest: String,
@@ -964,8 +1060,8 @@ pub enum TaskStatus {
     Canceled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConnectorTask {
     task_id: String,
     scope_digest: String,
@@ -1008,9 +1104,164 @@ impl ConnectorTask {
     pub fn cursor(&self) -> Option<&Cursor> {
         self.cursor.as_ref()
     }
+
+    pub fn kind(&self) -> ConnectorTaskKind {
+        self.kind
+    }
+
+    pub const fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
+    pub const fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
+    pub fn advance_cursor(
+        &mut self,
+        cursor: Option<Cursor>,
+        at: DateTime<Utc>,
+    ) -> Result<(), ConnectorError> {
+        if self.status != TaskStatus::Running || at < self.updated_at {
+            return Err(ConnectorError::InvalidTaskTransition);
+        }
+        if let Some(cursor) = &cursor
+            && cursor.scope_digest() != self.scope_digest
+        {
+            return Err(ConnectorError::InvalidCursor);
+        }
+        self.cursor = cursor;
+        self.updated_at = at;
+        Ok(())
+    }
+
+    fn transition(&mut self, status: TaskStatus, at: DateTime<Utc>) -> Result<(), ConnectorError> {
+        let valid = matches!(
+            (self.status, status),
+            (
+                TaskStatus::Queued,
+                TaskStatus::Running | TaskStatus::Canceled
+            ) | (
+                TaskStatus::Running,
+                TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Canceled,
+            )
+        );
+        if !valid || at < self.updated_at {
+            return Err(ConnectorError::InvalidTaskTransition);
+        }
+        self.status = status;
+        self.updated_at = at;
+        Ok(())
+    }
+
+    fn validate(&self, scope: &ConnectorScope) -> Result<(), ConnectorError> {
+        if !valid_prefixed_identifier(&self.task_id, "connector-task-")
+            || self.scope_digest != scope.digest()
+            || self.generation == 0
+            || self.updated_at < self.created_at
+        {
+            return Err(ConnectorError::DurableStateInvalid);
+        }
+        if let Some(cursor) = &self.cursor {
+            cursor.validate(scope)?;
+        }
+        Ok(())
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// A serializable, replayable task ledger.  It contains only connector
+/// metadata and cursor digests; opaque credentials and adapter state remain
+/// outside the snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectorTaskLedger {
+    schema_version: u32,
+    scope_digest: String,
+    generation: u64,
+    revision: u64,
+    tasks: BTreeMap<String, ConnectorTask>,
+}
+
+impl ConnectorTaskLedger {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn new(scope: &ConnectorScope, generation: u64) -> Result<Self, ConnectorError> {
+        if generation == 0 {
+            return Err(ConnectorError::DurableStateInvalid);
+        }
+        Ok(Self {
+            schema_version: Self::SCHEMA_VERSION,
+            scope_digest: scope.digest(),
+            generation,
+            revision: 0,
+            tasks: BTreeMap::new(),
+        })
+    }
+
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn tasks(&self) -> &BTreeMap<String, ConnectorTask> {
+        &self.tasks
+    }
+
+    pub fn apply(
+        &mut self,
+        task: ConnectorTask,
+        expected_revision: u64,
+    ) -> Result<(), ConnectorError> {
+        if self.schema_version != Self::SCHEMA_VERSION
+            || expected_revision != self.revision
+            || task.scope_digest() != self.scope_digest
+            || task.generation() != self.generation
+            || self.tasks.contains_key(task.task_id()) && self.tasks[task.task_id()] == task
+        {
+            return Err(if expected_revision == self.revision {
+                ConnectorError::DurableStateInvalid
+            } else {
+                ConnectorError::DurableRevisionMismatch
+            });
+        }
+        self.tasks.insert(task.task_id().to_owned(), task);
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn validate(&self, scope: &ConnectorScope, generation: u64) -> Result<(), ConnectorError> {
+        if self.schema_version != Self::SCHEMA_VERSION
+            || self.scope_digest != scope.digest()
+            || self.generation != generation
+            || self.revision < self.tasks.len() as u64
+            || self.tasks.values().any(|task| {
+                task.scope_digest() != self.scope_digest
+                    || task.generation() != self.generation
+                    || task.validate(scope).is_err()
+            })
+        {
+            return Err(ConnectorError::DurableStateInvalid);
+        }
+        Ok(())
+    }
+
+    pub fn canonical_digest(&self) -> String {
+        let json = serde_json::to_string(self).expect("task ledger serialization is infallible");
+        canonical_digest([json.as_str()])
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FreshnessWindow {
     observed_at: DateTime<Utc>,
@@ -1054,7 +1305,7 @@ impl FreshnessWindow {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RateLimitState {
     remaining: u64,
@@ -1078,7 +1329,7 @@ impl RateLimitState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuotaState {
     limit: u64,
@@ -1107,7 +1358,7 @@ impl QuotaState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CostState {
     limit_minor: i64,
@@ -1147,7 +1398,8 @@ impl CostState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchBudget {
     pub rate_limit: RateLimitState,
     pub quota: QuotaState,
@@ -1406,7 +1658,7 @@ pub enum ReceiptCandidateStatus {
     Uncertain,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReceiptCandidate {
     receipt_digest: String,
@@ -1482,6 +1734,26 @@ impl ReceiptCandidate {
 
     pub const fn observed_at(&self) -> DateTime<Utc> {
         self.observed_at
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        if !is_sha256(&self.receipt_digest)
+            || !is_sha256(&self.effect_digest)
+            || !is_sha256(&self.provider_request_id_digest)
+            || !is_sha256(&self.response_digest)
+            || !valid_prefixed_identifier(&self.idempotency_key, "effect-idem-")
+            || self.receipt_digest
+                != canonical_digest([
+                    self.effect_digest.as_str(),
+                    self.provider_request_id_digest.as_str(),
+                    &format!("{:?}", self.status),
+                    self.response_digest.as_str(),
+                    &self.observed_at.to_rfc3339(),
+                ])
+        {
+            return Err(ConnectorError::InvalidReceiptCandidate);
+        }
+        self.scope.validate()
     }
 }
 
@@ -1754,7 +2026,8 @@ impl WebhookEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebhookReplayGuard {
     highest_sequence: BTreeMap<String, u64>,
     seen_events: BTreeSet<String>,
@@ -1787,8 +2060,28 @@ impl WebhookReplayGuard {
         {
             return Err(ConnectorError::WebhookReplay);
         }
+        if self
+            .highest_sequence
+            .get(&stream)
+            .is_some_and(|highest| envelope.sequence != highest.saturating_add(1))
+            || !self.highest_sequence.contains_key(&stream) && envelope.sequence != 1
+        {
+            self.seen_events.remove(&envelope.event_id);
+            return Err(ConnectorError::WebhookOutOfOrder);
+        }
         self.highest_sequence.insert(stream, envelope.sequence);
         Ok(())
+    }
+
+    pub fn highest_sequence(
+        &self,
+        scope: &ConnectorScope,
+        adapter: &ProviderAdapterIdentity,
+    ) -> u64 {
+        self.highest_sequence
+            .get(&format!("{}:{}", scope.digest(), adapter.adapter_id()))
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -2049,17 +2342,21 @@ impl WebhookObservation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkerLeaseState {
     Active,
     Canceled,
     Expired,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerLease {
     worker_id: String,
     scope_digest: String,
+    adapter_id: String,
+    adapter_version: u32,
     generation: u64,
     lease_digest: String,
     issued_at: DateTime<Utc>,
@@ -2074,6 +2371,14 @@ impl WorkerLease {
 
     pub fn scope_digest(&self) -> &str {
         &self.scope_digest
+    }
+
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
+    }
+
+    pub const fn adapter_version(&self) -> u32 {
+        self.adapter_version
     }
 
     pub const fn generation(&self) -> u64 {
@@ -2094,6 +2399,113 @@ impl WorkerLease {
 
     pub const fn state(&self) -> WorkerLeaseState {
         self.state
+    }
+
+    fn validate(&self, scope: &ConnectorScope, now: DateTime<Utc>) -> Result<(), ConnectorError> {
+        if !valid_prefixed_identifier(&self.worker_id, "worker-")
+            || self.scope_digest != scope.digest()
+            || !valid_identifier(&self.adapter_id)
+            || self.adapter_version == 0
+            || self.generation == 0
+            || self.expires_at <= self.issued_at
+            || self.expires_at - self.issued_at > Duration::seconds(MAX_WORKER_LEASE_TTL_SECONDS)
+            || now < self.issued_at
+            || self.lease_digest
+                != canonical_digest([
+                    self.worker_id.as_str(),
+                    self.scope_digest.as_str(),
+                    self.adapter_id.as_str(),
+                    &self.adapter_version.to_string(),
+                    &self.generation.to_string(),
+                    &self.issued_at.to_rfc3339(),
+                    &self.expires_at.to_rfc3339(),
+                ])
+        {
+            return Err(ConnectorError::InvalidWorkerLease);
+        }
+        if self.state == WorkerLeaseState::Active && now >= self.expires_at {
+            return Err(ConnectorError::FreshnessExpired);
+        }
+        if self.state == WorkerLeaseState::Expired && now < self.expires_at {
+            return Err(ConnectorError::InvalidWorkerLease);
+        }
+        Ok(())
+    }
+}
+
+/// Durable connector-worker metadata.  Restoring a snapshot never restores
+/// an adapter's secret material; the caller must supply a freshly constructed
+/// adapter and the same exact contract registry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectorWorkerSnapshot {
+    schema_version: u32,
+    scope: ConnectorScope,
+    lease: WorkerLease,
+    next_task: u64,
+    tasks: BTreeMap<String, ConnectorTask>,
+    executed_effects: BTreeMap<String, ReceiptCandidate>,
+    idempotency_effects: BTreeMap<String, String>,
+    webhook_replay: WebhookReplayGuard,
+    last_budget: Option<DispatchBudget>,
+}
+
+impl ConnectorWorkerSnapshot {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn scope(&self) -> &ConnectorScope {
+        &self.scope
+    }
+
+    pub fn lease(&self) -> &WorkerLease {
+        &self.lease
+    }
+
+    pub fn tasks(&self) -> &BTreeMap<String, ConnectorTask> {
+        &self.tasks
+    }
+
+    pub fn webhook_replay(&self) -> &WebhookReplayGuard {
+        &self.webhook_replay
+    }
+
+    pub fn canonical_digest(&self) -> String {
+        let json =
+            serde_json::to_string(self).expect("worker snapshot serialization is infallible");
+        canonical_digest([json.as_str()])
+    }
+
+    fn validate(&self, now: DateTime<Utc>) -> Result<(), ConnectorError> {
+        if self.schema_version != Self::SCHEMA_VERSION
+            || self.next_task == 0
+            || self.tasks.values().any(|task| {
+                task.scope_digest() != self.scope.digest()
+                    || task.generation() > self.lease.generation
+                    || task.validate(&self.scope).is_err()
+            })
+            || self
+                .idempotency_effects
+                .values()
+                .any(|digest| !is_sha256(digest))
+            || self.executed_effects.iter().any(|(digest, receipt)| {
+                digest != receipt.effect_digest()
+                    || receipt.scope() != &self.scope
+                    || receipt.validate().is_err()
+            })
+            || self
+                .idempotency_effects
+                .values()
+                .any(|digest| !self.executed_effects.contains_key(digest))
+            || now < self.lease.issued_at
+        {
+            return Err(ConnectorError::DurableStateInvalid);
+        }
+        self.lease.validate(&self.scope, now)?;
+        Ok(())
     }
 }
 
@@ -2222,6 +2634,8 @@ pub enum ConnectorError {
     WebhookScopeMismatch,
     #[error("webhook envelope was replayed or reordered")]
     WebhookReplay,
+    #[error("webhook sequence is not the next contiguous event")]
+    WebhookOutOfOrder,
     #[error("worker lease is invalid")]
     InvalidWorkerLease,
     #[error("worker generation or lease does not match")]
@@ -2230,6 +2644,10 @@ pub enum ConnectorError {
     TaskNotFound,
     #[error("connector task transition is invalid")]
     InvalidTaskTransition,
+    #[error("durable connector state is invalid")]
+    DurableStateInvalid,
+    #[error("durable connector state revision does not match")]
+    DurableRevisionMismatch,
     #[error("provider adapter rejected the operation")]
     ProviderRejected,
     #[error("provider operation is uncertain")]
@@ -2307,8 +2725,9 @@ pub mod testkit {
     };
     #[cfg(test)]
     use super::{
-        CredentialLease, DEFAULT_PAGE_SIZE, DispatchBudget, EffectExecutionContext, LiveProbeFence,
-        ProbeResult, WebhookEnvelope, WebhookReplayGuard, WebhookSigningKey,
+        ConnectorTaskKind, ConnectorTaskLedger, ConnectorWorkerSnapshot, CredentialLease,
+        DEFAULT_PAGE_SIZE, DispatchBudget, EffectExecutionContext, LiveProbeFence, ProbeResult,
+        WebhookEnvelope, WebhookReplayGuard, WebhookSigningKey,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::collections::BTreeMap;
@@ -3048,6 +3467,164 @@ pub mod testkit {
         );
         Ok(())
     }
+
+    #[test]
+    fn revocation_fence_propagates_across_derived_auth_chain() -> Result<(), ConnectorError> {
+        let kit = ProviderTestkit::new()?;
+        let mut worker = kit.worker()?;
+        let (mut secret, mut lease, session, _, _) = auth_and_probe(&kit, &mut worker)?;
+        let lease_clone = lease.clone();
+        let session_clone = session.clone();
+        lease.revoke(kit.now + Duration::seconds(10))?;
+        assert_eq!(
+            ConnectorAuth::begin_auth_session(
+                &secret,
+                &lease_clone,
+                "auth-session-after-lease-revoke",
+                2,
+                kit.now + Duration::seconds(11),
+                kit.now + Duration::minutes(2),
+            ),
+            Err(ConnectorError::InvalidCredentialLease)
+        );
+        assert_eq!(
+            session_clone.validate(&secret, &lease_clone, kit.now + Duration::seconds(11)),
+            Err(ConnectorError::InvalidCredentialLease)
+        );
+
+        let lease2 = ConnectorAuth::issue_credential_lease(
+            &secret,
+            kit.descriptor.identity().clone(),
+            "credential-lease-revocation-2",
+            2,
+            kit.now,
+            kit.now + Duration::minutes(5),
+        )?;
+        secret.revoke(kit.now + Duration::seconds(20))?;
+        assert_eq!(
+            ConnectorAuth::begin_auth_session(
+                &secret,
+                &lease2,
+                "auth-session-after-secret-revoke",
+                3,
+                kit.now + Duration::seconds(21),
+                kit.now + Duration::minutes(2),
+            ),
+            Err(ConnectorError::InvalidCredentialLease)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_worker_snapshot_and_task_ledger_replay_fail_closed() -> Result<(), ConnectorError> {
+        let kit = ProviderTestkit::new()?;
+        let mut worker = kit.worker()?;
+        let fence = worker.dispatch_fence();
+        let task = worker.enqueue_task(
+            &fence,
+            ConnectorTaskKind::Read,
+            Some(Cursor::new(
+                &kit.scope,
+                sha256("query"),
+                1,
+                sha256("token"),
+            )?),
+            kit.now,
+        )?;
+        let mut ledger = ConnectorTaskLedger::new(&kit.scope, fence.generation())?;
+        ledger.apply(task.clone(), 0)?;
+        assert_eq!(
+            ledger.apply(task.clone(), 0),
+            Err(ConnectorError::DurableRevisionMismatch)
+        );
+        let ledger_json = serde_json::to_string(&ledger).expect("ledger JSON");
+        let replayed_ledger: ConnectorTaskLedger =
+            serde_json::from_str(&ledger_json).expect("ledger replay");
+        replayed_ledger.validate(&kit.scope, fence.generation())?;
+        assert_eq!(
+            replayed_ledger.canonical_digest(),
+            ledger.canonical_digest()
+        );
+
+        let snapshot = worker.snapshot();
+        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot JSON");
+        let replayed_snapshot: ConnectorWorkerSnapshot =
+            serde_json::from_str(&snapshot_json).expect("snapshot replay");
+        assert_eq!(
+            replayed_snapshot.canonical_digest(),
+            snapshot.canonical_digest()
+        );
+        let restored = ConnectorWorker::from_snapshot(
+            DeterministicAdapter::new(kit.descriptor.clone()),
+            kit.contract_registry.clone(),
+            replayed_snapshot,
+            kit.now,
+        )?;
+        assert_eq!(restored.task(task.task_id()), Some(&task));
+
+        let tampered = snapshot_json.replace("\"nextTask\":2", "\"nextTask\":0");
+        let tampered_snapshot: ConnectorWorkerSnapshot =
+            serde_json::from_str(&tampered).expect("typed tamper");
+        assert!(matches!(
+            ConnectorWorker::from_snapshot(
+                DeterministicAdapter::new(kit.descriptor.clone()),
+                kit.contract_registry,
+                tampered_snapshot,
+                kit.now,
+            ),
+            Err(ConnectorError::DurableStateInvalid)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_order_fence_requires_contiguous_sequences() -> Result<(), ConnectorError> {
+        let kit = ProviderTestkit::new()?;
+        let key = WebhookSigningKey::new(b"deterministic-webhook-key")?;
+        let mut guard = WebhookReplayGuard::default();
+        let first = WebhookEnvelope::sign(
+            &kit.scope,
+            kit.descriptor.identity().clone(),
+            "webhook-event-order-1",
+            1,
+            kit.now,
+            kit.now,
+            sha256("payload-1"),
+            &key,
+        )?;
+        guard.accept(&kit.scope, &first, &key, kit.now)?;
+        let third = WebhookEnvelope::sign(
+            &kit.scope,
+            kit.descriptor.identity().clone(),
+            "webhook-event-order-3",
+            3,
+            kit.now,
+            kit.now,
+            sha256("payload-3"),
+            &key,
+        )?;
+        assert_eq!(
+            guard.accept(&kit.scope, &third, &key, kit.now),
+            Err(ConnectorError::WebhookOutOfOrder)
+        );
+        let second = WebhookEnvelope::sign(
+            &kit.scope,
+            kit.descriptor.identity().clone(),
+            "webhook-event-order-2",
+            2,
+            kit.now,
+            kit.now,
+            sha256("payload-2"),
+            &key,
+        )?;
+        guard.accept(&kit.scope, &second, &key, kit.now)?;
+        guard.accept(&kit.scope, &third, &key, kit.now)?;
+        assert_eq!(
+            guard.highest_sequence(&kit.scope, kit.descriptor.identity()),
+            3
+        );
+        Ok(())
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -3082,9 +3659,13 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         adapter.descriptor().validate()?;
         adapter.descriptor().validate_against(&contract_registry)?;
         let scope_digest = scope.digest();
+        let adapter_id = adapter.descriptor().identity().adapter_id().to_owned();
+        let adapter_version = adapter.descriptor().identity().adapter_version();
         let lease_digest = canonical_digest([
             worker_id.as_str(),
             &scope_digest,
+            adapter_id.as_str(),
+            &adapter_version.to_string(),
             "1",
             &now.to_rfc3339(),
             &lease_expires_at.to_rfc3339(),
@@ -3096,6 +3677,8 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
             lease: WorkerLease {
                 worker_id,
                 scope_digest,
+                adapter_id,
+                adapter_version,
                 generation: 1,
                 lease_digest,
                 issued_at: now,
@@ -3128,10 +3711,72 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         self.now
     }
 
+    pub fn tasks(&self) -> &BTreeMap<String, ConnectorTask> {
+        &self.tasks
+    }
+
+    pub fn task(&self, task_id: &str) -> Option<&ConnectorTask> {
+        self.tasks.get(task_id)
+    }
+
+    pub fn snapshot(&self) -> ConnectorWorkerSnapshot {
+        ConnectorWorkerSnapshot {
+            schema_version: ConnectorWorkerSnapshot::SCHEMA_VERSION,
+            scope: self.scope.clone(),
+            lease: self.lease.clone(),
+            next_task: self.next_task,
+            tasks: self.tasks.clone(),
+            executed_effects: self.executed_effects.clone(),
+            idempotency_effects: self.idempotency_effects.clone(),
+            webhook_replay: self.webhook_replay.clone(),
+            last_budget: self.last_budget.clone(),
+        }
+    }
+
+    pub fn from_snapshot(
+        adapter: A,
+        contract_registry: ProviderAdapterRegistry,
+        snapshot: ConnectorWorkerSnapshot,
+        now: DateTime<Utc>,
+    ) -> Result<Self, ConnectorError> {
+        snapshot.validate(now)?;
+        contract_registry
+            .validate()
+            .map_err(|_| ConnectorError::InvalidRegistry)?;
+        adapter.descriptor().validate()?;
+        adapter.descriptor().validate_against(&contract_registry)?;
+        if adapter.descriptor().identity().adapter_id() != snapshot.lease.adapter_id
+            || adapter.descriptor().identity().adapter_version() != snapshot.lease.adapter_version
+        {
+            return Err(ConnectorError::AdapterMetadataMismatch);
+        }
+        Ok(Self {
+            adapter,
+            contract_registry,
+            scope: snapshot.scope,
+            lease: snapshot.lease,
+            now,
+            next_task: snapshot.next_task,
+            tasks: snapshot.tasks,
+            executed_effects: snapshot.executed_effects,
+            idempotency_effects: snapshot.idempotency_effects,
+            webhook_replay: snapshot.webhook_replay,
+            last_budget: snapshot.last_budget,
+        })
+    }
+
     pub fn set_now(&mut self, now: DateTime<Utc>) {
+        if now < self.now {
+            return;
+        }
         self.now = now;
         if now >= self.lease.expires_at && self.lease.state == WorkerLeaseState::Active {
             self.lease.state = WorkerLeaseState::Expired;
+            for task in self.tasks.values_mut() {
+                if matches!(task.status(), TaskStatus::Queued | TaskStatus::Running) {
+                    let _ = task.transition(TaskStatus::Canceled, now);
+                }
+            }
         }
     }
 
@@ -3149,11 +3794,18 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         at: DateTime<Utc>,
     ) -> Result<(), ConnectorError> {
         self.validate_dispatch(fence, &self.scope, at)?;
+        for task in self.tasks.values_mut() {
+            if matches!(task.status(), TaskStatus::Queued | TaskStatus::Running) {
+                task.transition(TaskStatus::Canceled, at)?;
+            }
+        }
         self.lease.state = WorkerLeaseState::Canceled;
         self.lease.generation = self.lease.generation.saturating_add(1);
         self.lease.lease_digest = canonical_digest([
             self.lease.worker_id.as_str(),
             &self.scope.digest(),
+            self.lease.adapter_id.as_str(),
+            &self.lease.adapter_version.to_string(),
             &self.lease.generation.to_string(),
             &at.to_rfc3339(),
         ]);
@@ -3168,6 +3820,8 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
     ) -> Result<DispatchFence, ConnectorError> {
         if previous.generation != self.lease.generation
             || previous.lease_digest != self.lease.lease_digest
+            || issued_at < self.now
+            || issued_at < self.lease.issued_at
             || expires_at <= issued_at
             || expires_at - issued_at > Duration::seconds(MAX_WORKER_LEASE_TTL_SECONDS)
         {
@@ -3180,11 +3834,22 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         self.lease.lease_digest = canonical_digest([
             self.lease.worker_id.as_str(),
             &self.scope.digest(),
+            self.lease.adapter_id.as_str(),
+            &self.lease.adapter_version.to_string(),
             &self.lease.generation.to_string(),
             &issued_at.to_rfc3339(),
             &expires_at.to_rfc3339(),
         ]);
         Ok(self.dispatch_fence())
+    }
+
+    pub fn resume_generation(
+        &mut self,
+        previous: &DispatchFence,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<DispatchFence, ConnectorError> {
+        self.renew_generation(previous, issued_at, expires_at)
     }
 
     pub fn last_budget(&self) -> Option<&DispatchBudget> {
@@ -3232,9 +3897,7 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         if task.generation != fence.generation || task.status != TaskStatus::Queued {
             return Err(ConnectorError::GenerationMismatch);
         }
-        task.status = TaskStatus::Running;
-        task.updated_at = at;
-        Ok(())
+        task.transition(TaskStatus::Running, at)
     }
 
     pub fn finish_task(
@@ -3258,9 +3921,7 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         if task.generation != fence.generation || task.status != TaskStatus::Running {
             return Err(ConnectorError::GenerationMismatch);
         }
-        task.status = status;
-        task.updated_at = at;
-        Ok(())
+        task.transition(status, at)
     }
 
     pub fn begin_auth(&mut self, request: BeginAuthRequest) -> Result<AuthSession, ConnectorError> {
@@ -3271,7 +3932,15 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         {
             return Err(ConnectorError::ScopeMismatch);
         }
-        self.adapter.begin_auth(request)
+        request
+            .credential_lease
+            .validate(&request.secret_reference, request.issued_at)?;
+        let secret = request.secret_reference.clone();
+        let lease = request.credential_lease.clone();
+        let issued_at = request.issued_at;
+        let session = self.adapter.begin_auth(request)?;
+        session.validate(&secret, &lease, issued_at)?;
+        Ok(session)
     }
 
     pub fn refresh_auth(
@@ -3287,7 +3956,17 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         {
             return Err(ConnectorError::ScopeMismatch);
         }
-        self.adapter.refresh_auth(request)
+        request.session.validate(
+            &request.secret_reference,
+            &request.credential_lease,
+            request.issued_at,
+        )?;
+        let secret = request.secret_reference.clone();
+        let lease = request.credential_lease.clone();
+        let issued_at = request.issued_at;
+        let session = self.adapter.refresh_auth(request)?;
+        session.validate(&secret, &lease, issued_at)?;
+        Ok(session)
     }
 
     pub fn probe(&mut self, request: ProbeRequest) -> Result<ProbeResult, ConnectorError> {
@@ -3300,6 +3979,11 @@ impl<A: ConnectorAdapter> ConnectorWorker<A> {
         {
             return Err(ConnectorError::ScopeMismatch);
         }
+        request.session.validate(
+            &request.secret_reference,
+            &request.credential_lease,
+            request.at,
+        )?;
         let observation = self.adapter.probe(request.clone())?;
         ConnectorAuth::record_probe(
             &request.secret_reference,

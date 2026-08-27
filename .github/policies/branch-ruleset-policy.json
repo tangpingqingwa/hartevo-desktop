@@ -1,0 +1,240 @@
+{
+  "schemaVersion": "hartevo-github-branch-ruleset-policy/v1",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "defaultBranch": "bootstrap/macos-r0",
+  "repositorySettings": {
+    "deleteBranchOnMerge": true,
+    "allowUpdateBranch": true,
+    "allowMergeCommit": true,
+    "allowSquashMerge": false,
+    "allowRebaseMerge": false,
+    "allowAutoMerge": false
+  },
+  "hostedEnforcement": "desired_active_not_yet_applied",
+  "observedHostedStatus": {
+    "branchProtectionApi": "NOT_REQUIRED_RULESET_IS_AUTHORITATIVE",
+    "rulesetApi": "NOT_APPLIED_AT_CHECKIN",
+    "rulesetId": 20797159,
+    "rulesetName": "Hartevo protected integration branches",
+    "requiredStatusCheckIntegrationId": 15368,
+    "previousRulesetRemainsActive": true,
+    "activationFence": "merge governance-admission.yml into bootstrap/macos-r0, then run the idempotent apply command",
+    "verifiedAt": "2026-08-21T07:06:21Z"
+  },
+  "verification": {
+    "localCommand": "python3 scripts/ci-branch-policy.py verify",
+    "hostedCommand": "python3 scripts/ci-branch-policy.py probe --repo tangpingqingwa/hartevo-desktop",
+    "applyCommand": "python3 scripts/ci-branch-policy.py apply --repo tangpingqingwa/hartevo-desktop",
+    "applySemantics": "idempotently enforce the default Integration branch, post-merge branch deletion, update-branch support, and protected ruleset; apply hosted merge queue only when GitHub reports an eligible Organization owner; never bypass or delete protection"
+  },
+  "branches": [
+    {
+      "name": "bootstrap/macos-r0",
+      "requirePullRequest": true,
+      "requiredApprovingReviews": 0,
+      "requireCodeOwnerReview": false,
+      "dismissStaleReviews": false,
+      "requireConversationResolution": true,
+      "allowForcePushes": false,
+      "allowDeletions": false,
+      "requiredStatusChecks": [
+        "PR / Workflow policy",
+        "Governance / PR admission",
+        "Governance / Train-only merge",
+        "PR / Scope plan",
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+        "PR / Result taxonomy"
+      ]
+    },
+    {
+      "name": "main",
+      "requirePullRequest": true,
+      "requiredApprovingReviews": 0,
+      "requireCodeOwnerReview": false,
+      "dismissStaleReviews": false,
+      "requireConversationResolution": true,
+      "allowForcePushes": false,
+      "allowDeletions": false,
+      "requiredStatusChecks": [
+        "PR / Workflow policy",
+        "Governance / PR admission",
+        "Governance / Train-only merge",
+        "PR / Scope plan",
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+        "PR / Result taxonomy"
+      ]
+    }
+  ],
+  "reviewDeadlockAvoidance": {
+    "singleMaintainerApprovalRequired": false,
+    "bypassActors": [],
+    "reason": "PR and required checks remain mandatory, but a solo maintainer is not required to approve their own pull request."
+  },
+  "mergeQueue": {
+    "hostedEnforcement": "blocked_owner_type",
+    "observedHostedStatus": {
+      "rulesetApi": "UNAVAILABLE_PERSONAL_ACCOUNT_OWNER",
+      "rulesetId": null,
+      "rulesetName": "Hartevo bootstrap merge queue",
+      "ownerType": "User",
+      "requiredOwnerType": "Organization",
+      "apiError": "Invalid rule merge_queue",
+      "verifiedAt": "2026-08-21T06:54:30Z"
+    },
+    "availabilityDocumentation": "https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/merging-a-pull-request-with-a-merge-queue#who-can-use-this-feature",
+    "buildConcurrency": 4,
+    "minimumGroupSize": 1,
+    "maximumGroupSize": 4,
+    "minimumGroupWaitMinutes": 5,
+    "requiredCheckTimeoutMinutes": 120,
+    "groupingStrategy": "HEADGREEN",
+    "mergeMethod": "MERGE",
+    "ruleset": {
+      "name": "Hartevo bootstrap merge queue",
+      "target": "branch",
+      "enforcement": "active",
+      "conditions": {
+        "ref_name": {
+          "include": [
+            "refs/heads/bootstrap/macos-r0"
+          ],
+          "exclude": []
+        }
+      },
+      "rules": [
+        {
+          "type": "merge_queue",
+          "parameters": {
+            "check_response_timeout_minutes": 120,
+            "grouping_strategy": "HEADGREEN",
+            "max_entries_to_build": 4,
+            "max_entries_to_merge": 4,
+            "merge_method": "MERGE",
+            "min_entries_to_merge": 1,
+            "min_entries_to_merge_wait_minutes": 5
+          }
+        }
+      ],
+      "bypass_actors": []
+    }
+  },
+  "repositoryMergeTrain": {
+    "enforcement": "active",
+    "reason": "GitHub hosted merge queue is unavailable to a public repository owned by a personal account.",
+    "branchPrefix": "merge-train/",
+    "manifestDirectory": ".github/merge-train/manifests",
+    "baseBranch": "bootstrap/macos-r0",
+    "maximumCandidateCount": 4,
+    "candidateRequirements": [
+      "open",
+      "ready",
+      "root-bootstrap-base",
+      "exact-current-head",
+      "candidate-checks-success-excluding-intentional-train-only-block"
+    ],
+    "compositeRequirements": [
+      "exact-first-parent-history",
+      "exact-reconstructed-tree",
+      "full-ubuntu-macos-matrix",
+      "normal-protected-pull-request-merge",
+      "no-bypass"
+    ]
+  },
+  "ruleset": {
+    "name": "Hartevo protected integration branches",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "include": [
+          "refs/heads/bootstrap/macos-r0",
+          "refs/heads/main"
+        ],
+        "exclude": []
+      }
+    },
+    "rules": [
+      {
+        "type": "deletion"
+      },
+      {
+        "type": "non_fast_forward"
+      },
+      {
+        "type": "pull_request",
+        "parameters": {
+          "dismiss_stale_reviews_on_push": false,
+          "require_code_owner_review": false,
+          "require_last_push_approval": false,
+          "required_approving_review_count": 0,
+          "required_review_thread_resolution": true
+        }
+      },
+      {
+        "type": "required_status_checks",
+        "parameters": {
+          "strict_required_status_checks_policy": true,
+          "do_not_enforce_on_create": false,
+          "required_status_checks": [
+            {
+              "context": "PR / Workflow policy",
+              "integration_id": 15368
+            },
+            {
+              "context": "Governance / PR admission",
+              "integration_id": 15368
+            },
+            {
+              "context": "Governance / Train-only merge",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Scope plan",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Result taxonomy",
+              "integration_id": 15368
+            }
+          ]
+        }
+      }
+    ],
+    "bypass_actors": []
+  },
+  "releaseEnvironment": {
+    "name": "release-promotion",
+    "manualApprovalRequired": true,
+    "oidcOnly": true,
+    "longLivedCredentialsAllowed": false,
+    "releaseEnabledInThisPr": false
+  }
+}

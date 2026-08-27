@@ -625,6 +625,7 @@ fn initialize_native_store() -> Result<(), SecretStoreError> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn read_secret(entry: &Entry) -> Result<SecretBytes, SecretStoreError> {
     let secret = entry.get_secret().map_err(|error| match error {
         KeyringError::NoEntry => SecretStoreError::SecretNotFound,
@@ -633,6 +634,7 @@ fn read_secret(entry: &Entry) -> Result<SecretBytes, SecretStoreError> {
     SecretBytes::new(secret)
 }
 
+#[cfg(target_os = "macos")]
 fn delete_secret(entry: &Entry) -> Result<(), SecretStoreError> {
     entry.delete_credential().map_err(|error| match error {
         KeyringError::NoEntry => SecretStoreError::SecretNotFound,

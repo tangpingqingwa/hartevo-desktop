@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "hartevo-federation-provider-registry/v1",
+  "registryId": "federation.result.fixture.registry",
+  "nativeWorkerVerifierAvailable": false,
+  "providers": [
+    {
+      "providerId": "provider.fixture.active",
+      "workerId": "worker.fixture.active",
+      "serviceId": "service.federation.result",
+      "providerDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "workerAttestationDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "status": "active"
+    },
+    {
+      "providerId": "provider.fixture.revoked",
+      "workerId": "worker.fixture.revoked",
+      "serviceId": "service.federation.result",
+      "providerDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "workerAttestationDigest": "4444444444444444444444444444444444444444444444444444444444444444",
+      "status": "revoked"
+    }
+  ],
+  "releaseDecision": "NOT_EVALUATED"
+}

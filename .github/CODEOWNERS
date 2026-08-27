@@ -1,0 +1,12 @@
+# Governance and release surfaces require explicit product-owner review.
+/.github/ @tangpingqingwa
+/.github/governance/ @tangpingqingwa
+/.github/merge-train/ @tangpingqingwa
+/.github/policies/repository-governance-policy.json @tangpingqingwa
+/scripts/ci-* @tangpingqingwa
+/scripts/repository_governance.py @tangpingqingwa
+/docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md @tangpingqingwa
+/contracts/release-evidence/ @tangpingqingwa
+/contracts/security/ @tangpingqingwa
+/docs/security/ @tangpingqingwa
+/hartevo-rs/ @tangpingqingwa
