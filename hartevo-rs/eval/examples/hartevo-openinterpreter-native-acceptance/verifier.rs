@@ -389,7 +389,14 @@ fn validate_app_server_contract() -> Result<()> {
                 "thread/start",
                 "thread/resume",
                 "turn/start",
-                "turn/interrupt"
+                "turn/steer",
+                "turn/interrupt",
+                "interpreter/provider/list",
+                "interpreter/provider/set",
+                "interpreter/model/list",
+                "interpreter/model/set",
+                "interpreter/harness/list",
+                "interpreter/harness/set",
             ],
         "app-server stable method set drifted"
     );
