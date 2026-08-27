@@ -7,6 +7,7 @@
 
 mod model_tokenizer;
 mod steering;
+pub mod worker_graph;
 
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,

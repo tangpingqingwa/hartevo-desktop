@@ -1,0 +1,412 @@
+{
+  "schemaVersion": "hartevo-progress-trace/v1",
+  "contract": {
+    "schemaVersion": "hartevo-progress-trace/v1",
+    "contractId": "durable-progress-trace",
+    "authority": "eval_only_no_production_authority",
+    "releaseEligible": false,
+    "requiredIdentity": {
+      "scope": true,
+      "epoch": true,
+      "cursor": true,
+      "everyEvent": true
+    },
+    "awaiting": {
+      "persistence": "durable",
+      "presentation": "painted",
+      "beforeResume": true
+    },
+    "firstUsefulProgress": {
+      "progressClass": "useful",
+      "distinctFromGeneric": true,
+      "requiresBusinessStep": true
+    },
+    "runningCaughtUp": {
+      "caughtUpIsNonTerminal": true,
+      "lateDeltaLegal": true
+    },
+    "terminal": {
+      "operations": ["append", "reset"],
+      "finalCaughtUpRequired": true,
+      "finalCaughtUpSameCursor": true
+    },
+    "rejectionRules": {
+      "duplicateEventId": true,
+      "duplicateCursor": true,
+      "skippedCursor": true,
+      "crossScope": true,
+      "cursorRegression": true,
+      "postTerminal": true,
+      "rawClockDeterminism": true
+    },
+    "requiredRestartMarkers": [
+      "before_resume",
+      "after_first_useful_progress",
+      "before_terminal"
+    ],
+    "clock": {
+      "authority": "virtual_monotonic/v1",
+      "wallClockOrderingAllowed": false
+    },
+    "provenance": {
+      "allowedKinds": ["fixture", "simulator", "native"],
+      "mixedSourcesAllowed": false,
+      "nativeReceiptRequired": true,
+      "checkedInSampleSatisfiesNative": false
+    }
+  },
+  "trace": {
+    "traceId": "durable-progress-example",
+    "scope": {
+      "tenantId": "fixture-tenant",
+      "projectId": "fixture-project",
+      "missionId": "fixture-mission",
+      "conversationId": "fixture-conversation",
+      "runId": "fixture-run"
+    },
+    "epoch": 7,
+    "initialCursor": 40,
+    "provenance": {
+      "kind": "fixture",
+      "fixtureId": "durable-progress-fixture-v1",
+      "checkedIn": true,
+      "nativeReceiptId": null
+    },
+    "events": [
+      {
+        "eventId": "evt-awaiting",
+        "ordinal": 0,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 40
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 0
+        },
+        "event": {
+          "type": "awaiting",
+          "data": {
+            "persistence": "durable",
+            "presentation": "painted",
+            "checkpointId": "progress.awaiting"
+          }
+        }
+      },
+      {
+        "eventId": "evt-restart-before-resume",
+        "ordinal": 1,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 40
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 1
+        },
+        "event": {
+          "type": "restart_marker",
+          "data": {
+            "position": "before_resume",
+            "contractPositionOnly": true,
+            "processKillObserved": false
+          }
+        }
+      },
+      {
+        "eventId": "evt-resume",
+        "ordinal": 2,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 40
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 2
+        },
+        "event": {
+          "type": "resume",
+          "data": { "mode": "runtime" }
+        }
+      },
+      {
+        "eventId": "evt-first-useful",
+        "ordinal": 3,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 41
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 3
+        },
+        "event": {
+          "type": "first_useful_progress",
+          "data": {
+            "progressClass": "useful",
+            "generic": false,
+            "businessStepId": "mission.progress.first_useful",
+            "label": "Preparing the first mission-specific progress update",
+            "detailDigest": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        }
+      },
+      {
+        "eventId": "evt-restart-after-first-useful",
+        "ordinal": 4,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 41
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 4
+        },
+        "event": {
+          "type": "restart_marker",
+          "data": {
+            "position": "after_first_useful_progress",
+            "contractPositionOnly": true,
+            "processKillObserved": false
+          }
+        }
+      },
+      {
+        "eventId": "evt-running",
+        "ordinal": 5,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 41
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 5
+        },
+        "event": {
+          "type": "running",
+          "data": { "phase": "running" }
+        }
+      },
+      {
+        "eventId": "evt-delta",
+        "ordinal": 6,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 42
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 6
+        },
+        "event": {
+          "type": "delta",
+          "data": {
+            "operation": "append",
+            "deltaId": "delta-42",
+            "payloadDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "late": false
+          }
+        }
+      },
+      {
+        "eventId": "evt-caught-up",
+        "ordinal": 7,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 42
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 7
+        },
+        "event": {
+          "type": "caught_up",
+          "data": { "finalCaughtUp": false }
+        }
+      },
+      {
+        "eventId": "evt-late-delta",
+        "ordinal": 8,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 43
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 8
+        },
+        "event": {
+          "type": "delta",
+          "data": {
+            "operation": "append",
+            "deltaId": "delta-43-late",
+            "payloadDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "late": true
+          }
+        }
+      },
+      {
+        "eventId": "evt-caught-up-after-late",
+        "ordinal": 9,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 43
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 9
+        },
+        "event": {
+          "type": "caught_up",
+          "data": { "finalCaughtUp": false }
+        }
+      },
+      {
+        "eventId": "evt-restart-before-terminal",
+        "ordinal": 10,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 43
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 10
+        },
+        "event": {
+          "type": "restart_marker",
+          "data": {
+            "position": "before_terminal",
+            "contractPositionOnly": true,
+            "processKillObserved": false
+          }
+        }
+      },
+      {
+        "eventId": "evt-terminal",
+        "ordinal": 11,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 44
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 11
+        },
+        "event": {
+          "type": "terminal_envelope",
+          "data": {
+            "operation": "append",
+            "envelopeDigest": "4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        }
+      },
+      {
+        "eventId": "evt-final-caught-up",
+        "ordinal": 12,
+        "identity": {
+          "scope": {
+            "tenantId": "fixture-tenant",
+            "projectId": "fixture-project",
+            "missionId": "fixture-mission",
+            "conversationId": "fixture-conversation",
+            "runId": "fixture-run"
+          },
+          "epoch": 7,
+          "cursor": 44
+        },
+        "clock": {
+          "authority": "virtual_monotonic/v1",
+          "tickMs": 12
+        },
+        "event": {
+          "type": "caught_up",
+          "data": { "finalCaughtUp": true }
+        }
+      }
+    ]
+  }
+}

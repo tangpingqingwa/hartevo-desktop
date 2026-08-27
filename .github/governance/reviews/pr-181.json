@@ -1,0 +1,24 @@
+{
+  "authorTaskId": "01a03d77-5ca5-7d01-9f84-da44eedb2064",
+  "baseSha": "11ad52fa6686d96fa8a503bddf6e42f248b06123",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "contracts/federation/provider-registry.v1.json",
+    "contracts/federation/provider-registry.v1.schema.json",
+    "contracts/federation/result-envelope.v1.schema.json",
+    "hartevo-rs/eval/examples/hartevo-federation-result/digest.rs",
+    "hartevo-rs/eval/examples/hartevo-federation-result/fixtures/not-evaluated-envelope.v1.json",
+    "hartevo-rs/eval/examples/hartevo-federation-result/main.rs",
+    "hartevo-rs/eval/examples/hartevo-federation-result/model.rs",
+    "hartevo-rs/eval/examples/hartevo-federation-result/signature.rs",
+    "hartevo-rs/eval/examples/hartevo-federation-result/verifier.rs"
+  ],
+  "pr": 181,
+  "receiptDigest": "ecdfcd387f92e85eb58ca16fa79002e39c8f32018b8021897fd83ed71712a57d",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T11:10:35Z",
+  "reviewedHeadSha": "11ced6c35b34ee5c69801d642e39bea41286ae59",
+  "reviewerTaskId": "01a03dbf-f4a4-71b0-be08-499dfdc490a8",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

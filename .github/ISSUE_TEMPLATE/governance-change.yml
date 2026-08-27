@@ -1,0 +1,52 @@
+name: Governed repository change
+description: Propose a bounded change while the repository is in governance drain mode.
+title: "[governance] "
+labels: ["governance"]
+body:
+  - type: dropdown
+    id: change_class
+    attributes:
+      label: Change class
+      options:
+        - governance
+        - integration-recovery
+        - review-repair
+        - base-refresh
+        - security
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: Single accountable owner
+      description: One human or task identity; no shared or duplicate ownership.
+    validations:
+      required: true
+  - type: textarea
+    id: owned_paths
+    attributes:
+      label: Exact path lease
+      description: List the repository paths or directory prefixes this change owns.
+    validations:
+      required: true
+  - type: textarea
+    id: exit_criteria
+    attributes:
+      label: Exit criteria and proof
+    validations:
+      required: true
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback or recovery plan
+    validations:
+      required: true
+  - type: checkboxes
+    id: honesty
+    attributes:
+      label: Governance honesty
+      options:
+        - label: This issue does not treat local tests, commits, pushes, or inventory movement as merge throughput.
+          required: true
+        - label: Destructive cleanup requires a separately approved, digest-bound lifecycle plan.
+          required: true

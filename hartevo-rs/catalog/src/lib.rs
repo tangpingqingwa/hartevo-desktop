@@ -12,6 +12,7 @@ use thiserror::Error;
 
 mod evidence;
 mod mission_contract;
+mod planning_plugin;
 mod provider_closure;
 mod route_graph;
 mod route_runtime_authority;
@@ -23,11 +24,21 @@ pub use evidence::{
     EvaluationPrivateAttestationStatus, EvaluationReferenceRunProfile,
     EvaluationReferenceThresholdStatus, EvaluationRunEvidenceAuthority,
     EvaluationRunResultReference, EvaluationRunResultReferences, EvaluationRunValidationAuthority,
-    EvaluationSafetyMappingStatus, EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus,
-    ReleaseEvidence, ReleaseStage,
+    EvaluationSafetyMappingStatus, EvaluatorAuthorityScope, EvaluatorEvidenceAuthority,
+    EvaluatorEvidenceKind, EvaluatorExecutionStatus, EvidenceLevel, MissionEvidenceRecord,
+    MissionEvidenceStatus, ReleaseEvidence, ReleaseStage,
 };
 pub use mission_contract::{
     EXPECTED_CAPABILITY_COUNT, EXPECTED_CHECKPOINT_ROUTE_COUNT, validate_mission_contract_closure,
+};
+pub use planning_plugin::{
+    CapabilityRouteProposal, DurableDispatchRecord, DurablePlanLog, MAX_PLANNING_BUDGET_UNITS,
+    MAX_PLANNING_OBJECTIVE_BYTES, MAX_PLANNING_ROUTE_STEPS, MAX_PLANNING_TEXT_BYTES,
+    MissionPlanningConsumer, MissionRouteDispatch, PLANNING_PLUGIN_ROUTE_SCHEMA_VERSION,
+    PlanLogEntry, PlanLogEvent, PlanningCancellation, PlanningCapabilityId, PlanningError,
+    PlanningObjective, PlanningProvider, PlanningProviderDescriptor, PlanningProviderError,
+    PlanningProviderRegistration, PlanningProviderRoute, PlanningRouteStep, PlanningScope,
+    PlanningService, ProviderLifecycleState, ScopedProviderRegistry,
 };
 use provider_closure::EFFECT_READBACK_ROUTE_CONTRACT_JSON;
 pub use provider_closure::{
