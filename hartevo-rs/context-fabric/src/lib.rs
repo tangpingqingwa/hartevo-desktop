@@ -13,10 +13,12 @@ pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
 };
 pub use steering::{
-    SteeringCancellationReason, SteeringCheckpoint, SteeringCompactionInput, SteeringConsumedInput,
-    SteeringConsumer, SteeringDurableEvent, SteeringError, SteeringEventStatus, SteeringInput,
-    SteeringJournal, SteeringLifecycle, SteeringMicroCompaction, SteeringPluginService,
-    SteeringProvider, SteeringSafePoint, SteeringSubmitOutcome, SteeringTurnFence,
+    SteeringCancellationReason, SteeringCheckpoint, SteeringCompactionInput,
+    SteeringCompactionRebuild, SteeringConsumedInput, SteeringConsumer, SteeringConsumerOutcome,
+    SteeringConsumptionReceipt, SteeringDurableEvent, SteeringError, SteeringEventStatus,
+    SteeringInput, SteeringJournal, SteeringLifecycle, SteeringMicroCompaction,
+    SteeringPluginService, SteeringProvider, SteeringSafePoint, SteeringSubmitOutcome,
+    SteeringTurnFence,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

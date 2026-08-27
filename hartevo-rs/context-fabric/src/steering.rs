@@ -42,6 +42,8 @@ pub enum SteeringError {
     ExpiredRevision,
     #[error("steering lifecycle is unavailable")]
     LifecycleUnavailable,
+    #[error("steering turn is terminal")]
+    TurnTerminal,
     #[error("steering idempotency key conflicts with durable input")]
     IdempotencyConflict,
     #[error("steering content must be durably logged")]
@@ -68,6 +70,7 @@ pub enum SteeringLifecycle {
     Mounted,
     Revoked,
     Unmounted,
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -75,6 +78,7 @@ pub enum SteeringLifecycle {
 pub enum SteeringEventStatus {
     Pending,
     Consumed,
+    Superseded,
     Cancelled,
 }
 
@@ -84,6 +88,7 @@ pub enum SteeringCancellationReason {
     Unmounted,
     Revoked,
     CrashRecovery,
+    Terminal,
 }
 
 /// The owner/revision/epoch fence attached to every steering operation.
@@ -272,6 +277,32 @@ impl SteeringMicroCompaction {
     }
 }
 
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SteeringCompactionRebuild {
+    compaction: SteeringMicroCompaction,
+    summary: String,
+}
+
+impl fmt::Debug for SteeringCompactionRebuild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SteeringCompactionRebuild")
+            .field("compaction", &self.compaction)
+            .field("summary_present", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SteeringCompactionRebuild {
+    pub fn compaction(&self) -> &SteeringMicroCompaction {
+        &self.compaction
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SteeringDurableEvent {
     sequence: u64,
@@ -288,6 +319,8 @@ pub struct SteeringDurableEvent {
     status: SteeringEventStatus,
     accepted_at: DateTime<Utc>,
     consumed_at: Option<DateTime<Utc>>,
+    superseded_at: Option<DateTime<Utc>>,
+    superseded_by_sequence: Option<u64>,
     cancelled_at: Option<DateTime<Utc>>,
     cancellation_reason: Option<SteeringCancellationReason>,
 }
@@ -329,6 +362,166 @@ impl SteeringDurableEvent {
 
     pub fn accepted_at(&self) -> DateTime<Utc> {
         self.accepted_at
+    }
+}
+
+/// A durable, typed result of attempting to consume one steering event.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SteeringConsumptionReceipt {
+    Consumed {
+        event_sequence: u64,
+        safe_point: SteeringSafePoint,
+        revision: u64,
+        generation: u64,
+        attachment_epoch: u64,
+        content_digest: String,
+        consumed_at: DateTime<Utc>,
+    },
+    Superseded {
+        event_sequence: u64,
+        safe_point: SteeringSafePoint,
+        superseded_by_sequence: u64,
+        revision: u64,
+        generation: u64,
+        attachment_epoch: u64,
+        superseded_at: DateTime<Utc>,
+    },
+    Cancelled {
+        event_sequence: u64,
+        safe_point: SteeringSafePoint,
+        revision: u64,
+        generation: u64,
+        attachment_epoch: u64,
+        reason: SteeringCancellationReason,
+        cancelled_at: DateTime<Utc>,
+    },
+}
+
+impl fmt::Debug for SteeringConsumptionReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SteeringConsumptionReceipt");
+        match self {
+            Self::Consumed {
+                event_sequence,
+                safe_point,
+                revision,
+                generation,
+                attachment_epoch,
+                ..
+            } => debug
+                .field("kind", &"consumed")
+                .field("event_sequence", event_sequence)
+                .field("safe_point", safe_point)
+                .field("revision", revision)
+                .field("generation", generation)
+                .field("attachment_epoch", attachment_epoch)
+                .field("content_digest_present", &true),
+            Self::Superseded {
+                event_sequence,
+                safe_point,
+                superseded_by_sequence,
+                revision,
+                generation,
+                attachment_epoch,
+                ..
+            } => debug
+                .field("kind", &"superseded")
+                .field("event_sequence", event_sequence)
+                .field("safe_point", safe_point)
+                .field("superseded_by_sequence", superseded_by_sequence)
+                .field("revision", revision)
+                .field("generation", generation)
+                .field("attachment_epoch", attachment_epoch),
+            Self::Cancelled {
+                event_sequence,
+                safe_point,
+                revision,
+                generation,
+                attachment_epoch,
+                reason,
+                ..
+            } => debug
+                .field("kind", &"cancelled")
+                .field("event_sequence", event_sequence)
+                .field("safe_point", safe_point)
+                .field("revision", revision)
+                .field("generation", generation)
+                .field("attachment_epoch", attachment_epoch)
+                .field("reason", reason),
+        }
+        .finish_non_exhaustive()
+    }
+}
+
+impl SteeringConsumptionReceipt {
+    pub fn event_sequence(&self) -> u64 {
+        match self {
+            Self::Consumed { event_sequence, .. }
+            | Self::Superseded { event_sequence, .. }
+            | Self::Cancelled { event_sequence, .. } => *event_sequence,
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        match self {
+            Self::Consumed { revision, .. }
+            | Self::Superseded { revision, .. }
+            | Self::Cancelled { revision, .. } => *revision,
+        }
+    }
+
+    pub fn safe_point(&self) -> SteeringSafePoint {
+        match self {
+            Self::Consumed { safe_point, .. }
+            | Self::Superseded { safe_point, .. }
+            | Self::Cancelled { safe_point, .. } => *safe_point,
+        }
+    }
+
+    pub fn content_digest(&self) -> Option<&str> {
+        match self {
+            Self::Consumed { content_digest, .. } => Some(content_digest),
+            Self::Superseded { .. } | Self::Cancelled { .. } => None,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Consumed { generation, .. }
+            | Self::Superseded { generation, .. }
+            | Self::Cancelled { generation, .. } => *generation,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SteeringConsumerOutcome {
+    NoInput,
+    Applied {
+        input: SteeringConsumedInput,
+        receipts: Vec<SteeringConsumptionReceipt>,
+    },
+    Replayed {
+        receipts: Vec<SteeringConsumptionReceipt>,
+    },
+}
+
+impl fmt::Debug for SteeringConsumerOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoInput => formatter.write_str("SteeringConsumerOutcome::NoInput"),
+            Self::Applied { receipts, .. } => formatter
+                .debug_struct("SteeringConsumerOutcome")
+                .field("kind", &"applied")
+                .field("receipt_count", &receipts.len())
+                .field("input_present", &true)
+                .finish_non_exhaustive(),
+            Self::Replayed { receipts } => formatter
+                .debug_struct("SteeringConsumerOutcome")
+                .field("kind", &"replayed")
+                .field("receipt_count", &receipts.len())
+                .finish_non_exhaustive(),
+        }
     }
 }
 
@@ -533,26 +726,52 @@ impl SteeringJournal {
             let valid_status = match event.status {
                 SteeringEventStatus::Pending => {
                     event.consumed_at.is_none()
+                        && event.superseded_at.is_none()
+                        && event.superseded_by_sequence.is_none()
                         && event.cancelled_at.is_none()
                         && event.cancellation_reason.is_none()
                 }
                 SteeringEventStatus::Consumed => {
                     event.consumed_at.is_some()
+                        && event.superseded_at.is_none()
+                        && event.superseded_by_sequence.is_none()
+                        && event.cancelled_at.is_none()
+                        && event.cancellation_reason.is_none()
+                }
+                SteeringEventStatus::Superseded => {
+                    event.consumed_at.is_none()
+                        && event.superseded_at.is_some()
+                        && event.superseded_by_sequence.is_some()
                         && event.cancelled_at.is_none()
                         && event.cancellation_reason.is_none()
                 }
                 SteeringEventStatus::Cancelled => {
                     event.cancelled_at.is_some()
                         && event.consumed_at.is_none()
+                        && event.superseded_at.is_none()
+                        && event.superseded_by_sequence.is_none()
                         && event.cancellation_reason.is_some()
                 }
             };
             let valid_timing = event
                 .consumed_at
+                .or(event.superseded_at)
                 .or(event.cancelled_at)
                 .is_none_or(|completed_at| completed_at >= event.accepted_at);
             if !valid_status || !valid_timing {
                 return Err(SteeringError::InvalidCheckpoint);
+            }
+        }
+        for event in &self.events {
+            if let SteeringEventStatus::Superseded = event.status {
+                let Some(superseded_by_sequence) = event.superseded_by_sequence else {
+                    return Err(SteeringError::InvalidCheckpoint);
+                };
+                if superseded_by_sequence == event.sequence
+                    || !event_sequences.contains(&superseded_by_sequence)
+                {
+                    return Err(SteeringError::InvalidCheckpoint);
+                }
             }
         }
         Ok(event_sequences)
@@ -657,6 +876,26 @@ impl SteeringJournal {
             .ok_or(SteeringError::InvalidCheckpoint)
     }
 
+    pub fn rebuild_micro_compaction(
+        &self,
+    ) -> Result<Option<SteeringCompactionRebuild>, SteeringError> {
+        self.validate_structural()?;
+        let Some(compaction) = &self.micro_compaction else {
+            return Ok(None);
+        };
+        let summary = self
+            .content_log
+            .iter()
+            .find(|record| record.log_sequence == compaction.summary_log_sequence)
+            .ok_or(SteeringError::InvalidCheckpoint)?
+            .content
+            .clone();
+        Ok(Some(SteeringCompactionRebuild {
+            compaction: compaction.clone(),
+            summary,
+        }))
+    }
+
     fn ensure_active(
         &self,
         expected: &SteeringTurnFence,
@@ -667,8 +906,12 @@ impl SteeringJournal {
         if expected != &self.fence {
             return Err(SteeringError::StaleFence);
         }
-        if self.lifecycle != SteeringLifecycle::Mounted {
-            return Err(SteeringError::LifecycleUnavailable);
+        match self.lifecycle {
+            SteeringLifecycle::Mounted => {}
+            SteeringLifecycle::Terminal => return Err(SteeringError::TurnTerminal),
+            SteeringLifecycle::Revoked | SteeringLifecycle::Unmounted => {
+                return Err(SteeringError::LifecycleUnavailable);
+            }
         }
         self.fence.validate_at(at)
     }
@@ -694,14 +937,63 @@ impl SteeringJournal {
         (sequence, digest)
     }
 
-    fn cancel_pending(&mut self, reason: SteeringCancellationReason, at: DateTime<Utc>) {
+    fn receipt_for_event(
+        event: &SteeringDurableEvent,
+    ) -> Result<SteeringConsumptionReceipt, SteeringError> {
+        match event.status {
+            SteeringEventStatus::Consumed => Ok(SteeringConsumptionReceipt::Consumed {
+                event_sequence: event.sequence,
+                safe_point: event.safe_point,
+                revision: event.revision,
+                generation: event.generation,
+                attachment_epoch: event.attachment_epoch,
+                content_digest: event.content_digest.clone(),
+                consumed_at: event.consumed_at.ok_or(SteeringError::InvalidCheckpoint)?,
+            }),
+            SteeringEventStatus::Superseded => Ok(SteeringConsumptionReceipt::Superseded {
+                event_sequence: event.sequence,
+                safe_point: event.safe_point,
+                superseded_by_sequence: event
+                    .superseded_by_sequence
+                    .ok_or(SteeringError::InvalidCheckpoint)?,
+                revision: event.revision,
+                generation: event.generation,
+                attachment_epoch: event.attachment_epoch,
+                superseded_at: event
+                    .superseded_at
+                    .ok_or(SteeringError::InvalidCheckpoint)?,
+            }),
+            SteeringEventStatus::Cancelled => Ok(SteeringConsumptionReceipt::Cancelled {
+                event_sequence: event.sequence,
+                safe_point: event.safe_point,
+                revision: event.revision,
+                generation: event.generation,
+                attachment_epoch: event.attachment_epoch,
+                reason: event
+                    .cancellation_reason
+                    .ok_or(SteeringError::InvalidCheckpoint)?,
+                cancelled_at: event.cancelled_at.ok_or(SteeringError::InvalidCheckpoint)?,
+            }),
+            SteeringEventStatus::Pending => Err(SteeringError::InvalidCheckpoint),
+        }
+    }
+
+    fn cancel_pending(
+        &mut self,
+        reason: SteeringCancellationReason,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<SteeringConsumptionReceipt>, SteeringError> {
+        let mut receipts = Vec::new();
         for event in &mut self.events {
             if event.status == SteeringEventStatus::Pending {
                 event.status = SteeringEventStatus::Cancelled;
                 event.cancelled_at = Some(at);
                 event.cancellation_reason = Some(reason);
+                receipts.push(Self::receipt_for_event(event)?);
             }
         }
+        self.validate_structural()?;
+        Ok(receipts)
     }
 
     fn submit(
@@ -752,6 +1044,8 @@ impl SteeringJournal {
             status: SteeringEventStatus::Pending,
             accepted_at: at,
             consumed_at: None,
+            superseded_at: None,
+            superseded_by_sequence: None,
             cancelled_at: None,
             cancellation_reason: None,
         });
@@ -762,39 +1056,99 @@ impl SteeringJournal {
         })
     }
 
+    fn consume_with_receipts(
+        &mut self,
+        expected: &SteeringTurnFence,
+        safe_point: SteeringSafePoint,
+        at: DateTime<Utc>,
+    ) -> Result<SteeringConsumerOutcome, SteeringError> {
+        self.ensure_active(expected, at)?;
+
+        let matching_pending: Vec<usize> = self
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                (event.status == SteeringEventStatus::Pending
+                    && event.safe_point == safe_point
+                    && event.revision == expected.revision
+                    && event.generation == expected.generation
+                    && event.attachment_epoch == expected.attachment_epoch)
+                    .then_some(index)
+            })
+            .collect();
+        if matching_pending.is_empty() {
+            let receipts: Vec<SteeringConsumptionReceipt> = self
+                .events
+                .iter()
+                .filter(|event| {
+                    event.safe_point == safe_point
+                        && event.revision == expected.revision
+                        && event.generation == expected.generation
+                        && event.attachment_epoch == expected.attachment_epoch
+                        && event.status != SteeringEventStatus::Pending
+                })
+                .map(Self::receipt_for_event)
+                .collect::<Result<_, _>>()?;
+            return if receipts.is_empty() {
+                Ok(SteeringConsumerOutcome::NoInput)
+            } else {
+                Ok(SteeringConsumerOutcome::Replayed { receipts })
+            };
+        }
+
+        let winner_index = *matching_pending
+            .last()
+            .ok_or(SteeringError::InvalidCheckpoint)?;
+        let winner = self.events[winner_index].clone();
+        let content = self
+            .content_log
+            .iter()
+            .find(|record| record.log_sequence == winner.content_log_sequence)
+            .ok_or(SteeringError::InvalidCheckpoint)?;
+        if content.content_digest != winner.content_digest {
+            return Err(SteeringError::InvalidCheckpoint);
+        }
+
+        let mut receipts = Vec::new();
+        for index in matching_pending
+            .iter()
+            .copied()
+            .filter(|index| *index != winner_index)
+        {
+            self.events[index].status = SteeringEventStatus::Superseded;
+            self.events[index].superseded_at = Some(at);
+            self.events[index].superseded_by_sequence = Some(winner.sequence);
+            receipts.push(Self::receipt_for_event(&self.events[index])?);
+        }
+        self.events[winner_index].status = SteeringEventStatus::Consumed;
+        self.events[winner_index].consumed_at = Some(at);
+        receipts.push(Self::receipt_for_event(&self.events[winner_index])?);
+        self.validate_structural()?;
+        Ok(SteeringConsumerOutcome::Applied {
+            input: SteeringConsumedInput {
+                event_sequence: winner.sequence,
+                safe_point: winner.safe_point,
+                content: content.content.clone(),
+                content_digest: content.content_digest.clone(),
+                revision: winner.revision,
+                generation: winner.generation,
+                attachment_epoch: winner.attachment_epoch,
+            },
+            receipts,
+        })
+    }
+
     fn consume(
         &mut self,
         expected: &SteeringTurnFence,
         safe_point: SteeringSafePoint,
         at: DateTime<Utc>,
     ) -> Result<Option<SteeringConsumedInput>, SteeringError> {
-        self.ensure_active(expected, at)?;
-        let Some(index) = self.events.iter().position(|event| {
-            event.status == SteeringEventStatus::Pending && event.safe_point == safe_point
-        }) else {
-            return Ok(None);
-        };
-        let event = self.events[index].clone();
-        let content = self
-            .content_log
-            .iter()
-            .find(|record| record.log_sequence == event.content_log_sequence)
-            .ok_or(SteeringError::InvalidCheckpoint)?;
-        if content.content_digest != event.content_digest {
-            return Err(SteeringError::InvalidCheckpoint);
+        match self.consume_with_receipts(expected, safe_point, at)? {
+            SteeringConsumerOutcome::Applied { input, .. } => Ok(Some(input)),
+            SteeringConsumerOutcome::NoInput | SteeringConsumerOutcome::Replayed { .. } => Ok(None),
         }
-        self.events[index].status = SteeringEventStatus::Consumed;
-        self.events[index].consumed_at = Some(at);
-        self.validate_structural()?;
-        Ok(Some(SteeringConsumedInput {
-            event_sequence: event.sequence,
-            safe_point: event.safe_point,
-            content: content.content.clone(),
-            content_digest: content.content_digest.clone(),
-            revision: event.revision,
-            generation: event.generation,
-            attachment_epoch: event.attachment_epoch,
-        }))
     }
 
     fn compact(
@@ -874,6 +1228,13 @@ pub trait SteeringConsumer {
         safe_point: SteeringSafePoint,
         at: DateTime<Utc>,
     ) -> Result<Option<SteeringConsumedInput>, SteeringError>;
+
+    fn consume_at_safe_point_with_receipts(
+        &mut self,
+        expected: &SteeringTurnFence,
+        safe_point: SteeringSafePoint,
+        at: DateTime<Utc>,
+    ) -> Result<SteeringConsumerOutcome, SteeringError>;
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -906,6 +1267,12 @@ impl SteeringPluginService {
         &self.journal
     }
 
+    pub fn rebuild_micro_compaction(
+        &self,
+    ) -> Result<Option<SteeringCompactionRebuild>, SteeringError> {
+        self.journal.rebuild_micro_compaction()
+    }
+
     pub fn checkpoint(&self) -> Result<SteeringCheckpoint, SteeringError> {
         self.journal.validate_structural()?;
         let bytes =
@@ -933,6 +1300,15 @@ impl SteeringPluginService {
         replacement_fence: SteeringTurnFence,
         at: DateTime<Utc>,
     ) -> Result<Self, SteeringError> {
+        Self::recover_after_crash_with_receipts(checkpoint, replacement_fence, at)
+            .map(|(service, _)| service)
+    }
+
+    pub fn recover_after_crash_with_receipts(
+        checkpoint: &SteeringCheckpoint,
+        replacement_fence: SteeringTurnFence,
+        at: DateTime<Utc>,
+    ) -> Result<(Self, Vec<SteeringConsumptionReceipt>), SteeringError> {
         checkpoint.validate()?;
         replacement_fence.validate_at(at)?;
         if replacement_fence.generation <= checkpoint.journal.fence.generation
@@ -943,10 +1319,10 @@ impl SteeringPluginService {
         let mut journal = checkpoint.journal.clone();
         journal.fence = replacement_fence;
         journal.lifecycle = SteeringLifecycle::Mounted;
-        journal.cancel_pending(SteeringCancellationReason::CrashRecovery, at);
+        let receipts = journal.cancel_pending(SteeringCancellationReason::CrashRecovery, at)?;
         journal.crash_recoveries += 1;
         journal.validate_structural()?;
-        Ok(Self { journal })
+        Ok((Self { journal }, receipts))
     }
 
     pub fn unmount(
@@ -954,11 +1330,20 @@ impl SteeringPluginService {
         expected: &SteeringTurnFence,
         at: DateTime<Utc>,
     ) -> Result<(), SteeringError> {
+        self.unmount_with_receipts(expected, at).map(|_| ())
+    }
+
+    pub fn unmount_with_receipts(
+        &mut self,
+        expected: &SteeringTurnFence,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<SteeringConsumptionReceipt>, SteeringError> {
         self.journal.ensure_owner(expected, at)?;
-        self.journal
-            .cancel_pending(SteeringCancellationReason::Unmounted, at);
+        let receipts = self
+            .journal
+            .cancel_pending(SteeringCancellationReason::Unmounted, at)?;
         self.journal.lifecycle = SteeringLifecycle::Unmounted;
-        Ok(())
+        Ok(receipts)
     }
 
     pub fn revoke(
@@ -966,11 +1351,33 @@ impl SteeringPluginService {
         expected: &SteeringTurnFence,
         at: DateTime<Utc>,
     ) -> Result<(), SteeringError> {
+        self.revoke_with_receipts(expected, at).map(|_| ())
+    }
+
+    pub fn revoke_with_receipts(
+        &mut self,
+        expected: &SteeringTurnFence,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<SteeringConsumptionReceipt>, SteeringError> {
         self.journal.ensure_owner(expected, at)?;
-        self.journal
-            .cancel_pending(SteeringCancellationReason::Revoked, at);
+        let receipts = self
+            .journal
+            .cancel_pending(SteeringCancellationReason::Revoked, at)?;
         self.journal.lifecycle = SteeringLifecycle::Revoked;
-        Ok(())
+        Ok(receipts)
+    }
+
+    pub fn terminate(
+        &mut self,
+        expected: &SteeringTurnFence,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<SteeringConsumptionReceipt>, SteeringError> {
+        self.journal.ensure_owner(expected, at)?;
+        let receipts = self
+            .journal
+            .cancel_pending(SteeringCancellationReason::Terminal, at)?;
+        self.journal.lifecycle = SteeringLifecycle::Terminal;
+        Ok(receipts)
     }
 }
 
@@ -1002,6 +1409,26 @@ impl SteeringConsumer for SteeringPluginService {
         at: DateTime<Utc>,
     ) -> Result<Option<SteeringConsumedInput>, SteeringError> {
         self.journal.consume(expected, safe_point, at)
+    }
+
+    fn consume_at_safe_point_with_receipts(
+        &mut self,
+        expected: &SteeringTurnFence,
+        safe_point: SteeringSafePoint,
+        at: DateTime<Utc>,
+    ) -> Result<SteeringConsumerOutcome, SteeringError> {
+        self.journal.consume_with_receipts(expected, safe_point, at)
+    }
+}
+
+impl SteeringPluginService {
+    pub fn consume_at_safe_point_with_receipts(
+        &mut self,
+        expected: &SteeringTurnFence,
+        safe_point: SteeringSafePoint,
+        at: DateTime<Utc>,
+    ) -> Result<SteeringConsumerOutcome, SteeringError> {
+        self.journal.consume_with_receipts(expected, safe_point, at)
     }
 }
 
@@ -1103,6 +1530,145 @@ mod tests {
     }
 
     #[test]
+    fn consumer_receipts_supersede_and_replay_without_new_events() {
+        let (mut service, active_fence) = new_service();
+        for (key, content) in [("input-1", "first"), ("input-2", "latest")] {
+            service
+                .submit_mid_turn_input(
+                    &active_fence,
+                    SteeringInput::new(key, content, SteeringSafePoint::DuringStreaming),
+                    at(1),
+                )
+                .expect("input");
+        }
+        let applied = service
+            .consume_at_safe_point_with_receipts(
+                &active_fence,
+                SteeringSafePoint::DuringStreaming,
+                at(2),
+            )
+            .expect("consume");
+        match &applied {
+            SteeringConsumerOutcome::Applied { input, receipts } => {
+                assert_eq!(input.content(), "latest");
+                assert_eq!(receipts.len(), 2);
+                assert!(matches!(
+                    receipts[0],
+                    SteeringConsumptionReceipt::Superseded {
+                        event_sequence: 1,
+                        superseded_by_sequence: 2,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    receipts[1],
+                    SteeringConsumptionReceipt::Consumed {
+                        event_sequence: 2,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("unexpected consumer outcome: {other:?}"),
+        }
+        assert_eq!(
+            service
+                .journal()
+                .events()
+                .iter()
+                .map(SteeringDurableEvent::status)
+                .collect::<Vec<_>>(),
+            vec![
+                SteeringEventStatus::Superseded,
+                SteeringEventStatus::Consumed
+            ]
+        );
+    }
+
+    #[test]
+    fn consumer_reopen_terminal_and_empty_paths_are_exactly_once() {
+        let (mut service, active_fence) = new_service();
+        service
+            .submit_mid_turn_input(
+                &active_fence,
+                SteeringInput::new("input-1", "latest", SteeringSafePoint::DuringStreaming),
+                at(1),
+            )
+            .expect("input");
+        let applied = service
+            .consume_at_safe_point_with_receipts(
+                &active_fence,
+                SteeringSafePoint::DuringStreaming,
+                at(2),
+            )
+            .expect("consume");
+        let receipts = match applied {
+            SteeringConsumerOutcome::Applied { receipts, .. } => receipts,
+            other => panic!("unexpected consumer outcome: {other:?}"),
+        };
+        let checkpoint = service.checkpoint().expect("checkpoint");
+        let mut reopened = SteeringPluginService::reopen(&checkpoint, at(3)).expect("reopen");
+        assert_eq!(
+            reopened
+                .consume_at_safe_point_with_receipts(
+                    &active_fence,
+                    SteeringSafePoint::DuringStreaming,
+                    at(4),
+                )
+                .expect("replay"),
+            SteeringConsumerOutcome::Replayed { receipts }
+        );
+        assert_eq!(reopened.journal().event_count(), 1);
+        let consumed_checkpoint = reopened.checkpoint().expect("consumed checkpoint");
+        let (mut crashed_after_consume, crash_receipts) =
+            SteeringPluginService::recover_after_crash_with_receipts(
+                &consumed_checkpoint,
+                make_fence(8, 3, 4),
+                at(5),
+            )
+            .expect("crash reopen");
+        assert!(crash_receipts.is_empty());
+        let recovered_fence = crashed_after_consume.journal().fence().clone();
+        assert_eq!(
+            crashed_after_consume.consume_at_safe_point_with_receipts(
+                &recovered_fence,
+                SteeringSafePoint::DuringStreaming,
+                at(6),
+            ),
+            Ok(SteeringConsumerOutcome::NoInput)
+        );
+        assert_eq!(crashed_after_consume.journal().event_count(), 1);
+        let drifted = make_fence(7, 3, 3);
+        assert_eq!(
+            reopened.consume_at_safe_point_with_receipts(
+                &drifted,
+                SteeringSafePoint::DuringStreaming,
+                at(5),
+            ),
+            Err(SteeringError::StaleFence)
+        );
+        reopened.terminate(&active_fence, at(6)).expect("terminal");
+        assert_eq!(
+            reopened.consume_at_safe_point_with_receipts(
+                &active_fence,
+                SteeringSafePoint::BeforeHumanDecision,
+                at(7),
+            ),
+            Err(SteeringError::TurnTerminal)
+        );
+
+        let (mut empty, empty_fence) = new_service();
+        assert_eq!(
+            empty.consume_at_safe_point_with_receipts(
+                &empty_fence,
+                SteeringSafePoint::BeforeFirstDelta,
+                at(1),
+            ),
+            Ok(SteeringConsumerOutcome::NoInput)
+        );
+        assert_eq!(empty.journal().event_count(), 0);
+    }
+
+    #[test]
     fn stale_or_expired_revision_is_rejected_without_mutation() {
         let (mut service, _active_fence) = new_service();
         let before = service.journal().clone();
@@ -1165,6 +1731,12 @@ mod tests {
                 .expect("logged summary"),
             "durable summary"
         );
+        let rebuilt = service
+            .rebuild_micro_compaction()
+            .expect("rebuild")
+            .expect("compaction");
+        assert_eq!(rebuilt.compaction(), &compaction);
+        assert_eq!(rebuilt.summary(), "durable summary");
         assert!(!format!("{service:?}").contains("durable summary"));
         assert_eq!(
             service
@@ -1200,9 +1772,21 @@ mod tests {
             .expect("input");
         let checkpoint = service.checkpoint().expect("checkpoint");
         let replacement = make_fence(8, 3, 4);
-        let mut recovered =
-            SteeringPluginService::recover_after_crash(&checkpoint, replacement.clone(), at(4))
-                .expect("recovery");
+        let (mut recovered, crash_receipts) =
+            SteeringPluginService::recover_after_crash_with_receipts(
+                &checkpoint,
+                replacement.clone(),
+                at(4),
+            )
+            .expect("recovery");
+        assert!(matches!(
+            crash_receipts.as_slice(),
+            [SteeringConsumptionReceipt::Cancelled {
+                event_sequence: 1,
+                reason: SteeringCancellationReason::CrashRecovery,
+                ..
+            }]
+        ));
         assert_eq!(recovered.journal().pending_event_count(), 0);
         assert_eq!(recovered.journal().event_count(), 1);
         assert_eq!(
@@ -1224,7 +1808,17 @@ mod tests {
                 at(6),
             )
             .expect("new input");
-        recovered.revoke(&replacement, at(7)).expect("revoke");
+        let revoke_receipts = recovered
+            .revoke_with_receipts(&replacement, at(7))
+            .expect("revoke");
+        assert!(matches!(
+            revoke_receipts.as_slice(),
+            [SteeringConsumptionReceipt::Cancelled {
+                event_sequence: 2,
+                reason: SteeringCancellationReason::Revoked,
+                ..
+            }]
+        ));
         assert_eq!(recovered.journal().pending_event_count(), 0);
         assert_eq!(
             recovered.submit_mid_turn_input(
@@ -1243,7 +1837,17 @@ mod tests {
                 at(1),
             )
             .expect("input");
-        unmounted.unmount(&unmount_fence, at(2)).expect("unmount");
+        let unmount_receipts = unmounted
+            .unmount_with_receipts(&unmount_fence, at(2))
+            .expect("unmount");
+        assert!(matches!(
+            unmount_receipts.as_slice(),
+            [SteeringConsumptionReceipt::Cancelled {
+                event_sequence: 1,
+                reason: SteeringCancellationReason::Unmounted,
+                ..
+            }]
+        ));
         assert_eq!(unmounted.journal().pending_event_count(), 0);
     }
 
