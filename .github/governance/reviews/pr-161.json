@@ -1,0 +1,18 @@
+{
+  "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "baseSha": "92db1c896479af9a5cf0129349a8da136d244d5e",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/catalog/src/lib.rs",
+    "hartevo-rs/catalog/src/planning_plugin.rs",
+    "hartevo-rs/catalog/tests/planning_plugin_route.rs"
+  ],
+  "pr": 161,
+  "receiptDigest": "1a886f02089ac89d92896b3650f797f3e097b133ed1b97baafd8682a5c64a4db",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-27T04:46:15Z",
+  "reviewedHeadSha": "c4071de288c739fb834a78dd0c21492ef080a199",
+  "reviewerTaskId": "01a04184-d51b-7f50-a4b3-3f16fafb9968",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

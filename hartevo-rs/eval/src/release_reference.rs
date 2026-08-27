@@ -6,7 +6,8 @@ use anyhow::{Context, Result, ensure};
 use hartevo_catalog::{
     BrowserEvaluationResultReference, BrowserReferenceEvidenceClass, BrowserReferenceProviderMode,
     BrowserReferenceValidationAuthority, BrowserReferenceVerdict, EvaluationRunResultReference,
-    EvaluationRunResultReferences,
+    EvaluationRunResultReferences, EvaluatorAuthorityScope, EvaluatorEvidenceAuthority,
+    EvaluatorEvidenceKind, EvaluatorExecutionStatus,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -266,6 +267,8 @@ fn derive_browser_result_reference(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let (evidence_kind, evaluator_authority, execution_status, authority_scope) =
+        browser_evaluator_provenance(receipt, &evidence_classes);
     let validation_result_digest = digest_json(
         BROWSER_VALIDATION_RESULT_DIGEST_DOMAIN,
         &BrowserValidationResultDigestMaterial {
@@ -286,6 +289,10 @@ fn derive_browser_result_reference(
     Ok(BrowserEvaluationResultReference {
         validation_authority:
             BrowserReferenceValidationAuthority::HartevoBrowserContractValidatorV1,
+        evidence_kind,
+        evaluator_authority,
+        execution_status,
+        authority_scope,
         receipt_schema_version: receipt.schema_version.clone(),
         receipt_authority: receipt.authority.clone(),
         release_decision: receipt.release_decision.clone(),
@@ -337,6 +344,74 @@ fn derive_browser_result_reference(
         release_evidence_authority: receipt.authority_claims.release_evidence_authority,
         e_level_ceiling: receipt.authority_claims.e_level.clone(),
     })
+}
+
+fn browser_evaluator_provenance(
+    receipt: &BrowserRunReceipt,
+    evidence_classes: &[BrowserReferenceEvidenceClass],
+) -> (
+    EvaluatorEvidenceKind,
+    EvaluatorEvidenceAuthority,
+    EvaluatorExecutionStatus,
+    EvaluatorAuthorityScope,
+) {
+    let ignored = receipt.attempts.iter().any(|attempt| attempt.ignored_test);
+    let execution_started = receipt
+        .attempts
+        .iter()
+        .any(|attempt| attempt.execution_started);
+    let kind = if ignored {
+        EvaluatorEvidenceKind::IgnoredResult
+    } else if evidence_classes.contains(&BrowserReferenceEvidenceClass::SourceAudit) {
+        EvaluatorEvidenceKind::SourceAudit
+    } else if receipt.provider.mode == ProviderMode::ControlledSimulator
+        || evidence_classes.contains(&BrowserReferenceEvidenceClass::DeterministicSimulator)
+    {
+        EvaluatorEvidenceKind::Simulator
+    } else if receipt
+        .attempts
+        .iter()
+        .any(|attempt| attempt.test_mode || attempt.mock)
+    {
+        EvaluatorEvidenceKind::Fixture
+    } else {
+        EvaluatorEvidenceKind::BrowserEvaluationResult
+    };
+    let (authority, scope) = match kind {
+        EvaluatorEvidenceKind::BrowserEvaluationResult => (
+            EvaluatorEvidenceAuthority::HartevoBrowserContractValidatorV1,
+            EvaluatorAuthorityScope::EvaluationResultsOnly,
+        ),
+        EvaluatorEvidenceKind::Fixture => (
+            EvaluatorEvidenceAuthority::FixtureEvidenceOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::Simulator => (
+            EvaluatorEvidenceAuthority::SimulatorEvidenceOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::SourceAudit => (
+            EvaluatorEvidenceAuthority::SourceAuditOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::IgnoredResult => (
+            EvaluatorEvidenceAuthority::IgnoredResultOnly,
+            EvaluatorAuthorityScope::AuditOnly,
+        ),
+        EvaluatorEvidenceKind::EvaluationRunResult
+        | EvaluatorEvidenceKind::IntegrationBuildProvenance
+        | EvaluatorEvidenceKind::LocalFallbackReceipt => {
+            unreachable!("Browser receipt classification cannot produce non-Browser provenance")
+        }
+    };
+    let status = if ignored {
+        EvaluatorExecutionStatus::Ignored
+    } else if execution_started {
+        EvaluatorExecutionStatus::Executed
+    } else {
+        EvaluatorExecutionStatus::NotExecuted
+    };
+    (kind, authority, status, scope)
 }
 
 const fn map_evidence_class(value: EvidenceClass) -> BrowserReferenceEvidenceClass {
