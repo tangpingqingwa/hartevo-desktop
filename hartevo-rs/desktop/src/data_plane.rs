@@ -23,9 +23,9 @@ use hartevo_application::{
     PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
     ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
-    RetryContextWorkerRuntime, RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor,
-    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
-    Vm11NextContractOrValidTerminalResult,
+    RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
+    RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition, StartCatalogMission,
+    StartMission, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -36,12 +36,13 @@ use hartevo_catalog::{
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisError, CordisHost};
 use hartevo_domain_kernel::{
-    ActorId, Approval, ApprovalDecision, BrowserControlLeaseId, BrowserWorkspaceId, ConsentRecord,
-    ConsentState, ConsentStatus, CurrencyCode, DeviceId, EffectClass, EffectId, KeyManagementError,
-    KeyRecipient, KpiContract, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
-    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, ProjectEncryptionMode,
-    ProjectId, ProjectKeyring, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId,
+    AcceptanceCheck, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
+    BrowserWorkspaceId, ConsentRecord, ConsentState, ConsentStatus, CreatorTaskId, CurrencyCode,
+    DeliverableId, DeviceId, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
+    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
+    OperatingMode, OutcomeDecision, ProjectEncryptionMode, ProjectId, ProjectKeyring,
+    ReviewDecision, ReviewId, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId,
     RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
@@ -549,6 +550,20 @@ pub struct DesktopContinueBrowserWorkspaceRequest {
     pub workspace_id: BrowserWorkspaceId,
     pub expected_revision: u64,
     pub expected_generation: u64,
+}
+
+/// Window Review of one exact uploaded Creator Deliverable. Decision is a typed
+/// ReviewDecision; Desktop never stamps Verification or prepares a payout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopReviewCreatorDeliverableRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub task_id: CreatorTaskId,
+    pub deliverable_id: DeliverableId,
+    pub expected_task_revision: u64,
+    pub expected_deliverable_revision: u32,
+    pub decision: ReviewDecision,
+    pub acceptance_checks: Vec<AcceptanceCheck>,
 }
 
 #[cfg(any(test, feature = "native-journey"))]
@@ -1776,6 +1791,104 @@ impl DesktopDataPlane {
                 new_lease_id: BrowserControlLeaseId::new(),
                 lease_expires_at: now + Duration::hours(1),
                 evidence_digest,
+            },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    /// Reviews one exact uploaded Creator Deliverable through Application
+    /// `review_creator_deliverable`. Stale revision, mismatched deliverable, or
+    /// a missing submit fail closed. Review is not Verification and never
+    /// executes an external Effect or prepares a Creator payout.
+    pub fn review_creator_deliverable_os(
+        &self,
+        request: DesktopReviewCreatorDeliverableRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.review_creator_deliverable_with(&secret_store, request, now)
+    }
+
+    pub fn review_creator_deliverable_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopReviewCreatorDeliverableRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.expected_task_revision == 0
+            || request.expected_deliverable_revision == 0
+            || request.task_id.as_str().trim().is_empty()
+            || request.deliverable_id.as_str().trim().is_empty()
+            || request.acceptance_checks.is_empty()
+            || !matches!(
+                request.decision,
+                ReviewDecision::Accept | ReviewDecision::RequestRevision
+            )
+        {
+            return Err(DesktopDataError::InvalidCreatorDeliverableReview);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .load_creator_task(&project_id, &request.task_id)
+            .map_err(|_| DesktopDataError::CreatorDeliverableReviewUnavailable)?;
+        if live.project_id != project_id
+            || live.mission_id != request.mission_id
+            || live.id != request.task_id
+        {
+            return Err(DesktopDataError::InvalidCreatorDeliverableReview);
+        }
+        if live.state_revision != request.expected_task_revision {
+            return Err(DesktopDataError::CreatorDeliverableReviewStale);
+        }
+        let Some(deliverable) = live
+            .deliverables
+            .iter()
+            .find(|item| item.id == request.deliverable_id)
+        else {
+            return Err(DesktopDataError::CreatorDeliverableReviewUnavailable);
+        };
+        if deliverable.revision != request.expected_deliverable_revision
+            || deliverable.status != hartevo_domain_kernel::DeliverableStatus::ReadyForReview
+        {
+            return Err(DesktopDataError::CreatorDeliverableReviewUnavailable);
+        }
+        let notes = match request.decision {
+            ReviewDecision::Accept => {
+                "window Accept of the exact uploaded Creator Deliverable".into()
+            }
+            ReviewDecision::RequestRevision => {
+                "window request revision of the exact uploaded Creator Deliverable".into()
+            }
+            ReviewDecision::Reject | ReviewDecision::Dispute => {
+                return Err(DesktopDataError::InvalidCreatorDeliverableReview);
+            }
+        };
+        service.review_creator_deliverable(
+            ReviewCreatorDeliverable {
+                project_id,
+                mission_id: request.mission_id,
+                task_id: request.task_id,
+                deliverable_id: request.deliverable_id,
+                expected_task_revision: request.expected_task_revision,
+                expected_deliverable_revision: request.expected_deliverable_revision,
+                review_id: ReviewId::new(),
+                reviewer_id: ActorId::from_stable(format!(
+                    "desktop-local-operator:{}",
+                    self.device_id
+                )),
+                decision: request.decision,
+                acceptance_checks: request.acceptance_checks,
+                notes,
             },
             now,
         )?;
@@ -3718,6 +3831,16 @@ pub enum DesktopDataError {
         "Browser Workspace Continue requires a user-held lease; Take over remains NOT_IMPLEMENTED"
     )]
     BrowserWorkspaceContinueNotHeld,
+    #[error(
+        "Creator Deliverable Review requires the exact Project, Mission, task, deliverable, CAS revision, frozen checklist, and a typed ReviewDecision"
+    )]
+    InvalidCreatorDeliverableReview,
+    #[error("no matching uploaded Creator Deliverable is ready for Review")]
+    CreatorDeliverableReviewUnavailable,
+    #[error(
+        "Creator Deliverable Review must match the current task CAS revision; stale Review was not written"
+    )]
+    CreatorDeliverableReviewStale,
     #[error("project name cannot be empty")]
     EmptyProjectName,
     #[error("recovery key must be exactly 32 bytes encoded as 64 hexadecimal characters")]
@@ -3764,22 +3887,26 @@ mod tests {
 
     use chrono::Duration;
     use hartevo_application::{
-        CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject, EvidenceInput,
-        ProposePreviewEffect, ProvisionProjectEncryption, ResearchPacket,
-        RuntimeTextSubscriptionError, StartMission, StartRelationshipMission,
-        TakeOverBrowserWorkspace,
+        AcceptCreatorTask, CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject,
+        EvidenceInput, ProposePreviewEffect, ProvisionProjectEncryption, PublishCreatorTask,
+        ResearchPacket, RuntimeTextSubscriptionError, StartCreatorWorkMission, StartMission,
+        StartRelationshipMission, SubmitCreatorDeliverable, TakeOverBrowserWorkspace,
     };
     use hartevo_browser_adapter::FakeBrowserHost;
     use hartevo_domain_kernel::{
         AccountId, ActorId, ApprovalDecision, BrowserControlLeaseId, BrowserProfileId,
         BrowserTabId, BrowserWorkspaceId, Connection, ConnectionId, ConnectionProbe,
         ConsentPurpose, ConsentRecordId, ConsentRequirement, ConsentState, ContactChannel,
-        ContextBranchStatus, ContextCapsuleStatus, EffectId, EffectStatus, EvidenceId,
-        ExternalIdentity, IdentityLink, IdentityLinkId, IdentitySubject, KeyRecipient,
-        KpiDirection, LegalBasis, MissionCheckpointExecutor, MissionScheduleStatus, MissionStage,
-        OrderId, OutcomeDecision, OutcomeEvent, OutcomeEventId, OutcomeEventKind,
-        OutcomeSourceVerification, OutcomeVerificationMethod, Person, PersonId, ProbeOutcome,
-        ProjectEncryptionMode, StorageMode, TaskId, TaskStatus, WorkProductId, WorkerLeaseStatus,
+        ContextBranchStatus, ContextCapsuleStatus, CreatorApplicationId, CreatorDeliverableInput,
+        CreatorEligibility, CreatorHiringAward, CreatorHiringId, CreatorId, CreatorMilestoneId,
+        CreatorMilestoneSpec, CreatorTaskId, CreatorTaskSpec, DeliverableAssessment, DeliverableId,
+        EffectId, EffectStatus, EvidenceId, ExternalIdentity, FundingReservation, IdentityLink,
+        IdentityLinkId, IdentitySubject, KeyRecipient, KpiDirection, LegalBasis,
+        MissionCheckpointExecutor, MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision,
+        OutcomeEvent, OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification,
+        OutcomeVerificationMethod, PartnerId, Person, PersonId, ProbeOutcome,
+        ProjectEncryptionMode, RightsAttestation, StorageMode, TaskId, TaskStatus, UsageRights,
+        WorkProductId, WorkerLeaseStatus,
     };
     use hartevo_effect_broker::EffectBroker;
     use hartevo_storage::MemorySecretStore;
@@ -9827,5 +9954,441 @@ sleep 30"#;
                 .agent_lease_proof(now + Duration::seconds(4))
                 .is_ok()
         );
+    }
+
+    struct WindowCreatorReviewFixture {
+        mission_id: MissionId,
+        task_id: CreatorTaskId,
+        deliverable_id: DeliverableId,
+        expected_task_revision: u64,
+        expected_deliverable_revision: u32,
+        content_digest: String,
+        acceptance_checks: Vec<AcceptanceCheck>,
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "tests plant Offer through Submit via Application before this unit's Review path"
+    )]
+    fn persist_submitted_creator_deliverable(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        now: DateTime<Utc>,
+    ) -> WindowCreatorReviewFixture {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let inventory = service.desktop_inventory().expect("inventory");
+        let project = inventory
+            .projects
+            .iter()
+            .find(|project| &project.project_id == project_id)
+            .expect("ready project");
+        let tenant_id = project.tenant_id.clone();
+        let mission_id = MissionId::from("mission-desktop-creator-review");
+        let task_id = CreatorTaskId::from("task-desktop-creator-review");
+        let milestone_id = CreatorMilestoneId::from("milestone-desktop-creator-review");
+        let deliverable_id = DeliverableId::from("deliverable-desktop-creator-review");
+        let creator_id = CreatorId::from("creator-desktop-review");
+        let connection_id = ConnectionId::from("connection-desktop-creator-review");
+        let usd = CurrencyCode::parse("USD").expect("USD");
+        let bounty = Money::new(5_000, usd.clone());
+        service
+            .start_creator_work_mission(
+                StartCreatorWorkMission {
+                    id: mission_id.clone(),
+                    project_id: project_id.clone(),
+                    task_id: TaskId::from("mission-task-desktop-creator-review"),
+                    title: "Window Review Creator Deliverable".into(),
+                    goal: "Accept one exact uploaded Creator Deliverable without payout".into(),
+                    mode: OperatingMode::Campaign,
+                },
+                now,
+            )
+            .expect("creator work Mission");
+        service
+            .register_connection(
+                Connection::register(
+                    connection_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "stripe-connect",
+                    AccountId::from("acct-desktop-creator-review"),
+                    "acct-desktop-creator-review",
+                    ["payout.write".into()],
+                    now,
+                )
+                .expect("creator review connection"),
+                now,
+            )
+            .expect("persist creator review connection");
+        service
+            .record_connection_probe(
+                project_id,
+                &connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "acct-desktop-creator-review".into(),
+                    granted_scopes: BTreeSet::from(["payout.write".into()]),
+                    probed_at: now,
+                    valid_until: now + Duration::days(30),
+                    credential_expires_at: now + Duration::days(30),
+                    evidence_digest: "3".repeat(64),
+                },
+                now,
+            )
+            .expect("creator review connection probe");
+        let task = hartevo_domain_kernel::CreatorTask::create(
+            CreatorTaskSpec {
+                id: task_id.clone(),
+                tenant_id: tenant_id.clone(),
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                creator_id: creator_id.clone(),
+                hiring_award: CreatorHiringAward {
+                    hiring_id: CreatorHiringId::from("hiring-desktop-creator-review"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    creator_id: creator_id.clone(),
+                    partner_id: PartnerId::from("partner-desktop-creator-review"),
+                    application_id: CreatorApplicationId::from(
+                        "application-desktop-creator-review",
+                    ),
+                    offer_digest: "1".repeat(64),
+                    bounty: bounty.clone(),
+                    selected_by: ActorId::from("desktop-creator-review-selector"),
+                    selection_evidence_digest: "2".repeat(64),
+                    selected_at: now,
+                },
+                title: "Exact uploaded deliverable".into(),
+                brief: "Produce one reviewable Creator Deliverable".into(),
+                acceptance_criteria: vec!["Matches the approved scope".into()],
+                deliverable_requirements: vec!["Includes the source manifest".into()],
+                bounty: bounty.clone(),
+                milestones: vec![CreatorMilestoneSpec {
+                    id: milestone_id.clone(),
+                    title: "Reviewed delivery".into(),
+                    amount: bounty.clone(),
+                    due_at: now + Duration::days(7),
+                }],
+                revision_limit: 1,
+                usage_rights: UsageRights {
+                    license: "campaign review use".into(),
+                    territories: vec!["US".into()],
+                    channels: vec!["owned".into()],
+                    exclusivity: "none".into(),
+                    disclosure_required: true,
+                    source_manifest_required: true,
+                },
+                due_at: now + Duration::days(10),
+            },
+            now,
+        )
+        .expect("creator review task");
+        service
+            .persist_created_creator_task(task.clone(), now)
+            .expect("persist creator review task");
+        service
+            .publish_creator_task(
+                PublishCreatorTask {
+                    project_id: project_id.clone(),
+                    task_id: task_id.clone(),
+                    reservation: FundingReservation {
+                        provider: "stripe-connect".into(),
+                        external_id: "funding-desktop-creator-review".into(),
+                        connection_id: connection_id.clone(),
+                        payer_account_id: AccountId::from("acct-desktop-payer"),
+                        amount: bounty,
+                        contract_revision: task.contract_revision,
+                        contract_digest: task.contract_digest(),
+                        reserved_at: now + Duration::minutes(1),
+                        expires_at: now + Duration::days(30),
+                        request_digest: "4".repeat(64),
+                        provider_receipt_digest: "5".repeat(64),
+                        verification_evidence_digest: "6".repeat(64),
+                    },
+                },
+                now + Duration::minutes(1),
+            )
+            .expect("publish creator review task");
+        let published = service
+            .load_creator_task(project_id, &task_id)
+            .expect("published creator review task");
+        service
+            .accept_creator_task(
+                &AcceptCreatorTask {
+                    project_id: project_id.clone(),
+                    task_id: task_id.clone(),
+                    eligibility: CreatorEligibility {
+                        creator_id,
+                        connected_account_id: AccountId::from("acct-desktop-creator-review"),
+                        connection_id,
+                        kyc_verified: true,
+                        payouts_enabled: true,
+                        region_supported: true,
+                        verified_at: now,
+                        expires_at: now + Duration::days(30),
+                        verification_evidence_digest: "9".repeat(64),
+                    },
+                    contract_digest: published.contract_digest(),
+                },
+                now + Duration::minutes(2),
+            )
+            .expect("accept creator review task");
+        service
+            .start_creator_work(project_id, &task_id, now + Duration::minutes(3))
+            .expect("start creator review work");
+        service
+            .submit_creator_deliverable(
+                SubmitCreatorDeliverable {
+                    project_id: project_id.clone(),
+                    task_id: task_id.clone(),
+                    deliverable: CreatorDeliverableInput {
+                        id: deliverable_id.clone(),
+                        milestone_id,
+                        artifact_uri: "cas://creator/desktop-review".into(),
+                        media_type: "application/zip".into(),
+                        size_bytes: 1_024,
+                        content_digest: "7".repeat(64),
+                        uploaded_at: now + Duration::minutes(4),
+                        assessment: DeliverableAssessment {
+                            scanner: "desktop-review-scanner".into(),
+                            clean: true,
+                            assessed_at: now + Duration::minutes(4),
+                            evidence_digest: "8".repeat(64),
+                        },
+                        rights: RightsAttestation {
+                            ownership_or_license: "creator original".into(),
+                            source_manifest_digest: "9".repeat(64),
+                            permitted_use: "campaign review use".into(),
+                            verified: true,
+                        },
+                    },
+                },
+                now + Duration::minutes(4),
+            )
+            .expect("submit creator review deliverable");
+        let submitted = service
+            .load_creator_task(project_id, &task_id)
+            .expect("submitted creator review task");
+        WindowCreatorReviewFixture {
+            mission_id,
+            task_id,
+            deliverable_id,
+            expected_task_revision: submitted.state_revision,
+            expected_deliverable_revision: 1,
+            content_digest: "7".repeat(64),
+            acceptance_checks: vec![
+                AcceptanceCheck {
+                    requirement: "Matches the approved scope".into(),
+                    satisfied: true,
+                    evidence: "window-scope-check".into(),
+                },
+                AcceptanceCheck {
+                    requirement: "Includes the source manifest".into(),
+                    satisfied: true,
+                    evidence: "window-manifest-check".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn review_without_uploaded_deliverable_stays_empty() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(2);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "没有 uploaded Creator Deliverable 时 Review 必须失败关闭",
+                now,
+            )
+            .expect("mission");
+        let mission = &started.inventory.projects[0].missions[0];
+        assert!(mission.creator_work.is_none());
+        let refused = plane.review_creator_deliverable_with(
+            &secrets,
+            DesktopReviewCreatorDeliverableRequest {
+                project_id: project_id.clone(),
+                mission_id: mission.mission_id.clone(),
+                task_id: CreatorTaskId::from("task-does-not-exist"),
+                deliverable_id: DeliverableId::from("deliverable-does-not-exist"),
+                expected_task_revision: 1,
+                expected_deliverable_revision: 1,
+                decision: ReviewDecision::Accept,
+                acceptance_checks: vec![AcceptanceCheck {
+                    requirement: "Matches the approved scope".into(),
+                    satisfied: true,
+                    evidence: "missing".into(),
+                }],
+            },
+            now + Duration::seconds(1),
+        );
+        assert!(matches!(
+            refused,
+            Err(DesktopDataError::CreatorDeliverableReviewUnavailable)
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the window Review journey asserts stale, mismatch, typed-decision, Accept, and no-payout fences together"
+    )]
+    fn window_review_accepts_exact_uploaded_deliverable_without_payout_or_effect() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(5);
+        let fixture = persist_submitted_creator_deliverable(&plane, &secrets, &project_id, now);
+        let snapshot = plane
+            .load_with(&secrets, now + Duration::minutes(5))
+            .expect("reload after submit");
+        let DesktopLoadState::Ready(ready) = snapshot else {
+            panic!("ready after submit");
+        };
+        let projected = ready
+            .inventory
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .expect("project")
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == fixture.mission_id)
+            .expect("creator Mission")
+            .creator_work
+            .as_ref()
+            .expect("creator work projection");
+        let reviewable = projected
+            .reviewable
+            .as_ref()
+            .expect("reviewable deliverable");
+        assert_eq!(projected.task_id, fixture.task_id);
+        assert_eq!(
+            projected.expected_task_revision,
+            fixture.expected_task_revision
+        );
+        assert_eq!(reviewable.deliverable_id, fixture.deliverable_id);
+        assert_eq!(reviewable.content_digest, fixture.content_digest);
+        assert!(!projected.payout_verified);
+
+        let stale = plane.review_creator_deliverable_with(
+            &secrets,
+            DesktopReviewCreatorDeliverableRequest {
+                project_id: project_id.clone(),
+                mission_id: fixture.mission_id.clone(),
+                task_id: fixture.task_id.clone(),
+                deliverable_id: fixture.deliverable_id.clone(),
+                expected_task_revision: fixture.expected_task_revision.saturating_sub(1),
+                expected_deliverable_revision: fixture.expected_deliverable_revision,
+                decision: ReviewDecision::Accept,
+                acceptance_checks: fixture.acceptance_checks.clone(),
+            },
+            now + Duration::minutes(6),
+        );
+        assert!(matches!(
+            stale,
+            Err(DesktopDataError::CreatorDeliverableReviewStale)
+        ));
+        let mismatched = plane.review_creator_deliverable_with(
+            &secrets,
+            DesktopReviewCreatorDeliverableRequest {
+                project_id: project_id.clone(),
+                mission_id: fixture.mission_id.clone(),
+                task_id: fixture.task_id.clone(),
+                deliverable_id: DeliverableId::from("deliverable-other"),
+                expected_task_revision: fixture.expected_task_revision,
+                expected_deliverable_revision: fixture.expected_deliverable_revision,
+                decision: ReviewDecision::Accept,
+                acceptance_checks: fixture.acceptance_checks.clone(),
+            },
+            now + Duration::minutes(6),
+        );
+        assert!(matches!(
+            mismatched,
+            Err(DesktopDataError::CreatorDeliverableReviewUnavailable)
+        ));
+        let reject = plane.review_creator_deliverable_with(
+            &secrets,
+            DesktopReviewCreatorDeliverableRequest {
+                project_id: project_id.clone(),
+                mission_id: fixture.mission_id.clone(),
+                task_id: fixture.task_id.clone(),
+                deliverable_id: fixture.deliverable_id.clone(),
+                expected_task_revision: fixture.expected_task_revision,
+                expected_deliverable_revision: fixture.expected_deliverable_revision,
+                decision: ReviewDecision::Reject,
+                acceptance_checks: fixture.acceptance_checks.clone(),
+            },
+            now + Duration::minutes(6),
+        );
+        assert!(matches!(
+            reject,
+            Err(DesktopDataError::InvalidCreatorDeliverableReview)
+        ));
+
+        let accepted = plane
+            .review_creator_deliverable_with(
+                &secrets,
+                DesktopReviewCreatorDeliverableRequest {
+                    project_id: project_id.clone(),
+                    mission_id: fixture.mission_id.clone(),
+                    task_id: fixture.task_id.clone(),
+                    deliverable_id: fixture.deliverable_id.clone(),
+                    expected_task_revision: fixture.expected_task_revision,
+                    expected_deliverable_revision: fixture.expected_deliverable_revision,
+                    decision: ReviewDecision::Accept,
+                    acceptance_checks: fixture.acceptance_checks.clone(),
+                },
+                now + Duration::minutes(6),
+            )
+            .expect("window Accept through Application");
+        let accepted_work = accepted
+            .inventory
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .expect("project")
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == fixture.mission_id)
+            .expect("accepted Mission")
+            .creator_work
+            .as_ref()
+            .expect("accepted creator work");
+        assert!(accepted_work.reviewable.is_none());
+        assert_eq!(accepted_work.accepted_deliverable_count, 1);
+        assert!(!accepted_work.payout_verified);
+        assert_eq!(
+            accepted_work.status,
+            hartevo_domain_kernel::CreatorTaskStatus::SettlementPending
+        );
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::minutes(7))
+            .expect("reopen after Accept");
+        let durable = service
+            .load_creator_task(&project_id, &fixture.task_id)
+            .expect("durable reviewed task");
+        assert_eq!(
+            durable
+                .deliverable_entitlement(&fixture.deliverable_id)
+                .expect("reviewed entitlement"),
+            hartevo_domain_kernel::DeliverableEntitlementStatus::AcceptedAwaitingVerifiedPayout
+        );
+        assert!(durable.payouts.is_empty());
+        assert!(durable.payout_authorizations.is_empty());
+        let mission = service
+            .load_mission(&project_id, &fixture.mission_id)
+            .expect("durable Mission");
+        assert!(mission.effects.is_empty());
     }
 }
