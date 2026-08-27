@@ -1,0 +1,105 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "a3931097c57fea4d4a7871b8162057e0e92b63c4",
+  "candidateCount": 4,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "a3931097c57fea4d4a7871b8162057e0e92b63c4",
+      "headBranch": "codex/browser-artifact-consumer-02",
+      "headCommit": "3170512d1e87aab4b58824c7d49059c1c95f661c",
+      "number": 205,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/browser-adapter/src/artifact.rs",
+          "hartevo-rs/browser-adapter/src/lib.rs"
+        ],
+        "receiptDigest": "2871aba775da00cad146b164137aff28b36d9cd0061bbb5621fe96ed6c487bdb",
+        "receiptPath": ".github/governance/reviews/pr-205.json",
+        "reviewedHeadSha": "d6d8005bdbbcb83e43ad488b52bff975f6cf2677",
+        "reviewerTaskId": "01a0428b-27ac-7131-bd63-d62e1d75dbc0"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "a3931097c57fea4d4a7871b8162057e0e92b63c4",
+      "headBranch": "codex/identity-team-membership-plugin-01",
+      "headCommit": "a72654ae6fb95cfe7638231a44bddcb00acb142e",
+      "number": 192,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/domain-kernel/src/identity_team_plugin.rs",
+          "hartevo-rs/domain-kernel/src/ids.rs",
+          "hartevo-rs/domain-kernel/src/lib.rs"
+        ],
+        "receiptDigest": "37481b6ee61e4957b8b60f5631b2499b322d2ac51953dfbea5c5002e93ca7bb7",
+        "receiptPath": ".github/governance/reviews/pr-192.json",
+        "reviewedHeadSha": "09a5f7c46b8c36a6af6605baead59ba519c14910",
+        "reviewerTaskId": "01a0428b-27ae-7d20-9336-60681d5a5992"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "a3931097c57fea4d4a7871b8162057e0e92b63c4",
+      "headBranch": "codex/plugin-native-journey-evidence-02",
+      "headCommit": "771146310b0f289e7c0bf8b0fdb2eccc5d7d88a5",
+      "number": 219,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "contracts/plugins/plugin-native-journey-evidence.v1.json",
+          "hartevo-rs/eval/examples/hartevo-plugin-native-journey/digest.rs",
+          "hartevo-rs/eval/examples/hartevo-plugin-native-journey/evidence.rs",
+          "hartevo-rs/eval/examples/hartevo-plugin-native-journey/main.rs",
+          "hartevo-rs/eval/examples/hartevo-plugin-native-journey/model.rs",
+          "hartevo-rs/eval/examples/hartevo-plugin-native-journey/verifier.rs"
+        ],
+        "receiptDigest": "9c14c821dfaaf7bf06ed9a0a997b28d169ea57681ab453fdd990a8be8db1321a",
+        "receiptPath": ".github/governance/reviews/pr-219.json",
+        "reviewedHeadSha": "0ade6ab138a635f7afe1a3297733d3d3a9fb2639",
+        "reviewerTaskId": "01a0428b-27b1-7f32-bce6-eebdd0086a9e"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "a3931097c57fea4d4a7871b8162057e0e92b63c4",
+      "headBranch": "codex/tiktok-authenticated-read-plugin-01",
+      "headCommit": "408c0ea506022a31848d01b0a9de8b83b7440cc3",
+      "number": 191,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/channel-adapters/Cargo.lock",
+          "hartevo-rs/channel-adapters/Cargo.toml",
+          "hartevo-rs/channel-adapters/README.md",
+          "hartevo-rs/channel-adapters/src/lib.rs",
+          "hartevo-rs/channel-adapters/src/tiktok/consumer.rs",
+          "hartevo-rs/channel-adapters/src/tiktok/mod.rs",
+          "hartevo-rs/channel-adapters/src/tiktok/provider.rs",
+          "hartevo-rs/channel-adapters/src/tiktok/service.rs",
+          "hartevo-rs/channel-adapters/src/tiktok/testkit.rs",
+          "hartevo-rs/channel-adapters/src/transport.rs",
+          "hartevo-rs/channel-adapters/tests/tiktok_authenticated_read.rs"
+        ],
+        "receiptDigest": "e016e5078d6a9cc2e26176838de492d1689618e89df10cb9e7c67770f1c758db",
+        "receiptPath": ".github/governance/reviews/pr-191.json",
+        "reviewedHeadSha": "a7bf537daebc1caa114c1088613752bee83f378c",
+        "reviewerTaskId": "01a0428b-27b3-7b02-84da-d3a648b3a184"
+      }
+    }
+  ],
+  "createdAt": "2026-08-27T10:19:04Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260827-1018"
+}
