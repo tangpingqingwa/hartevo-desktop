@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "hartevo-repository-governance-policy/v1",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "protectedBranch": "bootstrap/macos-r0",
+  "admissionModeWhenUnpaused": "drain",
+  "truthSources": [
+    "live-github-api",
+    "live-git-refs",
+    "hash-chained-governance-ledger",
+    "exact-review-receipts"
+  ],
+  "manualCountsAccepted": false,
+  "capacity": {
+    "repair": 4,
+    "review": 4,
+    "integrationWriters": 1,
+    "maximumTrainCandidates": 4
+  },
+  "admission": {
+    "pausedAllowedClasses": [
+      "governance",
+      "integration-recovery",
+      "security"
+    ],
+    "drainAllowedClasses": [
+      "governance",
+      "integration-recovery",
+      "review-repair",
+      "base-refresh",
+      "security"
+    ],
+    "normalAllowedClasses": [
+      "governance",
+      "integration-recovery",
+      "review-repair",
+      "base-refresh",
+      "security",
+      "feature"
+    ],
+    "requiredFields": [
+      "schema",
+      "changeClass",
+      "issue",
+      "owner",
+      "ownedPaths",
+      "rollback",
+      "externalEffects",
+      "release"
+    ],
+    "exactPathOwnership": true,
+    "externalEffectsDefault": false,
+    "releaseDefault": false
+  },
+  "review": {
+    "schema": "hartevo-independent-review-receipt/v1",
+    "receiptDirectory": ".github/governance/reviews",
+    "requireNonAuthorTask": true,
+    "requireExactBaseAndReviewedHead": true,
+    "requireExactChangedPaths": true,
+    "requireReceiptOnlyCommit": true,
+    "acceptedDisposition": "APPROVE",
+    "syntheticPreflightGreenRequired": true
+  },
+  "integration": {
+    "singleOpenTrain": true,
+    "readyToTrainSlaSeconds": 120,
+    "maximumCandidateCount": 4,
+    "requireNonOverlappingPaths": true,
+    "requireCurrentProtectedBase": true,
+    "requireExactReviewReceipt": true,
+    "requireAllHostedChecksSuccess": true,
+    "requireTrustedBaseAdmission": true,
+    "requireTrainOnlyRequiredCheck": true,
+    "manifestDirectory": ".github/merge-train/manifests",
+    "nativeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+    "normalProtectedPullRequestMergeOnly": true
+  },
+  "lifecycle": {
+    "draftReviewAgeDays": 14,
+    "stalePullRequestDays": 30,
+    "staleIssueDays": 60,
+    "orphanBranchReviewDays": 14,
+    "defaultDryRun": true,
+    "explicitApprovalArtifactRequired": true,
+    "approvalMaximumAgeMinutes": 30,
+    "automaticCloseEnabled": false,
+    "automaticBranchDeleteEnabled": false
+  },
+  "repositorySettings": {
+    "defaultBranch": "bootstrap/macos-r0",
+    "deleteBranchOnMerge": true,
+    "allowUpdateBranch": true,
+    "allowMergeCommit": true,
+    "allowSquashMerge": false,
+    "allowRebaseMerge": false,
+    "allowAutoMerge": false,
+    "allowForcePushes": false,
+    "allowProtectedBranchDeletion": false
+  },
+  "metrics": {
+    "mergeThroughputCountsOnlyProtectedBaseAdvances": true,
+    "commitPushAndLocalGreenDoNotCountAsMergeThroughput": true,
+    "required": [
+      "ready_count",
+      "oldest_ready_seconds",
+      "open_train_count",
+      "protected_base_advances",
+      "stale_root_count",
+      "draft_count",
+      "orphan_branch_count"
+    ]
+  }
+}

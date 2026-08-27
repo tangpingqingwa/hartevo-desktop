@@ -1,0 +1,39 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "f195ae393808b8a58984c42377b24af655b5561f",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "f195ae393808b8a58984c42377b24af655b5561f",
+      "headBranch": "codex/governance-inventory-permission-fallback-01",
+      "headCommit": "7d95111a365f0ddcfff6e37eb8bf49f303cf869c",
+      "number": 936,
+      "review": {
+        "authorTaskId": "codex-root-governance-inventory-repair",
+        "exactPaths": [
+          ".github/workflows/rust-reusable.yml",
+          "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+          "scripts/ci-branch-policy.py",
+          "scripts/ci-workflow-policy.py"
+        ],
+        "receiptDigest": "7879d49b009352fbdb39b6e46a54b064edd61f6c161c7d58ddc2ef244ad9cfbf",
+        "receiptPath": ".github/governance/reviews/pr-936.json",
+        "reviewedHeadSha": "921d0a89cb88853ed856477c6bb5849772b7a8ae",
+        "reviewerTaskId": "github-actions-run-32570291626"
+      }
+    }
+  ],
+  "createdAt": "2026-08-22T12:01:00Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260822-1943-pr936"
+}

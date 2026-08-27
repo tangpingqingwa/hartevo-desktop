@@ -1385,6 +1385,15 @@ impl DesktopRuntimeCommandSlot {
             })
     }
 
+    fn cancellation_for(
+        &self,
+        selected_scope: Option<&DesktopRuntimeSubscriptionScope>,
+    ) -> Option<DesktopRuntimeCancellation> {
+        self.active.as_ref().and_then(|handle| {
+            (selected_scope == Some(&handle.identity.scope)).then(|| handle.cancellation.clone())
+        })
+    }
+
     fn progress_since(
         &self,
         identity: &DesktopRuntimeCommandIdentity,
@@ -2186,6 +2195,15 @@ impl DesktopRuntimeExecutionPaintState {
         let scope = selected
             .and_then(|(project_id, mission_id)| self.selected_scope_for(project_id, mission_id));
         self.command_slot.request_stop_for(scope)
+    }
+
+    pub(crate) fn live_cancellation_for_selection(
+        &self,
+        selected: Option<(&ProjectId, &MissionId)>,
+    ) -> Option<DesktopRuntimeCancellation> {
+        let scope = selected
+            .and_then(|(project_id, mission_id)| self.selected_scope_for(project_id, mission_id));
+        self.command_slot.cancellation_for(scope)
     }
 
     pub(crate) fn progress_since(
@@ -3534,6 +3552,16 @@ mod tests {
         assert!(!view.has_unseen());
         assert!(!view.transport_caught_up());
         assert!(state.stop_available_for_selection(Some((&project_id, &mission_id))));
+        let live = state
+            .live_cancellation_for_selection(Some((&project_id, &mission_id)))
+            .expect("catalog first-run observe-loop cancellation");
+        assert!(!live.is_requested());
+        let other_project = ProjectId::from("other-project");
+        assert!(
+            state
+                .live_cancellation_for_selection(Some((&other_project, &mission_id)))
+                .is_none()
+        );
         assert_eq!(
             state.mark_runtime_returned(&commit.identity),
             Err(RuntimeSubscriptionError::RuntimeStartedBeforePaint)
