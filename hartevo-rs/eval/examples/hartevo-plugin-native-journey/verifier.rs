@@ -1260,6 +1260,11 @@ fn exact_string_set(value: &Value) -> Result<BTreeSet<&str>> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_journey(mode: ComponentMode) -> PluginNativeJourney {
+    tests::journey(mode)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;

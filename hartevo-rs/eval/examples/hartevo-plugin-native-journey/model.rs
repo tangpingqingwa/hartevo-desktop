@@ -336,7 +336,7 @@ pub struct PluginNativeJourney {
     pub evidence_root: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OracleStatus {
     NativePass,
