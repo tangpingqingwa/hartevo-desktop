@@ -1,0 +1,17 @@
+{
+  "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "baseSha": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/context-fabric/src/lib.rs",
+    "hartevo-rs/context-fabric/src/mission_memory.rs"
+  ],
+  "pr": 162,
+  "receiptDigest": "01565f7b9fd4179a599589b83717636f0d949e5f5265001b04aa0bfcf6a9b241",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-27T13:53:26Z",
+  "reviewedHeadSha": "3708b666069d8ce025a409fbf40980d1b56a3db2",
+  "reviewerTaskId": "01a04379-d596-7d22-a462-9207a8b51a03",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
