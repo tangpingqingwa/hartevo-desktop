@@ -285,13 +285,7 @@ impl DesktopRuntimeCancellation {
         expected_revision: u64,
         request_digest: &str,
     ) -> Result<(), DesktopDataError> {
-        self.decide_held_local_write(
-            project_id,
-            turn_id,
-            expected_revision,
-            request_digest,
-            true,
-        )
+        self.decide_held_local_write(project_id, turn_id, expected_revision, request_digest, true)
     }
 
     fn decide_held_local_write(
@@ -7442,12 +7436,7 @@ sleep 30"#;
             "digest-local-write"
         );
         assert!(matches!(
-            control.approve_held_local_write(
-                &project_id,
-                &turn_id,
-                4,
-                "stale-digest",
-            ),
+            control.approve_held_local_write(&project_id, &turn_id, 4, "stale-digest",),
             Err(DesktopDataError::RuntimeLocalApprovalMismatch)
         ));
         control

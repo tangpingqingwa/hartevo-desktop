@@ -16,9 +16,7 @@ use hartevo_domain_kernel::{
     RuntimeTurnStatus, WorkProductStatus,
 };
 
-use crate::{
-    DesktopHeldLocalApproval, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection,
-};
+use crate::{DesktopHeldLocalApproval, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationsStatus {
@@ -603,8 +601,7 @@ fn approval_projection(
         } else {
             OperationsStatus::Empty
         },
-        local_runtime_request_digest: held_local_approval
-            .map(|held| held.request_digest.clone()),
+        local_runtime_request_digest: held_local_approval.map(|held| held.request_digest.clone()),
     }
 }
 
@@ -868,7 +865,11 @@ mod tests {
             approval.local_runtime_request_digest.as_deref(),
             Some("digest-local-write")
         );
-        assert!(approval.local_runtime_detail.contains("respond_context_runtime_local_approval"));
+        assert!(
+            approval
+                .local_runtime_detail
+                .contains("respond_context_runtime_local_approval")
+        );
     }
 
     #[test]

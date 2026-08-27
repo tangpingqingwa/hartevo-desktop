@@ -1626,7 +1626,9 @@ pub fn App() -> Element {
             return;
         };
         let Some(control) = runtime_cancellation.read().clone() else {
-            model.write().set_notice(&DesktopDataError::RuntimeLocalApprovalUnavailable);
+            model
+                .write()
+                .set_notice(&DesktopDataError::RuntimeLocalApprovalUnavailable);
             return;
         };
         match control.approve_held_local_write(
@@ -8752,7 +8754,9 @@ const fn desktop_runtime_progress_label(phase: DesktopRuntimeProgressPhase) -> &
         DesktopRuntimeProgressPhase::ItemCompleted => "Runtime 工作项已完成",
         DesktopRuntimeProgressPhase::LocalActionDeclined => "本地写入请求已按默认策略拒绝",
         DesktopRuntimeProgressPhase::WaitingLocalApproval => "本地写入请求等待窗口精确批准",
-        DesktopRuntimeProgressPhase::LocalActionApproved => "窗口已批准精确 Runtime 本地写入 digest",
+        DesktopRuntimeProgressPhase::LocalActionApproved => {
+            "窗口已批准精确 Runtime 本地写入 digest"
+        }
         DesktopRuntimeProgressPhase::StopRequested => "停止请求已交给协调器",
         DesktopRuntimeProgressPhase::InterruptSent => "fenced interrupt 已发送",
         DesktopRuntimeProgressPhase::Completed => "Runtime turn 已完成，正在采纳最终产物",
