@@ -1,21 +1,22 @@
-use std::process::Command;
-
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hartevo_cloud_storage::{
-    CellScope, CloudProjectRegistration, CloudRemoteWorkerCompletion, CloudRemoteWorkerTask,
-    CloudStorageError, DataCell, EncryptedPayload, EncryptedSyncMutation, MutationPrecondition,
-    POSTGRES_L2_URL_ENV, PostgresCellStore, SyncObjectKind,
+    CellScope, CloudProjectKeyGenerationMutation, CloudProjectRegistration,
+    CloudRemoteWorkerCompletion, CloudRemoteWorkerTask, CloudStorageError, DataCell,
+    EncryptedPayload, EncryptedSyncMutation, MutationPrecondition, POSTGRES_L2_URL_ENV,
+    PostgresCellStore, SyncObjectKind,
 };
 use hartevo_domain_kernel::{
     ActorId, DeviceId, DevicePublicKeyRegistration, MissionId, ProjectEncryptionMode, ProjectId,
     TaskId, TenantId, WorkerId, WorkerLeaseId,
 };
 use sha2::{Digest, Sha256};
+use std::process::Command;
 use tokio_postgres::NoTls;
 
 #[derive(Clone, Debug)]
 struct ProcessLease {
     task_id: TaskId,
+    key_generation: u64,
     lease_id: WorkerLeaseId,
     generation: u64,
     owner: String,
@@ -37,9 +38,13 @@ fn sql_i64(value: u64) -> i64 {
 }
 
 fn payload(byte: u8) -> EncryptedPayload {
+    payload_with_key_version(byte, 1)
+}
+
+fn payload_with_key_version(byte: u8, key_version: u64) -> EncryptedPayload {
     let ciphertext = vec![byte; 48];
     EncryptedPayload {
-        key_version: 1,
+        key_version,
         nonce: vec![byte; 12],
         ciphertext: ciphertext.clone(),
         aad_digest: digest("aad"),
@@ -103,16 +108,17 @@ async fn spawn_process(mode: &str, variables: &[(&str, String)]) -> String {
 
 fn parse_claim(output: &str) -> (bool, ProcessLease) {
     let parts: Vec<&str> = output.trim().split('|').collect();
-    assert_eq!(parts.len(), 9, "unexpected claim output: {output}");
+    assert_eq!(parts.len(), 10, "unexpected claim output: {output}");
     assert_eq!(parts[0], "CLAIM");
     (
         parts[1].parse().expect("claim duplicate flag"),
         ProcessLease {
             task_id: TaskId::from_stable(parts[2]),
-            lease_id: WorkerLeaseId::from_stable(parts[3]),
-            generation: parts[4].parse().expect("lease generation"),
-            owner: parts[5].into(),
-            token_digest: parts[6].into(),
+            key_generation: parts[3].parse().expect("key generation"),
+            lease_id: WorkerLeaseId::from_stable(parts[4]),
+            generation: parts[5].parse().expect("lease generation"),
+            owner: parts[6].into(),
+            token_digest: parts[7].into(),
         },
     )
 }
@@ -174,6 +180,13 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         )
         .await
         .expect("create encrypted team project");
+    let initial_key_fence = store
+        .load_project_key_fence(&mut client, &scope, &project_id)
+        .await
+        .expect("load initial Project key-generation fence");
+    assert_eq!(initial_key_fence.scope.cell, DataCell::Us);
+    assert_eq!(initial_key_fence.key_generation, 1);
+    assert_eq!(initial_key_fence.key_version, 1);
 
     let mission_object = "mission-sync-head";
     let create_sync = EncryptedSyncMutation {
@@ -512,6 +525,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         mission_id: MissionId::from("integration-mission"),
         task_id: TaskId::from("worker-task-complete"),
         worker_id: worker_id.clone(),
+        key_generation: 1,
         payload: payload(31),
         idempotency_key_digest: digest("worker-task-complete"),
         enqueued_at: timestamp + Duration::seconds(6),
@@ -611,6 +625,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         scope: scope.clone(),
         project_id: project_id.clone(),
         task_id: race_lease.task_id.clone(),
+        key_generation: race_lease.key_generation,
         lease_id: race_lease.lease_id,
         lease_generation: race_lease.lease_generation,
         lease_owner: race_lease.lease_owner.clone(),
@@ -671,6 +686,10 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
     let mut first_complete_variables = common.clone();
     first_complete_variables.extend([
         ("HARTEVO_CELL_TASK", first_lease.task_id.as_str().into()),
+        (
+            "HARTEVO_CELL_KEY_GENERATION",
+            first_lease.key_generation.to_string(),
+        ),
         (
             "HARTEVO_CELL_LEASE_ID",
             first_lease.lease_id.as_str().into(),
@@ -761,6 +780,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         scope: scope.clone(),
         project_id: project_id.clone(),
         task_id: old_lease.task_id.clone(),
+        key_generation: old_lease.key_generation,
         lease_id: old_lease.lease_id,
         lease_generation: old_lease.generation,
         lease_owner: old_lease.owner.clone(),
@@ -776,9 +796,13 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         Err(CloudStorageError::RemoteWorkerLeaseLost)
     ));
 
-    let mut recovered_complete_variables = common;
+    let mut recovered_complete_variables = common.clone();
     recovered_complete_variables.extend([
         ("HARTEVO_CELL_TASK", recovered_lease.task_id.as_str().into()),
+        (
+            "HARTEVO_CELL_KEY_GENERATION",
+            recovered_lease.key_generation.to_string(),
+        ),
         (
             "HARTEVO_CELL_LEASE_ID",
             recovered_lease.lease_id.as_str().into(),
@@ -815,6 +839,231 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
     );
     assert_eq!(record.result_digest, Some(digest("recovered-result")));
 
+    // A coordinator/leader loss invalidates every in-flight remote Worker
+    // writeback from the old project-key generation, even when the lease clock
+    // itself has not expired. Recovery must first rotate the encrypted key
+    // generation, then claim only a task carrying the new generation/version.
+    let leader_loss_task = CloudRemoteWorkerTask {
+        task_id: TaskId::from("worker-task-leader-loss"),
+        payload: payload(34),
+        idempotency_key_digest: digest("worker-task-leader-loss"),
+        enqueued_at: timestamp + Duration::seconds(35),
+        deadline_at: timestamp + Duration::hours(1),
+        ..first_task.clone()
+    };
+    store
+        .enqueue_remote_worker_task(&mut client, &leader_loss_task)
+        .await
+        .expect("enqueue old-generation leader-loss task");
+    let old_leader_lease = store
+        .claim_remote_worker_task(
+            &mut client,
+            &scope,
+            &project_id,
+            &worker_id,
+            "leader-before-restart",
+            &digest("leader-before-restart-token"),
+            &digest("claim-leader-before-restart"),
+            timestamp + Duration::seconds(36),
+            Duration::seconds(60),
+        )
+        .await
+        .expect("claim old-generation leader-loss task")
+        .expect("old-generation task available")
+        .lease;
+    assert_eq!(old_leader_lease.key_generation, 1);
+
+    let key_rotation = CloudProjectKeyGenerationMutation {
+        scope: scope.clone(),
+        project_id: project_id.clone(),
+        expected_generation: 1,
+        key_version: 2,
+        idempotency_key_digest: digest("project-key-rotation"),
+        advanced_at: timestamp + Duration::seconds(40),
+    };
+    let advanced = store
+        .advance_project_key_generation(&mut client, &key_rotation)
+        .await
+        .expect("advance Project key-generation fence");
+    assert_eq!(advanced.key_generation, 2);
+    assert_eq!(advanced.key_version, 2);
+    assert!(!advanced.duplicate);
+    let replayed_rotation = store
+        .advance_project_key_generation(&mut client, &key_rotation)
+        .await
+        .expect("replay Project key-generation fence mutation");
+    assert_eq!(replayed_rotation.key_generation, 2);
+    assert_eq!(replayed_rotation.key_version, 2);
+    assert!(replayed_rotation.duplicate);
+    let wrong_generation_rotation = CloudProjectKeyGenerationMutation {
+        expected_generation: 1,
+        key_version: 3,
+        idempotency_key_digest: digest("project-key-rotation-wrong-generation"),
+        advanced_at: timestamp + Duration::seconds(41),
+        ..key_rotation.clone()
+    };
+    assert!(matches!(
+        store
+            .advance_project_key_generation(&mut client, &wrong_generation_rotation)
+            .await,
+        Err(CloudStorageError::ProjectKeyGenerationConflict {
+            expected: 1,
+            actual: 2
+        })
+    ));
+    let rotated_fence = store
+        .load_project_key_fence(&mut client, &scope, &project_id)
+        .await
+        .expect("load rotated Project key-generation fence");
+    assert_eq!(rotated_fence.key_generation, 2);
+    assert_eq!(rotated_fence.key_version, 2);
+
+    assert!(matches!(
+        store
+            .heartbeat_remote_worker_task(
+                &mut client,
+                &scope,
+                &project_id,
+                &old_leader_lease.task_id,
+                &old_leader_lease.lease_id,
+                old_leader_lease.lease_generation,
+                &old_leader_lease.lease_owner,
+                &old_leader_lease.lease_token_digest,
+                timestamp + Duration::seconds(41),
+                Duration::seconds(60),
+            )
+            .await,
+        Err(CloudStorageError::RemoteWorkerKeyFenceLost)
+    ));
+    let old_leader_writeback = CloudRemoteWorkerCompletion {
+        scope: scope.clone(),
+        project_id: project_id.clone(),
+        task_id: old_leader_lease.task_id.clone(),
+        key_generation: old_leader_lease.key_generation,
+        lease_id: old_leader_lease.lease_id.clone(),
+        lease_generation: old_leader_lease.lease_generation,
+        lease_owner: old_leader_lease.lease_owner.clone(),
+        lease_token_digest: old_leader_lease.lease_token_digest.clone(),
+        result_digest: digest("old-leader-writeback"),
+        idempotency_key_digest: digest("old-leader-writeback-key"),
+        completed_at: timestamp + Duration::seconds(41),
+    };
+    assert!(matches!(
+        store
+            .complete_remote_worker_task(&mut client, &old_leader_writeback)
+            .await,
+        Err(CloudStorageError::RemoteWorkerKeyFenceLost)
+    ));
+    assert!(
+        store
+            .claim_remote_worker_task(
+                &mut client,
+                &scope,
+                &project_id,
+                &worker_id,
+                "leader-after-restart",
+                &digest("leader-after-restart-token"),
+                &digest("claim-leader-after-restart-empty"),
+                timestamp + Duration::seconds(42),
+                Duration::seconds(60),
+            )
+            .await
+            .expect("old-generation task must remain fenced after restart")
+            .is_none()
+    );
+
+    let restarted_task = CloudRemoteWorkerTask {
+        task_id: TaskId::from("worker-task-after-restart"),
+        key_generation: 2,
+        payload: payload_with_key_version(35, 2),
+        idempotency_key_digest: digest("worker-task-after-restart"),
+        enqueued_at: timestamp + Duration::seconds(45),
+        deadline_at: timestamp + Duration::hours(1),
+        ..first_task.clone()
+    };
+    store
+        .enqueue_remote_worker_task(&mut client, &restarted_task)
+        .await
+        .expect("enqueue new-generation restart task");
+    let mut restarted_claim_variables = common.clone();
+    restarted_claim_variables.extend([
+        ("HARTEVO_CELL_LEASE_OWNER", "process-after-restart".into()),
+        (
+            "HARTEVO_CELL_LEASE_TOKEN_DIGEST",
+            digest("process-after-restart-token"),
+        ),
+        ("HARTEVO_CELL_CLAIM_KEY", digest("claim-after-restart")),
+        (
+            "HARTEVO_CELL_NOW",
+            (timestamp + Duration::seconds(50)).to_rfc3339(),
+        ),
+        ("HARTEVO_CELL_LEASE_SECONDS", "60".into()),
+    ]);
+    let (restarted_duplicate, restarted_lease) =
+        parse_claim(&spawn_process("claim", &restarted_claim_variables).await);
+    assert!(!restarted_duplicate);
+    assert_eq!(restarted_lease.task_id, restarted_task.task_id);
+    assert_eq!(restarted_lease.key_generation, 2);
+    let mut restarted_complete_variables = common;
+    restarted_complete_variables.extend([
+        ("HARTEVO_CELL_TASK", restarted_lease.task_id.as_str().into()),
+        (
+            "HARTEVO_CELL_KEY_GENERATION",
+            restarted_lease.key_generation.to_string(),
+        ),
+        (
+            "HARTEVO_CELL_LEASE_ID",
+            restarted_lease.lease_id.as_str().into(),
+        ),
+        (
+            "HARTEVO_CELL_LEASE_GENERATION",
+            restarted_lease.generation.to_string(),
+        ),
+        ("HARTEVO_CELL_LEASE_OWNER", restarted_lease.owner.clone()),
+        (
+            "HARTEVO_CELL_LEASE_TOKEN_DIGEST",
+            restarted_lease.token_digest.clone(),
+        ),
+        ("HARTEVO_CELL_RESULT_DIGEST", digest("restarted-result")),
+        (
+            "HARTEVO_CELL_COMPLETION_KEY",
+            digest("restarted-completion"),
+        ),
+        (
+            "HARTEVO_CELL_NOW",
+            (timestamp + Duration::seconds(55)).to_rfc3339(),
+        ),
+    ]);
+    assert_completion(
+        &spawn_process("complete", &restarted_complete_variables).await,
+        &restarted_task.task_id,
+        false,
+    );
+    assert_completion(
+        &spawn_process("complete", &restarted_complete_variables).await,
+        &restarted_task.task_id,
+        true,
+    );
+    let altered_duplicate = CloudRemoteWorkerCompletion {
+        scope: scope.clone(),
+        project_id: project_id.clone(),
+        task_id: restarted_task.task_id.clone(),
+        key_generation: restarted_lease.key_generation,
+        lease_id: restarted_lease.lease_id,
+        lease_generation: restarted_lease.generation,
+        lease_owner: restarted_lease.owner,
+        lease_token_digest: restarted_lease.token_digest,
+        result_digest: digest("altered-restarted-result"),
+        idempotency_key_digest: digest("restarted-completion"),
+        completed_at: timestamp + Duration::seconds(55),
+    };
+    assert!(matches!(
+        store
+            .complete_remote_worker_task(&mut client, &altered_duplicate)
+            .await,
+        Err(CloudStorageError::RemoteWorkerTaskAlreadyCompleted)
+    ));
+
     let marker = b"PLAINTEXT-MISSION-CONTENT";
     let worker_inspection = client
         .transaction()
@@ -825,7 +1074,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         .query_one(
             "SELECT status, attempts, lease_generation, lease_id, lease_owner,
                     lease_token_digest, lease_expires_at, heartbeat_at,
-                    result_digest, completed_at, payload_ciphertext
+                    result_digest, completed_at, payload_ciphertext, key_generation
              FROM hartevo_cell.remote_worker_mailbox_messages
              WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND task_id = $4",
             &[
@@ -863,11 +1112,12 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
             .windows(marker.len())
             .any(|window| window == marker)
     );
+    assert_eq!(recovery_row.get::<_, i64>(11), sql_i64(1));
 
     let claim_rows = worker_inspection
         .query(
             "SELECT lease_generation, lease_owner, lease_token_digest,
-                    heartbeat_at, lease_expires_at
+                    heartbeat_at, lease_expires_at, key_generation
              FROM hartevo_cell.remote_worker_claims
              WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND task_id = $4
              ORDER BY lease_generation",
@@ -895,6 +1145,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         claim_rows[0].get::<_, DateTime<Utc>>(4),
         timestamp + Duration::seconds(31)
     );
+    assert_eq!(claim_rows[0].get::<_, i64>(5), sql_i64(1));
     assert_eq!(
         claim_rows[1].get::<_, i64>(0),
         sql_i64(recovered_lease.generation)
@@ -912,6 +1163,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         claim_rows[1].get::<_, DateTime<Utc>>(4),
         timestamp + Duration::seconds(32) + Duration::seconds(60)
     );
+    assert_eq!(claim_rows[1].get::<_, i64>(5), sql_i64(1));
     worker_inspection
         .commit()
         .await
@@ -929,6 +1181,8 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
     for table in [
         "sync_object_heads",
         "device_public_key_heads",
+        "project_key_generation_versions",
+        "project_key_generation_heads",
         "remote_worker_mailbox_messages",
         "remote_worker_claims",
     ] {
