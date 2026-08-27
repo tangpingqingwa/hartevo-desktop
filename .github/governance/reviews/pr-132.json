@@ -1,0 +1,21 @@
+{
+  "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "baseSha": "3d656507a73fa4a3813bf510ee0d3826f430775e",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/channel-adapters/src/lib.rs",
+    "hartevo-rs/channel-adapters/src/testkit.rs",
+    "hartevo-rs/channel-adapters/src/transport.rs",
+    "hartevo-rs/channel-adapters/src/youtube.rs",
+    "hartevo-rs/channel-adapters/src/youtube_sync.rs",
+    "hartevo-rs/channel-adapters/tests/channel02_reconciliation.rs"
+  ],
+  "pr": 132,
+  "receiptDigest": "59e1f50f2d2da4cbff0cdf3e0a82d81399ee4bb5bacf787a58ef415c85236c91",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-27T14:05:02Z",
+  "reviewedHeadSha": "58071fcccd6f29b0851f45929229e43ea2f422ab",
+  "reviewerTaskId": "01a04379-d596-7d22-a462-91f91215a749",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
