@@ -47,8 +47,8 @@ use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{
     AccountId, ActorId, Approval, ApprovalDecision, ApprovalId, ConnectionId, ConsentRecordId,
     ConsentState, ConversationId, CreatorHiringId, CurrencyCode, DurableProviderState, Effect,
-    EffectClass, EffectId, EffectStatus, ExecutionAttemptId, Mission, MissionError, PartnerId,
-    Receipt, Verification, VerificationStatus,
+    EffectClass, EffectId, EffectStatus, ExecutionAttemptId, Mission, MissionCheckpointStatus,
+    MissionError, MissionStage, PartnerId, Receipt, Verification, VerificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -553,7 +553,7 @@ pub trait EffectPermissionResolver {
     ) -> Result<PermissionEvidence, PermissionFailure>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionDisposition {
     Executed,
     ReusedIdempotentReceipt,
@@ -613,6 +613,7 @@ impl EffectAuthorityTimeSource for SystemEffectAuthorityTimeSource {
 /// fence for claim and business semantics.
 struct EffectAuthorityClock {
     entry_at: DateTime<Utc>,
+    history_not_after: DateTime<Utc>,
     source: Box<dyn EffectAuthorityTimeSource>,
     sample_count: u64,
 }
@@ -645,6 +646,7 @@ impl EffectAuthorityClock {
         }
         Ok(Self {
             entry_at,
+            history_not_after: authority_utc_anchor,
             source: Box::new(SystemEffectAuthorityTimeSource {
                 authority_utc_anchor,
                 monotonic_anchor,
@@ -656,10 +658,12 @@ impl EffectAuthorityClock {
     #[cfg(test)]
     fn from_test_source(
         entry_at: DateTime<Utc>,
+        history_not_after: DateTime<Utc>,
         source: impl EffectAuthorityTimeSource + 'static,
     ) -> Self {
         Self {
             entry_at,
+            history_not_after,
             source: Box::new(source),
             sample_count: 0,
         }
@@ -676,6 +680,16 @@ impl EffectAuthorityClock {
         self.sample_count
     }
 
+    fn validate_persisted_completion(
+        &self,
+        operation_at: DateTime<Utc>,
+    ) -> Result<(), BrokerError> {
+        if operation_at > self.history_not_after {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        Ok(())
+    }
+
     fn sample_post_external_call(
         &mut self,
         not_before: DateTime<Utc>,
@@ -689,21 +703,28 @@ impl EffectAuthorityClock {
             return Err(BrokerError::InvalidAuthorityClock);
         }
         Ok(EffectAuthoritySample {
-            sequence: self.sample_count,
+            source_ordinal: self.sample_count,
             operation_at,
         })
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct EffectAuthoritySample {
-    sequence: u64,
+    source_ordinal: u64,
     operation_at: DateTime<Utc>,
+}
+
+impl EffectAuthoritySample {
+    fn into_parts(self) -> (u64, DateTime<Utc>) {
+        (self.source_ordinal, self.operation_at)
+    }
 }
 
 struct ReconciliationCompletionTiming<'a> {
     clock: &'a mut EffectAuthorityClock,
     authority: &'a mut EffectCompletionAuthority,
+    projection_committed: &'a mut bool,
     reconciliation_at: DateTime<Utc>,
 }
 
@@ -715,12 +736,35 @@ struct ExecuteAndVerifyFlow<'a, Infrastructure, Executor, Verifier> {
     verifier: &'a mut Verifier,
     clock: &'a mut EffectAuthorityClock,
     authority: &'a mut EffectCompletionAuthority,
+    projection_committed: &'a mut bool,
 }
 
 struct ExecutionReceiptCompletion {
     receipt: Receipt,
     disposition: ExecutionDisposition,
     recovered_receipt_candidate: Option<Mission>,
+}
+
+struct PersistedVerificationRecovery {
+    receipt: Receipt,
+    verification: Verification,
+    execution_started_at: DateTime<Utc>,
+    receipt_completion: Option<PersistedCompletionPoint>,
+    completion: PersistedCompletionPoint,
+}
+
+struct PersistedProviderRejectionRecovery {
+    reason: String,
+    observed_at: Option<DateTime<Utc>>,
+    execution_started_at: DateTime<Utc>,
+    completion: PersistedCompletionPoint,
+}
+
+struct PersistedNotExecutedRecovery {
+    evidence_digest: String,
+    observed_at: DateTime<Utc>,
+    execution_started_at: DateTime<Utc>,
+    completion: PersistedCompletionPoint,
 }
 
 struct ReconcileUncertainFlow<'a, Infrastructure, Reconciler, Verifier> {
@@ -731,6 +775,7 @@ struct ReconcileUncertainFlow<'a, Infrastructure, Reconciler, Verifier> {
     verifier: &'a mut Verifier,
     clock: &'a mut EffectAuthorityClock,
     authority: &'a mut EffectCompletionAuthority,
+    projection_committed: &'a mut bool,
 }
 
 struct ReconciledReceiptVerification {
@@ -754,6 +799,12 @@ pub struct EffectCompletionAuthority {
     provider: Option<EffectCompletionPoint>,
     reconciliation: Option<EffectCompletionPoint>,
     verification: Option<EffectCompletionPoint>,
+    provider_disposition: Option<ExecutionDisposition>,
+    last_source_ordinal: u64,
+    #[cfg(test)]
+    reject_next_sample_accept: bool,
+    #[cfg(test)]
+    reject_sample_accept_at_source_ordinal: Option<u64>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -810,6 +861,12 @@ impl EffectCompletionAuthority {
             provider: None,
             reconciliation: None,
             verification: None,
+            provider_disposition: None,
+            last_source_ordinal: 0,
+            #[cfg(test)]
+            reject_next_sample_accept: false,
+            #[cfg(test)]
+            reject_sample_accept_at_source_ordinal: None,
         }
     }
 
@@ -818,11 +875,25 @@ impl EffectCompletionAuthority {
         boundary: EffectCompletionBoundary,
         sample: EffectAuthoritySample,
     ) -> Result<(), BrokerError> {
-        if self.latest_accepted().is_some_and(|latest| {
-            sample.sequence <= latest.sequence || sample.operation_at < latest.operation_at
-        }) {
+        let (source_ordinal, operation_at) = sample.into_parts();
+        #[cfg(test)]
+        if self.reject_next_sample_accept {
+            self.reject_next_sample_accept = false;
             return Err(BrokerError::InvalidAuthorityClock);
         }
+        #[cfg(test)]
+        if self.reject_sample_accept_at_source_ordinal == Some(source_ordinal) {
+            self.reject_sample_accept_at_source_ordinal = None;
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        let expected_source_ordinal = self
+            .last_source_ordinal
+            .checked_add(1)
+            .ok_or(BrokerError::InvalidAuthorityClock)?;
+        if source_ordinal != expected_source_ordinal {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        let sequence = self.next_sequence(operation_at)?;
         let slot = match boundary {
             EffectCompletionBoundary::Provider => &mut self.provider,
             EffectCompletionBoundary::Reconciliation => &mut self.reconciliation,
@@ -832,10 +903,45 @@ impl EffectCompletionAuthority {
             return Err(BrokerError::InvalidAuthorityClock);
         }
         *slot = Some(EffectCompletionPoint {
-            sequence: sample.sequence,
-            operation_at: sample.operation_at,
+            sequence,
+            operation_at,
+        });
+        self.last_source_ordinal = source_ordinal;
+        Ok(())
+    }
+
+    fn accept_persisted(
+        &mut self,
+        boundary: EffectCompletionBoundary,
+        point: PersistedCompletionPoint,
+    ) -> Result<(), BrokerError> {
+        let sequence = self.next_sequence(point.operation_at)?;
+        let slot = match boundary {
+            EffectCompletionBoundary::Provider => &mut self.provider,
+            EffectCompletionBoundary::Reconciliation => &mut self.reconciliation,
+            EffectCompletionBoundary::Verification => &mut self.verification,
+        };
+        if slot.is_some() {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        *slot = Some(EffectCompletionPoint {
+            sequence,
+            operation_at: point.operation_at,
         });
         Ok(())
+    }
+
+    fn next_sequence(&self, operation_at: DateTime<Utc>) -> Result<u64, BrokerError> {
+        let Some(latest) = self.latest_accepted() else {
+            return Ok(1);
+        };
+        if operation_at < latest.operation_at {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        latest
+            .sequence
+            .checked_add(1)
+            .ok_or(BrokerError::InvalidAuthorityClock)
     }
 
     #[must_use]
@@ -851,6 +957,25 @@ impl EffectCompletionAuthority {
     #[must_use]
     pub const fn verification(&self) -> Option<EffectCompletionPoint> {
         self.verification
+    }
+
+    /// Identifies the accepted Provider receipt boundary without exposing
+    /// receipt content. This is absent for Provider rejection/uncertainty and
+    /// for verification-only recovery.
+    #[must_use]
+    pub const fn provider_disposition(&self) -> Option<ExecutionDisposition> {
+        self.provider_disposition
+    }
+
+    fn bind_provider_disposition(
+        &mut self,
+        disposition: ExecutionDisposition,
+    ) -> Result<(), BrokerError> {
+        if self.provider.is_none() || self.provider_disposition.is_some() {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        self.provider_disposition = Some(disposition);
+        Ok(())
     }
 
     #[must_use]
@@ -869,7 +994,7 @@ impl EffectCompletionAuthority {
 
     fn sampling_floor(&self) -> DateTime<Utc> {
         match self.latest_accepted() {
-            Some(point) => point.operation_at,
+            Some(point) => self.entry_at.max(point.operation_at),
             None => self.entry_at,
         }
     }
@@ -879,6 +1004,7 @@ impl EffectCompletionAuthority {
 pub struct AuthorityBoundBrokerResult {
     result: BrokerResult,
     authority: EffectCompletionAuthority,
+    projection_committed: bool,
 }
 
 impl std::fmt::Debug for AuthorityBoundBrokerResult {
@@ -887,6 +1013,7 @@ impl std::fmt::Debug for AuthorityBoundBrokerResult {
             .debug_struct("AuthorityBoundBrokerResult")
             .field("disposition", &self.result.disposition)
             .field("authority", &self.authority)
+            .field("projection_committed", &self.projection_committed)
             .finish_non_exhaustive()
     }
 }
@@ -900,6 +1027,11 @@ impl AuthorityBoundBrokerResult {
     #[must_use]
     pub const fn authority(&self) -> &EffectCompletionAuthority {
         &self.authority
+    }
+
+    #[must_use]
+    pub const fn projection_committed(&self) -> bool {
+        self.projection_committed
     }
 
     #[must_use]
@@ -917,6 +1049,7 @@ pub struct AuthorityBoundBrokerError {
 struct AuthorityBoundBrokerErrorInner {
     error: BrokerError,
     authority: EffectCompletionAuthority,
+    projection_committed: bool,
 }
 
 impl std::fmt::Debug for AuthorityBoundBrokerError {
@@ -925,6 +1058,7 @@ impl std::fmt::Debug for AuthorityBoundBrokerError {
             .debug_struct("AuthorityBoundBrokerError")
             .field("error_kind", &broker_error_kind(self.error()))
             .field("authority", self.authority())
+            .field("projection_committed", &self.projection_committed())
             .finish_non_exhaustive()
     }
 }
@@ -942,9 +1076,17 @@ impl std::error::Error for AuthorityBoundBrokerError {
 }
 
 impl AuthorityBoundBrokerError {
-    fn new(error: BrokerError, authority: EffectCompletionAuthority) -> Self {
+    fn new(
+        error: BrokerError,
+        authority: EffectCompletionAuthority,
+        projection_committed: bool,
+    ) -> Self {
         Self {
-            inner: Box::new(AuthorityBoundBrokerErrorInner { error, authority }),
+            inner: Box::new(AuthorityBoundBrokerErrorInner {
+                error,
+                authority,
+                projection_committed,
+            }),
         }
     }
 
@@ -959,8 +1101,17 @@ impl AuthorityBoundBrokerError {
     }
 
     #[must_use]
+    pub fn projection_committed(&self) -> bool {
+        self.inner.projection_committed
+    }
+
+    #[must_use]
     pub fn into_parts(self) -> (BrokerError, EffectCompletionAuthority) {
-        let AuthorityBoundBrokerErrorInner { error, authority } = *self.inner;
+        let AuthorityBoundBrokerErrorInner {
+            error,
+            authority,
+            projection_committed: _,
+        } = *self.inner;
         (error, authority)
     }
 }
@@ -1188,7 +1339,7 @@ pub enum ReconciliationClaim {
         lease: ReconciliationLease,
         execution_started_at: DateTime<Utc>,
     },
-    Resolved(LedgerClaim),
+    Resolved(Box<LedgerClaim>),
     NotReady {
         retry_at: DateTime<Utc>,
     },
@@ -1231,6 +1382,111 @@ pub enum ReconciliationDisposition {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistedCompletionStage {
+    Provider,
+    Reconciliation,
+    Verification,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistedCompletionProvenance {
+    EffectIdempotencyProviderReceipt,
+    EffectIdempotencyProviderRejected,
+    EffectIdempotencyVerification,
+    ReconciliationHeadReceiptFound,
+    ReconciliationHeadProviderRejected,
+    ReconciliationHeadNotExecuted,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct PersistedCompletionPoint {
+    stage: PersistedCompletionStage,
+    provenance: PersistedCompletionProvenance,
+    operation_at: DateTime<Utc>,
+}
+
+impl PersistedCompletionPoint {
+    #[must_use]
+    pub const fn effect_idempotency_provider_receipt(operation_at: DateTime<Utc>) -> Self {
+        Self {
+            stage: PersistedCompletionStage::Provider,
+            provenance: PersistedCompletionProvenance::EffectIdempotencyProviderReceipt,
+            operation_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn effect_idempotency_provider_rejected(operation_at: DateTime<Utc>) -> Self {
+        Self {
+            stage: PersistedCompletionStage::Provider,
+            provenance: PersistedCompletionProvenance::EffectIdempotencyProviderRejected,
+            operation_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn effect_idempotency_verification(operation_at: DateTime<Utc>) -> Self {
+        Self {
+            stage: PersistedCompletionStage::Verification,
+            provenance: PersistedCompletionProvenance::EffectIdempotencyVerification,
+            operation_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn reconciliation_head_receipt_found(operation_at: DateTime<Utc>) -> Self {
+        Self {
+            stage: PersistedCompletionStage::Reconciliation,
+            provenance: PersistedCompletionProvenance::ReconciliationHeadReceiptFound,
+            operation_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn reconciliation_head_provider_rejected(operation_at: DateTime<Utc>) -> Self {
+        Self {
+            stage: PersistedCompletionStage::Reconciliation,
+            provenance: PersistedCompletionProvenance::ReconciliationHeadProviderRejected,
+            operation_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn reconciliation_head_not_executed(operation_at: DateTime<Utc>) -> Self {
+        Self {
+            stage: PersistedCompletionStage::Reconciliation,
+            provenance: PersistedCompletionProvenance::ReconciliationHeadNotExecuted,
+            operation_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn stage(self) -> PersistedCompletionStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub const fn provenance(self) -> PersistedCompletionProvenance {
+        self.provenance
+    }
+
+    #[must_use]
+    pub const fn operation_at(self) -> DateTime<Utc> {
+        self.operation_at
+    }
+}
+
+impl std::fmt::Debug for PersistedCompletionPoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedCompletionPoint")
+            .field("stage", &self.stage)
+            .field("provenance", &self.provenance)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LedgerClaim {
     Acquired {
@@ -1238,15 +1494,34 @@ pub enum LedgerClaim {
         receipt: Option<Receipt>,
         execution_started_at: DateTime<Utc>,
     },
+    RecoverableReceipt {
+        lease: ExecutionLease,
+        receipt: Receipt,
+        execution_started_at: DateTime<Utc>,
+        completion: PersistedCompletionPoint,
+    },
     AlreadyVerified {
         receipt: Receipt,
         verification: Verification,
         execution_started_at: DateTime<Utc>,
     },
+    RecoverableVerification {
+        receipt: Receipt,
+        verification: Verification,
+        execution_started_at: DateTime<Utc>,
+        receipt_completion: Option<PersistedCompletionPoint>,
+        completion: PersistedCompletionPoint,
+    },
     ProviderRejected {
         reason: String,
         execution_started_at: DateTime<Utc>,
         recorded_at: DateTime<Utc>,
+    },
+    RecoverableProviderRejected {
+        reason: String,
+        observed_at: Option<DateTime<Utc>>,
+        execution_started_at: DateTime<Utc>,
+        completion: PersistedCompletionPoint,
     },
     Uncertain {
         reason: String,
@@ -1262,6 +1537,12 @@ pub enum LedgerClaim {
         evidence_digest: String,
         observed_at: DateTime<Utc>,
         execution_started_at: DateTime<Utc>,
+    },
+    RecoverableReconciledNotExecuted {
+        evidence_digest: String,
+        observed_at: DateTime<Utc>,
+        execution_started_at: DateTime<Utc>,
+        completion: PersistedCompletionPoint,
     },
     DeadLetter {
         reason: String,
@@ -1280,8 +1561,32 @@ pub enum LedgerClaim {
 enum ResolvedLedgerClaim {
     Acquired {
         lease: ExecutionLease,
-        receipt: Option<Receipt>,
         execution_started_at: DateTime<Utc>,
+    },
+    RecoverableReceipt {
+        lease: ExecutionLease,
+        receipt: Receipt,
+        execution_started_at: DateTime<Utc>,
+        completion: PersistedCompletionPoint,
+    },
+    RecoverableProviderRejected {
+        reason: String,
+        observed_at: Option<DateTime<Utc>>,
+        execution_started_at: DateTime<Utc>,
+        completion: PersistedCompletionPoint,
+    },
+    RecoverableReconciledNotExecuted {
+        evidence_digest: String,
+        observed_at: DateTime<Utc>,
+        execution_started_at: DateTime<Utc>,
+        completion: PersistedCompletionPoint,
+    },
+    RecoverableVerification {
+        receipt: Receipt,
+        verification: Verification,
+        execution_started_at: DateTime<Utc>,
+        receipt_completion: Option<PersistedCompletionPoint>,
+        completion: PersistedCompletionPoint,
     },
 }
 
@@ -1554,7 +1859,9 @@ impl EffectBroker {
         let authority = EffectCompletionAuthority::new(entry_at);
         let mut clock = match EffectAuthorityClock::system(entry_at) {
             Ok(clock) => clock,
-            Err(error) => return Err(AuthorityBoundBrokerError::new(error, authority)),
+            Err(error) => {
+                return Err(AuthorityBoundBrokerError::new(error, authority, false));
+            }
         };
         self.execute_and_verify_with_clock(
             mission,
@@ -1576,7 +1883,8 @@ impl EffectBroker {
         clock: &mut EffectAuthorityClock,
     ) -> Result<AuthorityBoundBrokerResult, AuthorityBoundBrokerError> {
         let mut authority = EffectCompletionAuthority::new(clock.entry_at());
-        match self.execute_and_verify_inner(ExecuteAndVerifyFlow {
+        let mut projection_committed = false;
+        let outcome = self.execute_and_verify_inner(ExecuteAndVerifyFlow {
             mission,
             effect_id,
             infrastructure,
@@ -1584,9 +1892,19 @@ impl EffectBroker {
             verifier,
             clock,
             authority: &mut authority,
-        }) {
-            Ok(result) => Ok(AuthorityBoundBrokerResult { result, authority }),
-            Err(error) => Err(AuthorityBoundBrokerError::new(error, authority)),
+            projection_committed: &mut projection_committed,
+        });
+        match outcome {
+            Ok(result) => Ok(AuthorityBoundBrokerResult {
+                result,
+                authority,
+                projection_committed,
+            }),
+            Err(error) => Err(AuthorityBoundBrokerError::new(
+                error,
+                authority,
+                projection_committed,
+            )),
         }
     }
 
@@ -1623,21 +1941,43 @@ impl EffectBroker {
             return Err(BrokerError::NotApproved(effect.status.clone()));
         }
         let claim = self.claim_recovery_or_fresh(&effect, flow.infrastructure, now)?;
-        let ResolvedLedgerClaim::Acquired {
-            lease,
-            receipt: existing_receipt,
-            execution_started_at,
-        } = Self::resolve_ledger_claim(claim)?;
-
-        let receipt_completion = Self::complete_provider_execution(
-            &mut flow,
-            &effect,
-            &lease,
-            existing_receipt,
-            execution_started_at,
-            now,
-        )?;
-        Self::complete_execution_verification(flow, &effect, &lease, receipt_completion)
+        match Self::resolve_ledger_claim(claim)? {
+            ResolvedLedgerClaim::Acquired {
+                lease,
+                execution_started_at,
+            } => {
+                let receipt_completion = Self::complete_provider_execution(
+                    &mut flow,
+                    &effect,
+                    &lease,
+                    None,
+                    execution_started_at,
+                    now,
+                )?;
+                Self::complete_execution_verification(flow, &effect, &lease, receipt_completion)
+            }
+            ResolvedLedgerClaim::RecoverableReceipt {
+                lease,
+                receipt,
+                execution_started_at,
+                completion,
+            } => Self::complete_recoverable_receipt(
+                flow,
+                &effect,
+                &lease,
+                receipt,
+                execution_started_at,
+                completion,
+            ),
+            claim => Self::complete_persisted_recovery(
+                flow.mission,
+                flow.effect_id,
+                flow.clock,
+                flow.authority,
+                flow.projection_committed,
+                claim,
+            ),
+        }
     }
 
     fn complete_provider_execution<Infrastructure, Executor, Verifier>(
@@ -1668,25 +2008,30 @@ impl EffectBroker {
                 recovered_receipt_candidate: Some(candidate),
             })
         } else {
-            flow.mission.begin_effect(flow.effect_id, entry_at)?;
+            let mut provider_candidate = flow.mission.clone();
+            provider_candidate.begin_effect(flow.effect_id, entry_at)?;
             let provider_result = flow.executor.execute(effect);
             let provider_sample = flow
                 .clock
                 .sample_post_external_call(flow.authority.sampling_floor())?;
+            let provider_operation_at = provider_sample.operation_at;
             match provider_result {
                 Ok(receipt) => {
-                    let mut candidate = flow.mission.clone();
+                    let mut candidate = provider_candidate;
                     candidate.record_receipt(flow.effect_id, receipt.clone())?;
                     flow.infrastructure.record_receipt(
                         effect,
                         lease,
                         &receipt,
-                        provider_sample.operation_at,
+                        provider_operation_at,
                     )?;
                     flow.authority
                         .accept(EffectCompletionBoundary::Provider, provider_sample)?;
-                    Self::bind_receipt_projection_at(&mut candidate, provider_sample.operation_at);
+                    flow.authority
+                        .bind_provider_disposition(ExecutionDisposition::Executed)?;
+                    Self::bind_receipt_projection_at(&mut candidate, provider_operation_at);
                     *flow.mission = candidate;
+                    *flow.projection_committed = true;
                     Ok(ExecutionReceiptCompletion {
                         receipt,
                         disposition: ExecutionDisposition::Executed,
@@ -1694,29 +2039,33 @@ impl EffectBroker {
                     })
                 }
                 Err(ProviderFailure::Rejected(reason)) => {
+                    let mut candidate = provider_candidate;
+                    candidate.mark_effect_failed(flow.effect_id, provider_operation_at)?;
                     flow.infrastructure.record_failed(
                         effect,
                         lease,
                         &reason,
-                        provider_sample.operation_at,
+                        provider_operation_at,
                     )?;
                     flow.authority
                         .accept(EffectCompletionBoundary::Provider, provider_sample)?;
-                    flow.mission
-                        .mark_effect_failed(flow.effect_id, provider_sample.operation_at)?;
+                    *flow.mission = candidate;
+                    *flow.projection_committed = true;
                     Err(BrokerError::ProviderRejected(reason))
                 }
                 Err(ProviderFailure::Uncertain(reason)) => {
+                    let mut candidate = provider_candidate;
+                    candidate.mark_effect_uncertain(flow.effect_id, provider_operation_at)?;
                     flow.infrastructure.record_uncertain(
                         effect,
                         lease,
                         &reason,
-                        provider_sample.operation_at,
+                        provider_operation_at,
                     )?;
                     flow.authority
                         .accept(EffectCompletionBoundary::Provider, provider_sample)?;
-                    flow.mission
-                        .mark_effect_uncertain(flow.effect_id, provider_sample.operation_at)?;
+                    *flow.mission = candidate;
+                    *flow.projection_committed = true;
                     Err(BrokerError::ProviderUncertain(reason))
                 }
             }
@@ -1740,6 +2089,7 @@ impl EffectBroker {
             verifier,
             clock,
             authority,
+            projection_committed,
             executor: _,
         } = flow;
         let ExecutionReceiptCompletion {
@@ -1754,16 +2104,18 @@ impl EffectBroker {
         let effect_with_receipt = candidate.effect(effect_id)?.clone();
         let verification = verifier.verify(&effect_with_receipt, &receipt);
         let verification_sample = clock.sample_post_external_call(authority.sampling_floor())?;
+        let verification_operation_at = verification_sample.operation_at;
         candidate.record_verification(effect_id, verification.clone())?;
         infrastructure.record_verification(
             effect,
             lease,
             &verification,
-            verification_sample.operation_at,
+            verification_operation_at,
         )?;
         authority.accept(EffectCompletionBoundary::Verification, verification_sample)?;
-        Self::bind_verification_projection_at(&mut candidate, verification_sample.operation_at);
+        Self::bind_verification_projection_at(&mut candidate, verification_operation_at);
         *mission = candidate;
+        *projection_committed = true;
         match verification.status {
             VerificationStatus::Rejected => return Err(BrokerError::VerificationRejected),
             VerificationStatus::Inconclusive => {
@@ -1777,6 +2129,656 @@ impl EffectBroker {
             receipt,
             verification,
         })
+    }
+
+    fn complete_recoverable_receipt<Infrastructure, Executor, Verifier>(
+        flow: ExecuteAndVerifyFlow<'_, Infrastructure, Executor, Verifier>,
+        effect: &Effect,
+        lease: &ExecutionLease,
+        receipt: Receipt,
+        execution_started_at: DateTime<Utc>,
+        completion: PersistedCompletionPoint,
+    ) -> Result<BrokerResult, BrokerError>
+    where
+        Infrastructure: EffectInfrastructure,
+        Verifier: EffectVerifier,
+    {
+        let ExecuteAndVerifyFlow {
+            mission,
+            effect_id,
+            infrastructure,
+            executor,
+            verifier,
+            clock,
+            authority,
+            projection_committed,
+        } = flow;
+        if *projection_committed
+            || authority.latest_accepted().is_some()
+            || authority.provider_disposition().is_some()
+        {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        let boundary = Self::validate_recoverable_receipt_completion(
+            clock,
+            effect,
+            completion,
+            execution_started_at,
+            &receipt,
+        )?;
+        let existing_receipt = mission.effect(effect_id)?.receipt.as_ref();
+        if existing_receipt.is_some_and(|existing| existing != &receipt) {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        let history_required = existing_receipt.is_none();
+        let mut candidate_mission = mission.clone();
+        candidate_mission.reconcile_durable_receipt(
+            effect_id,
+            receipt.clone(),
+            execution_started_at,
+        )?;
+        let mut candidate_authority = *authority;
+        if history_required {
+            Self::bind_receipt_projection_at(&mut candidate_mission, completion.operation_at());
+            candidate_authority.accept_persisted(boundary, completion)?;
+            if boundary == EffectCompletionBoundary::Provider {
+                candidate_authority
+                    .bind_provider_disposition(ExecutionDisposition::ReusedIdempotentReceipt)?;
+            }
+        }
+        let mut candidate_projection_committed = false;
+        let outcome = Self::complete_execution_verification(
+            ExecuteAndVerifyFlow {
+                mission: &mut candidate_mission,
+                effect_id,
+                infrastructure,
+                executor,
+                verifier,
+                clock,
+                authority: &mut candidate_authority,
+                projection_committed: &mut candidate_projection_committed,
+            },
+            effect,
+            lease,
+            ExecutionReceiptCompletion {
+                receipt,
+                disposition: ExecutionDisposition::ReusedIdempotentReceipt,
+                recovered_receipt_candidate: None,
+            },
+        );
+        if candidate_projection_committed && candidate_authority.verification().is_some() {
+            *mission = candidate_mission;
+            *authority = candidate_authority;
+            *projection_committed = true;
+        }
+        outcome
+    }
+
+    fn complete_persisted_recovery(
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        clock: &EffectAuthorityClock,
+        authority: &mut EffectCompletionAuthority,
+        projection_committed: &mut bool,
+        claim: ResolvedLedgerClaim,
+    ) -> Result<BrokerResult, BrokerError> {
+        match claim {
+            ResolvedLedgerClaim::RecoverableProviderRejected {
+                reason,
+                observed_at,
+                execution_started_at,
+                completion,
+            } => Self::complete_persisted_provider_rejection(
+                mission,
+                effect_id,
+                clock,
+                authority,
+                projection_committed,
+                PersistedProviderRejectionRecovery {
+                    reason,
+                    observed_at,
+                    execution_started_at,
+                    completion,
+                },
+            ),
+            ResolvedLedgerClaim::RecoverableReconciledNotExecuted {
+                evidence_digest,
+                observed_at,
+                execution_started_at,
+                completion,
+            } => Self::complete_persisted_not_executed(
+                mission,
+                effect_id,
+                clock,
+                authority,
+                projection_committed,
+                PersistedNotExecutedRecovery {
+                    evidence_digest,
+                    observed_at,
+                    execution_started_at,
+                    completion,
+                },
+            ),
+            ResolvedLedgerClaim::RecoverableVerification {
+                receipt,
+                verification,
+                execution_started_at,
+                receipt_completion,
+                completion,
+            } => Self::complete_persisted_verification(
+                mission,
+                effect_id,
+                clock,
+                authority,
+                projection_committed,
+                PersistedVerificationRecovery {
+                    receipt,
+                    verification,
+                    execution_started_at,
+                    receipt_completion,
+                    completion,
+                },
+            ),
+            ResolvedLedgerClaim::Acquired { .. }
+            | ResolvedLedgerClaim::RecoverableReceipt { .. } => {
+                Err(BrokerError::DurableProjectionRecoveryRequired)
+            }
+        }
+    }
+
+    fn complete_persisted_provider_rejection(
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        clock: &EffectAuthorityClock,
+        authority: &mut EffectCompletionAuthority,
+        projection_committed: &mut bool,
+        recovery: PersistedProviderRejectionRecovery,
+    ) -> Result<BrokerResult, BrokerError> {
+        let PersistedProviderRejectionRecovery {
+            reason,
+            observed_at,
+            execution_started_at,
+            completion,
+        } = recovery;
+        if reason.trim().is_empty() {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        Self::validate_persisted_execution_provenance(
+            mission.effect(effect_id)?,
+            execution_started_at,
+        )?;
+        let boundary = Self::validate_recoverable_provider_rejection(
+            clock,
+            completion,
+            observed_at,
+            execution_started_at,
+        )?;
+        if Self::is_exact_persisted_provider_replay(
+            mission,
+            effect_id,
+            DurableProviderState::Rejected,
+            completion.operation_at(),
+        )? {
+            return Err(BrokerError::ProviderRejected(reason));
+        }
+        let mut candidate = mission.clone();
+        candidate.reconcile_durable_provider_state(
+            effect_id,
+            DurableProviderState::Rejected,
+            execution_started_at,
+            completion.operation_at(),
+        )?;
+        authority.accept_persisted(boundary, completion)?;
+        *mission = candidate;
+        *projection_committed = true;
+        Err(BrokerError::ProviderRejected(reason))
+    }
+
+    fn complete_persisted_not_executed(
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        clock: &EffectAuthorityClock,
+        authority: &mut EffectCompletionAuthority,
+        projection_committed: &mut bool,
+        recovery: PersistedNotExecutedRecovery,
+    ) -> Result<BrokerResult, BrokerError> {
+        let PersistedNotExecutedRecovery {
+            evidence_digest,
+            observed_at,
+            execution_started_at,
+            completion,
+        } = recovery;
+        if !is_sha256(&evidence_digest) {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        Self::validate_persisted_execution_provenance(
+            mission.effect(effect_id)?,
+            execution_started_at,
+        )?;
+        Self::validate_persisted_completion(
+            clock,
+            completion,
+            PersistedCompletionStage::Reconciliation,
+            PersistedCompletionProvenance::ReconciliationHeadNotExecuted,
+            execution_started_at,
+            Some(observed_at),
+        )?;
+        if Self::is_exact_persisted_provider_replay(
+            mission,
+            effect_id,
+            DurableProviderState::ReconciledNotExecuted,
+            completion.operation_at(),
+        )? {
+            return Err(BrokerError::ProviderNotExecuted { evidence_digest });
+        }
+        let mut candidate = mission.clone();
+        candidate.reconcile_durable_provider_state(
+            effect_id,
+            DurableProviderState::ReconciledNotExecuted,
+            execution_started_at,
+            completion.operation_at(),
+        )?;
+        authority.accept_persisted(EffectCompletionBoundary::Reconciliation, completion)?;
+        *mission = candidate;
+        *projection_committed = true;
+        Err(BrokerError::ProviderNotExecuted { evidence_digest })
+    }
+
+    fn complete_persisted_verification(
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        clock: &EffectAuthorityClock,
+        authority: &mut EffectCompletionAuthority,
+        projection_committed: &mut bool,
+        recovery: PersistedVerificationRecovery,
+    ) -> Result<BrokerResult, BrokerError> {
+        let PersistedVerificationRecovery {
+            receipt,
+            verification,
+            execution_started_at,
+            receipt_completion,
+            completion,
+        } = recovery;
+        let effect = mission.effect(effect_id)?;
+        Self::validate_persisted_receipt_provenance(effect, &receipt, execution_started_at)?;
+        Self::validate_persisted_verification_provenance(&receipt, &verification)?;
+        Self::validate_persisted_completion(
+            clock,
+            completion,
+            PersistedCompletionStage::Verification,
+            PersistedCompletionProvenance::EffectIdempotencyVerification,
+            execution_started_at,
+            Some(verification.observed_at),
+        )?;
+        if verification.receipt_id != receipt.id || verification.observed_at < receipt.accepted_at {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        if Self::is_exact_persisted_verification_replay(
+            mission,
+            effect_id,
+            &receipt,
+            &verification,
+            completion.operation_at(),
+        )? {
+            return Self::persisted_verification_result(receipt, verification);
+        }
+        let existing_receipt = mission.effect(effect_id)?.receipt.as_ref();
+        if existing_receipt.is_some_and(|existing| existing != &receipt) {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        let receipt_missing = existing_receipt.is_none();
+        if receipt_missing && receipt_completion.is_none() {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        if receipt_missing && let Some(receipt_completion) = receipt_completion {
+            Self::validate_persisted_completion(
+                clock,
+                receipt_completion,
+                PersistedCompletionStage::Reconciliation,
+                PersistedCompletionProvenance::ReconciliationHeadReceiptFound,
+                execution_started_at,
+                Some(receipt.accepted_at),
+            )?;
+            if receipt_completion.operation_at() > completion.operation_at() {
+                return Err(BrokerError::InvalidAuthorityClock);
+            }
+        }
+        let mut candidate = mission.clone();
+        if receipt_missing {
+            let receipt_completion =
+                receipt_completion.ok_or(BrokerError::DurableProjectionRecoveryRequired)?;
+            candidate.reconcile_durable_receipt(
+                effect_id,
+                receipt.clone(),
+                execution_started_at,
+            )?;
+            Self::bind_receipt_projection_at(&mut candidate, receipt_completion.operation_at());
+        } else if !matches!(
+            candidate.effect(effect_id)?.status,
+            EffectStatus::ReceiptRecorded | EffectStatus::VerificationRequired
+        ) {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        candidate.record_verification(effect_id, verification.clone())?;
+        Self::bind_verification_projection_at(&mut candidate, completion.operation_at());
+        if receipt_missing {
+            authority.accept_persisted(
+                EffectCompletionBoundary::Reconciliation,
+                receipt_completion.ok_or(BrokerError::DurableProjectionRecoveryRequired)?,
+            )?;
+        }
+        authority.accept_persisted(EffectCompletionBoundary::Verification, completion)?;
+        *mission = candidate;
+        *projection_committed = true;
+        Self::persisted_verification_result(receipt, verification)
+    }
+
+    fn persisted_verification_result(
+        receipt: Receipt,
+        verification: Verification,
+    ) -> Result<BrokerResult, BrokerError> {
+        match verification.status {
+            VerificationStatus::Confirmed => Ok(BrokerResult {
+                disposition: ExecutionDisposition::AlreadyVerified,
+                receipt,
+                verification,
+            }),
+            VerificationStatus::Rejected => Err(BrokerError::VerificationRejected),
+            VerificationStatus::Inconclusive => Err(BrokerError::VerificationInconclusive),
+        }
+    }
+
+    fn is_exact_persisted_provider_replay(
+        mission: &Mission,
+        effect_id: &EffectId,
+        state: DurableProviderState,
+        projected_at: DateTime<Utc>,
+    ) -> Result<bool, BrokerError> {
+        let effect = mission.effect(effect_id)?;
+        let (expected_status, block_code, block_detail) = match state {
+            DurableProviderState::Rejected => (
+                EffectStatus::Failed,
+                "effect_failed",
+                format!("effect {effect_id} requires recovery or an explicit terminal decision"),
+            ),
+            DurableProviderState::ReconciledNotExecuted => (
+                EffectStatus::Reconciled,
+                "effect_reconciled_not_executed",
+                format!(
+                    "effect {effect_id} was independently reconciled as not executed; any retry requires a new exact effect and approval"
+                ),
+            ),
+            DurableProviderState::Uncertain | DurableProviderState::DeadLetter => {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            }
+        };
+        if effect.status != expected_status {
+            return Ok(false);
+        }
+        let Some(block) = mission.block.as_ref() else {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        };
+        if effect.receipt.is_some()
+            || effect.verification.is_some()
+            || mission.stage != MissionStage::Blocked
+            || mission.updated_at != projected_at
+            || block.code != block_code
+            || block.detail != block_detail
+            || !block.recoverable
+            || block.observed_at != projected_at
+        {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        if let Some(definition) = mission.definition.as_ref() {
+            let active = definition
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.status.is_active())
+                .collect::<Vec<_>>();
+            let [checkpoint] = active.as_slice() else {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            };
+            if checkpoint.status != MissionCheckpointStatus::Blocked
+                || checkpoint.block.as_ref() != Some(block)
+            {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            }
+        }
+        Ok(true)
+    }
+
+    fn is_exact_persisted_verification_replay(
+        mission: &Mission,
+        effect_id: &EffectId,
+        receipt: &Receipt,
+        verification: &Verification,
+        projected_at: DateTime<Utc>,
+    ) -> Result<bool, BrokerError> {
+        let effect = mission.effect(effect_id)?;
+        let Some(existing_verification) = effect.verification.as_ref() else {
+            return Ok(false);
+        };
+        let expected_status = match verification.status {
+            VerificationStatus::Confirmed => EffectStatus::Verified,
+            VerificationStatus::Rejected => EffectStatus::Failed,
+            VerificationStatus::Inconclusive => EffectStatus::VerificationRequired,
+        };
+        if effect.receipt.as_ref() != Some(receipt)
+            || existing_verification != verification
+            || effect.status != expected_status
+        {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        Self::validate_exact_verification_projection(mission, projected_at)?;
+        Ok(true)
+    }
+
+    fn validate_exact_verification_projection(
+        mission: &Mission,
+        projected_at: DateTime<Utc>,
+    ) -> Result<(), BrokerError> {
+        if mission.updated_at != projected_at {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        let blocked = mission
+            .effects
+            .iter()
+            .any(|effect| effect.status == EffectStatus::Failed);
+        let expected_stage = if blocked {
+            MissionStage::Blocked
+        } else {
+            MissionStage::Verifying
+        };
+        if mission.stage != expected_stage {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        if blocked {
+            let Some(block) = mission.block.as_ref() else {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            };
+            if block.code != "verification_rejected"
+                || block.detail != "independent verification rejected at least one provider effect"
+                || !block.recoverable
+                || block.observed_at != projected_at
+            {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            }
+        } else if mission.block.is_some() {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        if let Some(definition) = mission.definition.as_ref() {
+            let active = definition
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.status.is_active())
+                .collect::<Vec<_>>();
+            let [checkpoint] = active.as_slice() else {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            };
+            let expected_status = if blocked {
+                MissionCheckpointStatus::Blocked
+            } else {
+                MissionCheckpointStatus::Verifying
+            };
+            if checkpoint.status != expected_status || checkpoint.block != mission.block {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_recoverable_receipt_completion(
+        clock: &EffectAuthorityClock,
+        effect: &Effect,
+        completion: PersistedCompletionPoint,
+        execution_started_at: DateTime<Utc>,
+        receipt: &Receipt,
+    ) -> Result<EffectCompletionBoundary, BrokerError> {
+        Self::validate_persisted_receipt_provenance(effect, receipt, execution_started_at)?;
+        let (stage, provenance, boundary) = match completion.provenance() {
+            PersistedCompletionProvenance::EffectIdempotencyProviderReceipt => (
+                PersistedCompletionStage::Provider,
+                PersistedCompletionProvenance::EffectIdempotencyProviderReceipt,
+                EffectCompletionBoundary::Provider,
+            ),
+            PersistedCompletionProvenance::ReconciliationHeadReceiptFound => (
+                PersistedCompletionStage::Reconciliation,
+                PersistedCompletionProvenance::ReconciliationHeadReceiptFound,
+                EffectCompletionBoundary::Reconciliation,
+            ),
+            _ => return Err(BrokerError::DurableProjectionRecoveryRequired),
+        };
+        Self::validate_persisted_completion(
+            clock,
+            completion,
+            stage,
+            provenance,
+            execution_started_at,
+            Some(receipt.accepted_at),
+        )?;
+        Ok(boundary)
+    }
+
+    fn validate_persisted_execution_provenance(
+        effect: &Effect,
+        execution_started_at: DateTime<Utc>,
+    ) -> Result<(), BrokerError> {
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(BrokerError::DurableProjectionRecoveryRequired)?;
+        if approval.decision != ApprovalDecision::Approved
+            || approval.id.as_str().trim().is_empty()
+            || approval.scope_digest != effect.approval_digest()
+            || !is_sha256(&approval.permission_digest)
+            || approval.decided_at >= approval.valid_until
+            || approval.valid_until > effect.expires_at
+            || execution_started_at < approval.decided_at
+            || execution_started_at >= approval.valid_until
+            || execution_started_at >= effect.expires_at
+            || effect
+                .scheduled_for
+                .is_some_and(|scheduled_at| execution_started_at < scheduled_at)
+        {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn validate_persisted_receipt_provenance(
+        effect: &Effect,
+        receipt: &Receipt,
+        execution_started_at: DateTime<Utc>,
+    ) -> Result<(), BrokerError> {
+        Self::validate_persisted_execution_provenance(effect, execution_started_at)?;
+        if receipt.id.as_str().trim().is_empty()
+            || receipt.provider != effect.provider
+            || receipt.external_id.trim().is_empty()
+            || receipt.request_digest != effect.approval_digest()
+            || !is_sha256(&receipt.response_digest)
+            || receipt.accepted_at < execution_started_at
+            || receipt.accepted_at >= effect.expires_at
+        {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn validate_persisted_verification_provenance(
+        receipt: &Receipt,
+        verification: &Verification,
+    ) -> Result<(), BrokerError> {
+        if verification.id.as_str().trim().is_empty()
+            || verification.receipt_id != receipt.id
+            || verification.verifier.trim().is_empty()
+            || !verification.independent
+            || !is_sha256(&verification.evidence_digest)
+            || verification.observed_at < receipt.accepted_at
+        {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn validate_recoverable_provider_rejection(
+        clock: &EffectAuthorityClock,
+        completion: PersistedCompletionPoint,
+        observed_at: Option<DateTime<Utc>>,
+        execution_started_at: DateTime<Utc>,
+    ) -> Result<EffectCompletionBoundary, BrokerError> {
+        match (completion.stage(), completion.provenance(), observed_at) {
+            (
+                PersistedCompletionStage::Provider,
+                PersistedCompletionProvenance::EffectIdempotencyProviderRejected,
+                None,
+            ) => {
+                Self::validate_persisted_completion(
+                    clock,
+                    completion,
+                    PersistedCompletionStage::Provider,
+                    PersistedCompletionProvenance::EffectIdempotencyProviderRejected,
+                    execution_started_at,
+                    None,
+                )?;
+                Ok(EffectCompletionBoundary::Provider)
+            }
+            (
+                PersistedCompletionStage::Reconciliation,
+                PersistedCompletionProvenance::ReconciliationHeadProviderRejected,
+                Some(observed_at),
+            ) => {
+                Self::validate_persisted_completion(
+                    clock,
+                    completion,
+                    PersistedCompletionStage::Reconciliation,
+                    PersistedCompletionProvenance::ReconciliationHeadProviderRejected,
+                    execution_started_at,
+                    Some(observed_at),
+                )?;
+                Ok(EffectCompletionBoundary::Reconciliation)
+            }
+            _ => Err(BrokerError::DurableProjectionRecoveryRequired),
+        }
+    }
+
+    fn validate_persisted_completion(
+        clock: &EffectAuthorityClock,
+        completion: PersistedCompletionPoint,
+        stage: PersistedCompletionStage,
+        provenance: PersistedCompletionProvenance,
+        execution_started_at: DateTime<Utc>,
+        fact_at: Option<DateTime<Utc>>,
+    ) -> Result<(), BrokerError> {
+        if completion.stage() != stage || completion.provenance() != provenance {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        clock.validate_persisted_completion(completion.operation_at())?;
+        if completion.operation_at() < execution_started_at
+            || fact_at.is_some_and(|fact_at| completion.operation_at() < fact_at)
+        {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        Ok(())
     }
 
     pub fn reconcile_uncertain(
@@ -1815,7 +2817,9 @@ impl EffectBroker {
         let authority = EffectCompletionAuthority::new(entry_at);
         let mut clock = match EffectAuthorityClock::system(entry_at) {
             Ok(clock) => clock,
-            Err(error) => return Err(AuthorityBoundBrokerError::new(error, authority)),
+            Err(error) => {
+                return Err(AuthorityBoundBrokerError::new(error, authority, false));
+            }
         };
         self.reconcile_uncertain_with_clock(
             mission,
@@ -1837,7 +2841,8 @@ impl EffectBroker {
         clock: &mut EffectAuthorityClock,
     ) -> Result<AuthorityBoundBrokerResult, AuthorityBoundBrokerError> {
         let mut authority = EffectCompletionAuthority::new(clock.entry_at());
-        match self.reconcile_uncertain_inner(ReconcileUncertainFlow {
+        let mut projection_committed = false;
+        let outcome = self.reconcile_uncertain_inner(ReconcileUncertainFlow {
             mission,
             effect_id,
             infrastructure,
@@ -1845,9 +2850,19 @@ impl EffectBroker {
             verifier,
             clock,
             authority: &mut authority,
-        }) {
-            Ok(result) => Ok(AuthorityBoundBrokerResult { result, authority }),
-            Err(error) => Err(AuthorityBoundBrokerError::new(error, authority)),
+            projection_committed: &mut projection_committed,
+        });
+        match outcome {
+            Ok(result) => Ok(AuthorityBoundBrokerResult {
+                result,
+                authority,
+                projection_committed,
+            }),
+            Err(error) => Err(AuthorityBoundBrokerError::new(
+                error,
+                authority,
+                projection_committed,
+            )),
         }
     }
 
@@ -1878,8 +2893,20 @@ impl EffectBroker {
                 execution_started_at,
             } => (lease, execution_started_at),
             ReconciliationClaim::Resolved(claim) => {
-                let ResolvedLedgerClaim::Acquired { .. } = Self::resolve_ledger_claim(claim)?;
-                return Err(BrokerError::ReconciliationNotRequired);
+                return match Self::resolve_ledger_claim(*claim)? {
+                    ResolvedLedgerClaim::Acquired { .. }
+                    | ResolvedLedgerClaim::RecoverableReceipt { .. } => {
+                        Err(BrokerError::ReconciliationNotRequired)
+                    }
+                    claim => Self::complete_persisted_recovery(
+                        flow.mission,
+                        flow.effect_id,
+                        &*flow.clock,
+                        flow.authority,
+                        flow.projection_committed,
+                        claim,
+                    ),
+                };
             }
             ReconciliationClaim::NotReady { retry_at } => {
                 return Err(BrokerError::ReconciliationNotReady { retry_at });
@@ -1893,12 +2920,13 @@ impl EffectBroker {
         let reconciliation_sample = flow
             .clock
             .sample_post_external_call(flow.authority.sampling_floor())?;
+        let reconciliation_operation_at = reconciliation_sample.operation_at;
         observation.validate_for(&effect, execution_started_at)?;
         let disposition = flow.infrastructure.record_reconciliation(
             &effect,
             &lease,
             &observation,
-            reconciliation_sample.operation_at,
+            reconciliation_operation_at,
         )?;
         flow.authority.accept(
             EffectCompletionBoundary::Reconciliation,
@@ -1911,12 +2939,14 @@ impl EffectBroker {
             verifier,
             clock,
             authority,
+            projection_committed,
             reconciler: _,
         } = flow;
         let mut timing = ReconciliationCompletionTiming {
             clock,
             authority,
-            reconciliation_at: reconciliation_sample.operation_at,
+            projection_committed,
+            reconciliation_at: reconciliation_operation_at,
         };
         Self::finish_reconciliation(
             mission,
@@ -1961,12 +2991,15 @@ impl EffectBroker {
                 execution_started_at,
                 ..
             } => {
-                mission.reconcile_durable_provider_state(
+                let mut candidate = mission.clone();
+                candidate.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::ReconciledNotExecuted,
                     execution_started_at,
                     timing.reconciliation_at,
                 )?;
+                *mission = candidate;
+                *timing.projection_committed = true;
                 Err(BrokerError::ProviderNotExecuted { evidence_digest })
             }
             ReconciliationDisposition::ProviderRejected {
@@ -1974,12 +3007,15 @@ impl EffectBroker {
                 execution_started_at,
                 ..
             } => {
-                mission.reconcile_durable_provider_state(
+                let mut candidate = mission.clone();
+                candidate.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::Rejected,
                     execution_started_at,
                     timing.reconciliation_at,
                 )?;
+                *mission = candidate;
+                *timing.projection_committed = true;
                 Err(BrokerError::ProviderRejected(reason))
             }
             ReconciliationDisposition::RetryScheduled {
@@ -1989,12 +3025,15 @@ impl EffectBroker {
                 execution_started_at,
                 ..
             } => {
-                mission.reconcile_durable_provider_state(
+                let mut candidate = mission.clone();
+                candidate.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::Uncertain,
                     execution_started_at,
                     timing.reconciliation_at,
                 )?;
+                *mission = candidate;
+                *timing.projection_committed = true;
                 Err(BrokerError::ReconciliationStillUncertain {
                     reason,
                     evidence_digest,
@@ -2008,12 +3047,15 @@ impl EffectBroker {
                 execution_started_at,
                 ..
             } => {
-                mission.reconcile_durable_provider_state(
+                let mut candidate = mission.clone();
+                candidate.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::DeadLetter,
                     execution_started_at,
                     timing.reconciliation_at,
                 )?;
+                *mission = candidate;
+                *timing.projection_committed = true;
                 Err(BrokerError::ReconciliationDeadLetter {
                     reason,
                     evidence_digest,
@@ -2037,25 +3079,33 @@ impl EffectBroker {
             receipt,
             execution_started_at,
         } = input;
-        mission.reconcile_durable_receipt(effect_id, receipt.clone(), execution_started_at)?;
-        Self::bind_receipt_projection_at(mission, timing.reconciliation_at);
+        let mut receipt_candidate = mission.clone();
+        receipt_candidate.reconcile_durable_receipt(
+            effect_id,
+            receipt.clone(),
+            execution_started_at,
+        )?;
+        Self::bind_receipt_projection_at(&mut receipt_candidate, timing.reconciliation_at);
+        *mission = receipt_candidate;
+        *timing.projection_committed = true;
         let effect_with_receipt = mission.effect(effect_id)?.clone();
         let verification = verifier.verify(&effect_with_receipt, &receipt);
         let verification_sample = timing
             .clock
             .sample_post_external_call(timing.authority.sampling_floor())?;
+        let verification_operation_at = verification_sample.operation_at;
         let mut candidate = mission.clone();
         candidate.record_verification(effect_id, verification.clone())?;
         infrastructure.record_verification(
             effect,
             &lease,
             &verification,
-            verification_sample.operation_at,
+            verification_operation_at,
         )?;
         timing
             .authority
             .accept(EffectCompletionBoundary::Verification, verification_sample)?;
-        Self::bind_verification_projection_at(&mut candidate, verification_sample.operation_at);
+        Self::bind_verification_projection_at(&mut candidate, verification_operation_at);
         *mission = candidate;
         match verification.status {
             VerificationStatus::Confirmed => Ok(BrokerResult {
@@ -2119,14 +3169,62 @@ impl EffectBroker {
         match claim {
             LedgerClaim::Acquired {
                 lease,
-                receipt,
+                receipt: None,
                 execution_started_at,
             } => Ok(ResolvedLedgerClaim::Acquired {
                 lease,
-                receipt,
                 execution_started_at,
             }),
-            LedgerClaim::AlreadyVerified { .. }
+            LedgerClaim::RecoverableReceipt {
+                lease,
+                receipt,
+                execution_started_at,
+                completion,
+            } => Ok(ResolvedLedgerClaim::RecoverableReceipt {
+                lease,
+                receipt,
+                execution_started_at,
+                completion,
+            }),
+            LedgerClaim::RecoverableProviderRejected {
+                reason,
+                observed_at,
+                execution_started_at,
+                completion,
+            } => Ok(ResolvedLedgerClaim::RecoverableProviderRejected {
+                reason,
+                observed_at,
+                execution_started_at,
+                completion,
+            }),
+            LedgerClaim::RecoverableReconciledNotExecuted {
+                evidence_digest,
+                observed_at,
+                execution_started_at,
+                completion,
+            } => Ok(ResolvedLedgerClaim::RecoverableReconciledNotExecuted {
+                evidence_digest,
+                observed_at,
+                execution_started_at,
+                completion,
+            }),
+            LedgerClaim::RecoverableVerification {
+                receipt,
+                verification,
+                execution_started_at,
+                receipt_completion,
+                completion,
+            } => Ok(ResolvedLedgerClaim::RecoverableVerification {
+                receipt,
+                verification,
+                execution_started_at,
+                receipt_completion,
+                completion,
+            }),
+            LedgerClaim::Acquired {
+                receipt: Some(_), ..
+            }
+            | LedgerClaim::AlreadyVerified { .. }
             | LedgerClaim::DurableVerification { .. }
             | LedgerClaim::ProviderRejected { .. }
             | LedgerClaim::Uncertain { .. }
@@ -2518,6 +3616,8 @@ mod tests {
         failed_operation_at: Option<DateTime<Utc>>,
         uncertain_operation_at: Option<DateTime<Utc>>,
         reconciliation_operation_at: Option<DateTime<Utc>>,
+        reconciliation_observed_at: Option<DateTime<Utc>>,
+        verification_write_calls: usize,
     }
 
     impl TestLedger {
@@ -2590,6 +3690,77 @@ mod tests {
                 execution_started_at,
             })
         }
+
+        fn existing_execution_claim(&self, now: DateTime<Utc>) -> Option<LedgerClaim> {
+            if let Some(claim) = &self.reconciliation_terminal {
+                return Some(claim.clone());
+            }
+            if let (Some(receipt), Some(verification)) = (&self.receipt, &self.verification) {
+                if let Some(operation_at) = self.verification_operation_at {
+                    let receipt_completion = self
+                        .reconciliation_operation_at
+                        .filter(|reconciliation_at| {
+                            self.receipt_operation_at == Some(*reconciliation_at)
+                        })
+                        .map(PersistedCompletionPoint::reconciliation_head_receipt_found);
+                    return Some(LedgerClaim::RecoverableVerification {
+                        receipt: receipt.clone(),
+                        verification: verification.clone(),
+                        execution_started_at: self.execution_started_at.unwrap_or(now),
+                        receipt_completion,
+                        completion: PersistedCompletionPoint::effect_idempotency_verification(
+                            operation_at,
+                        ),
+                    });
+                }
+                return Some(match verification.status {
+                    VerificationStatus::Confirmed => LedgerClaim::AlreadyVerified {
+                        receipt: receipt.clone(),
+                        verification: verification.clone(),
+                        execution_started_at: self.execution_started_at.unwrap_or(now),
+                    },
+                    VerificationStatus::Rejected | VerificationStatus::Inconclusive => {
+                        LedgerClaim::DurableVerification {
+                            receipt: receipt.clone(),
+                            verification: verification.clone(),
+                            execution_started_at: self.execution_started_at.unwrap_or(now),
+                        }
+                    }
+                });
+            }
+            if let Some(reason) = &self.rejected {
+                if let Some(operation_at) = self.failed_operation_at {
+                    let reconciled = self.reconciliation_operation_at == Some(operation_at);
+                    return Some(LedgerClaim::RecoverableProviderRejected {
+                        reason: reason.clone(),
+                        observed_at: reconciled
+                            .then_some(self.reconciliation_observed_at.unwrap_or(operation_at)),
+                        execution_started_at: self.execution_started_at.unwrap_or(now),
+                        completion: if reconciled {
+                            PersistedCompletionPoint::reconciliation_head_provider_rejected(
+                                operation_at,
+                            )
+                        } else {
+                            PersistedCompletionPoint::effect_idempotency_provider_rejected(
+                                operation_at,
+                            )
+                        },
+                    });
+                }
+                return Some(LedgerClaim::ProviderRejected {
+                    reason: reason.clone(),
+                    execution_started_at: self.execution_started_at.unwrap_or(now),
+                    recorded_at: now,
+                });
+            }
+            self.uncertain
+                .as_ref()
+                .map(|reason| LedgerClaim::Uncertain {
+                    reason: reason.clone(),
+                    execution_started_at: self.execution_started_at.unwrap_or(now),
+                    recorded_at: now,
+                })
+        }
     }
 
     impl DurableEffectLedger for TestLedger {
@@ -2606,38 +3777,8 @@ mod tests {
             } else {
                 self.recovery_probe_calls += 1;
             }
-            if let Some(claim) = &self.reconciliation_terminal {
-                return Ok(claim.clone());
-            }
-            if let (Some(receipt), Some(verification)) = (&self.receipt, &self.verification) {
-                return Ok(match verification.status {
-                    VerificationStatus::Confirmed => LedgerClaim::AlreadyVerified {
-                        receipt: receipt.clone(),
-                        verification: verification.clone(),
-                        execution_started_at: self.execution_started_at.unwrap_or(now),
-                    },
-                    VerificationStatus::Rejected | VerificationStatus::Inconclusive => {
-                        LedgerClaim::DurableVerification {
-                            receipt: receipt.clone(),
-                            verification: verification.clone(),
-                            execution_started_at: self.execution_started_at.unwrap_or(now),
-                        }
-                    }
-                });
-            }
-            if let Some(reason) = &self.rejected {
-                return Ok(LedgerClaim::ProviderRejected {
-                    reason: reason.clone(),
-                    execution_started_at: self.execution_started_at.unwrap_or(now),
-                    recorded_at: now,
-                });
-            }
-            if let Some(reason) = &self.uncertain {
-                return Ok(LedgerClaim::Uncertain {
-                    reason: reason.clone(),
-                    execution_started_at: self.execution_started_at.unwrap_or(now),
-                    recorded_at: now,
-                });
+            if let Some(claim) = self.existing_execution_claim(now) {
+                return Ok(claim);
             }
             if self.receipt.is_none() && context.is_none() {
                 return Ok(LedgerClaim::AuthorizationRequired);
@@ -2651,16 +3792,33 @@ mod tests {
                 }
                 self.execution_started_at = Some(now);
             }
-            Ok(LedgerClaim::Acquired {
-                lease: ExecutionLease {
-                    attempt_id: ExecutionAttemptId::from("attempt-1"),
-                    owner: owner.into(),
-                    generation: 1,
-                    expires_at: lease_expires_at,
-                },
-                receipt: self.receipt.clone(),
-                execution_started_at: self.execution_started_at.unwrap_or(now),
-            })
+            let lease = ExecutionLease {
+                attempt_id: ExecutionAttemptId::from("attempt-1"),
+                owner: owner.into(),
+                generation: 1,
+                expires_at: lease_expires_at,
+            };
+            let execution_started_at = self.execution_started_at.unwrap_or(now);
+            match (&self.receipt, self.receipt_operation_at) {
+                (Some(receipt), Some(operation_at)) => {
+                    let completion = if self.reconciliation_operation_at == Some(operation_at) {
+                        PersistedCompletionPoint::reconciliation_head_receipt_found(operation_at)
+                    } else {
+                        PersistedCompletionPoint::effect_idempotency_provider_receipt(operation_at)
+                    };
+                    Ok(LedgerClaim::RecoverableReceipt {
+                        lease,
+                        receipt: receipt.clone(),
+                        execution_started_at,
+                        completion,
+                    })
+                }
+                _ => Ok(LedgerClaim::Acquired {
+                    lease,
+                    receipt: self.receipt.clone(),
+                    execution_started_at,
+                }),
+            }
         }
 
         fn record_receipt(
@@ -2683,6 +3841,7 @@ mod tests {
             verification: &Verification,
             operation_at: DateTime<Utc>,
         ) -> Result<(), LedgerError> {
+            self.verification_write_calls += 1;
             self.require_execution_completion_live(lease, operation_at)?;
             self.verification = Some(verification.clone());
             self.verification_operation_at = Some(operation_at);
@@ -2725,7 +3884,50 @@ mod tests {
         ) -> Result<ReconciliationClaim, LedgerError> {
             policy.validate()?;
             if let Some(claim) = &self.reconciliation_terminal {
-                return Ok(ReconciliationClaim::Resolved(claim.clone()));
+                return Ok(ReconciliationClaim::Resolved(Box::new(claim.clone())));
+            }
+            if let (Some(receipt), Some(verification), Some(operation_at)) = (
+                &self.receipt,
+                &self.verification,
+                self.verification_operation_at,
+            ) {
+                let receipt_completion = self
+                    .reconciliation_operation_at
+                    .filter(|reconciliation_at| {
+                        self.receipt_operation_at == Some(*reconciliation_at)
+                    })
+                    .map(PersistedCompletionPoint::reconciliation_head_receipt_found);
+                return Ok(ReconciliationClaim::Resolved(Box::new(
+                    LedgerClaim::RecoverableVerification {
+                        receipt: receipt.clone(),
+                        verification: verification.clone(),
+                        execution_started_at: self.execution_started_at.unwrap_or(now),
+                        receipt_completion,
+                        completion: PersistedCompletionPoint::effect_idempotency_verification(
+                            operation_at,
+                        ),
+                    },
+                )));
+            }
+            if let (Some(reason), Some(operation_at)) = (&self.rejected, self.failed_operation_at) {
+                let reconciled = self.reconciliation_operation_at == Some(operation_at);
+                return Ok(ReconciliationClaim::Resolved(Box::new(
+                    LedgerClaim::RecoverableProviderRejected {
+                        reason: reason.clone(),
+                        observed_at: reconciled
+                            .then_some(self.reconciliation_observed_at.unwrap_or(operation_at)),
+                        execution_started_at: self.execution_started_at.unwrap_or(now),
+                        completion: if reconciled {
+                            PersistedCompletionPoint::reconciliation_head_provider_rejected(
+                                operation_at,
+                            )
+                        } else {
+                            PersistedCompletionPoint::effect_idempotency_provider_rejected(
+                                operation_at,
+                            )
+                        },
+                    },
+                )));
             }
             if self.uncertain.is_none() {
                 return Ok(ReconciliationClaim::NotRequired);
@@ -2790,9 +3992,11 @@ mod tests {
                 return Err(LedgerError::LeaseLost);
             }
             self.reconciliation_operation_at = Some(now);
+            self.reconciliation_observed_at = Some(observation.observed_at());
             let disposition = match observation {
                 ReconciliationObservation::ReceiptFound { receipt, .. } => {
                     self.receipt = Some(receipt.clone());
+                    self.receipt_operation_at = Some(now);
                     self.uncertain = None;
                     ReconciliationDisposition::ReceiptReadyForVerification {
                         lease: ExecutionLease {
@@ -2812,10 +4016,11 @@ mod tests {
                     evidence_digest,
                     observed_at,
                 } => {
-                    let claim = LedgerClaim::ReconciledNotExecuted {
+                    let claim = LedgerClaim::RecoverableReconciledNotExecuted {
                         evidence_digest: evidence_digest.clone(),
                         observed_at: *observed_at,
                         execution_started_at,
+                        completion: PersistedCompletionPoint::reconciliation_head_not_executed(now),
                     };
                     self.reconciliation_terminal = Some(claim);
                     ReconciliationDisposition::ReconciledNotExecuted {
@@ -2830,6 +4035,7 @@ mod tests {
                     observed_at,
                 } => {
                     self.rejected = Some(reason.clone());
+                    self.failed_operation_at = Some(now);
                     self.uncertain = None;
                     ReconciliationDisposition::ProviderRejected {
                         reason: reason.clone(),
@@ -3003,6 +4209,7 @@ mod tests {
     }
 
     struct ProbeVerifier {
+        calls: usize,
         sample_calls: Rc<Cell<usize>>,
         expected_sample_calls: usize,
         verification: Verification,
@@ -3010,12 +4217,14 @@ mod tests {
 
     impl EffectVerifier for ProbeVerifier {
         fn verify(&mut self, _effect: &Effect, _receipt: &Receipt) -> Verification {
+            self.calls += 1;
             assert_eq!(self.sample_calls.get(), self.expected_sample_calls);
             self.verification.clone()
         }
     }
 
     struct ProbeReconciler {
+        calls: usize,
         sample_calls: Rc<Cell<usize>>,
         expected_sample_calls: usize,
         observation: ReconciliationObservation,
@@ -3023,6 +4232,7 @@ mod tests {
 
     impl EffectReconciler for ProbeReconciler {
         fn reconcile(&mut self, _effect: &Effect) -> ReconciliationObservation {
+            self.calls += 1;
             assert_eq!(self.sample_calls.get(), self.expected_sample_calls);
             self.observation.clone()
         }
@@ -3033,8 +4243,20 @@ mod tests {
         samples: impl IntoIterator<Item = DateTime<Utc>>,
         calls: Rc<Cell<usize>>,
     ) -> EffectAuthorityClock {
+        let samples = samples.into_iter().collect::<VecDeque<_>>();
+        let history_not_after = samples.iter().copied().max().unwrap_or(entry_at);
+        scripted_clock_with_history_ceiling(entry_at, history_not_after, samples, calls)
+    }
+
+    fn scripted_clock_with_history_ceiling(
+        entry_at: DateTime<Utc>,
+        history_not_after: DateTime<Utc>,
+        samples: impl IntoIterator<Item = DateTime<Utc>>,
+        calls: Rc<Cell<usize>>,
+    ) -> EffectAuthorityClock {
         EffectAuthorityClock::from_test_source(
             entry_at,
+            history_not_after,
             ScriptedAuthorityTimeSource {
                 samples: samples.into_iter().collect(),
                 calls,
@@ -3436,34 +4658,56 @@ mod tests {
             id: ReceiptId::from("recovered-receipt"),
             provider: effect.provider.clone(),
             external_id: "recovered-publication".into(),
-            accepted_at: now(),
+            accepted_at: now() + Duration::seconds(1),
             request_digest: effect.approval_digest(),
             response_digest: "f".repeat(64),
         });
+        ledger.receipt_operation_at = Some(now() + Duration::seconds(2));
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(now(), [now() + Duration::seconds(3)], Rc::clone(&calls));
         let mut executor = CountingExecutor::default();
-        let mut verifier = ConfirmingVerifier;
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
 
-        let result = broker
-            .execute_and_verify(
+        let bound = broker
+            .execute_and_verify_with_clock(
                 &mut mission,
                 &effect_id,
                 &mut ledger,
                 &mut executor,
                 &mut verifier,
-                now() + Duration::seconds(61),
+                &mut clock,
             )
             .expect("durable receipt resumes verification after approval expiry");
+        assert!(bound.projection_committed());
+        let (result, authority) = bound.into_parts();
 
         assert_eq!(
             result.disposition,
             ExecutionDisposition::ReusedIdempotentReceipt
         );
-        assert_eq!(executor.calls, 0);
+        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
         assert_eq!(ledger.recovery_probe_calls, 1);
         assert_eq!(ledger.authorized_claim_calls, 0);
         assert_eq!(
             mission.effect(&effect_id).expect("effect").status,
             EffectStatus::Verified
+        );
+        assert_eq!(
+            authority.provider(),
+            Some(EffectCompletionPoint {
+                sequence: 1,
+                operation_at: now() + Duration::seconds(2),
+            })
+        );
+        assert_eq!(
+            authority.verification(),
+            Some(EffectCompletionPoint {
+                sequence: 2,
+                operation_at: now() + Duration::seconds(3),
+            })
         );
     }
 
@@ -3707,162 +4951,157 @@ mod tests {
 
     #[test]
     fn existing_receipt_resume_commits_only_after_verification_cas_and_authority_accept() {
-        for status in [
-            VerificationStatus::Confirmed,
-            VerificationStatus::Rejected,
-            VerificationStatus::Inconclusive,
+        for history in [
+            RecoverableReceiptHistory::Provider,
+            RecoverableReceiptHistory::Reconciliation,
         ] {
-            let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
-            let effect = mission.effect(&effect_id).expect("effect").clone();
-            let receipt = durable_receipt(&effect, "resume-status-receipt");
-            ledger.execution_started_at = Some(now());
-            ledger.receipt = Some(receipt);
-            ledger.enforce_completion_fence = true;
-            let completion_at = now() + Duration::seconds(3);
-            let calls = Rc::new(Cell::new(0));
-            let mut clock = scripted_clock(now(), [completion_at], Rc::clone(&calls));
-            let mut executor = CountingExecutor::default();
-            let mut verifier = CountingVerifier {
-                calls: 0,
-                status: status.clone(),
-            };
-
-            let bound = broker.execute_and_verify_with_clock(
-                &mut mission,
-                &effect_id,
-                &mut ledger,
-                &mut executor,
-                &mut verifier,
-                &mut clock,
-            );
-            let authority = match &status {
-                VerificationStatus::Confirmed => bound.expect("confirmed resume").authority,
-                VerificationStatus::Rejected => {
-                    let error = bound.expect_err("rejected resume");
-                    assert_eq!(error.error(), &BrokerError::VerificationRejected);
-                    *error.authority()
+            for status in [
+                VerificationStatus::Confirmed,
+                VerificationStatus::Rejected,
+                VerificationStatus::Inconclusive,
+            ] {
+                let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+                let effect = mission.effect(&effect_id).expect("effect").clone();
+                let receipt = durable_receipt(&effect, "resume-status-receipt");
+                ledger.execution_started_at = Some(now());
+                ledger.receipt = Some(receipt);
+                ledger.receipt_operation_at = Some(now() + Duration::seconds(2));
+                if matches!(history, RecoverableReceiptHistory::Reconciliation) {
+                    ledger.reconciliation_operation_at = ledger.receipt_operation_at;
                 }
-                VerificationStatus::Inconclusive => {
-                    let error = bound.expect_err("inconclusive resume");
-                    assert_eq!(error.error(), &BrokerError::VerificationInconclusive);
-                    *error.authority()
-                }
-            };
-            let expected_status = match status {
-                VerificationStatus::Confirmed => EffectStatus::Verified,
-                VerificationStatus::Rejected => EffectStatus::Failed,
-                VerificationStatus::Inconclusive => EffectStatus::VerificationRequired,
-            };
+                ledger.enforce_completion_fence = true;
+                let completion_at = now() + Duration::seconds(3);
+                let calls = Rc::new(Cell::new(0));
+                let mut clock = scripted_clock(now(), [completion_at], Rc::clone(&calls));
+                let mut executor = CountingExecutor::default();
+                let mut verifier = CountingVerifier {
+                    calls: 0,
+                    status: status.clone(),
+                };
 
-            assert_eq!(
-                mission.effect(&effect_id).expect("effect").status,
-                expected_status
-            );
-            assert_eq!(mission.updated_at, completion_at);
-            assert!(authority.provider().is_none());
-            assert_eq!(
-                authority.verification().expect("verification authority"),
-                EffectCompletionPoint {
+                let bound = broker.execute_and_verify_with_clock(
+                    &mut mission,
+                    &effect_id,
+                    &mut ledger,
+                    &mut executor,
+                    &mut verifier,
+                    &mut clock,
+                );
+                let authority = match &status {
+                    VerificationStatus::Confirmed => {
+                        let bound = bound.expect("confirmed resume");
+                        assert!(bound.projection_committed());
+                        bound.authority
+                    }
+                    VerificationStatus::Rejected => {
+                        let error = bound.expect_err("rejected resume");
+                        assert_eq!(error.error(), &BrokerError::VerificationRejected);
+                        assert!(error.projection_committed());
+                        *error.authority()
+                    }
+                    VerificationStatus::Inconclusive => {
+                        let error = bound.expect_err("inconclusive resume");
+                        assert_eq!(error.error(), &BrokerError::VerificationInconclusive);
+                        assert!(error.projection_committed());
+                        *error.authority()
+                    }
+                };
+                let expected_status = match status {
+                    VerificationStatus::Confirmed => EffectStatus::Verified,
+                    VerificationStatus::Rejected => EffectStatus::Failed,
+                    VerificationStatus::Inconclusive => EffectStatus::VerificationRequired,
+                };
+
+                assert_eq!(
+                    mission.effect(&effect_id).expect("effect").status,
+                    expected_status
+                );
+                assert_eq!(mission.updated_at, completion_at);
+                let history_point = EffectCompletionPoint {
                     sequence: 1,
-                    operation_at: completion_at,
+                    operation_at: now() + Duration::seconds(2),
+                };
+                match history {
+                    RecoverableReceiptHistory::Provider => {
+                        assert_eq!(authority.provider(), Some(history_point));
+                        assert!(authority.reconciliation().is_none());
+                    }
+                    RecoverableReceiptHistory::Reconciliation => {
+                        assert!(authority.provider().is_none());
+                        assert_eq!(authority.reconciliation(), Some(history_point));
+                    }
                 }
-            );
-            assert_eq!(ledger.verification_operation_at, Some(completion_at));
-            assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
+                assert_eq!(
+                    authority.verification().expect("verification authority"),
+                    EffectCompletionPoint {
+                        sequence: 2,
+                        operation_at: completion_at,
+                    }
+                );
+                assert_eq!(ledger.verification_operation_at, Some(completion_at));
+                assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
+            }
         }
     }
 
-    fn assert_existing_receipt_sample_failure_preserves_mission() {
-        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
-        let effect = mission.effect(&effect_id).expect("effect").clone();
-        ledger.execution_started_at = Some(now());
-        ledger.receipt = Some(durable_receipt(&effect, "resume-sample-failure"));
-        let mission_before = mission.clone();
-        let calls = Rc::new(Cell::new(0));
-        let mut clock = scripted_clock(now(), [], Rc::clone(&calls));
-        let mut executor = CountingExecutor::default();
-        let mut verifier = CountingVerifier {
-            calls: 0,
-            status: VerificationStatus::Confirmed,
-        };
-        let sample_error = broker
-            .execute_and_verify_with_clock(
-                &mut mission,
-                &effect_id,
-                &mut ledger,
-                &mut executor,
-                &mut verifier,
-                &mut clock,
-            )
-            .expect_err("missing post-verifier sample");
-
-        assert_eq!(sample_error.error(), &BrokerError::InvalidAuthorityClock);
-        assert!(sample_error.authority().latest_accepted().is_none());
-        assert_eq!(mission, mission_before);
-        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
-        assert!(ledger.verification.is_none());
+    #[derive(Clone, Copy, Debug)]
+    enum RecoverableReceiptHistory {
+        Provider,
+        Reconciliation,
     }
 
-    fn assert_existing_receipt_cas_failure_preserves_mission() {
+    #[derive(Clone, Copy, Debug)]
+    enum RecoverableReceiptFailure {
+        Sample,
+        LedgerCas,
+        VerificationAccept,
+    }
+
+    fn assert_recoverable_receipt_failure_is_projection_atomic(
+        history: RecoverableReceiptHistory,
+        failure: RecoverableReceiptFailure,
+    ) {
         let (mut mission, effect_id, broker, mut ledger) = approved_mission();
-        let mut broker = broker.with_lease_for(Duration::seconds(5));
+        let mut broker = if matches!(failure, RecoverableReceiptFailure::LedgerCas) {
+            broker.with_lease_for(Duration::seconds(5))
+        } else {
+            broker
+        };
         let effect = mission.effect(&effect_id).expect("effect").clone();
         ledger.execution_started_at = Some(now());
-        ledger.receipt = Some(durable_receipt(&effect, "resume-cas-failure"));
+        ledger.receipt = Some(durable_receipt(&effect, "recoverable-receipt-failure"));
+        ledger.receipt_operation_at = Some(now() + Duration::seconds(2));
+        if matches!(history, RecoverableReceiptHistory::Reconciliation) {
+            ledger.reconciliation_operation_at = ledger.receipt_operation_at;
+        }
         ledger.enforce_completion_fence = true;
         let mission_before = mission.clone();
         let calls = Rc::new(Cell::new(0));
-        let mut clock = scripted_clock(now(), [now() + Duration::seconds(5)], Rc::clone(&calls));
-        let mut executor = CountingExecutor::default();
-        let mut verifier = CountingVerifier {
-            calls: 0,
-            status: VerificationStatus::Confirmed,
+        let samples = match failure {
+            RecoverableReceiptFailure::Sample => Vec::new(),
+            RecoverableReceiptFailure::LedgerCas => vec![now() + Duration::seconds(5)],
+            RecoverableReceiptFailure::VerificationAccept => {
+                vec![now() + Duration::seconds(3)]
+            }
         };
-        let cas_error = broker
-            .execute_and_verify_with_clock(
-                &mut mission,
-                &effect_id,
-                &mut ledger,
-                &mut executor,
-                &mut verifier,
-                &mut clock,
-            )
-            .expect_err("strict lease equality rejects verification CAS");
-
-        assert_eq!(
-            cas_error.error(),
-            &BrokerError::Ledger(LedgerError::LeaseLost)
+        let mut clock = scripted_clock_with_history_ceiling(
+            now(),
+            now() + Duration::seconds(3),
+            samples,
+            Rc::clone(&calls),
         );
-        assert!(cas_error.authority().latest_accepted().is_none());
-        assert_eq!(mission, mission_before);
-        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
-        assert!(ledger.verification.is_none());
-    }
-
-    fn assert_existing_receipt_accept_failure_preserves_mission() {
-        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
-        let effect = mission.effect(&effect_id).expect("effect").clone();
-        ledger.execution_started_at = Some(now());
-        ledger.receipt = Some(durable_receipt(&effect, "resume-accept-failure"));
-        let mission_before = mission.clone();
-        let calls = Rc::new(Cell::new(0));
-        let mut clock = scripted_clock(now(), [now() + Duration::seconds(3)], Rc::clone(&calls));
         let mut authority = EffectCompletionAuthority::new(now());
-        authority
-            .accept(
-                EffectCompletionBoundary::Provider,
-                EffectAuthoritySample {
-                    sequence: 1,
-                    operation_at: now() + Duration::seconds(1),
-                },
-            )
-            .expect("artificial previously accepted stage");
+        if matches!(failure, RecoverableReceiptFailure::VerificationAccept) {
+            authority.reject_next_sample_accept = true;
+        }
+        let mut projection_committed = false;
         let mut executor = CountingExecutor::default();
         let mut verifier = CountingVerifier {
             calls: 0,
             status: VerificationStatus::Confirmed,
         };
-        let accept_error = broker
+
+        let error = broker
             .execute_and_verify_inner(ExecuteAndVerifyFlow {
                 mission: &mut mission,
                 effect_id: &effect_id,
@@ -3871,21 +5110,415 @@ mod tests {
                 verifier: &mut verifier,
                 clock: &mut clock,
                 authority: &mut authority,
+                projection_committed: &mut projection_committed,
             })
-            .expect_err("duplicate accepted sequence must fail closed");
+            .expect_err("recoverable Receipt failure must remain projection-atomic");
 
-        assert_eq!(accept_error, BrokerError::InvalidAuthorityClock);
+        let expected_error = if matches!(failure, RecoverableReceiptFailure::LedgerCas) {
+            BrokerError::Ledger(LedgerError::LeaseLost)
+        } else {
+            BrokerError::InvalidAuthorityClock
+        };
+        assert_eq!(error, expected_error);
         assert_eq!(mission, mission_before);
+        assert!(!projection_committed);
+        assert!(authority.latest_accepted().is_none());
         assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
-        assert!(ledger.verification.is_some());
-        assert!(authority.verification().is_none());
+        assert_eq!(
+            ledger.verification.is_some(),
+            matches!(failure, RecoverableReceiptFailure::VerificationAccept)
+        );
+        assert_eq!(
+            ledger.verification_operation_at.is_some(),
+            matches!(failure, RecoverableReceiptFailure::VerificationAccept)
+        );
     }
 
     #[test]
-    fn existing_receipt_resume_preserves_mission_on_sample_cas_and_accept_failure() {
-        assert_existing_receipt_sample_failure_preserves_mission();
-        assert_existing_receipt_cas_failure_preserves_mission();
-        assert_existing_receipt_accept_failure_preserves_mission();
+    fn recoverable_receipt_provider_and_reconciliation_history_fail_atomically() {
+        for history in [
+            RecoverableReceiptHistory::Provider,
+            RecoverableReceiptHistory::Reconciliation,
+        ] {
+            for failure in [
+                RecoverableReceiptFailure::Sample,
+                RecoverableReceiptFailure::LedgerCas,
+                RecoverableReceiptFailure::VerificationAccept,
+            ] {
+                assert_recoverable_receipt_failure_is_projection_atomic(history, failure);
+            }
+        }
+    }
+
+    fn exact_persisted_verification_mission(
+        status: VerificationStatus,
+    ) -> (Mission, EffectId, Receipt, Verification, DateTime<Utc>) {
+        let (mut mission, effect_id, _, _) = approved_mission();
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let receipt = durable_receipt(&effect, "persisted-verification-replay");
+        let verification = durable_verification(&receipt, "persisted-verification-replay", status);
+        mission
+            .reconcile_durable_receipt(&effect_id, receipt.clone(), now())
+            .expect("project persisted Receipt");
+        mission
+            .record_verification(&effect_id, verification.clone())
+            .expect("project persisted Verification");
+        let operation_at = now() + Duration::seconds(3);
+        EffectBroker::bind_verification_projection_at(&mut mission, operation_at);
+        (mission, effect_id, receipt, verification, operation_at)
+    }
+
+    #[test]
+    fn exact_persisted_verification_replay_is_empty_and_time_drift_fails_closed() {
+        for status in [
+            VerificationStatus::Confirmed,
+            VerificationStatus::Rejected,
+            VerificationStatus::Inconclusive,
+        ] {
+            let (mission, effect_id, receipt, verification, operation_at) =
+                exact_persisted_verification_mission(status.clone());
+            for updated_at_drift in [None, Some(-1), Some(1)] {
+                let mut candidate = mission.clone();
+                if let Some(seconds) = updated_at_drift {
+                    candidate.updated_at = operation_at + Duration::seconds(seconds);
+                }
+                let candidate_before = candidate.clone();
+                let calls = Rc::new(Cell::new(0));
+                let clock = scripted_clock(now() + Duration::seconds(4), [], Rc::clone(&calls));
+                let mut authority = EffectCompletionAuthority::new(now() + Duration::seconds(4));
+                let mut projection_committed = false;
+                let outcome = EffectBroker::complete_persisted_verification(
+                    &mut candidate,
+                    &effect_id,
+                    &clock,
+                    &mut authority,
+                    &mut projection_committed,
+                    PersistedVerificationRecovery {
+                        receipt: receipt.clone(),
+                        verification: verification.clone(),
+                        execution_started_at: now(),
+                        receipt_completion: None,
+                        completion: PersistedCompletionPoint::effect_idempotency_verification(
+                            operation_at,
+                        ),
+                    },
+                );
+
+                if updated_at_drift.is_some() {
+                    assert_eq!(outcome, Err(BrokerError::DurableProjectionRecoveryRequired));
+                } else {
+                    match status {
+                        VerificationStatus::Confirmed => {
+                            assert!(outcome.is_ok());
+                        }
+                        VerificationStatus::Rejected => {
+                            assert_eq!(outcome, Err(BrokerError::VerificationRejected));
+                        }
+                        VerificationStatus::Inconclusive => {
+                            assert_eq!(outcome, Err(BrokerError::VerificationInconclusive));
+                        }
+                    }
+                }
+                assert_eq!(candidate, candidate_before);
+                assert!(!projection_committed);
+                assert!(authority.latest_accepted().is_none());
+                assert_eq!(calls.get(), 0);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PersistedVerificationProvenanceTamper {
+        ExecutionAfterReceipt,
+        ExecutionBeforeApproval,
+        ExecutionAtApprovalExpiry,
+        ExecutionAtEffectExpiry,
+        ApprovalScope,
+        ApprovalPermissionDigest,
+        ReceiptProvider,
+        ReceiptExternalId,
+        ReceiptRequestDigest,
+        ReceiptResponseDigest,
+        VerificationReceiptId,
+    }
+
+    fn apply_persisted_verification_provenance_tamper(
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        receipt: &mut Receipt,
+        verification: &mut Verification,
+        execution_started_at: &mut DateTime<Utc>,
+        tamper: PersistedVerificationProvenanceTamper,
+    ) {
+        match tamper {
+            PersistedVerificationProvenanceTamper::ExecutionAfterReceipt => {
+                *execution_started_at = receipt.accepted_at + Duration::seconds(1);
+            }
+            PersistedVerificationProvenanceTamper::ExecutionBeforeApproval => {
+                *execution_started_at = mission
+                    .effect(effect_id)
+                    .expect("effect")
+                    .approval
+                    .as_ref()
+                    .expect("approval")
+                    .decided_at
+                    - Duration::seconds(1);
+            }
+            PersistedVerificationProvenanceTamper::ExecutionAtApprovalExpiry => {
+                *execution_started_at = mission
+                    .effect(effect_id)
+                    .expect("effect")
+                    .approval
+                    .as_ref()
+                    .expect("approval")
+                    .valid_until;
+            }
+            PersistedVerificationProvenanceTamper::ExecutionAtEffectExpiry => {
+                *execution_started_at = mission.effect(effect_id).expect("effect").expires_at;
+            }
+            PersistedVerificationProvenanceTamper::ApprovalScope => {
+                mission
+                    .effects
+                    .iter_mut()
+                    .find(|effect| &effect.id == effect_id)
+                    .expect("effect")
+                    .approval
+                    .as_mut()
+                    .expect("approval")
+                    .scope_digest = "0".repeat(64);
+            }
+            PersistedVerificationProvenanceTamper::ApprovalPermissionDigest => {
+                mission
+                    .effects
+                    .iter_mut()
+                    .find(|effect| &effect.id == effect_id)
+                    .expect("effect")
+                    .approval
+                    .as_mut()
+                    .expect("approval")
+                    .permission_digest = "not-a-digest".into();
+            }
+            PersistedVerificationProvenanceTamper::ReceiptProvider => {
+                receipt.provider = "other-provider".into();
+            }
+            PersistedVerificationProvenanceTamper::ReceiptExternalId => {
+                receipt.external_id = "   ".into();
+            }
+            PersistedVerificationProvenanceTamper::ReceiptRequestDigest => {
+                receipt.request_digest = "1".repeat(64);
+            }
+            PersistedVerificationProvenanceTamper::ReceiptResponseDigest => {
+                receipt.response_digest = "not-a-digest".into();
+            }
+            PersistedVerificationProvenanceTamper::VerificationReceiptId => {
+                verification.receipt_id = ReceiptId::from("different-receipt");
+            }
+        }
+    }
+
+    fn assert_persisted_verification_provenance_tamper_fails_closed(
+        status: VerificationStatus,
+        tamper: PersistedVerificationProvenanceTamper,
+    ) {
+        let (mut mission, effect_id, mut receipt, mut verification, operation_at) =
+            exact_persisted_verification_mission(status);
+        let mut execution_started_at = now();
+        apply_persisted_verification_provenance_tamper(
+            &mut mission,
+            &effect_id,
+            &mut receipt,
+            &mut verification,
+            &mut execution_started_at,
+            tamper,
+        );
+        {
+            let effect = mission
+                .effects
+                .iter_mut()
+                .find(|effect| effect.id == effect_id)
+                .expect("effect");
+            effect.receipt = Some(receipt.clone());
+            effect.verification = Some(verification.clone());
+        }
+        let mission_before = mission.clone();
+        if mission
+            .effect(&effect_id)
+            .is_ok_and(|effect| effect.status == EffectStatus::Verified)
+        {
+            let calls = Rc::new(Cell::new(0));
+            let clock = scripted_clock(now() + Duration::seconds(4), [], Rc::clone(&calls));
+            let mut authority = EffectCompletionAuthority::new(now() + Duration::seconds(4));
+            let mut projection_committed = false;
+            assert_eq!(
+                EffectBroker::complete_persisted_verification(
+                    &mut mission,
+                    &effect_id,
+                    &clock,
+                    &mut authority,
+                    &mut projection_committed,
+                    PersistedVerificationRecovery {
+                        receipt,
+                        verification,
+                        execution_started_at,
+                        receipt_completion: None,
+                        completion: PersistedCompletionPoint::effect_idempotency_verification(
+                            operation_at,
+                        ),
+                    },
+                ),
+                Err(BrokerError::DurableProjectionRecoveryRequired),
+                "{tamper:?}",
+            );
+            assert_eq!(mission, mission_before, "{tamper:?}");
+            assert!(!projection_committed, "{tamper:?}");
+            assert!(authority.latest_accepted().is_none(), "{tamper:?}");
+            assert_eq!(calls.get(), 0, "{tamper:?}");
+            return;
+        }
+        let mut ledger = TestLedger {
+            receipt: Some(receipt),
+            verification: Some(verification),
+            execution_started_at: Some(execution_started_at),
+            verification_operation_at: Some(operation_at),
+            ..TestLedger::default()
+        };
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(now() + Duration::seconds(4), [], Rc::clone(&calls));
+        let mut broker = broker();
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+
+        let error = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect_err("invalid persisted provenance must fail closed");
+
+        assert_eq!(
+            error.error(),
+            &BrokerError::DurableProjectionRecoveryRequired,
+            "{tamper:?}",
+        );
+        assert!(!error.projection_committed(), "{tamper:?}");
+        assert!(error.authority().latest_accepted().is_none(), "{tamper:?}");
+        assert_eq!(mission, mission_before, "{tamper:?}");
+        assert_eq!(
+            (
+                executor.calls,
+                verifier.calls,
+                calls.get(),
+                ledger.verification_write_calls,
+            ),
+            (0, 0, 0, 0),
+            "{tamper:?}",
+        );
+    }
+
+    #[test]
+    fn persisted_verification_claim_provenance_is_validated_before_exact_replay() {
+        for status in [
+            VerificationStatus::Confirmed,
+            VerificationStatus::Rejected,
+            VerificationStatus::Inconclusive,
+        ] {
+            assert_persisted_verification_provenance_tamper_fails_closed(
+                status,
+                PersistedVerificationProvenanceTamper::ExecutionAfterReceipt,
+            );
+        }
+        for tamper in [
+            PersistedVerificationProvenanceTamper::ExecutionBeforeApproval,
+            PersistedVerificationProvenanceTamper::ExecutionAtApprovalExpiry,
+            PersistedVerificationProvenanceTamper::ExecutionAtEffectExpiry,
+            PersistedVerificationProvenanceTamper::ApprovalScope,
+            PersistedVerificationProvenanceTamper::ApprovalPermissionDigest,
+            PersistedVerificationProvenanceTamper::ReceiptProvider,
+            PersistedVerificationProvenanceTamper::ReceiptExternalId,
+            PersistedVerificationProvenanceTamper::ReceiptRequestDigest,
+            PersistedVerificationProvenanceTamper::ReceiptResponseDigest,
+            PersistedVerificationProvenanceTamper::VerificationReceiptId,
+        ] {
+            assert_persisted_verification_provenance_tamper_fails_closed(
+                VerificationStatus::Confirmed,
+                tamper,
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_provider_terminal_replay_rejects_invalid_execution_provenance() {
+        for state in [
+            DurableProviderState::Rejected,
+            DurableProviderState::ReconciledNotExecuted,
+        ] {
+            let (mut mission, effect_id, _, _) = approved_mission();
+            let projected_at = now() + Duration::seconds(3);
+            mission
+                .reconcile_durable_provider_state(&effect_id, state, now(), projected_at)
+                .expect("exact persisted terminal projection");
+            let mission_before = mission.clone();
+            let invalid_execution_started_at = mission
+                .effect(&effect_id)
+                .expect("effect")
+                .approval
+                .as_ref()
+                .expect("approval")
+                .decided_at
+                - Duration::seconds(1);
+            let claim = match state {
+                DurableProviderState::Rejected => {
+                    ResolvedLedgerClaim::RecoverableProviderRejected {
+                        reason: "stored Provider rejection".into(),
+                        observed_at: None,
+                        execution_started_at: invalid_execution_started_at,
+                        completion: PersistedCompletionPoint::effect_idempotency_provider_rejected(
+                            projected_at,
+                        ),
+                    }
+                }
+                DurableProviderState::ReconciledNotExecuted => {
+                    ResolvedLedgerClaim::RecoverableReconciledNotExecuted {
+                        evidence_digest: "d".repeat(64),
+                        observed_at: projected_at,
+                        execution_started_at: invalid_execution_started_at,
+                        completion: PersistedCompletionPoint::reconciliation_head_not_executed(
+                            projected_at,
+                        ),
+                    }
+                }
+                DurableProviderState::Uncertain | DurableProviderState::DeadLetter => {
+                    unreachable!("test enumerates recoverable terminal states")
+                }
+            };
+            let calls = Rc::new(Cell::new(0));
+            let clock = scripted_clock(now() + Duration::seconds(4), [], Rc::clone(&calls));
+            let mut authority = EffectCompletionAuthority::new(now() + Duration::seconds(4));
+            let mut projection_committed = false;
+
+            assert_eq!(
+                EffectBroker::complete_persisted_recovery(
+                    &mut mission,
+                    &effect_id,
+                    &clock,
+                    &mut authority,
+                    &mut projection_committed,
+                    claim,
+                ),
+                Err(BrokerError::DurableProjectionRecoveryRequired),
+            );
+            assert_eq!(mission, mission_before);
+            assert!(!projection_committed);
+            assert!(authority.latest_accepted().is_none());
+            assert_eq!(calls.get(), 0);
+        }
     }
 
     #[test]
@@ -4157,9 +5790,24 @@ mod tests {
                 &mut verifier,
                 now() + Duration::seconds(2),
             ),
-            Err(BrokerError::DurableProjectionRecoveryRequired)
+            Err(BrokerError::ProviderNotExecuted {
+                evidence_digest: evidence_digest.clone()
+            })
         );
-        assert_eq!(stale_projection, stale_projection_before);
+        assert_ne!(stale_projection, stale_projection_before);
+        assert_eq!(
+            stale_projection
+                .effect(&effect_id)
+                .expect("recovered effect")
+                .status,
+            EffectStatus::Reconciled
+        );
+        assert_eq!(
+            stale_projection.updated_at,
+            ledger
+                .reconciliation_operation_at
+                .expect("persisted reconciliation completion")
+        );
         assert_eq!((executor.calls, reconciler.calls), (1, 1));
     }
 
@@ -4423,7 +6071,7 @@ mod tests {
             .accept(
                 EffectCompletionBoundary::Provider,
                 EffectAuthoritySample {
-                    sequence: 1,
+                    source_ordinal: 1,
                     operation_at: accepted_at,
                 },
             )
@@ -4432,7 +6080,7 @@ mod tests {
             authority.accept(
                 EffectCompletionBoundary::Reconciliation,
                 EffectAuthoritySample {
-                    sequence: 1,
+                    source_ordinal: 1,
                     operation_at: accepted_at,
                 },
             ),
@@ -4442,7 +6090,7 @@ mod tests {
             authority.accept(
                 EffectCompletionBoundary::Reconciliation,
                 EffectAuthoritySample {
-                    sequence: 2,
+                    source_ordinal: 2,
                     operation_at: entry_at,
                 },
             ),
@@ -4452,7 +6100,7 @@ mod tests {
             .accept(
                 EffectCompletionBoundary::Verification,
                 EffectAuthoritySample {
-                    sequence: 2,
+                    source_ordinal: 2,
                     operation_at: accepted_at,
                 },
             )
@@ -4461,7 +6109,7 @@ mod tests {
             .accept(
                 EffectCompletionBoundary::Reconciliation,
                 EffectAuthoritySample {
-                    sequence: 3,
+                    source_ordinal: 3,
                     operation_at: accepted_at,
                 },
             )
@@ -4574,6 +6222,7 @@ mod tests {
             result: Ok(receipt.clone()),
         };
         let mut verifier = ProbeVerifier {
+            calls: 0,
             sample_calls: Rc::clone(&calls),
             expected_sample_calls: 1,
             verification: Verification {
@@ -4746,6 +6395,7 @@ mod tests {
             result: Ok(receipt.clone()),
         };
         let mut verifier = ProbeVerifier {
+            calls: 0,
             sample_calls: Rc::clone(&calls),
             expected_sample_calls: 1,
             verification: Verification {
@@ -4893,6 +6543,7 @@ mod tests {
             response_digest: "1".repeat(64),
         };
         let mut reconciler = ProbeReconciler {
+            calls: 0,
             sample_calls: Rc::clone(&calls),
             expected_sample_calls: 0,
             observation: ReconciliationObservation::ReceiptFound {
@@ -4902,6 +6553,7 @@ mod tests {
             },
         };
         let mut verifier = ProbeVerifier {
+            calls: 0,
             sample_calls: Rc::clone(&calls),
             expected_sample_calls: 1,
             verification: Verification {
@@ -4946,6 +6598,214 @@ mod tests {
         assert_eq!(ledger.reconciliation_operation_at, Some(reconciliation_at));
         assert_eq!(ledger.verification_operation_at, Some(verification_at));
         assert_eq!(mission.updated_at, verification_at);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReconciledReceiptDownstreamFailure {
+        Sample,
+        LedgerCas,
+        Domain,
+        AuthorityAccept,
+    }
+
+    struct ReconciledReceiptFailureFixture {
+        mission: Mission,
+        effect_id: EffectId,
+        broker: EffectBroker,
+        ledger: TestLedger,
+        calls: Rc<Cell<usize>>,
+        clock: EffectAuthorityClock,
+        receipt: Receipt,
+        reconciler: ProbeReconciler,
+        verifier: ProbeVerifier,
+        authority: EffectCompletionAuthority,
+        reconciliation_at: DateTime<Utc>,
+    }
+
+    fn reconciled_receipt_failure_fixture(
+        failure: ReconciledReceiptDownstreamFailure,
+    ) -> ReconciledReceiptFailureFixture {
+        let entry_at = now();
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        ledger.enforce_completion_fence = true;
+        let provider_calls = Rc::new(Cell::new(0));
+        let mut provider_clock = scripted_clock(
+            entry_at,
+            [entry_at + Duration::seconds(1)],
+            Rc::clone(&provider_calls),
+        );
+        let mut executor = ProbeExecutor {
+            sample_calls: Rc::clone(&provider_calls),
+            expected_sample_calls: 0,
+            result: Err(ProviderFailure::Uncertain("submitted".into())),
+        };
+        let mut unused_verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut unused_verifier,
+                &mut provider_clock,
+            )
+            .expect_err("seed uncertain Provider state");
+
+        if matches!(failure, ReconciledReceiptDownstreamFailure::LedgerCas) {
+            broker = broker.with_lease_for(Duration::seconds(5));
+        }
+        let reconciliation_entry = entry_at + Duration::seconds(2);
+        let reconciliation_at = entry_at + Duration::seconds(3);
+        let verification_at = if matches!(failure, ReconciledReceiptDownstreamFailure::LedgerCas) {
+            reconciliation_entry + Duration::seconds(5)
+        } else {
+            entry_at + Duration::seconds(4)
+        };
+        let samples = if matches!(failure, ReconciledReceiptDownstreamFailure::Sample) {
+            vec![reconciliation_at]
+        } else {
+            vec![reconciliation_at, verification_at]
+        };
+        let calls = Rc::new(Cell::new(0));
+        let clock = scripted_clock(reconciliation_entry, samples, Rc::clone(&calls));
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let receipt = durable_receipt(&effect, "partial-reconciliation-receipt");
+        let reconciler = ProbeReconciler {
+            calls: 0,
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 0,
+            observation: ReconciliationObservation::ReceiptFound {
+                receipt: receipt.clone(),
+                evidence_digest: "7".repeat(64),
+                observed_at: reconciliation_at,
+            },
+        };
+        let verifier = ProbeVerifier {
+            calls: 0,
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 1,
+            verification: Verification {
+                id: VerificationId::from("partial-reconciliation-verification"),
+                status: VerificationStatus::Confirmed,
+                verifier: "partial-reconciliation-readback".into(),
+                independent: true,
+                observed_at: entry_at + Duration::seconds(4),
+                evidence_digest: "8".repeat(64),
+                receipt_id: if matches!(failure, ReconciledReceiptDownstreamFailure::Domain) {
+                    ReceiptId::from("mismatched-receipt")
+                } else {
+                    receipt.id.clone()
+                },
+            },
+        };
+        let mut authority = EffectCompletionAuthority::new(reconciliation_entry);
+        if matches!(failure, ReconciledReceiptDownstreamFailure::AuthorityAccept) {
+            authority.reject_sample_accept_at_source_ordinal = Some(2);
+        }
+        ReconciledReceiptFailureFixture {
+            mission,
+            effect_id,
+            broker,
+            ledger,
+            calls,
+            clock,
+            receipt,
+            reconciler,
+            verifier,
+            authority,
+            reconciliation_at,
+        }
+    }
+
+    fn assert_reconciled_receipt_downstream_failure(failure: ReconciledReceiptDownstreamFailure) {
+        let ReconciledReceiptFailureFixture {
+            mut mission,
+            effect_id,
+            mut broker,
+            mut ledger,
+            calls,
+            mut clock,
+            receipt,
+            mut reconciler,
+            mut verifier,
+            mut authority,
+            reconciliation_at,
+        } = reconciled_receipt_failure_fixture(failure);
+        let mut projection_committed = false;
+        let error = broker
+            .reconcile_uncertain_inner(ReconcileUncertainFlow {
+                mission: &mut mission,
+                effect_id: &effect_id,
+                infrastructure: &mut ledger,
+                reconciler: &mut reconciler,
+                verifier: &mut verifier,
+                clock: &mut clock,
+                authority: &mut authority,
+                projection_committed: &mut projection_committed,
+            })
+            .expect_err("verification failure preserves accepted receipt boundary");
+        let expected_error = match failure {
+            ReconciledReceiptDownstreamFailure::Sample
+            | ReconciledReceiptDownstreamFailure::AuthorityAccept => {
+                BrokerError::InvalidAuthorityClock
+            }
+            ReconciledReceiptDownstreamFailure::LedgerCas => {
+                BrokerError::Ledger(LedgerError::LeaseLost)
+            }
+            ReconciledReceiptDownstreamFailure::Domain => {
+                BrokerError::Domain(MissionError::VerificationReceiptMismatch)
+            }
+        };
+        assert_eq!(error, expected_error, "{failure:?}");
+        assert!(projection_committed, "{failure:?}");
+        assert_eq!(
+            authority.reconciliation(),
+            Some(EffectCompletionPoint {
+                sequence: 1,
+                operation_at: reconciliation_at,
+            }),
+            "{failure:?}",
+        );
+        assert!(authority.verification().is_none(), "{failure:?}");
+        let projected = mission.effect(&effect_id).expect("projected effect");
+        assert_eq!(
+            projected.status,
+            EffectStatus::ReceiptRecorded,
+            "{failure:?}"
+        );
+        assert_eq!(projected.receipt.as_ref(), Some(&receipt), "{failure:?}");
+        assert!(projected.verification.is_none(), "{failure:?}");
+        assert_eq!(mission.updated_at, reconciliation_at, "{failure:?}");
+        assert_eq!((reconciler.calls, verifier.calls, calls.get()), (1, 1, 2));
+        assert_eq!(
+            ledger.verification_write_calls,
+            usize::from(matches!(
+                failure,
+                ReconciledReceiptDownstreamFailure::LedgerCas
+                    | ReconciledReceiptDownstreamFailure::AuthorityAccept
+            )),
+            "{failure:?}",
+        );
+        assert_eq!(
+            ledger.verification.is_some(),
+            matches!(failure, ReconciledReceiptDownstreamFailure::AuthorityAccept),
+            "{failure:?}",
+        );
+    }
+
+    #[test]
+    fn reconciled_receipt_commits_only_its_accepted_boundary_on_downstream_failure() {
+        for failure in [
+            ReconciledReceiptDownstreamFailure::Sample,
+            ReconciledReceiptDownstreamFailure::LedgerCas,
+            ReconciledReceiptDownstreamFailure::Domain,
+            ReconciledReceiptDownstreamFailure::AuthorityAccept,
+        ] {
+            assert_reconciled_receipt_downstream_failure(failure);
+        }
     }
 
     #[test]

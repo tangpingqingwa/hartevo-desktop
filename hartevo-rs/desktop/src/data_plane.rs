@@ -12,32 +12,40 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_application::{
-    AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
-    ApplicationMissionCheckpointExecution, ApplicationService, CatalogMissionExecutionHandle,
-    ConfirmHumanMissionCheckpoint, CreateProject, DecideVm11OutcomeReview,
-    DesktopInventoryProjection, DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
+    AcceptWorkProduct, AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
+    ApplicationMissionCheckpointExecution, ApplicationService, ApproveProposedEffect,
+    CatalogMissionExecutionHandle, ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace,
+    CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
+    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
     MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
     PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    ResearchPacket, RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission,
+    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
+    RetryContextWorkerRuntime, RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor,
+    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
+    Vm11NextContractOrValidTerminalResult,
+};
+use hartevo_browser_adapter::{
+    BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
 };
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
+use hartevo_cordis::{AgentStep, AgentStepResult, CordisError, CordisHost};
 use hartevo_domain_kernel::{
-    ActorId, CurrencyCode, DeviceId, KeyManagementError, KeyRecipient, KpiContract,
-    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
-    OperatingMode, OutcomeDecision, ProjectEncryptionMode, ProjectId, ProjectKeyring,
-    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus,
-    StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
+    ActorId, Approval, ApprovalDecision, BrowserControlLeaseId, BrowserWorkspaceId, ConsentRecord,
+    ConsentState, ConsentStatus, CurrencyCode, DeviceId, EffectClass, EffectId, KeyManagementError,
+    KeyRecipient, KpiContract, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, ProjectEncryptionMode,
+    ProjectId, ProjectKeyring, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId,
+    RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
-use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand};
+use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
+use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
 use hartevo_storage::{
     ContextMaterialStoreError, DatabaseKey, KeyMaterial, OsSecretStore, ProjectStore,
     RuntimeTurnStartupReconciliation, SecretBytes, SecretReference, SecretStore, SecretStoreError,
@@ -47,6 +55,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::cordis_host::{bind_live_domain_kernel, mount_cordis_host};
 use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
     discover_runtime, ensure_project_runtime_home,
@@ -203,6 +212,8 @@ pub enum DesktopRuntimeProgressPhase {
     ItemStarted,
     ItemCompleted,
     LocalActionDeclined,
+    WaitingLocalApproval,
+    LocalActionApproved,
     StopRequested,
     InterruptSent,
     Completed,
@@ -236,6 +247,17 @@ struct DesktopRuntimeProgressFeed {
 pub struct DesktopRuntimeCancellation {
     requested: Arc<AtomicBool>,
     progress: Arc<Mutex<DesktopRuntimeProgressFeed>>,
+    local_approval: Arc<Mutex<Option<DesktopHeldLocalApproval>>>,
+    local_approval_decision: Arc<Mutex<Option<bool>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopHeldLocalApproval {
+    pub project_id: ProjectId,
+    pub turn_id: RuntimeTurnAttemptId,
+    pub expected_revision: u64,
+    pub request_digest: String,
+    pub kind: RuntimeLocalApprovalKind,
 }
 
 impl DesktopRuntimeCancellation {
@@ -247,6 +269,78 @@ impl DesktopRuntimeCancellation {
 
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    pub fn held_local_approval(&self) -> Option<DesktopHeldLocalApproval> {
+        self.local_approval
+            .lock()
+            .ok()
+            .and_then(|held| held.clone())
+    }
+
+    pub fn approve_held_local_write(
+        &self,
+        project_id: &ProjectId,
+        turn_id: &RuntimeTurnAttemptId,
+        expected_revision: u64,
+        request_digest: &str,
+    ) -> Result<(), DesktopDataError> {
+        self.decide_held_local_write(project_id, turn_id, expected_revision, request_digest, true)
+    }
+
+    fn decide_held_local_write(
+        &self,
+        project_id: &ProjectId,
+        turn_id: &RuntimeTurnAttemptId,
+        expected_revision: u64,
+        request_digest: &str,
+        approved: bool,
+    ) -> Result<(), DesktopDataError> {
+        let held = self
+            .held_local_approval()
+            .ok_or(DesktopDataError::RuntimeLocalApprovalUnavailable)?;
+        if &held.project_id != project_id
+            || &held.turn_id != turn_id
+            || held.expected_revision != expected_revision
+            || held.request_digest != request_digest
+        {
+            return Err(DesktopDataError::RuntimeLocalApprovalMismatch);
+        }
+        let mut decision = self
+            .local_approval_decision
+            .lock()
+            .map_err(|_| DesktopDataError::RuntimeLocalApprovalUnavailable)?;
+        if decision.is_some() {
+            return Err(DesktopDataError::RuntimeLocalApprovalUnavailable);
+        }
+        *decision = Some(approved);
+        Ok(())
+    }
+
+    fn hold_local_approval(&self, held: DesktopHeldLocalApproval) {
+        if let Ok(mut slot) = self.local_approval.lock() {
+            *slot = Some(held);
+        }
+        if let Ok(mut decision) = self.local_approval_decision.lock() {
+            *decision = None;
+        }
+        self.record_progress(DesktopRuntimeProgressPhase::WaitingLocalApproval);
+    }
+
+    fn take_local_approval_decision(&self) -> Option<bool> {
+        self.local_approval_decision
+            .lock()
+            .ok()
+            .and_then(|mut decision| decision.take())
+    }
+
+    fn clear_held_local_approval(&self) {
+        if let Ok(mut slot) = self.local_approval.lock() {
+            *slot = None;
+        }
+        if let Ok(mut decision) = self.local_approval_decision.lock() {
+            *decision = None;
+        }
     }
 
     pub fn progress_since(&self, sequence: u64) -> Vec<DesktopRuntimeProgressEvent> {
@@ -342,6 +436,37 @@ pub struct DesktopHumanCheckpointConfirmationRequest {
     pub expected_conversation_revision: u64,
 }
 
+/// Exact Desktop-to-Application fence for adopting one projected WorkProduct.
+/// The Desktop surface carries these values from the current Mission read
+/// model; Application remains the authority that validates and persists the
+/// transition.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopWorkProductAdoptionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub work_product_id: WorkProductId,
+    pub expected_mission_revision: u64,
+    pub expected_work_product_revision: u64,
+    pub expected_manifest_version: u64,
+}
+
+impl fmt::Debug for DesktopWorkProductAdoptionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopWorkProductAdoptionRequest")
+            .field("project_id", &"[REDACTED]")
+            .field("mission_id", &"[REDACTED]")
+            .field("work_product_id", &"[REDACTED]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field(
+                "expected_work_product_revision",
+                &self.expected_work_product_revision,
+            )
+            .field("expected_manifest_version", &self.expected_manifest_version)
+            .finish()
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct DesktopVm11OutcomeDecisionRequest {
     pub project_id: ProjectId,
@@ -388,12 +513,50 @@ impl fmt::Debug for DesktopVm11OutcomeDecisionRequest {
     }
 }
 
-#[cfg(test)]
-type DesktopRuntimeCommandBuilder = Box<dyn FnOnce(&Path, &Path) -> RuntimeCommand>;
+/// Route-specific CAS for VM-11 `next_contract_or_valid_terminal`. The frozen
+/// decision digest and parent-contract digest must come from the SQLCipher
+/// projection; the window cannot substitute a replacement contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopVm11NextContractResolutionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_decision_digest: String,
+    pub expected_parent_mission_revision: u64,
+    pub expected_parent_contract_digest: String,
+}
 
-enum DesktopRuntimeSource {
+/// Window-bound ApprovalGrant for one Proposed Effect. The frozen digest and
+/// Mission revision must come from the SQLCipher projection; the window cannot
+/// stamp a SAMPLE digest or execute the Effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopWaitingApprovalGrantRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_mission_revision: u64,
+}
+
+/// Window Continue for one Mission-bound Browser Workspace. The ids, revision
+/// and generation must come from the SQLCipher projection; Desktop never
+/// invents a workspace or treats Continue as Verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopContinueBrowserWorkspaceRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub expected_generation: u64,
+}
+
+#[cfg(any(test, feature = "native-journey"))]
+pub(crate) type DesktopRuntimeCommandBuilder = Box<dyn FnOnce(&Path, &Path) -> RuntimeCommand>;
+
+pub(crate) enum DesktopRuntimeSource {
     Pinned(Box<DesktopRuntimeConfiguration>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-journey"))]
     Fixture {
         provider: String,
         model: String,
@@ -411,7 +574,7 @@ impl DesktopRuntimeSource {
     fn provider(&self) -> &str {
         match self {
             Self::Pinned(configuration) => &configuration.provider,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { provider, .. } => provider,
         }
     }
@@ -419,7 +582,7 @@ impl DesktopRuntimeSource {
     fn model(&self) -> &str {
         match self {
             Self::Pinned(configuration) => &configuration.model,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { model, .. } => model,
         }
     }
@@ -434,7 +597,7 @@ impl DesktopRuntimeSource {
                 .artifact
                 .runtime_command(project_root, runtime_home)
                 .map_err(|error| DesktopDataError::Application(ApplicationError::Runtime(error))),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture {
                 command_builder, ..
             } => Ok(command_builder(project_root, runtime_home)),
@@ -520,11 +683,54 @@ pub struct DesktopDataPlane {
     database_path: PathBuf,
     database_key_reference: SecretReference,
     device_id: DeviceId,
+    cordis: Arc<Mutex<CordisHost>>,
 }
 
 impl DesktopDataPlane {
     pub fn discover() -> Result<Self, DesktopDataError> {
         Self::at_data_root(default_data_root()?)
+    }
+
+    /// Cordis-hosted live loop. OpenInterpreter is never this loop.
+    pub fn with_cordis_host<T>(&self, f: impl FnOnce(&mut CordisHost) -> T) -> T {
+        f(&mut self.lock_cordis())
+    }
+
+    /// Bind live Domain Kernel consent/approval onto the mounted host.
+    ///
+    /// Production `desktop_surfaces()` stays fail-closed. `step` / `apply_effect`
+    /// still require these facts; this never stamps `true` at boot.
+    pub fn bind_live_domain_kernel(
+        &self,
+        consent: &ConsentState,
+        record: Option<&ConsentRecord>,
+        approval: Option<&Approval>,
+        now: DateTime<Utc>,
+    ) -> Result<(), CordisError> {
+        bind_live_domain_kernel(&mut self.lock_cordis(), consent, record, approval, now)
+    }
+
+    /// Production Cordis step. Live Domain Kernel facts are rebound from
+    /// ApplicationService before the host may plan; missing facts stay fail-closed.
+    pub fn step(
+        &self,
+        secret_store: &impl SecretStore,
+        step: AgentStep,
+        now: DateTime<Utc>,
+    ) -> Result<AgentStepResult, DesktopDataError> {
+        self.bind_live_domain_kernel_from_store(secret_store, now)?;
+        Ok(self.lock_cordis().step(step)?)
+    }
+
+    /// Production Effect write path. Live Domain Kernel facts are rebound
+    /// first; OpenInterpreter still cannot own Domain or Effect.
+    pub fn apply_effect(
+        &self,
+        secret_store: &impl SecretStore,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        self.bind_live_domain_kernel_from_store(secret_store, now)?;
+        Ok(self.lock_cordis().apply_effect()?)
     }
 
     pub fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
@@ -555,11 +761,16 @@ impl DesktopDataPlane {
             version: 1,
         };
         let device_id = DeviceId::from_stable(format!("desktop-device:{root_digest}"));
+        let cordis = Arc::new(Mutex::new(
+            mount_cordis_host(&discover_runtime().projection)
+                .expect("Cordis host mounts SurfaceMapping, AgentLoop, and InvariantGate"),
+        ));
         Ok(Self {
             data_root,
             database_path,
             database_key_reference,
             device_id,
+            cordis,
         })
     }
 
@@ -584,6 +795,7 @@ impl DesktopDataPlane {
             Ok(secret) => {
                 let (service, runtime_reconciliation) =
                     self.open_application_from_secret(&secret, now)?;
+                self.bind_live_domain_kernel_from_service(&service, now)?;
                 Ok(DesktopLoadState::Ready(Box::new(self.build_snapshot(
                     &service,
                     secret_store,
@@ -700,6 +912,7 @@ impl DesktopDataPlane {
             Err(error) => return Err(error.into()),
         };
         let (service, runtime_reconciliation) = self.open_application_from_secret(&secret, now)?;
+        self.bind_live_domain_kernel_from_service(&service, now)?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -835,6 +1048,16 @@ impl DesktopDataPlane {
         Ok(DesktopCatalogMissionExecutionStart { snapshot, handle })
     }
 
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn start_catalog_mission_execution_native(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopCatalogMissionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopCatalogMissionExecutionStart, DesktopDataError> {
+        self.start_catalog_mission_execution_with(secret_store, request, now)
+    }
+
     /// Pulls one integrity-checked page from the encrypted Runtime text ledger
     /// after exact Tenant/Project/Device context authorization. The signed
     /// Application handle and cursor are returned unchanged; this read cannot
@@ -863,6 +1086,93 @@ impl DesktopDataPlane {
         let service = self.open_read_application_from_secret(&database_secret)?;
         self.require_runtime_subscription_context_access(&service, secret_store, handle, now)?;
         Ok(service.read_runtime_text_subscription(handle, cursor, page_size)?)
+    }
+
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn runtime_text_subscription_native(
+        &self,
+        secret_store: &impl SecretStore,
+        handle: &CatalogMissionExecutionHandle,
+        cursor: Option<&RuntimeTextSubscriptionCursor>,
+        page_size: usize,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeTextSubscriptionBatch, DesktopDataError> {
+        self.runtime_text_subscription_with(secret_store, handle, cursor, page_size, now)
+    }
+
+    /// Adopts one exact projected WorkProduct through the existing typed
+    /// Application consumer.  The Desktop layer adds a product-revision fence
+    /// before delegating; it never mutates a Mission or manifest directly.
+    pub fn adopt_work_product_os(
+        &self,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.adopt_work_product_with(&secret_store, request, now)
+    }
+
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn adopt_work_product_native(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        self.adopt_work_product_with(secret_store, request, now)
+    }
+
+    fn adopt_work_product_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.expected_mission_revision == 0
+            || request.expected_work_product_revision == 0
+            || request.expected_manifest_version == 0
+        {
+            return Err(DesktopDataError::WorkProductActionStale);
+        }
+        let project_id = request.project_id.clone();
+        let database_secret = self.database_secret(secret_store)?;
+        let read_service = self.open_read_application_from_secret(&database_secret)?;
+        self.require_project_context_access(&read_service, secret_store, &project_id, now)?;
+        let read_mission = read_service.load_mission(&request.project_id, &request.mission_id)?;
+        let read_product = read_mission
+            .work_products
+            .iter()
+            .find(|product| product.id == request.work_product_id)
+            .ok_or(DesktopDataError::WorkProductActionStale)?;
+        if read_mission.revision != request.expected_mission_revision
+            || read_product.revision != request.expected_work_product_revision
+        {
+            return Err(DesktopDataError::WorkProductActionStale);
+        }
+        let read_manifest = read_service
+            .load_work_product_manifest(&request.project_id, &request.work_product_id)?;
+        if read_manifest.version != request.expected_manifest_version {
+            return Err(DesktopDataError::WorkProductActionStale);
+        }
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        service.accept_work_product(
+            &AcceptWorkProduct {
+                project_id: request.project_id,
+                mission_id: request.mission_id,
+                work_product_id: request.work_product_id,
+                expected_mission_revision: request.expected_mission_revision,
+                expected_manifest_version: request.expected_manifest_version,
+            },
+            now,
+        )?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
+            now,
+        )
     }
 
     /// Starts an explicitly confirmed VM-00..VM-11 Mission from the machine
@@ -1104,6 +1414,27 @@ impl DesktopDataPlane {
         )
     }
 
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn resume_mission_runtime_native(
+        &self,
+        secret_store: &impl SecretStore,
+        scope: (&ProjectId, &MissionId),
+        runtime: DesktopRuntimeSource,
+        cancellation: &DesktopRuntimeCancellation,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let (project_id, mission_id) = scope;
+        self.resume_mission_runtime_with_cancellation(
+            secret_store,
+            project_id,
+            mission_id,
+            Some(runtime),
+            DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+            Some(cancellation),
+            now,
+        )
+    }
+
     /// Runs only the current registered Application Checkpoint handler. The
     /// call deliberately supplies no Runtime source; if the route changed
     /// concurrently, dispatch returns the newly fenced route without starting
@@ -1267,6 +1598,239 @@ impl DesktopDataPlane {
                 expected_checkpoint_revision: request.expected_checkpoint_revision,
                 expected_conversation_revision: request.expected_conversation_revision,
             },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    /// Resolves VM-11's frozen Continue/Stop/Scale/Test into the typed next
+    /// contract or valid terminal. This is a first-class Desktop action: the
+    /// generic Application completion path is rejected for this route, and no
+    /// Runtime or Provider Effect is constructed.
+    pub fn resolve_vm11_next_contract_or_valid_terminal_os(
+        &self,
+        request: DesktopVm11NextContractResolutionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.resolve_vm11_next_contract_or_valid_terminal_with(&secret_store, request, now)
+    }
+
+    pub fn resolve_vm11_next_contract_or_valid_terminal_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopVm11NextContractResolutionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        if request.expected_decision_digest.len() != 64
+            || request.expected_parent_contract_digest.len() != 64
+            || request.expected_mission_revision == 0
+            || request.expected_checkpoint_revision == 0
+            || request.expected_parent_mission_revision == 0
+        {
+            return Err(DesktopDataError::InvalidVm11NextContractResolution);
+        }
+        let project_id = request.project_id.clone();
+        let mission_id = request.mission_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let runtime_outcome =
+            match service.resolve_vm11_next_contract_or_valid_terminal(
+                ResolveVm11NextContractOrValidTerminal {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    expected_mission_revision: request.expected_mission_revision,
+                    expected_checkpoint_revision: request.expected_checkpoint_revision,
+                    expected_decision_digest: request.expected_decision_digest,
+                    expected_parent_mission_revision: request.expected_parent_mission_revision,
+                    expected_parent_contract_digest: request.expected_parent_contract_digest,
+                },
+                now,
+            )? {
+                Vm11NextContractOrValidTerminalResult::Resolved {
+                    next_dispatch: Some(dispatch),
+                    ..
+                } => DesktopMissionRuntimeOutcome::CheckpointRouted {
+                    checkpoint_id: dispatch.checkpoint_id,
+                    capability_id: dispatch.capability_id,
+                    executor: dispatch.executor,
+                    oracle_ids: dispatch.oracle_ids,
+                    completion_policy: dispatch.completion_policy,
+                    state: dispatch.state,
+                },
+                Vm11NextContractOrValidTerminalResult::Resolved {
+                    mission,
+                    next_dispatch: None,
+                    ..
+                } => DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                    checkpoint_id: "next_contract_or_valid_terminal".into(),
+                    evidence_digest: mission
+                        .definition
+                        .as_ref()
+                        .and_then(|definition| {
+                            definition.checkpoints.iter().find(|checkpoint| {
+                                checkpoint.id == "next_contract_or_valid_terminal"
+                            })
+                        })
+                        .and_then(|checkpoint| checkpoint.completion.as_ref())
+                        .map(|completion| completion.evidence_digest.clone())
+                        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+                },
+                Vm11NextContractOrValidTerminalResult::WaitingUser { mission, .. } => {
+                    let checkpoint = mission
+                        .definition
+                        .as_ref()
+                        .and_then(|definition| {
+                            definition.checkpoints.iter().find(|checkpoint| {
+                                checkpoint.id == "next_contract_or_valid_terminal"
+                            })
+                        })
+                        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+                    let route = checkpoint
+                        .route
+                        .as_ref()
+                        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+                    DesktopMissionRuntimeOutcome::CheckpointRouted {
+                        checkpoint_id: checkpoint.id.clone(),
+                        capability_id: route.capability_id.clone(),
+                        executor: route.executor,
+                        oracle_ids: route.oracle_ids.clone(),
+                        completion_policy: route
+                            .completion_policy
+                            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+                        state: MissionCheckpointDispatchState::WaitingUser,
+                    }
+                }
+            };
+        self.finish_mission_submission(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            mission_id,
+            runtime_outcome,
+            now,
+        )
+    }
+
+    /// Continues one user-held Browser Workspace through Application
+    /// `continue_browser_workspace` and a real BrowserControlHost. Missing or
+    /// non-user-held workspaces fail closed; Host sync failure is reported as
+    /// `BrowserHostReconciliationRequired` and is not treated as Verification.
+    pub fn continue_browser_workspace_os(
+        &self,
+        request: DesktopContinueBrowserWorkspaceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.continue_browser_workspace_with(&secret_store, request, now)
+    }
+
+    pub fn continue_browser_workspace_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopContinueBrowserWorkspaceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.expected_revision == 0
+            || request.expected_generation == 0
+            || request.workspace_id.as_str().trim().is_empty()
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceContinue);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
+            .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
+        if live.id != request.workspace_id
+            || live.mission_id != request.mission_id
+            || live.project_id != project_id
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceContinue);
+        }
+        if live.control_state != BrowserControlState::UserControlled {
+            return Err(DesktopDataError::BrowserWorkspaceContinueNotHeld);
+        }
+        if live.revision != request.expected_revision
+            || live.lease_generation != request.expected_generation
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceContinue);
+        }
+        let evidence_digest = continue_browser_workspace_evidence_digest(&live, now);
+        let mut host = DesktopBrowserControlHost::attach(&live)?;
+        service.continue_browser_workspace(
+            &mut host,
+            ContinueBrowserWorkspace {
+                project_id,
+                workspace_id: request.workspace_id,
+                expected_revision: request.expected_revision,
+                expected_generation: request.expected_generation,
+                new_lease_id: BrowserControlLeaseId::new(),
+                lease_expires_at: now + Duration::hours(1),
+                evidence_digest,
+            },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    /// Grants Domain Kernel Approval for one Proposed Effect without executing
+    /// it. The frozen digest and Mission revision must match SQLCipher; a
+    /// fixture SAMPLE digest is refused.
+    pub fn grant_waiting_approval_os(
+        &self,
+        request: DesktopWaitingApprovalGrantRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.grant_waiting_approval_with(&secret_store, request, now)
+    }
+
+    pub fn grant_waiting_approval_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWaitingApprovalGrantRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.expected_mission_revision == 0
+            || request.effect_id.as_str().trim().is_empty()
+            || request.expected_scope_digest.len() != 64
+            || !request
+                .expected_scope_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(DesktopDataError::InvalidWaitingApprovalGrant);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let broker = Self::waiting_approval_broker();
+        service.approve_proposed_effect(
+            &broker,
+            ApproveProposedEffect {
+                project_id,
+                mission_id: request.mission_id,
+                effect_id: request.effect_id,
+                expected_scope_digest: request.expected_scope_digest,
+                expected_mission_revision: request.expected_mission_revision,
+            },
+            ActorId::from_stable(format!("desktop-local-operator:{}", self.device_id)),
             now,
         )?;
         let product_evidence = load_product_evidence(now)?;
@@ -1492,6 +2056,11 @@ impl DesktopDataPlane {
             let mut dispatch =
                 service.dispatch_current_mission_checkpoint(project_id, &mission_id, now)?;
             if dispatch.executor == MissionCheckpointExecutor::Application {
+                if dispatch.checkpoint_id == "next_contract_or_valid_terminal" {
+                    return Err(
+                        ApplicationError::Vm11NextContractRouteSpecificCommandRequired.into(),
+                    );
+                }
                 match service.execute_application_mission_checkpoint(
                     ExecuteApplicationMissionCheckpoint {
                         project_id: project_id.clone(),
@@ -1969,8 +2538,34 @@ impl DesktopDataPlane {
                 }
             }
             if let Some(request) = observation.local_approval_request {
-                if let Some(control) = cancellation {
-                    control.record_progress(DesktopRuntimeProgressPhase::LocalActionDeclined);
+                let Some(control) = cancellation else {
+                    return Err(DesktopDataError::RuntimeLocalApprovalUnavailable);
+                };
+                control.hold_local_approval(DesktopHeldLocalApproval {
+                    project_id: project_id.clone(),
+                    turn_id: turn_id.clone(),
+                    expected_revision: attempt.revision,
+                    request_digest: request.request_digest.clone(),
+                    kind: request.kind,
+                });
+                let approved = loop {
+                    if control.is_requested() {
+                        control.clear_held_local_approval();
+                        break None;
+                    }
+                    if let Some(decision) = control.take_local_approval_decision() {
+                        break Some(decision);
+                    }
+                    std::thread::sleep(StdDuration::from_millis(50));
+                };
+                let Some(approved) = approved else {
+                    consecutive_timeouts = 0;
+                    continue;
+                };
+                if !approved {
+                    control.clear_held_local_approval();
+                    consecutive_timeouts = 0;
+                    continue;
                 }
                 logical_millis += 1;
                 attempt = service.respond_context_runtime_local_approval(
@@ -1980,10 +2575,12 @@ impl DesktopDataPlane {
                         id: turn_id.clone(),
                         expected_revision: attempt.revision,
                         request,
-                        approved: false,
+                        approved: true,
                     },
                     now + Duration::milliseconds(logical_millis),
                 )?;
+                control.clear_held_local_approval();
+                control.record_progress(DesktopRuntimeProgressPhase::LocalActionApproved);
                 consecutive_timeouts = 0;
                 continue;
             }
@@ -2392,6 +2989,26 @@ impl DesktopDataPlane {
         &self.data_root
     }
 
+    fn waiting_approval_broker() -> EffectBroker {
+        EffectBroker::new(
+            EffectPolicy {
+                version: "policy-v1".into(),
+                allowed_capabilities: BTreeSet::from(["channel.preview".into()]),
+                allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
+                max_amounts_minor: BTreeMap::from([(CurrencyCode::parse("CNY").expect("CNY"), 0)]),
+                rate_limits: vec![EffectRateLimit {
+                    rule_id: "desktop-preview-per-minute".into(),
+                    provider: "fixture-provider".into(),
+                    capability: "channel.preview".into(),
+                    max_executions: 10,
+                    window_seconds: 60,
+                }],
+            },
+            "desktop-waiting-approval-worker",
+        )
+        .with_lease_for(Duration::days(36_500))
+    }
+
     fn finish_mission_submission(
         &self,
         service: &ApplicationService,
@@ -2666,6 +3283,48 @@ impl DesktopDataPlane {
         Ok(ApplicationService::new(store))
     }
 
+    fn bind_live_domain_kernel_from_store(
+        &self,
+        secret_store: &impl SecretStore,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        self.revalidate_database_entry()?;
+        match secret_store.get(&self.database_key_reference) {
+            Ok(secret) => {
+                let service = self.open_read_application_from_secret(&secret)?;
+                self.bind_live_domain_kernel_from_service(&service, now)
+            }
+            Err(SecretStoreError::SecretNotFound) => {
+                // Uninitialized / missing key: host stays mounted and fail-closed.
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn lock_cordis(&self) -> std::sync::MutexGuard<'_, CordisHost> {
+        self.cordis
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn bind_live_domain_kernel_from_service(
+        &self,
+        service: &ApplicationService,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        let Some(facts) = live_domain_kernel_facts(service, now)? else {
+            return Ok(());
+        };
+        self.bind_live_domain_kernel(
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+        )?;
+        Ok(())
+    }
+
     fn revalidate_database_entry(&self) -> Result<(), DesktopDataError> {
         reject_symlink(&self.data_root)?;
         reject_symlink(&self.database_path)
@@ -2692,6 +3351,72 @@ impl DesktopDataPlane {
     }
 }
 
+struct LiveDomainKernelFacts {
+    consent: ConsentState,
+    record: Option<ConsentRecord>,
+    approval: Option<Approval>,
+}
+
+fn live_domain_kernel_facts(
+    service: &ApplicationService,
+    now: DateTime<Utc>,
+) -> Result<Option<LiveDomainKernelFacts>, DesktopDataError> {
+    let projects = service.list_projects()?;
+    let Some(project) = projects.first() else {
+        return Ok(None);
+    };
+    let records = service.list_consent_records(&project.id)?;
+    let record = records.into_iter().max_by_key(|record| {
+        (
+            record.revision,
+            record.granted_at.unwrap_or(DateTime::<Utc>::MIN_UTC),
+            record.id.as_str().to_owned(),
+        )
+    });
+    let consent = record
+        .as_ref()
+        .map_or(ConsentState::Missing, |record| match record.status {
+            ConsentStatus::Granted
+                if record.permits(
+                    &record.person_id,
+                    &record.purpose,
+                    &record.channel,
+                    &record.market,
+                    now,
+                ) =>
+            {
+                ConsentState::Confirmed
+            }
+            ConsentStatus::Withdrawn => ConsentState::Withdrawn,
+            ConsentStatus::Granted | ConsentStatus::Denied | ConsentStatus::Expired => {
+                ConsentState::Missing
+            }
+        });
+    let missions = service.list_missions(&project.id)?;
+    let approval = missions
+        .iter()
+        .flat_map(|mission| mission.effects.iter())
+        .filter_map(|effect| effect.approval.as_ref())
+        .filter(|candidate| {
+            candidate.decision == ApprovalDecision::Approved && now < candidate.valid_until
+        })
+        .max_by_key(|candidate| (candidate.valid_until, candidate.decided_at))
+        .cloned()
+        .or_else(|| {
+            missions
+                .iter()
+                .flat_map(|mission| mission.effects.iter())
+                .filter_map(|effect| effect.approval.as_ref())
+                .max_by_key(|candidate| (candidate.valid_until, candidate.decided_at))
+                .cloned()
+        });
+    Ok(Some(LiveDomainKernelFacts {
+        consent,
+        record,
+        approval,
+    }))
+}
+
 fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation {
     RuntimeTurnStartupReconciliation {
         scanned_attempts: 0,
@@ -2701,6 +3426,62 @@ fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation 
         event_sequences: Vec::new(),
         outbox_sequences: Vec::new(),
     }
+}
+
+/// Process-local BrowserControlHost for Desktop Continue.
+///
+/// Continue is a permissive transition: Application persists the new Agent
+/// lease first, then this Host must adopt that successor. An unregistered or
+/// non-successor Host fails as `BrowserHostReconciliationRequired`. This is
+/// not a Fake Host test helper and does not execute Effects.
+struct DesktopBrowserControlHost {
+    workspace: BrowserWorkspace,
+}
+
+impl DesktopBrowserControlHost {
+    fn attach(workspace: &BrowserWorkspace) -> Result<Self, DesktopDataError> {
+        workspace
+            .validate()
+            .map_err(ApplicationError::from)
+            .map_err(DesktopDataError::from)?;
+        Ok(Self {
+            workspace: workspace.clone(),
+        })
+    }
+}
+
+impl BrowserControlHost for DesktopBrowserControlHost {
+    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+        if *workspace == self.workspace {
+            return Ok(());
+        }
+        if !workspace.is_valid_successor_of(&self.workspace)? {
+            return Err(BrowserError::ScopeMismatch);
+        }
+        self.workspace = workspace.clone();
+        Ok(())
+    }
+}
+
+fn continue_browser_workspace_evidence_digest(
+    workspace: &BrowserWorkspace,
+    now: DateTime<Utc>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"desktop.browser_workspace.continue\0");
+    hasher.update(workspace.project_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.mission_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.revision.to_le_bytes());
+    hasher.update(workspace.lease_generation.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", workspace.control_state).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_rfc3339().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 impl fmt::Debug for DesktopDataPlane {
@@ -2919,6 +3700,24 @@ pub enum DesktopDataError {
         "VM-11 outcome decision requires a typed action, private rationale, actor, and exact frozen review digests"
     )]
     InvalidVm11OutcomeDecision,
+    #[error(
+        "VM-11 next_contract_or_valid_terminal requires the frozen decision digest, parent contract digest, and exact Mission/Checkpoint revisions"
+    )]
+    InvalidVm11NextContractResolution,
+    #[error(
+        "WaitingApproval grant requires an exact Proposed Effect digest and Mission CAS revision"
+    )]
+    InvalidWaitingApprovalGrant,
+    #[error(
+        "Browser Workspace Continue requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
+    )]
+    InvalidBrowserWorkspaceContinue,
+    #[error("no live Mission-bound Browser Workspace exists for Continue")]
+    BrowserWorkspaceUnavailable,
+    #[error(
+        "Browser Workspace Continue requires a user-held lease; Take over remains NOT_IMPLEMENTED"
+    )]
+    BrowserWorkspaceContinueNotHeld,
     #[error("project name cannot be empty")]
     EmptyProjectName,
     #[error("recovery key must be exactly 32 bytes encoded as 64 hexadecimal characters")]
@@ -2939,6 +3738,14 @@ pub enum DesktopDataError {
     ProjectContextIntegrityError(ProjectId),
     #[error("Runtime text subscription context does not match the authorized Tenant and Project")]
     RuntimeSubscriptionContextMismatch,
+    #[error("the selected WorkProduct revision no longer matches the current Mission projection")]
+    WorkProductActionStale,
+    #[error("no live Runtime local-write approval is held for this Desktop turn")]
+    RuntimeLocalApprovalUnavailable,
+    #[error("Runtime local-write approval must match the exact held digest and revision")]
+    RuntimeLocalApprovalMismatch,
+    #[error(transparent)]
+    Cordis(#[from] CordisError),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -2957,18 +3764,24 @@ mod tests {
 
     use chrono::Duration;
     use hartevo_application::{
-        CreateProject, EvidenceInput, ProvisionProjectEncryption, ResearchPacket,
-        RuntimeTextSubscriptionError, StartRelationshipMission,
+        CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject, EvidenceInput,
+        ProposePreviewEffect, ProvisionProjectEncryption, ResearchPacket,
+        RuntimeTextSubscriptionError, StartMission, StartRelationshipMission,
+        TakeOverBrowserWorkspace,
     };
+    use hartevo_browser_adapter::FakeBrowserHost;
     use hartevo_domain_kernel::{
-        AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ContextBranchStatus,
-        ContextCapsuleStatus, EvidenceId, ExternalIdentity, IdentityLink, IdentityLinkId,
-        IdentitySubject, KeyRecipient, KpiDirection, MissionCheckpointExecutor,
-        MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision, OutcomeEvent,
-        OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
-        Person, PersonId, ProbeOutcome, ProjectEncryptionMode, StorageMode, TaskId, TaskStatus,
-        WorkProductId, WorkerLeaseStatus,
+        AccountId, ActorId, ApprovalDecision, BrowserControlLeaseId, BrowserProfileId,
+        BrowserTabId, BrowserWorkspaceId, Connection, ConnectionId, ConnectionProbe,
+        ConsentPurpose, ConsentRecordId, ConsentRequirement, ConsentState, ContactChannel,
+        ContextBranchStatus, ContextCapsuleStatus, EffectId, EffectStatus, EvidenceId,
+        ExternalIdentity, IdentityLink, IdentityLinkId, IdentitySubject, KeyRecipient,
+        KpiDirection, LegalBasis, MissionCheckpointExecutor, MissionScheduleStatus, MissionStage,
+        OrderId, OutcomeDecision, OutcomeEvent, OutcomeEventId, OutcomeEventKind,
+        OutcomeSourceVerification, OutcomeVerificationMethod, Person, PersonId, ProbeOutcome,
+        ProjectEncryptionMode, StorageMode, TaskId, TaskStatus, WorkProductId, WorkerLeaseStatus,
     };
+    use hartevo_effect_broker::EffectBroker;
     use hartevo_storage::MemorySecretStore;
     use rust_decimal::Decimal;
 
@@ -2983,6 +3796,219 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-11T10:00:00Z")
             .expect("valid fixture time")
             .with_timezone(&Utc)
+    }
+
+    fn production_preview_broker() -> EffectBroker {
+        DesktopDataPlane::waiting_approval_broker()
+    }
+
+    fn assert_host_fail_closed_on_consent(plane: &DesktopDataPlane) {
+        use hartevo_cordis::{
+            DomainSurface, OPENINTERPRETER, SurfaceOwner, host_is_cordis_loop, invariant_missing,
+        };
+
+        plane.with_cordis_host(|host| {
+            host_is_cordis_loop(host).unwrap();
+            let domain = host.context().domain::<DomainSurface>().unwrap();
+            assert_eq!(domain.owner, SurfaceOwner::Hartevo);
+            assert!(!domain.consent);
+            assert!(!domain.approved);
+            assert!(
+                !host
+                    .context()
+                    .effect_broker::<hartevo_cordis::EffectBrokerSurface>()
+                    .unwrap()
+                    .receipt_is_verification
+            );
+            assert_eq!(
+                host.step(AgentStep::new("mission-unbound", "plan"))
+                    .unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert_eq!(
+                host.apply_effect().unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert!(
+                host.context().get::<String>(OPENINTERPRETER).is_none()
+                    || host.runtime_plugin() == Some(OPENINTERPRETER)
+            );
+        });
+    }
+
+    fn create_kernel_bind_project(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_root: &Path,
+        suffix: &str,
+        now: DateTime<Utc>,
+    ) -> (ProjectId, TenantId) {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let tenant_id = TenantId::from_stable(format!("desktop-kernel-tenant-{suffix}"));
+        let project_id = ProjectId::from_stable(format!("desktop-kernel-project-{suffix}"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: tenant_id.clone(),
+                    id: project_id.clone(),
+                    name: format!("Kernel bind {suffix}"),
+                    description: String::new(),
+                    workspace_root: project_root.to_path_buf(),
+                    storage_mode: StorageMode::LocalExisting,
+                },
+                now,
+            )
+            .expect("project");
+        (project_id, tenant_id)
+    }
+
+    struct LiveConsentGrant<'a> {
+        plane: &'a DesktopDataPlane,
+        secrets: &'a MemorySecretStore,
+        project_id: &'a ProjectId,
+        tenant_id: &'a TenantId,
+        suffix: &'a str,
+        now: DateTime<Utc>,
+        consent_until: Option<DateTime<Utc>>,
+    }
+
+    fn grant_live_consent(input: &LiveConsentGrant<'_>) -> (PersonId, ConsentRecordId, MissionId) {
+        let database_secret = input
+            .secrets
+            .get(input.plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = input
+            .plane
+            .open_application_from_secret(&database_secret, input.now)
+            .expect("application");
+        let person_id = PersonId::from_stable(format!("desktop-kernel-person-{}", input.suffix));
+        let consent_id =
+            ConsentRecordId::from_stable(format!("desktop-kernel-consent-{}", input.suffix));
+        let mission_id = MissionId::from_stable(format!("desktop-kernel-mission-{}", input.suffix));
+        service
+            .create_person(
+                Person::create(
+                    person_id.clone(),
+                    input.tenant_id.clone(),
+                    input.project_id.clone(),
+                    "Kernel bind contact",
+                    None,
+                    vec![],
+                )
+                .expect("person"),
+                input.now,
+            )
+            .expect("persist person");
+        service
+            .grant_consent(
+                ConsentRecord::grant(
+                    consent_id.clone(),
+                    input.tenant_id.clone(),
+                    input.project_id.clone(),
+                    person_id.clone(),
+                    ConsentPurpose::DirectOutreach,
+                    ContactChannel::Email,
+                    "US",
+                    LegalBasis::ExplicitConsent,
+                    "desktop-kernel-bind",
+                    "e".repeat(64),
+                    input.now,
+                    input.consent_until,
+                )
+                .expect("granted consent"),
+                input.now,
+            )
+            .expect("persist consent");
+        service
+            .start_mission(
+                StartMission {
+                    id: mission_id.clone(),
+                    research_task_id: TaskId::from_stable(format!(
+                        "desktop-kernel-task-{}",
+                        input.suffix
+                    )),
+                    project_id: input.project_id.clone(),
+                    title: Some("Kernel bind Mission".into()),
+                    prompt: "研究当前增长约束；不得执行外部动作".into(),
+                },
+                input.now,
+            )
+            .expect("mission");
+        (person_id, consent_id, mission_id)
+    }
+
+    struct LivePreviewApproval<'a> {
+        plane: &'a DesktopDataPlane,
+        secrets: &'a MemorySecretStore,
+        project_id: &'a ProjectId,
+        person_id: PersonId,
+        consent_id: &'a ConsentRecordId,
+        mission_id: &'a MissionId,
+        suffix: &'a str,
+        now: DateTime<Utc>,
+    }
+
+    fn approve_live_preview(input: &LivePreviewApproval<'_>) {
+        let database_secret = input
+            .secrets
+            .get(input.plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = input
+            .plane
+            .open_application_from_secret(&database_secret, input.now)
+            .expect("application");
+        let effect_id = EffectId::from_stable(format!("desktop-kernel-effect-{}", input.suffix));
+        service
+            .propose_preview_effect(
+                input.project_id,
+                input.mission_id,
+                ProposePreviewEffect {
+                    effect_id: effect_id.clone(),
+                    actor_id: ActorId::from("desktop-kernel-actor"),
+                    capability: "channel.preview".into(),
+                    provider: "fixture-provider".into(),
+                    connection_id: None,
+                    account_id: None,
+                    required_scopes: BTreeSet::new(),
+                    description: "Bind live Domain Kernel approval".into(),
+                    target_resource: "preview://desktop-kernel".into(),
+                    audience_digest: None,
+                    payload_digest: "1".repeat(64),
+                    asset_digests: BTreeSet::new(),
+                    scheduled_for: None,
+                    timezone: "UTC".into(),
+                    consent: ConsentState::Confirmed,
+                    consent_record_id: Some(input.consent_id.clone()),
+                    consent_requirement: Some(ConsentRequirement {
+                        person_id: input.person_id.clone(),
+                        purpose: ConsentPurpose::DirectOutreach,
+                        channel: ContactChannel::Email,
+                        market: "US".into(),
+                    }),
+                    policy_version: "policy-v1".into(),
+                    amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
+                    idempotency_key: format!("desktop-kernel-{}", input.suffix),
+                    expires_in: Duration::hours(1),
+                },
+                input.now + Duration::seconds(1),
+            )
+            .expect("effect");
+        let broker = production_preview_broker();
+        service
+            .approve_effect(
+                &broker,
+                input.project_id,
+                input.mission_id,
+                &effect_id,
+                ActorId::from("desktop-kernel-approver"),
+                input.now + Duration::seconds(2),
+            )
+            .expect("approval");
     }
 
     fn catalog_count_kpis() -> BTreeMap<String, KpiContract> {
@@ -3457,7 +4483,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn runtime_fixture_completion_messages() -> [String; 6] {
+    fn runtime_fixture_completion_messages() -> [String; 5] {
         let thread_id = "desktop-fixture-thread";
         let turn_id = "desktop-fixture-turn";
         [
@@ -3494,18 +4520,6 @@ mod tests {
                     "turnId": turn_id,
                     "itemId": "desktop-fixture-item",
                     "delta": "draft; no external effect occurred.",
-                },
-            })
-            .to_string(),
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "desktop-fixture-local-approval",
-                "method": "item/fileChange/requestApproval",
-                "params": {
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "itemId": "desktop-fixture-item",
-                    "path": "must-not-be-written.txt",
                 },
             })
             .to_string(),
@@ -3556,7 +4570,6 @@ mod tests {
             item_started,
             first_delta,
             second_delta,
-            approval_request,
             item_completed,
             turn_completed,
         ] = runtime_fixture_completion_messages();
@@ -3577,10 +4590,7 @@ printf '%s\n' "$5"
 printf '%s\n' "$6"
 printf '%s\n' "$7"
 printf '%s\n' "$8"
-IFS= read -r decision
-case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"decline"'*) ;; *) exit 34 ;; esac
 printf '%s\n' "$9"
-printf '%s\n' "${10}"
 sleep 30"#
                 .into(),
             "hartevo-desktop-runtime-fixture".into(),
@@ -3591,7 +4601,6 @@ sleep 30"#
             item_started,
             first_delta,
             second_delta,
-            approval_request,
             item_completed,
             turn_completed,
         ];
@@ -3681,6 +4690,95 @@ sleep 30"#
             provider: "fixture-provider".into(),
             model: "fixture-model".into(),
             command_builder: Box::new(interruptible_runtime_fixture_command),
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_write_approve_runtime_fixture_command(
+        project_root: &Path,
+        runtime_home: &Path,
+    ) -> RuntimeCommand {
+        let project_root = project_root
+            .canonicalize()
+            .expect("canonical fixture project root");
+        let runtime_home = runtime_home
+            .canonicalize()
+            .expect("canonical fixture runtime home");
+        let [
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+        ] = runtime_fixture_start_messages(&project_root, &runtime_home);
+        let [
+            item_started,
+            first_delta,
+            second_delta,
+            item_completed,
+            turn_completed,
+        ] = runtime_fixture_completion_messages();
+        let approval_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "desktop-fixture-local-approval",
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "desktop-fixture-thread",
+                "turnId": "desktop-fixture-turn",
+                "itemId": "desktop-fixture-item",
+                "path": "must-not-be-written.txt",
+            },
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), &project_root);
+        command.args = vec![
+            "-c".into(),
+            r#"IFS= read -r initialize
+case "$initialize" in *'"method":"initialize"'*) ;; *) exit 61 ;; esac
+printf '%s\n' "$1"
+IFS= read -r thread
+case "$thread" in *'"method":"thread/start"'*'"model":"fixture-model"'*) ;; *) exit 62 ;; esac
+printf '%s\n' "$2"
+IFS= read -r turn
+case "$turn" in *'"method":"turn/start"'*'"clientUserMessageId"'*) ;; *) exit 63 ;; esac
+printf '%s\n' "$3"
+printf '%s\n' "$4"
+printf '%s\n' "$5"
+printf '%s\n' "$6"
+printf '%s\n' "$7"
+printf '%s\n' "$8"
+IFS= read -r decision
+case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"accept"'*) ;; *) exit 64 ;; esac
+printf '%s\n' "$9"
+printf '%s\n' "${10}"
+sleep 30"#
+                .into(),
+            "hartevo-desktop-local-write-approve-runtime-fixture".into(),
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+            item_started,
+            first_delta,
+            second_delta,
+            approval_request,
+            item_completed,
+            turn_completed,
+        ];
+        command.environment.insert(
+            "INTERPRETER_HOME".into(),
+            runtime_home.to_string_lossy().into_owned(),
+        );
+        command.openinterpreter_home = Some(runtime_home);
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn local_write_approve_runtime_fixture_source() -> DesktopRuntimeSource {
+        DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(local_write_approve_runtime_fixture_command),
         }
     }
 
@@ -4022,7 +5120,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the Desktop data-plane Journey proves seven deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, and zero Runtime construction"
+        reason = "the Desktop data-plane Journey proves eight deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, typed next-contract resolution, and zero Runtime construction"
     )]
     fn vm11_application_handlers_recover_and_advance_without_constructing_runtime() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -4226,7 +5324,7 @@ sleep 30"#;
                     id: OutcomeEventId::from("desktop-vm11-order-event"),
                     tenant_id,
                     project_id: project_id.clone(),
-                    mission_id: parent_mission_id,
+                    mission_id: parent_mission_id.clone(),
                     kind: OutcomeEventKind::OrderPlaced,
                     provider: "user-review".into(),
                     connection_id: Some(outcome_connection_id),
@@ -4934,6 +6032,152 @@ sleep 30"#;
         .expect("VM-11 event JSON");
         assert!(event_json.contains("mission.outcome_review_decided"));
         assert!(!event_json.contains("one-off parent contract"));
+
+        assert!(matches!(
+            plane.resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("eighth Application handler must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(16),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::Vm11NextContractRouteSpecificCommandRequired
+            ))
+        ));
+        let parent_projection = decided.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == parent_mission_id)
+            .expect("parent Mission projection");
+        let persisted_decision_digest = persisted_decision
+            .digest()
+            .expect("structured decision digest");
+        let next_contract_request = DesktopVm11NextContractResolutionRequest {
+            project_id: project_id.clone(),
+            mission_id: started.mission_id.clone(),
+            expected_mission_revision: decided_projection.revision,
+            expected_checkpoint_revision: decided_projection
+                .current_checkpoint_revision
+                .expect("next-contract Checkpoint revision"),
+            expected_decision_digest: persisted_decision_digest,
+            expected_parent_mission_revision: parent_projection.revision,
+            expected_parent_contract_digest: review_decision_projection
+                .review
+                .source_contract_digest
+                .clone(),
+        };
+        let resolved = plane
+            .resolve_vm11_next_contract_or_valid_terminal_with(
+                &secrets,
+                next_contract_request.clone(),
+                observed_at() + Duration::minutes(17),
+            )
+            .expect("Desktop Stop typed terminal");
+        assert!(matches!(
+            resolved.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                checkpoint_id,
+                ..
+            } if checkpoint_id == "next_contract_or_valid_terminal"
+        ));
+        let resolved_projection = resolved.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("resolved VM-11 projection");
+        assert_eq!(resolved_projection.stage, MissionStage::Completed);
+        assert_eq!(resolved_projection.completed_checkpoint_count, 9);
+        assert_eq!(resolved_projection.current_checkpoint_id, None);
+        assert!(resolved.snapshot.runtime_activity.iter().all(|activity| {
+            activity.mission_id != started.mission_id
+                || (activity.process_claim_status.is_none()
+                    && activity.recovery_status.is_none()
+                    && activity.turn_status.is_none())
+        }));
+        let replayed_terminal = plane
+            .resolve_vm11_next_contract_or_valid_terminal_with(
+                &secrets,
+                next_contract_request.clone(),
+                observed_at() + Duration::minutes(18),
+            )
+            .expect("exact Desktop terminal replay");
+        let replayed_terminal_projection = replayed_terminal.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("replayed terminal projection");
+        assert_eq!(
+            replayed_terminal_projection.revision,
+            resolved_projection.revision
+        );
+        let mut drifted = next_contract_request;
+        drifted.expected_parent_contract_digest = "f".repeat(64);
+        assert!(matches!(
+            plane.resolve_vm11_next_contract_or_valid_terminal_with(
+                &secrets,
+                drifted,
+                observed_at() + Duration::minutes(19),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::Vm11NextContractCommandMismatch
+            ))
+        ));
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(20))
+            .expect("reopen typed terminal");
+        let terminal_mission = service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("durable typed terminal");
+        assert_eq!(terminal_mission.stage, MissionStage::Completed);
+        assert_eq!(terminal_mission.effects.len(), 0);
+        let terminal_completion = terminal_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable eighth-handler completion");
+        assert_eq!(
+            terminal_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.next-contract-or-valid-terminal/v1")
+        );
+        let candidate_learning = terminal_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "candidate_learning")
+            })
+            .expect("durable skipped candidate_learning");
+        assert_eq!(
+            candidate_learning.status,
+            hartevo_domain_kernel::MissionCheckpointStatus::Skipped
+        );
+        let terminal_event_json = serde_json::to_string(
+            &service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("content-free eighth-handler events"),
+        )
+        .expect("eighth-handler event JSON");
+        assert!(terminal_event_json.contains("mission.next_contract_or_valid_terminal_resolved"));
+        assert!(!terminal_event_json.contains("one-off parent contract"));
     }
 
     #[test]
@@ -6244,6 +7488,116 @@ sleep 30"#;
         );
     }
 
+    #[test]
+    fn held_local_write_approve_matches_exact_digest_and_rejects_stale() {
+        let control = DesktopRuntimeCancellation::default();
+        let project_id = ProjectId::from("project-local-approve");
+        let turn_id = RuntimeTurnAttemptId::from("turn-local-approve");
+        control.hold_local_approval(DesktopHeldLocalApproval {
+            project_id: project_id.clone(),
+            turn_id: turn_id.clone(),
+            expected_revision: 4,
+            request_digest: "digest-local-write".into(),
+            kind: RuntimeLocalApprovalKind::FileChange,
+        });
+        assert_eq!(
+            control
+                .held_local_approval()
+                .expect("held request")
+                .request_digest,
+            "digest-local-write"
+        );
+        assert!(matches!(
+            control.approve_held_local_write(&project_id, &turn_id, 4, "stale-digest",),
+            Err(DesktopDataError::RuntimeLocalApprovalMismatch)
+        ));
+        control
+            .approve_held_local_write(&project_id, &turn_id, 4, "digest-local-write")
+            .expect("exact digest approve");
+        assert!(matches!(
+            control.approve_held_local_write(&project_id, &turn_id, 4, "digest-local-write"),
+            Err(DesktopDataError::RuntimeLocalApprovalUnavailable)
+        ));
+        assert_eq!(control.take_local_approval_decision(), Some(true));
+        control.clear_held_local_approval();
+        assert!(control.held_local_approval().is_none());
+        assert!(matches!(
+            control.approve_held_local_write(&project_id, &turn_id, 4, "digest-local-write"),
+            Err(DesktopDataError::RuntimeLocalApprovalUnavailable)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn window_approve_issues_respond_context_runtime_local_approval() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let cancellation = DesktopRuntimeCancellation::default();
+        let approver = {
+            let control = cancellation.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if let Some(held) = control.held_local_approval() {
+                        control
+                            .approve_held_local_write(
+                                &held.project_id,
+                                &held.turn_id,
+                                held.expected_revision,
+                                &held.request_digest,
+                            )
+                            .expect("window Approve of exact held digest");
+                        return;
+                    }
+                    std::thread::sleep(StdDuration::from_millis(50));
+                }
+                panic!("window Approve never saw a held Runtime local-write request");
+            })
+        };
+        let submission = plane
+            .start_catalog_mission_and_run_with_cancellation(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Window Approve local write".into()),
+                    goal: "Hold one exact local write for window Approve".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(local_write_approve_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                Some(&cancellation),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("window Approve completes the live Runtime turn");
+        approver.join().expect("approver thread");
+        assert!(matches!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        let phases = cancellation
+            .progress_since(0)
+            .into_iter()
+            .map(|event| event.phase)
+            .collect::<Vec<_>>();
+        assert!(
+            phases.contains(&DesktopRuntimeProgressPhase::WaitingLocalApproval),
+            "missing WaitingLocalApproval in {phases:?}"
+        );
+        assert!(
+            phases.contains(&DesktopRuntimeProgressPhase::LocalActionApproved),
+            "missing LocalActionApproved in {phases:?}"
+        );
+        assert!(!phases.contains(&DesktopRuntimeProgressPhase::LocalActionDeclined));
+        assert!(cancellation.held_local_approval().is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     #[allow(
@@ -7104,6 +8458,346 @@ sleep 30"#;
     }
 
     #[test]
+    fn data_plane_mounts_cordis_host_as_the_live_loop() {
+        use chrono::{Duration, TimeZone, Utc};
+        use hartevo_cordis::{
+            AgentStep, CordisError, DomainSurface, OPENINTERPRETER, SurfaceOwner,
+            host_is_cordis_loop, invariant_missing,
+        };
+        use hartevo_domain_kernel::{
+            ActorId, Approval, ApprovalDecision, ApprovalId, ConsentState,
+        };
+
+        let directory = tempfile::tempdir().expect("directory");
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("data plane");
+        plane.with_cordis_host(|host| {
+            host_is_cordis_loop(host).unwrap();
+            let domain = host.context().domain::<DomainSurface>().unwrap();
+            assert_eq!(domain.owner, SurfaceOwner::Hartevo);
+            assert!(!domain.consent);
+            assert!(!domain.approved);
+            assert_eq!(
+                host.step(AgentStep::new("mission-plane", "plan"))
+                    .unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert_eq!(
+                host.apply_effect().unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert!(
+                host.context().get::<String>(OPENINTERPRETER).is_none()
+                    || host.runtime_plugin() == Some(OPENINTERPRETER)
+            );
+        });
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 25, 13, 34, 33).unwrap();
+        plane
+            .bind_live_domain_kernel(
+                &ConsentState::Confirmed,
+                None,
+                Some(&Approval {
+                    id: ApprovalId::from("approval-plane"),
+                    decision: ApprovalDecision::Approved,
+                    decided_by: ActorId::from("user-plane"),
+                    decided_at: now,
+                    valid_until: now + Duration::minutes(5),
+                    scope_digest: "a".repeat(64),
+                    permission_digest: "b".repeat(64),
+                }),
+                now,
+            )
+            .unwrap();
+        let out = plane
+            .with_cordis_host(|host| host.step(AgentStep::new("mission-plane", "plan")))
+            .unwrap();
+        assert_eq!(out.id, "mission-plane");
+        plane.with_cordis_host(|host| host.apply_effect()).unwrap();
+    }
+
+    #[test]
+    fn uninitialized_and_fresh_initialize_keep_host_mounted_and_fail_closed() {
+        let directory = tempfile::tempdir().expect("directory");
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("data plane");
+        let secrets = MemorySecretStore::default();
+        let DesktopLoadState::Uninitialized { .. } = plane
+            .load_with(&secrets, observed_at())
+            .expect("honest first-run state")
+        else {
+            panic!("first run must not create a database or key implicitly");
+        };
+        assert_host_fail_closed_on_consent(&plane);
+        assert_eq!(
+            plane
+                .step(
+                    &secrets,
+                    AgentStep::new("mission-uninitialized", "plan"),
+                    observed_at(),
+                )
+                .unwrap_err()
+                .to_string(),
+            DesktopDataError::Cordis(CordisError::MissingDependencies(vec![
+                hartevo_cordis::invariant_missing::CONSENT.to_string()
+            ]))
+            .to_string()
+        );
+        assert_eq!(
+            plane
+                .apply_effect(&secrets, observed_at())
+                .unwrap_err()
+                .to_string(),
+            DesktopDataError::Cordis(CordisError::MissingDependencies(vec![
+                hartevo_cordis::invariant_missing::CONSENT.to_string()
+            ]))
+            .to_string()
+        );
+
+        plane
+            .initialize_with(&secrets, observed_at())
+            .expect("explicit initialization");
+        assert_host_fail_closed_on_consent(&plane);
+        assert!(matches!(
+            plane.step(
+                &secrets,
+                AgentStep::new("mission-initialized", "plan"),
+                observed_at(),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [hartevo_cordis::invariant_missing::CONSENT]
+        ));
+        assert!(matches!(
+            plane.apply_effect(&secrets, observed_at()),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [hartevo_cordis::invariant_missing::CONSENT]
+        ));
+    }
+
+    #[test]
+    fn production_load_binds_live_grant_and_in_window_approval() {
+        use hartevo_cordis::{DomainSurface, host_is_cordis_loop, invariant_missing};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let data_root = directory.path().join("desktop-data");
+        let project_root = directory.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
+        let secrets = MemorySecretStore::default();
+        plane
+            .initialize_with(&secrets, observed_at())
+            .expect("initialize");
+        let (project_id, tenant_id) = create_kernel_bind_project(
+            &plane,
+            &secrets,
+            &project_root,
+            "live",
+            observed_at() + Duration::minutes(1),
+        );
+        let (person_id, consent_id, mission_id) = grant_live_consent(&LiveConsentGrant {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            tenant_id: &tenant_id,
+            suffix: "live",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::days(30)),
+        });
+        approve_live_preview(&LivePreviewApproval {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            person_id,
+            consent_id: &consent_id,
+            mission_id: &mission_id,
+            suffix: "live",
+            now: observed_at() + Duration::minutes(2),
+        });
+
+        let DesktopLoadState::Ready(_) = plane
+            .load_with(&secrets, observed_at() + Duration::minutes(3))
+            .expect("reload binds live kernel facts")
+        else {
+            panic!("initialized database must reopen");
+        };
+        plane.with_cordis_host(|host| {
+            host_is_cordis_loop(host).unwrap();
+            let domain = host.context().domain::<DomainSurface>().unwrap();
+            assert!(domain.consent);
+            assert!(domain.approved);
+        });
+        let out = plane
+            .step(
+                &secrets,
+                AgentStep::new("mission-live", "plan"),
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("production step after live bind");
+        assert_eq!(out.id, "mission-live");
+        plane
+            .apply_effect(&secrets, observed_at() + Duration::minutes(3))
+            .expect("production apply_effect after live bind");
+
+        let consent_only = DesktopDataPlane::at_data_root(directory.path().join("consent-only"))
+            .expect("consent-only plane");
+        let consent_secrets = MemorySecretStore::default();
+        consent_only
+            .initialize_with(&consent_secrets, observed_at())
+            .expect("initialize");
+        let consent_root = directory.path().join("consent-only-project");
+        fs::create_dir(&consent_root).expect("consent-only project root");
+        let (consent_project, consent_tenant) = create_kernel_bind_project(
+            &consent_only,
+            &consent_secrets,
+            &consent_root,
+            "consent-only",
+            observed_at() + Duration::minutes(1),
+        );
+        grant_live_consent(&LiveConsentGrant {
+            plane: &consent_only,
+            secrets: &consent_secrets,
+            project_id: &consent_project,
+            tenant_id: &consent_tenant,
+            suffix: "consent-only",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::days(30)),
+        });
+        consent_only
+            .load_with(&consent_secrets, observed_at() + Duration::minutes(3))
+            .expect("reload consent-only");
+        assert!(matches!(
+            consent_only.step(
+                &consent_secrets,
+                AgentStep::new("mission-consent-only", "plan"),
+                observed_at() + Duration::minutes(3),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [invariant_missing::APPROVAL]
+        ));
+    }
+
+    #[test]
+    fn withdrawn_kernel_facts_stay_fail_closed() {
+        use hartevo_cordis::invariant_missing;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("data plane");
+        let secrets = MemorySecretStore::default();
+        plane
+            .initialize_with(&secrets, observed_at())
+            .expect("initialize");
+        let project_root = directory.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let (project_id, tenant_id) = create_kernel_bind_project(
+            &plane,
+            &secrets,
+            &project_root,
+            "withdrawn",
+            observed_at() + Duration::minutes(1),
+        );
+        let (person_id, consent_id, mission_id) = grant_live_consent(&LiveConsentGrant {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            tenant_id: &tenant_id,
+            suffix: "withdrawn",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::days(30)),
+        });
+        approve_live_preview(&LivePreviewApproval {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            person_id,
+            consent_id: &consent_id,
+            mission_id: &mission_id,
+            suffix: "withdrawn",
+            now: observed_at() + Duration::minutes(2),
+        });
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("application");
+        service
+            .withdraw_consent(
+                &project_id,
+                &consent_id,
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("withdraw");
+        drop(service);
+        plane
+            .load_with(&secrets, observed_at() + Duration::minutes(5))
+            .expect("reload withdrawn");
+        assert!(matches!(
+            plane.step(
+                &secrets,
+                AgentStep::new("mission-withdrawn", "plan"),
+                observed_at() + Duration::minutes(5),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [invariant_missing::CONSENT]
+        ));
+    }
+
+    #[test]
+    fn expired_kernel_facts_stay_fail_closed() {
+        use hartevo_cordis::invariant_missing;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let expired = DesktopDataPlane::at_data_root(directory.path().join("expired"))
+            .expect("expired plane");
+        let expired_secrets = MemorySecretStore::default();
+        expired
+            .initialize_with(&expired_secrets, observed_at())
+            .expect("initialize");
+        let expired_root = directory.path().join("expired-project");
+        fs::create_dir(&expired_root).expect("expired project root");
+        let (expired_project, expired_tenant) = create_kernel_bind_project(
+            &expired,
+            &expired_secrets,
+            &expired_root,
+            "expired",
+            observed_at() + Duration::minutes(1),
+        );
+        let (person_id, consent_id, mission_id) = grant_live_consent(&LiveConsentGrant {
+            plane: &expired,
+            secrets: &expired_secrets,
+            project_id: &expired_project,
+            tenant_id: &expired_tenant,
+            suffix: "expired",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::minutes(3)),
+        });
+        approve_live_preview(&LivePreviewApproval {
+            plane: &expired,
+            secrets: &expired_secrets,
+            project_id: &expired_project,
+            person_id,
+            consent_id: &consent_id,
+            mission_id: &mission_id,
+            suffix: "expired",
+            now: observed_at() + Duration::minutes(2),
+        });
+        expired
+            .load_with(&expired_secrets, observed_at() + Duration::minutes(4))
+            .expect("reload expired");
+        assert!(matches!(
+            expired.step(
+                &expired_secrets,
+                AgentStep::new("mission-expired", "plan"),
+                observed_at() + Duration::minutes(4),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [invariant_missing::CONSENT]
+                    || missing == [invariant_missing::APPROVAL]
+        ));
+    }
+
+    #[test]
     fn explicit_initialization_and_application_inventory_survive_restart() {
         let directory = tempfile::tempdir().expect("directory");
         let data_root = directory.path().join("desktop-data");
@@ -7628,5 +9322,510 @@ sleep 30"#;
             DesktopDataPlane::at_data_root(&link_root),
             Err(DesktopDataError::InvalidDataRoot(path)) if path == link_root
         ));
+    }
+
+    fn propose_waiting_approval_preview(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        suffix: &str,
+        now: DateTime<Utc>,
+    ) -> (MissionId, EffectId, String, u64) {
+        let started = plane
+            .start_mission_with(
+                secrets,
+                project_id,
+                "准备受控预览；等待精确 digest 审批，禁止执行外部动作",
+                now,
+            )
+            .expect("WaitingApproval Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("application");
+        let effect_id = EffectId::from_stable(format!("desktop-waiting-approval-{suffix}"));
+        service
+            .propose_preview_effect(
+                project_id,
+                &mission_id,
+                ProposePreviewEffect {
+                    effect_id: effect_id.clone(),
+                    actor_id: ActorId::from("desktop-waiting-approval-actor"),
+                    capability: "channel.preview".into(),
+                    provider: "fixture-provider".into(),
+                    connection_id: None,
+                    account_id: None,
+                    required_scopes: BTreeSet::new(),
+                    description: "Publish exact preview after window grant".into(),
+                    target_resource: "preview://desktop-waiting-approval".into(),
+                    audience_digest: None,
+                    payload_digest: "1".repeat(64),
+                    asset_digests: BTreeSet::new(),
+                    scheduled_for: None,
+                    timezone: "UTC".into(),
+                    consent: ConsentState::NotRequired,
+                    consent_record_id: None,
+                    consent_requirement: None,
+                    policy_version: "policy-v1".into(),
+                    amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
+                    idempotency_key: format!("desktop-waiting-approval-{suffix}"),
+                    expires_in: Duration::hours(1),
+                },
+                now + Duration::seconds(2),
+            )
+            .expect("proposed Effect");
+        let mission = service
+            .load_mission(project_id, &mission_id)
+            .expect("WaitingApproval Mission after propose");
+        let effect = mission.effect(&effect_id).expect("proposed Effect");
+        assert_eq!(mission.stage, MissionStage::WaitingApproval);
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        (
+            mission_id,
+            effect_id,
+            effect.approval_digest(),
+            mission.revision,
+        )
+    }
+
+    #[test]
+    fn waiting_approval_window_grant_records_approval_without_executing_effect() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(2);
+        let (mission_id, effect_id, scope_digest, revision) =
+            propose_waiting_approval_preview(&plane, &secrets, &project_id, "grant", now);
+        let request = DesktopWaitingApprovalGrantRequest {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: effect_id.clone(),
+            expected_scope_digest: scope_digest.clone(),
+            expected_mission_revision: revision,
+        };
+        let granted = plane
+            .grant_waiting_approval_with(&secrets, request.clone(), now + Duration::seconds(3))
+            .expect("production WaitingApproval grant");
+        let projected = granted.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("granted Mission projection");
+        assert_eq!(projected.stage, MissionStage::Running);
+        assert_eq!(projected.pending_approval_count, 0);
+        assert!(projected.pending_effects.is_empty());
+        assert_eq!(projected.verified_effect_count, 0);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("reopen after grant");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("durable granted Mission");
+        let effect = mission.effect(&effect_id).expect("granted Effect");
+        let approval = effect.approval.as_ref().expect("Domain Kernel Approval");
+        assert_eq!(effect.status, EffectStatus::Approved);
+        assert_eq!(approval.decision, ApprovalDecision::Approved);
+        assert_eq!(approval.scope_digest, scope_digest);
+        assert!(approval.valid_until > now + Duration::seconds(3));
+        assert!(effect.receipt.is_none());
+        assert!(effect.verification.is_none());
+        let events_before_replay = service
+            .mission_events(&project_id, &mission_id)
+            .expect("grant events");
+        assert_eq!(
+            events_before_replay
+                .iter()
+                .filter(|event| event.event_type == "approval.decided")
+                .count(),
+            1
+        );
+        let event_json = serde_json::to_string(&events_before_replay).expect("event JSON");
+        assert!(!event_json.contains("Receipt"));
+        assert!(!event_json.contains("Verification"));
+
+        let replay_request = DesktopWaitingApprovalGrantRequest {
+            expected_mission_revision: projected.revision,
+            ..request
+        };
+        let replayed = plane
+            .grant_waiting_approval_with(&secrets, replay_request, now + Duration::seconds(5))
+            .expect("exact grant replay");
+        let replayed_projection = replayed.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("replayed Mission projection");
+        assert_eq!(replayed_projection.revision, projected.revision);
+        assert_eq!(replayed_projection.pending_approval_count, 0);
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(6))
+            .expect("reopen after replay");
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged replay events"),
+            events_before_replay
+        );
+        let replayed_effect = service
+            .load_mission(&project_id, &mission_id)
+            .expect("replayed Mission")
+            .effect(&effect_id)
+            .expect("replayed Effect")
+            .clone();
+        assert_eq!(replayed_effect.status, EffectStatus::Approved);
+        assert!(replayed_effect.receipt.is_none());
+        assert!(replayed_effect.verification.is_none());
+    }
+
+    #[test]
+    fn waiting_approval_grant_cas_mismatches_refuse_without_mutating_mission() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let (mission_id, effect_id, scope_digest, revision) =
+            propose_waiting_approval_preview(&plane, &secrets, &project_id, "cas", now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(3))
+            .expect("baseline before CAS refusals");
+        let before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("unmutated Mission");
+        let events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("baseline events");
+
+        let swapped = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: "a".repeat(64),
+                expected_mission_revision: revision,
+            },
+            now + Duration::seconds(4),
+        );
+        assert!(matches!(
+            swapped,
+            Err(DesktopDataError::Application(
+                ApplicationError::ProposedEffectApprovalDigestMismatch
+            ))
+        ));
+
+        let stale_revision = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: scope_digest.clone(),
+                expected_mission_revision: revision.saturating_add(1),
+            },
+            now + Duration::seconds(5),
+        );
+        assert!(matches!(
+            stale_revision,
+            Err(DesktopDataError::Application(
+                ApplicationError::MissionRevisionMismatch { expected, actual }
+            )) if expected == revision.saturating_add(1) && actual == revision
+        ));
+
+        let sample_digest = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: "SAMPLE-r1-not-an-effect-digest".into(),
+                expected_mission_revision: revision,
+            },
+            now + Duration::seconds(6),
+        );
+        assert!(matches!(
+            sample_digest,
+            Err(DesktopDataError::InvalidWaitingApprovalGrant)
+        ));
+
+        let expired = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: scope_digest,
+                expected_mission_revision: revision,
+            },
+            now + Duration::hours(2),
+        );
+        assert!(expired.is_err());
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(7))
+            .expect("reopen after CAS refusals");
+        let after = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission after refusals");
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.stage, MissionStage::WaitingApproval);
+        let effect = after.effect(&effect_id).expect("still Proposed");
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        assert!(effect.approval.is_none());
+        assert!(effect.receipt.is_none());
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged events"),
+            events_before
+        );
+    }
+
+    fn persist_user_held_browser_workspace(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> (BrowserWorkspaceId, u64, u64) {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let profile = service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("profile-desktop-continue"),
+                    project_id: project_id.clone(),
+                    credential_reference: "keychain://desktop-continue/profile".into(),
+                    provider: "fixture-provider".into(),
+                    account_id: AccountId::from("account-desktop-continue"),
+                    identity_digest: "1".repeat(64),
+                    probe_digest: "2".repeat(64),
+                },
+                now,
+            )
+            .expect("profile");
+        let workspace = service
+            .create_browser_workspace(
+                CreateBrowserWorkspace {
+                    id: BrowserWorkspaceId::from("workspace-desktop-continue"),
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    profile_id: profile.id.clone(),
+                    initial_tab_id: BrowserTabId::from("tab-desktop-continue"),
+                    lease_id: BrowserControlLeaseId::from("lease-desktop-continue-1"),
+                    lease_expires_at: now + Duration::hours(1),
+                    evidence_digest: "3".repeat(64),
+                },
+                now,
+            )
+            .expect("workspace");
+        let mut host = FakeBrowserHost::new();
+        host.register_workspace(
+            profile,
+            workspace.clone(),
+            vec![hartevo_browser_adapter::FakeBrowserPage {
+                tab_id: BrowserTabId::from("tab-desktop-continue"),
+                identity_digest: "1".repeat(64),
+                url_digest: "4".repeat(64),
+                origin_digest: "5".repeat(64),
+                content_digest: "6".repeat(64),
+                redaction_digest: "7".repeat(64),
+                document_generation: 1,
+                prompt_risk: hartevo_browser_adapter::BrowserPromptRisk::None,
+                element_refs: Vec::new(),
+            }],
+        )
+        .expect("register host");
+        let taken = service
+            .take_over_browser_workspace(
+                &mut host,
+                TakeOverBrowserWorkspace {
+                    project_id: project_id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    expected_revision: workspace.revision,
+                    expected_generation: workspace.lease_generation,
+                    new_lease_id: BrowserControlLeaseId::from("lease-desktop-continue-2"),
+                    evidence_digest: "b".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("user-held lease");
+        assert_eq!(taken.control_state, BrowserControlState::UserControlled);
+        (taken.id, taken.revision, taken.lease_generation)
+    }
+
+    #[test]
+    fn continue_without_mission_workspace_stays_empty() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(2);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "没有 Browser Workspace 时 Continue 必须失败关闭",
+                now,
+            )
+            .expect("mission");
+        let mission = &started.inventory.projects[0].missions[0];
+        assert!(mission.browser_workspace.is_none());
+        let refused = plane.continue_browser_workspace_with(
+            &secrets,
+            DesktopContinueBrowserWorkspaceRequest {
+                project_id: project_id.clone(),
+                mission_id: mission.mission_id.clone(),
+                workspace_id: BrowserWorkspaceId::from("workspace-does-not-exist"),
+                expected_revision: 1,
+                expected_generation: 1,
+            },
+            now + Duration::seconds(1),
+        );
+        assert!(matches!(
+            refused,
+            Err(DesktopDataError::BrowserWorkspaceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn continue_on_agent_held_workspace_stays_disabled() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "Agent-held Continue 在 Take over 前保持 NOT_IMPLEMENTED",
+                now,
+            )
+            .expect("mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("application");
+        let profile = service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("profile-desktop-agent-held"),
+                    project_id: project_id.clone(),
+                    credential_reference: "keychain://desktop-continue/agent-held".into(),
+                    provider: "fixture-provider".into(),
+                    account_id: AccountId::from("account-desktop-agent-held"),
+                    identity_digest: "1".repeat(64),
+                    probe_digest: "2".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("profile");
+        let workspace = service
+            .create_browser_workspace(
+                CreateBrowserWorkspace {
+                    id: BrowserWorkspaceId::from("workspace-desktop-agent-held"),
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    profile_id: profile.id.clone(),
+                    initial_tab_id: BrowserTabId::from("tab-desktop-agent-held"),
+                    lease_id: BrowserControlLeaseId::from("lease-desktop-agent-held-1"),
+                    lease_expires_at: now + Duration::hours(1),
+                    evidence_digest: "3".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("agent-held workspace");
+        assert_eq!(
+            workspace.control_state,
+            BrowserControlState::AgentControlled
+        );
+        let refused = plane.continue_browser_workspace_with(
+            &secrets,
+            DesktopContinueBrowserWorkspaceRequest {
+                project_id: project_id.clone(),
+                mission_id,
+                workspace_id: workspace.id,
+                expected_revision: workspace.revision,
+                expected_generation: workspace.lease_generation,
+            },
+            now + Duration::seconds(2),
+        );
+        assert!(matches!(
+            refused,
+            Err(DesktopDataError::BrowserWorkspaceContinueNotHeld)
+        ));
+    }
+
+    #[test]
+    fn continue_user_held_workspace_issues_continue_browser_workspace() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(4);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "用户持有 lease 后 Continue 走 Application continue_browser_workspace",
+                now,
+            )
+            .expect("mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let (workspace_id, revision, generation) = persist_user_held_browser_workspace(
+            &plane,
+            &secrets,
+            &project_id,
+            &mission_id,
+            now + Duration::seconds(1),
+        );
+        let continued = plane
+            .continue_browser_workspace_with(
+                &secrets,
+                DesktopContinueBrowserWorkspaceRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: revision,
+                    expected_generation: generation,
+                },
+                now + Duration::seconds(3),
+            )
+            .expect("Continue through Application");
+        let projected = continued.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("continued Mission")
+            .browser_workspace
+            .as_ref()
+            .expect("continued workspace");
+        assert_eq!(projected.workspace_id, workspace_id);
+        assert_eq!(
+            projected.control_state,
+            BrowserControlState::AgentControlled
+        );
+        assert_eq!(projected.revision, revision.saturating_add(1));
+        assert_eq!(projected.lease_generation, generation.saturating_add(1));
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("reopen");
+        let durable = service
+            .load_browser_workspace(&project_id, &workspace_id)
+            .expect("durable continued workspace");
+        assert_eq!(durable.control_state, BrowserControlState::AgentControlled);
+        assert_eq!(durable.lease_generation, generation.saturating_add(1));
+        assert!(
+            durable
+                .agent_lease_proof(now + Duration::seconds(4))
+                .is_ok()
+        );
     }
 }
