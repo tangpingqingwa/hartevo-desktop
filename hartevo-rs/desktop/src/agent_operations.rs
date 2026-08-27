@@ -1,20 +1,22 @@
 //! Read-only Agent Operations Workbench model for Desktop.
 //!
-//! OI-01, CAP-01, CTX-01 and BW-01 own the durable control-plane records that
-//! will eventually fill these panels.  Until those APIs land, this module
-//! projects only existing Application/Desktop facts and represents every
-//! unavailable field as an honest typed state.  It has no persistence,
-//! runtime loop, browser control, approval authority or Effect path.
+//! OI-01, CAP-01 and CTX-01 own remaining control-plane records that will
+//! eventually fill these panels. Browser Continue reads the durable
+//! Mission-bound workspace projection and stays empty until a user-held lease
+//! exists. This module has no persistence, runtime loop, approval authority or
+//! Effect path.
 
 use hartevo_application::{
-    DesktopProjectProjection, MissionProjection, MissionRuntimeProjection, WorkProductProjection,
+    BrowserWorkspaceProjection as DurableBrowserWorkspaceProjection, DesktopProjectProjection,
+    MissionProjection, MissionRuntimeProjection, WorkProductProjection,
 };
+use hartevo_browser_adapter::BrowserControlState;
 use hartevo_domain_kernel::{
-    MissionStage, RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus,
-    WorkProductStatus,
+    BrowserWorkspaceId, MissionStage, RuntimeProcessClaimStatus, RuntimeRecoveryStatus,
+    RuntimeTurnStatus, WorkProductStatus,
 };
 
-use crate::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+use crate::{DesktopHeldLocalApproval, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationsStatus {
@@ -147,6 +149,8 @@ pub struct ApprovalEffectProjection {
     pub external_status: OperationsStatus,
     pub local_runtime_status: OperationsStatus,
     pub local_runtime_detail: String,
+    pub local_runtime_approve_status: OperationsStatus,
+    pub local_runtime_request_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +159,10 @@ pub struct BrowserWorkspaceProjection {
     pub identity: String,
     pub control_owner: String,
     pub next_action: String,
+    pub workspace_id: Option<BrowserWorkspaceId>,
+    pub revision: Option<u64>,
+    pub lease_generation: Option<u64>,
+    pub continue_status: OperationsStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,6 +197,7 @@ impl AgentOperationsWorkbenchProjection {
         mission: Option<&MissionProjection>,
         runtime_activity: Option<&MissionRuntimeProjection>,
         runtime: Option<&DesktopRuntimeProjection>,
+        held_local_approval: Option<&DesktopHeldLocalApproval>,
     ) -> Self {
         let project_name =
             project.map_or_else(|| "未选择 Project".into(), |project| project.name.clone());
@@ -202,7 +211,7 @@ impl AgentOperationsWorkbenchProjection {
                 .map(artifact_projection)
                 .collect()
         });
-        let approvals = approval_projection(mission, runtime_activity);
+        let approvals = approval_projection(mission, runtime_activity, held_local_approval);
         let browser = browser_projection(mission);
         let recovery = recovery_projection(runtime_activity);
         let quick_entry = QuickEntryProjection {
@@ -554,15 +563,15 @@ fn artifact_status(status: &WorkProductStatus) -> OperationsStatus {
 fn approval_projection(
     mission: Option<&MissionProjection>,
     runtime_activity: Option<&MissionRuntimeProjection>,
+    held_local_approval: Option<&DesktopHeldLocalApproval>,
 ) -> ApprovalEffectProjection {
     let external_approval_count = mission.map_or(0, |mission| mission.pending_approval_count);
     let verified_effect_count = mission.map_or(0, |mission| mission.verified_effect_count);
-    let local_runtime_status = match runtime_activity.and_then(|activity| activity.turn_status) {
-        Some(RuntimeTurnStatus::WaitingLocalApproval | RuntimeTurnStatus::ApprovalResponding) => {
-            OperationsStatus::WaitingApproval
-        }
-        Some(_) | None => OperationsStatus::Empty,
-    };
+    let waiting_local = matches!(
+        runtime_activity.and_then(|activity| activity.turn_status),
+        Some(RuntimeTurnStatus::WaitingLocalApproval | RuntimeTurnStatus::ApprovalResponding)
+    ) || held_local_approval.is_some();
+    let local_runtime_approve_ready = held_local_approval.is_some();
     ApprovalEffectProjection {
         external_approval_count,
         verified_effect_count,
@@ -571,26 +580,119 @@ fn approval_projection(
         } else {
             OperationsStatus::Empty
         },
-        local_runtime_status,
-        local_runtime_detail: "Local Runtime approval is separate from external Effect approval."
-            .into(),
+        local_runtime_status: if waiting_local {
+            OperationsStatus::WaitingApproval
+        } else {
+            OperationsStatus::Empty
+        },
+        local_runtime_detail: if local_runtime_approve_ready {
+            "Approve issues Application respond_context_runtime_local_approval for the exact held digest."
+                .into()
+        } else if waiting_local {
+            "Local Runtime write is waiting; the live turn must hold an exact digest before Approve."
+                .into()
+        } else {
+            "Local Runtime approval is separate from external Effect approval.".into()
+        },
+        local_runtime_approve_status: if local_runtime_approve_ready {
+            OperationsStatus::Ready
+        } else if waiting_local {
+            OperationsStatus::WaitingApproval
+        } else {
+            OperationsStatus::Empty
+        },
+        local_runtime_request_digest: held_local_approval.map(|held| held.request_digest.clone()),
     }
 }
 
 fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspaceProjection {
-    if mission.is_none() {
+    let Some(mission) = mission else {
         return BrowserWorkspaceProjection {
             status: OperationsStatus::Empty,
             identity: "No Mission-bound Browser Workspace".into(),
             control_owner: "No owner".into(),
             next_action: "Select a Mission".into(),
+            workspace_id: None,
+            revision: None,
+            lease_generation: None,
+            continue_status: OperationsStatus::Empty,
         };
+    };
+    let Some(workspace) = mission.browser_workspace.as_ref() else {
+        return BrowserWorkspaceProjection {
+            status: OperationsStatus::Empty,
+            identity: "No Mission-bound Browser Workspace".into(),
+            control_owner: "No owner".into(),
+            next_action: "Continue stays empty until a durable workspace exists".into(),
+            workspace_id: None,
+            revision: None,
+            lease_generation: None,
+            continue_status: OperationsStatus::Empty,
+        };
+    };
+    match workspace.control_state {
+        BrowserControlState::UserControlled => BrowserWorkspaceProjection {
+            status: OperationsStatus::WaitingUser,
+            identity: short_identity_digest(&workspace.identity_digest),
+            control_owner: "User holds the current lease".into(),
+            next_action: "Continue issues Application continue_browser_workspace".into(),
+            workspace_id: Some(workspace.workspace_id.clone()),
+            revision: Some(workspace.revision),
+            lease_generation: Some(workspace.lease_generation),
+            continue_status: OperationsStatus::Ready,
+        },
+        BrowserControlState::AgentControlled => browser_workspace_view(
+            workspace,
+            OperationsStatus::Active,
+            "Agent holds the current lease",
+            "Take over remains NOT_IMPLEMENTED; Continue stays disabled",
+            OperationsStatus::NotImplemented,
+        ),
+        BrowserControlState::PausedAgent | BrowserControlState::PausedUser => {
+            browser_workspace_view(
+                workspace,
+                OperationsStatus::WaitingUser,
+                "Workspace is paused",
+                "Pause/Resume remains NOT_IMPLEMENTED; Continue stays disabled",
+                OperationsStatus::NotImplemented,
+            )
+        }
+        BrowserControlState::Completed
+        | BrowserControlState::KeptForUser
+        | BrowserControlState::Closed => browser_workspace_view(
+            workspace,
+            OperationsStatus::Empty,
+            "Workspace is terminal",
+            "Continue does not reopen a closed workspace",
+            OperationsStatus::Empty,
+        ),
     }
+}
+
+fn browser_workspace_view(
+    workspace: &DurableBrowserWorkspaceProjection,
+    status: OperationsStatus,
+    control_owner: &str,
+    next_action: &str,
+    continue_status: OperationsStatus,
+) -> BrowserWorkspaceProjection {
     BrowserWorkspaceProjection {
-        status: OperationsStatus::NotImplemented,
-        identity: "No active authenticated profile".into(),
-        control_owner: "User control is required".into(),
-        next_action: "BW-01 must establish exact profile and takeover lease".into(),
+        status,
+        identity: short_identity_digest(&workspace.identity_digest),
+        control_owner: control_owner.into(),
+        next_action: next_action.into(),
+        workspace_id: Some(workspace.workspace_id.clone()),
+        revision: Some(workspace.revision),
+        lease_generation: Some(workspace.lease_generation),
+        continue_status,
+    }
+}
+
+fn short_identity_digest(digest: &str) -> String {
+    if digest.len() >= 12 {
+        format!("identity {}", &digest[..12])
+    } else {
+        "Mission-bound identity".into()
     }
 }
 
@@ -718,13 +820,56 @@ mod tests {
             last_updated_at: None,
             requires_reconciliation: false,
         };
-        let approval = approval_projection(None, Some(&activity));
+        let approval = approval_projection(None, Some(&activity), None);
         assert_eq!(approval.external_status, OperationsStatus::Empty);
         assert_eq!(
             approval.local_runtime_status,
             OperationsStatus::WaitingApproval
         );
-        assert!(approval.local_runtime_detail.contains("separate"));
+        assert_eq!(
+            approval.local_runtime_approve_status,
+            OperationsStatus::WaitingApproval
+        );
+        assert!(approval.local_runtime_detail.contains("exact digest"));
+    }
+
+    #[test]
+    fn held_local_runtime_digest_makes_window_approve_ready() {
+        let activity = MissionRuntimeProjection {
+            project_id: "project".into(),
+            mission_id: "mission".into(),
+            process_claim_status: None,
+            process_cleanup_attempt_count: 0,
+            recovery_status: None,
+            recovery_failure_count: 0,
+            recovery_process_attempt: None,
+            turn_status: Some(RuntimeTurnStatus::WaitingLocalApproval),
+            turn_failure_count: 0,
+            turn_evidence_count: 0,
+            last_updated_at: None,
+            requires_reconciliation: false,
+        };
+        let held = DesktopHeldLocalApproval {
+            project_id: hartevo_domain_kernel::ProjectId::from("project"),
+            turn_id: hartevo_domain_kernel::RuntimeTurnAttemptId::from("turn"),
+            expected_revision: 7,
+            request_digest: "digest-local-write".into(),
+            kind: hartevo_runtime_adapter::RuntimeLocalApprovalKind::FileChange,
+        };
+        let approval = approval_projection(None, Some(&activity), Some(&held));
+        assert_eq!(
+            approval.local_runtime_approve_status,
+            OperationsStatus::Ready
+        );
+        assert_eq!(
+            approval.local_runtime_request_digest.as_deref(),
+            Some("digest-local-write")
+        );
+        assert!(
+            approval
+                .local_runtime_detail
+                .contains("respond_context_runtime_local_approval")
+        );
     }
 
     #[test]
@@ -748,6 +893,76 @@ mod tests {
         assert!(!recovery.detail.contains("success"));
         let workers = worker_projection(None, Some(&activity));
         assert!(workers.is_empty());
+    }
+
+    #[test]
+    fn browser_continue_stays_empty_without_a_mission_bound_workspace() {
+        let mission = MissionProjection {
+            surface: "orchestrator".into(),
+            project_id: "project".into(),
+            mission_id: "mission".into(),
+            title: "goal".into(),
+            goal: "goal".into(),
+            manifest_id: None,
+            manifest_version: None,
+            catalog_digest: None,
+            current_checkpoint_id: None,
+            current_checkpoint_status: None,
+            current_checkpoint_revision: None,
+            current_checkpoint_capability_id: None,
+            current_checkpoint_executor: None,
+            current_checkpoint_application_handler_status: None,
+            current_checkpoint_application_handler_id: None,
+            current_checkpoint_oracle_ids: std::collections::BTreeSet::default(),
+            current_checkpoint_completion_policy: None,
+            browser_workspace: None,
+            completed_checkpoint_count: 0,
+            checkpoint_count: 0,
+            cycle: 1,
+            schedule: None,
+            conversation_id: None,
+            conversation_revision: None,
+            conversation_messages: Vec::new(),
+            stage: MissionStage::Running,
+            revision: 1,
+            evidence_count: 0,
+            work_product_count: 0,
+            work_products: Vec::new(),
+            pending_approval_count: 0,
+            pending_effects: Vec::new(),
+            verified_effect_count: 0,
+            outcome_summary: None,
+            vm11_outcome_review: None,
+        };
+        let empty = browser_projection(Some(&mission));
+        assert_eq!(empty.status, OperationsStatus::Empty);
+        assert_eq!(empty.continue_status, OperationsStatus::Empty);
+        assert!(empty.workspace_id.is_none());
+
+        let mut held = mission.clone();
+        held.browser_workspace = Some(DurableBrowserWorkspaceProjection {
+            workspace_id: BrowserWorkspaceId::from("workspace-held"),
+            profile_id: "profile-held".into(),
+            identity_digest: "a".repeat(64),
+            control_state: BrowserControlState::UserControlled,
+            revision: 2,
+            lease_generation: 2,
+        });
+        let ready = browser_projection(Some(&held));
+        assert_eq!(ready.continue_status, OperationsStatus::Ready);
+        assert_eq!(ready.status, OperationsStatus::WaitingUser);
+
+        held.browser_workspace
+            .as_mut()
+            .expect("workspace")
+            .control_state = BrowserControlState::AgentControlled;
+        let agent = browser_projection(Some(&held));
+        assert_eq!(agent.continue_status, OperationsStatus::NotImplemented);
+        assert!(
+            agent
+                .next_action
+                .contains("Take over remains NOT_IMPLEMENTED")
+        );
     }
 
     #[test]

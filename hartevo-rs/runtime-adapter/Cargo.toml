@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 command-group.workspace = true
 crossbeam-channel.workspace = true
+hartevo-mission-scheduler = { path = "../mission-scheduler" }
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

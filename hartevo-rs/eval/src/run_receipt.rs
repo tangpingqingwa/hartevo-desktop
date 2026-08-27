@@ -9,7 +9,8 @@ use hartevo_catalog::{
     Catalog, CatalogSnapshot, EvaluationPartition, EvaluationPrivateAttestationStatus,
     EvaluationReferenceRunProfile, EvaluationReferenceThresholdStatus,
     EvaluationRunEvidenceAuthority, EvaluationRunResultReference, EvaluationRunValidationAuthority,
-    EvaluationSafetyMappingStatus,
+    EvaluationSafetyMappingStatus, EvaluatorAuthorityScope, EvaluatorEvidenceAuthority,
+    EvaluatorEvidenceKind, EvaluatorExecutionStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1978,6 +1979,14 @@ pub fn validate_evaluation_run_result_reference(
     Ok(EvaluationRunResultReference {
         validation_authority: EvaluationRunValidationAuthority::HartevoEvaluationRunValidatorV1,
         evidence_authority: EvaluationRunEvidenceAuthority::RunEvidenceOnly,
+        evidence_kind: EvaluatorEvidenceKind::EvaluationRunResult,
+        evaluator_authority: EvaluatorEvidenceAuthority::HartevoEvaluationRunValidatorV1,
+        execution_status: if receipt.summary.executed_case_count > 0 {
+            EvaluatorExecutionStatus::Executed
+        } else {
+            EvaluatorExecutionStatus::NotExecuted
+        },
+        authority_scope: EvaluatorAuthorityScope::EvaluationResultsOnly,
         release_commit: plan.release_commit.clone(),
         catalog_digest: plan.catalog.snapshot_digest.clone(),
         release_schema_digest: sha256(RELEASE_EVIDENCE_SCHEMA),
@@ -3374,6 +3383,22 @@ mod tests {
         assert_eq!(reference.executed_case_count, 0);
         assert!(reference.structurally_complete);
         assert!(!reference.partition_complete);
+        assert_eq!(
+            reference.evidence_kind,
+            EvaluatorEvidenceKind::EvaluationRunResult
+        );
+        assert_eq!(
+            reference.evaluator_authority,
+            EvaluatorEvidenceAuthority::HartevoEvaluationRunValidatorV1
+        );
+        assert_eq!(
+            reference.execution_status,
+            EvaluatorExecutionStatus::NotExecuted
+        );
+        assert_eq!(
+            reference.authority_scope,
+            EvaluatorAuthorityScope::EvaluationResultsOnly
+        );
         assert_eq!(
             reference.threshold_status,
             EvaluationReferenceThresholdStatus::NotEvaluatedIncompletePartition

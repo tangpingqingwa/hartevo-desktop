@@ -1,0 +1,25 @@
+{
+  "authorTaskId": "01a0340f-5e17-74a2-b8a0-48b6613f77c0",
+  "baseSha": "1d84b099267fc1d8105f6a7b7c1b20e47504e0de",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "hartevo-rs/cordis/Cargo.toml",
+    "hartevo-rs/cordis/src/context.rs",
+    "hartevo-rs/cordis/src/effect.rs",
+    "hartevo-rs/cordis/src/lib.rs",
+    "hartevo-rs/cordis/src/service.rs",
+    "hartevo-rs/cordis/tests/kernel.rs",
+    "scripts/ci-rust-test-shards.py",
+    "scripts/ci-scope.py"
+  ],
+  "pr": 943,
+  "receiptDigest": "34155c3ed0b00c4e1303ada6dab000d61a6c421ce52977c709423c1acdf7cf56",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-24T14:58:41Z",
+  "reviewedHeadSha": "2595c35ec2bf813f3ea0d3c49f01c0ec6a6d52fe",
+  "reviewerTaskId": "01a03441-d9ca-7e80-b3d4-f4200dd6573d",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

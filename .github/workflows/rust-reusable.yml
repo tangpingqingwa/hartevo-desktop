@@ -253,7 +253,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Planned scope skip marker
+        if: ${{ !inputs.run_rust }}
+        run: echo "Rust scope is empty; the Ubuntu aggregate confirms the planned shard markers only."
       - name: Require successful Ubuntu shards
+        if: inputs.run_rust
         run: |
           if [[ "${{ needs.test-ubuntu-shards.result }}" != success ]]; then
             echo "Ubuntu Rust shard aggregate is fail-closed: ${{ needs.test-ubuntu-shards.result }}"
