@@ -4483,7 +4483,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn runtime_fixture_completion_messages() -> [String; 6] {
+    fn runtime_fixture_completion_messages() -> [String; 5] {
         let thread_id = "desktop-fixture-thread";
         let turn_id = "desktop-fixture-turn";
         [
@@ -4520,18 +4520,6 @@ mod tests {
                     "turnId": turn_id,
                     "itemId": "desktop-fixture-item",
                     "delta": "draft; no external effect occurred.",
-                },
-            })
-            .to_string(),
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "desktop-fixture-local-approval",
-                "method": "item/fileChange/requestApproval",
-                "params": {
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "itemId": "desktop-fixture-item",
-                    "path": "must-not-be-written.txt",
                 },
             })
             .to_string(),
@@ -4582,7 +4570,6 @@ mod tests {
             item_started,
             first_delta,
             second_delta,
-            approval_request,
             item_completed,
             turn_completed,
         ] = runtime_fixture_completion_messages();
@@ -4603,10 +4590,7 @@ printf '%s\n' "$5"
 printf '%s\n' "$6"
 printf '%s\n' "$7"
 printf '%s\n' "$8"
-IFS= read -r decision
-case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"decline"'*) ;; *) exit 34 ;; esac
 printf '%s\n' "$9"
-printf '%s\n' "${10}"
 sleep 30"#
                 .into(),
             "hartevo-desktop-runtime-fixture".into(),
@@ -4617,7 +4601,6 @@ sleep 30"#
             item_started,
             first_delta,
             second_delta,
-            approval_request,
             item_completed,
             turn_completed,
         ];
@@ -4707,6 +4690,95 @@ sleep 30"#
             provider: "fixture-provider".into(),
             model: "fixture-model".into(),
             command_builder: Box::new(interruptible_runtime_fixture_command),
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_write_approve_runtime_fixture_command(
+        project_root: &Path,
+        runtime_home: &Path,
+    ) -> RuntimeCommand {
+        let project_root = project_root
+            .canonicalize()
+            .expect("canonical fixture project root");
+        let runtime_home = runtime_home
+            .canonicalize()
+            .expect("canonical fixture runtime home");
+        let [
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+        ] = runtime_fixture_start_messages(&project_root, &runtime_home);
+        let [
+            item_started,
+            first_delta,
+            second_delta,
+            item_completed,
+            turn_completed,
+        ] = runtime_fixture_completion_messages();
+        let approval_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "desktop-fixture-local-approval",
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "desktop-fixture-thread",
+                "turnId": "desktop-fixture-turn",
+                "itemId": "desktop-fixture-item",
+                "path": "must-not-be-written.txt",
+            },
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), &project_root);
+        command.args = vec![
+            "-c".into(),
+            r#"IFS= read -r initialize
+case "$initialize" in *'"method":"initialize"'*) ;; *) exit 61 ;; esac
+printf '%s\n' "$1"
+IFS= read -r thread
+case "$thread" in *'"method":"thread/start"'*'"model":"fixture-model"'*) ;; *) exit 62 ;; esac
+printf '%s\n' "$2"
+IFS= read -r turn
+case "$turn" in *'"method":"turn/start"'*'"clientUserMessageId"'*) ;; *) exit 63 ;; esac
+printf '%s\n' "$3"
+printf '%s\n' "$4"
+printf '%s\n' "$5"
+printf '%s\n' "$6"
+printf '%s\n' "$7"
+printf '%s\n' "$8"
+IFS= read -r decision
+case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"accept"'*) ;; *) exit 64 ;; esac
+printf '%s\n' "$9"
+printf '%s\n' "${10}"
+sleep 30"#
+                .into(),
+            "hartevo-desktop-local-write-approve-runtime-fixture".into(),
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+            item_started,
+            first_delta,
+            second_delta,
+            approval_request,
+            item_completed,
+            turn_completed,
+        ];
+        command.environment.insert(
+            "INTERPRETER_HOME".into(),
+            runtime_home.to_string_lossy().into_owned(),
+        );
+        command.openinterpreter_home = Some(runtime_home);
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn local_write_approve_runtime_fixture_source() -> DesktopRuntimeSource {
+        DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(local_write_approve_runtime_fixture_command),
         }
     }
 
@@ -7453,6 +7525,77 @@ sleep 30"#;
             control.approve_held_local_write(&project_id, &turn_id, 4, "digest-local-write"),
             Err(DesktopDataError::RuntimeLocalApprovalUnavailable)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn window_approve_issues_respond_context_runtime_local_approval() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let cancellation = DesktopRuntimeCancellation::default();
+        let approver = {
+            let control = cancellation.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if let Some(held) = control.held_local_approval() {
+                        control
+                            .approve_held_local_write(
+                                &held.project_id,
+                                &held.turn_id,
+                                held.expected_revision,
+                                &held.request_digest,
+                            )
+                            .expect("window Approve of exact held digest");
+                        return;
+                    }
+                    std::thread::sleep(StdDuration::from_millis(50));
+                }
+                panic!("window Approve never saw a held Runtime local-write request");
+            })
+        };
+        let submission = plane
+            .start_catalog_mission_and_run_with_cancellation(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Window Approve local write".into()),
+                    goal: "Hold one exact local write for window Approve".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(local_write_approve_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                Some(&cancellation),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("window Approve completes the live Runtime turn");
+        approver.join().expect("approver thread");
+        assert!(matches!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        let phases = cancellation
+            .progress_since(0)
+            .into_iter()
+            .map(|event| event.phase)
+            .collect::<Vec<_>>();
+        assert!(
+            phases.contains(&DesktopRuntimeProgressPhase::WaitingLocalApproval),
+            "missing WaitingLocalApproval in {phases:?}"
+        );
+        assert!(
+            phases.contains(&DesktopRuntimeProgressPhase::LocalActionApproved),
+            "missing LocalActionApproved in {phases:?}"
+        );
+        assert!(!phases.contains(&DesktopRuntimeProgressPhase::LocalActionDeclined));
+        assert!(cancellation.held_local_approval().is_none());
     }
 
     #[cfg(unix)]
