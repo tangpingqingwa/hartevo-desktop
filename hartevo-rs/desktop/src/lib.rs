@@ -1570,8 +1570,16 @@ pub fn App() -> Element {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
     };
-    let held_local_approval = runtime_cancellation
+    let live_runtime_cancellation = runtime_execution_paint
         .read()
+        .live_cancellation_for_selection(
+            project
+                .as_ref()
+                .zip(mission.as_ref())
+                .map(|(project, mission)| (&project.project_id, &mission.mission_id)),
+        )
+        .or_else(|| runtime_cancellation.read().clone());
+    let held_local_approval = live_runtime_cancellation
         .as_ref()
         .and_then(DesktopRuntimeCancellation::held_local_approval);
     let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
@@ -1613,10 +1621,21 @@ pub fn App() -> Element {
         }
     };
     let request_operations_approve_local_runtime = move |()| {
-        let Some(held) = runtime_cancellation
+        let selected = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let Some(control) = runtime_execution_paint
             .read()
-            .as_ref()
-            .and_then(DesktopRuntimeCancellation::held_local_approval)
+            .live_cancellation_for_selection(
+                selected
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+            )
+            .or_else(|| runtime_cancellation.read().clone())
         else {
             model.write().notice = Some(UiFailure {
                 code: "EMPTY".into(),
@@ -1625,7 +1644,7 @@ pub fn App() -> Element {
             });
             return;
         };
-        let Some(control) = runtime_cancellation.read().clone() else {
+        let Some(held) = control.held_local_approval() else {
             model
                 .write()
                 .set_notice(&DesktopDataError::RuntimeLocalApprovalUnavailable);
@@ -10464,6 +10483,8 @@ mod tests {
         assert!(source.contains("respond_context_runtime_local_approval"));
         assert!(source.contains("on_approve_local_runtime"));
         assert!(source.contains("format!(\"Approve · {}\""));
+        assert!(source.contains("live_cancellation_for_selection"));
+        assert!(source.contains("coordinator.cancellation()"));
         let data_plane = include_str!("data_plane.rs");
         assert!(data_plane.contains("approved: true"));
         assert!(data_plane.contains("WaitingLocalApproval"));
