@@ -1,0 +1,304 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-license-manager-result/contract.v1.json",
+  "title": "Hartevo AWS License Manager result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-license-manager-result-contract/v1",
+  "contractVersion": "EXT-AWS-LICENSE-MANAGER-01-L1/v1",
+  "pluginId": "aws-license-manager-result",
+  "objectiveType": "license_capacity_evidence",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-license-manager-result/v1|layer=1|service=aws.license-manager.result.read|provider=aws.license-manager.result.recording|consumer=mission.aws-license-manager-result.consumer|contract=EXT-AWS-LICENSE-MANAGER-01-L1/v1",
+  "contractDigest": "c0d80b90844503b0b4d6202ab6cee8f4a2b30f509617da5b71bcbc7ab6d2f0c2",
+  "service": {
+    "type": "AwsLicenseManagerService",
+    "id": "aws.license-manager.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "read_list_license_configurations",
+      "read_get_license_configuration",
+      "read_list_usage_for_license_configuration",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "AwsLicenseManagerProvider",
+    "id": "aws.license-manager.result.recording",
+    "apiVersion": "2019-08-08",
+    "apiRevision": "license-manager-list-get-usage-1",
+    "operations": [
+      "ListLicenseConfigurations",
+      "GetLicenseConfiguration",
+      "ListUsageForLicenseConfiguration"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false,
+    "externalWrites": false,
+    "mutationOperations": []
+  },
+  "consumer": {
+    "type": "MissionAwsLicenseManagerConsumer",
+    "id": "mission.aws-license-manager-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "awsAccountId",
+      "awsRegion",
+      "licenseConfiguration",
+      "managedResource",
+      "usageWindow",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "licenseConfigurationId",
+      "licenseConfigurationArn",
+      "managedResourceArn",
+      "managedResourceType",
+      "usageWindowStart",
+      "usageWindowEnd",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "arnAllowlist": ["aws", "aws-us-gov", "aws-cn"],
+    "resourceTypeAllowlist": [
+      "EC2",
+      "EC2_INSTANCE",
+      "EC2_HOST",
+      "EC2_AMI",
+      "RDS",
+      "RDS_INSTANCE",
+      "RDS_CLUSTER",
+      "SSM_MANAGED_INSTANCE",
+      "DMS",
+      "S3",
+      "DYNAMODB",
+      "DOCDB",
+      "ELASTICACHE",
+      "WORKSPACES",
+      "APPSTREAM",
+      "APPLICATION"
+    ],
+    "rawInventory": false,
+    "rawLicenseText": false
+  },
+  "bounds": {
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxUsageItems": 400,
+    "maxResponseBytes": 1048576,
+    "maxIdentifierBytes": 256,
+    "maxUsageWindowDays": 366
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "licenseConfigurationDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "evidenceBindingDigest",
+      "registrationRevision",
+      "registrationStatus"
+    ],
+    "failClosedOnDrift": true,
+    "permissions": [
+      "license-manager:ListLicenseConfigurations",
+      "license-manager:GetLicenseConfiguration",
+      "license-manager:ListUsageForLicenseConfiguration",
+      "mission.scope"
+    ],
+    "forbiddenCapabilities": [
+      "configuration_write",
+      "association_write",
+      "raw_inventory",
+      "raw_license_text",
+      "financial_or_legal_advice",
+      "outcome_adoption"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "licenseConfiguration",
+      "resourceType",
+      "usageWindow",
+      "operation",
+      "pageNumber",
+      "filterDigest"
+    ],
+    "filterDriftRejected": true,
+    "usageWindowDriftRejected": true,
+    "repeatedCursorRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "projection": {
+    "configuration": [
+      "licenseConfigurationDigest",
+      "licenseType",
+      "licenseCount",
+      "licenseCountHardLimit",
+      "configurationStatus",
+      "resourceType",
+      "discoveryTimestamp",
+      "licenseRulesDigest"
+    ],
+    "usage": [
+      "usageWindow",
+      "usageItemCount",
+      "consumedLicenses",
+      "resourceStatus",
+      "resourceDigests",
+      "usageDigest",
+      "quotaState"
+    ],
+    "rawResourceInventory": false,
+    "rawLicenseRules": false,
+    "rawProviderStatus": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "registrationDigest",
+      "licenseConfigurationDigest",
+      "listDigest",
+      "getDigest",
+      "usageDigest",
+      "cursorDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "complete",
+      "partial",
+      "quota_exceeded",
+      "drifted",
+      "access_loss",
+      "not_found",
+      "throttled",
+      "provider_unknown",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "quotaExceededIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "driftIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "malformedIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS License Manager account/region/configuration/resource/window scope",
+      "bounded ListLicenseConfigurations, GetLicenseConfiguration, and ListUsageForLicenseConfiguration seams",
+      "license count/limit/type/status/discovery metadata projection",
+      "bounded usage/quota/resource-status digest projection",
+      "pagination and usage-window fences",
+      "version/contract/provider/permission/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS License Manager HTTPS",
+      "license configuration mutation",
+      "license association mutation",
+      "raw resource inventory",
+      "raw license text or rules",
+      "financial or legal advice",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live AWS License Manager HTTPS",
+    "durable provider receipt",
+    "independent native readback",
+    "Connected/native/first-party evidence",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Layer 1 supplies bounded normalized license-capacity evidence and read/proposal/record/verify seams through recording, fixture, loopback, or BLOCKED_ENV transports. These transports never claim Connected, native, or first-party evidence. Layer 1 does not retain raw inventory or license text, mutate configurations or associations, resolve SigV4 credentials, create a durable native receipt, perform independent native reread, provide financial/legal advice, or adopt a Mission Outcome or Work Product; those remain Layer-2 host-authority work."
+}

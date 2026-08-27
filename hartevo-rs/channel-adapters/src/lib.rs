@@ -1,13 +1,15 @@
-//! YouTube read-only channel contracts.
+//! Provider-specific read-only channel adapter contracts.
 //!
-//! This root owns the shared typed channel request/identity boundary and the
-//! YouTube Data API/Analytics vertical. It intentionally does not implement
-//! the generic Connector SDK lifecycle from CONN-01, a central registry, or
-//! any publish/reply effect path. TikTok and Reddit adapters are independent
-//! sibling roots.
+//! The TikTok plugin keeps its independent authenticated-read service,
+//! provider, and Mission consumer boundary while sharing the bootstrap
+//! crate's YouTube read-only root. No module here owns credentials,
+//! persistence, Effect authority, or a central connector registry.
+
+#![forbid(unsafe_code)]
 
 pub mod identity;
 pub mod testkit;
+pub mod tiktok;
 pub mod transport;
 pub mod youtube;
 pub mod youtube_read;
@@ -16,7 +18,19 @@ pub mod youtube_sync;
 pub use identity::{
     AccountIdentity, ChannelIdentity, ContentIdentity, ProviderId, RevisionIdentity,
 };
+
+pub use tiktok::{
+    BusinessId, DEFAULT_VIDEO_PAGE_SIZE, EvidenceProvenance, MissionTiktokReadConsumer,
+    OAuthCredential, SecretReference, TenantId, TiktokAccountId, TiktokAccountIdentity,
+    TiktokApiOperation, TiktokAuthenticatedReadService, TiktokConnectionState, TiktokCursor,
+    TiktokCursorDisposition, TiktokDisplayApiProvider, TiktokError, TiktokFreshness,
+    TiktokFreshnessPolicy, TiktokMissionAcceptedRead, TiktokOAuthScope, TiktokObservationEnvelope,
+    TiktokQuotaLedger, TiktokReadObservation, TiktokReadScope, TiktokRealReadGate,
+    TiktokRevisionIdentity, TiktokVideoId, TiktokVideoListCursor, TiktokVideoObservation,
+    TiktokVideoPageEnvelope,
+};
 pub use transport::{
-    AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderReadRequest,
-    ProviderResponse, ReadOnlyTransport, ReadOperation, ScopeName, TransportError,
+    AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderKind,
+    ProviderReadRequest, ProviderResponse, ReadOnlyTransport, ReadOperation, ScopeName,
+    TransportError,
 };

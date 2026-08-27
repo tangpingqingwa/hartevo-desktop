@@ -4,11 +4,26 @@ use hartevo_desktop::App;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
+    #[cfg(feature = "native-journey")]
+    if let Some(exit_code) = hartevo_desktop::native_runtime_journey::controlled_runtime_exit_code()
+    {
+        std::process::exit(exit_code);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
         .compact()
         .init();
+
+    #[cfg(feature = "native-journey")]
+    if hartevo_desktop::native_runtime_journey::is_requested() {
+        if let Err(error) = hartevo_desktop::native_runtime_journey::launch() {
+            tracing::error!(code = error.code(), "native Runtime journey blocked");
+            std::process::exit(2);
+        }
+        return;
+    }
 
     let (window_width, window_height) = visual_window_size();
     let window = dioxus::desktop::WindowBuilder::new()

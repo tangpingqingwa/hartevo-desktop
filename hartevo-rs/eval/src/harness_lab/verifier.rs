@@ -942,7 +942,10 @@ pub fn verify_signed_record(
             "rollback target and prior candidate are identical"
         );
     }
-    if record.action == PromotionAction::Promote {
+    if matches!(
+        record.action,
+        PromotionAction::Canary | PromotionAction::Promote
+    ) {
         ensure!(
             record.prior_candidate_id.is_none(),
             "promotion record carries an unexpected prior candidate"

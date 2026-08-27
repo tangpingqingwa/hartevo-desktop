@@ -14,43 +14,85 @@
 //! independent verification.
 
 mod action;
+mod artifact;
 #[cfg(unix)]
 mod chromium_host;
+mod consumer;
+mod control;
 mod fake_host;
 mod file_broker;
+mod handoff;
 mod locator;
+mod mission_batch;
 mod navigation;
 mod profile_dir;
+mod provider;
 #[cfg(test)]
 mod real_chromium_signed_recipe_test;
 mod recipe;
 #[cfg(unix)]
+mod recipe_resume;
+#[cfg(unix)]
 mod scanner;
+mod service;
 mod workspace;
 
 pub use action::{
-    BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
-    BrowserEffectBinding, BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
+    BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionResult, BrowserActionRisk,
+    BrowserActionSurface, BrowserBatchReceipt, BrowserBatchReceiptState, BrowserEffectBinding,
+    BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
+};
+pub use artifact::{
+    BrowserArtifactAdoptionState, BrowserArtifactCapture, BrowserArtifactCaptureInput,
+    BrowserArtifactFileInspectionRequest, BrowserArtifactFileInspectionResult,
+    BrowserArtifactFrameObservation, BrowserArtifactFrameRevision, BrowserArtifactHost,
+    BrowserArtifactInspectionEvidence, BrowserArtifactInspectionVerdict, BrowserArtifactInspector,
+    BrowserArtifactPlugin, BrowserArtifactProviderState, BrowserArtifactQuarantineReceipt,
+    BrowserArtifactResultLog, BrowserArtifactResultSink, BrowserArtifactSafeForAdoption,
+    BrowserArtifactScope, UnavailableBrowserArtifactHost, UnavailableBrowserArtifactInspector,
 };
 #[cfg(unix)]
 pub use chromium_host::{
     ChromiumClickDispatchEvidence, ChromiumCredentialStoreMode, ChromiumFileUploadDispatchEvidence,
     ChromiumHostHealth, ChromiumHostShutdown, ChromiumLaunchConfig,
     ChromiumTextInputDispatchEvidence, ManagedChromiumClickExecutor,
-    ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
+    ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumRecipeClickStepExecutor,
+    ManagedChromiumTextInputExecutor,
+};
+pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
+pub use control::{
+    BrowserControlHandoff, BrowserQueuedBatch, BrowserQueuedBatchState, BrowserWorkspaceControl,
 };
 pub use fake_host::{
-    BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
-    FakeBrowserPage,
+    BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost, FakeBrowserPage,
 };
 pub use file_broker::{
     BrowserFileGrant, BrowserFileGrantState, BrowserFileType, FileBroker, FileBrokerReconciliation,
     FileClaimPlan, FileSafetyScanner, FileScanDecision, FileScanReport, FileScanRequest,
     FileTerminalPlan, FileUploadHandle,
 };
+pub use handoff::{
+    BrowserHandoffCapability, BrowserHandoffConsumerState, BrowserHandoffEvent,
+    BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffLog, BrowserHandoffProviderState,
+    BrowserHandoffScope, BrowserHandoffServiceDefinition, BrowserHandoffSnapshot,
+    BrowserResumeReceipt, BrowserTakeoverOffer, BrowserTakeoverReceipt,
+    BrowserWorkspaceHandoffProvider, MissionBrowserHandoffConsumer,
+};
 pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
+#[cfg(unix)]
+pub use mission_batch::ManagedChromiumBatchProvider;
+pub use mission_batch::{
+    MissionBrowserBatchClaimSet, MissionBrowserBatchConsumer, MissionBrowserBatchPlan,
+    MissionBrowserBatchProvider, MissionBrowserBatchProviderFailure,
+    MissionBrowserBatchProviderResult, MissionBrowserBatchReceipt, MissionBrowserBatchScope,
+    MissionBrowserBatchService, MissionBrowserBatchState, MissionBrowserBatchStepOutcome,
+    MissionBrowserBatchStepResult, MissionBrowserBatchTerminalReason, MissionBrowserFrameScope,
+};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
 pub use profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
+pub use provider::{
+    AuthenticatedChromiumProvider, BrowserProviderLifecycle, DurableBrowserObservation,
+};
 pub use recipe::{
     BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeCandidate,
     BrowserRecipeEvaluationEvidence, BrowserRecipeExecutionAuthorization, BrowserRecipeKeyPurpose,
@@ -60,7 +102,13 @@ pub use recipe::{
     BrowserRecipeTrustSnapshot, BrowserRecipeTrustStore, TrustedBrowserRecipeKey,
 };
 #[cfg(unix)]
+pub use recipe_resume::{BrowserRecipeResumeContext, BrowserRecipeResumeCursor};
+#[cfg(unix)]
 pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
+pub use service::{
+    BrowserWorkspaceCapability, BrowserWorkspaceMountRequest, BrowserWorkspaceScope,
+    BrowserWorkspaceServiceDefinition,
+};
 pub use workspace::{
     BrowserControlState, BrowserControlTransition, BrowserIdentity, BrowserLeaseProof,
     BrowserProfile, BrowserProfileSource, BrowserProfileStatus, BrowserWorkspace,
@@ -95,10 +143,20 @@ pub enum BrowserError {
     ControlLeaseLost,
     #[error("browser semantic snapshot is malformed")]
     InvalidSnapshot,
+    #[error("browser human-takeover offer is malformed or outside the exact workspace scope")]
+    InvalidHandoffOffer,
+    #[error("browser human-takeover receipt is malformed, stale, or not explicit")]
+    InvalidHandoffReceipt,
+    #[error("browser human-takeover host is detached, crashed, or unavailable")]
+    HandoffHostUnavailable,
     #[error("browser action is malformed")]
     InvalidAction,
     #[error("browser action batch is malformed or expired")]
     InvalidBatch,
+    #[error(
+        "browser batch cursor or receipt is malformed, stale, terminal, or does not acknowledge an exact digest-bound action prefix"
+    )]
+    InvalidBatchReceipt,
     #[error("potential browser external write requires the Effect Broker")]
     EffectBrokerRequired,
     #[error("browser action batch does not match the exact approved Effect")]
@@ -195,6 +253,32 @@ pub enum BrowserError {
     NavigationFailed,
     #[error("browser navigation attempted to produce a download outside the File Broker")]
     NavigationDownloadBlocked,
+    #[error("browser artifact metadata, bytes, source, or receipt is malformed")]
+    InvalidArtifact,
+    #[error("browser artifact is outside the exact Mission, profile, workspace, or frame scope")]
+    ArtifactScopeMismatch,
+    #[error("browser artifact has already been captured or delivered")]
+    ArtifactDuplicate,
+    #[error("browser artifact provider is no longer mounted")]
+    ArtifactProviderUnavailable,
+    #[error("browser artifact frame, loader, navigation, or source changed during capture")]
+    ArtifactFrameStale,
+    #[error("browser artifact provider was revoked")]
+    ArtifactProviderRevoked,
+    #[error("browser artifact provider was restarted and its old cursor is invalid")]
+    ArtifactProviderRestarted,
+    #[error("browser artifact File Inspection request or result is malformed")]
+    ArtifactInspectionInvalid,
+    #[error("browser artifact File Inspection scanner was unavailable")]
+    ArtifactInspectionUnavailable,
+    #[error("browser artifact File Inspection did not produce a clean verdict")]
+    ArtifactInspectionRejected,
+    #[error("browser artifact File Inspection request was already closed or replayed")]
+    ArtifactInspectionReopened,
+    #[error("browser artifact File Inspection request or result was duplicated")]
+    ArtifactInspectionDuplicate,
+    #[error("browser artifact is not currently SafeForAdoption")]
+    ArtifactNotSafeForAdoption,
     #[error("browser file is outside every canonical project root or crosses a symlink")]
     FileOutsideProject,
     #[error("browser file is empty or exceeds the configured size boundary")]
@@ -239,8 +323,12 @@ impl BrowserError {
             Self::InvalidTabTransition => "BROWSER_INVALID_TAB_TRANSITION",
             Self::ControlLeaseLost => "BROWSER_CONTROL_LEASE_LOST",
             Self::InvalidSnapshot => "BROWSER_INVALID_SNAPSHOT",
+            Self::InvalidHandoffOffer => "BROWSER_INVALID_HANDOFF_OFFER",
+            Self::InvalidHandoffReceipt => "BROWSER_INVALID_HANDOFF_RECEIPT",
+            Self::HandoffHostUnavailable => "BROWSER_HANDOFF_HOST_UNAVAILABLE",
             Self::InvalidAction => "BROWSER_INVALID_ACTION",
             Self::InvalidBatch => "BROWSER_INVALID_BATCH",
+            Self::InvalidBatchReceipt => "BROWSER_INVALID_BATCH_RECEIPT",
             Self::EffectBrokerRequired => "BROWSER_EFFECT_BROKER_REQUIRED",
             Self::EffectScopeMismatch => "BROWSER_EFFECT_SCOPE_MISMATCH",
             Self::WorkspaceNotRegistered => "BROWSER_WORKSPACE_NOT_REGISTERED",
@@ -291,6 +379,19 @@ impl BrowserError {
             Self::NavigationRequestBlocked => "BROWSER_NAVIGATION_REQUEST_BLOCKED",
             Self::NavigationFailed => "BROWSER_NAVIGATION_FAILED",
             Self::NavigationDownloadBlocked => "BROWSER_NAVIGATION_DOWNLOAD_BLOCKED",
+            Self::InvalidArtifact => "BROWSER_INVALID_ARTIFACT",
+            Self::ArtifactScopeMismatch => "BROWSER_ARTIFACT_SCOPE_MISMATCH",
+            Self::ArtifactDuplicate => "BROWSER_ARTIFACT_DUPLICATE",
+            Self::ArtifactProviderUnavailable => "BROWSER_ARTIFACT_PROVIDER_UNAVAILABLE",
+            Self::ArtifactFrameStale => "BROWSER_ARTIFACT_FRAME_STALE",
+            Self::ArtifactProviderRevoked => "BROWSER_ARTIFACT_PROVIDER_REVOKED",
+            Self::ArtifactProviderRestarted => "BROWSER_ARTIFACT_PROVIDER_RESTARTED",
+            Self::ArtifactInspectionInvalid => "BROWSER_ARTIFACT_INSPECTION_INVALID",
+            Self::ArtifactInspectionUnavailable => "BROWSER_ARTIFACT_INSPECTION_UNAVAILABLE",
+            Self::ArtifactInspectionRejected => "BROWSER_ARTIFACT_INSPECTION_REJECTED",
+            Self::ArtifactInspectionReopened => "BROWSER_ARTIFACT_INSPECTION_REOPENED",
+            Self::ArtifactInspectionDuplicate => "BROWSER_ARTIFACT_INSPECTION_DUPLICATE",
+            Self::ArtifactNotSafeForAdoption => "BROWSER_ARTIFACT_NOT_SAFE_FOR_ADOPTION",
             Self::FileOutsideProject => "BROWSER_FILE_OUTSIDE_PROJECT",
             Self::FileSizeRejected => "BROWSER_FILE_SIZE_REJECTED",
             Self::FileTypeRejected => "BROWSER_FILE_TYPE_REJECTED",

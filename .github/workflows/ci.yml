@@ -41,6 +41,10 @@ jobs:
           python3 scripts/ci-workflow-policy.py verify
           python3 scripts/ci-workflow-policy.py verify-pins
           python3 scripts/ci-branch-policy.py verify
+          python3 scripts/repository_governance.py verify-repository
+          python3 scripts/repository_governance.py verify-pr-event \
+            --event "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME"
           bash scripts/ci-tests.sh
 
   scope:
@@ -83,9 +87,12 @@ jobs:
               '{"schema":"hartevo-ci-scope/v1","mode":"merge_group_full","full":true,"rust":true,"packages":[]}' \
               > target/ci/scope.json
           elif [[ "$IS_MERGE_TRAIN" == true ]]; then
+            MANIFEST_PATH="$(python3 scripts/ci-merge-train.py discover-manifest \
+              --head "$HEAD_SHA" \
+              --branch "$HEAD_REF")"
             python3 scripts/ci-merge-train.py verify-hosted \
               --repo "$GITHUB_REPOSITORY" \
-              --manifest .github/merge-train/current.json \
+              --manifest "$MANIFEST_PATH" \
               --base "$BASE_SHA" \
               --head "$HEAD_SHA" \
               --branch "$HEAD_REF"

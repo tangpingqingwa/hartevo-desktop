@@ -130,6 +130,25 @@ impl ProjectStore {
         .map_err(|error| StorageError::DomainDecode(error.to_string()))
     }
 
+    /// Reloads every Connection for one Project from its durable record.
+    /// The list query is not treated as authoritative state.
+    pub fn connections_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Connection>, StorageError> {
+        self.load_project(project_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM connections
+             WHERE project_id = ?1 ORDER BY created_at, id",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.load_connection(project_id, &ConnectionId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_consent_record(
         &mut self,
         record: &ConsentRecord,
@@ -246,6 +265,27 @@ impl ProjectStore {
             .validate()
             .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
         Ok(record)
+    }
+
+    /// Returns every consent record for a project by stable id, reloading each
+    /// full record instead of treating the list query as authoritative state.
+    pub fn list_consent_records(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<ConsentRecord>, StorageError> {
+        self.load_project(project_id)?;
+        let record_ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM consent_records WHERE project_id = ?1 ORDER BY id")?;
+            statement
+                .query_map([project_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        record_ids
+            .into_iter()
+            .map(|id| self.load_consent_record(project_id, &ConsentRecordId::from_stable(id)))
+            .collect()
     }
 
     pub fn create_truth_fact(
@@ -2051,6 +2091,7 @@ mod tests {
             )
             .expect("resume verification from durable receipt");
         let (result, authority) = bound.into_parts();
+        let provider = authority.provider().expect("persisted provider authority");
         let verification = authority.verification().expect("recovery authority");
 
         assert_eq!(
@@ -2059,8 +2100,10 @@ mod tests {
         );
         assert_eq!(result.receipt, receipt);
         assert_eq!((executor.calls, verifier.calls), (0, 1));
-        assert!(authority.provider().is_none());
-        assert_eq!(verification.sequence(), 1);
+        assert_eq!(provider.sequence(), 1);
+        assert_eq!(provider.operation_at(), receipt_operation_at);
+        assert_eq!(verification.sequence(), 2);
+        assert!(verification.operation_at() >= provider.operation_at());
         assert!(verification.operation_at() >= recovery_entry);
         assert!(verification.operation_at() > verification_fact);
         assert_eq!(
