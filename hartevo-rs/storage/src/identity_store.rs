@@ -235,6 +235,22 @@ impl ProjectStore {
             .ok_or_else(|| missing("person", project_id, person_id.as_str()))
     }
 
+    /// Reloads every Person for one Project from its durable record.
+    /// The list query is not treated as authoritative state.
+    pub fn people_for_project(&self, project_id: &ProjectId) -> Result<Vec<Person>, StorageError> {
+        self.load_project(project_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM people
+             WHERE project_id = ?1 ORDER BY id",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.load_person(project_id, &PersonId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_partner(
         &mut self,
         partner: &Partner,

@@ -18,11 +18,11 @@ use hartevo_application::{
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    AcceptanceCheck, CadenceTriggerKind, CreatorTaskStatus, KpiContract, KpiDirection,
-    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
-    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
-    MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode, OutcomeDecision,
-    OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
+    AcceptanceCheck, CadenceTriggerKind, ConversationState, CreatorTaskStatus, KpiContract,
+    KpiDirection, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+    MissionCheckpointStatus, MissionConversationMessageId, MissionConversationMessageKind,
+    MissionConversationRole, MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode,
+    OutcomeDecision, OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
     ProjectEncryptionMode, ProjectId, ReviewDecision, RuntimeProcessClaimStatus,
     RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
@@ -46,7 +46,8 @@ use data_plane::{
     DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
     DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
     DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome,
-    DesktopMissionSubmission, DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
+    DesktopMissionSubmission, DesktopOpenConversationRequest,
+    DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
     DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
     DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
@@ -1804,6 +1805,70 @@ pub fn App() -> Element {
             }
         });
     };
+    let request_relationships_open_conversation = move |()| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message:
+                    "当前没有可用的 Mission；未发明 Conversation，也未执行 Open Conversation。"
+                        .into(),
+            });
+            return;
+        };
+        let Some(identity) = mission.relationship_conversation.as_ref() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::ConversationOpenUnavailable);
+            return;
+        };
+        if identity.conversation_id.is_some() {
+            model
+                .write()
+                .set_notice(&DesktopDataError::ConversationAlreadyOpen);
+            return;
+        }
+        let request = DesktopOpenConversationRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            person_id: identity.person_id.clone(),
+            company_id: identity.company_id.clone(),
+            connection_id: identity.connection_id.clone(),
+            account_id: identity.account_id.clone(),
+            provider: identity.provider.clone(),
+            gateway: identity.gateway.clone(),
+            contact_channel: identity.contact_channel.clone(),
+            market: identity.market.clone(),
+            route_digest: identity.route_digest.clone(),
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover()
+                    .and_then(|plane| plane.open_conversation_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    model.write().set_ready(snapshot, false);
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "CONVERSATION_OPEN_COORDINATOR_FAILED".into(),
+                        message:
+                            "Open Conversation 协调异常结束；未执行 Effect，也未声明 Verification。"
+                                .into(),
+                    });
+                }
+            }
+        });
+    };
     let on_result_action = move |action: ResultSurfaceAction| {
         let (project, mission) = {
             let current = model.read();
@@ -2532,7 +2597,11 @@ pub fn App() -> Element {
                         } else if current_surface == Surface::ChannelOperations {
                             ChannelSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Relationships {
-                            RelationshipsSurface { project: project.clone(), mission: mission.clone() }
+                            RelationshipsSurface {
+                                project: project.clone(),
+                                mission: mission.clone(),
+                                on_open_conversation: request_relationships_open_conversation,
+                            }
                         } else if current_surface == Surface::Partners {
                             PartnersSurface {
                                 project: project.clone(),
@@ -7286,6 +7355,7 @@ fn ChannelSurface(
 fn RelationshipsSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
+    on_open_conversation: EventHandler<()>,
 ) -> Element {
     #[cfg(feature = "visual-fixtures")]
     if let Some(page) = visual_fixture::page("relationships") {
@@ -7305,6 +7375,11 @@ fn RelationshipsSurface(
     let mission_label = mission
         .as_ref()
         .map_or("未选择 Mission", |mission| mission.title.as_str());
+    let identity = mission
+        .as_ref()
+        .and_then(|mission| mission.relationship_conversation.as_ref());
+    let open_ready = identity.is_some_and(|identity| identity.conversation_id.is_none());
+    let already_open = identity.is_some_and(|identity| identity.conversation_id.is_some());
     rsx! {
         div { class: "surface-scroll business-surface relationships-surface",
             header { class: "surface-head",
@@ -7313,7 +7388,7 @@ fn RelationshipsSurface(
                     h1 { "关系与 CRM" }
                     p { "联系人、公司、邮件、会话与机会共享同一条关系记录；公开发现不会自动获得触达许可。" }
                 }
-                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                span { class: "honesty-badge", if identity.is_some() { "APPLICATION" } else { "NOT_IMPLEMENTED" } }
             }
             nav { class: "surface-tabs", aria_label: "关系与 CRM 视图",
                 button { class: if active_tab() == "pipeline" { "active" } else { "" }, onclick: move |_| active_tab.set("pipeline"), "Pipeline" }
@@ -7321,12 +7396,15 @@ fn RelationshipsSurface(
                 button { class: if active_tab() == "sequences" { "active" } else { "" }, onclick: move |_| active_tab.set("sequences"), "邮件序列" }
                 button { class: if active_tab() == "contacts" { "active" } else { "" }, onclick: move |_| active_tab.set("contacts"), "联系人" }
             }
-            section { class: "readiness-strip blocked",
+            section { class: if identity.is_some() { "readiness-strip" } else { "readiness-strip blocked" },
                 div { class: "readiness-intro",
                     span { class: "readiness-mark", UiIcon { name: if active_tab() == "inbox" { UiIconName::Inbox } else { UiIconName::Contact }, size: 18 } }
-                    span { strong { "CRM / Inbox Projection 尚未接线" } small { "可以查看当前 Mission 边界；不能显示演示联系人、Consent、发送或回复。" } }
+                    span {
+                        strong { if identity.is_some() { "CRM Conversation 身份来自 Application Projection" } else { "CRM / Inbox Projection 尚未接线" } }
+                        small { "Open Conversation 绑定 live Person / Connection；不会发明 Conversation，也不会 mint Effect 或 Verification。" }
+                    }
                 }
-                div { class: "readiness-stat", b { "0" } small { "可验证联系人" } }
+                div { class: "readiness-stat", b { if identity.is_some() { "1" } else { "0" } } small { "可验证联系人" } }
                 div { class: "readiness-stat", b { "0" } small { "可合法跟进" } }
                 div { class: "readiness-stat", b { "0" } small { "开放机会" } }
             }
@@ -7341,14 +7419,60 @@ fn RelationshipsSurface(
                         }
                         p { "{project.name} · {mission_label}" }
                     }
-                    div { class: "state-canvas",
-                        UiIcon {
-                            name: if active_tab() == "pipeline" { UiIconName::Briefcase } else if active_tab() == "inbox" { UiIconName::Message } else if active_tab() == "sequences" { UiIconName::Mail } else { UiIconName::Contact },
-                            size: 22,
+                    if active_tab() == "inbox" {
+                        div { class: "conversation-open-boundary",
+                            UiIcon { name: UiIconName::Message, size: 18 }
+                            span {
+                                strong {
+                                    if already_open { "CRM Conversation 已通过 Application open_conversation 打开" }
+                                    else if open_ready { "窗口 Open Conversation 绑定 exact Person / Connection" }
+                                    else { "等待 live Person / Connection 身份" }
+                                }
+                                small {
+                                    if let Some(identity) = identity {
+                                        if let Some(conversation_id) = identity.conversation_id.as_ref() {
+                                            "conversation {conversation_id} · {identity.provider} · {identity.market} · 已打开；Open Conversation 不 mint Effect / Verification。"
+                                        } else {
+                                            "{identity.provider} · person {short_digest(identity.person_id.as_str())} · connection {short_digest(identity.connection_id.as_str())} · 通过 Application open_conversation 写入 Domain Kernel Conversation；不是 Effect，也不是 Verification。"
+                                        }
+                                    } else {
+                                        "该视图不会从页面维护第二套 CRM，也不会把公开邮箱、草稿或 Provider 200 OK 冒充 Consent、Conversation 或业务完成。"
+                                    }
+                                }
+                            }
+                            em {
+                                if already_open {
+                                    if identity.is_some_and(|identity| {
+                                        identity.state == Some(ConversationState::Open)
+                                    }) { "OPEN" } else { "APPLICATION" }
+                                } else if open_ready { "WAITING_USER" } else { "NOT_IMPLEMENTED" }
+                            }
                         }
-                        span { class: "honesty-badge", "NOT_IMPLEMENTED" }
-                        h3 { "等待 Application Projection" }
-                        p { "该视图不会从页面维护第二套 CRM，也不会把公开邮箱、草稿或 Provider 200 OK 冒充 Consent、Conversation 或业务完成。" }
+                        div { class: "conversation-open-actions",
+                            button {
+                                disabled: !open_ready,
+                                aria_label: "打开精确 Mission-bound CRM Conversation",
+                                title: if open_ready {
+                                    "通过 Application open_conversation 打开当前 Person / Connection"
+                                } else if already_open {
+                                    "当前 Mission 已有打开的 CRM Conversation"
+                                } else {
+                                    "当前没有 live Person / Connection 身份可供 Open Conversation"
+                                },
+                                onclick: move |_| on_open_conversation.call(()),
+                                if already_open { "Open Conversation · OPEN" } else if open_ready { "Open Conversation · WAITING_USER" } else { "Open Conversation · NOT_IMPLEMENTED" }
+                            }
+                        }
+                    } else {
+                        div { class: "state-canvas",
+                            UiIcon {
+                                name: if active_tab() == "pipeline" { UiIconName::Briefcase } else if active_tab() == "sequences" { UiIconName::Mail } else { UiIconName::Contact },
+                                size: 22,
+                            }
+                            span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                            h3 { "等待 Application Projection" }
+                            p { "该视图不会从页面维护第二套 CRM，也不会把公开邮箱、草稿或 Provider 200 OK 冒充 Consent、Conversation 或业务完成。" }
+                        }
                     }
                 }
                 aside { class: "surface-section relationship-policy",
@@ -10662,6 +10786,24 @@ mod tests {
         assert!(source.contains("format!(\"Continue · {}\""));
         assert!(source.contains("on_continue_browser_workspace"));
         assert!(source.contains("BrowserHostReconciliationRequired"));
+    }
+
+    #[test]
+    fn relationships_open_calls_application_open_conversation() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("open_conversation_os"));
+        assert!(source.contains("DesktopOpenConversationRequest"));
+        assert!(source.contains("on_open_conversation"));
+        assert!(source.contains("Open Conversation · WAITING_USER"));
+        assert!(source.contains("Open Conversation · OPEN"));
+        assert!(source.contains("CONVERSATION_OPEN_COORDINATOR_FAILED"));
+        assert!(source.contains("onclick: move |_| on_open_conversation.call(()),"));
+        let data_plane = include_str!("data_plane.rs");
+        assert!(data_plane.contains("open_conversation_os"));
+        assert!(data_plane.contains("service.open_conversation"));
+        assert!(data_plane.contains("Conversation::open"));
+        assert!(!data_plane.contains("prepare_conversation_reply_effect"));
+        assert!(data_plane.contains("ConversationAlreadyOpen"));
     }
 
     #[test]

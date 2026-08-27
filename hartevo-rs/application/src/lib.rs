@@ -59,7 +59,7 @@ use hartevo_domain_kernel::{
     BrowserRecipeId, BrowserTabId, BrowserWorkspaceId, Cadence, CadenceTriggerKind, Campaign,
     CampaignId, CampaignSendAuthorization, CommissionId, CommissionRecord, Company, CompanyId,
     Connection, ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
-    ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint,
+    ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint, ContactChannel,
     ContextAssemblyId, ContextBranch, ContextBranchId, ContextBranchMerge, ContextBranchMergeId,
     ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleId, ContextCapsuleStatus,
     ContextCheckpoint, ContextCheckpointId, ContextCompactionRecord, ContextCompactionRecordId,
@@ -69,31 +69,32 @@ use hartevo_domain_kernel::{
     ContextWorkerMessageKind, ContextWorkingItem, ContextWorkingSet, ContextWorkingSetId,
     ContextWorkspace, ContextWorkspaceId, ContinuationEntry, ContinuationEntryInput,
     ContinuationEntryKind, ContinuationLedger, Conversation, ConversationEffectGuard,
-    ConversationId, ConversationIdentitySnapshot, CreatorApplicationId, CreatorApplicationInput,
-    CreatorCandidate, CreatorContactEffectGuard, CreatorDeliverableInput, CreatorEligibility,
-    CreatorExternalProof, CreatorHiring, CreatorHiringError, CreatorHiringId, CreatorHiringSpec,
-    CreatorId, CreatorIdentitySnapshot, CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask,
-    CreatorTaskId, CreatorTaskSpec, CreatorTaskStatus, CreatorWorkError, CurrencyCode,
-    DeletionError, DeletionId, DeletionReason, DeletionTombstone, DeliverableId,
-    DeliverableReviewInput, DeliverableStatus, DeviceAttachment, DeviceAttachmentId,
+    ConversationId, ConversationIdentitySnapshot, ConversationState, CreatorApplicationId,
+    CreatorApplicationInput, CreatorCandidate, CreatorContactEffectGuard, CreatorDeliverableInput,
+    CreatorEligibility, CreatorExternalProof, CreatorHiring, CreatorHiringError, CreatorHiringId,
+    CreatorHiringSpec, CreatorId, CreatorIdentitySnapshot, CreatorMilestoneId,
+    CreatorPayoutConfirmation, CreatorTask, CreatorTaskId, CreatorTaskSpec, CreatorTaskStatus,
+    CreatorWorkError, CurrencyCode, DeletionError, DeletionId, DeletionReason, DeletionTombstone,
+    DeliverableId, DeliverableReviewInput, DeliverableStatus, DeviceAttachment, DeviceAttachmentId,
     DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
     DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
     InboundMessageInput, KeyEnvelope, KeyEnvelopeId, KeyManagementError, KeyRecipient, KpiContract,
-    MessageDelivery, MessageId, MetricValue, Mission, MissionCheckpointApplicationEvidence,
-    MissionCheckpointCompletion, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionCheckpointOracleSource, MissionCheckpointRoute, MissionCheckpointStatus,
-    MissionContract, MissionConversation, MissionConversationError, MissionConversationId,
-    MissionConversationMessage, MissionConversationMessageId, MissionConversationMessageKind,
-    MissionConversationRole, MissionDefinition, MissionError, MissionId, MissionKpiProjection,
-    MissionSchedule, MissionScheduleError, MissionScheduleFailureClass, MissionScheduleId,
-    MissionScheduleStatus, MissionStage, MissionTerminalDisposition, Money, OperatingMode,
-    Opportunity, OpportunityId, OpportunityStage, OrderId, Outcome, OutcomeAttributionProjection,
-    OutcomeDecision, OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger,
-    OutcomeLedgerError, OutcomeNormalizationProjection, OutcomeReviewActionGate,
-    OutcomeReviewCausalStatus, OutcomeReviewCaveat, OutcomeReviewDecision, OutcomeReviewLoopPolicy,
+    MessageDelivery, MessageId, MessagingGateway, MetricValue, Mission,
+    MissionCheckpointApplicationEvidence, MissionCheckpointCompletion,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointOracleSource,
+    MissionCheckpointRoute, MissionCheckpointStatus, MissionContract, MissionConversation,
+    MissionConversationError, MissionConversationId, MissionConversationMessage,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionDefinition, MissionError, MissionId, MissionKpiProjection, MissionSchedule,
+    MissionScheduleError, MissionScheduleFailureClass, MissionScheduleId, MissionScheduleStatus,
+    MissionStage, MissionTerminalDisposition, Money, OperatingMode, Opportunity, OpportunityId,
+    OpportunityStage, OrderId, Outcome, OutcomeAttributionProjection, OutcomeDecision,
+    OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
+    OutcomeNormalizationProjection, OutcomeReviewActionGate, OutcomeReviewCausalStatus,
+    OutcomeReviewCaveat, OutcomeReviewDecision, OutcomeReviewLoopPolicy,
     OutcomeReviewNextContractIntent, OutcomeReviewNextContractResolution, OutcomeReviewProjection,
     OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization,
     PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
@@ -4395,6 +4396,30 @@ pub struct MissionProjection {
     /// digest, and the frozen acceptance checklist.
     #[serde(default)]
     pub creator_work: Option<CreatorWorkProjection>,
+    /// Content-free CRM Conversation facts for this Mission. Open Conversation
+    /// uses only live Person/Connection identity; the window never invents a
+    /// Conversation or treats open as Effect or Verification.
+    #[serde(default)]
+    pub relationship_conversation: Option<RelationshipConversationProjection>,
+}
+
+/// Exact Person/Connection identity shown by Desktop for window Open
+/// Conversation. Route digest is content-free SHA-256; messages never cross.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipConversationProjection {
+    pub conversation_id: Option<ConversationId>,
+    pub person_id: PersonId,
+    pub company_id: Option<CompanyId>,
+    pub connection_id: ConnectionId,
+    pub account_id: AccountId,
+    pub provider: String,
+    pub gateway: MessagingGateway,
+    pub contact_channel: ContactChannel,
+    pub market: String,
+    pub route_digest: String,
+    pub state: Option<ConversationState>,
+    pub revision: Option<u64>,
 }
 
 /// Content-free Creator Task facts for one Mission. Review is not Verification
@@ -7600,6 +7625,45 @@ impl ApplicationService {
         Ok(self.store.list_consent_records(project_id)?)
     }
 
+    /// Application-owned Person inventory for one Project. Desktop binds the
+    /// live Domain Kernel record from this list; it never invents a contact.
+    pub fn list_people(&self, project_id: &ProjectId) -> Result<Vec<Person>, ApplicationError> {
+        Ok(self.store.people_for_project(project_id)?)
+    }
+
+    pub fn load_person(
+        &self,
+        project_id: &ProjectId,
+        person_id: &PersonId,
+    ) -> Result<Person, ApplicationError> {
+        Ok(self.store.load_person(project_id, person_id)?)
+    }
+
+    pub fn load_company(
+        &self,
+        project_id: &ProjectId,
+        company_id: &CompanyId,
+    ) -> Result<Company, ApplicationError> {
+        Ok(self.store.load_company(project_id, company_id)?)
+    }
+
+    /// Application-owned Connection inventory for one Project. Desktop binds
+    /// the live Domain Kernel record from this list; it never invents a probe.
+    pub fn list_connections(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Connection>, ApplicationError> {
+        Ok(self.store.connections_for_project(project_id)?)
+    }
+
+    pub fn load_connection(
+        &self,
+        project_id: &ProjectId,
+        connection_id: &ConnectionId,
+    ) -> Result<Connection, ApplicationError> {
+        Ok(self.store.load_connection(project_id, connection_id)?)
+    }
+
     pub fn list_missions(&self, project_id: &ProjectId) -> Result<Vec<Mission>, ApplicationError> {
         Ok(self.store.list_missions(project_id)?)
     }
@@ -7608,11 +7672,84 @@ impl ApplicationService {
         Ok(self.store.list_projects()?)
     }
 
+    /// Content-free CRM Conversation facts for one Mission. Open Conversation
+    /// uses only the live Person/Connection/gateway identity; Desktop never
+    /// invents a Conversation or treats open as Effect or Verification.
+    pub fn list_relationship_conversations_for_mission(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<Vec<RelationshipConversationProjection>, ApplicationError> {
+        let mission = self.store.load_mission(project_id, mission_id)?;
+        if mission.project_id != *project_id {
+            return Err(ApplicationError::ConversationOpenCommandMismatch);
+        }
+        relationship_conversations_for_mission(&self.store, &mission)
+    }
+
     pub fn open_conversation(
         &mut self,
         conversation: Conversation,
         now: DateTime<Utc>,
     ) -> Result<Conversation, ApplicationError> {
+        conversation.validate().map_err(ApplicationError::from)?;
+        if conversation.revision != 1
+            || conversation.state != hartevo_domain_kernel::ConversationState::Open
+            || !conversation.messages.is_empty()
+            || conversation.mission_id.is_none()
+        {
+            return Err(ApplicationError::ConversationOpenCommandMismatch);
+        }
+        let Some(mission_id) = conversation.mission_id.as_ref() else {
+            return Err(ApplicationError::ConversationMissionRequired);
+        };
+        let mission = self
+            .store
+            .load_mission(&conversation.project_id, mission_id)?;
+        if mission.tenant_id != conversation.tenant_id
+            || mission.project_id != conversation.project_id
+        {
+            return Err(ApplicationError::ConversationOpenCommandMismatch);
+        }
+        let person = self
+            .store
+            .load_person(&conversation.project_id, &conversation.person_id)?;
+        if person.tenant_id != conversation.tenant_id
+            || person.project_id != conversation.project_id
+        {
+            return Err(ApplicationError::ConversationOpenCommandMismatch);
+        }
+        if conversation.company_id.as_ref() != person.company_id.as_ref() {
+            return Err(ApplicationError::ConversationOpenCommandMismatch);
+        }
+        if let Some(company_id) = conversation.company_id.as_ref() {
+            let company = self
+                .store
+                .load_company(&conversation.project_id, company_id)?;
+            if company.tenant_id != conversation.tenant_id
+                || company.project_id != conversation.project_id
+                || company.market != conversation.market
+            {
+                return Err(ApplicationError::ConversationOpenCommandMismatch);
+            }
+        }
+        let connection = self
+            .store
+            .load_connection(&conversation.project_id, &conversation.connection_id)?;
+        if connection.tenant_id() != &conversation.tenant_id
+            || connection.project_id() != &conversation.project_id
+            || connection.provider() != conversation.provider
+            || connection.account_id() != &conversation.account_id
+            || !connection.is_connected(now)
+        {
+            return Err(ApplicationError::ConversationOpenCommandMismatch);
+        }
+        if !conversation
+            .gateway
+            .supports_provider(connection.provider())
+        {
+            return Err(ApplicationError::ConversationOpenCommandMismatch);
+        }
         self.store.create_conversation(
             &conversation,
             "conversation.opened",
@@ -7622,6 +7759,8 @@ impl ApplicationService {
                 "personId": conversation.person_id,
                 "gateway": conversation.gateway,
                 "controlGeneration": conversation.control.generation(),
+                "externalEffectExecuted": false,
+                "verificationMinted": false,
             }),
             now,
         )?;
@@ -18396,6 +18535,7 @@ fn mission_projection(
     });
     let vm11_outcome_review = vm11_outcome_review_decision_projection(store, &mission)?;
     let creator_work = creator_work_projection(store, &mission)?;
+    let relationship_conversation = relationship_conversation_projection(store, &mission)?;
     let browser_workspace = store
         .load_live_browser_workspace_for_mission(&mission.project_id, &mission.id)?
         .map(|workspace| BrowserWorkspaceProjection {
@@ -18483,7 +18623,96 @@ fn mission_projection(
         outcome_summary,
         vm11_outcome_review,
         creator_work,
+        relationship_conversation,
     })
+}
+
+fn relationship_conversations_for_mission(
+    store: &ProjectStore,
+    mission: &Mission,
+) -> Result<Vec<RelationshipConversationProjection>, ApplicationError> {
+    let mut matching = store
+        .conversations_for_project(&mission.project_id)?
+        .into_iter()
+        .filter(|conversation| conversation.mission_id.as_ref() == Some(&mission.id))
+        .collect::<Vec<_>>();
+    matching.sort_by(|left, right| {
+        (left.updated_at, left.revision, left.id.as_str()).cmp(&(
+            right.updated_at,
+            right.revision,
+            right.id.as_str(),
+        ))
+    });
+    matching
+        .into_iter()
+        .map(|conversation| {
+            if conversation.tenant_id != mission.tenant_id
+                || conversation.project_id != mission.project_id
+            {
+                return Err(ApplicationError::ConversationOpenCommandMismatch);
+            }
+            Ok(RelationshipConversationProjection {
+                conversation_id: Some(conversation.id),
+                person_id: conversation.person_id,
+                company_id: conversation.company_id,
+                connection_id: conversation.connection_id,
+                account_id: conversation.account_id,
+                provider: conversation.provider,
+                gateway: conversation.gateway,
+                contact_channel: conversation.contact_channel,
+                market: conversation.market,
+                route_digest: conversation.route_digest,
+                state: Some(conversation.state),
+                revision: Some(conversation.revision),
+            })
+        })
+        .collect()
+}
+
+fn relationship_conversation_projection(
+    store: &ProjectStore,
+    mission: &Mission,
+) -> Result<Option<RelationshipConversationProjection>, ApplicationError> {
+    let mut matching = relationship_conversations_for_mission(store, mission)?;
+    if let Some(opened) = matching.pop() {
+        return Ok(Some(opened));
+    }
+    let people = store.people_for_project(&mission.project_id)?;
+    let connections = store.connections_for_project(&mission.project_id)?;
+    let Some(person) = people.into_iter().find(|person| {
+        person.tenant_id == mission.tenant_id && person.project_id == mission.project_id
+    }) else {
+        return Ok(None);
+    };
+    let Some(connection) = connections.into_iter().find(|connection| {
+        connection.tenant_id() == &mission.tenant_id
+            && connection.project_id() == &mission.project_id
+            && MessagingGateway::Gmail.supports_provider(connection.provider())
+    }) else {
+        return Ok(None);
+    };
+    let market = if let Some(company_id) = person.company_id.as_ref() {
+        store.load_company(&mission.project_id, company_id)?.market
+    } else if !mission.contract.market.trim().is_empty() && mission.contract.market != "unspecified"
+    {
+        mission.contract.market.clone()
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(RelationshipConversationProjection {
+        conversation_id: None,
+        person_id: person.id,
+        company_id: person.company_id,
+        connection_id: connection.id().clone(),
+        account_id: connection.account_id().clone(),
+        provider: connection.provider().to_owned(),
+        gateway: MessagingGateway::Gmail,
+        contact_channel: ContactChannel::Email,
+        market,
+        route_digest: String::new(),
+        state: None,
+        revision: None,
+    }))
 }
 
 fn creator_work_projection(
@@ -22428,6 +22657,10 @@ pub enum ApplicationError {
     InvalidCreatorWorkOperatingMode,
     #[error("a conversation reply effect requires a persisted mission binding")]
     ConversationMissionRequired,
+    #[error(
+        "Open Conversation requires the exact live Project, Mission, Person, Connection, gateway, and route digest"
+    )]
+    ConversationOpenCommandMismatch,
     #[error("the conversation reply effect expiry or exact scope is invalid")]
     InvalidConversationReplyEffect,
     #[error("the durable effect reconciliation cannot be projected into the bound conversation")]
@@ -31159,6 +31392,7 @@ sleep 30"#
             "研究真实项目状态，但不执行外部动作"
         );
         assert!(unlocked.missions[0].creator_work.is_none());
+        assert!(unlocked.missions[0].relationship_conversation.is_none());
     }
 
     #[test]
