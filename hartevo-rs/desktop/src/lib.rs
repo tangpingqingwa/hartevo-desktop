@@ -43,13 +43,14 @@ mod visual_fixture;
 use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
-    DesktopDataPlane, DesktopHumanCheckpointConfirmationRequest, DesktopLoadState,
-    DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome, DesktopMissionSubmission,
-    DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
-    DesktopRuntimeTextStreamProjection, DesktopSnapshot, DesktopVm11NextContractResolutionRequest,
-    DesktopVm11OutcomeDecisionRequest, DesktopWaitingApprovalGrantRequest,
-    DesktopWorkProductAdoptionRequest, ProductEvidenceProjection, ProjectContextAccessProjection,
-    ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
+    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome,
+    DesktopMissionSubmission, DesktopRuntimeCancellation, DesktopRuntimeProgressEvent,
+    DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection, DesktopSnapshot,
+    DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
+    DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
+    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
+    RecoveryKitDraft,
 };
 use result_adoption_surface::{
     ResultSurfaceAction, SelectedResultProjection, action_matches_current_projection,
@@ -423,6 +424,14 @@ impl UiFailure {
             DesktopDataError::WorkProductActionStale => Self::coded(
                 "STALE_SELECTION",
                 "结果与当前 Project / Mission revision 不一致，请刷新后重新选择；未改变正文、证据或状态。",
+            ),
+            DesktopDataError::RuntimeLocalApprovalUnavailable => Self::coded(
+                "EMPTY",
+                "当前没有待窗口批准的 Runtime 本地写入；未自动拒绝，也未执行 Effect。",
+            ),
+            DesktopDataError::RuntimeLocalApprovalMismatch => Self::coded(
+                "STALE_SELECTION",
+                "Runtime 本地写入批准必须绑定当前冻结 digest 与 turn revision；未写入部分状态，也未执行 Effect。",
             ),
             DesktopDataError::ProjectNotFound(_)
             | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => {
@@ -1561,11 +1570,16 @@ pub fn App() -> Element {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
     };
+    let held_local_approval = runtime_cancellation
+        .read()
+        .as_ref()
+        .and_then(DesktopRuntimeCancellation::held_local_approval);
     let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
         project.as_ref(),
         mission.as_ref(),
         runtime_activity.as_ref(),
         runtime_projection.as_ref(),
+        held_local_approval.as_ref(),
     );
     let operations_interrupt_available = runtime_busy && runtime_stop_available;
     let operations_interrupt_requested = runtime_stop_requested();
@@ -1596,6 +1610,33 @@ pub fn App() -> Element {
                     visual_streaming_fixture,
                 );
             }
+        }
+    };
+    let request_operations_approve_local_runtime = move |()| {
+        let Some(held) = runtime_cancellation
+            .read()
+            .as_ref()
+            .and_then(DesktopRuntimeCancellation::held_local_approval)
+        else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有待窗口批准的 Runtime 本地写入；未自动拒绝，也未执行 Effect。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(control) = runtime_cancellation.read().clone() else {
+            model.write().set_notice(&DesktopDataError::RuntimeLocalApprovalUnavailable);
+            return;
+        };
+        match control.approve_held_local_write(
+            &held.project_id,
+            &held.turn_id,
+            held.expected_revision,
+            &held.request_digest,
+        ) {
+            Ok(()) => {}
+            Err(error) => model.write().set_notice(&error),
         }
     };
     let request_operations_continue_browser = move |()| {
@@ -2318,6 +2359,7 @@ pub fn App() -> Element {
                                 },
                                 on_interrupt: request_operations_interrupt,
                                 on_continue_browser_workspace: request_operations_continue_browser,
+                                on_approve_local_runtime: request_operations_approve_local_runtime,
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
                                         let current = model.read();
@@ -5072,6 +5114,7 @@ fn AgentOperationsWorkbench(
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
+    on_approve_local_runtime: EventHandler<()>,
 ) -> Element {
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
     let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
@@ -5274,6 +5317,26 @@ fn AgentOperationsWorkbench(
                         div { small { "Verified effects" } strong { "{projection.approvals.verified_effect_count}" } span { "不会由本地 Runtime 状态代替" } }
                         div { small { "Local Runtime approval" } strong { "{projection.approvals.local_runtime_status.code()}" } span { "{projection.approvals.local_runtime_detail}" } }
                     }
+                    {
+                        let local_ready = projection.approvals.local_runtime_approve_status == OperationsStatus::Ready;
+                        let local_label = format!("Approve · {}", projection.approvals.local_runtime_approve_status.code());
+                        let local_title = match projection.approvals.local_runtime_approve_status {
+                            OperationsStatus::Ready => "通过 Application respond_context_runtime_local_approval 批准精确本地写入 digest",
+                            OperationsStatus::WaitingApproval => "本地写入仍在等待精确 digest；未自动拒绝",
+                            _ => "当前没有待窗口批准的 Runtime 本地写入",
+                        };
+                        rsx! {
+                            div { class: "operations-artifact-actions",
+                                button {
+                                    disabled: !local_ready,
+                                    aria_label: "批准 Runtime 本地写入",
+                                    title: local_title,
+                                    onclick: move |_| on_approve_local_runtime.call(()),
+                                    "{local_label}"
+                                }
+                            }
+                        }
+                    }
                 }
                 div { class: "operations-card operations-browser-card",
                     header { class: "operations-card-header",
@@ -5386,6 +5449,7 @@ fn OrchestratorSurface(
     on_open_workpad: EventHandler<()>,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_approve_local_runtime: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
     on_result_action: EventHandler<ResultSurfaceAction>,
@@ -5476,6 +5540,7 @@ fn OrchestratorSurface(
                             on_quick_entry,
                             on_interrupt,
                             on_continue_browser_workspace,
+                            on_approve_local_runtime,
                         }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
@@ -5601,6 +5666,7 @@ fn OrchestratorSurface(
                         on_quick_entry,
                         on_interrupt,
                         on_continue_browser_workspace,
+                        on_approve_local_runtime,
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
@@ -8685,6 +8751,8 @@ const fn desktop_runtime_progress_label(phase: DesktopRuntimeProgressPhase) -> &
         DesktopRuntimeProgressPhase::ItemStarted => "正在处理下一项 Runtime 工作",
         DesktopRuntimeProgressPhase::ItemCompleted => "Runtime 工作项已完成",
         DesktopRuntimeProgressPhase::LocalActionDeclined => "本地写入请求已按默认策略拒绝",
+        DesktopRuntimeProgressPhase::WaitingLocalApproval => "本地写入请求等待窗口精确批准",
+        DesktopRuntimeProgressPhase::LocalActionApproved => "窗口已批准精确 Runtime 本地写入 digest",
         DesktopRuntimeProgressPhase::StopRequested => "停止请求已交给协调器",
         DesktopRuntimeProgressPhase::InterruptSent => "fenced interrupt 已发送",
         DesktopRuntimeProgressPhase::Completed => "Runtime turn 已完成，正在采纳最终产物",
@@ -8707,13 +8775,14 @@ const fn desktop_runtime_progress_display_label(
 
 const fn desktop_runtime_progress_class(phase: DesktopRuntimeProgressPhase) -> &'static str {
     match phase {
-        DesktopRuntimeProgressPhase::Completed | DesktopRuntimeProgressPhase::Interrupted => {
-            "terminal"
-        }
+        DesktopRuntimeProgressPhase::Completed
+        | DesktopRuntimeProgressPhase::Interrupted
+        | DesktopRuntimeProgressPhase::LocalActionApproved => "terminal",
         DesktopRuntimeProgressPhase::Failed | DesktopRuntimeProgressPhase::Uncertain => "danger",
         DesktopRuntimeProgressPhase::StopRequested
         | DesktopRuntimeProgressPhase::InterruptSent
-        | DesktopRuntimeProgressPhase::LocalActionDeclined => "attention",
+        | DesktopRuntimeProgressPhase::LocalActionDeclined
+        | DesktopRuntimeProgressPhase::WaitingLocalApproval => "attention",
         DesktopRuntimeProgressPhase::Preparing
         | DesktopRuntimeProgressPhase::Dispatched
         | DesktopRuntimeProgressPhase::TurnStarted
@@ -10382,6 +10451,21 @@ mod tests {
         assert!(source.contains("format!(\"Continue · {}\""));
         assert!(source.contains("on_continue_browser_workspace"));
         assert!(source.contains("BrowserHostReconciliationRequired"));
+    }
+
+    #[test]
+    fn operations_approve_calls_application_respond_context_runtime_local_approval() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("approve_held_local_write"));
+        assert!(source.contains("respond_context_runtime_local_approval"));
+        assert!(source.contains("on_approve_local_runtime"));
+        assert!(source.contains("format!(\"Approve · {}\""));
+        let data_plane = include_str!("data_plane.rs");
+        assert!(data_plane.contains("approved: true"));
+        assert!(data_plane.contains("WaitingLocalApproval"));
+        assert!(data_plane.contains("respond_context_runtime_local_approval"));
+        assert!(!data_plane.contains("approved: false"));
+        assert!(!data_plane.contains("LocalActionDeclined);"));
     }
 
     #[test]
