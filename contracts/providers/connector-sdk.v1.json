@@ -1,0 +1,75 @@
+{
+  "schemaVersion": "hartevo-connector-sdk/v1",
+  "contractVersion": "connector-sdk-e1/v1",
+  "providerAdapterContractVersion": "provider-adapter-e1/v1",
+  "authority": "connector_worker_boundary",
+  "secretMaterial": "opaque_reference_only",
+  "operations": [
+    "probe",
+    "begin_auth",
+    "refresh",
+    "read",
+    "prepare_effect",
+    "execute",
+    "reconcile",
+    "verify",
+    "handle_webhook",
+    "revoke"
+  ],
+  "evidenceClasses": [
+    "probe_observation",
+    "authentication",
+    "read_observation",
+    "prepared_effect",
+    "receipt_candidate",
+    "reconciliation_observation",
+    "verification_observation",
+    "webhook_observation",
+    "revocation_observation"
+  ],
+  "provenanceClasses": [
+    "fixture",
+    "component_harness",
+    "controlled_provider",
+    "production_provider"
+  ],
+  "operationEvidenceBindings": {
+    "probe": "probe_observation",
+    "begin_auth": "authentication",
+    "refresh": "authentication",
+    "read": "read_observation",
+    "prepare_effect": "prepared_effect",
+    "execute": "receipt_candidate",
+    "reconcile": "reconciliation_observation",
+    "verify": "verification_observation",
+    "handle_webhook": "webhook_observation",
+    "revoke": "revocation_observation"
+  },
+  "taskStates": [
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "canceled"
+  ],
+  "workerStates": [
+    "active",
+    "canceled",
+    "expired"
+  ],
+  "webhookOrdering": "strict_contiguous_sequence",
+  "cursorBinding": [
+    "scope_digest",
+    "request_digest",
+    "sequence",
+    "token_digest"
+  ],
+  "freshnessSeconds": {
+    "credentialLease": 900,
+    "authSession": 600,
+    "probe": 120,
+    "workerLease": 900,
+    "webhook": 86400
+  },
+  "registrations": []
+}

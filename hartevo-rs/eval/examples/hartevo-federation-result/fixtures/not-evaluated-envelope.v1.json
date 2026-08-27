@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "hartevo-federation-result-envelope/v1",
+  "envelopeId": "fixture.result.not-evaluated",
+  "origin": {
+    "projectId": "project.fixture",
+    "missionId": "mission.fixture",
+    "turn": 1
+  },
+  "remoteWorker": {
+    "workerId": "worker.fixture.active",
+    "serviceId": "service.federation.result",
+    "providerDigest": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "roots": {
+    "inputRoot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "outputRoot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "evidenceRoot": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "sequence": 1,
+  "replayNonce": "5555555555555555555555555555555555555555555555555555555555555555",
+  "effectReceipt": {
+    "linkId": "receipt.fixture.pending",
+    "digest": "6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "verification": {
+    "linkId": "verification.fixture.pending",
+    "digest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "state": "pending"
+  },
+  "outcome": {
+    "linkId": "outcome.fixture.pending",
+    "digest": "8888888888888888888888888888888888888888888888888888888888888888"
+  },
+  "currentCommit": "0000000000000000000000000000000000000000",
+  "envelopeDigest": "9999999999999999999999999999999999999999999999999999999999999999",
+  "signature": null,
+  "workerEvidence": null
+}
