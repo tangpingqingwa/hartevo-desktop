@@ -4,9 +4,10 @@ use hartevo_domain_kernel::{
 };
 use hartevo_effect_broker::{
     DurableClaimDirective, DurableEffectLedger, DurableRateLimitDirective, ExecutionClaimContext,
-    ExecutionLease, LedgerClaim, LedgerError, PersistedClaimState, RateLimitRequest,
-    ReconciliationClaim, ReconciliationDisposition, ReconciliationLease, ReconciliationObservation,
-    ReconciliationPolicy, decide_durable_claim, decide_durable_rate_limit,
+    ExecutionLease, LedgerClaim, LedgerError, PersistedClaimState, PersistedCompletionPoint,
+    RateLimitRequest, ReconciliationClaim, ReconciliationDisposition, ReconciliationLease,
+    ReconciliationObservation, ReconciliationPolicy, decide_durable_claim,
+    decide_durable_rate_limit,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -262,6 +263,8 @@ fn load_claim_decision(
     LedgerError,
 > {
     let existing = load_idempotency(transaction, request.effect)?;
+    let reconciliation_head = load_reconciliation_head(transaction, request.effect)?;
+    validate_claim_head_classification(existing.as_ref(), reconciliation_head.as_ref())?;
     let Some(record) = existing.as_ref() else {
         return Ok((decide_durable_claim(None, false), None, existing));
     };
@@ -286,6 +289,43 @@ fn load_claim_decision(
     ))
 }
 
+fn validate_claim_head_classification(
+    record: Option<&IdempotencyRecord>,
+    head: Option<&ReconciliationHead>,
+) -> Result<(), LedgerError> {
+    let valid = match (record, head) {
+        (None, None) => true,
+        (Some(record), None) => matches!(
+            record.status.as_str(),
+            "executing"
+                | "failed"
+                | "uncertain"
+                | "receipt_recorded"
+                | "verified"
+                | "verification_required"
+        ),
+        (Some(IdempotencyRecord { status, .. }), Some(head)) if status == "uncertain" => {
+            matches!(head.status.as_str(), "leased" | "retry_wait")
+        }
+        (Some(record), Some(head)) if head.status == "receipt_found" => {
+            match record.status.as_str() {
+                "receipt_recorded" => {
+                    record.receipt_json.is_some() && record.verification_json.is_none()
+                }
+                "verified" | "verification_required" | "failed" => {
+                    record.receipt_json.is_some() && record.verification_json.is_some()
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
 fn materialize_claim(
     transaction: &Transaction<'_>,
     request: &ClaimRequest<'_>,
@@ -299,13 +339,7 @@ fn materialize_claim(
         }
         DurableClaimDirective::ReturnVerified => {
             let record = require_idempotency(existing, "verified")?;
-            let (receipt, verification, execution_started_at) =
-                decode_durable_verification(transaction, request.effect, record)?;
-            Ok(LedgerClaim::AlreadyVerified {
-                receipt,
-                verification,
-                execution_started_at,
-            })
+            durable_verification_claim(transaction, request.effect, record)
         }
         DurableClaimDirective::ReturnProviderFailed => provider_failed_claim(
             transaction,
@@ -382,13 +416,26 @@ fn provider_failed_claim(
             "provider rejection cannot carry an unverified receipt".into(),
         ));
     }
-    Ok(LedgerClaim::ProviderRejected {
-        reason: record
-            .uncertain_reason
-            .clone()
-            .unwrap_or_else(|| "provider rejected without a recorded reason".into()),
-        execution_started_at: initial_execution_started_at(transaction, effect)?,
-        recorded_at: record.updated_at,
+    if load_reconciliation_head(transaction, effect)?.is_some() {
+        return Err(LedgerError::ScopeConflict);
+    }
+    let execution_started_at = initial_execution_started_at(transaction, effect)?;
+    if record.updated_at < execution_started_at {
+        return Err(LedgerError::ScopeConflict);
+    }
+    let reason = record
+        .uncertain_reason
+        .as_ref()
+        .filter(|reason| !reason.trim().is_empty())
+        .cloned()
+        .ok_or(LedgerError::ScopeConflict)?;
+    Ok(LedgerClaim::RecoverableProviderRejected {
+        reason,
+        observed_at: None,
+        execution_started_at,
+        completion: PersistedCompletionPoint::effect_idempotency_provider_rejected(
+            record.updated_at,
+        ),
     })
 }
 
@@ -843,8 +890,10 @@ fn resume_verification_claim(
     now: DateTime<Utc>,
 ) -> Result<LedgerClaim, LedgerError> {
     let (receipt, execution_started_at) = decode_durable_receipt(transaction, effect, record)?;
+    let completion =
+        persisted_receipt_completion(transaction, effect, record, &receipt, execution_started_at)?;
     let (attempt_no, generation) = next_attempt(transaction, effect)?;
-    Ok(LedgerClaim::Acquired {
+    Ok(LedgerClaim::RecoverableReceipt {
         lease: insert_attempt(
             transaction,
             effect,
@@ -855,8 +904,9 @@ fn resume_verification_claim(
             lease_expires_at,
             now,
         )?,
-        receipt: Some(receipt),
+        receipt,
         execution_started_at,
+        completion,
     })
 }
 
@@ -867,11 +917,108 @@ fn durable_verification_claim(
 ) -> Result<LedgerClaim, LedgerError> {
     let (receipt, verification, execution_started_at) =
         decode_durable_verification(transaction, effect, record)?;
-    Ok(LedgerClaim::DurableVerification {
+    let (receipt_completion, completion) = persisted_verification_completions(
+        transaction,
+        effect,
+        record,
+        &receipt,
+        &verification,
+        execution_started_at,
+    )?;
+    Ok(LedgerClaim::RecoverableVerification {
         receipt,
         verification,
         execution_started_at,
+        receipt_completion,
+        completion,
     })
+}
+
+fn persisted_receipt_completion(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+    record: &IdempotencyRecord,
+    receipt: &Receipt,
+    execution_started_at: DateTime<Utc>,
+) -> Result<PersistedCompletionPoint, LedgerError> {
+    if record.updated_at < execution_started_at || record.updated_at < receipt.accepted_at {
+        return Err(LedgerError::ScopeConflict);
+    }
+    let Some(head) = load_reconciliation_head(transaction, effect)? else {
+        return Ok(
+            PersistedCompletionPoint::effect_idempotency_provider_receipt(record.updated_at),
+        );
+    };
+    validate_receipt_found_head(effect, &head, receipt, execution_started_at)?;
+    if record.updated_at != head.updated_at {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(PersistedCompletionPoint::reconciliation_head_receipt_found(
+        head.updated_at,
+    ))
+}
+
+fn persisted_verification_completions(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+    record: &IdempotencyRecord,
+    receipt: &Receipt,
+    verification: &Verification,
+    execution_started_at: DateTime<Utc>,
+) -> Result<(Option<PersistedCompletionPoint>, PersistedCompletionPoint), LedgerError> {
+    if record.updated_at < execution_started_at
+        || record.updated_at < receipt.accepted_at
+        || record.updated_at < verification.observed_at
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    let receipt_completion = match load_reconciliation_head(transaction, effect)? {
+        None => None,
+        Some(head) => {
+            validate_receipt_found_head(effect, &head, receipt, execution_started_at)?;
+            if head.updated_at > record.updated_at {
+                return Err(LedgerError::ScopeConflict);
+            }
+            Some(PersistedCompletionPoint::reconciliation_head_receipt_found(
+                head.updated_at,
+            ))
+        }
+    };
+    Ok((
+        receipt_completion,
+        PersistedCompletionPoint::effect_idempotency_verification(record.updated_at),
+    ))
+}
+
+fn validate_receipt_found_head(
+    effect: &Effect,
+    head: &ReconciliationHead,
+    receipt: &Receipt,
+    execution_started_at: DateTime<Utc>,
+) -> Result<(), LedgerError> {
+    if head.status != "receipt_found" || head.terminal_reason.is_some() {
+        return Err(LedgerError::ScopeConflict);
+    }
+    let observation = head
+        .observation
+        .as_ref()
+        .ok_or(LedgerError::ScopeConflict)?;
+    observation.validate_for(effect, execution_started_at)?;
+    let ReconciliationObservation::ReceiptFound {
+        receipt: observed_receipt,
+        observed_at,
+        ..
+    } = observation
+    else {
+        return Err(LedgerError::ScopeConflict);
+    };
+    if observed_receipt != receipt
+        || head.evidence_digest.as_deref() != Some(observation.evidence_digest())
+        || head.updated_at < *observed_at
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
 }
 
 fn decode_durable_verification(
@@ -1232,15 +1379,53 @@ fn claim_effect_reconciliation(
         .map_err(persistence)?;
     if let Some(claim) = load_terminal_reconciliation_claim(&transaction, effect)? {
         transaction.commit().map_err(persistence)?;
-        return Ok(ReconciliationClaim::Resolved(claim));
+        return Ok(ReconciliationClaim::Resolved(Box::new(claim)));
     }
     let record = load_idempotency(&transaction, effect)?;
-    if record
-        .as_ref()
-        .is_none_or(|record| record.status != "uncertain")
-    {
+    let Some(record) = record.as_ref() else {
+        if load_reconciliation_head(&transaction, effect)?.is_some() {
+            return Err(LedgerError::ScopeConflict);
+        }
         transaction.commit().map_err(persistence)?;
         return Ok(ReconciliationClaim::NotRequired);
+    };
+    match record.status.as_str() {
+        "verified" | "verification_required" => {
+            let claim = durable_verification_claim(&transaction, effect, record)?;
+            transaction.commit().map_err(persistence)?;
+            return Ok(ReconciliationClaim::Resolved(Box::new(claim)));
+        }
+        "failed" => {
+            let claim = provider_failed_claim(&transaction, effect, record)?;
+            transaction.commit().map_err(persistence)?;
+            return Ok(ReconciliationClaim::Resolved(Box::new(claim)));
+        }
+        "receipt_recorded" => {
+            let (receipt, execution_started_at) =
+                decode_durable_receipt(&transaction, effect, record)?;
+            persisted_receipt_completion(
+                &transaction,
+                effect,
+                record,
+                &receipt,
+                execution_started_at,
+            )?;
+            transaction.commit().map_err(persistence)?;
+            return Ok(ReconciliationClaim::NotRequired);
+        }
+        "executing" => {
+            if load_reconciliation_head(&transaction, effect)?.is_some() {
+                return Err(LedgerError::ScopeConflict);
+            }
+            transaction.commit().map_err(persistence)?;
+            return Ok(ReconciliationClaim::NotRequired);
+        }
+        "uncertain" => {}
+        status => {
+            return Err(LedgerError::Persistence(format!(
+                "invalid reconciliation ledger status {status}"
+            )));
+        }
     }
     let execution_started_at = initial_execution_started_at(&transaction, effect)?;
     let head = load_reconciliation_head(&transaction, effect)?;
@@ -1303,14 +1488,14 @@ fn claim_existing_reconciliation(
                     None,
                     now,
                 )?;
-                Ok(ReconciliationClaim::Resolved(
+                Ok(ReconciliationClaim::Resolved(Box::new(
                     reconciliation_dead_letter_claim(
                         head.attempts,
                         &observation,
                         now,
                         execution_started_at,
                     )?,
-                ))
+                )))
             } else {
                 finish_reconciliation_attempt_only(
                     transaction,
@@ -1350,13 +1535,13 @@ fn claim_existing_reconciliation(
             lease_expires_at,
             execution_started_at,
         ),
-        "receipt_found" | "provider_rejected" => Ok(ReconciliationClaim::NotRequired),
+        "receipt_found" | "provider_rejected" => Err(LedgerError::ScopeConflict),
         "not_executed" | "dead_letter" => {
             let claim =
                 load_terminal_reconciliation_claim(transaction, effect)?.ok_or_else(|| {
                     LedgerError::Persistence("missing terminal reconciliation projection".into())
                 })?;
-            Ok(ReconciliationClaim::Resolved(claim))
+            Ok(ReconciliationClaim::Resolved(Box::new(claim)))
         }
         status => Err(LedgerError::Persistence(format!(
             "invalid reconciliation head status {status}"
@@ -1938,6 +2123,9 @@ fn load_terminal_reconciliation_claim(
     let observation = head.observation.as_ref().ok_or_else(|| {
         LedgerError::Persistence("terminal reconciliation has no observation".into())
     })?;
+    let record = load_idempotency(transaction, effect)?.ok_or_else(|| {
+        LedgerError::Persistence("terminal reconciliation has no ledger row".into())
+    })?;
     observation.validate_for(effect, execution_started_at)?;
     if head.evidence_digest.as_deref() != Some(observation.evidence_digest())
         || head.updated_at < observation.observed_at()
@@ -1955,26 +2143,89 @@ fn load_terminal_reconciliation_claim(
                 evidence_digest,
                 observed_at,
             },
-        ) => Ok(Some(LedgerClaim::ReconciledNotExecuted {
-            evidence_digest: evidence_digest.clone(),
-            observed_at: *observed_at,
-            execution_started_at,
-        })),
-        ("provider_rejected", ReconciliationObservation::ProviderRejected { reason, .. }) => {
-            Ok(Some(LedgerClaim::ProviderRejected {
-                reason: reason.clone(),
+        ) => {
+            validate_not_executed_idempotency(&record, &head)?;
+            Ok(Some(LedgerClaim::RecoverableReconciledNotExecuted {
+                evidence_digest: evidence_digest.clone(),
+                observed_at: *observed_at,
                 execution_started_at,
-                recorded_at: head.updated_at,
+                completion: PersistedCompletionPoint::reconciliation_head_not_executed(
+                    head.updated_at,
+                ),
             }))
         }
-        ("dead_letter", _) => Ok(Some(reconciliation_dead_letter_claim(
-            head.attempts,
-            observation,
-            head.updated_at,
-            execution_started_at,
-        )?)),
+        (
+            "provider_rejected",
+            ReconciliationObservation::ProviderRejected {
+                reason,
+                observed_at,
+                ..
+            },
+        ) => {
+            validate_reconciled_rejection_idempotency(&record, &head, reason)?;
+            Ok(Some(LedgerClaim::RecoverableProviderRejected {
+                reason: reason.clone(),
+                observed_at: Some(*observed_at),
+                execution_started_at,
+                completion: PersistedCompletionPoint::reconciliation_head_provider_rejected(
+                    head.updated_at,
+                ),
+            }))
+        }
+        ("dead_letter", ReconciliationObservation::StillUncertain { reason, .. }) => {
+            validate_dead_letter_idempotency(&record, &head, reason)?;
+            Ok(Some(reconciliation_dead_letter_claim(
+                head.attempts,
+                observation,
+                head.updated_at,
+                execution_started_at,
+            )?))
+        }
         _ => Err(LedgerError::ScopeConflict),
     }
+}
+
+fn validate_reconciled_rejection_idempotency(
+    record: &IdempotencyRecord,
+    head: &ReconciliationHead,
+    reason: &str,
+) -> Result<(), LedgerError> {
+    if record.status != "failed"
+        || record.receipt_json.is_some()
+        || record.verification_json.is_some()
+        || record.updated_at != head.updated_at
+        || record.uncertain_reason.as_deref() != Some(reason)
+        || head.terminal_reason.as_deref() != Some(reason)
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn validate_not_executed_idempotency(
+    record: &IdempotencyRecord,
+    head: &ReconciliationHead,
+) -> Result<(), LedgerError> {
+    if record.status != "uncertain"
+        || record.receipt_json.is_some()
+        || record.verification_json.is_some()
+        || record.updated_at > head.updated_at
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn validate_dead_letter_idempotency(
+    record: &IdempotencyRecord,
+    head: &ReconciliationHead,
+    reason: &str,
+) -> Result<(), LedgerError> {
+    validate_not_executed_idempotency(record, head)?;
+    if reason.trim().is_empty() || head.terminal_reason.as_deref() != Some(reason) {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
 }
 
 fn reconciliation_dead_letter_claim(

@@ -1,6 +1,8 @@
 //! Local-first, project-scoped persistence with encrypted files and atomic outbox writes.
 
 mod aggregate;
+mod attribution_evidence_query_store;
+mod attribution_outcome_adoption_store;
 mod attribution_spine_store;
 mod authorization;
 mod browser_file_store;
@@ -11,6 +13,7 @@ mod context_collaboration_store;
 mod context_foundation_store;
 mod context_material_store;
 mod context_store;
+mod context_worker_graph_store;
 mod creator;
 mod creator_hiring_store;
 mod deletion_propagation;
@@ -38,10 +41,14 @@ mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
 };
+pub use attribution_spine_store::AttributionSpineStoreExt;
 pub use browser_recipe_store::BrowserRecipeRuntimeState;
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,
     LocalEncryptedContextMaterialStore,
+};
+pub use context_worker_graph_store::{
+    ContextWorkerGraphError, ContextWorkerGraphSnapshot, WorkerGraphStoreDisposition,
 };
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};
@@ -4669,8 +4676,9 @@ mod tests {
     };
     use hartevo_effect_broker::{
         DurableEffectLedger, EffectPolicy, EffectRateLimit, ExecutionClaimContext, ExecutionLease,
-        LedgerClaim, LedgerError, PermissionEvidence, ReconciliationClaim,
-        ReconciliationDisposition, ReconciliationObservation, ReconciliationPolicy,
+        LedgerClaim, LedgerError, PermissionEvidence, PersistedCompletionPoint,
+        ReconciliationClaim, ReconciliationDisposition, ReconciliationObservation,
+        ReconciliationPolicy,
     };
     use proptest::prelude::*;
 
@@ -6363,6 +6371,57 @@ mod tests {
         idempotency: EffectIdempotencyCompletionSnapshot,
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct ReconciliationHeadSnapshot {
+        tenant_id: String,
+        project_id: String,
+        mission_id: String,
+        effect_id: String,
+        policy_version: String,
+        policy_digest: String,
+        max_attempts: i64,
+        retry_delay_seconds: i64,
+        status: String,
+        attempts: i64,
+        lease_owner: Option<String>,
+        lease_generation: i64,
+        lease_expires_at: Option<String>,
+        retry_at: Option<String>,
+        terminal_reason: Option<String>,
+        evidence_digest: Option<String>,
+        observation_json: Option<String>,
+        created_at: String,
+        updated_at: String,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ReconciliationAttemptSnapshot {
+        attempt_id: String,
+        tenant_id: String,
+        project_id: String,
+        mission_id: String,
+        effect_id: String,
+        attempt_no: i64,
+        generation: i64,
+        policy_digest: String,
+        status: String,
+        lease_owner: String,
+        lease_expires_at: String,
+        terminal_reason: Option<String>,
+        evidence_digest: Option<String>,
+        observed_at: Option<String>,
+        observation_json: Option<String>,
+        created_at: String,
+        updated_at: String,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct EffectRecoverySnapshot {
+        completion: Option<EffectCompletionSnapshot>,
+        head: Option<ReconciliationHeadSnapshot>,
+        reconciliation_attempts: Vec<ReconciliationAttemptSnapshot>,
+    }
+
     fn effect_completion_snapshot(
         store: &ProjectStore,
         effect: &Effect,
@@ -6438,6 +6497,199 @@ mod tests {
         }
     }
 
+    fn effect_recovery_snapshot(store: &ProjectStore, effect: &Effect) -> EffectRecoverySnapshot {
+        let has_idempotency = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM effect_idempotency
+                    WHERE project_id = ?1 AND idempotency_key = ?2
+                 )",
+                params![effect.project_id.as_str(), effect.idempotency_key],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("effect recovery idempotency presence");
+        let head = store
+            .connection
+            .query_row(
+                "SELECT tenant_id, project_id, mission_id, effect_id, policy_version,
+                        policy_digest, max_attempts, retry_delay_seconds, status, attempts,
+                        lease_owner, lease_generation, lease_expires_at, retry_at,
+                        terminal_reason, evidence_digest, observation_json, created_at, updated_at
+                 FROM effect_reconciliation_heads
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                params![effect.project_id.as_str(), effect.id.as_str()],
+                |row| {
+                    Ok(ReconciliationHeadSnapshot {
+                        tenant_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        mission_id: row.get(2)?,
+                        effect_id: row.get(3)?,
+                        policy_version: row.get(4)?,
+                        policy_digest: row.get(5)?,
+                        max_attempts: row.get(6)?,
+                        retry_delay_seconds: row.get(7)?,
+                        status: row.get(8)?,
+                        attempts: row.get(9)?,
+                        lease_owner: row.get(10)?,
+                        lease_generation: row.get(11)?,
+                        lease_expires_at: row.get(12)?,
+                        retry_at: row.get(13)?,
+                        terminal_reason: row.get(14)?,
+                        evidence_digest: row.get(15)?,
+                        observation_json: row.get(16)?,
+                        created_at: row.get(17)?,
+                        updated_at: row.get(18)?,
+                    })
+                },
+            )
+            .optional()
+            .expect("reconciliation head snapshot");
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT attempt_id, tenant_id, project_id, mission_id, effect_id,
+                        attempt_no, generation, policy_digest, status, lease_owner,
+                        lease_expires_at, terminal_reason, evidence_digest, observed_at,
+                        observation_json, created_at, updated_at
+                 FROM effect_reconciliation_attempts
+                 WHERE project_id = ?1 AND effect_id = ?2
+                 ORDER BY generation ASC",
+            )
+            .expect("reconciliation attempt snapshot query");
+        let reconciliation_attempts = statement
+            .query_map(
+                params![effect.project_id.as_str(), effect.id.as_str()],
+                |row| {
+                    Ok(ReconciliationAttemptSnapshot {
+                        attempt_id: row.get(0)?,
+                        tenant_id: row.get(1)?,
+                        project_id: row.get(2)?,
+                        mission_id: row.get(3)?,
+                        effect_id: row.get(4)?,
+                        attempt_no: row.get(5)?,
+                        generation: row.get(6)?,
+                        policy_digest: row.get(7)?,
+                        status: row.get(8)?,
+                        lease_owner: row.get(9)?,
+                        lease_expires_at: row.get(10)?,
+                        terminal_reason: row.get(11)?,
+                        evidence_digest: row.get(12)?,
+                        observed_at: row.get(13)?,
+                        observation_json: row.get(14)?,
+                        created_at: row.get(15)?,
+                        updated_at: row.get(16)?,
+                    })
+                },
+            )
+            .expect("reconciliation attempt snapshot rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("reconciliation attempt snapshots");
+        EffectRecoverySnapshot {
+            completion: has_idempotency.then(|| effect_completion_snapshot(store, effect)),
+            head,
+            reconciliation_attempts,
+        }
+    }
+
+    fn seed_reconciliation_head_for_tamper(
+        store: &ProjectStore,
+        effect: &Effect,
+        status: &str,
+        at: DateTime<Utc>,
+    ) {
+        let policy = ReconciliationPolicy::default();
+        let policy_digest = policy.canonical_digest().expect("tamper policy digest");
+        let (
+            lease_owner,
+            lease_expires_at,
+            retry_at,
+            terminal_reason,
+            evidence_digest,
+            observation,
+        ) = match status {
+            "leased" => (
+                Some("tamper-reconciler"),
+                Some(at + Duration::seconds(30)),
+                None,
+                None,
+                None,
+                None,
+            ),
+            "retry_wait" => {
+                let observation = ReconciliationObservation::StillUncertain {
+                    reason: "tamper retry state".into(),
+                    evidence_digest: "a".repeat(64),
+                    observed_at: at,
+                };
+                let evidence_digest = observation.evidence_digest().to_owned();
+                (
+                    None,
+                    None,
+                    Some(at + Duration::seconds(10)),
+                    Some("tamper retry state"),
+                    Some(evidence_digest),
+                    Some(observation),
+                )
+            }
+            "receipt_found" => {
+                let observation = ReconciliationObservation::ReceiptFound {
+                    receipt: Receipt {
+                        id: ReceiptId::from("tamper-receipt"),
+                        provider: effect.provider.clone(),
+                        external_id: "tamper-external".into(),
+                        accepted_at: at,
+                        request_digest: effect.approval_digest(),
+                        response_digest: "b".repeat(64),
+                    },
+                    evidence_digest: "c".repeat(64),
+                    observed_at: at,
+                };
+                let evidence_digest = observation.evidence_digest().to_owned();
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(evidence_digest),
+                    Some(observation),
+                )
+            }
+            _ => panic!("unsupported tamper reconciliation status"),
+        };
+        store
+            .connection
+            .execute(
+                "INSERT INTO effect_reconciliation_heads
+                   (tenant_id, project_id, mission_id, effect_id, policy_version,
+                    policy_digest, max_attempts, retry_delay_seconds, status, attempts,
+                    lease_owner, lease_generation, lease_expires_at, retry_at,
+                    terminal_reason, evidence_digest, observation_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?16)",
+                params![
+                    effect.tenant_id.as_str(),
+                    effect.project_id.as_str(),
+                    effect.mission_id.as_str(),
+                    effect.id.as_str(),
+                    policy.version,
+                    policy_digest,
+                    i64::from(policy.max_attempts),
+                    i64::try_from(policy.retry_delay_seconds).expect("tamper retry delay"),
+                    status,
+                    lease_owner,
+                    lease_expires_at.map(|value| value.to_rfc3339()),
+                    retry_at.map(|value| value.to_rfc3339()),
+                    terminal_reason,
+                    evidence_digest,
+                    observation
+                        .map(|value| serde_json::to_string(&value).expect("tamper observation")),
+                    at.to_rfc3339(),
+                ],
+            )
+            .expect("seed reconciliation head tamper");
+    }
+
     struct LocalEffectCompletionFixture {
         store: ProjectStore,
         effect: Effect,
@@ -6494,9 +6746,10 @@ mod tests {
                     now() + Duration::seconds(1),
                 )
                 .expect("valid receipt before verification lease");
-            let LedgerClaim::Acquired {
+            let LedgerClaim::RecoverableReceipt {
                 lease,
-                receipt: Some(reused),
+                receipt: reused,
+                completion,
                 ..
             } = store
                 .claim(
@@ -6511,6 +6764,12 @@ mod tests {
                 panic!("expected completion verification lease")
             };
             assert_eq!(reused, receipt);
+            assert_eq!(
+                completion,
+                PersistedCompletionPoint::effect_idempotency_provider_receipt(
+                    now() + Duration::seconds(1),
+                )
+            );
             lease
         } else {
             execution_lease
@@ -6751,9 +7010,10 @@ mod tests {
         store
             .record_receipt(effect, &lease, &receipt, now() + Duration::seconds(1))
             .expect("receipt");
-        let LedgerClaim::Acquired {
+        let LedgerClaim::RecoverableReceipt {
             lease: verification_lease,
-            receipt: Some(reused),
+            receipt: reused,
+            completion,
             ..
         } = store
             .claim(
@@ -6768,6 +7028,12 @@ mod tests {
             panic!("expected verification claim")
         };
         assert_eq!(reused, receipt);
+        assert_eq!(
+            completion,
+            PersistedCompletionPoint::effect_idempotency_provider_receipt(
+                now() + Duration::seconds(1),
+            )
+        );
         let verification = Verification {
             id: VerificationId::from("verification-rejected"),
             status: VerificationStatus::Rejected,
@@ -9586,9 +9852,10 @@ mod tests {
         };
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("reopen");
-            let LedgerClaim::Acquired {
+            let LedgerClaim::RecoverableReceipt {
                 lease,
-                receipt: Some(reused),
+                receipt: reused,
+                completion,
                 ..
             } = store
                 .claim(
@@ -9603,6 +9870,12 @@ mod tests {
                 panic!("receipt should be reused without a second provider execution")
             };
             assert_eq!(reused, receipt);
+            assert_eq!(
+                completion,
+                PersistedCompletionPoint::effect_idempotency_provider_receipt(
+                    now() + Duration::seconds(1),
+                )
+            );
             store
                 .record_verification(&effect, &lease, &verification, now() + Duration::seconds(2))
                 .expect("durable verification");
@@ -9619,10 +9892,14 @@ mod tests {
             .expect("verified claim");
         assert_eq!(
             claim,
-            LedgerClaim::AlreadyVerified {
+            LedgerClaim::RecoverableVerification {
                 receipt,
-                verification,
+                verification: verification.clone(),
                 execution_started_at: now(),
+                receipt_completion: None,
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    now() + Duration::seconds(2),
+                ),
             }
         );
     }
@@ -9680,10 +9957,13 @@ mod tests {
                     now() + Duration::hours(2) + Duration::seconds(30),
                 )
                 .expect("typed durable rejection"),
-            LedgerClaim::ProviderRejected {
+            LedgerClaim::RecoverableProviderRejected {
                 reason: "provider rejected exact payload".into(),
+                observed_at: None,
                 execution_started_at: now(),
-                recorded_at: now() + Duration::seconds(2),
+                completion: PersistedCompletionPoint::effect_idempotency_provider_rejected(
+                    now() + Duration::seconds(2),
+                ),
             }
         );
     }
@@ -9723,10 +10003,18 @@ mod tests {
                     now() + Duration::seconds(44),
                 )
                 .expect("verified terminal"),
-            LedgerClaim::AlreadyVerified {
+            LedgerClaim::RecoverableVerification {
                 receipt,
                 verification,
                 execution_started_at: now(),
+                receipt_completion: Some(
+                    PersistedCompletionPoint::reconciliation_head_receipt_found(
+                        now() + Duration::seconds(12),
+                    ),
+                ),
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    now() + Duration::seconds(13),
+                ),
             }
         );
         let counts = store
@@ -9781,10 +10069,13 @@ mod tests {
             ));
         }
         let mut store = ProjectStore::open(&database, &database_key()).expect("reopen");
-        let expected = LedgerClaim::ReconciledNotExecuted {
+        let expected = LedgerClaim::RecoverableReconciledNotExecuted {
             evidence_digest,
             observed_at: now() + Duration::seconds(2),
             execution_started_at: now(),
+            completion: PersistedCompletionPoint::reconciliation_head_not_executed(
+                now() + Duration::seconds(2),
+            ),
         };
         assert_eq!(
             store
@@ -9808,7 +10099,7 @@ mod tests {
                     now() + Duration::seconds(33),
                 )
                 .expect("terminal reconciliation claim"),
-            ReconciliationClaim::Resolved(expected)
+            ReconciliationClaim::Resolved(Box::new(expected))
         );
     }
 
@@ -9910,10 +10201,14 @@ mod tests {
                     now() + Duration::hours(2) + Duration::seconds(30),
                 )
                 .expect("typed durable verification"),
-            LedgerClaim::DurableVerification {
+            LedgerClaim::RecoverableVerification {
                 receipt,
                 verification: verification.clone(),
                 execution_started_at: now(),
+                receipt_completion: None,
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    now() + Duration::seconds(3),
+                ),
             }
         );
     }
@@ -9953,6 +10248,624 @@ mod tests {
                 now() + Duration::hours(3) + Duration::seconds(30),
             ),
             Err(hartevo_effect_broker::LedgerError::Persistence(_))
+        ));
+    }
+
+    fn local_recovery_store(tag: &str) -> (ProjectStore, Project, Mission, Effect) {
+        let project_id = format!("project-recovery-{tag}");
+        let mission_id = format!("mission-recovery-{tag}");
+        let effect_id = format!("effect-recovery-{tag}");
+        let idempotency_key = format!("idempotency-recovery-{tag}");
+        let mut store = ProjectStore::in_memory().expect("recovery store");
+        let project = project(&project_id, &format!("/tmp/{project_id}"));
+        let (mission, effect) =
+            approved_effect_named(&project_id, &mission_id, &effect_id, &idempotency_key);
+        store.save_project(&project).expect("recovery project");
+        store.save_mission(&mission).expect("recovery mission");
+        (store, project, mission, effect)
+    }
+
+    fn claim_local_execution(store: &mut ProjectStore, effect: &Effect) -> ExecutionLease {
+        let LedgerClaim::Acquired { lease, .. } = store
+            .claim(
+                effect,
+                Some(&effect_claim_context(effect)),
+                "recovery-executor",
+                now(),
+                now() + Duration::seconds(30),
+            )
+            .expect("recovery execution claim")
+        else {
+            panic!("expected recovery execution lease")
+        };
+        lease
+    }
+
+    #[test]
+    fn ordinary_claim_head_classification_fails_closed_without_mutation() {
+        let (mut executing, _, _, executing_effect) = local_recovery_store("executing-head");
+        claim_local_execution(&mut executing, &executing_effect);
+        seed_reconciliation_head_for_tamper(
+            &executing,
+            &executing_effect,
+            "leased",
+            now() + Duration::seconds(1),
+        );
+        let before = effect_recovery_snapshot(&executing, &executing_effect);
+        assert_eq!(
+            executing.claim(
+                &executing_effect,
+                None,
+                "classification-probe",
+                now() + Duration::seconds(2),
+                now() + Duration::seconds(32),
+            ),
+            Err(LedgerError::ScopeConflict)
+        );
+        assert_eq!(
+            effect_recovery_snapshot(&executing, &executing_effect),
+            before
+        );
+
+        let (mut uncertain, project, mission, uncertain_effect) =
+            local_recovery_store("uncertain-receipt-head");
+        persist_uncertain_effect(&mut uncertain, &project, &mission, &uncertain_effect);
+        seed_reconciliation_head_for_tamper(
+            &uncertain,
+            &uncertain_effect,
+            "receipt_found",
+            now() + Duration::seconds(2),
+        );
+        let before = effect_recovery_snapshot(&uncertain, &uncertain_effect);
+        assert_eq!(
+            uncertain.claim_reconciliation(
+                &uncertain_effect,
+                &ReconciliationPolicy::default(),
+                "classification-probe",
+                now() + Duration::seconds(3),
+                now() + Duration::seconds(33),
+            ),
+            Err(LedgerError::ScopeConflict)
+        );
+        assert_eq!(
+            effect_recovery_snapshot(&uncertain, &uncertain_effect),
+            before
+        );
+
+        let (orphan, _, _, orphan_effect) = local_recovery_store("orphan-head");
+        orphan
+            .connection
+            .execute("PRAGMA foreign_keys = OFF", [])
+            .expect("disable foreign keys for corruption fixture");
+        seed_reconciliation_head_for_tamper(
+            &orphan,
+            &orphan_effect,
+            "leased",
+            now() + Duration::seconds(1),
+        );
+        let before = effect_recovery_snapshot(&orphan, &orphan_effect);
+        let mut orphan = orphan;
+        assert_eq!(
+            orphan.claim(
+                &orphan_effect,
+                None,
+                "classification-probe",
+                now() + Duration::seconds(2),
+                now() + Duration::seconds(32),
+            ),
+            Err(LedgerError::ScopeConflict)
+        );
+        assert_eq!(effect_recovery_snapshot(&orphan, &orphan_effect), before);
+    }
+
+    #[test]
+    fn direct_provider_rejection_requires_exact_nonblank_stored_reason() {
+        for (index, reason) in [None, Some(""), Some("   ")].into_iter().enumerate() {
+            let (mut store, _, _, effect) =
+                local_recovery_store(&format!("provider-reason-{index}"));
+            let lease = claim_local_execution(&mut store, &effect);
+            store
+                .record_failed(
+                    &effect,
+                    &lease,
+                    "stored Provider rejection",
+                    now() + Duration::seconds(2),
+                )
+                .expect("stored Provider rejection");
+            store
+                .connection
+                .execute(
+                    "UPDATE effect_idempotency SET uncertain_reason = ?3
+                     WHERE project_id = ?1 AND effect_id = ?2",
+                    params![effect.project_id.as_str(), effect.id.as_str(), reason],
+                )
+                .expect("tamper stored Provider rejection reason");
+            let before = effect_recovery_snapshot(&store, &effect);
+            assert_eq!(
+                store.claim(
+                    &effect,
+                    None,
+                    "provider-rejection-probe",
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(33),
+                ),
+                Err(LedgerError::ScopeConflict)
+            );
+            assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+        }
+    }
+
+    #[test]
+    fn receipt_reconciliation_claim_is_read_only_and_receipt_tamper_fails_closed() {
+        let (mut store, project, mission, effect) = local_recovery_store("receipt-read-only");
+        persist_uncertain_effect(&mut store, &project, &mission, &effect);
+        let policy = ReconciliationPolicy::default();
+        let ReconciliationClaim::Acquired { lease, .. } = store
+            .claim_reconciliation(
+                &effect,
+                &policy,
+                "receipt-reconciler",
+                now() + Duration::seconds(2),
+                now() + Duration::seconds(32),
+            )
+            .expect("receipt reconciliation claim")
+        else {
+            panic!("expected receipt reconciliation lease")
+        };
+        let receipt = Receipt {
+            id: ReceiptId::from("read-only-receipt"),
+            provider: effect.provider.clone(),
+            external_id: "read-only-external".into(),
+            accepted_at: now() + Duration::seconds(1),
+            request_digest: effect.approval_digest(),
+            response_digest: "d".repeat(64),
+        };
+        assert!(matches!(
+            store
+                .record_reconciliation(
+                    &effect,
+                    &lease,
+                    &ReconciliationObservation::ReceiptFound {
+                        receipt: receipt.clone(),
+                        evidence_digest: "e".repeat(64),
+                        observed_at: now() + Duration::seconds(2),
+                    },
+                    now() + Duration::seconds(2),
+                )
+                .expect("persist receipt reconciliation"),
+            ReconciliationDisposition::ReceiptReadyForVerification { .. }
+        ));
+        let before = effect_recovery_snapshot(&store, &effect);
+        assert_eq!(
+            store
+                .claim_reconciliation(
+                    &effect,
+                    &policy,
+                    "read-only-probe",
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(33),
+                )
+                .expect("receipt reconciliation read-only probe"),
+            ReconciliationClaim::NotRequired
+        );
+        assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+
+        let mut tampered = receipt;
+        tampered.external_id = "different-external".into();
+        let observation = ReconciliationObservation::ReceiptFound {
+            receipt: tampered,
+            evidence_digest: "e".repeat(64),
+            observed_at: now() + Duration::seconds(2),
+        };
+        store
+            .connection
+            .execute(
+                "UPDATE effect_reconciliation_heads SET observation_json = ?3
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                params![
+                    effect.project_id.as_str(),
+                    effect.id.as_str(),
+                    serde_json::to_string(&observation).expect("tampered receipt observation"),
+                ],
+            )
+            .expect("tamper receipt reconciliation observation");
+        let before = effect_recovery_snapshot(&store, &effect);
+        assert_eq!(
+            store.claim_reconciliation(
+                &effect,
+                &policy,
+                "tamper-probe",
+                now() + Duration::seconds(3),
+                now() + Duration::seconds(33),
+            ),
+            Err(LedgerError::ScopeConflict)
+        );
+        assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+    }
+
+    macro_rules! run_reconciliation_terminal_provenance_matrix {
+        () => {{
+            let (mut rejected, project, mission, rejected_effect) =
+                local_recovery_store("rh-rejected");
+            persist_uncertain_effect(&mut rejected, &project, &mission, &rejected_effect);
+            let policy = ReconciliationPolicy::default();
+            let ReconciliationClaim::Acquired { lease, .. } = rejected
+                .claim_reconciliation(
+                    &rejected_effect,
+                    &policy,
+                    "rejected-reconciler",
+                    now() + Duration::seconds(2),
+                    now() + Duration::seconds(32),
+                )
+                .expect("rejected reconciliation claim")
+            else {
+                panic!("expected rejected reconciliation lease")
+            };
+            let reason = "Provider rejected during durable lookup";
+            assert!(matches!(
+                rejected
+                    .record_reconciliation(
+                        &rejected_effect,
+                        &lease,
+                        &ReconciliationObservation::ProviderRejected {
+                            reason: reason.into(),
+                            evidence_digest: "1".repeat(64),
+                            observed_at: now() + Duration::seconds(2),
+                        },
+                        now() + Duration::seconds(2),
+                    )
+                    .expect("persist reconciled rejection"),
+                ReconciliationDisposition::ProviderRejected { .. }
+            ));
+            let before = effect_recovery_snapshot(&rejected, &rejected_effect);
+            assert_eq!(
+                rejected
+                    .claim(
+                        &rejected_effect,
+                        None,
+                        "rejected-recovery-reader",
+                        now() + Duration::seconds(3),
+                        now() + Duration::seconds(33),
+                    )
+                    .expect("recover reconciled rejection"),
+                LedgerClaim::RecoverableProviderRejected {
+                    reason: reason.into(),
+                    observed_at: Some(now() + Duration::seconds(2)),
+                    execution_started_at: now(),
+                    completion: PersistedCompletionPoint::reconciliation_head_provider_rejected(
+                        now() + Duration::seconds(2),
+                    ),
+                }
+            );
+            assert_eq!(
+                effect_recovery_snapshot(&rejected, &rejected_effect),
+                before
+            );
+            rejected
+                .connection
+                .execute(
+                    "UPDATE effect_idempotency SET uncertain_reason = 'different stored reason'
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                    params![
+                        rejected_effect.project_id.as_str(),
+                        rejected_effect.id.as_str()
+                    ],
+                )
+                .expect("tamper reconciled rejection reason");
+            let before = effect_recovery_snapshot(&rejected, &rejected_effect);
+            assert_eq!(
+                rejected.claim(
+                    &rejected_effect,
+                    None,
+                    "rejected-tamper-reader",
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(33),
+                ),
+                Err(LedgerError::ScopeConflict)
+            );
+            assert_eq!(
+                effect_recovery_snapshot(&rejected, &rejected_effect),
+                before
+            );
+
+            let (mut not_executed, project, mission, not_executed_effect) =
+                local_recovery_store("rh-not-executed");
+            persist_uncertain_effect(&mut not_executed, &project, &mission, &not_executed_effect);
+            let ReconciliationClaim::Acquired { lease, .. } = not_executed
+                .claim_reconciliation(
+                    &not_executed_effect,
+                    &policy,
+                    "not-executed-reconciler",
+                    now() + Duration::seconds(2),
+                    now() + Duration::seconds(32),
+                )
+                .expect("not-executed reconciliation claim")
+            else {
+                panic!("expected not-executed reconciliation lease")
+            };
+            assert!(matches!(
+                not_executed
+                    .record_reconciliation(
+                        &not_executed_effect,
+                        &lease,
+                        &ReconciliationObservation::NotExecuted {
+                            evidence_digest: "2".repeat(64),
+                            observed_at: now() + Duration::seconds(2),
+                        },
+                        now() + Duration::seconds(2),
+                    )
+                    .expect("persist not-executed reconciliation"),
+                ReconciliationDisposition::ReconciledNotExecuted { .. }
+            ));
+            not_executed
+                .connection
+                .execute(
+                    "UPDATE effect_idempotency SET status = 'verified'
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                    params![
+                        not_executed_effect.project_id.as_str(),
+                        not_executed_effect.id.as_str()
+                    ],
+                )
+                .expect("tamper not-executed idempotency status");
+            let before = effect_recovery_snapshot(&not_executed, &not_executed_effect);
+            assert_eq!(
+                not_executed.claim(
+                    &not_executed_effect,
+                    None,
+                    "not-executed-tamper-reader",
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(33),
+                ),
+                Err(LedgerError::ScopeConflict)
+            );
+            assert_eq!(
+                effect_recovery_snapshot(&not_executed, &not_executed_effect),
+                before
+            );
+        }};
+    }
+
+    #[test]
+    fn reconciliation_terminal_provenance_is_exact_and_cross_table_tamper_is_read_only() {
+        run_reconciliation_terminal_provenance_matrix!();
+    }
+
+    macro_rules! run_rejected_reconciled_verification_matrix {
+        () => {{
+            let (mut store, project, mission, effect) =
+                local_recovery_store("rh-rejected-verification");
+            persist_uncertain_effect(&mut store, &project, &mission, &effect);
+            let policy = ReconciliationPolicy::default();
+            let ReconciliationClaim::Acquired { lease, .. } = store
+                .claim_reconciliation(
+                    &effect,
+                    &policy,
+                    "receipt-reconciler",
+                    now() + Duration::seconds(2),
+                    now() + Duration::seconds(32),
+                )
+                .expect("receipt reconciliation claim")
+            else {
+                panic!("expected receipt reconciliation lease")
+            };
+            let receipt = Receipt {
+                id: ReceiptId::from("rh-rejected-receipt"),
+                provider: effect.provider.clone(),
+                external_id: "rh-rejected-external".into(),
+                accepted_at: now() + Duration::seconds(1),
+                request_digest: effect.approval_digest(),
+                response_digest: "6".repeat(64),
+            };
+            let ReconciliationDisposition::ReceiptReadyForVerification {
+                lease: verification_lease,
+                ..
+            } = store
+                .record_reconciliation(
+                    &effect,
+                    &lease,
+                    &ReconciliationObservation::ReceiptFound {
+                        receipt: receipt.clone(),
+                        evidence_digest: "7".repeat(64),
+                        observed_at: now() + Duration::seconds(2),
+                    },
+                    now() + Duration::seconds(2),
+                )
+                .expect("persist RH receipt")
+            else {
+                panic!("expected verification lease")
+            };
+            let verification = Verification {
+                id: VerificationId::from("rh-rejected-verification"),
+                status: VerificationStatus::Rejected,
+                verifier: "independent-rh-verifier".into(),
+                independent: true,
+                observed_at: now() + Duration::seconds(3),
+                evidence_digest: "8".repeat(64),
+                receipt_id: receipt.id.clone(),
+            };
+            store
+                .record_verification(
+                    &effect,
+                    &verification_lease,
+                    &verification,
+                    now() + Duration::seconds(3),
+                )
+                .expect("persist rejected RH verification");
+            let before = effect_recovery_snapshot(&store, &effect);
+            assert_eq!(
+                store
+                    .claim(
+                        &effect,
+                        None,
+                        "verification-recovery-reader",
+                        now() + Duration::seconds(4),
+                        now() + Duration::seconds(34),
+                    )
+                    .expect("recover rejected RH verification"),
+                LedgerClaim::RecoverableVerification {
+                    receipt,
+                    verification: verification.clone(),
+                    execution_started_at: now(),
+                    receipt_completion: Some(
+                        PersistedCompletionPoint::reconciliation_head_receipt_found(
+                            now() + Duration::seconds(2),
+                        ),
+                    ),
+                    completion: PersistedCompletionPoint::effect_idempotency_verification(
+                        now() + Duration::seconds(3),
+                    ),
+                }
+            );
+            assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+
+            let verification_json =
+                serde_json::to_string(&verification).expect("serialize rejected verification");
+            store
+                .connection
+                .execute(
+                    "UPDATE effect_idempotency SET verification_json = NULL
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                    params![effect.project_id.as_str(), effect.id.as_str()],
+                )
+                .expect("tamper rejected RH verification payload");
+            let before = effect_recovery_snapshot(&store, &effect);
+            assert_eq!(
+                store.claim(
+                    &effect,
+                    None,
+                    "verification-tamper-reader",
+                    now() + Duration::seconds(4),
+                    now() + Duration::seconds(34),
+                ),
+                Err(LedgerError::ScopeConflict)
+            );
+            assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+
+            store
+                .connection
+                .execute(
+                    "UPDATE effect_idempotency
+                 SET verification_json = ?3, receipt_json = NULL
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                    params![
+                        effect.project_id.as_str(),
+                        effect.id.as_str(),
+                        verification_json,
+                    ],
+                )
+                .expect("tamper rejected RH receipt payload");
+            let before = effect_recovery_snapshot(&store, &effect);
+            assert_eq!(
+                store.claim(
+                    &effect,
+                    None,
+                    "receipt-tamper-reader",
+                    now() + Duration::seconds(4),
+                    now() + Duration::seconds(34),
+                ),
+                Err(LedgerError::ScopeConflict)
+            );
+            assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+        }};
+    }
+
+    #[test]
+    fn rejected_reconciled_verification_preserves_both_db_completion_points() {
+        run_rejected_reconciled_verification_matrix!();
+    }
+
+    #[test]
+    fn dead_letter_sources_remain_unrecoverable_and_cross_table_tamper_fails_closed() {
+        let policy = ReconciliationPolicy {
+            version: "dead-letter-integrity-v1".into(),
+            max_attempts: 1,
+            retry_delay_seconds: 60,
+        };
+        let (mut store, project, mission, effect) = local_recovery_store("dead-letter-live");
+        persist_uncertain_effect(&mut store, &project, &mission, &effect);
+        let ReconciliationClaim::Acquired { lease, .. } = store
+            .claim_reconciliation(
+                &effect,
+                &policy,
+                "dead-letter-reconciler",
+                now() + Duration::seconds(2),
+                now() + Duration::seconds(32),
+            )
+            .expect("dead-letter reconciliation claim")
+        else {
+            panic!("expected dead-letter reconciliation lease")
+        };
+        let observation = ReconciliationObservation::StillUncertain {
+            reason: "Provider remains ambiguous".into(),
+            evidence_digest: "3".repeat(64),
+            observed_at: now() + Duration::seconds(2),
+        };
+        store
+            .record_reconciliation(&effect, &lease, &observation, now() + Duration::seconds(2))
+            .expect("persist live dead letter");
+        let before = effect_recovery_snapshot(&store, &effect);
+        assert!(matches!(
+            store
+                .claim(
+                    &effect,
+                    None,
+                    "dead-letter-reader",
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(33),
+                )
+                .expect("read dead letter"),
+            LedgerClaim::DeadLetter { .. }
+        ));
+        assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+        store
+            .connection
+            .execute(
+                "UPDATE effect_idempotency SET status = 'verified'
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                params![effect.project_id.as_str(), effect.id.as_str()],
+            )
+            .expect("tamper dead-letter idempotency status");
+        let before = effect_recovery_snapshot(&store, &effect);
+        assert_eq!(
+            store.claim(
+                &effect,
+                None,
+                "dead-letter-tamper-reader",
+                now() + Duration::seconds(3),
+                now() + Duration::seconds(33),
+            ),
+            Err(LedgerError::ScopeConflict)
+        );
+        assert_eq!(effect_recovery_snapshot(&store, &effect), before);
+
+        let (mut expired, project, mission, expired_effect) =
+            local_recovery_store("dead-letter-expiry");
+        persist_uncertain_effect(&mut expired, &project, &mission, &expired_effect);
+        let ReconciliationClaim::Acquired { .. } = expired
+            .claim_reconciliation(
+                &expired_effect,
+                &policy,
+                "expiring-reconciler",
+                now() + Duration::seconds(2),
+                now() + Duration::seconds(3),
+            )
+            .expect("expiring reconciliation claim")
+        else {
+            panic!("expected expiring reconciliation lease")
+        };
+        assert!(matches!(
+            expired
+                .claim_reconciliation(
+                    &expired_effect,
+                    &policy,
+                    "expiry-reader",
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(33),
+                )
+                .expect("expired lease dead letter"),
+            ReconciliationClaim::Resolved(claim)
+                if matches!(*claim, LedgerClaim::DeadLetter { .. })
         ));
     }
 
@@ -10000,9 +10913,10 @@ mod tests {
 
             let mut leases = Vec::with_capacity(competing_claims);
             for index in 0..competing_claims {
-                let LedgerClaim::Acquired {
+                let LedgerClaim::RecoverableReceipt {
                     lease,
-                    receipt: Some(reused),
+                    receipt: reused,
+                    completion,
                     ..
                 } = store.claim(
                     &effect,
@@ -10017,6 +10931,12 @@ mod tests {
                     ));
                 };
                 prop_assert_eq!(reused, receipt.clone());
+                prop_assert_eq!(
+                    completion,
+                    PersistedCompletionPoint::effect_idempotency_provider_receipt(
+                        now() + Duration::seconds(1),
+                    )
+                );
                 leases.push(lease);
             }
             let verification = Verification {
@@ -10052,7 +10972,13 @@ mod tests {
                 now() + Duration::seconds(4),
                 now() + Duration::seconds(34),
             )?;
-            let already_verified = matches!(final_claim, LedgerClaim::AlreadyVerified { .. });
+            let already_verified = matches!(
+                final_claim,
+                LedgerClaim::RecoverableVerification {
+                    receipt_completion: None,
+                    ..
+                }
+            );
             prop_assert!(already_verified);
         }
 

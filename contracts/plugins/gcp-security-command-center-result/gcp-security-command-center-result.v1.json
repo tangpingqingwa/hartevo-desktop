@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.gcp-security-command-center-result/v1",
+  "title": "Hartevo Google Cloud Security Command Center finding-result contract",
+  "schemaVersion": "hartevo.gcp-security-command-center-result-contract/v1",
+  "contractVersion": "gcp-security-command-center-result/v1",
+  "layer": 1,
+  "authority": "read_only_observational_evidence",
+  "service": {
+    "id": "gcp.security-command-center.result",
+    "name": "GcpSecurityCenterService",
+    "version": "1.0.0",
+    "access": "read_only",
+    "readOnly": true,
+    "liveExecution": false,
+    "connected": false,
+    "native": false,
+    "durableReceipt": false,
+    "durableAdoption": false
+  },
+  "provider": {
+    "id": "gcp.security-command-center.findings",
+    "name": "GcpSecurityCenterProvider",
+    "serviceId": "gcp.security-command-center.result",
+    "version": "1.0.0",
+    "apiVersion": "v1",
+    "transport": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "connected": false,
+    "reversible": true,
+    "revocable": true,
+    "credentialResolution": "host_deferred"
+  },
+  "consumer": {
+    "id": "mission.gcp-security-command-center.result",
+    "name": "MissionGcpSecurityCenterConsumer",
+    "serviceId": "gcp.security-command-center.result",
+    "version": "1.0.0",
+    "kind": "mission_observation_proposal",
+    "durableAdoption": false,
+    "truthAuthority": false
+  },
+  "operations": [
+    "describe_capabilities",
+    "register",
+    "revoke_registration",
+    "findings.list.read",
+    "findings.list.propose",
+    "findings.list.record",
+    "findings.list.verify",
+    "findings.group.read",
+    "findings.group.propose",
+    "findings.group.record",
+    "findings.group.verify",
+    "consume_observation"
+  ],
+  "reads": {
+    "findings.list": {
+      "method": "GET",
+      "bounded": true,
+      "arbitraryQuery": false,
+      "writes": false,
+      "filterBound": true,
+      "pageBound": true
+    },
+    "findings.group": {
+      "method": "POST",
+      "optional": true,
+      "bounded": true,
+      "arbitraryQuery": false,
+      "writes": false,
+      "filterBound": true,
+      "pageBound": true
+    }
+  },
+  "scope": [
+    "organization",
+    "folder",
+    "gcpProject",
+    "source",
+    "location",
+    "finding",
+    "resource",
+    "hartevoProject",
+    "mission",
+    "workProduct",
+    "projectRevision",
+    "missionRevision",
+    "workProductRevision"
+  ],
+  "permissions": [
+    "securitycenter.findings.list",
+    "securitycenter.findings.group"
+  ],
+  "digests": [
+    "pluginVersionDigest",
+    "contractDigest",
+    "providerRevisionDigest",
+    "permissionDigest",
+    "scopeDigest",
+    "requestDigest",
+    "responseDigest",
+    "evidenceDigest",
+    "registrationDigest"
+  ],
+  "registration": {
+    "binds": [
+      "pluginVersion",
+      "contractDigest",
+      "providerRevision",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxFindings": 500,
+    "maxGroups": 200,
+    "maxPages": 4,
+    "pageSize": 100,
+    "maxFilterBytes": 2048,
+    "maxFilterValues": 16
+  },
+  "metadata": [
+    "source",
+    "resource",
+    "category",
+    "state",
+    "severity",
+    "eventTime"
+  ],
+  "redaction": {
+    "sourcePropertiesRetained": false,
+    "securityMarksRetained": false,
+    "piiRetained": false,
+    "rawProviderPayloadRetained": false,
+    "credentialMaterialRetained": false
+  },
+  "mutatingProviderOperations": [],
+  "forbidden": [
+    "create_finding",
+    "update_finding",
+    "mute_finding",
+    "change_finding_state",
+    "write_security_marks",
+    "bigquery_export",
+    "raw_source_properties",
+    "raw_pii",
+    "live_credential_resolution",
+    "connected_claim",
+    "native_claim",
+    "durable_work_product_adoption"
+  ],
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "fixtureNative": false,
+    "recordingNative": false,
+    "loopbackNative": false,
+    "blockedEnvNative": false,
+    "deferredTo": "layer_2_native_google_auth_and_https_transport",
+    "failClosedCases": [
+      "missing_host_credential_authority",
+      "missing_access_token",
+      "scope_or_revision_drift",
+      "permission_drift",
+      "api_version_drift",
+      "response_tamper",
+      "provider_access_loss"
+    ]
+  },
+  "honestNativeGap": "Layer 1 provides bounded fixture, recording, loopback, and BLOCKED_ENV evidence only. It does not resolve OAuth or service-account credentials, execute live HTTPS, claim Connected/native authority, retain raw Security Command Center payloads, create durable receipts, or adopt a Work Product Outcome."
+}

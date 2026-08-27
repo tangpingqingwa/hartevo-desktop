@@ -1,0 +1,17 @@
+{
+  "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "baseSha": "ceec0e04dd037028b327fd264a67a2e8ef8fba9b",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/domain-kernel/src/identity_team_plugin.rs",
+    "hartevo-rs/domain-kernel/src/lib.rs"
+  ],
+  "pr": 201,
+  "receiptDigest": "20a40b16b713b1fdee9eae5144c784fab4dfcccf97d0087d5870fdee26bab1ad",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-27T12:04:05Z",
+  "reviewedHeadSha": "4682c14a955d92bf0af937f612cfaa119f016321",
+  "reviewerTaskId": "01a04316-519b-7dd2-b055-4f3d93b939ca",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

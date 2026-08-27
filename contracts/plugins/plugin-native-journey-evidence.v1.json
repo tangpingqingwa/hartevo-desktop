@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.plugin-native-journey-evidence/v1",
+  "title": "Hartevo native plugin journey evidence manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "documentType",
+    "authority",
+    "releaseDecision",
+    "sourceCommit",
+    "journeyId",
+    "captureId",
+    "oracle",
+    "bindings",
+    "process",
+    "events",
+    "effects",
+    "restartPoints",
+    "result",
+    "blobs",
+    "classification",
+    "manifestDigest",
+    "signature"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.plugin-native-journey-evidence/v1" },
+    "documentType": { "const": "plugin_native_journey_evidence" },
+    "authority": { "const": "plugin_native_journey_evidence_only" },
+    "releaseDecision": { "const": "NOT_EVALUATED" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "journeyId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "captureId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "oracle": { "$ref": "#/$defs/oracle" },
+    "bindings": { "$ref": "#/$defs/bindings" },
+    "process": { "$ref": "#/$defs/process" },
+    "events": {
+      "type": "array",
+      "minItems": 4,
+      "items": { "$ref": "#/$defs/event" }
+    },
+    "effects": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/effect" }
+    },
+    "restartPoints": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/restart" }
+    },
+    "result": { "$ref": "#/$defs/result" },
+    "blobs": {
+      "type": "array",
+      "minItems": 10,
+      "items": { "$ref": "#/$defs/blob" }
+    },
+    "classification": {
+      "enum": [
+        "native_verified",
+        "not_evaluated",
+        "blocked_env",
+        "fixture",
+        "simulator",
+        "ignored"
+      ]
+    },
+    "manifestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "oracleSchemaVersion",
+        "authority",
+        "releaseDecision",
+        "oracleStatus",
+        "nativePass",
+        "sourceCommit",
+        "journeyId",
+        "projectId",
+        "missionId",
+        "evidenceRoot",
+        "replayDigest",
+        "invocationCount",
+        "effectCount",
+        "recoveryCount"
+      ],
+      "properties": {
+        "oracleSchemaVersion": { "const": "hartevo-plugin-native-journey-report/v1" },
+        "authority": { "const": "plugin_native_journey_oracle_only" },
+        "releaseDecision": { "const": "NOT_EVALUATED" },
+        "oracleStatus": { "enum": ["NATIVE_PASS", "NOT_EVALUATED", "BLOCKED_ENV"] },
+        "nativePass": { "type": "boolean" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "journeyId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "evidenceRoot": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "replayDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "invocationCount": { "type": "integer", "minimum": 1 },
+        "effectCount": { "type": "integer", "minimum": 1 },
+        "recoveryCount": { "const": 4 }
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "missionId",
+        "runtimePluginId",
+        "modelPluginId",
+        "serviceId",
+        "providerId",
+        "consumerId",
+        "runtimePluginDigest",
+        "modelDigest",
+        "providerDigest",
+        "serviceLogDigest",
+        "consumerResultDigest"
+      ],
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "runtimePluginId": { "type": "string", "minLength": 1 },
+        "modelPluginId": { "type": "string", "minLength": 1 },
+        "serviceId": { "type": "string", "minLength": 1 },
+        "providerId": { "type": "string", "minLength": 1 },
+        "consumerId": { "type": "string", "minLength": 1 },
+        "runtimePluginDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "modelDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "providerDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "serviceLogDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "consumerResultDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "generation",
+        "mode",
+        "sourceCommit",
+        "executableDigest",
+        "startedAt",
+        "endedAt",
+        "exitCode",
+        "observationDigest",
+        "blobId"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "generation": { "type": "integer", "minimum": 1 },
+        "mode": { "enum": ["native", "simulator", "fixture", "blocked_env", "missing"] },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "executableDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "endedAt": { "type": "string", "format": "date-time" },
+        "exitCode": { "type": "integer" },
+        "observationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "blobId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "kind", "eventId", "sourceCommit", "occurredAt", "payloadDigest", "blobId"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "kind": { "enum": ["objective", "mission_composition", "invocation", "result"] },
+        "eventId": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "payloadDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "blobId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "effectId", "sourceCommit", "requestedAt", "receiptAt", "verifiedAt", "receiptDigest", "verificationDigest", "blobId"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "effectId": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "requestedAt": { "type": "string", "format": "date-time" },
+        "receiptAt": { "type": "string", "format": "date-time" },
+        "verifiedAt": { "type": "string", "format": "date-time" },
+        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "verificationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "blobId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "restart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "hook", "status", "sourceCommit", "occurredAt", "receiptDigest", "oldPluginAccepted", "oldDecisionPromotable", "blobId"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "hook": { "enum": ["unmount", "revoke", "crash", "relaunch"] },
+        "status": { "const": "recovered" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "oldPluginAccepted": { "const": false },
+        "oldDecisionPromotable": { "const": false },
+        "blobId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCommit", "revision", "status", "provenance", "resultDigest", "evidenceRoot", "decision", "selectedAt", "adoptedAt", "blobId"],
+      "properties": {
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["completed", "failed", "not_evaluated"] },
+        "provenance": { "enum": ["native", "simulator", "fixture", "blocked_env", "missing"] },
+        "resultDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "evidenceRoot": { "type": "string", "pattern": "^(?:|[0-9a-f]{64})$" },
+        "decision": { "enum": ["adopt", "reject", "not_evaluated"] },
+        "selectedAt": { "type": "string", "format": "date-time" },
+        "adoptedAt": { "type": "string", "format": "date-time" },
+        "blobId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "bytesHex", "sha256", "byteCount"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["process_observation", "durable_event", "effect_receipt", "restart_receipt", "result_receipt"] },
+        "bytesHex": { "type": "string", "pattern": "^[0-9a-f]+$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "byteCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "signerId", "publicKeyHex", "publicKeyDigest", "signatureHex", "signatureDigest", "signedManifestDigest"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "signerId": { "type": "string", "minLength": 1 },
+        "publicKeyHex": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "publicKeyDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "signatureHex": { "type": "string", "pattern": "^[0-9a-f]{128}$" },
+        "signatureDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "signedManifestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

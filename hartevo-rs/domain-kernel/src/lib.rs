@@ -3,6 +3,8 @@
 //! Runtime threads, model output, and provider responses are projections into this
 //! kernel. They are never accepted as business truth without a domain command.
 
+mod attribution_evidence_query;
+mod attribution_outcome_adoption;
 mod attribution_spine;
 mod connection;
 mod context;
@@ -12,6 +14,7 @@ mod creator_hiring;
 mod creator_work;
 mod deletion;
 mod identity;
+mod identity_team_plugin;
 mod ids;
 mod key_management;
 mod market_evidence;
@@ -29,6 +32,33 @@ mod truth;
 mod work_product;
 mod work_product_outcome;
 
+pub use attribution_evidence_query::{
+    ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_MOUNT_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_REVOKE_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_CONTRACT_VERSION, ATTRIBUTION_EVIDENCE_QUERY_FEEDBACK_EVENT_TYPE,
+    ATTRIBUTION_EVIDENCE_QUERY_REQUEST_EVENT_TYPE, ATTRIBUTION_EVIDENCE_QUERY_SCHEMA_VERSION,
+    AttributionEvidenceAdoptionDecision, AttributionEvidenceAdoptionFeedback,
+    AttributionEvidenceConfidence, AttributionEvidenceCounterevidence,
+    AttributionEvidenceFreshness, AttributionEvidenceFreshnessState,
+    AttributionEvidenceQueryConsumer, AttributionEvidenceQueryConsumerRecord,
+    AttributionEvidenceQueryConsumerState, AttributionEvidenceQueryError,
+    AttributionEvidenceQueryId, AttributionEvidenceQueryProvider, AttributionEvidenceQueryRecord,
+    AttributionEvidenceQueryRequest, AttributionEvidenceQueryResponse,
+    AttributionEvidenceQueryScope, AttributionEvidenceQueryService,
+    AttributionEvidenceQuerySnapshot, AttributionEvidenceQueryWindow,
+    AttributionEvidenceSourceCoverage,
+};
+pub use attribution_outcome_adoption::{
+    ATTRIBUTION_ADOPTION_CANDIDATE_EVENT_TYPE, ATTRIBUTION_ADOPTION_CONSUMER_MOUNT_EVENT_TYPE,
+    ATTRIBUTION_ADOPTION_CONSUMER_REVOKE_EVENT_TYPE,
+    ATTRIBUTION_ADOPTION_CONSUMER_UNMOUNT_EVENT_TYPE, ATTRIBUTION_ADOPTION_RECEIPT_EVENT_TYPE,
+    ATTRIBUTION_OUTCOME_ADOPTION_CONTRACT_VERSION, ATTRIBUTION_OUTCOME_ADOPTION_SCHEMA_VERSION,
+    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    AttributionAdoptionConsumer, AttributionAdoptionConsumerRecord,
+    AttributionAdoptionConsumerState, AttributionAdoptionDecision, AttributionAdoptionError,
+    AttributionAdoptionReceipt, AttributionAdoptionScope, AttributionAdoptionSnapshot,
+    AttributionModelVersion, AttributionOutcomeCandidate, AttributionVerificationRecord,
+};
 pub use attribution_spine::{
     ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
     AttributionError, AttributionLedger, AttributionProjection, AttributionReason,
@@ -39,6 +69,16 @@ pub use attribution_spine::{
     SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
     VerifiedOutcomeId,
 };
+
+/// Stable contract constants for storage crates.  The candidate and verified
+/// event names are also owned by the attribution-outcome adoption contract on
+/// newer bootstrap compositions, so they intentionally stay out of the root
+/// re-export above to avoid duplicate public names when that slice is composed.
+pub mod attribution_spine_contract {
+    pub use super::attribution_spine::{
+        ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    };
+}
 pub use context::{
     ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
     ContextDataClass, ContextDataPolicy, ContextError, ContextFactGrant, ContextInputRefs,
@@ -68,6 +108,18 @@ pub use identity::{
     ExternalIdentity, IdentityError, IdentityLink, IdentityLinkDecision, IdentityLinkStatus,
     IdentitySubject, LegalBasis, Partner, PartnerSupplyClass, Person,
 };
+pub use identity_team_plugin::{
+    CapabilityPolicyInput, IdentityCapabilityPolicyConsumer, IdentityCapabilityPolicyInput,
+    IdentityCapabilityPolicyProvider, IdentityCapabilityPolicyRoles, IdentityCapabilityRequirement,
+    IdentityMembershipReceipt, IdentityMembershipReceiptKind, IdentityMissionScope,
+    IdentityOfflineMembershipCache, IdentityOidcSession, IdentityPluginHandle,
+    IdentityPluginMountRequest, IdentityPluginPolicyDecision, IdentityPluginSessionFacts,
+    IdentitySessionAccessMode, IdentitySessionHead, IdentitySessionHeadStatus,
+    IdentityTeamMembership, IdentityTeamMembershipBinding, IdentityTeamMembershipConsumer,
+    IdentityTeamMembershipError, IdentityTeamMembershipProvider, IdentityTeamMembershipService,
+    IdentityTeamMembershipStatus, IdentityTeamRole, OidcIdentityTeamMembershipService,
+    ProjectMissionIdentityService,
+};
 pub use ids::{
     AccountId, ActorId, ApprovalId, AttributionId, BrowserActionBatchId, BrowserControlLeaseId,
     BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserSnapshotId,
@@ -78,10 +130,11 @@ pub use ids::{
     ConversationId, CreatorApplicationId, CreatorHiringId, CreatorId, CreatorMilestoneId,
     CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
     DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
-    KeyEnvelopeId, MemberId, MessageId, MissionConversationId, MissionConversationMessageId,
-    MissionId, MissionScheduleId, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId,
-    PersonId, ProjectId, ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId,
-    RuntimeTurnAttemptId, TaskId, TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+    IdentityMembershipReceiptId, IdentitySessionId, KeyEnvelopeId, MemberId, MessageId,
+    MissionConversationId, MissionConversationMessageId, MissionId, MissionScheduleId,
+    OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId, PersonId, ProjectId, ReceiptId,
+    RefundId, ReviewId, RuntimeRecoveryAttemptId, RuntimeTurnAttemptId, TaskId, TeamId, TenantId,
+    VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
 };
 pub use key_management::{
     DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,

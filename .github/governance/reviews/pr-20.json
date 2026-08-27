@@ -1,0 +1,21 @@
+{
+  "authorTaskId": "01a03cd9-105c-7170-9e98-b2db58b54d17",
+  "baseSha": "bc50f81493065e30b7896cf91d80ab3fa45ab7dd",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/github-pr-ci-observation.raw.json",
+    "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/manifest.json",
+    "artifacts/evidence/integration-build/7724c5ca06425262508136ab610e63df534df939/github-pr-ci-candidate.raw.json",
+    "artifacts/evidence/integration-build/7724c5ca06425262508136ab610e63df534df939/manifest.json",
+    "contracts/evidence/integration-build-provenance.v1.json",
+    "scripts/check-integration-build-provenance.sh"
+  ],
+  "pr": 20,
+  "receiptDigest": "e0e080e01864b680f247369bb2e6e65ff1db7915b20116dd3a6c9d0185c037ec",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T07:24:07Z",
+  "reviewedHeadSha": "48f22f16aee18cb86028a45e4ae2b1ae83cc5ac4",
+  "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
