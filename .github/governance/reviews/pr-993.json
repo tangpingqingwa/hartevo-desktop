@@ -1,0 +1,22 @@
+{
+  "authorTaskId": "01a045f7-6d21-7fd1-91fe-57a9efe0dd51",
+  "baseSha": "7c6fed53cfa479e2a11e1332038cb8da9563622d",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    ".github/ISSUE_TEMPLATE/governance-change.yml",
+    ".github/governance/README.md",
+    ".github/governance/events.jsonl",
+    ".github/policies/repository-governance-policy.json",
+    "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+    "scripts/repository_governance.py",
+    "scripts/tests/test_repository_governance.py"
+  ],
+  "pr": 993,
+  "receiptDigest": "76f7951f44cd3c7f7fc94176de9bf2fa2689ec7789bc41fe2b6498d77832bfdb",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-28T13:15:25Z",
+  "reviewedHeadSha": "f2c9364798bd72c16f64a0936f8f29f11f5f0396",
+  "reviewerTaskId": "codex-review/governance-resume-normal-pr-993/f2c9364798bd72c16f64a0936f8f29f11f5f0396",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
