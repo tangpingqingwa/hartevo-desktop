@@ -1,0 +1,53 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "bcb35e8fbbb304cf6da43e55394d2a495856e27e",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "bcb35e8fbbb304cf6da43e55394d2a495856e27e",
+      "headBranch": "codex/lightweight-cordis-governance-20260829",
+      "headCommit": "bf5432cede1c3426afdb4a32bb27ae7ff5a085f8",
+      "number": 998,
+      "review": {
+        "authorTaskId": "01a045f7-6d21-7fd1-91fe-57a9efe0dd51",
+        "exactPaths": [
+          ".github/governance/README.md",
+          ".github/governance/events.jsonl",
+          ".github/merge-train/README.md",
+          ".github/policies/branch-ruleset-policy.json",
+          ".github/policies/repository-governance-policy.json",
+          ".github/pull_request_template.md",
+          ".github/workflows/ci.yml",
+          ".github/workflows/governance-admission.yml",
+          ".github/workflows/integration.yml",
+          ".github/workflows/rust-reusable.yml",
+          "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+          "scripts/ci-branch-policy.py",
+          "scripts/ci-merge-train.py",
+          "scripts/ci-result.py",
+          "scripts/ci-scope.py",
+          "scripts/ci-workflow-policy.py",
+          "scripts/repository_governance.py",
+          "scripts/tests/test_repository_governance.py"
+        ],
+        "receiptDigest": "79dcf4d1ef30bbb5982f25a906229e829e72828e4f90cda29e772849a0887de7",
+        "receiptPath": ".github/governance/reviews/pr-998.json",
+        "reviewedHeadSha": "3f722af3c0d78e02106cf1d191910db76277e004",
+        "reviewerTaskId": "/root/lightweight_release_review"
+      }
+    }
+  ],
+  "createdAt": "2026-08-28T16:51:49Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260829-lightweight-cordis"
+}
