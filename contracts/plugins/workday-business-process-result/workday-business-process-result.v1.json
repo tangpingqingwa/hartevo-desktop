@@ -1,0 +1,146 @@
+{
+  "schemaVersion": "hartevo.workday-business-process-result-contract/v1",
+  "contractVersion": "workday-business-process-result/v1",
+  "layer": 1,
+  "service": {
+    "id": "workday.business-process.result",
+    "name": "WorkdayBusinessProcessResultService",
+    "readOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "workday.events-raas-wql",
+    "name": "WorkdayProvider",
+    "native": false,
+    "capabilities": ["events_read", "raas_read", "wql_read"],
+    "mutatingOperations": [],
+    "officialApiSeams": ["businessProcess/events", "RaaS", "WQL"]
+  },
+  "consumer": {
+    "id": "mission.workday-business-process-result",
+    "name": "MissionWorkdayBusinessProcessConsumer",
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "workProductAdoption": false
+  },
+  "apiVersion": "v1",
+  "transportProvenance": ["recording", "fixture", "loopback", "blocked_env"],
+  "operations": [
+    "describe_capabilities",
+    "register",
+    "revoke_registration",
+    "read_events",
+    "read_raas",
+    "read_wql",
+    "consume_result",
+    "prepare_effect",
+    "prepare_read_back"
+  ],
+  "readOnly": true,
+  "mutatingProviderOperations": [],
+  "authority": {
+    "externalWrites": false,
+    "payrollCompensation": false,
+    "rawWorkerPii": false,
+    "rawComments": false,
+    "rawAttachments": false,
+    "connected": false,
+    "effect": false,
+    "receipt": false,
+    "readBack": false,
+    "verification": false,
+    "outcome": false,
+    "workProductAdoption": false
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerVersion",
+      "providerDigest",
+      "capabilityDigest",
+      "tenantId",
+      "tenantRevision",
+      "scopeDigest",
+      "consentDigest",
+      "secretReferenceDigest",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "scopeFence": [
+    "tenantId",
+    "region",
+    "apiVersion",
+    "businessProcessId",
+    "businessProcessEventId",
+    "businessObjectIdAndRevision",
+    "workerReferenceDigest",
+    "reportId",
+    "timeWindow",
+    "pageAndRowBounds",
+    "eventRevision",
+    "stepIdAndRevision",
+    "missionIdAndRevision",
+    "projectIdAndRevision",
+    "consentDigestAndRevision"
+  ],
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxEvents": 16,
+    "maxSteps": 128,
+    "maxRows": 500,
+    "maxPages": 4,
+    "pageSize": 50,
+    "maxWindowDays": 31
+  },
+  "redaction": {
+    "workerPii": true,
+    "comments": true,
+    "attachments": true,
+    "payrollAndCompensation": true,
+    "rawProviderPayload": false
+  },
+  "receipts": {
+    "requestPathAndQuery": true,
+    "apiVersion": true,
+    "responseStatus": true,
+    "responseSize": true,
+    "responseDigest": true,
+    "providerRevision": true,
+    "freshness": true,
+    "rawProviderPayload": false,
+    "credentialMaterial": false,
+    "nativeReceipt": false
+  },
+  "seams": {
+    "consent": "consentDigestAndRevisionBound",
+    "effect": "deferredToLayer2HostEffectAuthority",
+    "receipt": "providerEvidenceOnlyInLayer1",
+    "readBack": "deferredToLayer2ExactReadBack"
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_workday_credentials_and_connected_authority",
+    "failClosedCases": [
+      "missing_native_workday_credential_authority",
+      "missing_native_access_token",
+      "api_version_drift",
+      "provider_or_capability_digest_drift",
+      "tenant_scope_or_revision_drift",
+      "expired_or_revoked_consent",
+      "arbitrary_wql",
+      "unbounded_raas_export",
+      "payroll_or_compensation_field",
+      "external_write_request",
+      "raw_worker_pii_comment_or_attachment_request"
+    ]
+  },
+  "honestNativeGap": "Layer 1 is recording/fixture/loopback/BLOCKED_ENV read evidence only. It does not resolve Workday OAuth or tenant credentials, claim Connected/native status, submit/cancel/rescind events, mutate workers or business objects, read payroll or compensation, retain worker PII/comments/attachments, mint a native Effect or Receipt, perform exact read-back, verify provider truth, adopt a kernel Outcome, or adopt a Work Product."
+}
