@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.modal-job-result-contract/v1",
+  "contractVersion": "modal-job-result-01-layer-1/v1",
+  "pluginId": "modal.job-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.modal-job-result-contract/v1|layer=1|service=modal.job-result.read|provider=modal.cloud.job-result.recording|consumer=mission.modal-job-result.consumer",
+  "contractDigest": "fee180888ece9a56cd55eb36179de450faa221465041270db456ad7e1115c554",
+  "service": {
+    "type": "ModalJobResultService",
+    "id": "modal.job-result.read",
+    "access": "read_proposal_recording",
+      "operations": [
+        "describe_capabilities",
+        "describe_scope",
+        "register_scope",
+      "lookup_deployed_function",
+      "spawn_function_call_projection",
+      "poll_function_call_projection",
+      "compile_job_result_proposal",
+      "record_job_result"
+    ]
+  },
+  "provider": {
+    "type": "ModalProvider",
+    "id": "modal.cloud.job-result.recording",
+    "apiRevision": "modal-function-call-read-1",
+    "operations": ["lookup_function", "spawn", "function_call_from_id", "poll_result"],
+    "allowedTransportProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    },
+    "mutations": {
+      "invoke": false,
+      "cancel": false,
+      "mutateApp": false,
+      "mutateDeployment": false,
+      "mutateEndpoint": false,
+      "shell": false,
+      "executeCode": false
+    }
+  },
+  "consumer": {
+    "type": "MissionModalJobConsumer",
+    "id": "mission.modal-job-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": ["missionId", "missionRevision", "projectId", "projectRevision", "workProductId", "workProductRevision"]
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kinds": ["modal_api_token", "workspace_token"],
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "hostId", "hostRevision", "workspaceId", "workspaceRevision",
+      "appId", "deploymentId", "appRevision", "deploymentKind",
+      "functionId", "functionRevision", "environmentId", "environmentRevision",
+      "callId", "callRevision", "inputId", "inputRevision", "inputDigest",
+      "retryRevision", "missionId", "missionRevision", "projectId", "projectRevision",
+      "workProductId", "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion", "contractVersion", "contractDigest", "providerId",
+      "providerRevision", "permissionSnapshotDigest", "scopeDigest",
+      "secretReferenceDigest", "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "permissions": [
+      "workspace.read",
+      "app.read",
+      "function.read",
+      "environment.read",
+      "function_call.read",
+      "function_call.result.read",
+      "usage.read"
+    ],
+    "forbiddenPermissions": [
+      "function.invoke",
+      "function_call.cancel",
+      "app.write",
+      "deployment.write",
+      "endpoint.write",
+      "container.shell",
+      "code.execute"
+    ],
+    "binding": [
+      "pluginVersion", "contractVersion", "contractDigest", "providerId",
+      "providerRevision", "permissionSnapshotDigest", "scopeDigest",
+      "secretReferenceDigest", "registrationRevision"
+    ]
+  },
+  "jobResultEvidence": {
+    "statuses": ["queued", "running", "succeeded", "failed", "canceled", "expired", "provider_unknown"],
+    "resultBodyRetention": false,
+    "rawLogsAndFiles": false,
+    "maxCapturedResultBytes": 65536,
+    "maxSerializedInputBytes": 65536,
+    "maxResponseBytes": 1048576,
+    "expirySeconds": 604800,
+    "usageFields": ["inputBytes", "outputBytes", "runtimeMillis", "providerRetryCount", "pollCount"],
+    "truncationIsNonAdoptable": true
+  },
+  "pollBounds": {
+    "maxPolls": 16,
+    "maxRetryAttempts": 8,
+    "boundedBackoff": true,
+    "repeatedCallHandling": "fail_closed_provider_unknown"
+  },
+  "adversarialEvidence": [
+    "deployed-lookup",
+    "ephemeral-lookup-refused",
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "canceled",
+    "expired",
+    "provider-unknown",
+    "retry-policy-drift",
+    "timeout",
+    "result-size-limit",
+    "serialization-limit",
+    "duplicate-spawn",
+    "replayed-recording",
+    "app-drift",
+    "function-drift",
+    "environment-drift",
+    "call-drift",
+    "input-drift",
+    "mission-drift",
+    "project-drift",
+    "work-product-drift",
+    "bounded-poll-backoff",
+    "unauthorized-401",
+    "forbidden-403",
+    "not-found-404",
+    "conflict-409",
+    "rate-limit-429",
+    "timeout-transport",
+    "server-5xx",
+    "access-loss",
+    "tamper",
+    "redaction",
+    "truncation",
+    "stale-mission-revision",
+    "registration-revocation"
+  ],
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Modal service/provider/consumer",
+      "exact deployed App and Function revision lookup projection",
+      "one bounded FunctionCall spawn and result poll projection",
+      "bounded status/result/expiry/usage evidence",
+      "canonical Mission job-result proposal",
+      "idempotent metadata-only recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "live Modal HTTPS or SDK invocation",
+      "native token or Workspace secret resolution",
+      "FunctionCall cancellation",
+      "App/deployment/endpoint mutation",
+      "container or sandbox shell",
+      "arbitrary code execution",
+      "raw logs/files/result bodies",
+      "durable provider receipt",
+      "independent readback/reconciliation",
+      "verified Work Product adoption",
+      "kernel authority"
+    ]
+  },
+  "honestNativeGap": "Native Modal token resolution, live HTTPS/SDK lookup/spawn/poll, durable provider receipt, independent result readback and reconciliation, and verified Work Product or Outcome adoption remain Layer-2 work; recording, fake, loopback, and BLOCKED_ENV never claim Connected, native, or first-party evidence."
+}
