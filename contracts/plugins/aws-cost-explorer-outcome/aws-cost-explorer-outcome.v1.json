@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-cost-explorer-outcome/aws-cost-explorer-outcome.v1.json",
+  "schemaVersion": "hartevo-aws-cost-explorer-outcome-contract/v1",
+  "contractVersion": "aws-cost-explorer-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "officialReferences": [
+    "https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_GetCostAndUsage.html",
+    "https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_GetCostAndUsageWithResources.html",
+    "https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_GetUsageForecast.html",
+    "https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_GetDimensionValues.html"
+  ],
+  "service": {
+    "id": "aws.cost-explorer.outcome",
+    "version": "1.0.0",
+    "operation": "governed_aws_spend_evidence_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "operations": [
+      "GetCostAndUsage",
+      "GetUsageForecast",
+      "GetDimensionValues",
+      "GetCostAndUsageWithResources"
+    ]
+  },
+  "provider": {
+    "id": "aws.cost-explorer",
+    "version": "1.0.0",
+    "acceptedProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "sigV4Credential": "opaque_secret_reference_only",
+    "resourceOperation": "explicit_allowlist_required",
+    "resourceOperationDefault": false
+  },
+  "consumer": {
+    "id": "mission.aws.cost-explorer.consumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "revisionBound": true,
+    "producesDecisionProposal": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "project",
+      "mission",
+      "missionRevision",
+      "workProduct",
+      "accountOrBillingView",
+      "timePeriod",
+      "metric",
+      "filter",
+      "groupBy",
+      "tags",
+      "costControlObjective",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "accountOrBillingView": "exactly_one",
+    "timePeriod": "start_inclusive_end_exclusive",
+    "secret": "opaque_secret_reference_only",
+    "pageToken": "opaque_digest_only"
+  },
+  "queryPolicy": {
+    "allow": [
+      "bounded_get_cost_and_usage",
+      "bounded_get_usage_forecast",
+      "bounded_get_dimension_values",
+      "explicitly_allowlisted_get_cost_and_usage_with_resources"
+    ],
+    "deny": [
+      "budget_mutation",
+      "cost_category_mutation",
+      "tag_mutation",
+      "billing_export",
+      "payment_or_credit_ledger",
+      "raw_cur_object_download",
+      "arbitrary_expression",
+      "unbounded_resource_detail",
+      "iam_policy_mutation",
+      "outcome_adoption",
+      "connected_or_native_claim"
+    ],
+    "groupByMax": 2,
+    "filterClauseMax": 4,
+    "pageMax": 16
+  },
+  "evidence": {
+    "states": [
+      "complete",
+      "estimated",
+      "partial",
+      "forecast_unavailable",
+      "access_loss",
+      "provider_unknown"
+    ],
+    "digests": [
+      "query",
+      "page",
+      "cost",
+      "forecast",
+      "registration",
+      "proposal",
+      "decision"
+    ],
+    "bounded": ["pages", "groups", "dimensionValues", "bytes", "retries"],
+    "estimateAndIncompleteFlags": true,
+    "redaction": "secrets_and_page_tokens_never_serialized"
+  },
+  "registration": {
+    "contractVersionBound": true,
+    "providerVersionBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "revisionBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "adoptedOutcome": false,
+    "truthAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "consented_sigv4_request_execution",
+    "native_aws_transport",
+    "durable_native_receipt",
+    "independent_readback",
+    "verified_work_product_adoption",
+    "budget_or_tag_mutation_authority"
+  ]
+}
