@@ -1,0 +1,25 @@
+{
+  "Payments": [
+    {
+      "PaymentID": "payment-1",
+      "Date": "2026-08-10",
+      "Amount": 100.0,
+      "CurrencyRate": 1.0,
+      "CurrencyCode": "USD",
+      "Status": "AUTHORISED",
+      "UpdatedDateUTC": "2026-08-10T12:00:00Z",
+      "Invoice": {
+        "InvoiceID": "invoice-1",
+        "InvoiceNumber": "INV-1001"
+      },
+      "Account": {
+        "AccountID": "account-1",
+        "Code": "090",
+        "Name": "Operating Account",
+        "Type": "BANK",
+        "Status": "ACTIVE",
+        "BankAccountNumber": "must never be projected"
+      }
+    }
+  ]
+}

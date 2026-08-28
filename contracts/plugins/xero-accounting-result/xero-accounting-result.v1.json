@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/xero-accounting-result/xero-accounting-result.v1.json",
+  "schemaVersion": "hartevo.xero-accounting-result.contract/v1",
+  "contractVersion": "xero-accounting-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": "Layer-1",
+  "title": "Hartevo Xero Accounting Result Layer-1 contract",
+  "description": "A bounded, read-only Xero Accounting projection. It is not a Connected/native Xero integration, financial authority, CRM/Inbox surface, dashboard, or kernel Outcome authority.",
+  "service": {
+    "id": "xero.accounting.result",
+    "implementation": "XeroAccountingResultService",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "revoke_secret",
+      "read_invoices",
+      "read_payments",
+      "read_contacts",
+      "consume_observation"
+    ]
+  },
+  "provider": {
+    "id": "xero.accounting",
+    "implementation": "XeroProvider",
+    "apiRevision": "xero-accounting-api-2.0-r1",
+    "permissions": [
+      "accounting.transactions.read",
+      "accounting.contacts.read"
+    ],
+    "authentication": ["oauth2_secret_reference"],
+    "transport": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "tenant_drift",
+      "organisation_drift",
+      "contact_drift",
+      "invoice_or_bill_drift",
+      "payment_drift",
+      "account_drift",
+      "currency_drift",
+      "updated_revision_drift",
+      "permission_digest_drift",
+      "provider_api_revision_drift",
+      "scope_digest_tamper",
+      "registration_tamper",
+      "access_loss",
+      "secret_revocation",
+      "registration_revocation"
+    ]
+  },
+  "consumer": {
+    "id": "mission.xero.accounting.result",
+    "implementation": "MissionXeroAccountingConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "kernelAuthority": false
+  },
+  "scope": [
+    "tenant_id",
+    "organisation_id",
+    "contact_id",
+    "invoice_or_bill_id_and_type",
+    "payment_id",
+    "account_id",
+    "currency_code",
+    "updated_revision",
+    "mission_id_and_revision",
+    "project_id_and_revision",
+    "work_product_id_and_revision",
+    "oauth2_secret_reference",
+    "permission_digest",
+    "api_revision"
+  ],
+  "digests": [
+    "plugin_version_digest",
+    "contract_digest",
+    "provider_digest",
+    "api_digest",
+    "permission_digest",
+    "scope_digest",
+    "updated_revision_digest",
+    "registration_digest",
+    "request_digest",
+    "redacted_response_digest",
+    "evidence_digest"
+  ],
+  "api": {
+    "baseUrl": "https://api.xero.com",
+    "revision": "xero-accounting-api-2.0-r1",
+    "method": "GET",
+    "endpoints": [
+      {
+        "path": "/api.xro/2.0/Invoices",
+        "method": "GET",
+        "fields": [
+          "InvoiceID",
+          "InvoiceNumber",
+          "Type",
+          "Status",
+          "Date",
+          "DueDate",
+          "Contact.ContactID",
+          "Contact.Name",
+          "Contact.ContactStatus",
+          "CurrencyCode",
+          "SubTotal",
+          "TotalTax",
+          "Total",
+          "AmountDue",
+          "AmountPaid",
+          "AmountCredited",
+          "UpdatedDateUTC"
+        ],
+        "query": ["exact_target_where", "date_bounds", "page", "pageSize", "fixed_order"]
+      },
+      {
+        "path": "/api.xro/2.0/Payments",
+        "method": "GET",
+        "fields": [
+          "PaymentID",
+          "Date",
+          "Amount",
+          "CurrencyRate",
+          "CurrencyCode",
+          "Status",
+          "UpdatedDateUTC",
+          "Invoice.InvoiceID",
+          "Invoice.InvoiceNumber",
+          "Account.AccountID",
+          "Account.Code",
+          "Account.Name",
+          "Account.Type",
+          "Account.Status"
+        ],
+        "query": ["exact_target_where", "date_bounds", "page", "pageSize", "fixed_order"]
+      },
+      {
+        "path": "/api.xro/2.0/Contacts",
+        "method": "GET",
+        "fields": ["ContactID", "Name", "ContactStatus", "UpdatedDateUTC"],
+        "query": ["exact_target_where", "date_bounds", "page", "pageSize", "fixed_order"]
+      }
+    ],
+    "queryPolicy": {
+      "arbitraryWhere": false,
+      "arbitraryReports": false,
+      "unboundedDates": false,
+      "unboundedPages": false,
+      "writes": false
+    }
+  },
+  "reads": [
+    { "id": "read_invoices", "path": "/api.xro/2.0/Invoices", "readOnly": true, "bounded": true, "writes": false },
+    { "id": "read_payments", "path": "/api.xro/2.0/Payments", "readOnly": true, "bounded": true, "writes": false },
+    { "id": "read_contacts", "path": "/api.xro/2.0/Contacts", "readOnly": true, "bounded": true, "writes": false },
+    { "id": "consume_observation", "path": null, "readOnly": true, "bounded": true, "writes": false }
+  ],
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPageSize": 100,
+    "maxPages": 4,
+    "maxRecords": 100,
+    "maxDateRangeDays": 366
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "revisionDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "evidenceModes": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+  "authority": {
+    "readOnly": true,
+    "connected": false,
+    "native": false,
+    "externalWrites": false,
+    "financialAdvice": false,
+    "durableReceipt": false,
+    "independentReadBack": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "forbidden": [
+    "invoice_mutation",
+    "payment_mutation",
+    "contact_mutation",
+    "payment_initiation",
+    "bank_details",
+    "attachments",
+    "pdfs",
+    "arbitrary_reports",
+    "financial_advice",
+    "dashboard_ui",
+    "kernel_authority",
+    "native_connected_claim"
+  ],
+  "distinctFrom": {
+    "money01": ["MONEY-01", "#78", "#104", "internal_money_authority"],
+    "crmInbox": ["CRM/Inbox", "#76", "contact_and_communication_authority"]
+  },
+  "nativeGaps": [
+    "native_oauth2_secret_resolution",
+    "native_xero_tenant_probe",
+    "native_bounded_https_execution",
+    "durable_provider_receipt",
+    "independent_read_back",
+    "verified_work_product_adoption"
+  ],
+  "honestNativeGap": "Layer-1 accepts fixture, recording, loopback, and BLOCKED_ENV evidence only. Native OAuth2 resolution, live Xero HTTPS execution, Connected/native status, durable provider receipts, independent read-back, financial advice, MONEY-01 authority, CRM/Inbox authority, dashboard/UI wiring, and kernel Outcome adoption remain deferred; BLOCKED_ENV is never native or Connected evidence."
+}
