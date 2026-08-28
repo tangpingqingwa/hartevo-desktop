@@ -1,5 +1,5 @@
 name: Governed repository change
-description: Propose a bounded change while the repository is in governance drain mode.
+description: Propose a bounded change under the repository governance control plane.
 title: "[governance] "
 labels: ["governance"]
 body:
@@ -13,6 +13,7 @@ body:
         - review-repair
         - base-refresh
         - security
+        - feature
     validations:
       required: true
   - type: input

@@ -1,0 +1,42 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "7c6fed53cfa479e2a11e1332038cb8da9563622d",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "7c6fed53cfa479e2a11e1332038cb8da9563622d",
+      "headBranch": "codex/governance-resume-normal-20260828",
+      "headCommit": "786efca7bb8dc2ebc38128c37fcc1054fae3f9bb",
+      "number": 993,
+      "review": {
+        "authorTaskId": "01a045f7-6d21-7fd1-91fe-57a9efe0dd51",
+        "exactPaths": [
+          ".github/ISSUE_TEMPLATE/governance-change.yml",
+          ".github/governance/README.md",
+          ".github/governance/events.jsonl",
+          ".github/policies/repository-governance-policy.json",
+          "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+          "scripts/repository_governance.py",
+          "scripts/tests/test_repository_governance.py"
+        ],
+        "receiptDigest": "76f7951f44cd3c7f7fc94176de9bf2fa2689ec7789bc41fe2b6498d77832bfdb",
+        "receiptPath": ".github/governance/reviews/pr-993.json",
+        "reviewedHeadSha": "f2c9364798bd72c16f64a0936f8f29f11f5f0396",
+        "reviewerTaskId": "codex-review/governance-resume-normal-pr-993/f2c9364798bd72c16f64a0936f8f29f11f5f0396"
+      }
+    }
+  ],
+  "createdAt": "2026-08-28T13:33:41Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260828-1331"
+}

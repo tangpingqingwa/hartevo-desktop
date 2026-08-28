@@ -31,6 +31,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = governance.load_policy(ROOT / governance.POLICY_PATH)
         self.events = governance.load_ledger(ROOT / governance.LEDGER_PATH)
+        self.paused_events = self.events[:-1]
 
     def admission(self, change_class: str = "governance") -> dict[str, object]:
         return {
@@ -85,9 +86,12 @@ class RepositoryGovernanceTests(unittest.TestCase):
             },
         }
 
-    def test_checked_in_policy_and_ledger_are_valid_and_paused(self) -> None:
+    def test_checked_in_policy_and_ledger_are_valid_resumed_and_normal(self) -> None:
         self.assertEqual(governance.verify_policy_value(self.policy)["status"], "PASS")
-        self.assertTrue(governance.global_paused(self.events))
+        self.assertEqual(self.policy["admissionModeWhenUnpaused"], "normal")
+        self.assertEqual(self.events[-1]["kind"], "GLOBAL_RESUMED")
+        self.assertFalse(governance.global_paused(self.events))
+        self.assertTrue(governance.global_paused(self.paused_events))
 
     def test_repository_lifecycle_settings_prefer_complete_rest_truth(self) -> None:
         repository = {
@@ -157,6 +161,15 @@ class RepositoryGovernanceTests(unittest.TestCase):
                 policy=self.policy,
             )
 
+    def test_normal_mode_admits_feature_through_the_same_exact_path_gate(self) -> None:
+        accepted = governance.verify_admission_value(
+            self.admission("feature"),
+            changed=[".github/policies/test.json"],
+            paused=False,
+            policy=self.policy,
+        )
+        self.assertEqual(accepted["mode"], "NORMAL")
+
     def test_exact_path_lease_rejects_outside_change(self) -> None:
         value = self.admission()
         value["ownedPaths"] = ["scripts"]
@@ -171,7 +184,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def test_paused_plan_has_no_executable_actions_but_keeps_deferred_work(self) -> None:
         plan = governance.build_plan(
             self.snapshot(),
-            self.events,
+            self.paused_events,
             self.policy,
             dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc),
         )
@@ -183,7 +196,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def test_paused_plan_cannot_be_approved(self) -> None:
         plan = governance.build_plan(
             self.snapshot(),
-            self.events,
+            self.paused_events,
             self.policy,
             dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc),
         )
@@ -196,25 +209,17 @@ class RepositoryGovernanceTests(unittest.TestCase):
                     dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc),
                 )
 
-    def test_unpaused_train_ready_sla_breach_is_an_incident(self) -> None:
+    def test_normal_train_ready_sla_breach_is_an_incident(self) -> None:
         snapshot = self.snapshot()
         snapshot["inventory"]["trainReadyPullRequests"] = 1
         snapshot["inventory"]["oldestTrainReadySeconds"] = 121
-        resumed = governance.seal_event(
-            {
-                "kind": "GLOBAL_RESUMED",
-                "actorTaskId": "governance-owner",
-                "payload": {"reason": "test exact drain-mode integration"},
-            },
-            str(self.events[-1]["digest"]),
-        )
         plan = governance.build_plan(
             snapshot,
-            [*self.events, resumed],
+            self.events,
             self.policy,
             dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc),
         )
-        self.assertEqual(plan["mode"], "DRAIN")
+        self.assertEqual(plan["mode"], "NORMAL")
         self.assertIn("READY_TO_TRAIN_SLA_BREACH", {item["code"] for item in plan["incidents"]})
         self.assertEqual(plan["truth"]["metrics"]["ready_count"], 1)
 
@@ -234,7 +239,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
         plan = governance.build_lifecycle_plan(
             self.snapshot(),
             nominations,
-            self.events,
+            self.paused_events,
             self.policy,
             dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc),
         )
@@ -259,7 +264,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
             governance.build_lifecycle_plan(
                 self.snapshot(),
                 nominations,
-                self.events,
+                self.paused_events,
                 self.policy,
                 dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc),
             )
