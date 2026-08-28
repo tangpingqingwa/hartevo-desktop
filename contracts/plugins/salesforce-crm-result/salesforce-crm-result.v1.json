@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/salesforce-crm-result/salesforce-crm-result.v1.json",
+  "schemaVersion": "hartevo-salesforce-crm-result-contract/v1",
+  "contractVersion": "salesforce-crm-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "salesforce.crm.result",
+    "name": "SalesforceCrmResultService",
+    "version": "1.0.0",
+    "operations": ["describe", "register", "revoke", "restore", "propose", "record", "verify"],
+    "readOnly": true,
+    "liveExecution": false,
+    "mutations": []
+  },
+  "provider": {
+    "id": "salesforce.crm.rest-graphql",
+    "name": "SalesforceProvider",
+    "version": "1.0.0",
+    "operations": ["rest_query", "graphql_query"],
+    "objects": ["Account", "Opportunity", "Case"],
+    "acceptedProvenance": ["fixture", "recording", "fake", "loopback", "BLOCKED_ENV"],
+    "native": false
+  },
+  "consumer": {
+    "id": "mission.salesforce.crm.result.consumer",
+    "name": "MissionSalesforceCrmConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "inboxAuthority": false
+  },
+  "officialApiBasis": {
+    "restQuery": "https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_query.htm",
+    "restSObject": "https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_basic_info.htm",
+    "graphqlRecordObjects": "https://developer.salesforce.com/docs/platform/graphql/guide/query-record-objects.html"
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "instance",
+      "apiVersion",
+      "allowlistedObjects",
+      "allowlistedFields",
+      "record",
+      "recordRevision",
+      "mission",
+      "missionRevision",
+      "project",
+      "projectRevision",
+      "workProduct",
+      "workProductRevision",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "secret": "opaque_non_serializing_oauth_secret_reference"
+  },
+  "allowlist": {
+    "objects": ["Account", "Opportunity", "Case"],
+    "fieldPolicy": "typed_enum_only",
+    "approval": ["status", "processDigest", "submittedAt", "completedAt", "stepCount", "lastStepStatus"],
+    "history": ["entryCount", "latestAt", "changedFieldDigest", "fromValueDigest", "toValueDigest"],
+    "redacted": ["contacts", "emails", "addresses", "notes", "rawPayload"]
+  },
+  "evidence": {
+    "digests": ["scope", "pluginVersion", "provider", "contract", "proposal", "request", "response", "record", "evidence"],
+    "bounded": ["fields", "records", "pages", "approvalSteps", "historyEntries", "diagnostics"],
+    "nextRecordsUrl": "digest_only",
+    "rawPayloadRetained": false,
+    "retries": "not_native_in_layer_1"
+  },
+  "registration": {
+    "versionBound": true,
+    "providerBound": true,
+    "contractBound": true,
+    "scopeBound": true,
+    "permissionBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "authority": {
+    "externalWrites": false,
+    "compositeWrites": false,
+    "emailSend": false,
+    "caseComments": false,
+    "approvalMutation": false,
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "independentReadback": false,
+    "workProductAdoption": false,
+    "inboxAuthority": false,
+    "truthAuthority": false
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "consented_native_oauth_resolution",
+    "native_https_rest_or_graphql_execution",
+    "durable_native_receipt",
+    "independent_readback",
+    "verified_work_product_adoption"
+  ]
+}
