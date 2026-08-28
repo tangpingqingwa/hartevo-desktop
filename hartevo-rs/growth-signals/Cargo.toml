@@ -1,0 +1,24 @@
+[package]
+name = "hartevo-growth-signals"
+description = "DataForSEO Labs read-only growth signal connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hartevo-connector-sdk = { path = "../connector-sdk" }
+hartevo-domain-kernel = { path = "../domain-kernel" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
