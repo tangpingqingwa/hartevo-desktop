@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/fivetran-sync-result/fivetran-sync-result.v1.json",
+  "title": "Hartevo Fivetran sync-result Layer-1 contract",
+  "description": "A standalone bounded read, proposal, and recording-only Fivetran data-movement projection. It is not a native Fivetran connection, sync effect, webhook, destination read-back, generic connector registry, or Domain Kernel authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "pluginVersion",
+    "layer",
+    "service",
+    "provider",
+    "consumer",
+    "scope",
+    "digests",
+    "reads",
+    "projections",
+    "bounds",
+    "registration",
+    "evidenceModes",
+    "authority",
+    "forbidden",
+    "nonOverlap",
+    "layer2Gaps",
+    "honestNativeGap"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo.fivetran-sync-result.contract/v1"},
+    "contractVersion": {"const": "EXT-FIVETRAN-01-L1/v1"},
+    "pluginVersion": {"const": "1.0.0"},
+    "layer": {"const": "Layer-1"},
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "implementation", "access", "operations"],
+      "properties": {
+        "id": {"const": "fivetran.sync-result"},
+        "implementation": {"const": "FivetranSyncResultService"},
+        "access": {"const": "read_proposal_recording_only"},
+        "operations": {
+          "const": [
+            "describe_connection",
+            "read_connection_state",
+            "list_connections_bounded",
+            "read_schema_table_metadata",
+            "read_sync_evidence",
+            "compile_sync_result_proposal",
+            "record_sync_projection",
+            "verify_sync_result",
+            "register",
+            "unmount",
+            "remount",
+            "revoke",
+            "reverse"
+          ]
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "implementation", "apiRevision", "method", "routes", "permissions", "transportModes", "backoff", "failClosedOn"],
+      "properties": {
+        "id": {"const": "fivetran.data-movement"},
+        "implementation": {"const": "FivetranProvider"},
+        "apiRevision": {"const": "fivetran-rest-connections-r1"},
+        "method": {"const": "GET"},
+        "routes": {
+          "const": [
+            "GET /v1/connections/{connection_id}",
+            "GET /v1/connections/{connection_id}/state",
+            "GET /v1/connections",
+            "GET /v1/connections/{connection_id}/schemas"
+          ]
+        },
+        "permissions": {
+          "const": [
+            "account:read",
+            "group:read",
+            "destination:read",
+            "connection:read",
+            "connection-state:read",
+            "connection-schema:read"
+          ]
+        },
+        "transportModes": {"const": ["fixture", "recording", "loopback", "BLOCKED_ENV"]},
+        "backoff": {"const": "bounded_no_sleep_retry_advisory"},
+        "failClosedOn": {
+          "const": [
+            "scope_drift",
+            "schema_table_drift",
+            "destination_drift",
+            "stale_mission_revision",
+            "non_monotonic_sync_revision",
+            "pagination_overflow_or_replay",
+            "malformed_or_partial_payload",
+            "redaction_violation",
+            "replay_or_tamper",
+            "registration_revocation"
+          ]
+        }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "implementation", "scopeCheck", "authority"],
+      "properties": {
+        "id": {"const": "mission.fivetran-sync-result"},
+        "implementation": {"const": "MissionFivetranSyncConsumer"},
+        "scopeCheck": {"const": "exact_project_mission_work_product_and_revision"},
+        "authority": {"const": "non_adoptable_observation"}
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account", "group", "destination", "connection", "sync", "schema", "table", "project", "mission", "workProduct", "revisions"],
+      "properties": {
+        "account": {"const": "exact_fivetran_account_id"},
+        "group": {"const": "exact_fivetran_group_id"},
+        "destination": {"const": "exact_fivetran_destination_id"},
+        "connection": {"const": "exact_fivetran_connection_id"},
+        "sync": {"const": "exact_fivetran_sync_id"},
+        "schema": {"const": "exact_schema_name"},
+        "table": {"const": "exact_table_name"},
+        "project": {"const": "exact_hartevo_project_id"},
+        "mission": {"const": "exact_hartevo_mission_id"},
+        "workProduct": {"const": "exact_hartevo_work_product_id"},
+        "revisions": {"const": ["account", "destination", "connection", "schema", "sync", "mission"]}
+      }
+    },
+    "digests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "contract", "provider", "api", "permissions", "scope", "revision", "registration", "evidence"],
+      "properties": {
+        "version": {"const": "sha256"},
+        "contract": {"const": "sha256"},
+        "provider": {"const": "sha256"},
+        "api": {"const": "sha256"},
+        "permissions": {"const": "sha256"},
+        "scope": {"const": "sha256"},
+        "revision": {"const": "sha256"},
+        "registration": {"const": "sha256"},
+        "evidence": {"const": "sha256"}
+      }
+    },
+    "reads": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": [
+        "connection_identity_and_status",
+        "connection_state",
+        "bounded_connection_listing",
+        "schema_metadata",
+        "table_metadata",
+        "latest_success_timestamp",
+        "latest_failure_timestamp",
+        "destination_identity_without_credentials"
+      ]}
+    },
+    "projections": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": ["setup_connected", "setup_broken", "setup_incomplete", "sync_scheduled", "syncing", "sync_paused", "sync_rescheduled", "update_on_schedule", "update_delayed", "partial", "stale", "access_loss", "provider_unknown"]}
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxResponseBytes", "maxPageItems", "maxPages", "maxSchemas", "maxTables", "maxColumns", "maxCursorBytes", "maxStateFields", "rawConfigRetained", "rawRowsRetained", "rawSourceRecordsRetained", "rawHeadersRetained"],
+      "properties": {
+        "maxResponseBytes": {"const": 2097152},
+        "maxPageItems": {"const": 100},
+        "maxPages": {"const": 4},
+        "maxSchemas": {"const": 256},
+        "maxTables": {"const": 4096},
+        "maxColumns": {"const": 65536},
+        "maxCursorBytes": {"const": 512},
+        "maxStateFields": {"const": 256},
+        "rawConfigRetained": {"const": false},
+        "rawRowsRetained": {"const": false},
+        "rawSourceRecordsRetained": {"const": false},
+        "rawHeadersRetained": {"const": false}
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "versionDigest", "contractDigest", "providerDigest", "apiDigest", "permissionDigest", "scopeDigest", "revisionDigest", "credentialDigest", "registrationDigest", "reversible", "revocable", "secretSerializable"],
+      "properties": {
+        "status": {"enum": ["active", "unmounted", "revoked", "reversed"]},
+        "versionDigest": {"const": "sha256"},
+        "contractDigest": {"const": "sha256"},
+        "providerDigest": {"const": "sha256"},
+        "apiDigest": {"const": "sha256"},
+        "permissionDigest": {"const": "sha256"},
+        "scopeDigest": {"const": "sha256"},
+        "revisionDigest": {"const": "sha256"},
+        "credentialDigest": {"const": "sha256_of_external_reference_only"},
+        "registrationDigest": {"const": "sha256"},
+        "reversible": {"const": true},
+        "revocable": {"const": true},
+        "secretSerializable": {"const": false}
+      }
+    },
+    "evidenceModes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+      "properties": {
+        "fixture": {"$ref": "#/$defs/nonNativeMode"},
+        "recording": {"$ref": "#/$defs/nonNativeMode"},
+        "loopback": {"$ref": "#/$defs/nonNativeMode"},
+        "BLOCKED_ENV": {"$ref": "#/$defs/nonNativeMode"}
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readOnly", "proposalOnly", "recordingOnly", "externalWrites", "durableReceipts", "webhookIngestion", "destinationReadBack", "genericConnectorRegistry", "kernelAuthority", "outcomeAuthority", "workProductAdoption"],
+      "properties": {
+        "readOnly": {"const": true},
+        "proposalOnly": {"const": true},
+        "recordingOnly": {"const": true},
+        "externalWrites": {"const": false},
+        "durableReceipts": {"const": false},
+        "webhookIngestion": {"const": false},
+        "destinationReadBack": {"const": false},
+        "genericConnectorRegistry": {"const": false},
+        "kernelAuthority": {"const": false},
+        "outcomeAuthority": {"const": false},
+        "workProductAdoption": {"const": false}
+      }
+    },
+    "forbidden": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": ["trigger_sync", "resync", "create_connection", "update_connection", "move_connection", "delete_connection", "mutate_schema", "mutate_table", "mutate_column", "run_setup_test", "ingest_webhook", "serialize_secret", "retain_api_key_or_secret", "retain_authorization_header", "retain_config", "retain_row_payload", "retain_source_record", "register_generic_connector", "kernel_authority", "durable_provider_receipt", "destination_read_back", "mission_work_product_adoption"]}
+    },
+    "nonOverlap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["airbyteIssue354", "dbtIssue353", "fivetranBoundary"],
+      "properties": {
+        "airbyteIssue354": {"const": "Airbyte Cloud connector/sync evidence owner"},
+        "dbtIssue353": {"const": "transformation/model/test evidence owner"},
+        "fivetranBoundary": {"const": "separately scoped Fivetran data-movement provider"}
+      }
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"enum": ["native_api_key_resolution", "live_https", "consented_sync_effects", "durable_receipts", "webhook_reconciliation", "independent_destination_read_back"]}
+    },
+    "honestNativeGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connected", "native", "firstParty", "reason"],
+      "properties": {
+        "connected": {"const": false},
+        "native": {"const": false},
+        "firstParty": {"const": false},
+        "reason": {"const": "Layer-1 has no live HTTPS or API-key resolver; fixture/recording/loopback/BLOCKED_ENV are non-native evidence modes"}
+      }
+    }
+  },
+  "$defs": {
+    "nonNativeMode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connected", "native", "firstParty", "recordingOnly"],
+      "properties": {
+        "connected": {"const": false},
+        "native": {"const": false},
+        "firstParty": {"const": false},
+        "recordingOnly": {"const": true}
+      }
+    }
+  }
+}
