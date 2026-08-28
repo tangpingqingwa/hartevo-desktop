@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/netsuite-accounting-result/netsuite-accounting-result.v1.json",
+  "title": "Hartevo NetSuite governed accounting-result Layer-1 contract",
+  "schemaVersion": "hartevo.netsuite-accounting-result-contract/v1",
+  "contractVersion": "netsuite-accounting-result/v1",
+  "layer": 1,
+  "service": {
+    "id": "netsuite.accounting-result",
+    "version": "1.0.0",
+    "implementation": "NetSuiteAccountingResultService",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "revoke_secret",
+      "read_record_metadata",
+      "read_record_collection",
+      "read_selected_record",
+      "compile_parameterized_suiteql_proposal",
+      "record_suiteql_proposal",
+      "consume_suiteql_proposal"
+    ],
+    "readOnly": true,
+    "liveExecution": false,
+    "writes": false
+  },
+  "provider": {
+    "id": "netsuite.suitetalk",
+    "version": "1.0.0",
+    "implementation": "NetSuiteSuiteTalkProvider",
+    "transport": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "operations": [
+      "GET /services/rest/record/v1/metadata-catalog",
+      "GET /services/rest/record/v1/{recordType}",
+      "GET /services/rest/record/v1/{recordType}/{recordId}",
+      "PARAMETERIZED SUITEQL PROPOSAL (not executed)"
+    ],
+    "native": false,
+    "connected": false,
+    "liveHttps": false
+  },
+  "consumer": {
+    "id": "mission.netsuite-accounting-result",
+    "version": "1.0.0",
+    "implementation": "MissionNetSuiteAccountingConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsWorkProduct": false,
+    "outcomeAuthority": false
+  },
+  "scope": {
+    "required": [
+      "accountId",
+      "dataCenter",
+      "roleId",
+      "recordType",
+      "recordId",
+      "collectionFilter",
+      "observationWindow",
+      "permissionDigest",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "consentScope",
+      "consentDigest",
+      "secretReference",
+      "credentialRevision"
+    ],
+    "secretReference": "opaque_non_serializable_oauth2_or_tba_reference",
+    "digest": "sha256_lower_hex",
+    "registration": "version_contract_provider_permission_scope_secret_revision_bound",
+    "recordIdFor": "selected_record_get; absent_only_for_collection_reads"
+  },
+  "reads": {
+    "allow": [
+      "bounded_record_metadata_get",
+      "bounded_record_collection_filter_get",
+      "bounded_selected_record_get"
+    ],
+    "method": "GET",
+    "arbitraryPath": false,
+    "arbitraryQuery": false,
+    "cursor": "opaque_digest_only",
+    "timeWindow": "bounded",
+    "maxPages": 4,
+    "pageSize": 50,
+    "maxResponseBytes": 1048576
+  },
+  "suiteQl": {
+    "allow": ["parameterized_select_proposal"],
+    "parameterized": true,
+    "arbitraryQuery": false,
+    "liveExecution": false,
+    "maxParameters": 8,
+    "maxQueryBytes": 16384
+  },
+  "evidence": {
+    "retain": [
+      "record_type",
+      "record_id_digest",
+      "metadata_field_allowlist",
+      "bounded_record_counts",
+      "normalized_status_counts",
+      "bounded_timestamps",
+      "request_response_digests",
+      "redacted_provider_receipts",
+      "suiteql_template_digest"
+    ],
+    "redact": [
+      "raw_provider_payload",
+      "raw_financial_values",
+      "customer_or_vendor_names",
+      "customer_or_vendor_contact_data",
+      "billing_or_shipping_addresses",
+      "bank_tax_or_payment_identifiers",
+      "transaction_memos",
+      "custom_field_values",
+      "credentials",
+      "access_tokens"
+    ],
+    "rawProviderPayload": false,
+    "rawFinancialPii": false,
+    "rawSuiteQl": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerBound": true,
+    "providerDefinitionDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "secretReferenceBound": true,
+    "credentialRevisionBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true,
+    "duplicateProposalRejected": true
+  },
+  "authority": {
+    "readOnly": true,
+    "externalWrites": false,
+    "create": false,
+    "update": false,
+    "delete": false,
+    "transform": false,
+    "approve": false,
+    "pay": false,
+    "refund": false,
+    "close": false,
+    "dashboard": false,
+    "erpAuthority": false,
+    "connected": false,
+    "nativeProvider": false,
+    "receipt": false,
+    "independentReadback": false,
+    "workProductAdoption": false,
+    "outcome": false
+  },
+  "honesty": {
+    "fixtureNative": false,
+    "recordingNative": false,
+    "loopbackNative": false,
+    "blockedEnvNative": false,
+    "fixtureConnected": false,
+    "recordingConnected": false,
+    "loopbackConnected": false,
+    "blockedEnvConnected": false,
+    "absenceOfRecordIsFinancialTruth": false,
+    "absenceOfPaymentIsSettlement": false,
+    "blockedEnvironmentStatus": "BLOCKED_ENV"
+  },
+  "distinctions": {
+    "notThisPluginIssues": ["407", "436", "430", "374"],
+    "notThisPluginProviders": ["xero", "sap", "paddle", "aws_cost_explorer"]
+  },
+  "layer2Gaps": [
+    "native_oauth2_or_tba_credential_resolution",
+    "native_account_and_data_center_probe",
+    "consented_live_suitetalk_https_gets",
+    "native_parameterized_suiteql_execution",
+    "durable_provider_receipts",
+    "independent_readback",
+    "create_update_delete_transform_effects",
+    "approve_pay_refund_close_effects",
+    "dashboard_or_erp_authority",
+    "verified_work_product_adoption"
+  ]
+}
