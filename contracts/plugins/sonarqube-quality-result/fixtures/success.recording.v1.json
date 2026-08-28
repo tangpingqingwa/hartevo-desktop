@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "hartevo.sonarqube-quality-result/v1",
+  "fixtureId": "sonarqube-quality-result-success-recording-v1",
+  "transport": "recording",
+  "connected": false,
+  "native": false,
+  "firstParty": false,
+  "endpointSequence": [
+    "/api/project_analyses/search",
+    "/api/qualitygates/project_status",
+    "/api/measures/component"
+  ],
+  "scope": {
+    "hostOrigin": "https://sonarqube.example.test",
+    "organizationId": "org-example",
+    "sonarProjectKey": "hartevo-example",
+    "branchOrPullRequest": {"kind": "branch", "key": "main"},
+    "analysisKey": "analysis-20260814-01",
+    "analysisDate": "2026-08-14T09:00:00+0800",
+    "sourceRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "qualityGateId": "gate-sonar-way",
+    "qualityGateName": "Sonar way",
+    "measureSelectors": [
+      {"metric": "coverage", "basis": "new_code"},
+      {"metric": "bugs", "basis": "overall"}
+    ],
+    "missionId": "mission-example",
+    "missionRevision": 3,
+    "projectId": "project-example",
+    "projectRevision": 7,
+    "workProductId": "work-product-example",
+    "workProductRevision": 2
+  },
+  "qualityGateStatus": "OK",
+  "qualityGateConditions": [
+    {
+      "metric": "coverage",
+      "basis": "new_code",
+      "status": "ok",
+      "operator": "greater_than_or_equal",
+      "errorThreshold": "80.0",
+      "actualValue": "92.0"
+    }
+  ],
+  "measures": [
+    {"metric": "coverage", "basis": "new_code", "value": "92.0", "bestValue": false},
+    {"metric": "bugs", "basis": "overall", "value": "0", "bestValue": true}
+  ],
+  "digests": {
+    "contractDigest": "9a0748ccf2f19de4579641ab8f914767217605d5144c3a952d68c52f5ed70ecc",
+    "secretReferenceDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "responseDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "proposalDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "rawProviderPayload": false,
+  "rawSource": false,
+  "rawBearerToken": false,
+  "durableProviderReceipt": false,
+  "outcomeAdopted": false
+}
