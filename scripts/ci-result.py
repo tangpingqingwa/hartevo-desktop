@@ -174,11 +174,9 @@ def run_aggregate(args: argparse.Namespace) -> int:
     names = parse_mapping(args.job_name, "--job-name")
     allowed = set(args.allow_skipped)
     planned_scopes = set(args.planned_scope)
-    supported_planned_scopes = {"rust", "macos"}
+    supported_planned_scopes = {"rust", "macos", "common-rust", "desktop", "dependency"}
     if planned_scopes - supported_planned_scopes:
         raise ValueError(f"unsupported planned scope: {sorted(planned_scopes - supported_planned_scopes)}")
-    if len(planned_scopes) > 1:
-        raise ValueError("planned rust and macos scopes are mutually exclusive")
     if set(results) != set(kinds):
         raise ValueError("every job must have exactly one --kind")
     if not set(names).issubset(results):
@@ -200,25 +198,62 @@ def run_aggregate(args: argparse.Namespace) -> int:
         }
     planned_evidence: dict[str, object] = {}
     if "rust" in planned_scopes:
-        if len(args.planned_job_name) != 5:
-            raise ValueError("planned rust scope requires five child check names")
+        required_rust_names = {
+            "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+            "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+            "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+            "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+            "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+        }
+        split_rust_names = {
+            "PR / Fast Rust matrix / PR / Fast Rust / test shard 0 of 2 (ubuntu-24.04)",
+            "PR / Fast Rust matrix / PR / Fast Rust / test shard 1 of 2 (ubuntu-24.04)",
+        }
+        if not required_rust_names.issubset(args.planned_job_name) or not split_rust_names.issubset(args.planned_job_name):
+            raise ValueError("planned rust scope requires all split-lane child check names")
+        rust_names = [name for name in args.planned_job_name if name in required_rust_names | split_rust_names]
         planned_evidence["rust"] = validate_planned_scope_markers(
-            records, args.planned_job_name, scope="rust"
+            records, rust_names, scope="rust"
         )
-    if "macos" in planned_scopes:
-        if len(args.planned_job_name) != 2 or any("(macos-15)" not in name for name in args.planned_job_name):
-            raise ValueError("planned macos scope requires the two macOS child check names")
-        planned_evidence["macos"] = validate_planned_scope_markers(
-            records, args.planned_job_name, scope="macos"
+    if "macos" in planned_scopes or "desktop" in planned_scopes:
+        desktop_names = [name for name in args.planned_job_name if "(macos-15)" in name]
+        if len(desktop_names) != 2:
+            raise ValueError("planned desktop scope requires the two macOS child check names")
+        planned_evidence["desktop" if "desktop" in planned_scopes else "macos"] = validate_planned_scope_markers(
+            records, desktop_names, scope="desktop"
+        )
+    if "common-rust" in planned_scopes:
+        common_names = [
+            name for name in args.planned_job_name
+            if "clippy (ubuntu-24.04)" in name
+            or "test shard " in name
+            or "test (ubuntu-24.04)" in name
+        ]
+        if len(common_names) != 4 or any("macos-15" in name for name in common_names):
+            raise ValueError("planned common-rust scope requires Ubuntu clippy, two shards, and Ubuntu aggregate")
+        planned_evidence["common-rust"] = validate_planned_scope_markers(
+            records, common_names, scope="common-rust"
+        )
+    if "dependency" in planned_scopes:
+        dependency_names = {
+            "PR / Dependency only",
+            "PR / Dependency Cordis smoke",
+            "PR / Dependency desktop smoke",
+        }
+        if not dependency_names.issubset(args.planned_job_name):
+            raise ValueError("planned dependency scope requires metadata and Cordis/desktop smoke names")
+        planned_evidence["dependency"] = validate_planned_scope_markers(
+            records, sorted(dependency_names), scope="dependency"
         )
     jobs = []
+    planned_job_names = set(args.planned_job_name)
     for name in sorted(results):
         result = results[name]
         if result not in GITHUB_RESULTS:
             raise ValueError(f"unsupported GitHub job result for {name}: {result}")
         if kinds[name] not in {"code", "infra"}:
             raise ValueError(f"unsupported job kind for {name}: {kinds[name]}")
-        jobs.append(Job(name, result, kinds[name], name in allowed, name in no_steps, name in planned_scopes))
+        jobs.append(Job(name, result, kinds[name], name in allowed, name in no_steps, name in planned_job_names))
     overall, entries = aggregate(jobs)
     payload = {
         "schema": "hartevo-ci-result/v1",
@@ -282,6 +317,28 @@ def self_test() -> None:
     macos_records = [record for record in marker_records if record["name"] in macos_names]
     macos_evidence = validate_planned_scope_markers(macos_records, macos_names, scope="macos")
     assert macos_evidence["status"] == "PASS" and macos_evidence["jobCount"] == 2
+    dependency_names = [
+        "PR / Dependency only",
+        "PR / Dependency Cordis smoke",
+        "PR / Dependency desktop smoke",
+    ]
+    dependency_records = [
+        {
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "steps": [
+                {"name": "Set up job", "conclusion": "success"},
+                {"name": PLANNED_SCOPE_MARKER, "conclusion": "success"},
+                {"name": "Complete job", "conclusion": "success"},
+            ],
+        }
+        for name in dependency_names
+    ]
+    dependency_evidence = validate_planned_scope_markers(
+        dependency_records, dependency_names, scope="dependency"
+    )
+    assert dependency_evidence["status"] == "PASS" and dependency_evidence["jobCount"] == 3
     try:
         validate_planned_scope_markers(
             marker_records[:-1]

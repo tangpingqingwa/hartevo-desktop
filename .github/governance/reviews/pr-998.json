@@ -1,0 +1,33 @@
+{
+  "authorTaskId": "01a045f7-6d21-7fd1-91fe-57a9efe0dd51",
+  "baseSha": "bcb35e8fbbb304cf6da43e55394d2a495856e27e",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    ".github/governance/README.md",
+    ".github/governance/events.jsonl",
+    ".github/merge-train/README.md",
+    ".github/policies/branch-ruleset-policy.json",
+    ".github/policies/repository-governance-policy.json",
+    ".github/pull_request_template.md",
+    ".github/workflows/ci.yml",
+    ".github/workflows/governance-admission.yml",
+    ".github/workflows/integration.yml",
+    ".github/workflows/rust-reusable.yml",
+    "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+    "scripts/ci-branch-policy.py",
+    "scripts/ci-merge-train.py",
+    "scripts/ci-result.py",
+    "scripts/ci-scope.py",
+    "scripts/ci-workflow-policy.py",
+    "scripts/repository_governance.py",
+    "scripts/tests/test_repository_governance.py"
+  ],
+  "pr": 998,
+  "receiptDigest": "79dcf4d1ef30bbb5982f25a906229e829e72828e4f90cda29e772849a0887de7",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-28T16:48:49Z",
+  "reviewedHeadSha": "3f722af3c0d78e02106cf1d191910db76277e004",
+  "reviewerTaskId": "/root/lightweight_release_review",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

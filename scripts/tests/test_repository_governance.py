@@ -31,7 +31,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = governance.load_policy(ROOT / governance.POLICY_PATH)
         self.events = governance.load_ledger(ROOT / governance.LEDGER_PATH)
-        self.paused_events = self.events[:-1]
+        self.paused_events = self.events[:1]
 
     def admission(self, change_class: str = "governance") -> dict[str, object]:
         return {
@@ -89,7 +89,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def test_checked_in_policy_and_ledger_are_valid_resumed_and_normal(self) -> None:
         self.assertEqual(governance.verify_policy_value(self.policy)["status"], "PASS")
         self.assertEqual(self.policy["admissionModeWhenUnpaused"], "normal")
-        self.assertEqual(self.events[-1]["kind"], "GLOBAL_RESUMED")
+        self.assertEqual(self.events[-2]["kind"], "GLOBAL_RESUMED")
         self.assertFalse(governance.global_paused(self.events))
         self.assertTrue(governance.global_paused(self.paused_events))
 
@@ -161,14 +161,130 @@ class RepositoryGovernanceTests(unittest.TestCase):
                 policy=self.policy,
             )
 
-    def test_normal_mode_admits_feature_through_the_same_exact_path_gate(self) -> None:
+    def test_normal_mode_admits_minimal_feature_and_rejects_sensitive_paths(self) -> None:
+        minimal = {
+            "schema": governance.ADMISSION_SCHEMA,
+            "changeClass": "feature",
+            "owner": "root",
+        }
         accepted = governance.verify_admission_value(
-            self.admission("feature"),
-            changed=[".github/policies/test.json"],
+            minimal,
+            changed=["src/feature.rs"],
             paused=False,
             policy=self.policy,
         )
         self.assertEqual(accepted["mode"], "NORMAL")
+        self.assertTrue(accepted["directMerge"])
+        self.assertNotIn("issue", accepted)
+        with self.assertRaises(governance.GovernanceError):
+            governance.verify_admission_value(
+                minimal,
+                changed=[".github/policies/test.json"],
+                paused=False,
+                policy=self.policy,
+            )
+
+    def test_dependency_admission_is_narrow_and_lightweight(self) -> None:
+        minimal = {
+            "schema": governance.ADMISSION_SCHEMA,
+            "changeClass": "dependency",
+            "owner": "root",
+        }
+        accepted = governance.verify_admission_value(
+            minimal,
+            changed=["Cargo.lock"],
+            paused=False,
+            policy=self.policy,
+        )
+        self.assertTrue(accepted["directMerge"])
+        with self.assertRaises(governance.GovernanceError):
+            governance.verify_admission_value(
+                minimal,
+                changed=["src/feature.rs"],
+                paused=False,
+                policy=self.policy,
+            )
+
+    def test_github_review_is_exact_head_and_task_independent(self) -> None:
+        head = "a" * 40
+        marker = (
+            "<!-- hartevo-github-review\n"
+            + json.dumps(
+                {
+                    "schema": governance.GITHUB_REVIEW_SCHEMA,
+                    "headSha": head,
+                    "disposition": "APPROVE",
+                    "reviewerTaskId": "reviewer",
+                }
+            )
+            + "\n-->"
+        )
+        valid = governance.validate_github_review_records(
+            [{"state": "COMMENTED", "commit_id": head, "body": marker}],
+            head_sha=head,
+            owner="author",
+        )
+        self.assertEqual(valid["reviewerTaskId"], "reviewer")
+        for stale in (
+            {"state": "COMMENTED", "commit_id": "b" * 40, "body": marker},
+            {
+                "state": "COMMENTED",
+                "commit_id": head,
+                "body": marker.replace('"reviewerTaskId": "reviewer"', '"reviewerTaskId": "author"'),
+            },
+            {"state": "COMMENTED", "commit_id": head, "body": marker + "\nextra"},
+        ):
+            with self.assertRaises(governance.GovernanceError):
+                governance.validate_github_review_records([stale], head_sha=head, owner="author")
+
+        actor = {"login": "reviewer-account"}
+        with self.assertRaisesRegex(governance.GovernanceError, "latest exact-head GitHub review requests changes"):
+            governance.validate_github_review_records(
+                [
+                    {
+                        "id": 1,
+                        "submitted_at": "2026-08-29T00:00:00Z",
+                        "user": actor,
+                        "state": "COMMENTED",
+                        "commit_id": head,
+                        "body": marker,
+                    },
+                    {
+                        "id": 2,
+                        "submitted_at": "2026-08-29T00:01:00Z",
+                        "user": actor,
+                        "state": "CHANGES_REQUESTED",
+                        "commit_id": head,
+                        "body": "The exact head needs changes.",
+                    },
+                ],
+                head_sha=head,
+                owner="author",
+            )
+
+        restored = governance.validate_github_review_records(
+            [
+                {
+                    "id": 1,
+                    "submitted_at": "2026-08-29T00:00:00Z",
+                    "user": actor,
+                    "state": "CHANGES_REQUESTED",
+                    "commit_id": head,
+                    "body": "The exact head needs changes.",
+                },
+                {
+                    "id": 2,
+                    "submitted_at": "2026-08-29T00:01:00Z",
+                    "user": actor,
+                    "state": "COMMENTED",
+                    "commit_id": head,
+                    "body": marker,
+                },
+            ],
+            head_sha=head,
+            owner="author",
+        )
+        self.assertEqual(restored["reviewerTaskId"], "reviewer")
 
     def test_exact_path_lease_rejects_outside_change(self) -> None:
         value = self.admission()
@@ -180,6 +296,17 @@ class RepositoryGovernanceTests(unittest.TestCase):
                 paused=True,
                 policy=self.policy,
             )
+
+    def test_release_and_destructive_classes_stay_on_high_risk_admission(self) -> None:
+        for change_class in ("release", "destructive", "security"):
+            accepted = governance.verify_admission_value(
+                self.admission(change_class),
+                changed=[".github/policies/test.json"],
+                paused=False,
+                policy=self.policy,
+            )
+            self.assertFalse(accepted["ordinary"])
+            self.assertFalse(accepted["directMerge"])
 
     def test_paused_plan_has_no_executable_actions_but_keeps_deferred_work(self) -> None:
         plan = governance.build_plan(
@@ -324,13 +451,8 @@ class RepositoryGovernanceTests(unittest.TestCase):
                         + json.dumps(
                             {
                                 "schema": governance.ADMISSION_SCHEMA,
-                                "changeClass": "governance",
-                                "issue": 1,
+                                "changeClass": "feature",
                                 "owner": "root",
-                                "ownedPaths": ["feature.txt"],
-                                "rollback": "Revert this exact fixture change.",
-                                "externalEffects": False,
-                                "release": False,
                             }
                         )
                         + "\n-->"
@@ -346,6 +468,24 @@ class RepositoryGovernanceTests(unittest.TestCase):
                 event_path,
                 "pull_request",
                 trusted_base=True,
+                github_reviews=[
+                    {
+                        "state": "COMMENTED",
+                        "commit_id": head,
+                        "body": (
+                            "<!-- hartevo-github-review\n"
+                            + json.dumps(
+                                {
+                                    "schema": governance.GITHUB_REVIEW_SCHEMA,
+                                    "headSha": head,
+                                    "disposition": "APPROVE",
+                                    "reviewerTaskId": "independent-reviewer",
+                                }
+                            )
+                            + "\n-->"
+                        ),
+                    }
+                ],
             )
             self.assertEqual(result["headSha"], head)
             self.assertEqual(command(root, "git", "rev-parse", "HEAD"), base)
@@ -374,6 +514,60 @@ class RepositoryGovernanceTests(unittest.TestCase):
         unsigned = dict(event)
         unsigned.pop("digest")
         self.assertNotEqual(governance.digest(unsigned), event["digest"])
+
+    def test_ledger_append_only_rejects_recomputed_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command(root, "git", "init", "--quiet")
+            command(root, "git", "config", "user.name", "Governance Test")
+            command(root, "git", "config", "user.email", "governance@example.invalid")
+            ledger = root / governance.LEDGER_PATH
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(
+                "\n".join(json.dumps(event, sort_keys=True, separators=(",", ":")) for event in self.events) + "\n",
+                encoding="utf-8",
+            )
+            command(root, "git", "add", governance.LEDGER_PATH.as_posix())
+            command(root, "git", "commit", "--quiet", "-m", "base ledger")
+            base = command(root, "git", "rev-parse", "HEAD")
+
+            rewritten: list[dict[str, object]] = []
+            previous = governance.ZERO_DIGEST
+            for index, source in enumerate(self.events):
+                raw = dict(source)
+                raw.pop("digest", None)
+                raw.pop("previousDigest", None)
+                if index == 0:
+                    raw["payload"] = {"reason": "rewritten historical fact"}
+                sealed = governance.seal_event(raw, previous)
+                rewritten.append(sealed)
+                previous = str(sealed["digest"])
+            ledger.write_text(
+                "\n".join(json.dumps(event, sort_keys=True, separators=(",", ":")) for event in rewritten) + "\n",
+                encoding="utf-8",
+            )
+            command(root, "git", "add", governance.LEDGER_PATH.as_posix())
+            command(root, "git", "commit", "--quiet", "-m", "rewrite self-consistent ledger")
+            rewritten_head = command(root, "git", "rev-parse", "HEAD")
+            with self.assertRaisesRegex(governance.GovernanceError, "rewrites the protected-base byte prefix"):
+                governance.verify_ledger_append_only(root, base, rewritten_head)
+
+            command(root, "git", "switch", "--quiet", "--detach", base)
+            appended = governance.seal_event(
+                {
+                    "kind": "GOVERNANCE_MODE_CHANGED",
+                    "actorTaskId": "append-only-test",
+                    "payload": {"mainline": "Cordis"},
+                },
+                str(self.events[-1]["digest"]),
+            )
+            with ledger.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(appended, sort_keys=True, separators=(",", ":")) + "\n")
+            command(root, "git", "add", governance.LEDGER_PATH.as_posix())
+            command(root, "git", "commit", "--quiet", "-m", "append ledger event")
+            appended_head = command(root, "git", "rev-parse", "HEAD")
+            events = governance.verify_ledger_append_only(root, base, appended_head)
+            self.assertEqual(events[-1]["eventId"], appended["eventId"])
 
 
 if __name__ == "__main__":
