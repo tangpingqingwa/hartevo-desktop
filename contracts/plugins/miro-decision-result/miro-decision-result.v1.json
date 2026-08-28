@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/miro-decision-result/miro-decision-result.v1.json",
+  "schemaVersion": "hartevo-miro-decision-result-contract/v1",
+  "contractVersion": "miro-decision-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "api": {
+    "provider": "Miro REST API",
+    "version": "v2",
+    "boardEndpoint": "GET /v2/boards/{board_id}",
+    "itemsEndpoint": "GET /v2/boards/{board_id}/items",
+    "supportedItemTypes": ["card", "text", "sticky_note", "link"],
+    "unsupportedItemTypesAreClaimed": false
+  },
+  "service": {
+    "id": "miro.decision-result",
+    "version": "1.0.0",
+    "operation": "bounded_decision_read_proposal_and_recording",
+    "readOnly": true,
+    "liveExecution": false,
+    "externalWrites": false,
+    "boardMutation": false,
+    "sharingAuthority": false,
+    "memberAdministration": false,
+    "viewportAuthority": false
+  },
+  "provider": {
+    "id": "miro.board.items",
+    "version": "1.0.0",
+    "operations": ["read_board", "read_allowlisted_items"],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "firstParty": false,
+    "connected": false,
+    "liveExecution": false,
+    "mutatingOperations": []
+  },
+  "consumer": {
+    "id": "mission.miro-decision-result",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "verifiedAdoption": false
+  },
+  "scope": {
+    "required": [
+      "team",
+      "board",
+      "allowlistedItemIds",
+      "boardRevision",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest"
+    ],
+    "secret": "opaque_secret_reference_only",
+    "scopeDrift": "fail_closed"
+  },
+  "registration": {
+    "boundFields": [
+      "schemaVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerVersion",
+      "providerDigest",
+      "implementationDigest",
+      "team",
+      "board",
+      "permissionDigest",
+      "scopeDigest"
+    ],
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "bounds": {
+    "maxPages": 8,
+    "maxPageSize": 100,
+    "maxItems": 256,
+    "maxLabelsPerItem": 32,
+    "maxLabelBytes": 128,
+    "maxExternalLinkBytes": 2048,
+    "cursor": "opaque_digest_only"
+  },
+  "evidence": {
+    "projectedFields": [
+      "itemId",
+      "itemKind",
+      "itemRevision",
+      "updatedAt",
+      "labels",
+      "redactedTextDigest",
+      "redactedExternalLink"
+    ],
+    "redaction": [
+      "rawTextNotRetained",
+      "credentialsNotRetained",
+      "urlQueryAndFragmentRemoved",
+      "urlUserInfoRemoved",
+      "piiLikePathSegmentsRedacted"
+    ],
+    "recording": "redacted_ephemeral_value_below_kernel_authority"
+  },
+  "failureProjections": [
+    "unsupported",
+    "deleted",
+    "access_lost",
+    "empty",
+    "partial",
+    "rate_limited",
+    "server_failure",
+    "timeout",
+    "blocked_env",
+    "scope_drift"
+  ],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "independentReadBack": false,
+    "verifiedAdoption": false,
+    "adoptedOutcome": false,
+    "truthAuthority": false,
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false
+  },
+  "layer2Gaps": [
+    "consented_native_oauth_resolution",
+    "connected_miro_provider",
+    "external_board_or_item_mutation",
+    "sharing_and_member_administration",
+    "durable_native_provider_receipt",
+    "independent_write_read_back",
+    "verified_work_product_adoption"
+  ]
+}
