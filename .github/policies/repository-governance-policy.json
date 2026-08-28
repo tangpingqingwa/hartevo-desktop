@@ -17,6 +17,32 @@
     "maximumTrainCandidates": 4
   },
   "admission": {
+    "ordinaryClasses": [
+      "dependency",
+      "feature"
+    ],
+    "highRiskRequiredFields": [
+      "schema",
+      "changeClass",
+      "issue",
+      "owner",
+      "ownedPaths",
+      "rollback",
+      "externalEffects",
+      "release"
+    ],
+    "highRiskPathPrefixes": [
+      ".github/workflows/",
+    ".github/policies/",
+    ".github/governance/",
+    ".github/merge-train/",
+    ".github/ISSUE_TEMPLATE/",
+    ".github/CODEOWNERS",
+      ".github/pull_request_template.md",
+      "scripts/ci-",
+      "scripts/repository_governance.py",
+      "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md"
+    ],
     "pausedAllowedClasses": [
       "governance",
       "integration-recovery",
@@ -35,18 +61,12 @@
       "review-repair",
       "base-refresh",
       "security",
-      "feature"
-    ],
-    "requiredFields": [
-      "schema",
-      "changeClass",
-      "issue",
-      "owner",
-      "ownedPaths",
-      "rollback",
-      "externalEffects",
+      "feature",
+      "dependency",
+      "destructive",
       "release"
     ],
+    "requiredFields": ["schema", "changeClass", "owner"],
     "exactPathOwnership": true,
     "externalEffectsDefault": false,
     "releaseDefault": false
@@ -61,6 +81,17 @@
     "acceptedDisposition": "APPROVE",
     "syntheticPreflightGreenRequired": true
   },
+  "githubReview": {
+    "schema": "hartevo-github-review/v1",
+    "marker": "hartevo-github-review",
+    "acceptedStates": [
+      "APPROVED",
+      "COMMENTED"
+    ],
+    "acceptedDisposition": "APPROVE",
+    "requireExactHead": true,
+    "requireReviewerTaskDistinctFromOwner": true
+  },
   "integration": {
     "singleOpenTrain": true,
     "readyToTrainSlaSeconds": 120,
@@ -70,7 +101,14 @@
     "requireExactReviewReceipt": true,
     "requireAllHostedChecksSuccess": true,
     "requireTrustedBaseAdmission": true,
-    "requireTrainOnlyRequiredCheck": true,
+    "requireTrainOnlyRequiredCheck": false,
+    "ordinaryDirectMerge": true,
+    "trainsOptional": true,
+    "fullIntegrationModes": [
+      "workflow_dispatch",
+      "schedule",
+      "explicit_full"
+    ],
     "manifestDirectory": ".github/merge-train/manifests",
     "nativeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
     "normalProtectedPullRequestMergeOnly": true

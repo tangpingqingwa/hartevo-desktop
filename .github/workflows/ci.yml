@@ -10,9 +10,6 @@ permissions:
   contents: read
 
 concurrency:
-  # A personal-account public repository cannot use GitHub's hosted merge
-  # queue. Serialize the repository-owned composite train while ordinary PRs
-  # retain independent cancellation domains.
   group: ${{ startsWith(github.head_ref, 'merge-train/') && 'hartevo-merge-train' || format('hartevo-pr-{0}-{1}', github.workflow, github.event.pull_request.number || github.event.merge_group.head_sha || github.ref) }}
   cancel-in-progress: true
 
@@ -57,6 +54,11 @@ jobs:
     outputs:
       full: ${{ steps.plan.outputs.full }}
       rust: ${{ steps.plan.outputs.rust }}
+      common_rust: ${{ steps.plan.outputs.common_rust }}
+      common_rust_packages: ${{ steps.plan.outputs.common_rust_packages }}
+      desktop: ${{ steps.plan.outputs.desktop }}
+      desktop_packages: ${{ steps.plan.outputs.desktop_packages }}
+      dependency_only: ${{ steps.plan.outputs.dependency_only }}
       packages: ${{ steps.plan.outputs.packages }}
       plan: ${{ steps.plan.outputs.plan }}
     steps:
@@ -65,8 +67,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          # pull_request defaults to GitHub's temporary merge ref. Scope and
-          # merge-train proof must instead bind the exact reviewed head SHA.
           ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
       - id: plan
         name: Plan conservative changed scope
@@ -75,34 +75,21 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           HEAD_REF: ${{ github.head_ref }}
           IS_MERGE_TRAIN: ${{ startsWith(github.head_ref, 'merge-train/') }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p target/ci
-          if [[ "$GITHUB_EVENT_NAME" == merge_group ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == merge_group || "$IS_MERGE_TRAIN" == true ]]; then
+            common='["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-channel-adapters","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-cordis","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-plugin-runtime","hartevo-runtime-adapter","hartevo-storage"]'
+            desktop='["hartevo-desktop"]'
             echo 'full=true' >> "$GITHUB_OUTPUT"
             echo 'rust=true' >> "$GITHUB_OUTPUT"
-            echo 'packages=[]' >> "$GITHUB_OUTPUT"
-            echo 'plan={"mode":"merge_group_full","full":true,"rust":true,"packages":[]}' >> "$GITHUB_OUTPUT"
-            printf '%s\n' \
-              '{"schema":"hartevo-ci-scope/v1","mode":"merge_group_full","full":true,"rust":true,"packages":[]}' \
-              > target/ci/scope.json
-          elif [[ "$IS_MERGE_TRAIN" == true ]]; then
-            MANIFEST_PATH="$(python3 scripts/ci-merge-train.py discover-manifest \
-              --head "$HEAD_SHA" \
-              --branch "$HEAD_REF")"
-            python3 scripts/ci-merge-train.py verify-hosted \
-              --repo "$GITHUB_REPOSITORY" \
-              --manifest "$MANIFEST_PATH" \
-              --base "$BASE_SHA" \
-              --head "$HEAD_SHA" \
-              --branch "$HEAD_REF"
-            echo 'full=true' >> "$GITHUB_OUTPUT"
-            echo 'rust=true' >> "$GITHUB_OUTPUT"
-            echo 'packages=[]' >> "$GITHUB_OUTPUT"
-            echo 'plan={"mode":"repository_merge_train_full","full":true,"rust":true,"packages":[]}' >> "$GITHUB_OUTPUT"
-            printf '%s\n' \
-              '{"schema":"hartevo-ci-scope/v1","mode":"repository_merge_train_full","full":true,"rust":true,"packages":[]}' \
-              > target/ci/scope.json
+            echo 'common_rust=true' >> "$GITHUB_OUTPUT"
+            echo "common_rust_packages=$common" >> "$GITHUB_OUTPUT"
+            echo 'desktop=true' >> "$GITHUB_OUTPUT"
+            echo "desktop_packages=$desktop" >> "$GITHUB_OUTPUT"
+            echo 'dependency_only=false' >> "$GITHUB_OUTPUT"
+            echo "packages=[$(printf '%s' "$common" | sed 's/^\[//;s/\]$//'),\"hartevo-desktop\"]" >> "$GITHUB_OUTPUT"
+            echo 'plan={"schema":"hartevo-ci-scope/v2","mode":"full_integration","full":true,"rust":true,"commonRust":true,"desktop":true,"dependencyOnly":false}' >> "$GITHUB_OUTPUT"
+            printf '%s\n' '{"schema":"hartevo-ci-scope/v2","mode":"full_integration","full":true,"rust":true,"commonRust":true,"desktop":true,"dependencyOnly":false}' | tee target/ci/scope.json
           else
             python3 scripts/ci-scope.py \
               --base "$BASE_SHA" \
@@ -126,16 +113,108 @@ jobs:
     with:
       check_prefix: PR / Fast Rust
       run_rust: ${{ needs.scope.outputs.rust == 'true' }}
-      run_macos: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') }}
-      full_workspace: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') || needs.scope.outputs.full == 'true' }}
+      run_common_rust: ${{ needs.scope.outputs.common_rust == 'true' }}
+      run_desktop: ${{ needs.scope.outputs.desktop == 'true' }}
+      run_macos: ${{ needs.scope.outputs.desktop == 'true' }}
+      full_workspace: false
       rust_packages: ${{ needs.scope.outputs.packages }}
+      common_rust_packages: ${{ needs.scope.outputs.common_rust_packages }}
+      desktop_packages: ${{ needs.scope.outputs.desktop_packages }}
     permissions:
       contents: read
+
+  dependency:
+    name: PR / Dependency only
+    needs: scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Planned scope skip marker
+        if: ${{ needs.scope.outputs.dependency_only != 'true' }}
+        run: echo "Dependency-only scope is not planned for this change."
+      - name: Checkout locked dependency source
+        if: needs.scope.outputs.dependency_only == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install pinned cargo-audit
+        if: needs.scope.outputs.dependency_only == 'true'
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Verify locked metadata, dependency tree, audit and SBOM
+        if: needs.scope.outputs.dependency_only == 'true'
+        run: |
+          mkdir -p target/ci/dependencies
+          test -s Cargo.lock
+          cargo metadata --format-version 1 --locked > target/ci/dependencies/metadata.json
+          cargo tree --workspace --locked --edges normal > target/ci/dependencies/tree.txt
+          cargo audit --json > target/ci/dependencies/cargo-audit.json
+          python3 scripts/ci-dependency-audit.py audit \
+            --metadata target/ci/dependencies/metadata.json \
+            --tree target/ci/dependencies/tree.txt \
+            --lock Cargo.lock \
+            --cargo-audit-json target/ci/dependencies/cargo-audit.json \
+            --output target/ci/dependencies/sbom.json
+      - name: Narrow dependency smoke check
+        if: needs.scope.outputs.dependency_only == 'true'
+        run: cargo metadata --format-version 1 --locked >/dev/null
+      - name: Upload dependency evidence
+        if: always() && needs.scope.outputs.dependency_only == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-dependency-evidence-${{ github.run_id }}
+          path: target/ci/dependencies
+          if-no-files-found: warn
+          retention-days: 14
+
+  dependency-cordis-smoke:
+    name: PR / Dependency Cordis smoke
+    needs: scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Planned scope skip marker
+        if: ${{ needs.scope.outputs.dependency_only != 'true' }}
+        run: echo "Dependency-only Cordis smoke is not planned for this change."
+      - name: Checkout locked dependency source
+        if: needs.scope.outputs.dependency_only == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run narrow locked Cordis smoke
+        if: needs.scope.outputs.dependency_only == 'true'
+        run: cargo test -p hartevo-cordis --locked --lib
+
+  dependency-desktop-smoke:
+    name: PR / Dependency desktop smoke
+    needs: scope
+    runs-on: ${{ needs.scope.outputs.dependency_only != 'true' && 'ubuntu-24.04' || 'macos-15' }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Planned scope skip marker
+        if: ${{ needs.scope.outputs.dependency_only != 'true' }}
+        run: echo "Dependency-only desktop smoke is not planned for this change."
+      - name: Checkout locked dependency source
+        if: needs.scope.outputs.dependency_only == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Run narrow locked desktop smoke
+        if: needs.scope.outputs.dependency_only == 'true'
+        run: cargo test -p hartevo-desktop --locked --lib
 
   result:
     name: PR / Result taxonomy
     if: always()
-    needs: [policy, scope, rust]
+    needs: [policy, scope, rust, dependency, dependency-cordis-smoke, dependency-desktop-smoke]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -158,24 +237,40 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
             > target/ci/github-jobs.json
-      - name: Classify job outcomes
+      - name: Classify every planned and relevant lane
         env:
-          RUST_SCOPE: ${{ needs.scope.outputs.rust }}
-          RUN_MACOS: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') }}
+          COMMON_RUST: ${{ needs.scope.outputs.common_rust }}
+          DESKTOP: ${{ needs.scope.outputs.desktop }}
+          DEPENDENCY_ONLY: ${{ needs.scope.outputs.dependency_only }}
         run: |
           mkdir -p target/ci
           planned=()
-          if [[ "$RUST_SCOPE" == false ]]; then
+          if [[ "$COMMON_RUST" != true && "$DESKTOP" != true ]]; then
             planned+=(--planned-scope rust)
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / fmt")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test shard 0 of 2 (ubuntu-24.04)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test shard 1 of 2 (ubuntu-24.04)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)")
-          elif [[ "$RUN_MACOS" != true ]]; then
-            planned+=(--planned-scope macos)
+          elif [[ "$COMMON_RUST" != true ]]; then
+            planned+=(--planned-scope common-rust)
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test shard 0 of 2 (ubuntu-24.04)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test shard 1 of 2 (ubuntu-24.04)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)")
+          fi
+          if [[ "$DESKTOP" != true && "$COMMON_RUST" == true ]]; then
+            planned+=(--planned-scope desktop)
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)")
+          fi
+          if [[ "$DEPENDENCY_ONLY" != true ]]; then
+            planned+=(--planned-scope dependency)
+            planned+=(--planned-job-name "PR / Dependency only")
+            planned+=(--planned-job-name "PR / Dependency Cordis smoke")
+            planned+=(--planned-job-name "PR / Dependency desktop smoke")
           fi
           python3 scripts/ci-result.py aggregate \
             --workflow "$GITHUB_WORKFLOW" \
@@ -188,12 +283,21 @@ jobs:
             --job "policy=${{ needs.policy.result }}" \
             --job "scope=${{ needs.scope.result }}" \
             --job "rust=${{ needs.rust.result }}" \
+            --job "dependency=${{ needs.dependency.result }}" \
+            --job "dependency-cordis-smoke=${{ needs.dependency-cordis-smoke.result }}" \
+            --job "dependency-desktop-smoke=${{ needs.dependency-desktop-smoke.result }}" \
             --job-name "policy=PR / Workflow policy" \
             --job-name "scope=PR / Scope plan" \
             --job-name "rust=PR / Fast Rust matrix" \
+            --job-name "dependency=PR / Dependency only" \
+            --job-name "dependency-cordis-smoke=PR / Dependency Cordis smoke" \
+            --job-name "dependency-desktop-smoke=PR / Dependency desktop smoke" \
             --kind policy=code \
             --kind scope=infra \
             --kind rust=code \
+            --kind dependency=infra \
+            --kind dependency-cordis-smoke=code \
+            --kind dependency-desktop-smoke=code \
             "${planned[@]}"
       - name: Upload redacted CI result and JUnit envelope
         if: always()

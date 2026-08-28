@@ -1,46 +1,57 @@
 # Repository governance control plane
 
-This directory contains durable coordination evidence. Chat messages, task
-heartbeats, commits, pushes, and local green tests are not repository truth.
+This directory contains durable coordination evidence. GitHub state, exact
+Git objects, required checks, and the append-only ledger are the source of
+truth; chat, task heartbeats, local commits, and local green runs are not.
 
-The closed loop is:
+## Cordis mainline and ordinary flow
 
-1. live GitHub/Git snapshot;
-2. policy-bound PR admission;
-3. exact non-author task review receipt;
-4. required hosted checks on the receipt commit;
-5. one bounded, non-overlapping repository merge train;
-6. normal protected PR merge;
-7. protected-base advance invalidates every old tuple automatically;
-8. inventory is projected again from live facts.
+Cordis is the absolute mainline. Historical PR waves are frozen, and the old
+triple-validation requirement has been removed. An ordinary `feature` or
+routine `dependency` PR uses the following four plain steps:
+
+1. Open a PR against `bootstrap/macos-r0` with one minimal admission block containing `changeClass` and `owner`.
+2. Run the scoped checks for the changed lane: common Rust on Ubuntu, desktop Rust on macOS, or the dependency-only lane.
+3. Obtain one independent GitHub review whose strict `hartevo-github-review` marker names the exact head SHA, says `APPROVE`, and uses a reviewer task ID different from the owner.
+4. Directly merge the PR as a normal protected merge commit.
+
+Full Integration is a milestone, release, scheduled, or explicit-full run. It
+is not repeated for every ordinary protected push. Trains remain optional for
+multi-PR integration, release, or an explicitly high-risk combination.
+
+The trusted `pull_request_target` admission workflow checks out only the
+protected base, fetches the event head as an object, and reads review records
+with a read-only token. A code push changes the exact head and therefore
+invalidates older GitHub review records. `requiredApprovingReviews` is zero on
+both protected branches because this repository has one GitHub collaborator;
+the admission verifier enforces task-independent exact-head review without a
+ruleset deadlock.
+
+## High-risk governance
+
+Governance, workflow, policy, ledger, security, destructive, release, and
+integration-recovery changes are never classified as ordinary work. They still
+require a positive Issue, one accountable owner, exact owned paths, concrete
+rollback, false external-effect and release claims, and an independent
+receipt-only review commit. The verifier fails closed when any of those facts
+or the exact base/head tuple is missing. Ordinary classes cannot claim a
+sensitive path, even if a legacy body includes heavyweight fields.
 
 `events.jsonl` is append-only and hash chained. The newest
-`GLOBAL_PAUSED`/`GLOBAL_RESUMED` event controls admission. A pause suppresses
-execution but preserves deferred actions, so no later chat receipt can
-silently resume work.
+`GLOBAL_PAUSED`/`GLOBAL_RESUMED` event controls admission; a pause suppresses
+ordinary work while preserving deferred recovery actions. Governance-mode
+events record the lightweight Cordis mainline transition without rewriting
+history.
 
-At this revision the ledger ends in `GLOBAL_RESUMED` and the policy selects
-`normal` admission when unpaused. That permits the `feature` change class, but
-does not bypass exact Issue ownership, non-author review receipts, hosted
-checks, or the bounded repository merge train. A later hash-chained
-`GLOBAL_PAUSED` event immediately suppresses admission again.
+## Optional merge trains
 
-Positive review evidence lives in `reviews/pr-<number>.json`. It is added by a
-dedicated receipt-only commit whose parent is the exact reviewed code head.
-The merge-train verifier rejects author/reviewer task reuse, base/head drift,
-path drift, extra receipt-commit changes, missing checks, stacked candidates,
-and overlapping ownership.
-
-Trusted admission runs from the protected branch through
-`governance-admission.yml`. Its train-only required check blocks direct
-candidate merges; untrusted PR code cannot relax that check. The scheduled
-inventory computes exact train readiness every five minutes and surfaces an
-unserved 120-second Ready-to-train SLA as an incident.
-
-Lifecycle plans are always dry-run by default. Closing issues or pull
-requests, or deleting branches, additionally requires a short-lived approval
-artifact bound to the exact plan digest. The checked-in policy disables
-automatic destructive execution.
+`ci-merge-train.py` can compose one to four independent root PRs for a
+multi-PR integration or release milestone. New ordinary candidates carry the
+exact-head GitHub review evidence; high-risk candidates retain receipt-only
+evidence. Already merged manifests remain immutable and continue to validate
+their historical receipt fields. A train is not a prerequisite for an
+ordinary Cordis PR and there is no `Governance / Train-only merge` required
+context.
 
 The complete activation and operating procedure is in
 `docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md`.

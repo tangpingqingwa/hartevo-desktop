@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and verify Hartevo's bounded repository merge train.
+"""Prepare trains and verify recoverable protected-branch merges.
 
 GitHub's hosted merge queue is not available to public repositories owned by
 personal accounts.  This train preserves the important queue semantics without
@@ -9,8 +9,8 @@ weakening the protected Integration branch:
   root pull-request heads;
 * the train history and tree are reconstructed and checked in CI;
 * only that composite head runs the full Ubuntu/macOS matrix; and
-* the composite pull request is merged normally, never by direct push or rule
-  bypass.
+* ordinary pull requests and composite trains are both merged normally, never
+  by direct push or rule bypass.
 
 ``prepare`` stops after making local merge commits and the manifest-only final
 commit.  ``publish`` then performs one exact verification, one normal push, and
@@ -41,9 +41,9 @@ BRANCH_PREFIX = "merge-train/"
 MANIFEST_DIRECTORY = Path(".github/merge-train/manifests")
 MAX_CANDIDATES = 4
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+GITHUB_MERGE_PATTERN = re.compile(r"^Merge pull request #([1-9][0-9]*) from [^\n]+(?:\n|$)")
 TRUSTED_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = TRUSTED_REPOSITORY_ROOT / ".github/policies/branch-ruleset-policy.json"
-TRAIN_ONLY_CHECK = "Governance / Train-only merge"
 
 
 class TrainError(ValueError):
@@ -98,10 +98,15 @@ def required_checks() -> tuple[str, ...]:
     checks = bootstrap.get("requiredStatusChecks") if isinstance(bootstrap, dict) else None
     if not isinstance(checks, list) or not checks or not all(isinstance(item, str) for item in checks):
         raise TrainError("bootstrap required-check contract is missing")
-    candidate_checks = tuple(check for check in checks if check != TRAIN_ONLY_CHECK)
-    if TRAIN_ONLY_CHECK not in checks or not candidate_checks:
-        raise TrainError("branch policy must require the train-only merge check in addition to candidate checks")
-    return candidate_checks
+    expected = (
+        "PR / Workflow policy",
+        "Governance / PR admission",
+        "PR / Scope plan",
+        "PR / Result taxonomy",
+    )
+    if tuple(checks) != expected:
+        raise TrainError("branch policy must use the four stable required contexts")
+    return expected
 
 
 def validate_sha(value: object, label: str) -> str:
@@ -162,16 +167,34 @@ def validate_manifest_value(value: object) -> dict[str, object]:
         review = candidate.get("review")
         if not isinstance(review, dict):
             raise TrainError(f"candidate #{number} has no exact independent review receipt")
-        if review.get("receiptPath") != governance.review_path(number).as_posix():
-            raise TrainError(f"candidate #{number} review receipt path drifted")
-        validate_sha(review.get("reviewedHeadSha"), f"candidate #{number} reviewedHeadSha")
-        receipt_digest = review.get("receiptDigest")
-        if not isinstance(receipt_digest, str) or governance.SHA256.fullmatch(receipt_digest) is None:
-            raise TrainError(f"candidate #{number} review receipt digest is invalid")
-        author_task = review.get("authorTaskId")
-        reviewer_task = review.get("reviewerTaskId")
-        if not isinstance(author_task, str) or not author_task or not isinstance(reviewer_task, str) or not reviewer_task or author_task == reviewer_task:
-            raise TrainError(f"candidate #{number} review is not independently non-author")
+        review_type = review.get("reviewType", "receipt")
+        if review_type == "github":
+            if review.get("schema") != governance.GITHUB_REVIEW_SCHEMA:
+                raise TrainError(f"candidate #{number} GitHub review schema drifted")
+            if review.get("state") not in {"APPROVED", "COMMENTED"}:
+                raise TrainError(f"candidate #{number} GitHub review state is invalid")
+            reviewed_head = validate_sha(review.get("reviewedHeadSha"), f"candidate #{number} reviewedHeadSha")
+            if reviewed_head != head:
+                raise TrainError(f"candidate #{number} GitHub review is stale")
+            reviewer_task = review.get("reviewerTaskId")
+            if not isinstance(reviewer_task, str) or not reviewer_task.strip():
+                raise TrainError(f"candidate #{number} GitHub review has no reviewer task")
+        else:
+            # Historical manifests use receipt-only review commits.  Keep this
+            # contract immutable while allowing new ordinary candidates to
+            # attest the exact-head GitHub review that admission now accepts.
+            if review_type != "receipt":
+                raise TrainError(f"candidate #{number} review type is invalid")
+            if review.get("receiptPath") != governance.review_path(number).as_posix():
+                raise TrainError(f"candidate #{number} review receipt path drifted")
+            validate_sha(review.get("reviewedHeadSha"), f"candidate #{number} reviewedHeadSha")
+            receipt_digest = review.get("receiptDigest")
+            if not isinstance(receipt_digest, str) or governance.SHA256.fullmatch(receipt_digest) is None:
+                raise TrainError(f"candidate #{number} review receipt digest is invalid")
+            author_task = review.get("authorTaskId")
+            reviewer_task = review.get("reviewerTaskId")
+            if not isinstance(author_task, str) or not author_task or not isinstance(reviewer_task, str) or not reviewer_task or author_task == reviewer_task:
+                raise TrainError(f"candidate #{number} review is not independently non-author")
         paths = review.get("exactPaths")
         if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path for path in paths) or paths != sorted(set(paths)):
             raise TrainError(f"candidate #{number} review path envelope is invalid")
@@ -198,7 +221,7 @@ def pull_request(repo: str, number: int) -> dict[str, object]:
         "--repo",
         repo,
         "--json",
-        "number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,statusCheckRollup",
+        "number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,body,statusCheckRollup",
     )
     if not isinstance(value, dict):
         raise TrainError(f"candidate #{number} metadata is not an object")
@@ -268,6 +291,58 @@ def verify_candidate_metadata(
     }
 
 
+def verify_candidate_review(
+    repo: str,
+    number: int,
+    metadata: dict[str, object],
+    base: str,
+    head: str,
+) -> dict[str, object]:
+    """Verify the candidate's admission and exact independent review.
+
+    Ordinary feature/dependency candidates use the trusted-base GitHub review
+    marker.  High-risk and historical candidates continue to use the
+    receipt-only commit contract.
+    """
+    body = metadata.get("body")
+    admission = governance.extract_admission(body)
+    changed = governance.changed_paths(Path("."), base, head)
+    policy = governance.load_policy()
+    events = governance.load_ledger()
+    result = governance.verify_admission_value(
+        admission,
+        changed=changed,
+        paused=governance.global_paused(events),
+        policy=policy,
+    )
+    if result.get("ordinary") is True:
+        reviews = governance.gh_json("api", f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+        github = governance.validate_github_review_records(
+            reviews,
+            head_sha=head,
+            owner=str(result["owner"]),
+        )
+        return {
+            "reviewType": "github",
+            "schema": governance.GITHUB_REVIEW_SCHEMA,
+            "state": github["state"],
+            "reviewedHeadSha": head,
+            "reviewerTaskId": github["reviewerTaskId"],
+            "reviewId": github.get("reviewId"),
+            "exactPaths": changed,
+        }
+    review = governance.verify_review_commit(Path("."), number, base, head)
+    return {
+        "reviewType": "receipt",
+        "receiptPath": review["receiptPath"],
+        "receiptDigest": review["receiptDigest"],
+        "reviewedHeadSha": review["reviewedHeadSha"],
+        "authorTaskId": review["authorTaskId"],
+        "reviewerTaskId": review["reviewerTaskId"],
+        "exactPaths": review["exactPaths"],
+    }
+
+
 def ensure_clean_train_branch(branch: str) -> str:
     if not branch.startswith(BRANCH_PREFIX) or branch == BRANCH_PREFIX:
         raise TrainError("current branch must use the merge-train/ prefix")
@@ -322,7 +397,12 @@ def prepare(repo: str, branch: str, numbers: list[int], output: Path | None) -> 
     if output is not None and output != manifest_path:
         raise TrainError(f"train manifest must use immutable historical path {manifest_path}")
     output = manifest_path
-    candidates = [verify_candidate_metadata(pull_request(repo, number), expected_base=base) for number in numbers]
+    metadata_by_number: dict[int, dict[str, object]] = {}
+    candidates: list[dict[str, object]] = []
+    for number in numbers:
+        metadata = pull_request(repo, number)
+        metadata_by_number[number] = metadata
+        candidates.append(verify_candidate_metadata(metadata, expected_base=base))
     owned_paths: set[str] = set()
     for candidate in candidates:
         number = int(candidate["number"])
@@ -338,22 +418,15 @@ def prepare(repo: str, branch: str, numbers: list[int], output: Path | None) -> 
         if command(("git", "merge-base", "--is-ancestor", head, base), check=False).returncode == 0:
             raise TrainError(f"candidate #{number} is already contained in bootstrap")
         try:
-            review = governance.verify_review_commit(Path("."), number, base, head)
+            review = verify_candidate_review(repo, number, metadata_by_number[number], base, head)
         except governance.GovernanceError as error:
-            raise TrainError(f"candidate #{number} independent review receipt failed: {error}") from error
+            raise TrainError(f"candidate #{number} independent review failed: {error}") from error
         paths = set(str(path) for path in review["exactPaths"])
         overlap = sorted(paths & owned_paths)
         if overlap:
             raise TrainError(f"candidate #{number} overlaps an earlier train candidate: {overlap}")
         owned_paths.update(paths)
-        candidate["review"] = {
-            "receiptPath": review["receiptPath"],
-            "receiptDigest": review["receiptDigest"],
-            "reviewedHeadSha": review["reviewedHeadSha"],
-            "authorTaskId": review["authorTaskId"],
-            "reviewerTaskId": review["reviewerTaskId"],
-            "exactPaths": review["exactPaths"],
-        }
+        candidate["review"] = review
 
     for index, candidate in enumerate(candidates):
         candidate_head = str(candidate["headCommit"])
@@ -628,27 +701,52 @@ def verify_hosted(
     owned_paths: set[str] = set()
     for candidate in candidates:
         assert isinstance(candidate, dict)
+        metadata = pull_request(repo, int(candidate["number"]))
         verify_candidate_metadata(
-            pull_request(repo, int(candidate["number"])),
+            metadata,
             candidate,
             expected_base=str(manifest["baseCommit"]),
         )
         candidate_head = str(candidate["headCommit"])
         if command(("git", "merge-base", "--is-ancestor", candidate_head, head), check=False).returncode != 0:
             raise TrainError(f"candidate #{candidate['number']} is not contained in the train head")
-        try:
-            review = governance.verify_review_commit(
-                Path("."),
-                int(candidate["number"]),
-                str(manifest["baseCommit"]),
-                candidate_head,
-            )
-        except governance.GovernanceError as error:
-            raise TrainError(f"candidate #{candidate['number']} review receipt failed in hosted verification: {error}") from error
         expected_review = candidate.get("review")
         if not isinstance(expected_review, dict):
             raise TrainError(f"candidate #{candidate['number']} manifest review is missing")
-        for key in ("receiptPath", "receiptDigest", "reviewedHeadSha", "authorTaskId", "reviewerTaskId", "exactPaths"):
+        review_type = expected_review.get("reviewType", "receipt")
+        try:
+            if review_type == "github":
+                review = verify_candidate_review(
+                    repo,
+                    int(candidate["number"]),
+                    metadata,
+                    str(manifest["baseCommit"]),
+                    candidate_head,
+                )
+            else:
+                review = governance.verify_review_commit(
+                    Path("."),
+                    int(candidate["number"]),
+                    str(manifest["baseCommit"]),
+                    candidate_head,
+                )
+                review = {
+                    "reviewType": "receipt",
+                    "receiptPath": review["receiptPath"],
+                    "receiptDigest": review["receiptDigest"],
+                    "reviewedHeadSha": review["reviewedHeadSha"],
+                    "authorTaskId": review["authorTaskId"],
+                    "reviewerTaskId": review["reviewerTaskId"],
+                    "exactPaths": review["exactPaths"],
+                }
+        except governance.GovernanceError as error:
+            raise TrainError(f"candidate #{candidate['number']} review failed in hosted verification: {error}") from error
+        expected_keys = (
+            ("reviewType", "schema", "state", "reviewedHeadSha", "reviewerTaskId", "exactPaths")
+            if review_type == "github"
+            else ("receiptPath", "receiptDigest", "reviewedHeadSha", "authorTaskId", "reviewerTaskId", "exactPaths")
+        )
+        for key in expected_keys:
             if expected_review.get(key) != review.get(key):
                 raise TrainError(f"candidate #{candidate['number']} manifest review field {key} drifted")
         paths = set(str(path) for path in review["exactPaths"])
@@ -720,19 +818,49 @@ def verify_attested_reviews(manifest: dict[str, object]) -> list[int]:
         assert isinstance(candidate, dict)
         number = int(candidate["number"])
         numbers.append(number)
-        try:
-            review = governance.verify_review_commit(
-                Path("."),
-                number,
-                str(manifest["baseCommit"]),
-                str(candidate["headCommit"]),
-            )
-        except governance.GovernanceError as error:
-            raise TrainError(f"candidate #{number} attested review failed: {error}") from error
         expected = candidate.get("review")
         if not isinstance(expected, dict):
             raise TrainError(f"candidate #{number} manifest review is missing")
-        for key in ("receiptPath", "receiptDigest", "reviewedHeadSha", "authorTaskId", "reviewerTaskId", "exactPaths"):
+        review_type = expected.get("reviewType", "receipt")
+        try:
+            if review_type == "github":
+                metadata = pull_request(REPOSITORY, number)
+                verify_candidate_metadata(
+                    metadata,
+                    candidate,
+                    expected_base=str(manifest["baseCommit"]),
+                )
+                review = verify_candidate_review(
+                    REPOSITORY,
+                    number,
+                    metadata,
+                    str(manifest["baseCommit"]),
+                    str(candidate["headCommit"]),
+                )
+            else:
+                review = governance.verify_review_commit(
+                    Path("."),
+                    number,
+                    str(manifest["baseCommit"]),
+                    str(candidate["headCommit"]),
+                )
+                review = {
+                    "reviewType": "receipt",
+                    "receiptPath": review["receiptPath"],
+                    "receiptDigest": review["receiptDigest"],
+                    "reviewedHeadSha": review["reviewedHeadSha"],
+                    "authorTaskId": review["authorTaskId"],
+                    "reviewerTaskId": review["reviewerTaskId"],
+                    "exactPaths": review["exactPaths"],
+                }
+        except governance.GovernanceError as error:
+            raise TrainError(f"candidate #{number} attested review failed: {error}") from error
+        expected_keys = (
+            ("reviewType", "schema", "state", "reviewedHeadSha", "reviewerTaskId", "exactPaths")
+            if review_type == "github"
+            else ("receiptPath", "receiptDigest", "reviewedHeadSha", "authorTaskId", "reviewerTaskId", "exactPaths")
+        )
+        for key in expected_keys:
             if expected.get(key) != review.get(key):
                 raise TrainError(f"candidate #{number} attested review field {key} drifted")
         paths = set(str(path) for path in review["exactPaths"])
@@ -759,25 +887,63 @@ def verify_bootstrap_push(event_path: Path) -> dict[str, object]:
     parents = git("rev-list", "--parents", "-n", "1", after).split()
     if len(parents) != 3 or parents[1] != before:
         raise TrainError("protected integration advance must be a normal merge whose first parent is the prior protected head")
-    train_head = parents[2]
-    path, manifest = discover_manifest_at_head(train_head)
-    if manifest.get("baseCommit") != before:
-        raise TrainError("merged train is stale relative to the prior protected head")
-    verify_exact_history(manifest, train_head)
-    verify_exact_tree(manifest, train_head, path)
-    numbers = verify_attested_reviews(manifest)
-    if git("rev-parse", f"{after}^{{tree}}") != git("rev-parse", f"{train_head}^{{tree}}"):
-        raise TrainError("protected merge tree differs from the hosted-green train tree")
+    pull_request_head = parents[2]
+    head_parents = git("rev-list", "--parents", "-n", "1", pull_request_head).split()
+    changed_from_head_parent = (
+        sorted(
+            line
+            for line in git("diff", "--name-only", f"{head_parents[1]}..{pull_request_head}").splitlines()
+            if line
+        )
+        if len(head_parents) == 2
+        else []
+    )
+    manifest_changes = [
+        path
+        for path in changed_from_head_parent
+        if path.startswith(MANIFEST_DIRECTORY.as_posix() + "/") and path.endswith(".json")
+    ]
+
+    if manifest_changes:
+        path, manifest = discover_manifest_at_head(pull_request_head)
+        if manifest.get("baseCommit") != before:
+            raise TrainError("merged train is stale relative to the prior protected head")
+        verify_exact_history(manifest, pull_request_head)
+        verify_exact_tree(manifest, pull_request_head, path)
+        numbers = verify_attested_reviews(manifest)
+        if git("rev-parse", f"{after}^{{tree}}") != git("rev-parse", f"{pull_request_head}^{{tree}}"):
+            raise TrainError("protected merge tree differs from the hosted-green train tree")
+        return {
+            "schema": "hartevo-bootstrap-integration-gate/v1",
+            "status": "PASS",
+            "mode": "TRAIN",
+            "before": before,
+            "after": after,
+            "trainHead": pull_request_head,
+            "trainBranch": manifest["trainBranch"],
+            "manifestPath": path.as_posix(),
+            "candidateNumbers": numbers,
+            "candidateCount": len(numbers),
+            "release": False,
+        }
+
+    if command(("git", "merge-base", "--is-ancestor", before, pull_request_head), check=False).returncode != 0:
+        raise TrainError("direct pull request head is not based on the prior protected head")
+    if git("rev-parse", f"{after}^{{tree}}") != git("rev-parse", f"{pull_request_head}^{{tree}}"):
+        raise TrainError("protected merge tree differs from the direct pull request head tree")
+    merge_message = git("show", "-s", "--format=%B", after)
+    match = GITHUB_MERGE_PATTERN.match(merge_message)
+    if match is None:
+        raise TrainError("direct protected merge has no recoverable GitHub pull request number")
+    number = int(match.group(1))
     return {
         "schema": "hartevo-bootstrap-integration-gate/v1",
         "status": "PASS",
+        "mode": "DIRECT",
         "before": before,
         "after": after,
-        "trainHead": train_head,
-        "trainBranch": manifest["trainBranch"],
-        "manifestPath": path.as_posix(),
-        "candidateNumbers": numbers,
-        "candidateCount": len(numbers),
+        "pr": number,
+        "head": pull_request_head,
         "release": False,
     }
 
@@ -814,6 +980,16 @@ def self_test() -> None:
         "release": False,
     }
     validate_manifest_value(valid)
+    github_manifest = json.loads(json.dumps(valid))
+    github_manifest["candidates"][0]["review"] = {
+        "reviewType": "github",
+        "schema": governance.GITHUB_REVIEW_SCHEMA,
+        "state": "COMMENTED",
+        "reviewedHeadSha": github_manifest["candidates"][0]["headCommit"],
+        "reviewerTaskId": "github-reviewer-1",
+        "exactPaths": ["candidate-1/file"],
+    }
+    validate_manifest_value(github_manifest)
     too_many = json.loads(json.dumps(valid))
     too_many["candidates"].append(
         {
@@ -985,8 +1161,109 @@ def self_test_exact_composite() -> None:
                 encoding="utf-8",
             )
             bootstrap_result = verify_bootstrap_push(event_path)
-            if bootstrap_result["candidateNumbers"] != [1, 2]:
+            if bootstrap_result.get("mode") != "TRAIN" or bootstrap_result["candidateNumbers"] != [1, 2]:
                 raise AssertionError("bootstrap gate lost the exact candidate set")
+
+            git("switch", "--quiet", "--detach", base)
+            git("switch", "--quiet", "-c", "direct-candidate")
+            Path("direct.txt").write_text("direct\n", encoding="utf-8")
+            git("add", "direct.txt")
+            git("commit", "--quiet", "-m", "direct candidate")
+            direct_head = git("rev-parse", "HEAD")
+            git("switch", "--quiet", "--detach", base)
+            git(
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "Merge pull request #42 from example/direct-candidate",
+                direct_head,
+            )
+            direct_merge = git("rev-parse", "HEAD")
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "ref": f"refs/heads/{BASE_BRANCH}",
+                        "before": base,
+                        "after": direct_merge,
+                        "forced": False,
+                        "created": False,
+                        "deleted": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            direct_result = verify_bootstrap_push(event_path)
+            if direct_result.get("mode") != "DIRECT" or direct_result.get("pr") != 42 or direct_result.get("head") != direct_head:
+                raise AssertionError("bootstrap gate lost the recoverable direct pull request record")
+
+            tampered_tree_merge = git(
+                "commit-tree",
+                f"{base}^{{tree}}",
+                "-p",
+                base,
+                "-p",
+                direct_head,
+                "-m",
+                "Merge pull request #42 from example/direct-candidate",
+            )
+            git("switch", "--quiet", "--detach", tampered_tree_merge)
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "ref": f"refs/heads/{BASE_BRANCH}",
+                        "before": base,
+                        "after": tampered_tree_merge,
+                        "forced": False,
+                        "created": False,
+                        "deleted": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            try:
+                verify_bootstrap_push(event_path)
+            except TrainError:
+                pass
+            else:
+                raise AssertionError("self-test accepted a direct merge with a tampered tree")
+
+            git("switch", "--quiet", "--detach", base)
+            Path("wrong-parent.txt").write_text("wrong parent\n", encoding="utf-8")
+            git("add", "wrong-parent.txt")
+            git("commit", "--quiet", "-m", "wrong protected parent")
+            wrong_parent = git("rev-parse", "HEAD")
+            wrong_parent_merge = git(
+                "commit-tree",
+                f"{direct_head}^{{tree}}",
+                "-p",
+                wrong_parent,
+                "-p",
+                direct_head,
+                "-m",
+                "Merge pull request #42 from example/direct-candidate",
+            )
+            git("switch", "--quiet", "--detach", wrong_parent_merge)
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "ref": f"refs/heads/{BASE_BRANCH}",
+                        "before": base,
+                        "after": wrong_parent_merge,
+                        "forced": False,
+                        "created": False,
+                        "deleted": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            try:
+                verify_bootstrap_push(event_path)
+            except TrainError:
+                pass
+            else:
+                raise AssertionError("self-test accepted a direct merge with the wrong first parent")
 
             git("switch", "--quiet", "--detach", composite)
             Path("unexpected.txt").write_text("must fail closed\n", encoding="utf-8")

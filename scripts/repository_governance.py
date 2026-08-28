@@ -6,7 +6,8 @@ The program separates facts, decisions, and mutations:
 * ``snapshot`` reads live GitHub/Git state;
 * ``plan`` derives idempotent actions from a snapshot and hash-chained ledger;
 * ``verify-pr-event`` enforces admission inside the existing required policy job;
-* exact independent review receipts are receipt-only commits;
+* high-risk independent review receipts are receipt-only commits while
+  ordinary work uses exact-head GitHub review markers;
 * destructive lifecycle execution requires a short-lived approval artifact.
 
 No command treats chat, local tests, commits, pushes, or hand-written counts as
@@ -41,10 +42,12 @@ APPROVAL_SCHEMA = "hartevo-lifecycle-approval/v1"
 NOMINATION_SCHEMA = "hartevo-lifecycle-nominations/v1"
 REVIEW_SCHEMA = "hartevo-independent-review-receipt/v1"
 ADMISSION_SCHEMA = "hartevo-pr-admission/v1"
+GITHUB_REVIEW_SCHEMA = "hartevo-github-review/v1"
 ZERO_DIGEST = "0" * 64
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ADMISSION_BLOCK = re.compile(r"<!--\s*hartevo-governance\s*(\{.*?\})\s*-->", re.DOTALL)
+GITHUB_REVIEW_BLOCK = re.compile(r"<!--\s*hartevo-github-review\s*(\{.*?\})\s*-->", re.DOTALL)
 REPOSITORY_LIFECYCLE_FIELDS = {
     "delete_branch_on_merge": "deleteBranchOnMerge",
     "allow_update_branch": "allowUpdateBranch",
@@ -53,6 +56,31 @@ REPOSITORY_LIFECYCLE_FIELDS = {
     "allow_rebase_merge": "rebaseMergeAllowed",
     "allow_auto_merge": "autoMergeAllowed",
 }
+
+# Only these two classes use the lightweight direct-merge path.  Every other
+# admitted class remains on the issue/path/rollback/receipt contract.  Keep
+# the sensitive prefixes explicit: a feature PR must never smuggle a policy,
+# workflow, or append-only ledger edit through ordinary admission.
+ORDINARY_CHANGE_CLASSES = frozenset({"feature", "dependency"})
+HIGH_RISK_PATH_PREFIXES = (
+    ".github/workflows/",
+    ".github/policies/",
+    ".github/governance/",
+    ".github/merge-train/",
+    ".github/ISSUE_TEMPLATE/",
+    ".github/CODEOWNERS",
+    ".github/pull_request_template.md",
+    "scripts/ci-",
+    "scripts/repository_governance.py",
+    "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+)
+DEPENDENCY_PATHS = frozenset({
+    "Cargo.lock",
+    "Cargo.toml",
+    "rust-toolchain.toml",
+    ".cargo/config",
+    ".cargo/config.toml",
+})
 
 
 class GovernanceError(ValueError):
@@ -266,9 +294,28 @@ def verify_policy_value(policy: dict[str, object]) -> dict[str, object]:
     if not isinstance(admission, dict):
         raise GovernanceError("admission policy is missing")
     required_fields = admission.get("requiredFields")
-    expected_fields = {"schema", "changeClass", "issue", "owner", "ownedPaths", "rollback", "externalEffects", "release"}
+    expected_fields = {"schema", "changeClass", "owner"}
     if not isinstance(required_fields, list) or set(required_fields) != expected_fields:
-        raise GovernanceError("PR admission required fields drifted")
+        raise GovernanceError("ordinary PR admission required fields drifted")
+    ordinary_classes = admission.get("ordinaryClasses")
+    if not isinstance(ordinary_classes, list) or set(ordinary_classes) != set(ORDINARY_CHANGE_CLASSES):
+        raise GovernanceError("ordinary PR admission classes drifted")
+    high_risk_fields = admission.get("highRiskRequiredFields")
+    expected_high_risk_fields = {
+        "schema",
+        "changeClass",
+        "issue",
+        "owner",
+        "ownedPaths",
+        "rollback",
+        "externalEffects",
+        "release",
+    }
+    if not isinstance(high_risk_fields, list) or set(high_risk_fields) != expected_high_risk_fields:
+        raise GovernanceError("high-risk PR admission required fields drifted")
+    sensitive = admission.get("highRiskPathPrefixes")
+    if not isinstance(sensitive, list) or tuple(sensitive) != HIGH_RISK_PATH_PREFIXES:
+        raise GovernanceError("path-sensitive governance prefixes drifted")
     paused = admission.get("pausedAllowedClasses")
     drain = admission.get("drainAllowedClasses")
     normal = admission.get("normalAllowedClasses")
@@ -276,8 +323,8 @@ def verify_policy_value(policy: dict[str, object]) -> dict[str, object]:
         raise GovernanceError("admission class sets must be non-empty and unique")
     if not set(paused).issubset(set(drain)) or not set(drain).issubset(set(normal)):
         raise GovernanceError("paused/drain/normal admission classes must expand monotonically")
-    if "feature" in set(paused) | set(drain) or "feature" not in set(normal):
-        raise GovernanceError("feature work must remain blocked outside normal mode")
+    if set(ORDINARY_CHANGE_CLASSES) & (set(paused) | set(drain)) or not set(ORDINARY_CHANGE_CLASSES).issubset(set(normal)):
+        raise GovernanceError("ordinary feature/dependency work must remain blocked outside normal mode")
     if admission.get("exactPathOwnership") is not True or admission.get("externalEffectsDefault") is not False or admission.get("releaseDefault") is not False:
         raise GovernanceError("admission honesty defaults drifted")
     review = policy.get("review")
@@ -304,13 +351,26 @@ def verify_policy_value(policy: dict[str, object]) -> dict[str, object]:
         "requireExactReviewReceipt": True,
         "requireAllHostedChecksSuccess": True,
         "requireTrustedBaseAdmission": True,
-        "requireTrainOnlyRequiredCheck": True,
+        "requireTrainOnlyRequiredCheck": False,
+        "ordinaryDirectMerge": True,
+        "trainsOptional": True,
+        "fullIntegrationModes": ["workflow_dispatch", "schedule", "explicit_full"],
         "manifestDirectory": ".github/merge-train/manifests",
         "nativeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
         "normalProtectedPullRequestMergeOnly": True,
     }
     if integration != expected_integration:
         raise GovernanceError("integration policy drifted")
+    github_review = policy.get("githubReview")
+    if github_review != {
+        "schema": GITHUB_REVIEW_SCHEMA,
+        "marker": "hartevo-github-review",
+        "acceptedStates": ["APPROVED", "COMMENTED"],
+        "acceptedDisposition": "APPROVE",
+        "requireExactHead": True,
+        "requireReviewerTaskDistinctFromOwner": True,
+    }:
+        raise GovernanceError("GitHub review contract drifted")
     lifecycle = policy.get("lifecycle")
     if not isinstance(lifecycle, dict):
         raise GovernanceError("lifecycle policy is missing")
@@ -373,6 +433,7 @@ def validate_event(event: dict[str, object]) -> None:
         "MERGED",
         "GLOBAL_PAUSED",
         "GLOBAL_RESUMED",
+        "GOVERNANCE_MODE_CHANGED",
     }:
         raise GovernanceError("unsupported governance event kind")
     pr = event.get("pr")
@@ -487,6 +548,23 @@ def path_is_owned(path: str, owned: Sequence[str]) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in owned)
 
 
+def is_high_risk_path(path: str) -> bool:
+    """Return whether a path must use the heavyweight governance contract."""
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return any(
+        normalized == prefix.rstrip("/")
+        or normalized.startswith(prefix)
+        for prefix in HIGH_RISK_PATH_PREFIXES
+    )
+
+
+def is_dependency_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized in DEPENDENCY_PATHS or normalized.endswith(("/Cargo.toml", "/Cargo.lock"))
+
+
 def extract_admission(body: object) -> dict[str, object]:
     if not isinstance(body, str):
         raise GovernanceError("pull request body is missing")
@@ -500,6 +578,88 @@ def extract_admission(body: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise GovernanceError("hartevo-governance block must be an object")
     return value
+
+
+def extract_github_review_marker(body: object) -> dict[str, object]:
+    """Parse the exact marker carried in an independent GitHub review body."""
+    if not isinstance(body, str) or not body.strip():
+        raise GovernanceError("GitHub review body is missing")
+    matches = GITHUB_REVIEW_BLOCK.findall(body)
+    if len(matches) != 1 or body.strip() != GITHUB_REVIEW_BLOCK.search(body).group(0).strip():
+        raise GovernanceError("GitHub review body must contain exactly one strict hartevo-github-review marker")
+    try:
+        value = json.loads(matches[0])
+    except json.JSONDecodeError as error:
+        raise GovernanceError(f"GitHub review marker is invalid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise GovernanceError("GitHub review marker must be an object")
+    return value
+
+
+def validate_github_review_record(
+    record: object,
+    *,
+    head_sha: str,
+    owner: str,
+) -> dict[str, object]:
+    """Validate one GitHub API review against the exact PR head and owner."""
+    if not isinstance(record, dict):
+        raise GovernanceError("GitHub review record must be an object")
+    state = record.get("state")
+    if state not in {"APPROVED", "COMMENTED"}:
+        raise GovernanceError("GitHub review must be COMMENTED or APPROVED")
+    commit = record.get("commit_id")
+    if commit is None:
+        commit = record.get("commitId")
+    if commit != head_sha:
+        raise GovernanceError("GitHub review is stale for the exact PR head")
+    marker = extract_github_review_marker(record.get("body"))
+    if marker.get("schema") != GITHUB_REVIEW_SCHEMA:
+        raise GovernanceError("GitHub review marker schema drift")
+    marker_head = marker.get("headSha")
+    if marker_head != head_sha:
+        raise GovernanceError("GitHub review marker is not bound to the exact PR head")
+    if marker.get("disposition") != "APPROVE":
+        raise GovernanceError("GitHub review marker disposition must be APPROVE")
+    reviewer_task = marker.get("reviewerTaskId")
+    if not isinstance(reviewer_task, str) or not reviewer_task.strip():
+        raise GovernanceError("GitHub review marker must contain reviewerTaskId")
+    reviewer_task = reviewer_task.strip()
+    if reviewer_task == owner.strip():
+        raise GovernanceError("GitHub review task identity must differ from the PR owner")
+    return {
+        "schema": GITHUB_REVIEW_SCHEMA,
+        "status": "PASS",
+        "state": state,
+        "headSha": head_sha,
+        "reviewerTaskId": reviewer_task,
+        "reviewId": record.get("id"),
+    }
+
+
+def validate_github_review_records(
+    records: object,
+    *,
+    head_sha: str,
+    owner: str,
+) -> dict[str, object]:
+    """Accept one current-head independent review and reject stale-only sets."""
+    if isinstance(records, dict):
+        records = records.get("reviews")
+    if not isinstance(records, list):
+        raise GovernanceError("GitHub review API response must contain a reviews array")
+    failures: list[str] = []
+    for record in records:
+        try:
+            return validate_github_review_record(record, head_sha=head_sha, owner=owner)
+        except GovernanceError as error:
+            failures.append(str(error))
+    detail = failures[-1] if failures else "no review records were returned"
+    raise GovernanceError(f"no exact-head independent GitHub review is valid: {detail}")
+
+
+# Short aliases make the pure verifier convenient for focused CI fixtures.
+verify_github_review = validate_github_review_records
 
 
 def changed_paths(root: Path, base: str, head: str) -> list[str]:
@@ -523,8 +683,6 @@ def verify_admission_value(
 ) -> dict[str, object]:
     admission = policy["admission"]
     assert isinstance(admission, dict)
-    required = set(str(item) for item in admission["requiredFields"] if isinstance(item, str))
-    require_exact_keys(value, required, "PR admission block")
     if value.get("schema") != ADMISSION_SCHEMA:
         raise GovernanceError("PR admission schema drift")
     change_class = value.get("changeClass")
@@ -535,6 +693,42 @@ def verify_admission_value(
     allowed = admission.get(allowed_key)
     if not isinstance(allowed, list) or change_class not in allowed:
         raise GovernanceError(f"changeClass {change_class!r} is not admitted while mode={mode}")
+
+    ordinary_classes = set(str(item) for item in admission.get("ordinaryClasses", []) if isinstance(item, str))
+    if change_class in ordinary_classes:
+        required = set(str(item) for item in admission["requiredFields"] if isinstance(item, str))
+        require_exact_keys(value, required, "ordinary PR admission block")
+        # The small block only requires owner/class.  Older templates may carry
+        # the heavyweight fields; they are ignored for ordinary classes and do
+        # not turn a GitHub review into a repository receipt.
+        owner = value.get("owner")
+        if not isinstance(owner, str) or not owner.strip() or "replace-" in owner:
+            raise GovernanceError("ordinary PR must bind one accountable owner")
+        sensitive = sorted(path for path in changed if is_high_risk_path(path))
+        if sensitive:
+            raise GovernanceError(
+                "path-sensitive governance/workflow/policy/ledger changes require a high-risk class: "
+                + ", ".join(sensitive)
+            )
+        if change_class == "dependency" and not all(is_dependency_path(path) for path in changed):
+            raise GovernanceError("dependency PRs may only change dependency manifests and lockfiles")
+        return {
+            "schema": "hartevo-pr-admission-verification/v1",
+            "status": "PASS",
+            "mode": mode.upper(),
+            "changeClass": change_class,
+            "owner": owner,
+            "ordinary": True,
+            "directMerge": True,
+            "exactChangedPaths": list(changed),
+            "review": "github_exact_head",
+            "train": "optional",
+            "externalEffects": False,
+            "release": False,
+        }
+
+    required = set(str(item) for item in admission.get("highRiskRequiredFields", []) if isinstance(item, str))
+    require_exact_keys(value, required, "high-risk PR admission block")
     issue = value.get("issue")
     if not isinstance(issue, int) or issue <= 0:
         raise GovernanceError("governed PR must bind one positive issue number")
@@ -557,6 +751,8 @@ def verify_admission_value(
         "changeClass": change_class,
         "issue": issue,
         "owner": owner,
+        "ordinary": False,
+        "directMerge": False,
         "ownedPaths": owned,
         "exactChangedPaths": list(changed),
         "pathDigest": digest(list(changed)),
@@ -571,10 +767,11 @@ def verify_pr_event(
     event_name: str,
     *,
     trusted_base: bool = False,
+    github_reviews: object | None = None,
 ) -> dict[str, object]:
     if event_name == "merge_group":
         return {"schema": "hartevo-pr-admission-verification/v1", "status": "PASS", "mode": "MERGE_GROUP"}
-    if event_name != "pull_request":
+    if event_name not in {"pull_request", "pull_request_review"}:
         raise GovernanceError(f"unsupported admission event: {event_name}")
     event = read_json(event_path)
     if not isinstance(event, dict) or not isinstance(event.get("pull_request"), dict):
@@ -611,6 +808,20 @@ def verify_pr_event(
     exact = changed_paths(root, base_sha, head_sha)
     admission = extract_admission(pr.get("body"))
     result = verify_admission_value(admission, changed=exact, paused=paused, policy=policy)
+    if trusted_base:
+        if result.get("ordinary") is True:
+            if github_reviews is None:
+                raise GovernanceError("trusted ordinary admission requires read-only GitHub review evidence")
+            result["githubReview"] = validate_github_review_records(
+                github_reviews,
+                head_sha=head_sha,
+                owner=str(result["owner"]),
+            )
+        else:
+            # High-risk changes retain the exact repository receipt-only
+            # review contract.  The receipt commit is the PR head; any code
+            # push after it changes the tuple and fails here.
+            result["reviewReceipt"] = verify_review_commit(root, number, base_sha, head_sha)
     result.update({"pr": number, "baseSha": base_sha, "headSha": head_sha, "headBranch": head_ref})
     return result
 
@@ -786,10 +997,40 @@ def candidate_required_checks(root: Path = Path(".")) -> tuple[str, ...]:
     checks = bootstrap.get("requiredStatusChecks") if isinstance(bootstrap, dict) else None
     if not isinstance(checks, list) or not all(isinstance(item, str) for item in checks):
         raise GovernanceError("bootstrap required-check policy is invalid")
-    train_only = "Governance / Train-only merge"
-    result = tuple(check for check in checks if check != train_only)
-    if train_only not in checks or not result:
-        raise GovernanceError("candidate policy must exclude exactly the train-only merge check")
+    expected = (
+        "PR / Workflow policy",
+        "Governance / PR admission",
+        "PR / Scope plan",
+        "PR / Result taxonomy",
+    )
+    if tuple(checks) != expected:
+        raise GovernanceError("candidate policy must use the four stable required contexts")
+    return expected
+
+
+def verify_candidate_admission(
+    repo: str,
+    number: int,
+    metadata: dict[str, object],
+    base: str,
+    head: str,
+) -> dict[str, object]:
+    """Verify train-candidate admission without requiring a receipt for ordinary work."""
+    body = metadata.get("body")
+    admission = extract_admission(body)
+    exact = changed_paths(Path("."), base, head)
+    policy = load_policy()
+    events = load_ledger()
+    result = verify_admission_value(admission, changed=exact, paused=global_paused(events), policy=policy)
+    if result.get("ordinary") is True:
+        reviews = gh_json("api", f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+        result["githubReview"] = validate_github_review_records(
+            reviews,
+            head_sha=head,
+            owner=str(result["owner"]),
+        )
+    else:
+        result["reviewReceipt"] = verify_review_commit(Path("."), number, base, head)
     return result
 
 
@@ -809,55 +1050,59 @@ def exact_train_readiness(repo: str, number: int, base: str, head: str) -> dict[
     if fetch.returncode != 0 or run(("git", "cat-file", "-e", f"{head}^{{commit}}"), check=False).returncode != 0:
         reasons.append("EXACT_HEAD_FETCH_FAILED")
     else:
+        # Candidate readiness follows the stable required checks and trusted
+        # admission.  Ordinary candidates use an exact-head GitHub review;
+        # high-risk candidates continue to use receipt-only review commits.
         try:
-            verify_review_commit(Path("."), number, base, head)
-        except GovernanceError:
-            reasons.append("EXACT_REVIEW_RECEIPT_NOT_VALID")
-    try:
-        metadata = gh_json(
-            "pr",
-            "view",
-            str(number),
-            "--repo",
-            repo,
-            "--json",
-            "number,state,isDraft,baseRefName,baseRefOid,headRefOid,statusCheckRollup",
-        )
-        if not isinstance(metadata, dict):
-            raise GovernanceError("pull request readiness metadata is invalid")
-        if (
-            metadata.get("state") != "OPEN"
-            or metadata.get("isDraft") is not False
-            or metadata.get("baseRefName") != BASE_BRANCH
-            or metadata.get("baseRefOid") != base
-            or metadata.get("headRefOid") != head
-        ):
-            reasons.append("EXACT_PR_TUPLE_NOT_READY")
-        rollup = metadata.get("statusCheckRollup")
-        if not isinstance(rollup, list):
-            reasons.append("REQUIRED_CHECK_ROLLUP_UNAVAILABLE")
-        else:
-            expected = set(candidate_required_checks())
-            observed: dict[str, list[dict[str, object]]] = {name: [] for name in expected}
-            for item in rollup:
-                if isinstance(item, dict) and item.get("name") in expected:
-                    observed[str(item["name"])].append(item)
-            missing = sorted(name for name, items in observed.items() if not items)
-            non_success = sorted(
-                name
-                for name, items in observed.items()
-                if items
-                and any(
-                    item.get("status") != "COMPLETED" or item.get("conclusion") != "SUCCESS"
-                    for item in items
-                )
+            metadata = gh_json(
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,body,statusCheckRollup",
             )
-            if missing:
-                reasons.append("REQUIRED_CHECKS_MISSING:" + ",".join(missing))
-            if non_success:
-                reasons.append("REQUIRED_CHECKS_NOT_SUCCESS:" + ",".join(non_success))
-    except GovernanceError:
-        reasons.append("REQUIRED_CHECK_PROBE_FAILED")
+            if not isinstance(metadata, dict):
+                raise GovernanceError("pull request readiness metadata is invalid")
+            if (
+                metadata.get("state") != "OPEN"
+                or metadata.get("isDraft") is not False
+                or metadata.get("baseRefName") != BASE_BRANCH
+                or metadata.get("baseRefOid") != base
+                or metadata.get("headRefOid") != head
+            ):
+                reasons.append("EXACT_PR_TUPLE_NOT_READY")
+            if not reasons:
+                try:
+                    verify_candidate_admission(repo, number, metadata, base, head)
+                except GovernanceError:
+                    reasons.append("ADMISSION_OR_REVIEW_NOT_VALID")
+            rollup = metadata.get("statusCheckRollup")
+            if not isinstance(rollup, list):
+                reasons.append("REQUIRED_CHECK_ROLLUP_UNAVAILABLE")
+            else:
+                expected = set(candidate_required_checks())
+                observed: dict[str, list[dict[str, object]]] = {name: [] for name in expected}
+                for item in rollup:
+                    if isinstance(item, dict) and item.get("name") in expected:
+                        observed[str(item["name"])].append(item)
+                missing = sorted(name for name, items in observed.items() if not items)
+                non_success = sorted(
+                    name
+                    for name, items in observed.items()
+                    if items
+                    and any(
+                        item.get("status") != "COMPLETED" or item.get("conclusion") != "SUCCESS"
+                        for item in items
+                    )
+                )
+                if missing:
+                    reasons.append("REQUIRED_CHECKS_MISSING:" + ",".join(missing))
+                if non_success:
+                    reasons.append("REQUIRED_CHECKS_NOT_SUCCESS:" + ",".join(non_success))
+        except GovernanceError:
+            reasons.append("REQUIRED_CHECK_PROBE_FAILED")
     return {
         "trainReady": not reasons,
         "readinessReasons": sorted(set(reasons)),
@@ -1348,6 +1593,16 @@ def verify_repository(root: Path) -> dict[str, object]:
     policy = load_policy(root / POLICY_PATH)
     policy_result = verify_policy_value(policy)
     events = load_ledger(root / LEDGER_PATH)
+    mode_events = [event for event in events if event.get("kind") == "GOVERNANCE_MODE_CHANGED"]
+    if not any(
+        isinstance(event.get("payload"), dict)
+        and event["payload"].get("admissionMode") == "lightweight"
+        and event["payload"].get("mainline") == "Cordis"
+        and event["payload"].get("historicalPrWaves") == "frozen"
+        and event["payload"].get("tripleValidation") == "removed"
+        for event in mode_events
+    ):
+        raise GovernanceError("lightweight Cordis governance-mode event is missing")
     if (root / ".github/merge-train/current.json").exists():
         raise GovernanceError("stale merge-train current.json must not exist")
     if not (root / ".github/merge-train/README.md").is_file():
@@ -1361,11 +1616,29 @@ def verify_repository(root: Path) -> dict[str, object]:
     template = (root / ".github/pull_request_template.md").read_text(encoding="utf-8")
     if "hartevo-governance" not in template or ADMISSION_SCHEMA not in template:
         raise GovernanceError("pull request admission template is missing")
+    governance_readme = (root / ".github/governance/README.md").read_text(encoding="utf-8")
+    runbook = (root / "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md").read_text(encoding="utf-8")
+    documentation = (governance_readme + "\n" + runbook).lower()
+    for required in ("Cordis", "lightweight", "scoped checks", "independent GitHub review", "directly merge", "Full Integration"):
+        if required.lower() not in documentation:
+            raise GovernanceError(f"governance documentation is missing {required!r}")
+    ordinary_steps = (
+        "1. Open a PR",
+        "2. Run scoped checks",
+        "3. Obtain one independent GitHub review",
+        "4. Directly merge",
+    )
+    if any(step not in runbook for step in ordinary_steps):
+        raise GovernanceError("ordinary Cordis flow must document its four plain steps")
+    admission_workflow = (root / ".github/workflows/governance-admission.yml").read_text(encoding="utf-8")
+    if "Governance / Train-only merge" in admission_workflow:
+        raise GovernanceError("train-only admission must not remain a workflow job")
     return {
         "schema": "hartevo-repository-governance-verification/v1",
         "status": "PASS",
         "policy": policy_result,
         "ledgerEvents": len(events),
+        "lightweightCordisMode": True,
         "globalPaused": global_paused(events),
         "staleCurrentManifestAbsent": True,
     }
@@ -1375,11 +1648,23 @@ def self_test() -> None:
     policy = load_policy()
     verify_policy_value(policy)
     events = load_ledger()
-    if global_paused(events) or events[-1].get("kind") != "GLOBAL_RESUMED":
+    resume_index = max(
+        (index for index, event in enumerate(events) if event.get("kind") == "GLOBAL_RESUMED"),
+        default=-1,
+    )
+    if global_paused(events) or resume_index < 0:
         raise AssertionError("checked-in governance ledger must end in an explicit resume")
     if policy.get("admissionModeWhenUnpaused") != "normal":
         raise AssertionError("resumed governance policy must select normal admission")
-    paused_events = events[:-1]
+    pause_index = max(
+        (
+            index
+            for index, event in enumerate(events[:resume_index])
+            if event.get("kind") == "GLOBAL_PAUSED"
+        ),
+        default=-1,
+    )
+    paused_events = events[: pause_index + 1]
     if not paused_events or not global_paused(paused_events):
         raise AssertionError("resume must extend an explicit checked-in pause")
     admission = {
@@ -1401,14 +1686,47 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("paused admission accepted feature work")
+    minimal_feature = {
+        "schema": ADMISSION_SCHEMA,
+        "changeClass": "feature",
+        "owner": "owner-task",
+    }
     normal_feature = verify_admission_value(
-        bad_feature,
-        changed=[".github/test.json"],
+        minimal_feature,
+        changed=["hartevo-rs/cordis/src/lib.rs"],
         paused=False,
         policy=policy,
     )
     if normal_feature["mode"] != "NORMAL":
         raise AssertionError("resumed policy did not admit feature work in normal mode")
+    minimal_result = verify_admission_value(
+        minimal_feature,
+        changed=["hartevo-rs/cordis/src/lib.rs"],
+        paused=False,
+        policy=policy,
+    )
+    if minimal_result["directMerge"] is not True or minimal_result["review"] != "github_exact_head":
+        raise AssertionError("ordinary feature admission did not select the GitHub review fast path")
+    exact_review_body = "<!-- hartevo-github-review {\"schema\":\"hartevo-github-review/v1\",\"headSha\":\"" + "b" * 40 + "\",\"disposition\":\"APPROVE\",\"reviewerTaskId\":\"review-task\"} -->"
+    github_review = validate_github_review_records(
+        [{"id": 1, "state": "COMMENTED", "commit_id": "b" * 40, "body": exact_review_body}],
+        head_sha="b" * 40,
+        owner="owner-task",
+    )
+    if github_review["status"] != "PASS":
+        raise AssertionError("exact-head GitHub review was not accepted")
+    for sensitive_path in (".github/workflows/ci.yml", ".github/governance/events.jsonl", "scripts/ci-scope.py"):
+        try:
+            verify_admission_value(
+                minimal_feature,
+                changed=[sensitive_path],
+                paused=False,
+                policy=policy,
+            )
+        except GovernanceError:
+            pass
+        else:
+            raise AssertionError("ordinary feature was allowed to edit a sensitive governance path")
     bad_path = dict(admission)
     bad_path["ownedPaths"] = ["scripts"]
     try:
@@ -1479,6 +1797,12 @@ def main(argv: Iterable[str]) -> int:
     admission_parser.add_argument("--event-name", required=True)
     admission_parser.add_argument("--root", type=Path, default=Path("."))
     admission_parser.add_argument("--trusted-base", action="store_true")
+    admission_parser.add_argument(
+        "--github-reviews",
+        "--reviews",
+        type=Path,
+        help="read-only GitHub API review JSON captured by trusted admission",
+    )
 
     append_parser = subparsers.add_parser("append-event")
     append_parser.add_argument("--ledger", type=Path, default=LEDGER_PATH)
@@ -1546,6 +1870,7 @@ def main(argv: Iterable[str]) -> int:
                     args.event.resolve(),
                     args.event_name,
                     trusted_base=args.trusted_base,
+                    github_reviews=read_json(args.github_reviews) if args.github_reviews else None,
                 ),
                 None,
             )

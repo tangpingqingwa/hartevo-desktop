@@ -1,159 +1,94 @@
 # Repository governance control plane
 
-This runbook makes repository state, review, integration, and lifecycle changes
-derive from GitHub/Git evidence rather than chat receipts or manually reported
-counts. A commit, push, local green run, completed task, or Draft-to-Ready click
-is not merge throughput. Only an exact advance of `bootstrap/macos-r0` counts.
+This runbook describes the lightweight Cordis mainline. GitHub API facts,
+exact Git objects, required checks, and the hash-chained governance ledger are
+the source of truth. Chat, task heartbeats, commits, pushes, and local green
+runs are not merge evidence.
 
-## Current safety state
+## Ordinary Cordis flow
 
-The checked-in hash-chained ledger ends in `GLOBAL_RESUMED`, and the policy's
-unpaused mode is `normal`. Feature admission is therefore available, but only
-through an Issue-bound path lease, exact non-author review receipt, required
-hosted checks, and the bounded repository merge train. This state was entered
-by a reviewed governance change after an explicit user instruction; no chat
-message, local commit, or green test was treated as the transition itself.
+Every ordinary `feature` or routine `dependency` change targeting
+`bootstrap/macos-r0` follows exactly four plain steps:
 
-A later `GLOBAL_PAUSED` event remains an immediate fail-closed override: it
-preserves existing worktrees, denies feature admission, and defers generated
-repair/inventory actions. Only `governance`, `integration-recovery`, and
-`security` changes can enter while paused, and resumption again requires a
-reviewed governance PR that appends a new explicit `GLOBAL_RESUMED` event.
+1. Open a PR with the minimal `hartevo-governance` admission block: schema, `changeClass`, and `owner`.
+2. Run scoped checks: common Rust packages on Ubuntu, desktop packages on macOS, or the locked dependency-only lane; non-Rust paths report honest planned skips.
+3. Obtain one independent GitHub review with a strict `hartevo-github-review/v1` marker containing the exact head SHA, `APPROVE` disposition, and a reviewer task ID different from the owner.
+4. Directly merge as a normal protected merge commit.
 
-GitHub repository settings are merge-commit-only: squash, rebase, and auto
-merge are disabled; merged branches are deleted; update-branch support is
-enabled. Protected refs still require normal pull requests, strict current-base
-checks, resolved conversations, and no force push or deletion.
+The protected branches require exactly these stable contexts: `PR / Workflow
+policy`, `Governance / PR admission`, `PR / Scope plan`, and `PR / Result
+taxonomy`. `requiredApprovingReviews` remains zero because there is one GitHub
+collaborator; trusted admission enforces the independent exact-head review and
+avoids a solo-maintainer ruleset deadlock. Protected refs still require a PR,
+current base, resolved conversations, no force push, no deletion, and
+merge-commit-only history.
 
-## Trusted admission activation boundary
+Full Integration runs on a milestone, release, scheduled, or explicit-full
+request. It is not repeated on every protected push. A protected push verifies
+only a recoverable normal merge record; the full Ubuntu-common,
+macOS-desktop, Postgres, contracts, OpenInterpreter, Dioxus, and dependency
+matrix runs through `workflow_dispatch` or the weekday schedule.
 
-`governance-admission.yml` must exist on the protected branch before its two
-trusted checks can be required. During an initial rollout, the previous
-protected ruleset remains active and `ci-branch-policy.py probe` returns
-`TRUSTED_ADMISSION_ROLLOUT_PENDING` rather than claiming enforcement.
+## Trusted admission and review freshness
 
-The bootstrap or recovery ceremony is:
+`governance-admission.yml` runs from the protected base for both PR updates and
+`pull_request_review` events. It fetches the untrusted head as a Git object,
+never checks out or executes PR code with privileged authority, and reads
+GitHub reviews with a read-only token. A review is accepted only when its
+state is `COMMENTED` or `APPROVED`, its API commit ID equals the current head,
+its body is exactly one machine-readable marker with `APPROVE`, and its
+reviewer task ID differs from the admission owner. Any code push changes the
+head and invalidates old records.
 
-1. open this exact governance PR against the current protected SHA;
-2. obtain a non-author review and append its receipt-only commit;
-3. require the existing protected checks to be terminal-success;
-4. merge normally as a merge commit (squash/rebase are already disabled);
-5. from the resulting protected checkout, run:
+## High-risk changes
 
-   ```bash
-   python3 scripts/ci-branch-policy.py apply --repo tangpingqingwa/hartevo-desktop
-   python3 scripts/ci-branch-policy.py probe --repo tangpingqingwa/hartevo-desktop
-   ```
+Workflow, policy, governance, ledger, merge-train, security, destructive,
+release, and integration-recovery changes cannot be classified as ordinary.
+They retain the positive Issue, accountable owner, exact owned paths, concrete
+rollback, false external-effect and release claims, and independent
+receipt-only review commit. The trusted verifier fails closed when any field,
+path envelope, base, head, or receipt-only commit is wrong. A feature PR that
+touches a sensitive path is rejected rather than downgraded to a normal lane.
 
-`apply` refuses to install the new required checks unless the protected copy of
-the trusted admission workflow exactly matches the local desired file. A green
-probe after that step closes the bootstrap exception. No subsequent ordinary
-PR can merge directly: `Governance / Train-only merge` intentionally fails on
-candidate branches and succeeds only for an exact repository-owned train.
+`events.jsonl` is append-only and hash chained. The latest
+`GLOBAL_PAUSED`/`GLOBAL_RESUMED` event controls admission; a pause blocks
+ordinary classes but preserves deferred recovery actions. Governance-mode
+events record the lightweight mode, Cordis mainline, frozen historical PR
+waves, and removal of triple validation without rewriting prior lines.
 
-## Governed PR admission
+## Optional trains and historical compatibility
 
-Every root PR contains exactly one `hartevo-governance` JSON block. It binds a
-positive Issue, one accountable owner, its path lease, a concrete rollback,
-and false product external-effect/release claims. The trusted
-`pull_request_target` workflow checks out only the protected base, fetches the
-untrusted head as an object, and executes protected verifier code. It never
-checks out or executes PR code with privileged event authority.
+Trains are optional and reserved for multi-PR integration, release milestones,
+or explicit high-risk combinations. They compose one to four independent root
+PRs and run the full Integration matrix once. Ordinary candidates attest the
+same exact-head GitHub review used by direct merge; high-risk candidates retain
+receipt-only evidence. Already merged manifests remain immutable and continue
+to validate their historical receipt fields. No protected branch requires a
+`Governance / Train-only merge` context.
 
-For an ordinary candidate, include its future receipt path
-`.github/governance/reviews/pr-<number>.json` in `ownedPaths` before the reviewer
-pushes the final receipt commit. Edit the PR body after GitHub assigns the PR
-number if necessary. Train PR bodies are generated by the publisher.
-
-## Independent review receipt
-
-Review in a detached worktree at the exact code head and current protected
-base. The reviewer must be a different task identity, rerun the relevant local
-gates, inspect the exact path envelope, and reach `APPROVE` with a green
-synthetic preflight. Then create the receipt:
-
-```bash
-python3 scripts/repository_governance.py create-review-receipt \
-  --pr 123 \
-  --base <exact-protected-sha> \
-  --reviewed-head <exact-code-head> \
-  --author-task <author-task-id> \
-  --reviewer-task <reviewer-task-id> \
-  --output .github/governance/reviews/pr-123.json
-git add -- .github/governance/reviews/pr-123.json
-git commit -m "review: attest PR #123 exact head"
-```
-
-That single-parent commit must change only the receipt. The receipt commit is
-the candidate PR's final head. Any code push after it invalidates the review.
-Formal GitHub approval is intentionally not the source of truth because this
-repository currently has one maintainer; distinct exact task identities and
-the receipt-only commit avoid pretending that self-approval is independent.
-
-## Integration fast path
-
-A candidate is train-ready only when all of these are simultaneously true:
-
-- Open, non-Draft, root PR on the exact current protected SHA;
-- final head is a valid receipt-only commit over the reviewed code head;
-- every candidate check except the intentionally failing train-only check is
-  terminal-success;
-- its leased paths do not overlap another candidate in the train.
-
-Create a clean train branch from the current protected head and compose one to
-four independent roots:
+The bounded operator path is:
 
 ```bash
 git switch --detach origin/bootstrap/macos-r0
 git switch -c merge-train/YYYYMMDD-HHMM
 python3 scripts/ci-merge-train.py prepare \
-  --branch merge-train/YYYYMMDD-HHMM \
-  --pr 123 --pr 124
+  --branch merge-train/YYYYMMDD-HHMM --pr 123 --pr 124
 python3 scripts/ci-merge-train.py publish \
   --branch merge-train/YYYYMMDD-HHMM \
-  --issue <integration-issue-number> \
-  --owner <integration-manager-task-id>
+  --issue <integration-issue> --owner <integration-manager-task>
 ```
 
-`publish` rechecks the live base, candidate tuples, hosted checks, receipts,
-history, tree, and the single-open-train invariant; then it performs one normal
-push and opens one non-Draft PR with a generated exact admission block. It does
-not merge. The train's trusted check reconstructs every merge and verifies the
-manifest without executing train code. The full Ubuntu/macOS matrix runs once
-on the composite.
+Publication verifies the current base, stable checks, admission, review
+evidence, exact history, tree, path overlap, and the single-open-train
+invariant. It pushes one normal train branch and opens one non-Draft PR; it
+does not merge or bypass protection. The immutable manifest remains history.
 
-After all required train checks succeed, merge the train PR with the normal
-merge method. The protected-push integration gate then requires:
+## Lifecycle safety
 
-- first parent equals the prior protected SHA;
-- second parent equals the hosted-green train head;
-- protected tree equals the train tree;
-- immutable manifest, candidates, receipts, and path envelopes still match.
-
-Automatic branch deletion removes the merged temporary train branch. The
-immutable manifest remains as history. There is no mutable `current.json`.
-
-## Throughput and forgetting alarms
-
-`Governance / Inventory` runs every five minutes and uploads an exact live
-snapshot and deterministic plan. `ready_count` means exact train-ready—not
-merely non-Draft. When unpaused, a train-ready PR older than 120 seconds with no
-open train produces `READY_TO_TRAIN_SLA_BREACH` and fails the governance run.
-Multiple trains or repository-setting drift also fail. During global pause,
-ready work is recorded as `TRAIN_READY_DEFERRED_BY_GLOBAL_PAUSE`; it is not
-misreported as integration throughput.
-
-The workflow token cannot see repository lifecycle booleans in the REST
-repository response even for this public repository. Both the policy probe and
-the Inventory snapshot therefore use the authenticated GraphQL repository
-fields when REST returns `null`, record `GRAPHQL_READ_FALLBACK` as the evidence
-source, and still fail closed if either source cannot provide every boolean.
-`null` is reported as an observability failure, never mislabeled as confirmed
-setting drift and never treated as a passing value.
-
-## Inventory and lifecycle cleanup
-
-Generate read-only truth at any time:
+Inventory and lifecycle plans are read-only or dry-run by default. Closing a
+PR/Issue or deleting a branch requires a short-lived approval artifact bound to
+the exact plan digest, and branch deletion first creates a recovery tag.
+Automatic destructive execution remains disabled.
 
 ```bash
 mkdir -p target/governance
@@ -164,43 +99,4 @@ python3 scripts/repository_governance.py plan \
   --output target/governance/plan.json
 ```
 
-Closing a PR/Issue or deleting an orphan branch is never inferred from age.
-Copy the example nominations, bind it to a fresh snapshot, and inspect dry-run
-output:
-
-```bash
-python3 scripts/repository_governance.py lifecycle-plan \
-  --snapshot target/governance/snapshot.json \
-  --nominations .github/governance/examples/lifecycle-nominations.example.json \
-  --output target/governance/lifecycle-plan.json
-```
-
-While paused, actions remain deferred and cannot be approved. After an explicit
-resume, approval is still a separate artifact bound to the exact plan digest
-and expires after 30 minutes:
-
-```bash
-python3 scripts/repository_governance.py approve-plan \
-  --plan target/governance/lifecycle-plan.json \
-  --actor <approver> \
-  --output target/governance/approval.json
-python3 scripts/repository_governance.py execute-lifecycle \
-  --plan target/governance/lifecycle-plan.json \
-  --approval target/governance/approval.json \
-  --action-id <exact-action-id>
-```
-
-The last command is still dry-run without `--execute`. Live execution rechecks
-the exact PR head, Issue update time, or branch SHA. Branch deletion first
-creates `refs/tags/governance-recovery/...` at the exact head. Automatic close
-and automatic branch deletion remain disabled.
-
-## Fail-closed limits
-
-GitHub's hosted merge queue is unavailable to this public User-owned repo, so
-the repository train is the explicit fallback. Fully autonomous train creation
-is not claimed: GitHub's default workflow token cannot safely create a PR and
-then trigger the required PR workflows. The five-minute SLA alarm and the
-single `prepare`/`publish` operator path make that remaining handoff observable
-and bounded instead of hidden. Product release, deployment, and native external
-effects remain outside this governance control plane.
+The complete verifier suite is available through `bash scripts/ci-tests.sh`.

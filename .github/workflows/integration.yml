@@ -4,6 +4,15 @@ on:
   push:
     branches: [bootstrap/macos-r0]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Run the full Integration matrix explicitly.
+        required: false
+        default: full
+        type: choice
+        options: [full]
+  schedule:
+    - cron: "17 4 * * 1-5"
 
 permissions:
   contents: read
@@ -26,37 +35,49 @@ jobs:
       contents: read
     outputs:
       ready: ${{ steps.ready.outputs.ready }}
+      full: ${{ steps.ready.outputs.full }}
     steps:
       - name: Checkout exact protected integration head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify normal merge of an exact hosted-green train
+      - name: Verify recoverable direct PR or exact train merge
         if: github.event_name == 'push'
         run: python3 scripts/ci-merge-train.py verify-bootstrap-push --event "$GITHUB_EVENT_PATH"
       - id: ready
-        name: Mark exact integration input ready
-        run: echo 'ready=true' >> "$GITHUB_OUTPUT"
+        name: Select recoverable push or full Integration mode
+        run: |
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            echo 'full=false' >> "$GITHUB_OUTPUT"
+            echo 'Protected push verifies the normal merge record only; full Integration is scheduled or explicit.'
+          else
+            echo 'full=true' >> "$GITHUB_OUTPUT"
+          fi
 
   rust:
     name: Integration / Full Rust matrix
     needs: review-gate
-    if: needs.review-gate.outputs.ready == 'true'
+    if: needs.review-gate.outputs.ready == 'true' && needs.review-gate.outputs.full == 'true'
     uses: ./.github/workflows/rust-reusable.yml
     with:
       check_prefix: Integration / Full Rust
       run_rust: true
+      run_common_rust: true
+      run_desktop: true
       run_macos: true
-      full_workspace: true
-      rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-runtime-adapter","hartevo-storage"]'
+      full_workspace: false
+      rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-channel-adapters","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-cordis","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-plugin-runtime","hartevo-runtime-adapter","hartevo-storage"]'
+      common_rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-channel-adapters","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-cordis","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-plugin-runtime","hartevo-runtime-adapter","hartevo-storage"]'
+      desktop_packages: '["hartevo-desktop"]'
     permissions:
       contents: read
 
   postgres:
     name: Integration / PostgreSQL 18 Cell
     needs: review-gate
-    if: needs.review-gate.outputs.ready == 'true'
+    if: needs.review-gate.outputs.ready == 'true' && needs.review-gate.outputs.full == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
@@ -125,7 +146,7 @@ jobs:
   contracts:
     name: Integration / Catalog and evidence
     needs: review-gate
-    if: needs.review-gate.outputs.ready == 'true'
+    if: needs.review-gate.outputs.ready == 'true' && needs.review-gate.outputs.full == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -181,7 +202,7 @@ jobs:
   openinterpreter:
     name: Integration / OpenInterpreter contract
     needs: review-gate
-    if: needs.review-gate.outputs.ready == 'true'
+    if: needs.review-gate.outputs.ready == 'true' && needs.review-gate.outputs.full == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -198,7 +219,7 @@ jobs:
   dioxus:
     name: Integration / Dioxus build and receipt
     needs: review-gate
-    if: needs.review-gate.outputs.ready == 'true'
+    if: needs.review-gate.outputs.ready == 'true' && needs.review-gate.outputs.full == 'true'
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -244,7 +265,7 @@ jobs:
   dependencies:
     name: Integration / Dependency and SBOM
     needs: review-gate
-    if: needs.review-gate.outputs.ready == 'true'
+    if: needs.review-gate.outputs.ready == 'true' && needs.review-gate.outputs.full == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
@@ -321,10 +342,11 @@ jobs:
       - name: Classify every integration job outcome
         env:
           READY: ${{ needs.review-gate.outputs.ready }}
+          FULL: ${{ needs.review-gate.outputs.full }}
         run: |
           mkdir -p target/ci
           allow=()
-          if [[ "$READY" != true ]]; then
+          if [[ "$FULL" != true ]]; then
             allow+=(--allow-skipped review-gate --allow-skipped rust --allow-skipped postgres --allow-skipped contracts --allow-skipped openinterpreter --allow-skipped dioxus --allow-skipped dependencies)
           fi
           python3 scripts/ci-result.py aggregate \
