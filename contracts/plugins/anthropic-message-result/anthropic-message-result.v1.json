@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/anthropic-message-result/anthropic-message-result.v1.json",
+  "title": "Hartevo Layer-1 Anthropic Claude Messages result contract",
+  "description": "A bounded, scoped proposal and recording seam for Anthropic POST /v1/messages. It is not a connected provider, kernel receipt, model registry, tool authority, or Outcome adoption surface.",
+  "schemaVersion": "hartevo.anthropic-message-result/v1",
+  "contractVersion": "EXT-ANTHROPIC-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "layer": 1,
+  "status": "read_proposal_and_recording_only",
+  "plugin": {
+    "id": "hartevo.anthropic-message-result",
+    "registration": {
+      "versionBound": true,
+      "providerApiModelPermissionScopeRevisionDigestsBound": true,
+      "projectMissionWorkProductBound": true,
+      "requestReplayFenced": true,
+      "reversible": true,
+      "revocable": true,
+      "failClosedOnDrift": [
+        "account",
+        "workspace",
+        "model",
+        "model_version",
+        "provider",
+        "api",
+        "permission",
+        "scope",
+        "revision",
+        "project_revision",
+        "mission_revision",
+        "work_product_revision",
+        "registration",
+        "revocation"
+      ]
+    }
+  },
+  "service": {
+    "id": "AnthropicMessageResultService",
+    "provider": "AnthropicProvider",
+    "consumer": "MissionAnthropicResultConsumer",
+    "operations": [
+      "describe_service",
+      "compile_message_proposal",
+      "record_message_result",
+      "record_blocked_env",
+      "post_messages_transport_seam",
+      "verify_message_result",
+      "register",
+      "revoke_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "durableReceipts": false,
+    "kernelTruthAuthority": false,
+    "kernelEffectAuthority": false,
+    "kernelReceiptAuthority": false,
+    "kernelVerificationAuthority": false,
+    "kernelOutcomeAuthority": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "id": "AnthropicProvider",
+    "version": "1.0.0",
+    "officialApi": "Claude Messages API",
+    "officialReferences": [
+      "https://docs.anthropic.com/en/api/messages",
+      "https://docs.anthropic.com/en/docs/build-with-claude/overview",
+      "https://docs.anthropic.com/en/api/getting-started"
+    ],
+    "authentication": {
+      "kind": "api_key",
+      "opaqueSecretReferenceOnly": true,
+      "serializedCredentialMaterial": false,
+      "environmentExport": false
+    },
+    "allowlistedTransport": {
+      "method": "POST",
+      "path": "/v1/messages",
+      "apiVersionHeader": "anthropic-version",
+      "apiVersion": "2023-06-01",
+      "singleProviderRoute": true,
+      "silentFailover": false,
+      "optionalNativeSeam": true
+    },
+    "evidenceModes": [
+      "fixture",
+      "fake",
+      "recording",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "capabilities": [
+      "bounded_messages_proposal",
+      "response_stop_reason_projection",
+      "usage_projection",
+      "latency_projection",
+      "refusal_projection",
+      "citation_metadata_projection",
+      "content_digest_projection",
+      "http_error_class_projection",
+      "reversible_registration",
+      "request_replay_fencing"
+    ]
+  },
+  "scope": {
+    "required": [
+      "account_id",
+      "workspace_id",
+      "api_host",
+      "api_version",
+      "opaque_api_key_secret_reference",
+      "permission_snapshot",
+      "model_id",
+      "immutable_model_version",
+      "provider_revision",
+      "project_id_and_revision",
+      "mission_id_and_revision",
+      "work_product_id_and_revision",
+      "policy_revision",
+      "request_id_and_digest",
+      "response_id_digest",
+      "response_digest",
+      "stop_reason",
+      "usage",
+      "latency",
+      "citation_metadata",
+      "content_digest"
+    ],
+    "identityFence": [
+      "account_id",
+      "workspace_id",
+      "api_host",
+      "api_version",
+      "provider_digest",
+      "api_digest",
+      "model_digest",
+      "permission_digest",
+      "scope_digest",
+      "revision_digest",
+      "project_revision",
+      "mission_revision",
+      "work_product_revision",
+      "registration_digest"
+    ]
+  },
+  "bounds": {
+    "maxRequestContentBytes": 262144,
+    "maxMessages": 64,
+    "maxMessageBytes": 65536,
+    "maxMaxTokens": 8192,
+    "maxResponseBytes": 2097152,
+    "maxContentBlocks": 64,
+    "maxCitations": 32,
+    "maxCitationMetadataBytes": 2048,
+    "maxStopSequenceBytes": 256
+  },
+  "allowlist": {
+    "requestContent": ["text_only"],
+    "responseProjection": [
+      "text_content_digest",
+      "tool_use_stop_reason_and_metadata_digest",
+      "refusal_class",
+      "citation_metadata",
+      "thinking_not_retained",
+      "provider_unknown_projection"
+    ],
+    "stopReasons": [
+      "end_turn",
+      "max_tokens",
+      "tool_use",
+      "stop_sequence",
+      "refusal",
+      "provider_unknown"
+    ],
+    "requestFeatures": {
+      "streaming": false,
+      "tools": false,
+      "fileUpload": false,
+      "batchAdministration": false,
+      "modelCreation": false,
+      "arbitraryModelRegistry": false
+    }
+  },
+  "errors": {
+    "http": [400, 401, 403, 404, 409, 429],
+    "server": "500_to_599",
+    "transport": ["timeout", "transport_unavailable", "BLOCKED_ENV"],
+    "response": ["malformed", "partial", "provider_unknown", "response_too_large"]
+  },
+  "redaction": {
+    "rawPrompt": false,
+    "rawOutput": false,
+    "thinking": false,
+    "toolInput": false,
+    "rawProviderErrorBody": false,
+    "credentialMaterial": false,
+    "contentDigestOnly": true,
+    "citationMetadataOnly": true
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "externalWrites": false,
+    "durableNativeReceipt": false,
+    "independentOutputReadBack": false,
+    "kernelTruth": false,
+    "kernelEffect": false,
+    "kernelReceipt": false,
+    "kernelVerification": false,
+    "kernelOutcome": false,
+    "workProductAdoption": false
+  },
+  "forbiddenAuthorities": [
+    "raw_prompt_retention",
+    "raw_output_retention",
+    "thinking_retention",
+    "tool_execution",
+    "file_upload",
+    "batch_administration",
+    "model_creation",
+    "arbitrary_model_registry",
+    "native_connected_claim",
+    "kernel_truth",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_verification",
+    "kernel_outcome",
+    "independent_output_read_back"
+  ],
+  "nonOverlap": [
+    "openai_batch_405_owns_asynchronous_openai_batch_lifecycle",
+    "bedrock_326_owns_amazon_bedrock_inference_provider",
+    "huggingface_351_owns_hugging_face_inference_provider",
+    "sagemaker_393_owns_sagemaker_endpoint_deployment_result",
+    "replicate_409_owns_replicate_prediction_result"
+  ],
+  "nativeGaps": [
+    "native_api_key_secret_resolution",
+    "live_anthropic_https_transport",
+    "durable_provider_receipt",
+    "independent_output_read_back",
+    "verified_work_product_adoption",
+    "kernel_truth_effect_receipt_verification_and_outcome_authority"
+  ],
+  "honesty": "fixture, fake, recording, loopback, and BLOCKED_ENV evidence never claims Connected, native, first-party execution, a durable provider receipt, or Outcome adoption"
+}
