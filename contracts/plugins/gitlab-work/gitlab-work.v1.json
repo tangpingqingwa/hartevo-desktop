@@ -1,0 +1,94 @@
+{
+  "schemaVersion": "hartevo-gitlab-work-contract/v1",
+  "contractVersion": "gitlab-work/v1",
+  "serviceId": "gitlab.work",
+  "providerId": "gitlab.work",
+  "layer": 1,
+  "evidenceLevel": "E1",
+  "transportProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+  "operations": [
+    "describe_capabilities",
+    "probe_registration",
+    "read_issue_graph",
+    "read_merge_request",
+    "read_pipeline_result",
+    "compile_issue_proposal",
+    "compile_merge_request_proposal",
+    "verify_webhook_envelope"
+  ],
+  "readOnly": true,
+  "mutatingProviderOperations": [],
+  "hartevoAuthority": {
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "workProductAdoption": false,
+    "connectedClaim": false,
+    "nativeEvidenceClaim": false,
+    "liveWebhookAcceptance": false
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "registeredHttpsOrigin",
+      "gitlabProjectNumericId",
+      "missionProjectWorkProductScope",
+      "opaqueSecretReference"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "normalizedScope": [
+    "httpsOrigin",
+    "namespacePath",
+    "projectNumericId",
+    "issueIid",
+    "mergeRequestIid",
+    "sourceRef",
+    "targetRef",
+    "sourceSha",
+    "targetSha",
+    "headSha",
+    "pipelineId",
+    "jobIds",
+    "missionIdAndRevision",
+    "projectIdAndRevision",
+    "workProductIdAndRevision"
+  ],
+  "receipts": {
+    "requestPathAndQuery": true,
+    "responseStatus": true,
+    "responseSize": true,
+    "responseDigest": true,
+    "rateLimitHeaders": true,
+    "rawProviderPayload": false,
+    "credentialMaterial": false
+  },
+  "webhook": {
+    "requiresRegisteredOrigin": true,
+    "requiresProjectNumericId": true,
+    "requiresSignatureVerification": true,
+    "requiresDeliveryReplayFence": true,
+    "requiresTimestampBounds": true,
+    "signalOnlyUntilReadback": true
+  },
+  "adversarialCoverage": [
+    "id_vs_iid",
+    "cross_origin_redirect",
+    "force_push_stale_sha",
+    "approval_mismatch",
+    "pipeline_sha_mismatch",
+    "pagination_loop",
+    "rate_limit",
+    "webhook_replay",
+    "webhook_timestamp",
+    "registration_revocation",
+    "blocked_env"
+  ],
+  "honestNativeGap": "Native OAuth/PAT resolution, live HTTPS probes, accepted production webhooks, external writes, atomic provider receipts, exact readback and durable Work Product adoption remain Layer-2/BLOCKED_ENV."
+}
