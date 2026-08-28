@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.buildkite-pipeline-result-contract/v1",
+  "contractVersion": "buildkite-pipeline-result-01-layer-1/v1",
+  "pluginId": "buildkite.pipeline-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.buildkite-pipeline-result-contract/v1|layer=1|service=buildkite.pipeline-result.read|provider=buildkite.cloud.pipeline-result.recording|consumer=mission.buildkite-pipeline-result.consumer",
+  "contractDigest": "c9942af361e8c7636dff8d344ce1189f592f6276e560e42f0b7d495bb902de4f",
+  "service": {
+    "type": "BuildkitePipelineResultService",
+    "id": "buildkite.pipeline-result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "read_builds",
+      "read_jobs",
+      "read_annotations",
+      "read_artifact_metadata",
+      "compile_pipeline_result",
+      "record_pipeline_result"
+    ]
+  },
+  "provider": {
+    "type": "BuildkiteProvider",
+    "id": "buildkite.cloud.pipeline-result.recording",
+    "apiRevision": "buildkite-rest-pipeline-result-read-1",
+    "operations": [
+      "read_builds",
+      "read_jobs",
+      "read_annotations",
+      "read_artifact_metadata"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "mutations": {
+      "createBuild": false,
+      "rebuildBuild": false,
+      "retryJob": false,
+      "cancelBuild": false,
+      "mutateAnnotation": false,
+      "resolveCredential": false
+    },
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    }
+  },
+  "consumer": {
+    "type": "MissionBuildkitePipelineConsumer",
+    "id": "mission.buildkite-pipeline-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "projectId",
+      "workProductId"
+    ]
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kinds": [
+      "api_token",
+      "oidc"
+    ],
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "hostHttpsOrigin",
+      "hostRevision",
+      "organizationSlug",
+      "organizationRevision",
+      "pipelineSlug",
+      "pipelineRevision",
+      "buildId",
+      "buildNumber",
+      "buildRevision",
+      "jobId",
+      "jobRevision",
+      "attemptId",
+      "attemptNumber",
+      "attemptRevision",
+      "commitSha",
+      "commitRevision",
+      "artifactId",
+      "artifactRevision",
+      "annotationId",
+      "annotationRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": [
+      "active"
+    ],
+    "terminalStatuses": [
+      "revoked",
+      "reversed"
+    ],
+    "permissions": [
+      "host.read",
+      "organization.read",
+      "pipeline.read",
+      "build.read",
+      "job.read",
+      "attempt.read",
+      "commit.read",
+      "artifact.read",
+      "annotation.read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "build.create",
+      "build.rebuild",
+      "job.retry",
+      "build.cancel",
+      "annotation.write",
+      "credential.write"
+    ]
+  },
+  "bounds": {
+    "maxPageSize": 50,
+    "maxPages": 8,
+    "maxBuilds": 32,
+    "maxJobs": 128,
+    "maxAttempts": 128,
+    "maxAnnotations": 128,
+    "maxArtifacts": 128,
+    "maxPageTokenBytes": 512,
+    "maxResponseBytes": 1048576,
+    "maxMetadataBytes": 65536,
+    "repeatedPageToken": "fail_closed",
+    "outOfScopeEntry": "fail_closed"
+  },
+  "evidence": {
+    "retryIdentity": true,
+    "retryState": true,
+    "tamperDigest": true,
+    "redactionEvidence": true,
+    "revocationEvidence": true,
+    "rawLogs": false,
+    "rawArtifacts": false,
+    "artifactContent": false,
+    "annotationBody": false,
+    "truncationIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected",
+    "fake": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Buildkite service/provider/consumer",
+      "exact host/organization/pipeline/build/job/attempt/commit/Mission scope",
+      "bounded build, job, annotation, and artifact metadata projections",
+      "retry identity and state evidence",
+      "tamper and redaction evidence",
+      "proposal digest and recording idempotency seam",
+      "reversible registration and revocation evidence"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native credential resolution",
+      "external Buildkite writes",
+      "raw logs",
+      "raw artifacts",
+      "SSH or debug sessions",
+      "kernel authority",
+      "generic CI provider registry"
+    ]
+  },
+  "nonOverlap": {
+    "circleCIIssue": "#363 owns the separate CircleCI pipeline-result seam",
+    "githubGitLabAzureDevOps": "separate provider seams remain independent",
+    "buildkiteOwns": "Buildkite pipeline build/job/attempt result metadata only"
+  },
+  "honestNativeGap": "Native Buildkite API-token or OIDC resolution, HTTPS readback, Connected status, provider receipts, independent verification, terminal reconciliation, raw-log or artifact download, annotation-body retention, Mission adoption, and Outcome authority remain Layer-2 work; recording, fake, loopback, and BLOCKED_ENV never claim Connected or native."
+}
