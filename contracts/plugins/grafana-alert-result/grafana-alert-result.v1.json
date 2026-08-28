@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/grafana-alert-result/grafana-alert-result.v1.json",
+  "title": "Hartevo Grafana alert-result Layer-1 contract",
+  "description": "A bounded, read-only Grafana alert-rule, rule-group, and alert-instance observation seam. It is not a Grafana connector, notification authority, observability registry, or kernel authority.",
+  "schemaVersion": "hartevo.grafana-alert-result/v1",
+  "contractVersion": "grafana-alert-result-e1/v1",
+  "pluginVersion": "0.1.0",
+  "layer": 1,
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "connected": false,
+    "nativeProvider": false,
+    "durableNativeReceipt": false,
+    "kernelAuthority": false,
+    "genericObservabilityRegistry": false,
+    "outcomeAdoption": false
+  },
+  "service": {
+    "id": "grafana.alert-result",
+    "name": "GrafanaAlertResultService",
+    "version": "1.0.0",
+    "access": "read_only",
+    "operations": [
+      "describe_alert_rule",
+      "read_alert_rule_metadata",
+      "read_rule_group_metadata",
+      "read_alert_instances",
+      "compile_alert_result_proposal",
+      "record_alert_result_observation",
+      "verify_alert_result",
+      "revoke_registration"
+    ],
+    "externalWrites": false
+  },
+  "provider": {
+    "id": "grafana.alert-result",
+    "name": "GrafanaProvider",
+    "version": "1.0.0",
+    "apis": [
+      "grafana_http_api",
+      "grafana_alerting_api"
+    ],
+    "scope": [
+      "cloud_stack",
+      "organization",
+      "folder",
+      "alert_rule",
+      "rule_group",
+      "alert_instance",
+      "project",
+      "mission",
+      "deployment",
+      "release",
+      "provider_digest",
+      "api_digest",
+      "permission_digest",
+      "scope_digest",
+      "revision_digest",
+      "registration_digest"
+    ],
+    "authentication": ["opaque_service_account_token_secret_reference"],
+    "permissions": [
+      "alert_rules_read",
+      "rule_groups_read",
+      "alert_instances_read"
+    ],
+    "transportProvenance": [
+      "fixture",
+      "recording",
+      "fake",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "reversible": true,
+    "revocable": true
+  },
+  "consumer": {
+    "id": "mission.grafana-alert-result",
+    "name": "MissionGrafanaAlertConsumer",
+    "kind": "mission_alert_result_projection",
+    "scope": [
+      "project",
+      "mission",
+      "deployment",
+      "release",
+      "mission_revision",
+      "source_evidence_digest"
+    ],
+    "adoptsOutcome": false,
+    "kernelAuthority": false
+  },
+  "exactScope": [
+    "cloud_stack",
+    "organization",
+    "folder",
+    "alert_rule",
+    "rule_group",
+    "alert_instance",
+    "project",
+    "mission",
+    "deployment",
+    "release"
+  ],
+  "allowlist": {
+    "reads": [
+      {
+        "operation": "read_alert_rule_metadata",
+        "method": "GET",
+        "path": "/api/v1/provisioning/alert-rules/{ruleUid}",
+        "bounded": true,
+        "arbitraryQuery": false
+      },
+      {
+        "operation": "read_rule_group_metadata",
+        "method": "GET",
+        "path": "/api/v1/provisioning/folder/{folderUid}/rule-groups/{groupName}",
+        "bounded": true,
+        "arbitraryQuery": false
+      },
+      {
+        "operation": "read_alert_instances",
+        "method": "GET",
+        "path": "/api/alertmanager/grafana/api/v1/alerts",
+        "bounded": true,
+        "arbitraryQuery": false
+      }
+    ],
+    "writes": [],
+    "forbidden": [
+      "alert_mutation",
+      "dashboard_mutation",
+      "contact_point_mutation",
+      "mute_mutation",
+      "notification_delivery",
+      "arbitrary_data_source_query",
+      "raw_log_retention",
+      "generic_observability_registry",
+      "kernel_receipt",
+      "kernel_outcome_authority"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 8,
+    "maxPageSize": 100,
+    "maxRules": 100,
+    "maxRuleGroups": 100,
+    "maxAlertInstances": 100,
+    "maxLabels": 32,
+    "maxLabelBytes": 256,
+    "maxNumericEvidence": 32,
+    "maxIncidentTransitions": 1000,
+    "maxIdentifierBytes": 256
+  },
+  "projections": {
+    "states": [
+      "normal",
+      "pending",
+      "alerting",
+      "recovering",
+      "no_data",
+      "error",
+      "unknown"
+    ],
+    "evaluationTimestamps": true,
+    "allowlistedLabels": true,
+    "selectedNumericEvidenceDigestsOnly": true,
+    "incidentStateTransitionsOnly": true,
+    "rawProviderPayload": false,
+    "rawAnnotations": false,
+    "rawLogs": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "revisionDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "cloud_stack_drift",
+      "organization_drift",
+      "folder_drift",
+      "rule_drift",
+      "rule_group_drift",
+      "alert_instance_drift",
+      "project_drift",
+      "mission_stale",
+      "deployment_drift",
+      "release_drift",
+      "provider_revision_drift",
+      "api_revision_drift",
+      "permission_drift",
+      "scope_tamper",
+      "registration_revocation"
+    ]
+  },
+  "authentication": {
+    "secretReference": "opaque_service_account_token_SecretReference",
+    "rawTokenSerialized": false,
+    "rawTokenDebug": false,
+    "rawTokenReceipt": false
+  },
+  "honesty": {
+    "fixtureNative": false,
+    "recordingNative": false,
+    "fakeNative": false,
+    "loopbackNative": false,
+    "blockedEnvNative": false,
+    "fixtureConnected": false,
+    "recordingConnected": false,
+    "fakeConnected": false,
+    "loopbackConnected": false,
+    "blockedEnvConnected": false,
+    "nativeHttpsLayer": "layer_2_gap",
+    "absenceIsSuccess": false
+  },
+  "distinction": {
+    "notDatadogSloOutcome": true,
+    "notSentryIssueEvent": true,
+    "notPagerDutyIncident": true,
+    "neighboringIssueNumbers": {
+      "datadogSloOutcome": 337,
+      "sentryIssueEvent": 307,
+      "pagerDutyIncident": 324
+    },
+    "providerDomain": "Grafana alerting API only"
+  },
+  "documentation": [
+    "https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/",
+    "https://grafana.com/docs/grafana/latest/developer-resources/api-reference/cloud-api/",
+    "https://grafana.com/docs/grafana-cloud/alerting-and-irm/alerting/set-up/provision-alerting-resources/http-api-provisioning/"
+  ],
+  "errorHandling": [
+    "HTTP_401",
+    "HTTP_403",
+    "HTTP_404",
+    "HTTP_409",
+    "HTTP_429",
+    "TIMEOUT",
+    "HTTP_5XX",
+    "MALFORMED_RESPONSE",
+    "PARTIAL_RESPONSE",
+    "REDACTION",
+    "REPLAY",
+    "TAMPER",
+    "REVOCATION"
+  ],
+  "layer2Gaps": [
+    "native_service_account_secret_resolution",
+    "native_cloud_stack_and_organization_probe",
+    "bounded_native_grafana_https_reads",
+    "durable_native_provider_receipts",
+    "independent_native_readback",
+    "verified_mission_outcome_adoption"
+  ]
+}
