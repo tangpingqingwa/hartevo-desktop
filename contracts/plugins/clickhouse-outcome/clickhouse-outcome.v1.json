@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/clickhouse-outcome/clickhouse-outcome.v1.json",
+  "schemaVersion": "hartevo-clickhouse-outcome-contract/v1",
+  "contractVersion": "clickhouse-outcome-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "clickhouse.outcome.result",
+    "version": "1.0.0",
+    "operation": "governed_analytical_read_proposal",
+    "readOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "clickhouse.http.query",
+    "version": "1.0.0",
+    "operations": ["query", "explain"],
+    "acceptedProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "httpsOnly": true
+  },
+  "consumer": {
+    "id": "mission.clickhouse.outcome.consumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "httpsHost",
+      "cluster",
+      "database",
+      "table",
+      "schema",
+      "schemaRevision",
+      "query",
+      "queryKind",
+      "parameters",
+      "bounds",
+      "mission",
+      "project",
+      "workProduct",
+      "workProductRevision",
+      "secretReference",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "secret": "opaque_secret_reference_only",
+    "secretKinds": ["https_basic", "service_token"]
+  },
+  "queryPolicy": {
+    "allow": ["parameterized_select", "parameterized_explain", "bounded_limit", "stable_ordering"],
+    "deny": [
+      "ddl",
+      "dml",
+      "insert",
+      "alter",
+      "optimize",
+      "mutation",
+      "multi_statement",
+      "arbitrary_sql",
+      "unbounded_read",
+      "live_query_execution",
+      "unbounded_streaming",
+      "cancel_authority"
+    ]
+  },
+  "evidence": {
+    "digests": ["query", "schema", "row_set", "statistics", "registration"],
+    "metadata": ["queryId", "progress", "summary", "rows", "bytes", "duration"],
+    "bounded": ["rows", "bytes"],
+    "statuses": ["complete", "partial", "truncated", "cancelled", "provider_unknown", "access_lost", "final_error"]
+  },
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true,
+    "replayFenced": true
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstPartyProvider": false,
+    "durableReceipt": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "opaque_secret_resolution",
+    "consented_live_https_query_execution",
+    "durable_native_query_receipt",
+    "native_query_cancellation",
+    "independent_read_back",
+    "verified_work_product_adoption"
+  ],
+  "officialReferences": [
+    "https://clickhouse.com/docs/interfaces/http",
+    "https://clickhouse.com/docs/sql-reference/syntax",
+    "https://clickhouse.com/docs/interfaces/formats"
+  ]
+}
