@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/dagger-pipeline-result/dagger-pipeline-result.v1.json",
+  "title": "Hartevo Dagger pipeline execution evidence result Layer-1 contract",
+  "description": "Bounded Dagger module, pipeline, function, container, execution result, and artifact metadata evidence for a Mission decision; not an execution, log, artifact-byte, registry, or Outcome authority.",
+  "schemaVersion": "hartevo.dagger-pipeline-result/v1",
+  "contractVersion": "EXT-DAGGER-01-L1/v1",
+  "pluginId": "dagger.pipeline-result",
+  "objectiveType": "pipeline_execution_evidence",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.dagger-pipeline-result/v1|layer=1|service=dagger.pipeline-result.read|provider=dagger.pipeline-result.recording|consumer=mission.dagger-pipeline-result.consumer",
+  "contractDigest": "b74f6d045358e1903bb755e4034e6c41806b7f3358fcdd29ee8bc27c965bab12",
+  "service": {
+    "type": "DaggerPipelineResultService",
+    "id": "dagger.pipeline-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "read_module_metadata",
+      "read_pipeline_result",
+      "read_artifact_metadata",
+      "compile_pipeline_evidence_proposal",
+      "verify_pipeline_evidence",
+      "record_observation_receipt",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "DaggerProvider",
+    "id": "dagger.pipeline-result.recording",
+    "apiRevision": "dagger-api-v0.16-module-pipeline-function-container-result-artifact-read-1",
+    "operations": [
+      "read_module_metadata",
+      "read_pipeline_result",
+      "read_artifact_metadata"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "schemes": ["token", "oci"],
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "debugRedacted": true,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false,
+    "maxRequestsPerMinute": 60,
+    "maxResponseBytes": 1048576
+  },
+  "consumer": {
+    "type": "MissionDaggerPipelineConsumer",
+    "id": "mission.dagger-pipeline-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "connected": false,
+    "native": false
+  },
+  "credentials": {
+    "boundary": "opaque token/OCI SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "rawMaterialRetained": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "moduleId",
+      "pipelineId",
+      "functionName",
+      "containerId",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "scopeRevision"
+    ],
+    "optional": ["commit", "artifactId", "executionId"],
+    "identifiersInEvidence": "digest_only_or_redacted",
+    "moduleDefinitionBytes": false,
+    "pipelineDefinitionBytes": false,
+    "shellOutput": false,
+    "rawLogs": false,
+    "artifactBytes": false,
+    "rawSecrets": false,
+    "maxPageSize": 64,
+    "maxMetadataItems": 64,
+    "maxResponseBytes": 1048576
+  },
+  "allowlist": {
+    "reads": [
+      {
+        "operation": "read_module_metadata",
+        "providerOperation": "module_metadata_read",
+        "aggregateOrMetadataOnly": true
+      },
+      {
+        "operation": "read_pipeline_result",
+        "providerOperation": "pipeline_result_read",
+        "aggregateOrMetadataOnly": true
+      },
+      {
+        "operation": "read_artifact_metadata",
+        "providerOperation": "artifact_metadata_read",
+        "aggregateOrMetadataOnly": true
+      }
+    ],
+    "writes": [],
+    "forbidden": [
+      "execute_pipeline",
+      "cancel_pipeline",
+      "registry_mutation",
+      "module_mutation",
+      "raw_log_read",
+      "shell_output_read",
+      "artifact_bytes_read",
+      "secret_export",
+      "external_write",
+      "kernel_receipt",
+      "verified_work_product_adoption",
+      "outcome_adoption"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "dagger:module:read",
+      "dagger:pipeline:result:read",
+      "dagger:function:metadata:read",
+      "dagger:container:metadata:read",
+      "dagger:artifact:metadata:read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "dagger:pipeline:execute",
+      "dagger:pipeline:cancel",
+      "dagger:registry:write",
+      "dagger:logs:read",
+      "dagger:shell:read",
+      "dagger:artifact:bytes:read",
+      "secret.export",
+      "outcome.adopt"
+    ]
+  },
+  "revisionAndIdempotency": {
+    "scopeRevisionRequired": true,
+    "missionRevisionRequired": true,
+    "projectRevisionRequired": true,
+    "workProductRevisionRequired": true,
+    "registrationRevisionRequired": true,
+    "requestIdempotencyDigestOnly": true,
+    "recordingIdempotencyDigestOnly": true,
+    "sameKeyDifferentProposalRejected": true,
+    "staleRegistrationRejected": true
+  },
+  "metadata": {
+    "bounded": true,
+    "module": ["identifierDigest", "observedAt"],
+    "pipeline": ["identifierDigest", "scopeRevision", "observedAt"],
+    "function": ["identifierDigest"],
+    "container": ["identifierDigest"],
+    "commit": ["identifierDigest"],
+    "execution": ["identifierDigest", "status", "durationMs", "exitCode", "observedAt"],
+    "artifact": ["identifierDigest", "artifactDigest", "kind", "sizeBytes", "mediaType", "createdAt"],
+    "rawModuleDefinition": false,
+    "rawPipelineDefinition": false,
+    "rawLogs": false,
+    "shellOutput": false,
+    "rawArtifactBytes": false,
+    "rawEnvironmentValues": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "moduleDigest",
+      "pipelineDigest",
+      "functionDigest",
+      "containerDigest",
+      "commitDigest",
+      "executionDigest",
+      "artifactDigests",
+      "evidenceDigest"
+    ],
+    "states": [
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+      "partial",
+      "denied",
+      "rate_limited",
+      "provider_unknown",
+      "tampered",
+      "access_loss",
+      "blocked_env",
+      "registration_revoked"
+    ],
+    "redactedReceipt": true,
+    "tamperRejected": true,
+    "revocationRejected": true,
+    "partialIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "rateLimitIsNonAdoptable": true,
+    "providerReceipt": false
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "durableProviderReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Dagger module/pipeline/function/container/commit/artifact/project/mission/work-product scope",
+      "bounded module, pipeline result, and artifact metadata reads",
+      "execution state observation without execution control",
+      "revision and idempotency fences",
+      "version/contract/provider/permission/consent/scope/evidence digests",
+      "reversible digest-bound registration",
+      "redacted recording receipts"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live Dagger API",
+      "native token or OCI credential resolution",
+      "pipeline execution or cancellation",
+      "registry mutation",
+      "raw logs or shell output",
+      "artifact bytes",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native token/OCI credential resolution",
+    "live Dagger API transport",
+    "durable provider receipt",
+    "independent execution and artifact reread verification",
+    "consented execution effects",
+    "Connected/native/first-party evidence",
+    "Hartevo Outcome or verified Work Product adoption"
+  ],
+  "honestNativeGap": "Native token/OCI resolution, live Dagger transport, durable provider receipt, independent reread verification, execution effects, and verified Mission adoption remain Layer-2 work; fixture, recording, loopback, and BLOCKED_ENV transports never claim Connected, native, or first-party evidence."
+}
