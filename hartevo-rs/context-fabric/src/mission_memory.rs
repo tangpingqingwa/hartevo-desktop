@@ -156,6 +156,11 @@ impl MissionMemoryFact {
         Ok(())
     }
 
+    pub fn digest(&self) -> Result<String, MissionMemoryError> {
+        self.validate()?;
+        digest_json_with_domain("hartevo.mission-memory-fact/v1", self)
+    }
+
     fn item(&self) -> MissionMemoryItem {
         MissionMemoryItem {
             fact_id: self.fact_id.clone(),
@@ -449,6 +454,12 @@ pub enum MissionMemoryRecycleCause {
     CrashRecovery,
 }
 
+impl MissionMemoryRecycleCause {
+    fn invalidates_compactions(self) -> bool {
+        matches!(self, Self::Unmounted | Self::Revoked)
+    }
+}
+
 /// Provider code can index or rank only the already durable typed facts. It
 /// cannot persist independently or obtain any product authority through this
 /// trait.
@@ -486,6 +497,265 @@ pub trait MissionMemoryConsumer {
     fn request(&self, scope: &MissionMemoryScope, now: DateTime<Utc>) -> MissionMemoryReadRequest;
 
     fn observe(&mut self, result: &MissionMemoryReadResult) -> Result<(), MissionMemoryError>;
+
+    fn observe_continuation(
+        &mut self,
+        _result: &MissionMemoryContinuationResult,
+    ) -> Result<(), MissionMemoryError> {
+        Ok(())
+    }
+}
+
+const MAX_COMPACTION_SOURCE_FACTS: usize = 4_096;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionMemoryCompactionRequest {
+    pub request_id: String,
+    pub max_retained_items: u32,
+    pub counterevidence_fact_ids: BTreeSet<FactId>,
+    pub requested_at: DateTime<Utc>,
+}
+
+impl MissionMemoryCompactionRequest {
+    pub fn validate(&self) -> Result<(), MissionMemoryError> {
+        if !bounded_text(&self.request_id, MAX_REQUEST_ID_BYTES)
+            || self.max_retained_items == 0
+            || usize::try_from(self.max_retained_items).unwrap_or(usize::MAX) > MAX_MEMORY_ITEMS
+            || self.counterevidence_fact_ids.len() > MAX_MEMORY_ITEMS
+            || self
+                .counterevidence_fact_ids
+                .iter()
+                .any(|fact_id| !bounded_text(fact_id.as_str(), MAX_FACT_ID_BYTES))
+        {
+            return Err(MissionMemoryError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionMemoryResumeRequest {
+    pub request_id: String,
+    pub requested_at: DateTime<Utc>,
+}
+
+impl MissionMemoryResumeRequest {
+    pub fn validate(&self) -> Result<(), MissionMemoryError> {
+        if !bounded_text(&self.request_id, MAX_REQUEST_ID_BYTES) {
+            return Err(MissionMemoryError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionMemoryContinuationToken {
+    pub scope: MissionMemoryScope,
+    pub source_generation: u64,
+    pub continuation_version: u64,
+    pub continuation_digest: String,
+}
+
+impl MissionMemoryContinuationToken {
+    pub fn validate(&self) -> Result<(), MissionMemoryError> {
+        self.scope.validate()?;
+        if self.source_generation == 0
+            || self.continuation_version == 0
+            || !is_lower_sha256(&self.continuation_digest)
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionMemoryContinuationArtifact {
+    pub scope: MissionMemoryScope,
+    pub source_generation: u64,
+    pub continuation_version: u64,
+    pub source_fact_digests: BTreeMap<FactId, String>,
+    pub retained_items: Vec<MissionMemoryItem>,
+    pub counterevidence_fact_ids: BTreeSet<FactId>,
+    pub summary_ref: String,
+    pub summary_digest: String,
+}
+
+impl MissionMemoryContinuationArtifact {
+    pub fn validate(&self) -> Result<(), MissionMemoryError> {
+        self.scope.validate()?;
+        if self.source_generation == 0
+            || self.continuation_version == 0
+            || self.source_fact_digests.len() > MAX_COMPACTION_SOURCE_FACTS
+            || self.retained_items.len() > MAX_MEMORY_ITEMS
+            || self.counterevidence_fact_ids.len() > MAX_MEMORY_ITEMS
+            || !is_memory_reference(&self.summary_ref)
+            || !is_lower_sha256(&self.summary_digest)
+            || self
+                .source_fact_digests
+                .iter()
+                .any(|(fact_id, fact_digest)| {
+                    !bounded_text(fact_id.as_str(), MAX_FACT_ID_BYTES)
+                        || !is_lower_sha256(fact_digest)
+                })
+            || self
+                .counterevidence_fact_ids
+                .iter()
+                .any(|fact_id| !self.source_fact_digests.contains_key(fact_id))
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        validate_item_list(&self.retained_items, MAX_MEMORY_ITEMS)?;
+        let retained_ids = self
+            .retained_items
+            .iter()
+            .map(|item| item.fact_id.clone())
+            .collect::<BTreeSet<_>>();
+        if self
+            .counterevidence_fact_ids
+            .iter()
+            .any(|fact_id| !retained_ids.contains(fact_id))
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, MissionMemoryError> {
+        self.validate()?;
+        digest_json_with_domain("hartevo.mission-memory-continuation/v1", self)
+    }
+
+    pub fn token(&self) -> Result<MissionMemoryContinuationToken, MissionMemoryError> {
+        Ok(MissionMemoryContinuationToken {
+            scope: self.scope.clone(),
+            source_generation: self.source_generation,
+            continuation_version: self.continuation_version,
+            continuation_digest: self.digest()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionMemoryContinuationProvenance {
+    pub source_compaction_event_sequence: u64,
+    pub source_compaction_event_digest: String,
+    pub source_continuation_digest: String,
+    pub source_generation: u64,
+    pub resumed_generation: u64,
+    pub source_fact_digests: BTreeMap<FactId, String>,
+}
+
+impl MissionMemoryContinuationProvenance {
+    fn validate(&self) -> Result<(), MissionMemoryError> {
+        if self.source_compaction_event_sequence == 0
+            || !is_lower_sha256(&self.source_compaction_event_digest)
+            || !is_lower_sha256(&self.source_continuation_digest)
+            || self.source_generation == 0
+            || self.resumed_generation == 0
+            || self.source_generation == self.resumed_generation
+            || self.source_fact_digests.len() > MAX_COMPACTION_SOURCE_FACTS
+            || self
+                .source_fact_digests
+                .iter()
+                .any(|(fact_id, fact_digest)| {
+                    !bounded_text(fact_id.as_str(), MAX_FACT_ID_BYTES)
+                        || !is_lower_sha256(fact_digest)
+                })
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionMemoryCompactionResult {
+    pub continuation: MissionMemoryContinuationArtifact,
+    pub token: MissionMemoryContinuationToken,
+    pub visibility_receipt: MissionMemoryVisibilityReceipt,
+}
+
+impl MissionMemoryCompactionResult {
+    fn validate(&self) -> Result<(), MissionMemoryError> {
+        self.continuation.validate()?;
+        self.token.validate()?;
+        self.visibility_receipt.validate()?;
+        let digest = self.continuation.digest()?;
+        if self.token.scope != self.continuation.scope
+            || self.token.source_generation != self.continuation.source_generation
+            || self.token.continuation_version != self.continuation.continuation_version
+            || self.token.continuation_digest != digest
+            || self.visibility_receipt.projection_digest != digest
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionMemoryContinuationResult {
+    pub token: MissionMemoryContinuationToken,
+    pub working_set: MissionMemoryWorkingSet,
+    pub provenance: MissionMemoryContinuationProvenance,
+    pub visibility_receipt: MissionMemoryVisibilityReceipt,
+}
+
+impl MissionMemoryContinuationResult {
+    fn validate(&self) -> Result<(), MissionMemoryError> {
+        self.token.validate()?;
+        self.working_set.validate()?;
+        self.provenance.validate()?;
+        self.visibility_receipt.validate()?;
+        if self.token.scope != self.working_set.scope
+            || self.token.source_generation != self.provenance.source_generation
+            || self.working_set.generation != self.provenance.resumed_generation
+            || self.token.continuation_digest != self.provenance.source_continuation_digest
+            || self.token.source_generation == self.working_set.generation
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        let digest = self.digest_without_receipt()?;
+        if self.visibility_receipt.projection_digest != digest {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        Ok(())
+    }
+
+    fn digest_without_receipt(&self) -> Result<String, MissionMemoryError> {
+        digest_json_with_domain(
+            "hartevo.mission-memory-continuation-result/v1",
+            &(&self.token, &self.working_set, &self.provenance),
+        )
+    }
+}
+
+/// The continuation provider has no persistence or product authority. It
+/// receives durable facts, produces a versioned digest-bound artifact, and
+/// can restore only the artifact's retained references.
+pub trait MissionMemoryContinuationProvider {
+    fn compact(
+        &self,
+        handle: &MissionMemoryProviderHandle,
+        facts: &[MissionMemoryFact],
+        continuation_version: u64,
+        request: &MissionMemoryCompactionRequest,
+    ) -> Result<MissionMemoryContinuationArtifact, MissionMemoryError>;
+
+    fn restore_working_set(
+        &self,
+        handle: &MissionMemoryProviderHandle,
+        facts: &[MissionMemoryFact],
+        continuation: &MissionMemoryContinuationArtifact,
+    ) -> Result<Vec<MissionMemoryItem>, MissionMemoryError>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -530,6 +800,20 @@ pub enum MissionMemoryEvent {
         request_digest: String,
         projection: Box<MissionMemoryProjection>,
     },
+    ContinuationCompacted {
+        session: MissionMemorySession,
+        consumer_id: String,
+        request_digest: String,
+        artifact: Box<MissionMemoryContinuationArtifact>,
+    },
+    ContinuationResumed {
+        session: MissionMemorySession,
+        consumer_id: String,
+        request_digest: String,
+        token: MissionMemoryContinuationToken,
+        working_set: Box<MissionMemoryWorkingSet>,
+        provenance: Box<MissionMemoryContinuationProvenance>,
+    },
     ProviderRecycled {
         session: MissionMemorySession,
         cause: MissionMemoryRecycleCause,
@@ -556,6 +840,38 @@ impl MissionMemoryEvent {
                     return Err(MissionMemoryError::InvalidEvent);
                 }
                 projection.validate()
+            }
+            Self::ContinuationCompacted {
+                session,
+                consumer_id,
+                request_digest,
+                artifact,
+            } => {
+                session.validate()?;
+                if !bounded_text(consumer_id, MAX_CONSUMER_ID_BYTES)
+                    || !is_lower_sha256(request_digest)
+                {
+                    return Err(MissionMemoryError::InvalidEvent);
+                }
+                artifact.validate()
+            }
+            Self::ContinuationResumed {
+                session,
+                consumer_id,
+                request_digest,
+                token,
+                working_set,
+                provenance,
+            } => {
+                session.validate()?;
+                if !bounded_text(consumer_id, MAX_CONSUMER_ID_BYTES)
+                    || !is_lower_sha256(request_digest)
+                {
+                    return Err(MissionMemoryError::InvalidEvent);
+                }
+                token.validate()?;
+                working_set.validate()?;
+                provenance.validate()
             }
         }
     }
@@ -609,6 +925,12 @@ pub trait MissionMemoryDurableLog {
     fn replay(&self) -> Result<Vec<MissionMemoryEventRecord>, MissionMemoryError>;
 }
 
+#[derive(Clone, Debug)]
+struct StoredMissionMemoryCompaction {
+    artifact: MissionMemoryContinuationArtifact,
+    record: MissionMemoryEventRecord,
+}
+
 #[derive(Debug)]
 struct ActiveMissionMemory {
     session: MissionMemorySession,
@@ -627,6 +949,9 @@ pub struct MissionMemoryService<L, P> {
     fact_events: BTreeMap<FactId, MissionMemoryEventRecord>,
     seen_sessions: BTreeSet<MissionMemorySession>,
     seen_handle_ids: BTreeSet<String>,
+    compactions: BTreeMap<String, StoredMissionMemoryCompaction>,
+    compaction_versions: BTreeMap<MissionMemoryScope, u64>,
+    invalidated_compactions: BTreeSet<String>,
     last_generation: u64,
     next_event_sequence: u64,
 }
@@ -646,6 +971,9 @@ where
             fact_events: BTreeMap::new(),
             seen_sessions: BTreeSet::new(),
             seen_handle_ids: BTreeSet::new(),
+            compactions: BTreeMap::new(),
+            compaction_versions: BTreeMap::new(),
+            invalidated_compactions: BTreeSet::new(),
             last_generation: 0,
             next_event_sequence: 1,
         };
@@ -850,6 +1178,183 @@ where
         Ok(result)
     }
 
+    pub fn resume_for_consumer<C: MissionMemoryConsumer>(
+        &mut self,
+        session: &MissionMemorySession,
+        consumer: &mut C,
+        token: MissionMemoryContinuationToken,
+        request: MissionMemoryResumeRequest,
+    ) -> Result<MissionMemoryContinuationResult, MissionMemoryError>
+    where
+        P: MissionMemoryContinuationProvider,
+    {
+        let result = self.resume(session, consumer.consumer_id().to_owned(), token, request)?;
+        consumer.observe_continuation(&result)?;
+        Ok(result)
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "compaction owns the immutable request snapshot that is durably bound to its event"
+    )]
+    pub fn compact(
+        &mut self,
+        session: &MissionMemorySession,
+        consumer_id: impl Into<String>,
+        request: MissionMemoryCompactionRequest,
+    ) -> Result<MissionMemoryCompactionResult, MissionMemoryError>
+    where
+        P: MissionMemoryContinuationProvider,
+    {
+        let handle = self.validate_session(session)?.handle.clone();
+        request.validate()?;
+        let consumer_id = consumer_id.into();
+        if !bounded_text(&consumer_id, MAX_CONSUMER_ID_BYTES) {
+            return Err(MissionMemoryError::InvalidRequest);
+        }
+        let continuation_version = self.next_compaction_version(&session.scope)?;
+        let facts = self.facts_for_scope(&session.scope);
+        let artifact = self
+            .provider
+            .compact(&handle, &facts, continuation_version, &request)?;
+        artifact.validate()?;
+        if artifact.scope != session.scope
+            || artifact.source_generation != session.generation
+            || artifact.continuation_version != continuation_version
+            || artifact.counterevidence_fact_ids != request.counterevidence_fact_ids
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        validate_compaction_against_facts(&artifact, &facts, &request.counterevidence_fact_ids)?;
+        let request_digest =
+            compaction_request_digest(session, &consumer_id, continuation_version, &request)?;
+        let record = self.append_event(MissionMemoryEvent::ContinuationCompacted {
+            session: session.clone(),
+            consumer_id,
+            request_digest: request_digest.clone(),
+            artifact: Box::new(artifact.clone()),
+        })?;
+        let continuation_digest = artifact.digest()?;
+        self.compactions.insert(
+            continuation_digest.clone(),
+            StoredMissionMemoryCompaction {
+                artifact: artifact.clone(),
+                record: record.clone(),
+            },
+        );
+        self.compaction_versions
+            .insert(session.scope.clone(), continuation_version);
+        let result = MissionMemoryCompactionResult {
+            token: artifact.token()?,
+            continuation: artifact,
+            visibility_receipt: MissionMemoryVisibilityReceipt {
+                event_sequence: record.sequence,
+                event_id: record.event_id,
+                event_digest: record.event_digest,
+                request_digest,
+                projection_digest: continuation_digest,
+            },
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "resume owns the immutable request and token snapshots that are durably bound to provenance"
+    )]
+    pub fn resume(
+        &mut self,
+        session: &MissionMemorySession,
+        consumer_id: impl Into<String>,
+        token: MissionMemoryContinuationToken,
+        request: MissionMemoryResumeRequest,
+    ) -> Result<MissionMemoryContinuationResult, MissionMemoryError>
+    where
+        P: MissionMemoryContinuationProvider,
+    {
+        let handle = self.validate_session(session)?.handle.clone();
+        request.validate()?;
+        token.validate()?;
+        let consumer_id = consumer_id.into();
+        if !bounded_text(&consumer_id, MAX_CONSUMER_ID_BYTES) {
+            return Err(MissionMemoryError::InvalidRequest);
+        }
+        if token.scope != session.scope {
+            return Err(MissionMemoryError::ScopeMismatch);
+        }
+        if token.source_generation >= session.generation
+            || self
+                .invalidated_compactions
+                .contains(&token.continuation_digest)
+        {
+            return Err(MissionMemoryError::StaleGeneration);
+        }
+        let stored = self
+            .compactions
+            .get(&token.continuation_digest)
+            .cloned()
+            .ok_or(MissionMemoryError::InvalidContinuation)?;
+        let artifact = stored.artifact;
+        if artifact.digest()? != token.continuation_digest
+            || artifact.source_generation != token.source_generation
+            || artifact.continuation_version != token.continuation_version
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        let facts = self.facts_for_scope(&session.scope);
+        validate_compaction_against_facts(&artifact, &facts, &artifact.counterevidence_fact_ids)?;
+        let items = self
+            .provider
+            .restore_working_set(&handle, &facts, &artifact)?;
+        if items != artifact.retained_items {
+            return Err(MissionMemoryError::InvalidProviderOutput);
+        }
+        validate_item_list(&items, MAX_MEMORY_ITEMS)?;
+        let working_set_revision = self
+            .active
+            .as_ref()
+            .map(|active| active.next_working_set_revision)
+            .ok_or(MissionMemoryError::NotMounted)?;
+        let working_set = MissionMemoryWorkingSet {
+            scope: session.scope.clone(),
+            generation: session.generation,
+            revision: working_set_revision,
+            items,
+        };
+        let provenance = continuation_provenance(&artifact, &stored.record, session)?;
+        let request_digest = resume_request_digest(session, &consumer_id, &token, &request)?;
+        let result_digest = continuation_result_digest(&token, &working_set, &provenance)?;
+        let record = self.append_event(MissionMemoryEvent::ContinuationResumed {
+            session: session.clone(),
+            consumer_id,
+            request_digest: request_digest.clone(),
+            token: token.clone(),
+            working_set: Box::new(working_set.clone()),
+            provenance: Box::new(provenance.clone()),
+        })?;
+        let result = MissionMemoryContinuationResult {
+            token,
+            working_set,
+            provenance,
+            visibility_receipt: MissionMemoryVisibilityReceipt {
+                event_sequence: record.sequence,
+                event_id: record.event_id,
+                event_digest: record.event_digest,
+                request_digest,
+                projection_digest: result_digest,
+            },
+        };
+        result.validate()?;
+        if let Some(active) = self.active.as_mut() {
+            active.next_working_set_revision = active
+                .next_working_set_revision
+                .checked_add(1)
+                .ok_or(MissionMemoryError::EventSequence)?;
+        }
+        Ok(result)
+    }
+
     pub fn active_session(&self) -> Option<&MissionMemorySession> {
         self.active.as_ref().map(|active| &active.session)
     }
@@ -883,6 +1388,9 @@ where
             cause,
         });
         let record = event_result?;
+        if cause.invalidates_compactions() {
+            self.invalidate_compactions(&active.scope);
+        }
         provider_result?;
         Ok(MissionMemoryLifecycleReceipt {
             session: active,
@@ -1024,7 +1532,17 @@ where
                     .checked_add(1)
                     .ok_or(MissionMemoryError::EventSequence)?;
             }
-            MissionMemoryEvent::ProviderRecycled { session, .. } => {
+            MissionMemoryEvent::ContinuationCompacted {
+                session, artifact, ..
+            } => self.apply_continuation_compacted(session, artifact, record)?,
+            MissionMemoryEvent::ContinuationResumed {
+                session,
+                token,
+                working_set,
+                provenance,
+                ..
+            } => self.apply_continuation_resumed(session, token, working_set, provenance)?,
+            MissionMemoryEvent::ProviderRecycled { session, cause } => {
                 let Some(active) = &self.active else {
                     return Err(MissionMemoryError::InvalidEventLog);
                 };
@@ -1032,8 +1550,105 @@ where
                     return Err(MissionMemoryError::InvalidEventLog);
                 }
                 self.active = None;
+                if cause.invalidates_compactions() {
+                    self.invalidate_compactions(&session.scope);
+                }
             }
         }
+        Ok(())
+    }
+
+    fn apply_continuation_compacted(
+        &mut self,
+        session: &MissionMemorySession,
+        artifact: &MissionMemoryContinuationArtifact,
+        record: &MissionMemoryEventRecord,
+    ) -> Result<(), MissionMemoryError> {
+        let Some(active) = &self.active else {
+            return Err(MissionMemoryError::InvalidEventLog);
+        };
+        if active.session != *session
+            || artifact.scope != session.scope
+            || artifact.source_generation != session.generation
+            || artifact.continuation_version != self.next_compaction_version(&session.scope)?
+        {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        artifact.validate()?;
+        let facts = self.facts_for_scope(&session.scope);
+        validate_compaction_against_facts(artifact, &facts, &artifact.counterevidence_fact_ids)?;
+        let digest = artifact.digest()?;
+        if self.compactions.contains_key(&digest) {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        self.compaction_versions
+            .insert(session.scope.clone(), artifact.continuation_version);
+        self.compactions.insert(
+            digest,
+            StoredMissionMemoryCompaction {
+                artifact: artifact.clone(),
+                record: record.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_continuation_resumed(
+        &mut self,
+        session: &MissionMemorySession,
+        token: &MissionMemoryContinuationToken,
+        working_set: &MissionMemoryWorkingSet,
+        provenance: &MissionMemoryContinuationProvenance,
+    ) -> Result<(), MissionMemoryError> {
+        let Some(active) = &self.active else {
+            return Err(MissionMemoryError::InvalidEventLog);
+        };
+        if active.session != *session || working_set.revision != active.next_working_set_revision {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        token.validate()?;
+        if token.scope != session.scope || token.source_generation >= session.generation {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        let stored = self
+            .compactions
+            .get(&token.continuation_digest)
+            .cloned()
+            .ok_or(MissionMemoryError::InvalidEventLog)?;
+        if self
+            .invalidated_compactions
+            .contains(&token.continuation_digest)
+        {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        let artifact = stored.artifact;
+        if artifact.digest()? != token.continuation_digest
+            || artifact.source_generation != token.source_generation
+            || artifact.continuation_version != token.continuation_version
+        {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        let facts = self.facts_for_scope(&session.scope);
+        validate_compaction_against_facts(&artifact, &facts, &artifact.counterevidence_fact_ids)?;
+        working_set.validate()?;
+        if working_set.scope != session.scope
+            || working_set.generation != session.generation
+            || working_set.items != artifact.retained_items
+        {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        let expected = continuation_provenance(&artifact, &stored.record, session)?;
+        if provenance != &expected {
+            return Err(MissionMemoryError::InvalidEventLog);
+        }
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(MissionMemoryError::InvalidEventLog)?;
+        active.next_working_set_revision = active
+            .next_working_set_revision
+            .checked_add(1)
+            .ok_or(MissionMemoryError::EventSequence)?;
         Ok(())
     }
 
@@ -1061,6 +1676,27 @@ where
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(MissionMemoryError::RevisionMismatch)
+    }
+
+    fn next_compaction_version(
+        &self,
+        scope: &MissionMemoryScope,
+    ) -> Result<u64, MissionMemoryError> {
+        self.compaction_versions
+            .get(scope)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(MissionMemoryError::InvalidContinuation)
+    }
+
+    fn invalidate_compactions(&mut self, scope: &MissionMemoryScope) {
+        self.invalidated_compactions.extend(
+            self.compactions
+                .iter()
+                .filter(|(_, stored)| stored.artifact.scope == *scope)
+                .map(|(digest, _)| digest.clone()),
+        );
     }
 
     fn recycle_active(
@@ -1192,6 +1828,98 @@ impl MissionMemoryProvider for DeterministicMissionMemoryProvider {
     }
 }
 
+impl MissionMemoryContinuationProvider for DeterministicMissionMemoryProvider {
+    fn compact(
+        &self,
+        handle: &MissionMemoryProviderHandle,
+        facts: &[MissionMemoryFact],
+        continuation_version: u64,
+        request: &MissionMemoryCompactionRequest,
+    ) -> Result<MissionMemoryContinuationArtifact, MissionMemoryError> {
+        self.handle_is_active(handle)?;
+        request.validate()?;
+        if continuation_version == 0 || facts.len() > MAX_COMPACTION_SOURCE_FACTS {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        for fact in facts {
+            fact.validate()?;
+            if fact.scope != *handle.scope() {
+                return Err(MissionMemoryError::ScopeMismatch);
+            }
+        }
+        let max_retained_items = usize::try_from(request.max_retained_items)
+            .map_err(|_| MissionMemoryError::InvalidContinuation)?;
+        if request.counterevidence_fact_ids.len() > max_retained_items {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        let mut ordered_facts = facts.to_vec();
+        ordered_facts.sort_by(|left, right| {
+            left.fact_revision
+                .cmp(&right.fact_revision)
+                .then_with(|| left.fact_id.cmp(&right.fact_id))
+        });
+        let source_fact_digests = ordered_facts
+            .iter()
+            .map(|fact| Ok((fact.fact_id.clone(), fact.digest()?)))
+            .collect::<Result<BTreeMap<_, _>, MissionMemoryError>>()?;
+        if request
+            .counterevidence_fact_ids
+            .iter()
+            .any(|fact_id| !source_fact_digests.contains_key(fact_id))
+        {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        let mut retained_ids = request.counterevidence_fact_ids.clone();
+        for fact in ordered_facts.iter().rev() {
+            if retained_ids.len() >= max_retained_items {
+                break;
+            }
+            retained_ids.insert(fact.fact_id.clone());
+        }
+        let retained_items = ordered_facts
+            .iter()
+            .filter(|fact| retained_ids.contains(&fact.fact_id))
+            .map(MissionMemoryFact::item)
+            .collect::<Vec<_>>();
+        let summary_digest = digest_json_with_domain(
+            "hartevo.mission-memory-summary/v1",
+            &(
+                handle.scope(),
+                continuation_version,
+                &source_fact_digests,
+                &retained_items,
+                &request.counterevidence_fact_ids,
+            ),
+        )?;
+        let artifact = MissionMemoryContinuationArtifact {
+            scope: handle.scope().clone(),
+            source_generation: handle.generation(),
+            continuation_version,
+            source_fact_digests,
+            retained_items,
+            counterevidence_fact_ids: request.counterevidence_fact_ids.clone(),
+            summary_ref: format!("cas://mission-memory/continuation/{summary_digest}"),
+            summary_digest,
+        };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    fn restore_working_set(
+        &self,
+        handle: &MissionMemoryProviderHandle,
+        _facts: &[MissionMemoryFact],
+        continuation: &MissionMemoryContinuationArtifact,
+    ) -> Result<Vec<MissionMemoryItem>, MissionMemoryError> {
+        self.handle_is_active(handle)?;
+        continuation.validate()?;
+        if continuation.scope != *handle.scope() {
+            return Err(MissionMemoryError::ScopeMismatch);
+        }
+        Ok(continuation.retained_items.clone())
+    }
+}
+
 fn fact_receipt(
     fact: MissionMemoryFact,
     disposition: MissionMemoryAppendDisposition,
@@ -1204,6 +1932,144 @@ fn fact_receipt(
         event_id: record.event_id.clone(),
         event_digest: record.event_digest.clone(),
     }
+}
+
+fn validate_item_list(
+    items: &[MissionMemoryItem],
+    maximum: usize,
+) -> Result<(), MissionMemoryError> {
+    if items.len() > maximum {
+        return Err(MissionMemoryError::InvalidProviderOutput);
+    }
+    let mut ids = BTreeSet::new();
+    let mut previous: Option<(u64, FactId)> = None;
+    for item in items {
+        item.validate()?;
+        if !ids.insert(item.fact_id.clone()) {
+            return Err(MissionMemoryError::InvalidProviderOutput);
+        }
+        let key = (item.fact_revision, item.fact_id.clone());
+        if previous.as_ref().is_some_and(|previous| previous >= &key) {
+            return Err(MissionMemoryError::InvalidProviderOutput);
+        }
+        previous = Some(key);
+    }
+    Ok(())
+}
+
+fn validate_compaction_against_facts(
+    artifact: &MissionMemoryContinuationArtifact,
+    facts: &[MissionMemoryFact],
+    expected_counterevidence: &BTreeSet<FactId>,
+) -> Result<(), MissionMemoryError> {
+    artifact.validate()?;
+    if artifact.counterevidence_fact_ids != *expected_counterevidence {
+        return Err(MissionMemoryError::InvalidContinuation);
+    }
+    let facts_by_id = facts
+        .iter()
+        .map(|fact| (fact.fact_id.clone(), fact))
+        .collect::<BTreeMap<_, _>>();
+    if facts_by_id.len() != facts.len() || artifact.source_fact_digests.len() != facts_by_id.len() {
+        return Err(MissionMemoryError::InvalidContinuation);
+    }
+    for fact in facts {
+        fact.validate()?;
+        if fact.scope != artifact.scope {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+        let expected_digest = artifact
+            .source_fact_digests
+            .get(&fact.fact_id)
+            .ok_or(MissionMemoryError::InvalidContinuation)?;
+        if expected_digest != &fact.digest()? {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+    }
+    if artifact
+        .source_fact_digests
+        .keys()
+        .any(|fact_id| !facts_by_id.contains_key(fact_id))
+    {
+        return Err(MissionMemoryError::InvalidContinuation);
+    }
+    for item in &artifact.retained_items {
+        let fact = facts_by_id
+            .get(&item.fact_id)
+            .ok_or(MissionMemoryError::InvalidContinuation)?;
+        if item != &fact.item() {
+            return Err(MissionMemoryError::InvalidContinuation);
+        }
+    }
+    if artifact.counterevidence_fact_ids.iter().any(|fact_id| {
+        !artifact
+            .retained_items
+            .iter()
+            .any(|item| &item.fact_id == fact_id)
+    }) {
+        return Err(MissionMemoryError::InvalidContinuation);
+    }
+    Ok(())
+}
+
+fn continuation_provenance(
+    artifact: &MissionMemoryContinuationArtifact,
+    record: &MissionMemoryEventRecord,
+    session: &MissionMemorySession,
+) -> Result<MissionMemoryContinuationProvenance, MissionMemoryError> {
+    let MissionMemoryEvent::ContinuationCompacted {
+        artifact: recorded_artifact,
+        ..
+    } = &record.event
+    else {
+        return Err(MissionMemoryError::InvalidEventLog);
+    };
+    if recorded_artifact.as_ref() != artifact {
+        return Err(MissionMemoryError::InvalidEventLog);
+    }
+    Ok(MissionMemoryContinuationProvenance {
+        source_compaction_event_sequence: record.sequence,
+        source_compaction_event_digest: record.event_digest.clone(),
+        source_continuation_digest: artifact.digest()?,
+        source_generation: artifact.source_generation,
+        resumed_generation: session.generation,
+        source_fact_digests: artifact.source_fact_digests.clone(),
+    })
+}
+
+fn continuation_result_digest(
+    token: &MissionMemoryContinuationToken,
+    working_set: &MissionMemoryWorkingSet,
+    provenance: &MissionMemoryContinuationProvenance,
+) -> Result<String, MissionMemoryError> {
+    digest_json_with_domain(
+        "hartevo.mission-memory-continuation-result/v1",
+        &(token, working_set, provenance),
+    )
+}
+
+fn compaction_request_digest(
+    session: &MissionMemorySession,
+    consumer_id: &str,
+    continuation_version: u64,
+    request: &MissionMemoryCompactionRequest,
+) -> Result<String, MissionMemoryError> {
+    digest_json_with_domain(
+        "hartevo.mission-memory-compaction-request/v1",
+        &(session, consumer_id, continuation_version, request),
+    )
+}
+
+fn resume_request_digest(
+    session: &MissionMemorySession,
+    consumer_id: &str,
+    token: &MissionMemoryContinuationToken,
+    request: &MissionMemoryResumeRequest,
+) -> Result<String, MissionMemoryError> {
+    digest_json_with_domain(
+        "hartevo.mission-memory-resume-request/v1",
+        &(session, consumer_id, token, request),
+    )
 }
 
 fn validate_provider_items(
@@ -1346,6 +2212,7 @@ mod tests {
     struct RecordingConsumer {
         id: String,
         seen: Vec<MissionMemoryReadResult>,
+        continuations: Vec<MissionMemoryContinuationResult>,
     }
 
     impl RecordingConsumer {
@@ -1353,6 +2220,7 @@ mod tests {
             Self {
                 id: id.into(),
                 seen: Vec::new(),
+                continuations: Vec::new(),
             }
         }
     }
@@ -1377,6 +2245,14 @@ mod tests {
 
         fn observe(&mut self, result: &MissionMemoryReadResult) -> Result<(), MissionMemoryError> {
             self.seen.push(result.clone());
+            Ok(())
+        }
+
+        fn observe_continuation(
+            &mut self,
+            result: &MissionMemoryContinuationResult,
+        ) -> Result<(), MissionMemoryError> {
+            self.continuations.push(result.clone());
             Ok(())
         }
     }
@@ -1424,6 +2300,29 @@ mod tests {
             max_items: 32,
             after_fact_revision: None,
             requested_at: at(20),
+        }
+    }
+
+    fn compaction_request(
+        id: &str,
+        max_retained_items: u32,
+        counterevidence_fact_ids: &[&str],
+    ) -> MissionMemoryCompactionRequest {
+        MissionMemoryCompactionRequest {
+            request_id: id.into(),
+            max_retained_items,
+            counterevidence_fact_ids: counterevidence_fact_ids
+                .iter()
+                .map(|fact_id| FactId::from(*fact_id))
+                .collect(),
+            requested_at: at(40),
+        }
+    }
+
+    fn resume_request(id: &str) -> MissionMemoryResumeRequest {
+        MissionMemoryResumeRequest {
+            request_id: id.into(),
+            requested_at: at(41),
         }
     }
 
@@ -1551,6 +2450,218 @@ mod tests {
             result.visibility_receipt.projection_digest,
             visible.digest().expect("projection digest")
         );
+    }
+
+    #[test]
+    fn compaction_is_equivalent_to_the_exact_working_set_and_not_a_new_fact() {
+        let mut service = new_service(TestLog::default());
+        let scope = scope("mission-compaction-equivalence");
+        let session = service.mount(scope.clone()).expect("mount");
+        for revision in 1..=3 {
+            let id = format!("fact-{revision}");
+            service
+                .append_fact(&session, fact(&scope, revision, &id))
+                .expect("fact");
+        }
+        let direct = service
+            .read(&session, "continuation-consumer", read_request("direct"))
+            .expect("direct working set");
+        let compacted = service
+            .compact(
+                &session,
+                "continuation-consumer",
+                compaction_request("compact", 32, &[]),
+            )
+            .expect("compact");
+        assert_eq!(
+            direct.working_set().items,
+            compacted.continuation.retained_items
+        );
+        assert_eq!(
+            compacted.token.continuation_digest,
+            compacted
+                .continuation
+                .digest()
+                .expect("continuation digest")
+        );
+        assert!(compacted.continuation.summary_ref.starts_with("cas://"));
+        let records = service.durable_log().replay().expect("replay");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, MissionMemoryEvent::FactAppended { .. }))
+                .count(),
+            3
+        );
+        assert!(!records.iter().any(|record| {
+            matches!(
+                &record.event,
+                MissionMemoryEvent::FactAppended { fact }
+                    if fact.payload_ref == compacted.continuation.summary_ref
+            )
+        }));
+        assert!(matches!(
+            service.resume(
+                &session,
+                "continuation-consumer",
+                compacted.token,
+                resume_request("same-generation"),
+            ),
+            Err(MissionMemoryError::StaleGeneration)
+        ));
+    }
+
+    #[test]
+    fn counterevidence_is_retained_when_compaction_window_is_narrow() {
+        let mut service = new_service(TestLog::default());
+        let scope = scope("mission-counterevidence");
+        let session = service.mount(scope.clone()).expect("mount");
+        for revision in 1..=3 {
+            let id = format!("fact-{revision}");
+            service
+                .append_fact(&session, fact(&scope, revision, &id))
+                .expect("fact");
+        }
+        let compacted = service
+            .compact(
+                &session,
+                "counterevidence-consumer",
+                compaction_request("protected", 1, &["fact-2"]),
+            )
+            .expect("compact with protected counterevidence");
+        assert_eq!(
+            compacted.continuation.counterevidence_fact_ids,
+            BTreeSet::from([FactId::from("fact-2")])
+        );
+        assert_eq!(
+            compacted
+                .continuation
+                .retained_items
+                .iter()
+                .map(|item| item.fact_id.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([FactId::from("fact-2")])
+        );
+    }
+
+    #[test]
+    fn restart_replay_restores_exact_items_and_durable_provenance() {
+        let mut service = new_service(TestLog::default());
+        let scope = scope("mission-continuation-restart");
+        let old_session = service.mount(scope.clone()).expect("mount");
+        for revision in 1..=3 {
+            let id = format!("fact-{revision}");
+            service
+                .append_fact(&old_session, fact(&scope, revision, &id))
+                .expect("fact");
+        }
+        let compacted = service
+            .compact(
+                &old_session,
+                "restart-consumer",
+                compaction_request("before-restart", 2, &["fact-1"]),
+            )
+            .expect("compact");
+        let token = compacted.token.clone();
+        let retained_items = compacted.continuation.retained_items.clone();
+        let source_event_sequence = compacted.visibility_receipt.event_sequence;
+        let source_event_digest = compacted.visibility_receipt.event_digest.clone();
+        let source_continuation_digest = token.continuation_digest.clone();
+        let (log, _) = service.into_parts();
+
+        let mut reopened = new_service(log);
+        let fresh_session = reopened.mount(scope).expect("new generation");
+        assert_eq!(fresh_session.generation(), 2);
+        let mut consumer = RecordingConsumer::new("restart-consumer");
+        let resumed = reopened
+            .resume_for_consumer(
+                &fresh_session,
+                &mut consumer,
+                token.clone(),
+                resume_request("after-restart"),
+            )
+            .expect("resume exact continuation");
+        assert_eq!(consumer.continuations, vec![resumed.clone()]);
+        assert_eq!(resumed.token, token);
+        assert_eq!(resumed.working_set.items, retained_items);
+        assert_eq!(
+            resumed.provenance.source_compaction_event_sequence,
+            source_event_sequence
+        );
+        assert_eq!(
+            resumed.provenance.source_compaction_event_digest,
+            source_event_digest
+        );
+        assert_eq!(
+            resumed.provenance.source_continuation_digest,
+            source_continuation_digest
+        );
+        assert_eq!(resumed.provenance.source_generation, 1);
+        assert_eq!(resumed.provenance.resumed_generation, 2);
+        let records = reopened.durable_log().replay().expect("replay");
+        let resumed_event = records
+            .iter()
+            .find_map(|record| match &record.event {
+                MissionMemoryEvent::ContinuationResumed {
+                    token: event_token,
+                    working_set,
+                    provenance,
+                    ..
+                } => Some((event_token, working_set, provenance)),
+                _ => None,
+            })
+            .expect("durable resume event");
+        assert_eq!(resumed_event.0, &resumed.token);
+        assert_eq!(resumed_event.1.as_ref(), &resumed.working_set);
+        assert_eq!(resumed_event.2.as_ref(), &resumed.provenance);
+
+        let (replayed_log, _) = reopened.into_parts();
+        let replayed = new_service(replayed_log);
+        assert_eq!(replayed.active_session(), None);
+        assert_eq!(replayed.last_generation(), 2);
+    }
+
+    #[test]
+    fn revoke_unmount_and_cross_mission_cannot_restore_a_continuation() {
+        let mut service = new_service(TestLog::default());
+        let scope_a = scope("mission-continuation-revoke");
+        let source_session = service.mount(scope_a.clone()).expect("mount");
+        service
+            .append_fact(&source_session, fact(&scope_a, 1, "fact-a"))
+            .expect("fact");
+        let compacted = service
+            .compact(
+                &source_session,
+                "revoke-consumer",
+                compaction_request("before-revoke", 8, &[]),
+            )
+            .expect("compact");
+        service.revoke(&source_session).expect("revoke");
+        let fresh_same_mission = service.mount(scope_a).expect("fresh generation");
+        assert!(matches!(
+            service.resume(
+                &fresh_same_mission,
+                "revoke-consumer",
+                compacted.token.clone(),
+                resume_request("after-revoke"),
+            ),
+            Err(MissionMemoryError::StaleGeneration)
+        ));
+        service
+            .unmount(&fresh_same_mission)
+            .expect("unmount fresh generation");
+        let other_mission = service
+            .mount(scope("mission-continuation-other"))
+            .expect("mount other mission");
+        assert!(matches!(
+            service.resume(
+                &other_mission,
+                "revoke-consumer",
+                compacted.token,
+                resume_request("cross-mission"),
+            ),
+            Err(MissionMemoryError::ScopeMismatch)
+        ));
     }
 
     #[test]
