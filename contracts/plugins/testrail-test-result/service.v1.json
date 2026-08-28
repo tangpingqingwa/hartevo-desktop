@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.testrail-test-result-contract/v1",
+  "contractVersion": "testrail-test-result-01-layer-1/v1",
+  "pluginId": "testrail.test-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.testrail-test-result-contract/v1|layer=1|service=testrail.test-result.read|provider=testrail.test-result.recording|consumer=mission.testrail-test-result.consumer",
+  "contractDigest": "f2635ad3f012f94a28ab2716c2cc8a2caec27de21b6a66825c4233e1a513150a",
+  "officialReferences": [
+    "https://support.testrail.com/hc/en-us/articles/7077083596436-Introduction-to-the-TestRail-API",
+    "https://support.testrail.com/hc/en-us/articles/7077874763156-Runs",
+    "https://support.testrail.com/hc/en-us/articles/7077990441108-Tests",
+    "https://support.testrail.com/hc/en-us/articles/7077819312404-Results",
+    "https://support.testrail.com/hc/en-us/articles/15762198453524-Exporting-test-results"
+  ],
+  "service": {
+    "type": "TestRailTestResultService",
+    "id": "testrail.test-result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "get_run",
+      "get_tests",
+      "get_results_for_run",
+      "compile_adoption_proposal",
+      "record_adoption_proposal"
+    ]
+  },
+  "provider": {
+    "type": "TestRailProvider",
+    "id": "testrail.test-result.recording",
+    "apiRevision": "testrail-api-v2-read-1",
+    "operations": [
+      "get_run",
+      "get_tests",
+      "get_results_for_run"
+    ],
+    "allowlistedPaths": [
+      "/api/v2/get_run/{run_id}",
+      "/api/v2/get_tests/{run_id}",
+      "/api/v2/get_results_for_run/{run_id}"
+    ],
+    "allowedTransportProvenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "blocked_env"
+    ],
+    "mutations": {
+      "addResult": false,
+      "editResult": false,
+      "addRun": false,
+      "updateTest": false,
+      "updateTests": false,
+      "addAttachment": false,
+      "exportRaw": false,
+      "resolveCredential": false
+    },
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    }
+  },
+  "consumer": {
+    "type": "MissionTestRailResultConsumer",
+    "id": "mission.testrail-test-result.consumer",
+    "authority": "non_mutating_proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ]
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kind": "api_key",
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "apiRevision",
+      "hostOrigin",
+      "hostRevision",
+      "testRailProjectId",
+      "testRailProjectRevision",
+      "suiteId",
+      "suiteRevision",
+      "sectionId",
+      "sectionRevision",
+      "runId",
+      "runRevision",
+      "runUpdatedOn",
+      "testIds",
+      "testRevisions",
+      "resultIds",
+      "resultRevision",
+      "statusIds",
+      "statusRevisions",
+      "defectKeys",
+      "defectRevisions",
+      "commitOrRelease",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "digests": [
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "revisionDigest",
+      "hostDigest",
+      "projectDigest",
+      "suiteDigest",
+      "sectionDigest",
+      "runDigest",
+      "testFingerprint",
+      "resultFingerprint",
+      "statusFingerprint",
+      "sourceDigest",
+      "missionDigest",
+      "workProductDigest"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "apiRevision",
+      "providerRevision",
+      "permissionDigest",
+      "scopeDigest",
+      "revisionDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "host.read",
+      "project.read",
+      "suite.read",
+      "section.read",
+      "run.read",
+      "test.read",
+      "result.read",
+      "status.read",
+      "defect.metadata.read",
+      "source.read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "result.add",
+      "result.edit",
+      "run.create",
+      "test.mutate",
+      "case.mutate",
+      "attachment.read",
+      "attachment.write",
+      "raw.comment.read",
+      "dashboard.write",
+      "outcome.adopt",
+      "credential.resolve"
+    ]
+  },
+  "bounds": {
+    "maxPageSize": 250,
+    "maxPages": 32,
+    "maxItems": 8192,
+    "maxResponseBytes": 1048576,
+    "maxCommentBytes": 65536,
+    "maxDefects": 32,
+    "maxVersionBytes": 512,
+    "repeatedOffset": "fail_closed",
+    "duplicateEntity": "fail_closed",
+    "outOfScopeEntity": "fail_closed",
+    "truncation": "non_adoptable"
+  },
+  "statusModel": {
+    "standardTestRailStatusIds": {
+      "1": "passed",
+      "2": "blocked",
+      "3": "untested",
+      "4": "partial",
+      "5": "failed"
+    },
+    "projectionStates": [
+      "passed",
+      "failed",
+      "blocked",
+      "skipped",
+      "untested",
+      "partial",
+      "expired",
+      "access_loss",
+      "provider_unknown"
+    ],
+    "unknownStatus": "provider_unknown",
+    "allowlistRequired": true
+  },
+  "redaction": {
+    "resultMetadataOnly": true,
+    "comments": "digest_and_byte_count_only",
+    "defects": "digest_only",
+    "version": "digest_only",
+    "attachments": false,
+    "screenshots": false,
+    "rawPayload": false,
+    "credentials": false
+  },
+  "evidence": {
+    "runRevisionAndTimestamp": true,
+    "testFingerprint": true,
+    "resultFingerprint": true,
+    "statusCountFingerprint": true,
+    "sourceCommitOrReleaseBinding": true,
+    "permissionDigest": true,
+    "registrationDigest": true,
+    "tamperDigest": true,
+    "duplicateReplayFence": true,
+    "nativeConnectedClaim": false,
+    "verifiedClaim": false,
+    "providerReceipt": false,
+    "rawComments": false,
+    "attachments": false
+  },
+  "provenance": {
+    "fixture": "non_native_non_connected",
+    "recording": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected"
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed TestRail service/provider/consumer",
+      "exact host/project/suite/section/run/test/result/status/defect/source/Mission/Project/Work Product scope",
+      "bounded allowlisted GET projections",
+      "redacted metadata and deterministic fingerprints",
+      "version, contract, provider, permission, scope, and revision digests",
+      "non_mutating Mission proposal",
+      "reversible registration and revocation",
+      "local recording and replay fence"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native credential resolution",
+      "test result creation or update",
+      "test run creation",
+      "test case mutation",
+      "attachment access",
+      "arbitrary export",
+      "dashboard or UI",
+      "generic test registry",
+      "kernel authority"
+    ]
+  },
+  "honestNativeGap": "Layer 2 remains responsible for approved SecretReference resolution, native HTTPS, durable provider receipts, independent read-back, terminal reconciliation, and any external write with explicit consent/effect/receipt/verification. Layer 1 fixture, recording, loopback, and BLOCKED_ENV evidence never claims Connected, native, first-party, verified, or adopted."
+}

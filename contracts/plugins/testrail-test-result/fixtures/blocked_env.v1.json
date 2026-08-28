@@ -1,0 +1,9 @@
+{
+  "fixtureVersion": "testrail-test-result-blocked-env/v1",
+  "provenance": "blocked_env",
+  "native": false,
+  "connected": false,
+  "verified": false,
+  "claim": "Layer 2 native SecretReference resolution and HTTPS are unavailable in this environment",
+  "evidence": "explicit BLOCKED_ENV refusal"
+}
