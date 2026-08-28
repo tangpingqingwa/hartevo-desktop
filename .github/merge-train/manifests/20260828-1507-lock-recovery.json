@@ -1,0 +1,36 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "9036d545937d4ff43885c8e29151823d66cc6759",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "9036d545937d4ff43885c8e29151823d66cc6759",
+      "headBranch": "codex/integration-recovery-lock-20260828",
+      "headCommit": "b8dace239f443668ac4f5fcd9afad838b734c520",
+      "number": 995,
+      "review": {
+        "authorTaskId": "01a045f7-6d21-7fd1-91fe-57a9efe0dd51",
+        "exactPaths": [
+          "Cargo.lock"
+        ],
+        "receiptDigest": "9da0ca48f53c9660c79fc10d126916f34d57b4967c24d8661ad41fff04c97b46",
+        "receiptPath": ".github/governance/reviews/pr-995.json",
+        "reviewedHeadSha": "672c26f6027494ff6361eecf0ae99f39353ae8f5",
+        "reviewerTaskId": "/root/ci_dependency_gate_review"
+      }
+    }
+  ],
+  "createdAt": "2026-08-28T15:06:46Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260828-1507-lock-recovery"
+}
