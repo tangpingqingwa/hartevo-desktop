@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo://contracts/plugins/octopus-release-result/contract.v1",
+  "schemaVersion": "hartevo.octopus-release-result-contract/v1",
+  "contractVersion": "octopus-release-result-01-layer-1/v1",
+  "pluginId": "octopus.release-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "contractDigestInput": "hartevo.octopus-release-result-contract/v1|layer=1|service=octopus.release-result.service|provider=octopus.release-result.provider|consumer=mission.octopus-release-result.consumer",
+  "contractDigest": "585eba1b322e7b95adb6323197dfa3ee2971d3a50adbc767d8289cd33170cd7a",
+  "service": {
+    "type": "OctopusReleaseResultService",
+    "id": "octopus.release-result.service",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "read_spaces",
+      "read_projects",
+      "read_channels",
+      "read_environments",
+      "read_tenants",
+      "read_releases",
+      "read_deployment_process_metadata",
+      "read_deployment_state",
+      "read_task_state",
+      "compile_release_result",
+      "record_release_result"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false
+  },
+  "provider": {
+    "type": "OctopusProvider",
+    "id": "octopus.release-result.provider",
+    "api": "Octopus REST API",
+    "apiRevision": "octopus-rest-api-v1-layer1-r1",
+    "providerRevision": "octopus-rest-release-result-r1",
+    "operations": [
+      "GET /api/spaces",
+      "GET /api/{spaceId}/projects",
+      "GET /api/{spaceId}/projects/{projectId}/channels",
+      "GET /api/{spaceId}/environments",
+      "GET /api/{spaceId}/tenants",
+      "GET /api/{spaceId}/releases/{releaseId}",
+      "GET /api/{spaceId}/deploymentprocesses/{deploymentProcessId}",
+      "GET /api/{spaceId}/deploymentprocesses/{deploymentProcessId}/template?channel={channelId}",
+      "GET /api/{spaceId}/deployments/{deploymentId}",
+      "GET /api/tasks/{taskId}"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "connected": false,
+    "native": false,
+    "liveTransport": false,
+    "redactedReceipts": true,
+    "mutations": {
+      "releaseCreate": false,
+      "deploymentTrigger": false,
+      "deploymentCancel": false,
+      "deploymentApprove": false,
+      "variableMutation": false,
+      "tenantMutation": false,
+      "runbookControl": false,
+      "workerControl": false,
+      "credentialResolution": false
+    },
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    }
+  },
+  "consumer": {
+    "type": "MissionOctopusReleaseConsumer",
+    "id": "mission.octopus-release-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "Mission",
+      "Project",
+      "Consent",
+      "server",
+      "space",
+      "project",
+      "channel",
+      "release",
+      "environment",
+      "tenant",
+      "deployment",
+      "target"
+    ],
+    "mutatesExternalState": false,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "server",
+      "space",
+      "project",
+      "channel",
+      "release",
+      "environment",
+      "tenant",
+      "deployment",
+      "target",
+      "Mission",
+      "Project",
+      "Consent"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "digestAlgorithm": "sha256(canonical-json)",
+    "exactScope": true
+  },
+  "permissions": {
+    "requiredReadScopes": [
+      "server.read",
+      "space.read",
+      "project.read",
+      "channel.read",
+      "release.read",
+      "environment.read",
+      "tenant.read",
+      "deployment.read",
+      "target.read",
+      "task.read",
+      "mission.scope",
+      "project.scope",
+      "consent.scope"
+    ],
+    "writeScopesRequested": [],
+    "secretReference": "opaque_digest_only",
+    "permissionSnapshotDigest": "sha256(canonical-json)"
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 8,
+    "maxItemsPerCollection": 128,
+    "maxReceipts": 16,
+    "maxIdentifierBytes": 256,
+    "maxMetadataBytes": 65536,
+    "repeatedPageToken": "fail_closed",
+    "outOfScopeEntry": "fail_closed",
+    "rawTaskLogs": false,
+    "rawScripts": false,
+    "packageBytes": false
+  },
+  "projection": {
+    "states": [
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+      "canceled",
+      "paused",
+      "partial",
+      "retention-gap",
+      "access-lost",
+      "provider-unknown"
+    ],
+    "completeEvidenceStates": [
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+      "canceled",
+      "paused"
+    ],
+    "redacted": true,
+    "tamperDigest": true,
+    "providerReceipt": false,
+    "connected": false,
+    "native": false,
+    "rawTaskLogs": false,
+    "rawScripts": false,
+    "packageBytes": false
+  },
+  "provenance": {
+    "recording": "non_native_non_connected",
+    "fixture": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "scopeBound": true,
+    "permissionDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"]
+  },
+  "forbiddenLayer1Effects": [
+    "create_release",
+    "trigger_deployment",
+    "cancel_deployment",
+    "approve_deployment",
+    "mutate_variables",
+    "mutate_tenant",
+    "control_runbook",
+    "control_worker",
+    "retain_raw_task_logs",
+    "retain_raw_scripts",
+    "retain_package_bytes",
+    "serialize_secret_material",
+    "generic_deployment_registry",
+    "kernel_authority",
+    "adopt_outcome",
+    "adopt_work_product"
+  ],
+  "authorityBoundary": {
+    "owns": [
+      "typed Octopus service/provider/Mission consumer",
+      "exact server/space/project/channel/release/environment/tenant/deployment/target/Mission/Project/Consent scope",
+      "bounded allowlisted GET metadata seams",
+      "redacted response receipts",
+      "deployment state projections",
+      "reversible digest-bound registration",
+      "below-kernel proposal and recording idempotency"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native credential resolution",
+      "native HTTPS transport",
+      "external Octopus writes",
+      "raw task logs or scripts",
+      "package bytes",
+      "generic deployment registry",
+      "kernel authority"
+    ]
+  },
+  "honestNativeGap": "Native Octopus API-key or OIDC resolution, live HTTPS readback, Connected status, native status, provider receipts, independent verification, terminal reconciliation, and Mission adoption remain Layer-2 work; recording, fixture, loopback, and BLOCKED_ENV never claim Connected or native."
+}
