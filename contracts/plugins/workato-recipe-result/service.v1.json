@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/workato-recipe-result/service.v1.json",
+  "title": "Hartevo Workato governed recipe/job result Layer-1 service",
+  "description": "A bounded Workato Developer API recipe/version/job read and Mission proposal seam. It is not a Workato connector, scheduler, worker runtime, effect authority, durable receipt authority, or Outcome authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "pluginVersion",
+    "layer",
+    "service",
+    "provider",
+    "consumer",
+    "scope",
+    "allowlist",
+    "bounds",
+    "projections",
+    "registration",
+    "consent",
+    "receipts",
+    "honesty",
+    "forbiddenEffects",
+    "layer2Gaps",
+    "officialApiBasis"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo.workato-recipe-result/v1"},
+    "contractVersion": {"const": "EXT-WORKATO-01-L1/v1"},
+    "pluginVersion": {"const": "0.1.0"},
+    "layer": {"const": 1},
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "implementation",
+        "access",
+        "readOnly",
+        "proposalOnly",
+        "recordingOnly",
+        "liveExecution",
+        "schedulerAuthority",
+        "effectAuthority",
+        "receiptAuthority",
+        "verificationAuthority"
+      ],
+      "properties": {
+        "id": {"const": "workato.recipe-result"},
+        "version": {"const": "1.0.0"},
+        "implementation": {"const": "WorkatoRecipeResultService"},
+        "access": {"const": "read_proposal_recording_only"},
+        "readOnly": {"const": true},
+        "proposalOnly": {"const": true},
+        "recordingOnly": {"const": true},
+        "liveExecution": {"const": false},
+        "schedulerAuthority": {"const": false},
+        "effectAuthority": {"const": false},
+        "receiptAuthority": {"const": false},
+        "verificationAuthority": {"const": false},
+        "operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "get_recipe",
+              "list_recipe_versions",
+              "get_recipe_version",
+              "list_jobs",
+              "get_job",
+              "compile_result_proposal",
+              "record_redacted_receipt",
+              "verify_bounded_evidence",
+              "revoke_registration"
+            ]
+          }
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "implementation",
+        "api",
+        "version",
+        "native",
+        "connected",
+        "firstParty",
+        "operations",
+        "acceptedProvenance",
+        "readRatePerMinute",
+        "maxRetryAttempts",
+        "externalWrites"
+      ],
+      "properties": {
+        "id": {"const": "workato.developer-api"},
+        "implementation": {"const": "WorkatoProvider"},
+        "api": {"const": "Workato Developer API"},
+        "version": {"const": "0.1.0"},
+        "native": {"const": false},
+        "connected": {"const": false},
+        "firstParty": {"const": false},
+        "externalWrites": {"const": false},
+        "operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "GET /api/recipes/:recipe_id",
+              "GET /api/recipes/:recipe_id/versions",
+              "GET /api/recipes/:recipe_id/versions/:id",
+              "GET /api/recipes/:recipe_id/jobs",
+              "GET /api/recipes/:recipe_id/jobs/:job_handle"
+            ]
+          }
+        },
+        "acceptedProvenance": {
+          "const": ["fixture", "recording", "loopback", "BLOCKED_ENV"]
+        },
+        "readRatePerMinute": {"const": 60},
+        "maxRetryAttempts": {"const": 3}
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "implementation",
+        "missionBound",
+        "projectBound",
+        "workProductBound",
+        "adoptsOutcome",
+        "adoptsWorkProduct",
+        "truthAuthority",
+        "schedulerAuthority"
+      ],
+      "properties": {
+        "id": {"const": "mission.workato-recipe-result"},
+        "implementation": {"const": "MissionWorkatoRecipeConsumer"},
+        "missionBound": {"const": true},
+        "projectBound": {"const": true},
+        "workProductBound": {"const": true},
+        "adoptsOutcome": {"const": false},
+        "adoptsWorkProduct": {"const": false},
+        "truthAuthority": {"const": false},
+        "schedulerAuthority": {"const": false}
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace",
+        "project",
+        "folder",
+        "recipe",
+        "recipeVersion",
+        "job",
+        "retry",
+        "step",
+        "mission",
+        "hartevoProject",
+        "consent",
+        "permission",
+        "opaqueSecretReference"
+      ],
+      "properties": {
+        "workspace": {"const": "exact_workato_workspace"},
+        "project": {"const": "exact_workato_project"},
+        "folder": {"const": "exact_workato_folder"},
+        "recipe": {"const": "exact_recipe"},
+        "recipeVersion": {"const": "exact_recipe_version"},
+        "job": {"const": "exact_job_handle"},
+        "retry": {"const": "exact_retry_identity"},
+        "step": {"const": "bounded_step_allowlist"},
+        "mission": {"const": "exact_mission_and_revision"},
+        "hartevoProject": {"const": "exact_project_and_revision"},
+        "consent": {"const": "read_proposal_consent_digest"},
+        "permission": {"const": "read_permission_lease_and_digest"},
+        "opaqueSecretReference": {"const": "opaque_non_serializable_reference_only"}
+      }
+    },
+    "allowlist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "reads", "writes", "forbidden"],
+      "properties": {
+        "method": {"const": "GET"},
+        "reads": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["operation", "path", "bounded", "arbitraryQuery"],
+            "properties": {
+              "operation": {"type": "string"},
+              "path": {"type": "string"},
+              "bounded": {"const": true},
+              "arbitraryQuery": {"const": false}
+            }
+          }
+        },
+        "writes": {"const": []},
+        "forbidden": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxIdentifierBytes",
+        "maxCursorBytes",
+        "maxPages",
+        "maxPageSize",
+        "maxSteps",
+        "maxRetries",
+        "maxResponseBytes",
+        "readRatePerMinute",
+        "maxRetryAttempts"
+      ],
+      "properties": {
+        "maxIdentifierBytes": {"const": 256},
+        "maxCursorBytes": {"const": 512},
+        "maxPages": {"const": 16},
+        "maxPageSize": {"const": 100},
+        "maxSteps": {"const": 256},
+        "maxRetries": {"const": 16},
+        "maxResponseBytes": {"const": 2097152},
+        "readRatePerMinute": {"const": 60},
+        "maxRetryAttempts": {"const": 3}
+      }
+    },
+    "projections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jobStates",
+        "resultStates",
+        "stepStates",
+        "retentionStates",
+        "runtimeDataRetained",
+        "datapillsRetained",
+        "inputPayloadRetained",
+        "outputPayloadRetained"
+      ],
+      "properties": {
+        "jobStates": {"const": ["completed", "failed", "processing", "paused", "aborted", "retried", "partial", "provider_unknown"]},
+        "resultStates": {"const": ["completed", "failed", "processing", "paused", "aborted", "retried", "retention_gap", "partial", "access_lost", "provider_unknown"]},
+        "stepStates": {"const": ["completed", "failed", "processing", "paused", "aborted", "skipped", "retried", "provider_unknown"]},
+        "retentionStates": {"const": ["present", "retention_gap", "unknown"]},
+        "runtimeDataRetained": {"const": false},
+        "datapillsRetained": {"const": false},
+        "inputPayloadRetained": {"const": false},
+        "outputPayloadRetained": {"const": false}
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["boundFields", "reversible", "revocable", "failClosedOn"],
+      "properties": {
+        "boundFields": {
+          "const": [
+            "pluginVersionDigest",
+            "contractDigest",
+            "providerDigest",
+            "capabilityDigest",
+            "workspaceDigest",
+            "projectDigest",
+            "folderDigest",
+            "recipeDigest",
+            "recipeVersionDigest",
+            "jobDigest",
+            "retryDigest",
+            "stepScopeDigest",
+            "missionDigest",
+            "permissionDigest",
+            "consentDigest",
+            "credentialDigest",
+            "scopeDigest"
+          ]
+        },
+        "reversible": {"const": true},
+        "revocable": {"const": true},
+        "failClosedOn": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+      }
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readProposal", "externalEffects", "effectAuthority", "digestBound"],
+      "properties": {
+        "readProposal": {"const": true},
+        "externalEffects": {"const": false},
+        "effectAuthority": {"const": false},
+        "digestBound": {"const": true}
+      }
+    },
+    "receipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestRedacted", "resultRedacted", "durableNative", "independentReadBack"],
+      "properties": {
+        "requestRedacted": {"const": true},
+        "resultRedacted": {"const": true},
+        "durableNative": {"const": false},
+        "independentReadBack": {"const": false}
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connected",
+        "native",
+        "firstParty",
+        "fixtureConnected",
+        "recordingConnected",
+        "loopbackConnected",
+        "blockedEnvConnected",
+        "fixtureNative",
+        "recordingNative",
+        "loopbackNative",
+        "blockedEnvNative",
+        "schedulerAuthority",
+        "kernelOutcomeAdopted"
+      ],
+      "properties": {
+        "connected": {"const": false},
+        "native": {"const": false},
+        "firstParty": {"const": false},
+        "fixtureConnected": {"const": false},
+        "recordingConnected": {"const": false},
+        "loopbackConnected": {"const": false},
+        "blockedEnvConnected": {"const": false},
+        "fixtureNative": {"const": false},
+        "recordingNative": {"const": false},
+        "loopbackNative": {"const": false},
+        "blockedEnvNative": {"const": false},
+        "schedulerAuthority": {"const": false},
+        "kernelOutcomeAdopted": {"const": false}
+      }
+    },
+    "forbiddenEffects": {
+      "const": [
+        "force_run",
+        "repeat_job",
+        "resume_job",
+        "start_recipe",
+        "stop_recipe",
+        "poll_now",
+        "reset_trigger",
+        "mutate_connection",
+        "lookup_table_access",
+        "generic_workflow_registry",
+        "resolve_native_secret",
+        "retain_runtime_datapills",
+        "retain_input_payload",
+        "retain_output_payload",
+        "durable_native_receipt",
+        "independent_read_back",
+        "adopt_kernel_outcome",
+        "scheduler_authority"
+      ]
+    },
+    "layer2Gaps": {
+      "const": [
+        "native_secret_resolution",
+        "bounded_native_developer_api_reads",
+        "durable_native_provider_receipt",
+        "independent_job_read_back_and_reconciliation",
+        "consented_external_effects",
+        "verified_work_product_adoption"
+      ]
+    },
+    "officialApiBasis": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "format": "uri"}
+    }
+  }
+}
