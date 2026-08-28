@@ -237,6 +237,55 @@ class RepositoryGovernanceTests(unittest.TestCase):
             with self.assertRaises(governance.GovernanceError):
                 governance.validate_github_review_records([stale], head_sha=head, owner="author")
 
+        actor = {"login": "reviewer-account"}
+        with self.assertRaisesRegex(governance.GovernanceError, "latest exact-head GitHub review requests changes"):
+            governance.validate_github_review_records(
+                [
+                    {
+                        "id": 1,
+                        "submitted_at": "2026-08-29T00:00:00Z",
+                        "user": actor,
+                        "state": "COMMENTED",
+                        "commit_id": head,
+                        "body": marker,
+                    },
+                    {
+                        "id": 2,
+                        "submitted_at": "2026-08-29T00:01:00Z",
+                        "user": actor,
+                        "state": "CHANGES_REQUESTED",
+                        "commit_id": head,
+                        "body": "The exact head needs changes.",
+                    },
+                ],
+                head_sha=head,
+                owner="author",
+            )
+
+        restored = governance.validate_github_review_records(
+            [
+                {
+                    "id": 1,
+                    "submitted_at": "2026-08-29T00:00:00Z",
+                    "user": actor,
+                    "state": "CHANGES_REQUESTED",
+                    "commit_id": head,
+                    "body": "The exact head needs changes.",
+                },
+                {
+                    "id": 2,
+                    "submitted_at": "2026-08-29T00:01:00Z",
+                    "user": actor,
+                    "state": "COMMENTED",
+                    "commit_id": head,
+                    "body": marker,
+                },
+            ],
+            head_sha=head,
+            owner="author",
+        )
+        self.assertEqual(restored["reviewerTaskId"], "reviewer")
+
     def test_exact_path_lease_rejects_outside_change(self) -> None:
         value = self.admission()
         value["ownedPaths"] = ["scripts"]
@@ -465,6 +514,60 @@ class RepositoryGovernanceTests(unittest.TestCase):
         unsigned = dict(event)
         unsigned.pop("digest")
         self.assertNotEqual(governance.digest(unsigned), event["digest"])
+
+    def test_ledger_append_only_rejects_recomputed_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command(root, "git", "init", "--quiet")
+            command(root, "git", "config", "user.name", "Governance Test")
+            command(root, "git", "config", "user.email", "governance@example.invalid")
+            ledger = root / governance.LEDGER_PATH
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(
+                "\n".join(json.dumps(event, sort_keys=True, separators=(",", ":")) for event in self.events) + "\n",
+                encoding="utf-8",
+            )
+            command(root, "git", "add", governance.LEDGER_PATH.as_posix())
+            command(root, "git", "commit", "--quiet", "-m", "base ledger")
+            base = command(root, "git", "rev-parse", "HEAD")
+
+            rewritten: list[dict[str, object]] = []
+            previous = governance.ZERO_DIGEST
+            for index, source in enumerate(self.events):
+                raw = dict(source)
+                raw.pop("digest", None)
+                raw.pop("previousDigest", None)
+                if index == 0:
+                    raw["payload"] = {"reason": "rewritten historical fact"}
+                sealed = governance.seal_event(raw, previous)
+                rewritten.append(sealed)
+                previous = str(sealed["digest"])
+            ledger.write_text(
+                "\n".join(json.dumps(event, sort_keys=True, separators=(",", ":")) for event in rewritten) + "\n",
+                encoding="utf-8",
+            )
+            command(root, "git", "add", governance.LEDGER_PATH.as_posix())
+            command(root, "git", "commit", "--quiet", "-m", "rewrite self-consistent ledger")
+            rewritten_head = command(root, "git", "rev-parse", "HEAD")
+            with self.assertRaisesRegex(governance.GovernanceError, "rewrites the protected-base byte prefix"):
+                governance.verify_ledger_append_only(root, base, rewritten_head)
+
+            command(root, "git", "switch", "--quiet", "--detach", base)
+            appended = governance.seal_event(
+                {
+                    "kind": "GOVERNANCE_MODE_CHANGED",
+                    "actorTaskId": "append-only-test",
+                    "payload": {"mainline": "Cordis"},
+                },
+                str(self.events[-1]["digest"]),
+            )
+            with ledger.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(appended, sort_keys=True, separators=(",", ":")) + "\n")
+            command(root, "git", "add", governance.LEDGER_PATH.as_posix())
+            command(root, "git", "commit", "--quiet", "-m", "append ledger event")
+            appended_head = command(root, "git", "rev-parse", "HEAD")
+            events = governance.verify_ledger_append_only(root, base, appended_head)
+            self.assertEqual(events[-1]["eventId"], appended["eventId"])
 
 
 if __name__ == "__main__":

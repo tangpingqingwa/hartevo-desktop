@@ -450,14 +450,13 @@ def validate_event(event: dict[str, object]) -> None:
         raise GovernanceError("event payload must be an object")
 
 
-def load_ledger(path: Path = LEDGER_PATH) -> list[dict[str, object]]:
-    if not path.is_file():
-        raise GovernanceError(f"governance ledger is missing: {path}")
+def parse_ledger_text(text: str) -> list[dict[str, object]]:
+    """Validate one complete ledger without weakening its historical chain."""
     events: list[dict[str, object]] = []
     previous = ZERO_DIGEST
     previous_time: dt.datetime | None = None
     identifiers: set[str] = set()
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -489,6 +488,46 @@ def load_ledger(path: Path = LEDGER_PATH) -> list[dict[str, object]]:
     if not events:
         raise GovernanceError("governance ledger must not be empty")
     return events
+
+
+def load_ledger(path: Path = LEDGER_PATH) -> list[dict[str, object]]:
+    if not path.is_file():
+        raise GovernanceError(f"governance ledger is missing: {path}")
+    return parse_ledger_text(path.read_text(encoding="utf-8"))
+
+
+def ledger_text_at_commit(root: Path, commit: str) -> str:
+    commit = require_sha(commit, "ledger commit")
+    result = run(
+        ("git", "-C", str(root), "show", f"{commit}:{LEDGER_PATH.as_posix()}"),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise GovernanceError(f"cannot read governance ledger at {commit}: {detail}")
+    return result.stdout
+
+
+def verify_ledger_append_only(root: Path, base: str, head: str) -> list[dict[str, object]]:
+    """Require the candidate ledger to preserve the protected-base bytes.
+
+    A hash chain proves internal consistency, not historical immutability: an
+    attacker could otherwise rewrite line one and recompute every later digest.
+    Binding the exact protected-base text as the candidate prefix closes that
+    gap while still allowing new, fully validated events to be appended.
+    """
+    base_text = ledger_text_at_commit(root, base)
+    head_text = ledger_text_at_commit(root, head)
+    parse_ledger_text(base_text)
+    head_events = parse_ledger_text(head_text)
+    if head_text != base_text:
+        if not base_text.endswith("\n"):
+            raise GovernanceError("protected-base governance ledger has no appendable newline boundary")
+        if not head_text.startswith(base_text):
+            raise GovernanceError("candidate governance ledger rewrites the protected-base byte prefix")
+        if not head_text.endswith("\n"):
+            raise GovernanceError("candidate governance ledger append must end at a newline boundary")
+    return head_events
 
 
 def global_paused(events: list[dict[str, object]]) -> bool:
@@ -648,13 +687,42 @@ def validate_github_review_records(
         records = records.get("reviews")
     if not isinstance(records, list):
         raise GovernanceError("GitHub review API response must contain a reviews array")
+    latest_by_actor: dict[str, tuple[tuple[str, int, int], object]] = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        commit = record.get("commit_id")
+        if commit is None:
+            commit = record.get("commitId")
+        if commit != head_sha:
+            continue
+        user = record.get("user")
+        login = user.get("login") if isinstance(user, dict) else None
+        identifier = record.get("id")
+        actor = str(login) if isinstance(login, str) and login else f"review-{identifier if identifier is not None else index}"
+        submitted = record.get("submitted_at")
+        if submitted is None:
+            submitted = record.get("submittedAt")
+        order = (
+            str(submitted) if isinstance(submitted, str) else "",
+            int(identifier) if isinstance(identifier, int) else index,
+            index,
+        )
+        previous = latest_by_actor.get(actor)
+        if previous is None or order > previous[0]:
+            latest_by_actor[actor] = (order, record)
+
+    latest = [value[1] for value in latest_by_actor.values()]
+    if any(isinstance(record, dict) and record.get("state") == "CHANGES_REQUESTED" for record in latest):
+        raise GovernanceError("a latest exact-head GitHub review requests changes")
+
     failures: list[str] = []
-    for record in records:
+    for record in latest:
         try:
             return validate_github_review_record(record, head_sha=head_sha, owner=owner)
         except GovernanceError as error:
             failures.append(str(error))
-    detail = failures[-1] if failures else "no review records were returned"
+    detail = failures[-1] if failures else "no current latest review records were returned"
     raise GovernanceError(f"no exact-head independent GitHub review is valid: {detail}")
 
 
@@ -801,6 +869,7 @@ def verify_pr_event(
             raise GovernanceError("trusted admission workflow has not fetched the exact event head")
     elif current != head_sha and git("rev-parse", "HEAD^2", root=root, check=False) != head_sha:
         raise GovernanceError("checked-out source does not contain the exact event head")
+    verify_ledger_append_only(root, base_sha, head_sha)
     policy = load_policy(root / POLICY_PATH)
     verify_policy_value(policy)
     events = load_ledger(root / LEDGER_PATH)
