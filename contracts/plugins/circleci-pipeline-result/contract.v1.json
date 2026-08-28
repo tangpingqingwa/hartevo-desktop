@@ -1,0 +1,104 @@
+{
+  "schemaVersion": "hartevo.circleci-pipeline-result/v1",
+  "contractVersion": "EXT-CIRCLECI-01-L1/v1",
+  "layer": 1,
+  "pluginId": "circleci-pipeline-result",
+  "serviceId": "CircleCiPipelineResultService",
+  "providerId": "CircleCiProvider",
+  "missionConsumerId": "MissionCircleCiPipelineConsumer",
+  "scope": {
+    "host": "exact HTTPS origin",
+    "organization": "exact CircleCI organization slug",
+    "project": "exact CircleCI project slug",
+    "pipeline": "exact pipeline identity and revision",
+    "workflow": "exact workflow identity and revision",
+    "job": "exact job number and revision",
+    "attempt": "exact job attempt identity and revision",
+    "commit": "exact VCS commit revision",
+    "mission": "exact Mission identity and revision",
+    "projectRevision": "exact Hartevo Project identity and revision",
+    "workProduct": "exact Work Product identity and revision",
+    "permissionRevision": "exact read permission snapshot"
+  },
+  "registration": {
+    "reversible": true,
+    "versionFenced": true,
+    "contractFenced": true,
+    "providerFenced": true,
+    "permissionFenced": true,
+    "requiredPermissions": [
+      "pipeline_read",
+      "workflow_read",
+      "job_read",
+      "approval_read",
+      "artifact_metadata_read"
+    ]
+  },
+  "evidence": {
+    "pipeline": true,
+    "workflows": true,
+    "jobs": true,
+    "approvals": true,
+    "artifactMetadata": true,
+    "pageTokenPagination": true,
+    "bounded": true,
+    "statusProjection": [
+      "created",
+      "queued",
+      "running",
+      "successful",
+      "failed",
+      "canceled",
+      "on_hold",
+      "not_run",
+      "blocked",
+      "unknown"
+    ]
+  },
+  "redaction": {
+    "secretMaterial": false,
+    "rawLogs": false,
+    "debugPayload": false,
+    "artifactBytes": false,
+    "opaquePageToken": false
+  },
+  "fences": [
+    "version",
+    "replay",
+    "tamper",
+    "accessLoss",
+    "permissionRevision",
+    "registrationRevocation",
+    "missionRevision",
+    "projectRevision",
+    "workProductRevision"
+  ],
+  "authority": {
+    "trigger": false,
+    "rerun": false,
+    "cancel": false,
+    "approve": false,
+    "configMutation": false,
+    "sshOrDebug": false,
+    "genericCiRegistry": false,
+    "deploymentScheduler": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "externalWrite": false
+  },
+  "native": {
+    "fixtureConnected": false,
+    "recordingConnected": false,
+    "loopbackConnected": false,
+    "blockedEnvConnected": false,
+    "liveHttps": false,
+    "durableProviderReceipt": false
+  },
+  "layer2Gaps": [
+    "native token or OIDC resolution",
+    "live HTTPS transport",
+    "terminal reconciliation",
+    "independent read-back",
+    "verified Work Product adoption"
+  ]
+}
