@@ -24,6 +24,10 @@ use zeroize::Zeroizing;
 
 use crate::locator::{canonical_accessible_name, canonical_role};
 use crate::profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
+use crate::read_observation::{
+    BrowserReadObservation, canonical_public_https_url, decode_resource_content,
+    parse_main_document_resource,
+};
 use crate::workspace::{digest, digest_json};
 use crate::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
@@ -751,6 +755,8 @@ struct CdpTabSession {
     current_loader_id: Option<String>,
     current_url_digest: Option<String>,
     navigation_policy: Option<BrowserNavigationPolicy>,
+    read_observation_origin_digest: Option<String>,
+    read_observation_target_url_digest: Option<String>,
     script_execution_disabled: bool,
     runtime_events: CdpRuntimeEvents,
     page_events_enabled: bool,
@@ -834,6 +840,14 @@ impl fmt::Debug for CdpTabSession {
                     .navigation_policy
                     .as_ref()
                     .map(BrowserNavigationPolicy::evidence_digest),
+            )
+            .field(
+                "read_observation_origin_digest",
+                &self.read_observation_origin_digest,
+            )
+            .field(
+                "read_observation_target_url_digest",
+                &self.read_observation_target_url_digest,
             )
             .field("script_execution_disabled", &self.script_execution_disabled)
             .field("runtime_events", &self.runtime_events)
@@ -1066,6 +1080,8 @@ impl ManagedChromiumHost {
                 current_loader_id: None,
                 current_url_digest: None,
                 navigation_policy: None,
+                read_observation_origin_digest: None,
+                read_observation_target_url_digest: None,
                 script_execution_disabled: false,
                 runtime_events: CdpRuntimeEvents::Disabled,
                 page_events_enabled: false,
@@ -1130,6 +1146,167 @@ impl ManagedChromiumHost {
             &loader_id,
             &guard,
         )
+    }
+
+    /// Reads exactly one public HTTPS main document through the managed host.
+    ///
+    /// This path is deliberately separate from `observe_ax`: it enables a
+    /// temporary GET-only, no-auth request fence, retrieves only the exact
+    /// loaded main resource, and emits a digest/metadata envelope without
+    /// exposing the response body. It has no action/effect executor surface.
+    pub fn read_observation(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        policy: &BrowserNavigationPolicy,
+        target: &BrowserNavigationTarget,
+        observation_id: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserReadObservation, BrowserError> {
+        self.workspace.validate_agent_lease(proof, now)?;
+        policy.validate_target(target)?;
+        let requested_url = canonical_public_https_url(target.canonical_url())?;
+        if requested_url != target.canonical_url()
+            || policy.permitted_origin_digest(&requested_url).as_deref()
+                != Some(target.origin_digest())
+        {
+            return Err(BrowserError::ReadObservationPolicyRejected);
+        }
+        self.begin_read_observation_fence(tab_id, target)?;
+        let result =
+            self.read_observation_inner(tab_id, proof, policy, target, observation_id, now);
+        self.end_read_observation_fence(tab_id);
+        result
+    }
+
+    fn begin_read_observation_fence(
+        &mut self,
+        tab_id: &BrowserTabId,
+        target: &BrowserNavigationTarget,
+    ) -> Result<(), BrowserError> {
+        let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
+        if tab.read_observation_origin_digest.is_some()
+            || tab.read_observation_target_url_digest.is_some()
+        {
+            return Err(BrowserError::ReadObservationRequestBlocked);
+        }
+        tab.read_observation_origin_digest = Some(target.origin_digest().to_owned());
+        tab.read_observation_target_url_digest = Some(target.url_digest().to_owned());
+        Ok(())
+    }
+
+    fn end_read_observation_fence(&mut self, tab_id: &BrowserTabId) {
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.read_observation_origin_digest = None;
+            tab.read_observation_target_url_digest = None;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_observation_inner(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        policy: &BrowserNavigationPolicy,
+        target: &BrowserNavigationTarget,
+        observation_id: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserReadObservation, BrowserError> {
+        let navigation = self.navigate_allowlisted(tab_id, proof, policy, target, now)?;
+        if navigation.final_url_digest != target.url_digest()
+            || navigation.final_origin_digest != target.origin_digest()
+        {
+            return Err(BrowserError::ReadObservationTampered);
+        }
+        let guard = OperationLeaseGuard::new(proof, navigation.completed_at);
+        let (target_id, session_id) = {
+            let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+            (tab.target_id.clone(), tab.session_id.clone())
+        };
+        let target_url_before = self.read_target_url(&target_id, &guard)?;
+        let (frame_tree_before, document_generation) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        let frame_before = frame_tree_before.root.clone();
+        let canonical_target_url = canonical_public_https_url(target.canonical_url())?;
+        if target_url_before != frame_before.url
+            || canonical_public_https_url(&target_url_before)? != canonical_target_url
+            || digest(frame_before.frame_id.as_bytes()) != navigation.frame_id_digest
+            || digest(frame_before.loader_id.as_bytes())
+                != navigation.loader_id_digest.clone().unwrap_or_default()
+            || document_generation != navigation.document_generation
+        {
+            return Err(BrowserError::ReadObservationTampered);
+        }
+        let context_before = {
+            let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+            if !tab.runtime_events.is_enabled() {
+                return Err(BrowserError::ReadObservationTampered);
+            }
+            tab.execution_context_registry.bind(
+                &frame_tree_before,
+                CdpExecutionWorld::Main,
+                document_generation,
+            )?
+        };
+        let resource_tree = self.command_guarded(
+            CdpMethod::PageGetResourceTree,
+            json!({}),
+            Some(&session_id),
+            &guard,
+        )?;
+        let resource = parse_main_document_resource(
+            &resource_tree,
+            &frame_before.frame_id,
+            &canonical_target_url,
+        )?;
+        let content_response = self.command_guarded(
+            CdpMethod::PageGetResourceContent,
+            json!({
+                "frameId": &frame_before.frame_id,
+                "url": &canonical_target_url,
+            }),
+            Some(&session_id),
+            &guard,
+        )?;
+        let content = decode_resource_content(&content_response)?;
+        let target_url_after = self.read_target_url(&target_id, &guard)?;
+        let (frame_tree_after, generation_after) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        let frame_after = frame_tree_after.root.clone();
+        if generation_after != document_generation
+            || validate_bound_frame_tree(&frame_tree_before, &frame_tree_after).is_err()
+            || frame_after != frame_before
+            || target_url_after != frame_after.url
+            || canonical_public_https_url(&target_url_after)? != canonical_target_url
+        {
+            return Err(BrowserError::ReadObservationTampered);
+        }
+        {
+            let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+            tab.execution_context_registry.validate_binding(
+                &context_before,
+                &frame_tree_after,
+                &CdpExecutionWorld::Main,
+                generation_after,
+            )?;
+        }
+        let observed_at = guard.observed_at()?;
+        self.workspace.validate_agent_lease(proof, observed_at)?;
+        BrowserReadObservation::from_managed_read(
+            observation_id,
+            &self.workspace,
+            tab_id.clone(),
+            &canonical_target_url,
+            &canonical_public_https_url(&target_url_after)?,
+            &frame_after.frame_id,
+            &frame_after.loader_id,
+            &context_before.identity.unique_id,
+            context_before.context_revision,
+            observed_at,
+            resource.media_type.as_str(),
+            &content,
+        )?
+        .with_document_generation(document_generation)
     }
 
     fn configure_navigation_policy(
@@ -3190,13 +3367,30 @@ impl ManagedChromiumHost {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty() && value.len() <= 4_096)
             .ok_or_else(|| self.poison())?;
-        let raw_url = params
+        let request = params
             .get("request")
             .and_then(Value::as_object)
-            .and_then(|request| request.get("url"))
+            .ok_or_else(|| self.poison())?;
+        let raw_url = request
+            .get("url")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
             .ok_or_else(|| self.poison())?;
+        let request_method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 32)
+            .ok_or_else(|| self.poison())?;
+        let resource_type = params
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 64);
+        let request_url_digest = canonical_public_https_url(raw_url)
+            .ok()
+            .map(|url| digest(url.as_bytes()));
+        let has_credential_headers = request
+            .get("headers")
+            .is_none_or(has_credential_request_headers);
         let tab_id = self
             .tab_for_session(Some(&session_id))
             .ok_or_else(|| self.poison())?;
@@ -3209,11 +3403,21 @@ impl ManagedChromiumHost {
                         .is_ok()
                 })
             });
-            lease_is_live
-                && tab
-                    .navigation_policy
-                    .as_ref()
-                    .is_some_and(|policy| policy.permits_request(raw_url))
+            let origin_permitted = tab
+                .navigation_policy
+                .as_ref()
+                .is_some_and(|policy| policy.permits_request(raw_url));
+            let read_only_permitted = permits_read_observation_request(
+                tab.navigation_policy.as_ref(),
+                tab.read_observation_origin_digest.as_deref(),
+                tab.read_observation_target_url_digest.as_deref(),
+                raw_url,
+                request_method,
+                resource_type,
+                request_url_digest.as_deref(),
+                has_credential_headers,
+            );
+            lease_is_live && origin_permitted && read_only_permitted
         };
         let (method, command_params) = if permitted {
             (
@@ -4058,6 +4262,8 @@ enum CdpMethod {
     InputInsertText,
     PageEnable,
     PageGetFrameTree,
+    PageGetResourceContent,
+    PageGetResourceTree,
     PageGetLayoutMetrics,
     PageSetLifecycleEventsEnabled,
     PageNavigate,
@@ -4088,6 +4294,8 @@ impl CdpMethod {
             Self::InputInsertText => "Input.insertText",
             Self::PageEnable => "Page.enable",
             Self::PageGetFrameTree => "Page.getFrameTree",
+            Self::PageGetResourceContent => "Page.getResourceContent",
+            Self::PageGetResourceTree => "Page.getResourceTree",
             Self::PageGetLayoutMetrics => "Page.getLayoutMetrics",
             Self::PageSetLifecycleEventsEnabled => "Page.setLifecycleEventsEnabled",
             Self::PageNavigate => "Page.navigate",
@@ -5787,6 +5995,45 @@ fn terminate_group_best_effort(child: &mut GroupChild) {
     let _ = child.wait();
 }
 
+fn has_credential_request_headers(headers: &Value) -> bool {
+    let Some(headers) = headers.as_object() else {
+        return true;
+    };
+    headers.keys().any(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "authorization" | "cookie" | "proxy-authorization"
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn permits_read_observation_request(
+    navigation_policy: Option<&BrowserNavigationPolicy>,
+    expected_origin_digest: Option<&str>,
+    expected_target_url_digest: Option<&str>,
+    raw_url: &str,
+    request_method: &str,
+    resource_type: Option<&str>,
+    request_url_digest: Option<&str>,
+    has_credential_headers: bool,
+) -> bool {
+    expected_origin_digest.is_none_or(|expected_origin_digest| {
+        let document_scope = match resource_type {
+            Some("Document") => expected_target_url_digest
+                .is_some_and(|expected_url_digest| request_url_digest == Some(expected_url_digest)),
+            Some(_) => true,
+            None => false,
+        };
+        request_method.eq_ignore_ascii_case("GET")
+            && !has_credential_headers
+            && document_scope
+            && navigation_policy.is_some_and(|policy| {
+                policy.permitted_origin_digest(raw_url).as_deref() == Some(expected_origin_digest)
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -7470,6 +7717,116 @@ mod tests {
         assert!(!debug.contains(root.to_string_lossy().as_ref()));
         #[cfg(target_os = "macos")]
         assert!(debug.contains("MacOsMockForTest"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn read_observation_request_fence_rejects_credentials_and_non_document_redirects() {
+        assert!(has_credential_request_headers(
+            &json!({"Cookie": "session=secret"})
+        ));
+        assert!(has_credential_request_headers(
+            &json!({"authorization": "Bearer secret"})
+        ));
+        assert!(has_credential_request_headers(&json!("malformed")));
+        assert!(!has_credential_request_headers(
+            &json!({"Accept": "text/html"})
+        ));
+
+        let target_url = "https://example.com/market.json";
+        let target_digest = digest(target_url.as_bytes());
+        let target_origin_digest = digest(b"https://example.com");
+        let requested_url = canonical_public_https_url(target_url).expect("public URL");
+        assert_eq!(digest(requested_url.as_bytes()), target_digest);
+        let policy = BrowserNavigationPolicy::https_only(["https://example.com"])
+            .expect("public navigation policy");
+        assert!(permits_read_observation_request(
+            Some(&policy),
+            Some(&target_origin_digest),
+            Some(&target_digest),
+            target_url,
+            "GET",
+            Some("Document"),
+            Some(&target_digest),
+            false,
+        ));
+        let redirected_url = "https://example.com/redirected.json";
+        let redirected_digest = digest(redirected_url.as_bytes());
+        assert_ne!(redirected_digest, target_digest);
+        assert!(!permits_read_observation_request(
+            Some(&policy),
+            Some(&target_origin_digest),
+            Some(&target_digest),
+            redirected_url,
+            "GET",
+            Some("Document"),
+            Some(&redirected_digest),
+            false,
+        ));
+        assert!(!permits_read_observation_request(
+            Some(&policy),
+            Some(&target_origin_digest),
+            Some(&target_digest),
+            target_url,
+            "POST",
+            Some("Document"),
+            Some(&target_digest),
+            false,
+        ));
+        assert!(!permits_read_observation_request(
+            Some(&policy),
+            Some(&target_origin_digest),
+            Some(&target_digest),
+            target_url,
+            "GET",
+            Some("Document"),
+            Some(&target_digest),
+            true,
+        ));
+        let script_url = "https://example.com/app.js";
+        let script_digest = digest(script_url.as_bytes());
+        assert!(permits_read_observation_request(
+            Some(&policy),
+            Some(&target_origin_digest),
+            Some(&target_digest),
+            script_url,
+            "GET",
+            Some("Script"),
+            Some(&script_digest),
+            false,
+        ));
+        assert!(!permits_read_observation_request(
+            Some(&policy),
+            Some(&target_origin_digest),
+            Some(&target_digest),
+            target_url,
+            "GET",
+            None,
+            Some(&target_digest),
+            false,
+        ));
+        let other_origin_url = "https://other.example/app.js";
+        let other_origin_digest = digest(other_origin_url.as_bytes());
+        assert!(!permits_read_observation_request(
+            Some(&policy),
+            Some(&target_origin_digest),
+            Some(&target_digest),
+            other_origin_url,
+            "GET",
+            Some("Script"),
+            Some(&other_origin_digest),
+            false,
+        ));
+        assert!(permits_read_observation_request(
+            None,
+            None,
+            None,
+            "https://example.com/other",
+            "PATCH",
+            None,
+            None,
+            true,
+        ));
     }
 
     #[cfg(target_os = "macos")]
