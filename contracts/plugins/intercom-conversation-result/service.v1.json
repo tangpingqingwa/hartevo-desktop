@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/intercom-conversation-result/service.v1.json",
+  "title": "Hartevo Intercom conversation-result Layer-1 service",
+  "description": "Bounded Intercom conversation evidence for a customer-conversation objective. This contract is read/proposal/recording only and is not Inbox, human-handoff, CRM registry, conversation mutation, webhook, or Outcome authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "serviceId",
+    "providerId",
+    "consumerId",
+    "layer",
+    "operations",
+    "scope",
+    "registration",
+    "projections",
+    "bounds",
+    "honesty",
+    "forbiddenEffects",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo.intercom-conversation-result/v1"},
+    "contractVersion": {"const": "EXT-INTERCOM-01-L1/v1"},
+    "serviceId": {"const": "IntercomConversationResultService"},
+    "providerId": {"const": "IntercomProvider"},
+    "consumerId": {"const": "MissionIntercomConversationConsumer"},
+    "layer": {"const": 1},
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "describe_workspace",
+          "read_conversation",
+          "read_conversation_parts",
+          "compile_conversation_result_proposal",
+          "record_conversation_receipt",
+          "verify_conversation_evidence"
+        ]
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "conversation", "objective", "mission", "permissions"],
+      "properties": {
+        "workspace": {"$ref": "#/$defs/workspace"},
+        "conversation": {"$ref": "#/$defs/conversation"},
+        "objective": {"$ref": "#/$defs/objective"},
+        "mission": {"$ref": "#/$defs/mission"},
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "workspace:read",
+              "conversation:read",
+              "conversation:parts:read",
+              "assignment:read",
+              "mission:scope"
+            ]
+          }
+        }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "versionDigest",
+        "contractDigest",
+        "providerDigest",
+        "workspaceDigest",
+        "conversationDigest",
+        "objectiveDigest",
+        "missionDigest",
+        "permissionDigest",
+        "scopeDigest",
+        "credentialDigest",
+        "registrationDigest",
+        "reversible",
+        "revocable"
+      ],
+      "properties": {
+        "status": {"enum": ["active", "unmounted", "revoked", "reversed"]},
+        "versionDigest": {"$ref": "#/$defs/digest"},
+        "contractDigest": {"$ref": "#/$defs/digest"},
+        "providerDigest": {"$ref": "#/$defs/digest"},
+        "workspaceDigest": {"$ref": "#/$defs/digest"},
+        "conversationDigest": {"$ref": "#/$defs/digest"},
+        "objectiveDigest": {"$ref": "#/$defs/digest"},
+        "missionDigest": {"$ref": "#/$defs/digest"},
+        "permissionDigest": {"$ref": "#/$defs/digest"},
+        "scopeDigest": {"$ref": "#/$defs/digest"},
+        "credentialDigest": {"$ref": "#/$defs/digest"},
+        "registrationDigest": {"$ref": "#/$defs/digest"},
+        "reversible": {"const": true},
+        "revocable": {"const": true}
+      }
+    },
+    "projections": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "open",
+          "closed",
+          "reopened",
+          "assignment_changed",
+          "unknown",
+          "partial",
+          "access_loss",
+          "provider_unknown"
+        ]
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxIdentifierBytes",
+        "maxCursorBytes",
+        "maxCursorAgeSeconds",
+        "maxPageItems",
+        "maxPages",
+        "maxParts",
+        "maxResponseBytes",
+        "maxMetadataBytes"
+      ],
+      "properties": {
+        "maxIdentifierBytes": {"const": 256},
+        "maxCursorBytes": {"const": 512},
+        "maxCursorAgeSeconds": {"const": 900},
+        "maxPageItems": {"const": 100},
+        "maxPages": {"const": 32},
+        "maxParts": {"const": 1024},
+        "maxResponseBytes": {"const": 2097152},
+        "maxMetadataBytes": {"const": 16384}
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connected",
+        "native",
+        "firstParty",
+        "recordingOnly",
+        "rawTokenSerialized",
+        "rawNamesRetained",
+        "rawEmailsRetained",
+        "rawPhoneNumbersRetained",
+        "rawMessageBodiesRetained",
+        "rawAttachmentsRetained",
+        "conversationMutationEnabled",
+        "webhookEnabled",
+        "inboxAuthority",
+        "humanHandoffSending",
+        "kernelOutcomeAdopted"
+      ],
+      "properties": {
+        "connected": {"const": false},
+        "native": {"const": false},
+        "firstParty": {"const": false},
+        "recordingOnly": {"const": true},
+        "rawTokenSerialized": {"const": false},
+        "rawNamesRetained": {"const": false},
+        "rawEmailsRetained": {"const": false},
+        "rawPhoneNumbersRetained": {"const": false},
+        "rawMessageBodiesRetained": {"const": false},
+        "rawAttachmentsRetained": {"const": false},
+        "conversationMutationEnabled": {"const": false},
+        "webhookEnabled": {"const": false},
+        "inboxAuthority": {"const": false},
+        "humanHandoffSending": {"const": false},
+        "kernelOutcomeAdopted": {"const": false}
+      }
+    },
+    "forbiddenEffects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "send_reply",
+          "close_conversation",
+          "reopen_conversation",
+          "assign_conversation",
+          "tag_conversation",
+          "create_webhook",
+          "retain_raw_names",
+          "retain_raw_emails",
+          "retain_raw_phone_numbers",
+          "retain_raw_message_bodies",
+          "retain_raw_attachments",
+          "own_inbox",
+          "send_human_handoff",
+          "resolve_native_secret",
+          "adopt_kernel_outcome"
+        ]
+      }
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "native_oauth_resolution",
+          "native_access_token_resolution",
+          "live_https_workspace_reads",
+          "live_https_conversation_reads",
+          "durable_provider_receipt",
+          "independent_conversation_reconciliation",
+          "verified_work_product_adoption"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "identifier": {"type": "string", "minLength": 1, "maxLength": 256},
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspaceId", "revision"],
+      "properties": {
+        "workspaceId": {"$ref": "#/$defs/identifier"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "conversation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conversationId", "revision"],
+      "properties": {
+        "conversationId": {"$ref": "#/$defs/identifier"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objectiveId", "revision", "objectiveDigest"],
+      "properties": {
+        "objectiveId": {"$ref": "#/$defs/identifier"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "objectiveDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "missionId",
+        "workProductId",
+        "projectRevision",
+        "missionRevision",
+        "workProductRevision",
+        "policyDigest",
+        "consentDigest"
+      ],
+      "properties": {
+        "projectId": {"$ref": "#/$defs/identifier"},
+        "missionId": {"$ref": "#/$defs/identifier"},
+        "workProductId": {"$ref": "#/$defs/identifier"},
+        "projectRevision": {"$ref": "#/$defs/revision"},
+        "missionRevision": {"$ref": "#/$defs/revision"},
+        "workProductRevision": {"$ref": "#/$defs/revision"},
+        "policyDigest": {"$ref": "#/$defs/digest"},
+        "consentDigest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}
