@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.openai-batch-result/v1",
+  "title": "Hartevo Layer-1 OpenAI Batch lifecycle/result-metadata contract",
+  "description": "A project- and Mission-scoped, GET-only OpenAI Batch metadata read proposal seam. It never creates, uploads, cancels, downloads, retains prompts or outputs, executes models/tools, or becomes kernel authority.",
+  "schemaVersion": "hartevo.openai-batch-result/v1",
+  "contractVersion": "EXT-OPENAI-BATCH-01-L1/v1",
+  "layer": 1,
+  "plugin": {
+    "id": "hartevo.openai-batch-result",
+    "version": "0.1.0",
+    "layer": "Layer-1",
+    "oneRoot": true,
+    "childLayer": false,
+    "registration": {
+      "providerDigestBound": true,
+      "apiDigestBound": true,
+      "modelDigestBound": true,
+      "permissionDigestBound": true,
+      "scopeDigestBound": true,
+      "revisionDigestBound": true,
+      "contractDigestBound": true,
+      "opaqueApiKeySecretReferenceOnly": true,
+      "serializedSecretReference": false,
+      "reversible": true,
+      "revocable": true,
+      "failClosedDrift": true
+    }
+  },
+  "service": {
+    "type": "OpenAiBatchResultService",
+    "provider": "OpenAiBatchProvider",
+    "consumer": "MissionOpenAiBatchConsumer",
+    "operations": [
+      "describe_capabilities",
+      "compile_bounded_batch_list_read",
+      "compile_bounded_batch_read",
+      "read_batches",
+      "read_batch",
+      "paginate_batches",
+      "compile_result_proposal",
+      "verify_result_proposal",
+      "revoke_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "durableReceipts": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "consumer": {
+    "type": "MissionOpenAiBatchConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsWorkProduct": false,
+    "kernelAuthority": false
+  },
+  "provider": {
+    "type": "OpenAiBatchProvider",
+    "id": "openai.batch.read",
+    "version": "1.0.0",
+    "officialReferences": [
+      "https://platform.openai.com/docs/api-reference/batch/object",
+      "https://platform.openai.com/docs/guides/batch"
+    ],
+    "readMethods": [
+      "GET /v1/batches",
+      "GET /v1/batches/{batch_id}"
+    ],
+    "pagination": {
+      "providerCursorParameter": "after",
+      "publicCursor": "opaque_digest_fenced",
+      "limit": {
+        "minimum": 1,
+        "maximum": 100
+      }
+    },
+    "responseByteCap": 2097152,
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "externalWrites": false,
+    "rawResponseBodies": false,
+    "rawSecrets": false,
+    "fileDownload": false,
+    "promptRetention": false,
+    "outputRetention": false,
+    "modelExecution": false,
+    "toolExecution": false,
+    "genericModelRegistry": false,
+    "transportSeams": [
+      "fixture",
+      "recording",
+      "loopback",
+      "BLOCKED_ENV"
+    ]
+  },
+  "authentication": {
+    "scheme": "api_key",
+    "boundary": "opaque non-serializable SecretReference",
+    "serialized": false,
+    "debugged": false,
+    "resolvedByLayer": "Layer-2 host secret broker",
+    "rawApiKeyAccepted": false
+  },
+  "scope": {
+    "exactFields": [
+      "organization_id",
+      "project_id",
+      "batch_id",
+      "endpoint",
+      "input_file_id",
+      "model",
+      "api",
+      "permission",
+      "hartevo_project_id",
+      "mission_id",
+      "work_product_id",
+      "project_revision",
+      "mission_revision",
+      "work_product_revision",
+      "scope_revision"
+    ],
+    "evidenceFields": [
+      "batch_id",
+      "endpoint",
+      "input_file",
+      "output_file",
+      "error_file",
+      "request_counts",
+      "expiry",
+      "status",
+      "created_at",
+      "completion_window",
+      "model",
+      "metadata_digest",
+      "errors_digest"
+    ],
+    "missionProjectWorkProductBound": true,
+    "crossOrganization": false,
+    "crossProject": false,
+    "arbitraryBatchDiscovery": false
+  },
+  "batchObject": {
+    "statuses": [
+      "validating",
+      "in_progress",
+      "finalizing",
+      "completed",
+      "failed",
+      "expired",
+      "cancelling",
+      "cancelled"
+    ],
+    "requestCounts": [
+      "total",
+      "completed",
+      "failed"
+    ],
+    "timestamps": [
+      "created_at",
+      "in_progress_at",
+      "finalizing_at",
+      "completed_at",
+      "failed_at",
+      "expired_at",
+      "cancelling_at",
+      "cancelled_at",
+      "expires_at"
+    ],
+    "fileRepresentation": "id plus metadata/content digest only",
+    "rawErrors": "digest and count only",
+    "rawMetadataValues": false,
+    "rawUsageOrTokenPayload": false
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "externalWrites": false,
+    "createBatch": false,
+    "uploadFile": false,
+    "cancelBatch": false,
+    "downloadFile": false,
+    "promptRetention": false,
+    "outputRetention": false,
+    "modelExecution": false,
+    "toolExecution": false,
+    "genericModelRegistry": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "workProductAdoption": false
+  },
+  "fences": [
+    "stale_snapshot",
+    "scope_revision_drift",
+    "provider_digest_drift",
+    "api_digest_drift",
+    "model_digest_drift",
+    "permission_digest_drift",
+    "registration_tamper",
+    "evidence_tamper",
+    "cursor_scope_mismatch",
+    "access_loss",
+    "secret_revocation",
+    "registration_revocation",
+    "response_byte_cap"
+  ],
+  "evidence": {
+    "provenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "bounded": true,
+    "redacted": true,
+    "rawPrompt": false,
+    "rawOutput": false,
+    "rawProviderBody": false,
+    "rawApiKey": false,
+    "connected": false,
+    "native": false,
+    "workProductAdopted": false
+  },
+  "forbiddenAuthorities": [
+    "POST /v1/batches",
+    "POST /v1/files",
+    "POST /v1/batches/{batch_id}/cancel",
+    "GET /v1/files/{file_id}/content",
+    "prompt_retention",
+    "output_retention",
+    "model_execution",
+    "tool_execution",
+    "generic_model_registry",
+    "kernel_truth",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_verification",
+    "work_product_adoption"
+  ],
+  "nonOverlap": {
+    "bedrock": "Bedrock#326 owns Bedrock model inference, not OpenAI Batch lifecycle metadata",
+    "huggingface": "HF#351 owns Hugging Face inference requests, not OpenAI Batch objects",
+    "sagemaker": "SageMaker#393 owns endpoint deployment metadata, not OpenAI Batch objects",
+    "langsmith": "LangSmith#355 owns evaluation/run/trace evidence, not OpenAI Batch lifecycle metadata"
+  },
+  "testSeams": {
+    "fixture": "non-native typed Batch object",
+    "recording": "bounded response recording",
+    "loopback": "local transport response",
+    "blockedEnv": "native secret/HTTPS unavailable",
+    "allNeverClaimConnectedOrNative": true,
+    "adversarial": [
+      "all_batch_statuses",
+      "cursor_and_limit",
+      "response_byte_cap",
+      "request_count_invariant",
+      "expiry_and_timestamp_invariant",
+      "stale_snapshot",
+      "scope_revision_drift",
+      "registration_tamper",
+      "evidence_tamper",
+      "access_loss",
+      "secret_revocation",
+      "registration_revocation",
+      "raw_metadata_prompt_output_redaction"
+    ]
+  },
+  "nativeGaps": [
+    "native_opaque_api_key_resolution",
+    "bounded_live_openai_https_gets",
+    "durable_native_receipt",
+    "independent_file_metadata_and_content_readback",
+    "verified_work_product_adoption",
+    "connected_or_native_evidence"
+  ],
+  "type": "object",
+  "additionalProperties": false
+}
