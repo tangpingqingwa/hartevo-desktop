@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/soda-quality-result/soda-quality-result.v1.json",
+  "title": "Hartevo Soda data-quality result Layer-1 contract",
+  "description": "Bounded Soda dataset, check, scan, and quality-health evidence for Mission review; not a check executor, data-certification, or Outcome authority.",
+  "schemaVersion": "hartevo.soda-quality-result/v1",
+  "contractVersion": "EXT-SODA-01-L1/v1",
+  "pluginVersion": "0.1.0",
+  "pluginId": "soda.quality.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.soda-quality-result/v1|layer=1|service=soda.quality.result.read|provider=soda.reporting.quality.result.recording|consumer=mission.soda.quality.result|api=soda-reporting-dataset-check-scan-quality-health-v1",
+  "contractDigest": "abf9758806b08d49367e9873c2bfc913ccf93ff69c3d3819550687a7d54c6ce1",
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "durableProviderReceipt": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false,
+    "dataCorrectnessCertification": false,
+    "externalWrites": false
+  },
+  "typedSurface": {
+    "service": "SodaQualityResultService",
+    "provider": "SodaProvider",
+    "consumer": "MissionSodaQualityConsumer",
+    "models": [
+      "SodaQualityScope",
+      "SodaOrganizationId",
+      "SodaDataSourceId",
+      "SodaDatasetId",
+      "SodaCheckId",
+      "SodaScanId",
+      "SodaMetricId",
+      "ProjectId",
+      "MissionId",
+      "WorkProductId",
+      "Revision",
+      "SecretReference",
+      "SodaRegistration",
+      "SodaQualityEvidence",
+      "SodaQualityResultProposal"
+    ]
+  },
+  "service": {
+    "id": "soda.quality.result.read",
+    "name": "SodaQualityResultService",
+    "version": "1.0.0",
+    "access": "bounded_read_proposal_recording",
+    "operations": [
+      "read_dataset",
+      "read_check",
+      "read_scan",
+      "read_quality_health",
+      "propose",
+      "verify",
+      "record",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "checkExecution": false,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "id": "soda.reporting.quality.result.recording",
+    "name": "SodaProvider",
+    "version": "1.0.0",
+    "apiRevision": "soda-reporting-dataset-check-scan-quality-health-v1",
+    "allowlistedReads": [
+      "dataset",
+      "check",
+      "scan",
+      "quality_health"
+    ],
+    "forbiddenWrites": [
+      "run_check",
+      "run_scan",
+      "mutate_dataset",
+      "mutate_check",
+      "mutate_scan",
+      "delete_dataset",
+      "export_raw_rows"
+    ],
+    "transportProvenance": [
+      "fixture",
+      "recording",
+      "fake",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "authentication": {
+      "scheme": "soda_api_token",
+      "boundary": "opaque_secret_reference",
+      "rawTokenSerialized": false,
+      "rawTokenDebug": false,
+      "rawTokenRequest": false,
+      "nativeResolution": false,
+      "resolvedByLayer": 2
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false,
+    "maxResponseBytes": 1048576,
+    "maxChecks": 32,
+    "maxMetrics": 32
+  },
+  "consumer": {
+    "id": "mission.soda.quality.result",
+    "name": "MissionSodaQualityConsumer",
+    "authority": "mission_review_only_below_kernel",
+    "scope": [
+      "organization",
+      "data_source",
+      "dataset",
+      "check",
+      "scan",
+      "metric",
+      "project",
+      "mission",
+      "work_product",
+      "scope_digest",
+      "revision_digest",
+      "registration_digest",
+      "evidence_digest"
+    ],
+    "reviewOnly": true,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "data_source",
+      "dataset",
+      "check",
+      "scan",
+      "metric",
+      "project",
+      "mission",
+      "work_product"
+    ],
+    "revisions": [
+      "organization_revision",
+      "data_source_revision",
+      "dataset_revision",
+      "check_revision",
+      "scan_revision",
+      "metric_revision",
+      "project_revision",
+      "mission_revision",
+      "work_product_revision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawRows": false,
+    "rawResponseBody": false,
+    "maxResponseBytes": 1048576,
+    "maxChecks": 32,
+    "maxMetrics": 32
+  },
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "digestBound": [
+      "pluginVersion",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "revisionDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationStatus"
+    ],
+    "permissions": [
+      "soda.dataset.read",
+      "soda.check.read",
+      "soda.scan.read",
+      "soda.quality_health.read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "soda.check.execute",
+      "soda.scan.execute",
+      "soda.dataset.write",
+      "soda.check.write",
+      "soda.scan.write",
+      "outcome.adopt"
+    ],
+    "statuses": ["active", "revoked", "reversed"]
+  },
+  "evidence": {
+    "states": [
+      "pass",
+      "fail",
+      "warn",
+      "unknown",
+      "partial",
+      "denied",
+      "rate_limit",
+      "provider_unknown",
+      "tamper"
+    ],
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "revisionDigest",
+      "datasetDigest",
+      "checkDigest",
+      "scanDigest",
+      "metricDigest",
+      "datasetResponseDigest",
+      "checkResponseDigest",
+      "scanResponseDigest",
+      "healthResponseDigest",
+      "evidenceDigest"
+    ],
+    "boundedProjection": [
+      "statuses",
+      "aggregateRowCounts",
+      "failedRowCounts",
+      "boundedMetricValues",
+      "boundedCheckAndMetricCounts"
+    ],
+    "redactedReceipts": true,
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "staleRevisionRejected": true,
+    "revocationRejected": true,
+    "partialNonAdoptable": true,
+    "unknownNonAdoptable": true
+  },
+  "provenance": {
+    "fixture": "non_native_non_connected_non_first_party",
+    "recording": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "providerReceipt": false
+  },
+  "forbiddenEffects": [
+    "execute_check",
+    "execute_scan",
+    "mutate_dataset",
+    "mutate_check",
+    "mutate_scan",
+    "export_raw_rows",
+    "export_raw_response_body",
+    "resolve_native_api_token",
+    "create_durable_provider_receipt",
+    "certify_data_correctness",
+    "adopt_verified_work_product"
+  ],
+  "authorityBoundary": {
+    "owns": [
+      "bounded allowlisted Soda reads",
+      "dataset/check/scan/metric/scope/evidence digests",
+      "aggregate-only data-quality projection",
+      "redacted request and cost receipts",
+      "digest-bound reversible registration",
+      "Mission-scoped review proposal and idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "raw rows or raw provider response bodies",
+      "check or scan execution",
+      "data correctness certification",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native API-token resolution and live Soda Reporting API",
+    "durable first-party provider receipt",
+    "independent reread/read-back verification",
+    "check or scan execution",
+    "dataset/check/scan/metric mutation",
+    "raw row and raw payload export",
+    "consented effects",
+    "data-correctness certification",
+    "verified Mission Work Product adoption"
+  ],
+  "honestNativeGap": "Layer-1 uses fixture, recording, fake, loopback, and BLOCKED_ENV transports only. None claims Connected, native, first-party, durable provider receipt, execution, data correctness, or verified adoption.",
+  "contractDigestNote": "contractDigest is the SHA-256 of digestInput, not of this self-referential JSON document."
+}
