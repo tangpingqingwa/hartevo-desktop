@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.contentful-entry-result/v1",
+  "title": "Hartevo Layer 1 Contentful governed content-result contract",
+  "schemaVersion": "hartevo.contentful-entry-result-contract/v1",
+  "contractVersion": "EXT-CONTENTFUL-01-L1/v1",
+  "layer": 1,
+  "plugin": {
+    "id": "contentful-entry-result",
+    "version": "1.0.0",
+    "digestBound": true,
+    "scopeBound": true,
+    "revocable": true
+  },
+  "service": {
+    "id": "ContentfulEntryResultService",
+    "providerId": "ContentfulProvider",
+    "consumerId": "MissionContentfulResultConsumer",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_entry",
+      "read_published_entry",
+      "read_entry_references",
+      "consume_observation"
+    ],
+    "effectAuthority": "read_and_recording_only"
+  },
+  "api": {
+    "cmaOrigin": "https://api.contentful.com",
+    "cdaOrigin": "https://cdn.contentful.com",
+    "entryPath": "/spaces/{space_id}/environments/{environment_id}/entries/{entry_id}",
+    "publishedEntryPath": "/spaces/{space_id}/environments/{environment_id}/entries/{entry_id}",
+    "referencesPath": "/spaces/{space_id}/environments/{environment_id}/entries/{entry_id}/references",
+    "entryReferencesIncludeMaximum": 10,
+    "arbitraryGraphql": false,
+    "officialReferences": [
+      "https://www.contentful.com/developers/docs/references/content-management-api/overview/",
+      "https://www.contentful.com/developers/docs/references/content-management-api/entries/",
+      "https://www.contentful.com/developers/docs/references/content-management-api/entries/get-entry-references/"
+    ]
+  },
+  "scope": {
+    "exactFields": [
+      "organization",
+      "space",
+      "environment",
+      "content_type",
+      "entry",
+      "locale",
+      "version",
+      "published_counter",
+      "project_id",
+      "project_revision",
+      "mission_id",
+      "mission_revision",
+      "work_product_id",
+      "work_product_revision"
+    ],
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "revisionDigestBound": true,
+    "staleMissionFailsClosed": true
+  },
+  "readBoundaries": {
+    "entry": true,
+    "publishedEntry": true,
+    "entryReferenceMetadata": true,
+    "maxResponseBytes": 1048576,
+    "maxPageSize": 50,
+    "maxPages": 4,
+    "maxReferenceDepth": 10,
+    "maxReferences": 1000,
+    "maxFields": 128,
+    "maxLocales": 64,
+    "versionTimestamp": true,
+    "publishedCounterTimestamp": true,
+    "rawLocalizedBody": false,
+    "rawReferenceBody": false
+  },
+  "projections": [
+    "draft",
+    "published",
+    "unpublished",
+    "archived",
+    "deleted",
+    "provider-unknown"
+  ],
+  "redaction": {
+    "rawLocalizedBodyInEvidence": false,
+    "rawLocalizedBodyInReceipt": false,
+    "rawReferenceBody": false,
+    "rawAuthorization": false,
+    "rawSecret": false,
+    "rawProviderPayload": false,
+    "retainedDigests": [
+      "field",
+      "reference",
+      "provider",
+      "api",
+      "permission",
+      "scope",
+      "revision",
+      "response"
+    ]
+  },
+  "authority": {
+    "entryCreate": false,
+    "entryUpdate": false,
+    "entryPublish": false,
+    "entryUnpublish": false,
+    "entryArchive": false,
+    "entryDelete": false,
+    "arbitraryGraphql": false,
+    "cmsRegistry": false,
+    "durableNativeReceipt": false,
+    "independentReadback": false,
+    "kernelTruth": false,
+    "kernelEffect": false,
+    "kernelOutcome": false,
+    "workProductAdoption": false
+  },
+  "native": {
+    "status": "BLOCKED_ENV",
+    "fixtureConnected": false,
+    "recordingConnected": false,
+    "loopbackConnected": false,
+    "blockedEnvConnected": false,
+    "fixtureNative": false,
+    "recordingNative": false,
+    "loopbackNative": false,
+    "blockedEnvNative": false
+  },
+  "typedHttpStatuses": [401, 403, 404, 409, 422, 429, 500, 502, 503, 504],
+  "failureClasses": [
+    "version_regression",
+    "published_counter_regression",
+    "space_environment_content_type_locale_drift",
+    "stale_mission_revision",
+    "pagination_cap",
+    "reference_cap",
+    "malformed_response",
+    "partial_response",
+    "replay_or_tamper",
+    "revoked_registration"
+  ],
+  "secretBoundary": {
+    "opaqueCmaCdaSecretReferenceOnly": true,
+    "rawCmaTokenInScope": false,
+    "rawCdaTokenInScope": false,
+    "rawAuthorizationInDebug": false,
+    "rawAuthorizationInReceipt": false
+  },
+  "layer2Gaps": [
+    "native CMA/CDA credential resolution",
+    "live Contentful HTTPS reads",
+    "entry/content-type create or update",
+    "entry publish, unpublish, archive, or delete",
+    "arbitrary GraphQL",
+    "raw localized body retention",
+    "durable native provider receipt",
+    "independent native read-back",
+    "CMS registry authority",
+    "kernel Truth/Effect/Outcome authority",
+    "verified Work Product adoption"
+  ]
+}
