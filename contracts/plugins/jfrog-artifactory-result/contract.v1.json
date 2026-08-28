@@ -1,0 +1,266 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.jfrog-artifactory-result-contract/v1",
+  "contractVersion": "jfrog-artifactory-result-01-layer-1/v1",
+  "pluginId": "jfrog.artifactory-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.jfrog-artifactory-result-contract/v1|layer=1|service=jfrog.artifactory-result.read|provider=jfrog.artifactory.result.recording|consumer=mission.jfrog-artifactory-result.consumer",
+  "contractDigest": "c40e23ec7ad3f4e88285a8619f35a92f77dfa9b03bdcd5dccbb7f727a4d35ae4",
+  "officialReferences": [
+    "https://docs.jfrog.com/artifactory/docs/build-integration",
+    "https://docs.jfrog.com/artifactory/docs/artifactory-query-language",
+    "https://docs.jfrog.com/artifactory/reference/searchaql"
+  ],
+  "service": {
+    "type": "JfrogArtifactoryResultService",
+    "id": "jfrog.artifactory-result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "read_build_info",
+      "read_artifact_metadata",
+      "read_aql_metadata",
+      "compile_release_decision_proposal",
+      "record_release_decision"
+    ]
+  },
+  "provider": {
+    "type": "JfrogArtifactoryProvider",
+    "id": "jfrog.artifactory.result.recording",
+    "apiRevision": "jfrog-artifactory-result-read-1",
+    "operations": [
+      "read_build_info",
+      "read_artifact_metadata",
+      "read_aql_metadata"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "mutations": {
+      "uploadArtifact": false,
+      "downloadArtifactBytes": false,
+      "deleteArtifact": false,
+      "overwriteArtifact": false,
+      "promoteBuild": false,
+      "demoteBuild": false,
+      "configureRepository": false,
+      "mutateXray": false,
+      "resolveCredential": false
+    },
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    }
+  },
+  "consumer": {
+    "type": "MissionJfrogArtifactConsumer",
+    "id": "mission.jfrog-artifactory-result.consumer",
+    "authority": "release_decision_proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ]
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kinds": [
+      "api_token",
+      "oidc"
+    ],
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "hostHttpsOrigin",
+      "hostRevision",
+      "organizationId",
+      "organizationRevision",
+      "repositoryKey",
+      "repositoryRevision",
+      "artifactPath",
+      "artifactPathRevision",
+      "buildName",
+      "buildNumber",
+      "buildRevision",
+      "moduleName",
+      "moduleRevision",
+      "artifactName",
+      "artifactRevision",
+      "commitSha",
+      "commitRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": [
+      "active"
+    ],
+    "terminalStatuses": [
+      "revoked",
+      "reversed"
+    ],
+    "permissions": [
+      "host.read",
+      "organization.read",
+      "repository.read",
+      "artifact.path.read",
+      "artifact.metadata.read",
+      "build.read",
+      "build.module.read",
+      "commit.read",
+      "promotion.read",
+      "aql.metadata.query",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "artifact.upload",
+      "artifact.download.bytes",
+      "artifact.delete",
+      "artifact.overwrite",
+      "build.promote",
+      "build.demote",
+      "repository.configure",
+      "xray.write",
+      "raw.logs.read",
+      "credential.write",
+      "outcome.adopt"
+    ]
+  },
+  "bounds": {
+    "maxPageSize": 50,
+    "maxPages": 8,
+    "maxAqlResults": 128,
+    "maxProperties": 128,
+    "maxModules": 32,
+    "maxArtifacts": 64,
+    "maxPageTokenBytes": 512,
+    "maxResponseBytes": 1048576,
+    "maxMetadataBytes": 65536,
+    "repeatedPageToken": "fail_closed",
+    "duplicateAqlResult": "fail_closed",
+    "outOfScopeEntry": "fail_closed"
+  },
+  "aql": {
+    "endpoint": "/artifactory/api/search/aql",
+    "primaryDomain": "items",
+    "allowlistedFields": [
+      "repo",
+      "path",
+      "name",
+      "type",
+      "size",
+      "sha1",
+      "sha256",
+      "md5",
+      "created",
+      "modified",
+      "property.key",
+      "property.value"
+    ],
+    "arbitraryQuery": false,
+    "archiveDomain": false,
+    "mutation": false
+  },
+  "projections": [
+    "present",
+    "missing",
+    "promoted",
+    "rejected",
+    "partial",
+    "access_lost",
+    "provider_unknown"
+  ],
+  "evidence": {
+    "artifactChecksum": true,
+    "buildInfoRevision": true,
+    "sourceRevision": true,
+    "promotionMetadata": true,
+    "properties": true,
+    "aqlMetadataOnly": true,
+    "artifactBytes": false,
+    "rawLogs": false,
+    "rawProviderPayload": false,
+    "retryIdentity": true,
+    "tamperDigest": true,
+    "registrationDigest": true,
+    "truncationIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected",
+    "fake": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed JFrog Artifactory service/provider/consumer",
+      "exact host/organization/repository/path/build/module/artifact/commit/Mission/Project/Work Product scope",
+      "bounded build-info and artifact metadata projections",
+      "allowlisted, paginated AQL metadata evidence",
+      "checksum, build, provenance, promotion, and registration digests",
+      "release decision proposal and idempotent recording seam",
+      "reversible registration and revocation evidence"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native credential resolution",
+      "artifact upload or download bytes",
+      "artifact delete or overwrite",
+      "build promotion or demotion",
+      "repository configuration",
+      "Xray mutation",
+      "raw logs",
+      "kernel authority",
+      "generic CI provider registry",
+      "user artifact storage"
+    ]
+  },
+  "nonOverlap": {
+    "buildkiteAndCircleCI": "Buildkite #368 and CircleCI #363 own pipeline evidence; this seam only reads Artifactory build/artifact metadata.",
+    "box": "Box #309 owns user artifacts and file content; this seam never stores or downloads bytes.",
+    "security": "Snyk #366 and Semgrep #371 own security findings; this seam records release provenance only.",
+    "jfrogOwns": "JFrog Artifactory build-info, repository/path artifact metadata, checksums, properties, source revision, and promotion-state evidence."
+  },
+  "honestNativeGap": "Native API-token or OIDC resolution, live HTTPS/AQL readback, provider receipts, independent verification, terminal reconciliation, upload/download bytes, repository configuration, promotion/demotion, Xray mutation, Mission adoption, and Outcome authority remain Layer-2 work; recording, fake, loopback, and BLOCKED_ENV never claim Connected or native."
+}
