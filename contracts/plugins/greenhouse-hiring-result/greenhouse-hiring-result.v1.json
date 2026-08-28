@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.greenhouse-hiring-result-contract/v1",
+  "contractVersion": "greenhouse-hiring-result-01-layer-1/v1",
+  "pluginId": "greenhouse.hiring-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.greenhouse-hiring-result-contract/v1|layer=1|service=greenhouse.hiring-result.read|provider=greenhouse.harvest.hiring-result|consumer=mission.greenhouse-hiring-result.consumer",
+  "contractDigest": "b76beeb8f667c03dabaced07c0a2eace8fed438dd92fe62b2a6af556e01587ee",
+  "service": {
+    "type": "GreenhouseHiringResultService",
+    "id": "greenhouse.hiring-result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "read_hiring_evidence",
+      "compile_result_proposal",
+      "record_result",
+      "read_back_recorded_result"
+    ]
+  },
+  "provider": {
+    "type": "GreenhouseHarvestProvider",
+    "id": "greenhouse.harvest.hiring-result",
+    "apiRevision": "harvest-hiring-result-read-1",
+    "operations": [
+      "get_job",
+      "get_application",
+      "get_candidate_activity_feed",
+      "get_application_scorecards",
+      "get_application_offers"
+    ],
+    "allowedMethods": ["GET"],
+    "allowedEndpointPatterns": [
+      "/v1/jobs/{jobId}",
+      "/v1/applications/{applicationId}",
+      "/v1/candidates/{candidateId}/activity_feed",
+      "/v1/applications/{applicationId}/scorecards",
+      "/v1/applications/{applicationId}/offers"
+    ],
+    "pagination": {
+      "linkHeader": "RFC5988_next",
+      "maxPages": 16,
+      "repeatedNextLink": "fail_closed"
+    },
+    "retry": {
+      "rateLimitStatus": 429,
+      "serverErrorRange": "500-599",
+      "boundedBackoff": true,
+      "liveSleep": false
+    },
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599"
+    },
+    "mutations": {
+      "createApplication": false,
+      "updateApplication": false,
+      "advanceStage": false,
+      "rejectApplication": false,
+      "hireApplication": false,
+      "sendCandidateMessage": false,
+      "uploadAttachment": false,
+      "readEeocOrDemographicData": false
+    }
+  },
+  "consumer": {
+    "type": "MissionGreenhouseHiringConsumer",
+    "id": "mission.greenhouse-hiring-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": ["missionId", "projectId", "workProductId", "organizationId", "jobId", "applicationId"],
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "domain": {
+    "organization": "bounded organization identity",
+    "job": "bounded job identity",
+    "application": "bounded application identity",
+    "candidateReference": "redacted digest only",
+    "stage": "stage transition and timestamp only",
+    "scorecard": "bounded aggregate and content digest only",
+    "offer": "bounded status and timestamps/content digest only",
+    "mission": "Mission identity and objective digest",
+    "project": "Project identity",
+    "consent": "scope, purpose, allowed evidence fields, expiry and revision"
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kinds": ["oauth", "harvest_api_key"],
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "organizationId",
+      "jobId",
+      "applicationId",
+      "missionId",
+      "projectId",
+      "workProductId",
+      "candidateReferenceId",
+      "stageId",
+      "scorecardId",
+      "offerId",
+      "capabilityDigest",
+      "consentDigest"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "capabilityDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "credentialRevision",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["reversed", "revoked"],
+    "permissions": [
+      "organization.read",
+      "job.read",
+      "application.read",
+      "stage.read",
+      "scorecard.aggregate.read",
+      "offer.aggregate.read"
+    ],
+    "forbiddenPermissions": [
+      "application.write",
+      "stage.advance",
+      "application.reject",
+      "application.hire",
+      "candidate.message.send",
+      "attachment.upload",
+      "eeoc.read",
+      "demographic.read",
+      "resume.read",
+      "interview_notes.read"
+    ]
+  },
+  "redaction": {
+    "retained": [
+      "redactedCandidateReferenceId",
+      "organizationId",
+      "jobId",
+      "applicationId",
+      "stageTransitions",
+      "timestamps",
+      "boundedScoreAggregates",
+      "offerStatus",
+      "contentDigests",
+      "requestAndResultDigests"
+    ],
+    "neverRetainedOrEmitted": [
+      "candidateName",
+      "candidateEmail",
+      "candidatePhone",
+      "resumeUrl",
+      "attachmentUrl",
+      "demographicData",
+      "eeocData",
+      "interviewNotes",
+      "rawScorecardAnswers",
+      "compensationAmount"
+    ],
+    "missingScorecardIsHiringSuccess": false
+  },
+  "evidence": {
+    "applicationStates": [
+      "active",
+      "converted",
+      "hired",
+      "rejected",
+      "stalled",
+      "incomplete",
+      "access_lost",
+      "provider_unknown"
+    ],
+    "completeness": ["complete", "partial", "redacted", "unavailable"],
+    "bounded": true,
+    "proposalIsRevisionFenced": true,
+    "proposalIsDigestFenced": true,
+    "adoptsOutcome": false
+  },
+  "consentEffectReceiptReadBack": {
+    "consent": "typed scope-bound receipt with expiry and revision",
+    "effect": "non-executable Layer-2-required effect intent",
+    "receipt": "redacted Layer-1 recording receipt with request/result digests",
+    "readBack": "local recording read-back verifies scope, registration and evidence digests",
+    "nativeReceipt": false,
+    "independentProviderReadBack": false
+  },
+  "provenance": {
+    "recording": "non_native_non_connected",
+    "fixture": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Greenhouse service/provider/consumer",
+      "bounded Harvest GET evidence",
+      "redacted application/stage/scorecard/offer projection",
+      "revision- and digest-fenced Mission proposal",
+      "recording and local read-back seams"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect authority",
+      "Hartevo Receipt authority",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "credential resolution",
+      "application mutation",
+      "candidate messaging",
+      "EEOC or demographic data",
+      "raw resumes, attachments, notes or scorecard answers",
+      "kernel authority"
+    ]
+  },
+  "nonOverlap": {
+    "workdayIssue": "Workday owns HR business-process events",
+    "rel01Issue": "REL-01 #76 owns CRM, Inbox and HubSpot relationship/handoff authority",
+    "greenhouseOwns": "ATS hiring application, stage, scorecard aggregate and offer evidence only"
+  },
+  "honestNativeGap": "Native Greenhouse credential resolution, Harvest HTTPS execution, durable provider receipts, independent provider read-back, recruitment effects, candidate messaging, EEOC/demographic access and Mission/Outcome adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected or native."
+}
