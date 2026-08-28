@@ -1,0 +1,16 @@
+{
+  "authorTaskId": "01a045f7-6d21-7fd1-91fe-57a9efe0dd51",
+  "baseSha": "9036d545937d4ff43885c8e29151823d66cc6759",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "Cargo.lock"
+  ],
+  "pr": 995,
+  "receiptDigest": "9da0ca48f53c9660c79fc10d126916f34d57b4967c24d8661ad41fff04c97b46",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-28T14:39:58Z",
+  "reviewedHeadSha": "672c26f6027494ff6361eecf0ae99f39353ae8f5",
+  "reviewerTaskId": "/root/ci_dependency_gate_review",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
