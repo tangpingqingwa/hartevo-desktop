@@ -1,0 +1,115 @@
+{
+  "schemaVersion": "hartevo.looker-analytics-result/v1",
+  "contractVersion": "EXT-LOOKER-01-L1/v1",
+  "layer": 1,
+  "pluginId": "looker.analytics-result",
+  "pluginVersion": "0.1.0",
+  "service": {
+    "id": "looker.analytics-result.read",
+    "version": "0.1.0",
+    "readOnly": true,
+    "liveExecution": false,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "outcomeAuthority": false
+  },
+  "provider": {
+    "id": "looker.analytics.metadata",
+    "version": "1.0.0",
+    "apiRevision": "looker-api-4.0.26.14-read-metadata",
+    "documentation": "https://docs.cloud.google.com/looker/docs/reference/looker-api/latest",
+    "provenance": ["fixture", "recording", "fake", "loopback", "blocked_env"],
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "maxRequestsPerMinute": 60,
+    "maxResponseBytes": 1048576,
+    "maxItems": 100,
+    "readAllowlist": [
+      "GET /dashboards/{dashboard_id}",
+      "GET /dashboards/search",
+      "GET /looks/{look_id}",
+      "GET /looks/search",
+      "GET /folders/{folder_id}",
+      "GET /content/search",
+      "GET /queries/{query_id}",
+      "GET /lookml_models/{lookml_model_name}",
+      "GET /lookml_models/{lookml_model_name}/explores/{explore_name}"
+    ],
+    "forbidden": [
+      "raw_warehouse_rows",
+      "arbitrary_sql",
+      "query_execution",
+      "sql_runner",
+      "dashboard_mutation",
+      "look_mutation",
+      "folder_mutation",
+      "render_tasks",
+      "scheduling",
+      "causal_claims",
+      "business_success_claims"
+    ]
+  },
+  "consumer": {
+    "id": "mission.looker-analytics-result.consumer",
+    "proposalOnly": true,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false
+  },
+  "scope": {
+    "required": [
+      "instance",
+      "model",
+      "explore",
+      "dateWindow",
+      "project",
+      "mission",
+      "workProduct",
+      "permissionRevision",
+      "consentRevision"
+    ],
+    "optionalResources": ["folder", "dashboard", "look", "query"],
+    "revisionBound": true,
+    "registrationDigestBound": true
+  },
+  "evidence": {
+    "aggregateOnly": true,
+    "rawResponseDropped": true,
+    "rawQueryDropped": true,
+    "rawSecretDropped": true,
+    "rawWarehouseRowsDropped": true,
+    "redactionDigestBound": true,
+    "idempotencyDigestBound": true,
+    "opaquePagination": true,
+    "queryBindingDigest": true,
+    "rateLimitedAndPartialStates": true
+  },
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "digestBound": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerDigest",
+      "scopeDigest",
+      "revisionDigest",
+      "permissionDigest",
+      "consentDigest",
+      "secretReferenceDigest"
+    ]
+  },
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableProviderReceipt": false,
+    "kernelAuthority": false,
+    "outcomeAuthority": false,
+    "externalWrites": false
+  }
+}
