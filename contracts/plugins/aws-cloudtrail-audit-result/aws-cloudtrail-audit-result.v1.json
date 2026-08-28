@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-cloudtrail-audit-result/aws-cloudtrail-audit-result.v1.json",
+  "schemaVersion": "hartevo.aws-cloudtrail-audit-result-contract/v1",
+  "contractVersion": "aws-cloudtrail-audit-result/v1",
+  "layer": 1,
+  "apiVersion": "2013-11-01",
+  "service": {
+    "id": "aws.cloudtrail.audit",
+    "name": "AwsCloudTrailAuditService",
+    "version": "1.0.0",
+    "operation": "governed_lookup_events_audit_result",
+    "readOnly": true,
+    "connected": false,
+    "native": false
+  },
+  "provider": {
+    "id": "aws.cloudtrail.lookup-events",
+    "revision": "aws-cloudtrail-lookup-events-2013-11-01-r1",
+    "operations": ["LookupEvents"],
+    "acceptedProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "liveExecution": false,
+    "managementEventsOnly": true,
+    "writesTrails": false,
+    "writesEventStores": false,
+    "writesEvents": false,
+    "runsLakeSql": false
+  },
+  "consumer": {
+    "id": "mission.aws-cloudtrail.audit",
+    "missionBound": true,
+    "projectBound": true,
+    "deploymentBound": true,
+    "workProductBound": true,
+    "observesEvidence": true,
+    "claimsSuccessfulEffect": false,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "accountId",
+      "region",
+      "timeWindow",
+      "eventSource",
+      "eventName",
+      "resourceDigest",
+      "effectDigest",
+      "missionAndRevision",
+      "projectAndRevision",
+      "deploymentAndRevision",
+      "workProductAndRevision",
+      "permissionDigest"
+    ],
+    "secret": "opaque_non_serializing_sigv4_reference",
+    "resourceRetention": "digest_only"
+  },
+  "lookupEvents": {
+    "allowedOperation": "LookupEvents",
+    "lookupAttribute": "EventName",
+    "managementEventsOnly": true,
+    "allowlist": ["EventSource", "EventName", "ResourceName"],
+    "lakeSql": false,
+    "rawEventRetention": false,
+    "rawResponseBodyRetention": false,
+    "cursor": "opaque_digest_bound",
+    "maxPages": 4,
+    "maxPageSize": 50,
+    "maxEvents": 200
+  },
+  "operations": [
+    "describe_capabilities",
+    "register",
+    "revoke_registration",
+    "propose_lookup_events",
+    "read_lookup_events",
+    "record_lookup_events",
+    "verify_lookup_events",
+    "consume_observation"
+  ],
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "versionDigest",
+      "accountId",
+      "region",
+      "timeWindow",
+      "eventSource",
+      "eventName",
+      "resourceDigest",
+      "effectDigest",
+      "mission",
+      "project",
+      "deployment",
+      "workProduct",
+      "permissionDigest",
+      "queryDigest",
+      "providerDigest",
+      "providerRevision",
+      "secretReferenceDigest",
+      "credentialRevision"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "digests": [
+    "version",
+    "provider",
+    "contract",
+    "permission",
+    "query",
+    "evidence"
+  ],
+  "redaction": {
+    "retained": [
+      "eventIdDigest",
+      "eventTime",
+      "eventSource",
+      "eventName",
+      "resourceType",
+      "resourceDigest",
+      "redactedOutcome",
+      "redactedIdentityClass"
+    ],
+    "forbidden": [
+      "CloudTrailEvent",
+      "accessKey",
+      "secretAccessKey",
+      "sessionToken",
+      "sourceIPAddress",
+      "userIdentityArn",
+      "requestParameters",
+      "responseElements",
+      "rawResponseBody",
+      "PII"
+    ]
+  },
+  "states": [
+    "complete",
+    "partial",
+    "retention_unavailable",
+    "access_lost",
+    "provider_unknown"
+  ],
+  "authority": {
+    "externalWrites": false,
+    "trailMutation": false,
+    "eventStoreMutation": false,
+    "eventWrite": false,
+    "lakeSql": false,
+    "rawCloudTrailEvent": false,
+    "rawResponseBody": false,
+    "rawAuditLogExport": false,
+    "successfulExternalEffect": false,
+    "connected": false,
+    "nativeProvider": false,
+    "receipt": false,
+    "verificationAuthority": false,
+    "outcome": false,
+    "workProductAdoption": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_sigv4_and_independent_readback",
+    "failClosedCases": [
+      "missing_host_sigv4_authority",
+      "revoked_secret_reference",
+      "api_version_drift",
+      "scope_or_revision_drift",
+      "cursor_binding_drift",
+      "raw_event_or_raw_body_request",
+      "trail_or_event_store_mutation_request",
+      "successful_external_effect_claim"
+    ]
+  },
+  "honestNativeGap": "Layer 1 is recording/fake/loopback/blocked-environment evidence only. Native SigV4 resolution, live AWS LookupEvents execution, Connected status, trail or event-store mutation, raw audit-log export, native receipt, independent readback, verification authority, successful external-effect state, Outcome authority, and Work Product adoption remain deferred."
+}
