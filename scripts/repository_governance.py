@@ -1375,8 +1375,13 @@ def self_test() -> None:
     policy = load_policy()
     verify_policy_value(policy)
     events = load_ledger()
-    if not global_paused(events):
-        raise AssertionError("checked-in governance ledger must preserve the user's pause")
+    if global_paused(events) or events[-1].get("kind") != "GLOBAL_RESUMED":
+        raise AssertionError("checked-in governance ledger must end in an explicit resume")
+    if policy.get("admissionModeWhenUnpaused") != "normal":
+        raise AssertionError("resumed governance policy must select normal admission")
+    paused_events = events[:-1]
+    if not paused_events or not global_paused(paused_events):
+        raise AssertionError("resume must extend an explicit checked-in pause")
     admission = {
         "schema": ADMISSION_SCHEMA,
         "changeClass": "governance",
@@ -1396,6 +1401,14 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("paused admission accepted feature work")
+    normal_feature = verify_admission_value(
+        bad_feature,
+        changed=[".github/test.json"],
+        paused=False,
+        policy=policy,
+    )
+    if normal_feature["mode"] != "NORMAL":
+        raise AssertionError("resumed policy did not admit feature work in normal mode")
     bad_path = dict(admission)
     bad_path["ownedPaths"] = ["scripts"]
     try:
@@ -1433,9 +1446,17 @@ def self_test() -> None:
             "allowAutoMerge": False,
         },
     }
-    plan = build_plan(snapshot, events, policy, dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc))
-    if plan["mode"] != "PAUSED" or plan["actions"] != [] or not plan["deferredActions"]:
+    paused_plan = build_plan(
+        snapshot,
+        paused_events,
+        policy,
+        dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc),
+    )
+    if paused_plan["mode"] != "PAUSED" or paused_plan["actions"] != [] or not paused_plan["deferredActions"]:
         raise AssertionError("global pause did not suppress execution while preserving deferred work")
+    resumed_plan = build_plan(snapshot, events, policy, dt.datetime(2026, 8, 21, 2, 0, tzinfo=dt.timezone.utc))
+    if resumed_plan["mode"] != "NORMAL" or resumed_plan["truth"]["globalPaused"] is not False:
+        raise AssertionError("global resume did not restore normal governed execution")
     tampered = dict(events[0])
     tampered["payload"] = {"reason": "forged"}
     unsigned = dict(tampered)
