@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "hartevo.dbt-cloud-result/v1",
+  "source": "fixture",
+  "connected": false,
+  "native": false,
+  "durable": false,
+  "status": "success",
+  "scope": {
+    "accountId": "account-01",
+    "projectId": "dbt-project-01",
+    "environmentId": "environment-01",
+    "jobId": "job-01",
+    "repository": "github/tangpingqingwa/data-product",
+    "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "modelSelectorDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "testSelectorDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "selectorDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "projectMissionWorkProduct": {
+      "projectId": "project-01",
+      "missionId": "mission-01",
+      "workProductId": "work-product-01",
+      "projectRevision": 3,
+      "missionRevision": 4,
+      "workProductRevision": 5,
+      "policyDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "consentDigest": "4444444444444444444444444444444444444444444444444444444444444444"
+    }
+  },
+  "run": {
+    "runId": "run-01",
+    "stepIds": [
+      "run",
+      "test"
+    ]
+  },
+  "modelTestEvidence": [
+    {
+      "uniqueId": "model.data_product.orders",
+      "kind": "model",
+      "status": "pass",
+      "executionTimeMillis": 30
+    },
+    {
+      "uniqueId": "test.data_product.orders.not_null_id",
+      "kind": "test",
+      "status": "pass",
+      "executionTimeMillis": 5
+    }
+  ],
+  "testSummary": {
+    "modelCount": 1,
+    "testCount": 1,
+    "passCount": 2,
+    "failCount": 0,
+    "errorCount": 0,
+    "skippedCount": 0,
+    "warnCount": 0,
+    "unknownCount": 0
+  },
+  "artifactMetadata": [
+    {
+      "name": "run_results.json",
+      "path": "run_results.json",
+      "sizeBytes": 512,
+      "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "contentType": "application/json",
+      "generatedAtEpochSeconds": 100,
+      "expiresAtEpochSeconds": 200
+    }
+  ],
+  "layer2Gap": "verified_work_product_adoption"
+}
