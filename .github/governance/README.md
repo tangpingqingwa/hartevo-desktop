@@ -19,6 +19,12 @@ The closed loop is:
 execution but preserves deferred actions, so no later chat receipt can
 silently resume work.
 
+At this revision the ledger ends in `GLOBAL_RESUMED` and the policy selects
+`normal` admission when unpaused. That permits the `feature` change class, but
+does not bypass exact Issue ownership, non-author review receipts, hosted
+checks, or the bounded repository merge train. A later hash-chained
+`GLOBAL_PAUSED` event immediately suppresses admission again.
+
 Positive review evidence lives in `reviews/pr-<number>.json`. It is added by a
 dedicated receipt-only commit whose parent is the exact reviewed code head.
 The merge-train verifier rejects author/reviewer task reuse, base/head drift,

@@ -7,26 +7,32 @@ is not merge throughput. Only an exact advance of `bootstrap/macos-r0` counts.
 
 ## Current safety state
 
-The checked-in hash-chained ledger ends in `GLOBAL_PAUSED`. That state is
-authoritative: existing worktrees are preserved, feature admission is denied,
-and generated repair/inventory actions remain deferred. Only `governance`,
-`integration-recovery`, and `security` changes can enter while paused. Resume
-requires a reviewed governance PR that appends an explicit `GLOBAL_RESUMED`
-event; no task message can resume the repository.
+The checked-in hash-chained ledger ends in `GLOBAL_RESUMED`, and the policy's
+unpaused mode is `normal`. Feature admission is therefore available, but only
+through an Issue-bound path lease, exact non-author review receipt, required
+hosted checks, and the bounded repository merge train. This state was entered
+by a reviewed governance change after an explicit user instruction; no chat
+message, local commit, or green test was treated as the transition itself.
+
+A later `GLOBAL_PAUSED` event remains an immediate fail-closed override: it
+preserves existing worktrees, denies feature admission, and defers generated
+repair/inventory actions. Only `governance`, `integration-recovery`, and
+`security` changes can enter while paused, and resumption again requires a
+reviewed governance PR that appends a new explicit `GLOBAL_RESUMED` event.
 
 GitHub repository settings are merge-commit-only: squash, rebase, and auto
 merge are disabled; merged branches are deleted; update-branch support is
 enabled. Protected refs still require normal pull requests, strict current-base
 checks, resolved conversations, and no force push or deletion.
 
-## One-time activation boundary
+## Trusted admission activation boundary
 
-`governance-admission.yml` must first exist on the protected branch before its
-two trusted checks can be required. Until this control-plane PR is merged, the
-previous protected ruleset remains active and `ci-branch-policy.py probe`
-returns `TRUSTED_ADMISSION_ROLLOUT_PENDING` rather than claiming enforcement.
+`governance-admission.yml` must exist on the protected branch before its two
+trusted checks can be required. During an initial rollout, the previous
+protected ruleset remains active and `ci-branch-policy.py probe` returns
+`TRUSTED_ADMISSION_ROLLOUT_PENDING` rather than claiming enforcement.
 
-The one-time bootstrap ceremony is:
+The bootstrap or recovery ceremony is:
 
 1. open this exact governance PR against the current protected SHA;
 2. obtain a non-author review and append its receipt-only commit;

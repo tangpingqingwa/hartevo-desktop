@@ -2,7 +2,7 @@
   "schemaVersion": "hartevo-repository-governance-policy/v1",
   "repository": "tangpingqingwa/hartevo-desktop",
   "protectedBranch": "bootstrap/macos-r0",
-  "admissionModeWhenUnpaused": "drain",
+  "admissionModeWhenUnpaused": "normal",
   "truthSources": [
     "live-github-api",
     "live-git-refs",
