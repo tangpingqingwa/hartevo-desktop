@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/mixpanel-analytics-result/mixpanel-analytics-result.v1.json",
+  "schemaVersion": "hartevo-mixpanel-analytics-result-contract/v1",
+  "contractVersion": "mixpanel-analytics-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "mixpanel.analytics.result",
+    "version": "1.0.0",
+    "operation": "governed_insights_aggregate_read_proposal",
+    "readOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "mixpanel.query.insights",
+    "version": "1.0.0",
+    "origin": "https://mixpanel.com",
+    "method": "GET",
+    "path": "/api/query/insights",
+    "allowlistedParameters": ["project_id", "workspace_id", "bookmark_id"],
+    "acceptedProvenance": ["fixture", "recording", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "httpsTransport": false,
+    "firstParty": false,
+    "readback": false
+  },
+  "consumer": {
+    "id": "mission.mixpanel.analytics.result.consumer",
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "projectId",
+      "projectRevision",
+      "workspaceId",
+      "reportId",
+      "dateWindow",
+      "eventSelector",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "privacyPolicyDigest"
+    ],
+    "secret": "opaque_project_token_reference_only"
+  },
+  "limits": {
+    "maxEventSelectors": 8,
+    "maxSeries": 8,
+    "maxBucketsPerSeries": 31,
+    "maxResponseBytes": 262144,
+    "maxRequestsPerProjectPerUtcHour": 60,
+    "maxConcurrentQueries": 5,
+    "paginated": false,
+    "aggregateOnly": true
+  },
+  "privacyPolicy": {
+    "version": "mixpanel-analytics-privacy/v1",
+    "requiredRedactions": [
+      "raw_api_body",
+      "raw_events",
+      "user_identifiers",
+      "event_properties",
+      "authorization_material"
+    ],
+    "retained": [
+      "bounded_event_labels",
+      "bounded_date_buckets",
+      "aggregate_counts",
+      "response_and_evidence_digests"
+    ]
+  },
+  "states": [
+    "complete",
+    "partial",
+    "empty",
+    "rate_limited",
+    "expired",
+    "access_lost",
+    "provider_unknown"
+  ],
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "scopeDigestBound": true,
+    "projectBound": true,
+    "workspaceBound": true,
+    "reportBound": true,
+    "dateWindowBound": true,
+    "eventSelectorBound": true,
+    "missionRevisionBound": true,
+    "workProductRevisionBound": true,
+    "evidenceDigestBound": true,
+    "idempotencyBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "forbidden": [
+    "raw_event_download",
+    "raw_event_retention",
+    "user_pii_retention",
+    "event_property_retention",
+    "user_profile_lookup",
+    "ingest_mutation",
+    "identify_mutation",
+    "replay",
+    "causal_claim",
+    "product_success_claim",
+    "outcome_authority",
+    "work_product_adoption"
+  ],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "httpsTransport": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "readback": false,
+    "adoptedWorkProduct": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_opaque_secret_resolution",
+    "native_basic_auth_or_service_account_resolution",
+    "native_https_insights_get",
+    "durable_provider_receipt",
+    "bounded_repeat_read_reconciliation",
+    "verified_work_product_adoption"
+  ]
+}
