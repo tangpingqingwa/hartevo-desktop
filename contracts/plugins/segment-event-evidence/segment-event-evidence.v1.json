@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.segment-event-evidence/v1",
+  "title": "Hartevo Segment event-quality and delivery-evidence Layer-1 contract",
+  "schemaVersion": "hartevo.segment-event-evidence-contract/v1",
+  "contractVersion": "segment-event-evidence-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "authority": "read_only_observational_evidence",
+  "service": {
+    "id": "segment.event-evidence.read",
+    "version": "1.0.0",
+    "operations": [
+      "describe",
+      "read",
+      "compile_evidence_proposal",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "liveExecution": false,
+    "arbitraryQuery": false
+  },
+  "provider": {
+    "id": "segment.protocols.read",
+    "version": "1.0.0",
+    "implementation": "SegmentProvider",
+    "api": "Protocols/public-read-api",
+    "reads": [
+      "tracking_plan",
+      "event_schema",
+      "violations",
+      "sources",
+      "destinations",
+      "delivery"
+    ],
+    "acceptedProvenance": [
+      "official_read_only_api",
+      "fixture",
+      "recording",
+      "loopback",
+      "blocked_env"
+    ],
+    "native": false,
+    "writes": false,
+    "sendEvents": false,
+    "replayEvents": false,
+    "schemaMutation": false,
+    "destinationMutation": false,
+    "reversible": true,
+    "revocable": true
+  },
+  "consumer": {
+    "id": "mission.segment-event-evidence.consumer",
+    "kind": "mission_outcome_evidence_proposal",
+    "binding": [
+      "project_id",
+      "project_revision",
+      "mission_id",
+      "mission_revision",
+      "work_product_id",
+      "work_product_revision",
+      "scope_digest",
+      "registration_digest",
+      "evidence_digest"
+    ],
+    "mutatesExternalState": false,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "workspace_id",
+      "source_id",
+      "tracking_plan_id",
+      "plan_revision",
+      "event_spec_id",
+      "destination_id",
+      "project_id",
+      "project_revision",
+      "mission_id",
+      "mission_revision",
+      "work_product_id",
+      "work_product_revision",
+      "permission_digest"
+    ],
+    "secret": "opaque_non_serializing_secret_reference_only",
+    "digests": [
+      "scope",
+      "provider",
+      "contract",
+      "evidence",
+      "request_receipt",
+      "response",
+      "high_water_cursor"
+    ]
+  },
+  "reads": [
+    {
+      "id": "describe",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "tracking_plan",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "event_schema",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "violations",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "sources",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "destinations",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "delivery",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "compile_evidence_proposal",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "record",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    },
+    {
+      "id": "verify",
+      "readOnly": true,
+      "bounded": true,
+      "writes": false
+    }
+  ],
+  "bounds": {
+    "maxWindowSeconds": 7776000,
+    "maxPages": 32,
+    "maxPageSize": 100,
+    "maxViolationSamples": 32,
+    "maxCursorBytes": 4096,
+    "maxEventSpecs": 512,
+    "maxSources": 128,
+    "maxDestinations": 128
+  },
+  "registration": {
+    "providerVersionBound": true,
+    "providerDigestBound": true,
+    "contractDigestBound": true,
+    "scopeDigestBound": true,
+    "permissionDigestBound": true,
+    "evidenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "scope_drift",
+      "permission_drift",
+      "plan_drift",
+      "cursor_loop",
+      "retention_gap",
+      "access_loss",
+      "tampered_response",
+      "provider_unknown",
+      "partial",
+      "empty"
+    ]
+  },
+  "projections": {
+    "states": [
+      "conforming",
+      "violation",
+      "delivery_degraded",
+      "stale",
+      "partial",
+      "empty",
+      "unavailable",
+      "provider_unknown",
+      "tampered"
+    ],
+    "rawEvents": false,
+    "pii": false,
+    "identity": false,
+    "personas": false,
+    "unconstrainedValidationMessages": false
+  },
+  "redaction": {
+    "rawEventPayload": false,
+    "customerIdentifiers": false,
+    "traits": false,
+    "ipDeviceData": false,
+    "destinationCredentials": false,
+    "validationMessages": "category_count_and_sample_digests_only",
+    "cursors": "opaque_digest_only",
+    "receipts": "request_response_digests_only"
+  },
+  "transport": {
+    "officialApiReadOnly": true,
+    "fixture": true,
+    "recording": true,
+    "loopback": true,
+    "blockedEnv": true,
+    "nativeCredentialResolution": false,
+    "nativeHttpsExecution": false,
+    "writes": false,
+    "eventSend": false,
+    "eventReplay": false,
+    "schemaMutation": false,
+    "destinationMutation": false
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "independentDeliveryReadback": false,
+    "verifiedWorkProductAdoption": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false
+  },
+  "nonGoals": [
+    "send_events",
+    "replay_or_forward_events",
+    "tracking_plan_mutation",
+    "event_schema_mutation",
+    "source_block_or_unblock",
+    "destination_mutation",
+    "alerts_or_webhooks_as_truth",
+    "dashboard_or_cockpit",
+    "identity_or_personas",
+    "kernel_truth_consent_effect_receipt_verification_or_outcome_authority"
+  ],
+  "layer2Gaps": [
+    "native_credential_resolution",
+    "live_segment_credentials",
+    "host_store_or_keyring_wiring",
+    "native_https_protocols_api_transport",
+    "durable_provider_receipts",
+    "independent_delivery_readback",
+    "verified_work_product_or_outcome_adoption"
+  ],
+  "officialSources": [
+    "https://segment.com/blog/introducing-protocols/",
+    "https://segment.com/data-hub/data-observability/",
+    "https://segment.com/data-hub/data-validation/",
+    "https://segment.com/product/connections-v3/"
+  ]
+}
