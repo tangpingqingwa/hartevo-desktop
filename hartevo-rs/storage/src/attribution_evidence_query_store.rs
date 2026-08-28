@@ -287,14 +287,14 @@ impl ProjectStore {
         AttributionEvidenceQuerySnapshot::new(project_id.clone(), records).map_err(query_decode)
     }
 
-    fn replay_attribution_evidence_query_consumers(
+    pub(crate) fn replay_attribution_evidence_query_consumers(
         &self,
         project_id: &ProjectId,
     ) -> Result<BTreeMap<String, AttributionEvidenceQueryConsumerRecord>, StorageError> {
         self.replay_attribution_evidence_query_consumers_through(project_id, i64::MAX)
     }
 
-    fn replay_attribution_evidence_query_consumers_through(
+    pub(crate) fn replay_attribution_evidence_query_consumers_through(
         &self,
         project_id: &ProjectId,
         through_sequence: i64,
@@ -536,7 +536,7 @@ impl AttributionEvidenceQueryService for ProjectStore {
     }
 }
 
-fn active_consumer(
+pub(crate) fn active_consumer(
     consumers: &BTreeMap<String, AttributionEvidenceQueryConsumerRecord>,
     consumer_id: &str,
 ) -> Result<AttributionEvidenceQueryConsumerRecord, StorageError> {
