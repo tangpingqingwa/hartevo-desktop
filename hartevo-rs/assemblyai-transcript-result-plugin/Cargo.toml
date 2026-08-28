@@ -1,0 +1,37 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "hartevo-assemblyai-transcript-result-plugin"
+description = "Standalone Layer-1 AssemblyAI transcript-result evidence and Work Product proposal seam"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Proprietary"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+cast_precision_loss = "allow"
+too_many_lines = "allow"
+needless_pass_by_value = "allow"
