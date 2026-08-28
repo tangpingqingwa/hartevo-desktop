@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/mlflow-evaluation-result/mlflow-evaluation-result.v1.json",
+  "schemaVersion": "hartevo-mlflow-evaluation-result-contract/v1",
+  "contractVersion": "mlflow-evaluation-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "mlflow.evaluation.result",
+    "version": "1.0.0",
+    "operation": "governed_experiment_run_read_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "exactCardinality": {
+      "getExperiment": "exactly_one_expected_identity",
+      "getRun": "exactly_one_expected_identity",
+      "emptyOrDuplicateCompletePage": "reject"
+    },
+    "operations": [
+      "search_experiments",
+      "get_experiment",
+      "search_runs",
+      "get_run",
+      "get_metric_history"
+    ]
+  },
+  "provider": {
+    "id": "mlflow.tracking.read",
+    "version": "1.0.0",
+    "operations": [
+      "experiments/search",
+      "experiments/get",
+      "runs/search",
+      "runs/get",
+      "metrics/get-history"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false
+  },
+  "consumer": {
+    "id": "mission.mlflow.evaluation.result.consumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "kernelAuthority": false
+  },
+  "scope": {
+    "required": [
+      "trackingServerDigest",
+      "allowlistedExperiments",
+      "allowlistedRuns",
+      "allowlistedMetrics",
+      "allowlistedParams",
+      "allowlistedTags",
+      "allowlistedDatasetDigests",
+      "mission",
+      "project",
+      "workProduct",
+      "experimentRevision",
+      "runRevision",
+      "datasetRevision",
+      "missionRevision",
+      "projectRevision",
+      "workProductRevision",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "secret": "opaque_non_serializing_secret_reference_only"
+  },
+  "queryPolicy": {
+    "allow": [
+      "allowlisted_filter_ast",
+      "bounded_experiment_search",
+      "bounded_run_search",
+      "bounded_run_get",
+      "bounded_metric_history",
+      "dataset_digest_observation"
+    ],
+    "deny": [
+      "raw_filter_sql",
+      "filter_injection",
+      "run_creation",
+      "run_update",
+      "run_delete",
+      "metric_logging",
+      "param_logging",
+      "tag_logging",
+      "artifact_download",
+      "model_registry_mutation",
+      "dashboard_authority",
+      "kernel_truth_authority",
+      "outcome_adoption"
+    ],
+    "operators": ["=", "!=", ">", ">=", "<", "<=", "LIKE", "ILIKE", "IN", "IS NULL", "IS NOT NULL"],
+    "combiner": "AND_only"
+  },
+  "evidence": {
+    "digests": [
+      "scope",
+      "version",
+      "provider",
+      "contract",
+      "proposal",
+      "registration",
+      "permission",
+      "consent",
+      "query",
+      "configuration",
+      "experiment_set",
+      "run_set",
+      "metric_history",
+      "dataset_set",
+      "evidence"
+    ],
+    "redacted": ["user_ids", "raw_params", "raw_tags", "artifact_bytes", "artifact_urls", "diagnostics"],
+    "bounded": ["pages", "experiments", "runs", "metrics", "metric_history", "response_bytes", "nested_record_collections"],
+    "overflow": "fail_closed_or_explicit_truncated_partial_before_retention",
+    "pageToken": "opaque_non_serializing_digest_only",
+    "retries": "bounded",
+    "tamperDetection": "response_and_evidence_digest"
+  },
+  "states": ["complete", "stale", "partial", "access_loss", "provider_unknown", "final_error"],
+  "registration": {
+    "versionBound": true,
+    "digestBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true,
+    "revocationFence": "live_monotonic_generation_in_memory_only",
+    "restartDurable": false
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "independentReadback": false,
+    "adoptedOutcome": false,
+    "truthAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_authentication_and_https_transport",
+    "durable_native_receipt",
+    "independent_provider_readback",
+    "verified_work_product_adoption"
+  ]
+}
