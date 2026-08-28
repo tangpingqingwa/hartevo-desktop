@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.pulumi-deployment-result/v1",
+  "title": "Hartevo Layer 1 Pulumi Cloud deployment-result contract",
+  "description": "Read, proposal, and recording evidence only. This contract never creates or mutates a Pulumi deployment and never adopts a kernel Outcome.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "layer",
+    "plugin",
+    "service",
+    "provider",
+    "scopeFence",
+    "evidence",
+    "registration",
+    "provenanceFence",
+    "forbiddenOperations",
+    "nativeGap"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.pulumi-deployment-result/v1" },
+    "contractVersion": { "const": "EXT-PULUMI-01-L1/v1" },
+    "layer": { "const": 1 },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "reversible", "revocable", "contractDigestBound"],
+      "properties": {
+        "id": { "const": "hartevo.pulumi-deployment-result" },
+        "version": { "const": "1.0.0" },
+        "reversible": { "const": true },
+        "revocable": { "const": true },
+        "contractDigestBound": { "const": true }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "provider", "consumer", "operations", "readOnly", "proposalOnly", "recordingOnly", "externalWrites", "kernelAuthority", "outcomeAdoption"],
+      "properties": {
+        "id": { "const": "pulumi.deployment.result.read" },
+        "provider": { "const": "pulumi.cloud.deployment" },
+        "consumer": { "const": "mission.pulumi.deployment.result" },
+        "operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "describe_stack",
+              "read_deployment_evidence",
+              "record_deployment_receipt",
+              "verify_deployment_result",
+              "mission_result_proposal",
+              "registration",
+              "revocation"
+            ]
+          }
+        },
+        "readOnly": { "const": true },
+        "proposalOnly": { "const": true },
+        "recordingOnly": { "const": true },
+        "externalWrites": { "const": false },
+        "kernelAuthority": { "const": false },
+        "outcomeAdoption": { "const": false }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "officialApi", "readMethods", "secretReferenceOnly", "authorizationObscured404", "connectedEvidence", "nativeStatus", "nativeProofStatus"],
+      "properties": {
+        "id": { "const": "pulumi.cloud.deployment" },
+        "version": { "const": "1.0.0" },
+        "officialApi": { "const": "Pulumi Cloud REST API" },
+        "readMethods": { "const": ["GET"] },
+        "secretReferenceOnly": { "const": true },
+        "authorizationObscured404": { "const": "not_found_or_unauthorized" },
+        "connectedEvidence": { "const": false },
+        "nativeStatus": { "const": "BLOCKED_ENV" },
+        "nativeProofStatus": { "const": "NOT_PROVEN" }
+      }
+    },
+    "scopeFence": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "https_api_base",
+          "organization",
+          "organization_revision",
+          "pulumi_project",
+          "pulumi_project_revision",
+          "stack",
+          "stack_revision",
+          "deployment_id",
+          "source_repository",
+          "source_branch",
+          "source_directory",
+          "commit_sha",
+          "update_id",
+          "update_version",
+          "policy_digest",
+          "policy_revision",
+          "hartevo_project_id",
+          "mission_id",
+          "work_product_id",
+          "mission_revision",
+          "work_product_revision",
+          "consent_revision",
+          "credential_revision",
+          "permission_snapshot"
+        ]
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bounded", "deployment", "updates", "steps", "statusTransitions", "policy", "audit", "rawLogs", "rawState", "rawSecrets", "revisionFences"],
+      "properties": {
+        "bounded": { "const": true },
+        "deployment": { "const": true },
+        "updates": { "const": true },
+        "steps": { "const": true },
+        "statusTransitions": { "const": true },
+        "policy": { "const": true },
+        "audit": { "const": true },
+        "rawLogs": { "const": false },
+        "rawState": { "const": false },
+        "rawSecrets": { "const": false },
+        "revisionFences": { "const": true }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["versionBound", "contractDigestBound", "providerBound", "permissionSnapshotBound", "scopeDigestBound", "credentialRevisionBound", "opaqueSecretReferenceOnly", "reversible", "revocable", "failClosedDrift"],
+      "properties": {
+        "versionBound": { "const": true },
+        "contractDigestBound": { "const": true },
+        "providerBound": { "const": true },
+        "permissionSnapshotBound": { "const": true },
+        "scopeDigestBound": { "const": true },
+        "credentialRevisionBound": { "const": true },
+        "opaqueSecretReferenceOnly": { "const": true },
+        "reversible": { "const": true },
+        "revocable": { "const": true },
+        "failClosedDrift": { "const": true }
+      }
+    },
+    "provenanceFence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture", "recording", "loopback", "blockedEnv", "connectedNative"],
+      "properties": {
+        "fixture": { "const": "never_connected_or_native" },
+        "recording": { "const": "never_connected_or_native" },
+        "loopback": { "const": "never_connected_or_native" },
+        "blockedEnv": { "const": "never_connected_or_native" },
+        "connectedNative": { "const": false }
+      }
+    },
+    "forbiddenOperations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "deployment_create",
+          "deployment_cancel",
+          "deployment_resume",
+          "stack_mutation",
+          "config_mutation",
+          "policy_mutation",
+          "resource_mutation",
+          "raw_logs",
+          "raw_state",
+          "raw_secrets",
+          "generic_iac_registry",
+          "kernel_authority",
+          "outcome_adoption"
+        ]
+      }
+    },
+    "nativeGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "planStatus", "deferredTo", "gaps", "exitPlan"],
+      "properties": {
+        "status": { "const": "BLOCKED_ENV" },
+        "planStatus": { "const": "NOT_PROVEN" },
+        "deferredTo": { "const": "optional_layer_2_draft" },
+        "gaps": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 7,
+          "items": {
+            "enum": [
+              "native_credential_resolution",
+              "read_only_permission_proof",
+              "bounded_read_probe",
+              "independent_readback",
+              "durable_receipt",
+              "acceptance_criteria",
+              "invalidation_cleanup"
+            ]
+          }
+        },
+        "exitPlan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "executionStatus",
+            "credentialResolution",
+            "permissionProof",
+            "boundedProbe",
+            "independentReadback",
+            "durableReceipt",
+            "acceptanceCriteria",
+            "invalidationCleanup"
+          ],
+          "properties": {
+            "executionStatus": { "const": "NOT_PROVEN" },
+            "credentialResolution": {
+              "const": "Resolve the opaque access-token/OIDC SecretReference in a host-owned credential boundary without serializing, logging, or persisting secret material."
+            },
+            "permissionProof": {
+              "const": "Prove the exact read-only Pulumi permission snapshot and reject organization, project, stack, policy, and permission revision drift."
+            },
+            "boundedProbe": {
+              "const": "Run a bounded read-only stack/deployment probe with declared page, item, redaction, timeout, and request caps; perform no create, cancel, resume, or mutation."
+            },
+            "independentReadback": {
+              "const": "Perform an independently authorized read-back of deployment identity, source/commit, update, status, policy, and audit evidence and compare revision fences."
+            },
+            "durableReceipt": {
+              "const": "Persist a redacted receipt in a host-owned durable store and verify its digest/read-back without treating Layer 1 recording as durable native evidence."
+            },
+            "acceptanceCriteria": {
+              "const": "Accept native only when credential resolution, permission proof, bounded probe, independent read-back, durable receipt, redaction, replay/tamper, revocation, and failure-invalidation tests all pass."
+            },
+            "invalidationCleanup": {
+              "const": "On drift, revocation, timeout, redaction failure, read-back mismatch, receipt failure, cleanup failure, or any native claim, mark NOT_PROVEN/BLOCKED_ENV, revoke the reference and registration, invalidate the receipt, and remove host-owned canary artifacts."
+            }
+          }
+        }
+      }
+    }
+  }
+}
