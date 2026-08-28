@@ -1,0 +1,355 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/zendesk-support-result/service.v1.json",
+  "title": "Hartevo Zendesk support-result Layer-1 service",
+  "description": "Bounded Zendesk Support ticket evidence for a customer-resolution objective. This contract is read/proposal/recording only and is not Inbox, human-handoff, CRM registry, ticket mutation, or Outcome authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "serviceId",
+    "providerId",
+    "consumerId",
+    "layer",
+    "operations",
+    "scope",
+    "registration",
+    "projections",
+    "bounds",
+    "honesty",
+    "forbiddenEffects",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo.zendesk-support-result/v1"},
+    "contractVersion": {"const": "EXT-ZENDESK-01-L1/v1"},
+    "serviceId": {"const": "ZendeskSupportResultService"},
+    "providerId": {"const": "ZendeskProvider"},
+    "consumerId": {"const": "MissionZendeskSupportConsumer"},
+    "layer": {"const": 1},
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "describe_account",
+          "read_ticket",
+          "read_sla_target",
+          "read_ticket_metric",
+          "read_audit_events",
+          "read_satisfaction",
+          "read_support_evidence",
+          "compile_support_outcome_proposal",
+          "record_support_receipt",
+          "verify_support_evidence"
+        ]
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "account",
+        "ticket",
+        "requester",
+        "organization",
+        "sla",
+        "metric",
+        "audit",
+        "objective",
+        "mission",
+        "permissions"
+      ],
+      "properties": {
+        "account": {"$ref": "#/$defs/account"},
+        "ticket": {"$ref": "#/$defs/ticket"},
+        "requester": {"$ref": "#/$defs/requester"},
+        "organization": {"$ref": "#/$defs/organization"},
+        "sla": {"$ref": "#/$defs/sla"},
+        "metric": {"$ref": "#/$defs/metric"},
+        "audit": {"$ref": "#/$defs/audit"},
+        "objective": {"$ref": "#/$defs/objective"},
+        "mission": {"$ref": "#/$defs/mission"},
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "account:read",
+              "ticket:read",
+              "requester:read",
+              "organization:read",
+              "sla:read",
+              "metric:read",
+              "audit:read",
+              "satisfaction:read",
+              "mission:scope"
+            ]
+          }
+        }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "versionDigest",
+        "contractDigest",
+        "providerDigest",
+        "accountDigest",
+        "ticketDigest",
+        "requesterDigest",
+        "organizationDigest",
+        "slaDigest",
+        "metricDigest",
+        "auditDigest",
+        "objectiveDigest",
+        "missionDigest",
+        "permissionDigest",
+        "scopeDigest",
+        "credentialDigest",
+        "registrationDigest",
+        "reversible",
+        "revocable"
+      ],
+      "properties": {
+        "status": {"enum": ["active", "unmounted", "revoked", "reversed"]},
+        "versionDigest": {"$ref": "#/$defs/digest"},
+        "contractDigest": {"$ref": "#/$defs/digest"},
+        "providerDigest": {"$ref": "#/$defs/digest"},
+        "accountDigest": {"$ref": "#/$defs/digest"},
+        "ticketDigest": {"$ref": "#/$defs/digest"},
+        "requesterDigest": {"$ref": "#/$defs/digest"},
+        "organizationDigest": {"$ref": "#/$defs/digest"},
+        "slaDigest": {"$ref": "#/$defs/digest"},
+        "metricDigest": {"$ref": "#/$defs/digest"},
+        "auditDigest": {"$ref": "#/$defs/digest"},
+        "objectiveDigest": {"$ref": "#/$defs/digest"},
+        "missionDigest": {"$ref": "#/$defs/digest"},
+        "permissionDigest": {"$ref": "#/$defs/digest"},
+        "scopeDigest": {"$ref": "#/$defs/digest"},
+        "credentialDigest": {"$ref": "#/$defs/digest"},
+        "registrationDigest": {"$ref": "#/$defs/digest"},
+        "reversible": {"const": true},
+        "revocable": {"const": true}
+      }
+    },
+    "projections": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "new",
+          "open",
+          "pending",
+          "hold",
+          "solved",
+          "closed",
+          "reopened",
+          "unknown",
+          "partial",
+          "access_loss",
+          "provider_unknown"
+        ]
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxIdentifierBytes",
+        "maxCursorBytes",
+        "maxPageItems",
+        "maxPages",
+        "maxAuditTransitions",
+        "maxResponseBytes",
+        "maxMetadataBytes",
+        "maxMetricValue"
+      ],
+      "properties": {
+        "maxIdentifierBytes": {"const": 256},
+        "maxCursorBytes": {"const": 512},
+        "maxPageItems": {"const": 100},
+        "maxPages": {"const": 32},
+        "maxAuditTransitions": {"const": 1024},
+        "maxResponseBytes": {"const": 2097152},
+        "maxMetadataBytes": {"const": 16384},
+        "maxMetricValue": {"const": 10000000}
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connected",
+        "native",
+        "firstParty",
+        "recordingOnly",
+        "rawTokenSerialized",
+        "rawCommentsRetained",
+        "rawAttachmentsRetained",
+        "rawPiiRetained",
+        "unboundedAuditExported",
+        "ticketMutationEnabled",
+        "inboxAuthority",
+        "humanHandoffSending",
+        "kernelOutcomeAdopted"
+      ],
+      "properties": {
+        "connected": {"const": false},
+        "native": {"const": false},
+        "firstParty": {"const": false},
+        "recordingOnly": {"const": true},
+        "rawTokenSerialized": {"const": false},
+        "rawCommentsRetained": {"const": false},
+        "rawAttachmentsRetained": {"const": false},
+        "rawPiiRetained": {"const": false},
+        "unboundedAuditExported": {"const": false},
+        "ticketMutationEnabled": {"const": false},
+        "inboxAuthority": {"const": false},
+        "humanHandoffSending": {"const": false},
+        "kernelOutcomeAdopted": {"const": false}
+      }
+    },
+    "forbiddenEffects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "send_ticket_comment",
+          "assign_ticket",
+          "mutate_ticket_status",
+          "create_webhook",
+          "retain_raw_comments",
+          "retain_raw_attachments",
+          "retain_raw_pii",
+          "retain_unbounded_audits",
+          "own_inbox",
+          "send_human_handoff",
+          "resolve_native_secret",
+          "adopt_kernel_outcome"
+        ]
+      }
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "native_oauth_resolution",
+          "native_api_token_resolution",
+          "live_https_ticket_reads",
+          "durable_provider_receipt",
+          "independent_ticket_reconciliation",
+          "independent_sla_reconciliation",
+          "verified_work_product_adoption"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "identifier": {"type": "string", "minLength": 1, "maxLength": 256},
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subdomain", "accountId", "revision"],
+      "properties": {
+        "subdomain": {"$ref": "#/$defs/identifier"},
+        "accountId": {"$ref": "#/$defs/identifier"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "ticket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ticketId", "revision"],
+      "properties": {
+        "ticketId": {"type": "integer", "minimum": 1},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "requester": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requesterId", "revision"],
+      "properties": {
+        "requesterId": {"type": "integer", "minimum": 1},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "organization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["organizationId", "revision"],
+      "properties": {
+        "organizationId": {"type": ["integer", "null"], "minimum": 1},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "sla": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetId", "revision"],
+      "properties": {
+        "targetId": {"type": ["integer", "null"], "minimum": 1},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metricId", "revision"],
+      "properties": {
+        "metricId": {"type": "integer", "minimum": 1},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["auditId", "revision"],
+      "properties": {
+        "auditId": {"type": ["integer", "null"], "minimum": 1},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objectiveId", "revision", "objectiveDigest"],
+      "properties": {
+        "objectiveId": {"$ref": "#/$defs/identifier"},
+        "revision": {"$ref": "#/$defs/revision"},
+        "objectiveDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "missionId",
+        "workProductId",
+        "projectRevision",
+        "missionRevision",
+        "workProductRevision",
+        "policyDigest",
+        "consentDigest"
+      ],
+      "properties": {
+        "projectId": {"$ref": "#/$defs/identifier"},
+        "missionId": {"$ref": "#/$defs/identifier"},
+        "workProductId": {"$ref": "#/$defs/identifier"},
+        "projectRevision": {"$ref": "#/$defs/revision"},
+        "missionRevision": {"$ref": "#/$defs/revision"},
+        "workProductRevision": {"$ref": "#/$defs/revision"},
+        "policyDigest": {"$ref": "#/$defs/digest"},
+        "consentDigest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}

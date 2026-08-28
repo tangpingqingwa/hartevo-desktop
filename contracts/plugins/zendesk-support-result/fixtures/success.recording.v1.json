@@ -1,0 +1,53 @@
+{
+  "schemaVersion": "hartevo.zendesk-support-result/v1",
+  "contractVersion": "EXT-ZENDESK-01-L1/v1",
+  "serviceId": "ZendeskSupportResultService",
+  "providerId": "ZendeskProvider",
+  "consumerId": "MissionZendeskSupportConsumer",
+  "layer": 1,
+  "transport": "recording",
+  "connected": false,
+  "native": false,
+  "firstParty": false,
+  "ticket": {
+    "subdomain": "fixture",
+    "accountId": "acct-fixture",
+    "accountRevision": 1,
+    "ticketId": 39701,
+    "ticketRevision": 4,
+    "requesterId": 39702,
+    "organizationId": 39703,
+    "status": "solved",
+    "priority": "high",
+    "type": "incident"
+  },
+  "sla": {
+    "targetId": 39704,
+    "state": "satisfied",
+    "targetMinutes": 60,
+    "elapsedMinutes": 42
+  },
+  "metrics": {
+    "metricId": 39705,
+    "replies": 3,
+    "reopens": 1,
+    "firstReplyCalendarMinutes": 12,
+    "fullResolutionCalendarMinutes": 42
+  },
+  "audits": {
+    "auditRevision": 2,
+    "pagesRead": 2,
+    "duplicateEventsDropped": 1,
+    "complete": true,
+    "rawCommentsRetained": false,
+    "rawAttachmentsRetained": false,
+    "rawPiiRetained": false
+  },
+  "satisfaction": {
+    "availability": "received",
+    "score": "good",
+    "commentPresent": true,
+    "rawCommentRetained": false
+  },
+  "adoption": "layer2_required"
+}
