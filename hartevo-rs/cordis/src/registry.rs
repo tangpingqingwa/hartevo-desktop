@@ -25,6 +25,7 @@ use crate::loader::{PluginFactory, PluginFactoryId, PluginId};
 type SharedUnitOperation = Shared<BoxFuture<'static, Result<(), CordisError>>>;
 type FiberTicketWait = (Arc<FiberControl>, u64);
 type FiberPublication = (Arc<FiberControl>, FiberSnapshot);
+type FiberTerminalPublication = (Fiber, FiberSnapshot, Vec<FiberState>);
 
 struct FiberTicketBatch {
     waits: Vec<FiberTicketWait>,
@@ -36,6 +37,7 @@ struct FiberTicketBatch {
 struct DriverRuntimeBinding {
     id: TokioRuntimeId,
     alive: Arc<AtomicBool>,
+    handle: TokioHandle,
 }
 
 impl DriverRuntimeBinding {
@@ -49,6 +51,7 @@ impl DriverRuntimeBinding {
         Self {
             id: handle.id(),
             alive,
+            handle: handle.clone(),
         }
     }
 
@@ -167,10 +170,20 @@ type ProviderValue = Arc<dyn Any + Send + Sync>;
 type ProviderGuard = Arc<dyn Fn(&ProviderValue) -> Result<bool, CordisError> + Send + Sync>;
 
 #[derive(Clone)]
+enum RuntimeProviderOwner {
+    Root,
+    Managed {
+        control: Weak<FiberControl>,
+        runtime_generation: u64,
+    },
+}
+
+#[derive(Clone)]
 struct RuntimeProviderRecord {
     value: ProviderValue,
     provider_id: u64,
     owner: Fiber,
+    owner_binding: RuntimeProviderOwner,
     generation: u64,
     removing: bool,
     guard: Option<ProviderGuard>,
@@ -191,6 +204,25 @@ struct ProviderRemovalPlan {
     marked_revision: u64,
     completed_revision: u64,
     batch: FiberTicketBatch,
+    drivers: Vec<DriverRuntimeBinding>,
+    terminal_publications: Vec<FiberTerminalPublication>,
+    completion_error: Option<CordisError>,
+    cascade_removals: Vec<ProviderCascadeRemoval>,
+}
+
+struct ProviderCascadeRemoval {
+    key: RuntimeProviderKey,
+    provider_id: u64,
+    removal_serial: u64,
+    marked_revision: u64,
+    completed_revision: u64,
+}
+
+enum ProviderRemovalMode {
+    Strict,
+    OwnerTeardown {
+        driver_runtime: DriverRuntimeBinding,
+    },
 }
 
 #[derive(Clone)]
@@ -198,6 +230,7 @@ struct ProviderRecordFact {
     value: ProviderValue,
     provider_id: u64,
     owner_uid: FiberUid,
+    owner_binding: RuntimeProviderOwner,
     generation: u64,
     removing: bool,
     guard: Option<ProviderGuard>,
@@ -265,9 +298,20 @@ struct ProviderObservation {
     guard: Option<ProviderGuard>,
     provider_id: u64,
     owner_uid: FiberUid,
+    owner: ProviderObservationOwner,
     generation: u64,
     revision: u64,
     removal_serial: u64,
+}
+
+#[derive(Clone)]
+enum ProviderObservationOwner {
+    Root,
+    Managed {
+        control: Arc<FiberControl>,
+        runtime_generation: u64,
+        activation_owner: bool,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -512,7 +556,11 @@ impl LifecycleRegistry {
         if let Some(alive) = bindings.get(&id).and_then(Weak::upgrade)
             && alive.load(Ordering::Acquire)
         {
-            return DriverRuntimeBinding { id, alive };
+            return DriverRuntimeBinding {
+                id,
+                alive,
+                handle: handle.clone(),
+            };
         }
         let binding = DriverRuntimeBinding::new(handle);
         bindings.insert(id, Arc::downgrade(&binding.alive));
@@ -641,6 +689,10 @@ impl LifecycleRegistry {
         )
     }
 
+    /// Registers a root provider whose guard is evaluated optimistically.
+    ///
+    /// The guard can be invoked more than once during exact revalidation, so
+    /// it must be repeatable and free of externally visible side effects.
     pub fn provide_guarded<T, F>(
         &self,
         key: impl Into<String>,
@@ -750,6 +802,15 @@ impl LifecycleRegistry {
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         require_async_runtime()?;
         self.validate_provider_handle(handle)?;
+        self.begin_provider_removal_with_mode(handle, ProviderRemovalMode::Strict)
+    }
+
+    fn begin_provider_removal_with_mode(
+        &self,
+        handle: &LifecycleProviderHandle,
+        mode: ProviderRemovalMode,
+    ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
+        self.validate_provider_handle(handle)?;
         let ProviderRemovalPlan {
             removal_serial,
             marked_revision,
@@ -760,8 +821,15 @@ impl LifecycleRegistry {
                     publications,
                     notifications,
                 },
-        } = self.prepare_provider_removal(handle)?;
+            drivers,
+            terminal_publications,
+            completion_error,
+            cascade_removals,
+        } = self.prepare_provider_removal(handle, mode)?;
         publish_deferred_batch(publications, notifications);
+        for (fiber, snapshot, history) in terminal_publications {
+            fiber.freeze_terminal(snapshot, history);
+        }
         let weak = Arc::downgrade(&self.inner);
         let handle = handle.clone();
         let operation = async move {
@@ -786,21 +854,35 @@ impl LifecycleRegistry {
                         slot.revision = completed_revision;
                     }
                 }
+                for removal in cascade_removals {
+                    if let Some(slot) = state.providers.get_mut(&removal.key) {
+                        let remove = slot.removal_serial == removal.removal_serial
+                            && slot.revision == removal.marked_revision
+                            && slot.record.as_ref().is_some_and(|record| {
+                                record.provider_id == removal.provider_id && record.removing
+                            });
+                        if remove {
+                            slot.record = None;
+                            slot.revision = removal.completed_revision;
+                        }
+                    }
+                }
             }
-            Ok(())
+            completion_error.map_or(Ok(()), Err)
         }
         .boxed()
         .shared();
-        let driver = operation.clone();
-        tokio::spawn(async move {
-            let _ = driver.await;
-        });
-        Ok(operation.boxed())
+        Ok(spawn_unit_operation_on(operation, drivers))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep strict and teardown removal as one visibly atomic registry transaction"
+    )]
     fn prepare_provider_removal(
         &self,
         handle: &LifecycleProviderHandle,
+        mode: ProviderRemovalMode,
     ) -> Result<ProviderRemovalPlan, CordisError> {
         let mut state = lock(&self.inner.state);
         let provider_key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
@@ -820,18 +902,98 @@ impl LifecycleRegistry {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if matches!(&mode, ProviderRemovalMode::OwnerTeardown { .. }) {
+            loop {
+                let dead = controls
+                    .iter()
+                    .filter(|control| control.driver_runtime.require_alive().is_err())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let owned_keys = state
+                    .providers
+                    .iter()
+                    .filter_map(|(key, slot)| {
+                        slot.record.as_ref().and_then(|record| {
+                            provider_owner_is_one_of(&record.owner_binding, &dead)
+                                .then_some(key.clone())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let previous = controls.len();
+                for key in owned_keys {
+                    controls.extend(affected_controls_locked(&state, &key));
+                }
+                controls.sort_by_key(|control| control.fiber.uid());
+                controls.dedup_by(|left, right| Arc::ptr_eq(left, right));
+                if controls.len() == previous {
+                    break;
+                }
+            }
+        }
         controls.sort_by_key(|control| control.fiber.uid());
         let mut machines = controls
             .iter()
             .map(|control| lock(&control.machine))
             .collect::<Vec<_>>();
-        let next_tickets = machines
+        let alive = controls
             .iter()
-            .map(|machine| FiberControl::preflight_desired_locked(machine, None))
-            .collect::<Result<Vec<_>, _>>()?;
-        for control in &controls {
-            control.driver_runtime.require_alive()?;
-        }
+            .map(|control| control.driver_runtime.require_alive().is_ok())
+            .collect::<Vec<_>>();
+        let dead_controls = controls
+            .iter()
+            .zip(&alive)
+            .filter(|(_, alive)| !**alive)
+            .map(|(control, _)| control.clone())
+            .collect::<Vec<_>>();
+        let cascade_removals = if matches!(&mode, ProviderRemovalMode::OwnerTeardown { .. }) {
+            preflight_dead_owner_provider_removals(&state, &provider_key, &dead_controls)?
+        } else {
+            Vec::new()
+        };
+        let (next_tickets, drivers, completion_error) = match mode {
+            ProviderRemovalMode::Strict => {
+                if alive.iter().any(|alive| !alive) {
+                    return Err(CordisError::AsyncRuntimeUnavailable);
+                }
+                let tickets = machines
+                    .iter()
+                    .map(|machine| FiberControl::preflight_desired_locked(machine, None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                (tickets, driver_runtimes_for_controls(&controls), None)
+            }
+            ProviderRemovalMode::OwnerTeardown { driver_runtime } => {
+                driver_runtime.require_alive()?;
+                let tickets = machines
+                    .iter()
+                    .zip(&alive)
+                    .map(|(machine, alive)| {
+                        if *alive {
+                            FiberControl::preflight_desired_locked(machine, None)
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, CordisError>>()?;
+                let live = controls
+                    .iter()
+                    .zip(&alive)
+                    .filter(|(_, alive)| **alive)
+                    .map(|(control, _)| control.clone())
+                    .collect::<Vec<_>>();
+                let mut drivers = driver_runtimes_for_controls(&live);
+                if !drivers.iter().any(|driver| driver.id == driver_runtime.id) {
+                    drivers.push(driver_runtime);
+                }
+                (
+                    tickets,
+                    drivers,
+                    alive
+                        .iter()
+                        .any(|alive| !alive)
+                        .then_some(CordisError::AsyncRuntimeUnavailable),
+                )
+            }
+        };
 
         // Slot absence and every dependent ticket publish in one registry ->
         // uid-ordered machine critical section. No fallible operation remains
@@ -843,12 +1005,50 @@ impl LifecycleRegistry {
                 record.removing = true;
             }
         }
+        for removal in &cascade_removals {
+            if let Some(slot) = state.providers.get_mut(&removal.key) {
+                slot.removal_serial = removal.removal_serial;
+                slot.revision = removal.marked_revision;
+                if let Some(record) = slot.record.as_mut() {
+                    record.removing = true;
+                }
+            }
+        }
         let mut waits = Vec::with_capacity(controls.len());
         let mut publications = Vec::new();
         let mut notifications = Vec::new();
-        for ((control, machine), next_ticket) in
-            controls.iter().zip(&mut machines).zip(next_tickets)
+        let mut terminal_publications = Vec::new();
+        let mut quarantined_controls = Vec::new();
+        for (((control, machine), next_ticket), alive) in controls
+            .iter()
+            .zip(&mut machines)
+            .zip(next_tickets)
+            .zip(&alive)
         {
+            if !*alive {
+                let diagnostic = CordisError::AsyncRuntimeUnavailable;
+                if !machine.diagnostics.contains(&diagnostic) {
+                    machine.diagnostics.push(diagnostic);
+                }
+                machine.tombstone = true;
+                machine.desired = None;
+                machine.committed = None;
+                machine.effects.clear();
+                machine.effects_epoch = None;
+                machine.force_restart = false;
+                machine.active_activation = None;
+                FiberControl::apply_transition_state_locked(machine, FiberState::Disposed);
+                control.fiber.publish_tombstone();
+                let snapshot = machine.snapshot();
+                publications.push((control.clone(), snapshot.clone()));
+                terminal_publications.push((
+                    control.fiber.clone(),
+                    snapshot,
+                    machine.history.clone(),
+                ));
+                quarantined_controls.push(control.clone());
+                continue;
+            }
             let (changed, serial) =
                 FiberControl::apply_desired_locked(machine, None, None, next_ticket);
             waits.push((control.clone(), serial));
@@ -856,6 +1056,9 @@ impl LifecycleRegistry {
                 publications.push((control.clone(), machine.snapshot()));
                 notifications.push(control.clone());
             }
+        }
+        for control in &quarantined_controls {
+            detach_control_locked(&mut state, control);
         }
         drop(machines);
         drop(state);
@@ -868,6 +1071,10 @@ impl LifecycleRegistry {
                 publications,
                 notifications,
             },
+            drivers,
+            terminal_publications,
+            completion_error,
+            cascade_removals,
         })
     }
 
@@ -902,7 +1109,7 @@ impl LifecycleRegistry {
         factory: &PluginFactory,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         require_async_runtime()?;
-        let (generation, batch) = {
+        let (generation, batch, drivers) = {
             let mut state = lock(&self.inner.state);
             let Some(runtime) = state.runtimes.get(&factory.id()) else {
                 return Ok(async { Ok(()) }.boxed());
@@ -918,13 +1125,14 @@ impl LifecycleRegistry {
             for control in &controls {
                 control.driver_runtime.require_alive()?;
             }
+            let drivers = driver_runtimes_for_controls(&controls);
             if let Some(runtime) = state.runtimes.get_mut(&factory.id()) {
                 runtime.status = RuntimeStatus::Deleting;
             }
             let batch = publish_dispose_batch(&controls, &mut machines, next_tickets);
             drop(machines);
             drop(state);
-            (generation, batch)
+            (generation, batch, drivers)
         };
         let FiberTicketBatch {
             waits,
@@ -958,7 +1166,7 @@ impl LifecycleRegistry {
         }
         .boxed()
         .shared();
-        Ok(spawn_unit_operation(operation))
+        Ok(spawn_unit_operation_on(operation, drivers))
     }
 
     pub async fn delete_factory(&self, factory: &PluginFactory) -> Result<(), CordisError> {
@@ -1051,7 +1259,7 @@ impl LifecycleRegistry {
             let operation = operation.clone();
             return Ok(operation.boxed());
         }
-        let batch = {
+        let (batch, drivers) = {
             let mut state = lock(&self.inner.state);
             let mut controls = state
                 .runtimes
@@ -1067,6 +1275,7 @@ impl LifecycleRegistry {
             for control in &controls {
                 control.driver_runtime.require_alive()?;
             }
+            let drivers = driver_runtimes_for_controls(&controls);
             state.shutting_down = true;
             for runtime in state.runtimes.values_mut() {
                 runtime.status = RuntimeStatus::Deleting;
@@ -1074,7 +1283,7 @@ impl LifecycleRegistry {
             let result = publish_dispose_batch(&controls, &mut machines, next_tickets);
             drop(machines);
             drop(state);
-            result
+            (result, drivers)
         };
         let FiberTicketBatch {
             waits,
@@ -1105,7 +1314,7 @@ impl LifecycleRegistry {
         *operation_slot = Some(operation.clone());
         drop(operation_slot);
         publish_deferred_batch(publications, notifications);
-        Ok(spawn_unit_operation(operation))
+        Ok(spawn_unit_operation_on(operation, drivers))
     }
 
     pub async fn shutdown(&self) -> Result<(), CordisError> {
@@ -1196,6 +1405,7 @@ fn plan_provider_registration(
     value: &ProviderValue,
     guard: Option<&ProviderGuard>,
 ) -> Result<ProviderMutationPlan, CordisError> {
+    let owner_binding = resolve_provider_owner_locked(state, owner)?;
     let expected_slot = state.providers.get(key).map(provider_slot_fact);
     if let Some(existing) = state
         .providers
@@ -1242,6 +1452,7 @@ fn plan_provider_registration(
             value: value.clone(),
             provider_id,
             owner: owner.clone(),
+            owner_binding,
             generation,
             removing: false,
             guard: guard.cloned(),
@@ -1310,6 +1521,7 @@ fn plan_provider_replacement(
             value: value.clone(),
             provider_id: record.provider_id,
             owner: record.owner.clone(),
+            owner_binding: record.owner_binding.clone(),
             generation,
             removing: false,
             guard: record.guard.clone(),
@@ -1319,6 +1531,25 @@ fn plan_provider_replacement(
             ..handle.clone()
         },
     })
+}
+
+fn resolve_provider_owner_locked(
+    state: &LifecycleRegistryState,
+    owner: &Fiber,
+) -> Result<RuntimeProviderOwner, CordisError> {
+    if owner.uid() == FiberUid::ROOT {
+        return Ok(RuntimeProviderOwner::Root);
+    }
+    state
+        .runtimes
+        .values()
+        .flat_map(|runtime| runtime.fibers.values())
+        .find(|control| control.fiber.uid() == owner.uid())
+        .map(|control| RuntimeProviderOwner::Managed {
+            control: Arc::downgrade(control),
+            runtime_generation: control.runtime_generation,
+        })
+        .ok_or(CordisError::FiberDisposed { uid: owner.uid() })
 }
 
 fn commit_provider_mutation_if_current(
@@ -1343,34 +1574,57 @@ fn commit_provider_mutation_if_current(
         return Ok(None);
     }
 
-    let mut machines = controls
+    let owner_control = runtime_provider_owner_control(&plan.record.owner_binding);
+    let transaction_controls = transaction_controls(&controls, outcomes, owner_control);
+    let mut machines = transaction_controls
         .iter()
         .map(|control| lock(&control.machine))
         .collect::<Vec<_>>();
-    if machines.iter().zip(outcomes).any(|(machine, outcome)| {
-        machine.config_revision != outcome.draft.config_revision
-            || machine.tombstone != outcome.draft.tombstone
+    if outcomes.iter().any(|outcome| {
+        control_index(&transaction_controls, &outcome.draft.control).is_none_or(|index| {
+            machines[index].config_revision != outcome.draft.config_revision
+                || machines[index].tombstone != outcome.draft.tombstone
+        })
     }) {
         return Ok(None);
     }
-    for control in &controls {
+    if !runtime_provider_owner_is_active_locked(
+        &state,
+        &plan.record.owner_binding,
+        &transaction_controls,
+        &machines,
+    ) {
+        return Err(CordisError::FiberDisposed {
+            uid: plan.record.owner.uid(),
+        });
+    }
+    if !provider_outcome_owners_are_current_locked(
+        &state,
+        &transaction_controls,
+        &machines,
+        outcomes,
+    ) {
+        return Ok(None);
+    }
+    for control in &transaction_controls {
         control.driver_runtime.require_alive()?;
     }
-    let next_tickets = machines
+    let next_tickets = outcomes
         .iter()
-        .zip(outcomes)
-        .map(|(machine, outcome)| {
+        .map(|outcome| {
+            let index = control_index(&transaction_controls, &outcome.draft.control)
+                .expect("affected control must be transaction-locked");
             if outcome.draft.tombstone {
                 Ok(None)
             } else {
-                FiberControl::preflight_desired_locked(machine, outcome.desired.as_ref())
+                FiberControl::preflight_desired_locked(&machines[index], outcome.desired.as_ref())
             }
         })
         .collect::<Result<Vec<_>, CordisError>>()?;
 
     commit_provider_plan(&mut state, plan);
     let (publications, notifications) =
-        apply_provider_outcomes(&controls, &mut machines, outcomes, next_tickets);
+        apply_provider_outcomes(&transaction_controls, &mut machines, outcomes, next_tickets);
     let handle = plan.handle.clone();
     drop(machines);
     drop(state);
@@ -1386,12 +1640,10 @@ fn apply_provider_outcomes(
 ) -> (Vec<FiberPublication>, Vec<Arc<FiberControl>>) {
     let mut publications = Vec::new();
     let mut notifications = Vec::new();
-    for (((control, machine), outcome), next_ticket) in controls
-        .iter()
-        .zip(machines)
-        .zip(outcomes)
-        .zip(next_tickets)
-    {
+    for (outcome, next_ticket) in outcomes.iter().zip(next_tickets) {
+        let control = &outcome.draft.control;
+        let index = control_index(controls, control).expect("affected control must be locked");
+        let machine = &mut machines[index];
         if outcome.draft.tombstone {
             continue;
         }
@@ -1421,6 +1673,7 @@ fn provider_slot_fact(slot: &RuntimeProviderSlot) -> ProviderSlotFact {
             value: record.value.clone(),
             provider_id: record.provider_id,
             owner_uid: record.owner.uid(),
+            owner_binding: record.owner_binding.clone(),
             generation: record.generation,
             removing: record.removing,
             guard: record.guard.clone(),
@@ -1442,6 +1695,10 @@ fn provider_slot_matches(
                     (Some(record), Some(expected)) => {
                         record.provider_id == expected.provider_id
                             && record.owner.uid() == expected.owner_uid
+                            && runtime_provider_owners_ptr_eq(
+                                &record.owner_binding,
+                                &expected.owner_binding,
+                            )
                             && record.generation == expected.generation
                             && record.removing == expected.removing
                             && Arc::ptr_eq(&record.value, &expected.value)
@@ -1453,6 +1710,26 @@ fn provider_slot_matches(
                     _ => false,
                 }
         }
+        _ => false,
+    }
+}
+
+fn runtime_provider_owners_ptr_eq(
+    left: &RuntimeProviderOwner,
+    right: &RuntimeProviderOwner,
+) -> bool {
+    match (left, right) {
+        (RuntimeProviderOwner::Root, RuntimeProviderOwner::Root) => true,
+        (
+            RuntimeProviderOwner::Managed {
+                control: left_control,
+                runtime_generation: left_generation,
+            },
+            RuntimeProviderOwner::Managed {
+                control: right_control,
+                runtime_generation: right_generation,
+            },
+        ) => left_generation == right_generation && left_control.ptr_eq(right_control),
         _ => false,
     }
 }
@@ -1508,6 +1785,28 @@ fn controls_locked(state: &LifecycleRegistryState) -> Vec<Arc<FiberControl>> {
     controls
 }
 
+fn detach_control_locked(state: &mut LifecycleRegistryState, control: &Arc<FiberControl>) {
+    let mut empty_runtime = None;
+    if let Some(runtime) = state.runtimes.get_mut(&control.factory.id())
+        && runtime.generation == control.runtime_generation
+        && runtime
+            .fibers
+            .get(&control.fiber.uid())
+            .is_some_and(|registered| Arc::ptr_eq(registered, control))
+    {
+        runtime.fibers.remove(&control.fiber.uid());
+        if runtime.fibers.is_empty() {
+            empty_runtime = Some(runtime.factory.plugin_id().clone());
+        }
+    }
+    if let Some(plugin_id) = empty_runtime {
+        state.runtimes.remove(&control.factory.id());
+        if state.catalog.get(&plugin_id) == Some(&control.factory.id()) {
+            state.catalog.remove(&plugin_id);
+        }
+    }
+}
+
 fn selected_controls_locked(
     state: &LifecycleRegistryState,
     requested: &[Arc<FiberControl>],
@@ -1519,6 +1818,91 @@ fn selected_controls_locked(
         .collect::<Vec<_>>();
     controls.sort_by_key(|control| control.fiber.uid());
     controls
+}
+
+fn transaction_controls(
+    affected: &[Arc<FiberControl>],
+    outcomes: &[ProviderControlOutcome],
+    extra: impl IntoIterator<Item = Arc<FiberControl>>,
+) -> Vec<Arc<FiberControl>> {
+    let mut controls = affected.to_vec();
+    controls.extend(extra);
+    controls.extend(
+        outcomes
+            .iter()
+            .flat_map(|outcome| outcome.draft.observations.iter().flatten())
+            .filter_map(|observation| match &observation.owner {
+                ProviderObservationOwner::Root => None,
+                ProviderObservationOwner::Managed { control, .. } => Some(control.clone()),
+            }),
+    );
+    controls.sort_by_key(|control| control.fiber.uid());
+    controls.dedup_by(|left, right| Arc::ptr_eq(left, right));
+    controls
+}
+
+fn control_index(controls: &[Arc<FiberControl>], target: &Arc<FiberControl>) -> Option<usize> {
+    controls
+        .iter()
+        .position(|control| Arc::ptr_eq(control, target))
+}
+
+fn provider_outcome_owners_are_current_locked(
+    state: &LifecycleRegistryState,
+    controls: &[Arc<FiberControl>],
+    machines: &[std::sync::MutexGuard<'_, FiberMachine>],
+    outcomes: &[ProviderControlOutcome],
+) -> bool {
+    outcomes
+        .iter()
+        .flat_map(|outcome| outcome.draft.observations.iter().flatten())
+        .all(|observation| match &observation.owner {
+            ProviderObservationOwner::Root => true,
+            ProviderObservationOwner::Managed {
+                control,
+                runtime_generation,
+                activation_owner,
+            } => {
+                control.runtime_generation == *runtime_generation
+                    && control_is_registered_locked(state, control)
+                    && control_index(controls, control).is_some_and(|index| {
+                        !machines[index].tombstone
+                            && if *activation_owner {
+                                machines[index].state == FiberState::Loading
+                            } else {
+                                machines[index].state == FiberState::Active
+                            }
+                    })
+            }
+        })
+}
+
+fn runtime_provider_owner_control(owner: &RuntimeProviderOwner) -> Option<Arc<FiberControl>> {
+    match owner {
+        RuntimeProviderOwner::Root => None,
+        RuntimeProviderOwner::Managed { control, .. } => control.upgrade(),
+    }
+}
+
+fn runtime_provider_owner_is_active_locked(
+    state: &LifecycleRegistryState,
+    owner: &RuntimeProviderOwner,
+    controls: &[Arc<FiberControl>],
+    machines: &[std::sync::MutexGuard<'_, FiberMachine>],
+) -> bool {
+    match owner {
+        RuntimeProviderOwner::Root => true,
+        RuntimeProviderOwner::Managed {
+            control,
+            runtime_generation,
+        } => control.upgrade().is_some_and(|control| {
+            control.runtime_generation == *runtime_generation
+                && control_is_registered_locked(state, &control)
+                && control_index(controls, &control).is_some_and(|index| {
+                    !machines[index].tombstone && machines[index].state == FiberState::Active
+                })
+        }),
+    }
 }
 
 fn stage_reconciliation(
@@ -1562,32 +1946,41 @@ fn commit_reconciliation_if_current(
         return Ok(false);
     }
 
-    let mut machines = controls
+    let transaction_controls = transaction_controls(&controls, outcomes, std::iter::empty());
+    let mut machines = transaction_controls
         .iter()
         .map(|control| lock(&control.machine))
         .collect::<Vec<_>>();
-    if machines.iter().zip(outcomes).any(|(machine, outcome)| {
-        machine.config_revision != outcome.draft.config_revision
-            || machine.tombstone != outcome.draft.tombstone
-    }) {
+    if outcomes.iter().any(|outcome| {
+        control_index(&transaction_controls, &outcome.draft.control).is_none_or(|index| {
+            machines[index].config_revision != outcome.draft.config_revision
+                || machines[index].tombstone != outcome.draft.tombstone
+        })
+    }) || !provider_outcome_owners_are_current_locked(
+        &state,
+        &transaction_controls,
+        &machines,
+        outcomes,
+    ) {
         return Ok(false);
     }
-    for control in &controls {
+    for control in &transaction_controls {
         control.driver_runtime.require_alive()?;
     }
-    let next_tickets = machines
+    let next_tickets = outcomes
         .iter()
-        .zip(outcomes)
-        .map(|(machine, outcome)| {
+        .map(|outcome| {
+            let index = control_index(&transaction_controls, &outcome.draft.control)
+                .expect("affected control must be transaction-locked");
             if outcome.draft.tombstone {
                 Ok(None)
             } else {
-                FiberControl::preflight_desired_locked(machine, outcome.desired.as_ref())
+                FiberControl::preflight_desired_locked(&machines[index], outcome.desired.as_ref())
             }
         })
         .collect::<Result<Vec<_>, CordisError>>()?;
     let (publications, notifications) =
-        apply_provider_outcomes(&controls, &mut machines, outcomes, next_tickets);
+        apply_provider_outcomes(&transaction_controls, &mut machines, outcomes, next_tickets);
     drop(machines);
     drop(state);
     publish_deferred_batch(publications, notifications);
@@ -1631,15 +2024,15 @@ fn provider_observations_with_plan_locked(
             let provider_key = RuntimeProviderKey::new(&control.namespace, key);
             if provider_key == plan.key {
                 let record = &plan.record;
-                if record.owner.is_disposed() || record.owner.state() != FiberState::Active {
-                    return None;
-                }
+                let owner =
+                    resolve_provider_observation_owner_locked(state, &record.owner_binding, false)?;
                 Some(ProviderObservation {
                     key: provider_key,
                     value: record.value.clone(),
                     guard: record.guard.clone(),
                     provider_id: record.provider_id,
                     owner_uid: record.owner.uid(),
+                    owner,
                     generation: record.generation,
                     revision: plan.revision,
                     removal_serial: plan.removal_serial,
@@ -1713,12 +2106,39 @@ fn provider_observations_equivalent(
                     left.key == right.key
                         && left.provider_id == right.provider_id
                         && left.owner_uid == right.owner_uid
+                        && provider_observation_owners_ptr_eq(&left.owner, &right.owner)
                         && left.generation == right.generation
                         && left.revision == right.revision
                         && left.removal_serial == right.removal_serial
                         && Arc::ptr_eq(&left.value, &right.value)
                         && provider_guards_ptr_eq(left.guard.as_ref(), right.guard.as_ref())
                 })
+        }
+        _ => false,
+    }
+}
+
+fn provider_observation_owners_ptr_eq(
+    left: &ProviderObservationOwner,
+    right: &ProviderObservationOwner,
+) -> bool {
+    match (left, right) {
+        (ProviderObservationOwner::Root, ProviderObservationOwner::Root) => true,
+        (
+            ProviderObservationOwner::Managed {
+                control: left_control,
+                runtime_generation: left_generation,
+                activation_owner: left_activation,
+            },
+            ProviderObservationOwner::Managed {
+                control: right_control,
+                runtime_generation: right_generation,
+                activation_owner: right_activation,
+            },
+        ) => {
+            left_generation == right_generation
+                && left_activation == right_activation
+                && Arc::ptr_eq(left_control, right_control)
         }
         _ => false,
     }
@@ -1770,6 +2190,10 @@ fn prepared_activations_equivalent(left: &PreparedActivation, right: &PreparedAc
                     )
                     && left.record.provider_id == right.record.provider_id
                     && left.record.owner.uid() == right.record.owner.uid()
+                    && runtime_provider_owners_ptr_eq(
+                        &left.record.owner_binding,
+                        &right.record.owner_binding,
+                    )
                     && left.record.generation == right.record.generation
                     && left.record.removing == right.record.removing
                     && Arc::ptr_eq(&left.record.value, &right.record.value)
@@ -1794,6 +2218,10 @@ fn provider_slot_facts_equivalent(
                     (Some(left), Some(right)) => {
                         left.provider_id == right.provider_id
                             && left.owner_uid == right.owner_uid
+                            && runtime_provider_owners_ptr_eq(
+                                &left.owner_binding,
+                                &right.owner_binding,
+                            )
                             && left.generation == right.generation
                             && left.removing == right.removing
                             && Arc::ptr_eq(&left.value, &right.value)
@@ -1841,12 +2269,18 @@ fn provider_observations_with_provisional_locked(
         .map(|key| {
             let provider_key = RuntimeProviderKey::new(&control.namespace, key);
             if let Some(plan) = provider_plans.iter().find(|plan| plan.key == provider_key) {
+                let owner = resolve_provider_observation_owner_locked(
+                    state,
+                    &plan.record.owner_binding,
+                    true,
+                )?;
                 Some(ProviderObservation {
                     key: provider_key,
                     value: plan.record.value.clone(),
                     guard: plan.record.guard.clone(),
                     provider_id: plan.record.provider_id,
                     owner_uid: plan.record.owner.uid(),
+                    owner,
                     generation: plan.record.generation,
                     revision: plan.revision,
                     removal_serial: plan.removal_serial,
@@ -2033,6 +2467,50 @@ fn preflight_provider_removal(
     Ok((removal_serial, marked_revision, completed_revision))
 }
 
+fn provider_owner_is_one_of(owner: &RuntimeProviderOwner, controls: &[Arc<FiberControl>]) -> bool {
+    match owner {
+        RuntimeProviderOwner::Root => false,
+        RuntimeProviderOwner::Managed { control, .. } => control.upgrade().is_some_and(|owner| {
+            controls
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, &owner))
+        }),
+    }
+}
+
+fn preflight_dead_owner_provider_removals(
+    state: &LifecycleRegistryState,
+    primary_key: &RuntimeProviderKey,
+    dead_controls: &[Arc<FiberControl>],
+) -> Result<Vec<ProviderCascadeRemoval>, CordisError> {
+    state
+        .providers
+        .iter()
+        .filter(|(key, slot)| {
+            *key != primary_key
+                && slot.record.as_ref().is_some_and(|record| {
+                    provider_owner_is_one_of(&record.owner_binding, dead_controls)
+                })
+        })
+        .map(|(key, slot)| {
+            let record = slot.record.as_ref().expect("filtered provider record");
+            let overflow = || CordisError::ProviderGenerationOverflow {
+                key: key.key.clone(),
+            };
+            let removal_serial = slot.removal_serial.checked_add(1).ok_or_else(&overflow)?;
+            let marked_revision = slot.revision.checked_add(1).ok_or_else(&overflow)?;
+            let completed_revision = marked_revision.checked_add(1).ok_or_else(overflow)?;
+            Ok(ProviderCascadeRemoval {
+                key: key.clone(),
+                provider_id: record.provider_id,
+                removal_serial,
+                marked_revision,
+                completed_revision,
+            })
+        })
+        .collect()
+}
+
 fn provider_observation_locked(
     state: &LifecycleRegistryState,
     namespace: &str,
@@ -2044,19 +2522,56 @@ fn provider_observation_locked(
     let provider_key = RuntimeProviderKey::new(namespace, key);
     let slot = state.providers.get(&provider_key)?;
     let record = slot.record.as_ref()?;
-    if record.removing || record.owner.is_disposed() || record.owner.state() != FiberState::Active {
+    if record.removing {
         return None;
     }
+    let owner = resolve_provider_observation_owner_locked(state, &record.owner_binding, false)?;
     Some(ProviderObservation {
         key: provider_key,
         value: record.value.clone(),
         guard: record.guard.clone(),
         provider_id: record.provider_id,
         owner_uid: record.owner.uid(),
+        owner,
         generation: record.generation,
         revision: slot.revision,
         removal_serial: slot.removal_serial,
     })
+}
+
+fn resolve_provider_observation_owner_locked(
+    state: &LifecycleRegistryState,
+    owner: &RuntimeProviderOwner,
+    activation_owner: bool,
+) -> Option<ProviderObservationOwner> {
+    match owner {
+        RuntimeProviderOwner::Root => Some(ProviderObservationOwner::Root),
+        RuntimeProviderOwner::Managed {
+            control,
+            runtime_generation,
+        } => {
+            let control = control.upgrade()?;
+            if control.runtime_generation != *runtime_generation
+                || !control_is_registered_locked(state, &control)
+                || control.driver_runtime.require_alive().is_err()
+            {
+                return None;
+            }
+            let machine = lock(&control.machine);
+            let valid = !machine.tombstone
+                && if activation_owner {
+                    machine.state == FiberState::Loading
+                } else {
+                    machine.state == FiberState::Active
+                };
+            drop(machine);
+            valid.then_some(ProviderObservationOwner::Managed {
+                control,
+                runtime_generation: *runtime_generation,
+                activation_owner,
+            })
+        }
+    }
 }
 
 fn provider_observations_are_current(
@@ -2073,11 +2588,65 @@ fn provider_observations_are_current(
                             && record.provider_id == observation.provider_id
                             && record.owner.uid() == observation.owner_uid
                             && record.generation == observation.generation
-                            && !record.owner.is_disposed()
-                            && record.owner.state() == FiberState::Active
+                            && provider_record_matches_observation_owner(record, observation)
+                            && provider_observation_owner_is_current_locked(state, observation)
                     })
             })
         })
+}
+
+fn provider_record_matches_observation_owner(
+    record: &RuntimeProviderRecord,
+    observation: &ProviderObservation,
+) -> bool {
+    match (&record.owner_binding, &observation.owner) {
+        (RuntimeProviderOwner::Root, ProviderObservationOwner::Root) => true,
+        (
+            RuntimeProviderOwner::Managed {
+                control: record_control,
+                runtime_generation: record_generation,
+            },
+            ProviderObservationOwner::Managed {
+                control,
+                runtime_generation,
+                ..
+            },
+        ) => {
+            record_generation == runtime_generation
+                && record_control
+                    .upgrade()
+                    .is_some_and(|registered| Arc::ptr_eq(&registered, control))
+        }
+        _ => false,
+    }
+}
+
+fn provider_observation_owner_is_current_locked(
+    state: &LifecycleRegistryState,
+    observation: &ProviderObservation,
+) -> bool {
+    match &observation.owner {
+        ProviderObservationOwner::Root => true,
+        ProviderObservationOwner::Managed {
+            control,
+            runtime_generation,
+            activation_owner,
+        } => {
+            if control.runtime_generation != *runtime_generation
+                || !control_is_registered_locked(state, control)
+                || control.driver_runtime.require_alive().is_err()
+            {
+                return false;
+            }
+            let machine = lock(&control.machine);
+            !machine.tombstone
+                && if *activation_owner {
+                    machine.state == FiberState::Loading
+                } else {
+                    machine.state == FiberState::Active
+                }
+        }
+    }
 }
 
 struct ActivationCollectorState {
@@ -3148,10 +3717,7 @@ fn finish_provider_activation_transaction(
             continue;
         }
 
-        let mut controls = affected.clone();
-        controls.push(control.clone());
-        controls.sort_by_key(|candidate| candidate.fiber.uid());
-        controls.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let controls = transaction_controls(&affected, &outcomes, std::iter::once(control.clone()));
         let mut machines = controls
             .iter()
             .map(|candidate| lock(&candidate.machine))
@@ -3171,6 +3737,11 @@ fn finish_provider_activation_transaction(
             drop(machines);
             drop(registry);
             return finish_stale_provider_activation(control, collector, epoch, finished);
+        }
+        if !provider_outcome_owners_are_current_locked(&registry, &controls, &machines, &outcomes) {
+            drop(machines);
+            drop(registry);
+            continue;
         }
         if outcomes.iter().any(|outcome| {
             let Some(index) = controls
@@ -3535,6 +4106,8 @@ fn commit_provisional_providers(
 ) -> Vec<Vec<LifecycleDisposer>> {
     let mut owner_groups = Vec::new();
     for plan in provider_plans {
+        let owner_driver = runtime_provider_owner_control(&plan.record.owner_binding)
+            .map(|control| control.driver_runtime.clone());
         let slot = registry
             .providers
             .entry(plan.key)
@@ -3547,7 +4120,15 @@ fn commit_provisional_providers(
             let Some(inner) = weak.upgrade() else {
                 return Ok(());
             };
-            LifecycleRegistry { inner }.remove_provider(&handle).await
+            let Some(driver_runtime) = owner_driver else {
+                return Err(CordisError::AsyncRuntimeUnavailable);
+            };
+            LifecycleRegistry { inner }
+                .begin_provider_removal_with_mode(
+                    &handle,
+                    ProviderRemovalMode::OwnerTeardown { driver_runtime },
+                )?
+                .await
         })]);
     }
     owner_groups
@@ -3728,6 +4309,10 @@ fn provisional_provider_plan(
             value: provider.value.clone(),
             provider_id,
             owner: control.fiber.clone(),
+            owner_binding: RuntimeProviderOwner::Managed {
+                control: control.self_weak.clone(),
+                runtime_generation: control.runtime_generation,
+            },
             generation,
             removing: false,
             guard: provider.guard.clone(),
@@ -4028,13 +4613,36 @@ async fn cleanup_groups(groups: Vec<Vec<LifecycleDisposer>>) -> Vec<CordisError>
     .collect()
 }
 
-fn spawn_unit_operation(
+fn driver_runtimes_for_controls(controls: &[Arc<FiberControl>]) -> Vec<DriverRuntimeBinding> {
+    let mut drivers = Vec::<DriverRuntimeBinding>::new();
+    for control in controls {
+        if !drivers
+            .iter()
+            .any(|driver| driver.id == control.driver_runtime.id)
+        {
+            drivers.push(control.driver_runtime.clone());
+        }
+    }
+    drivers
+}
+
+fn spawn_unit_operation_on(
     operation: SharedUnitOperation,
+    drivers: Vec<DriverRuntimeBinding>,
 ) -> BoxFuture<'static, Result<(), CordisError>> {
-    let driver = operation.clone();
-    tokio::spawn(async move {
-        let _ = driver.await;
-    });
+    if drivers.is_empty() {
+        // Zero-control operations contain no asynchronous wait before their
+        // compare-delete/clear commit, so polling once completes them without
+        // making a transient caller runtime their coordinator.
+        let _ = operation.clone().now_or_never();
+    } else {
+        for binding in drivers {
+            let driver = operation.clone();
+            drop(binding.handle.spawn(async move {
+                let _ = driver.await;
+            }));
+        }
+    }
     operation.boxed()
 }
 
@@ -4940,5 +5548,501 @@ mod lifecycle_boundary_tests {
             provider_boundary_snapshot(&registry, "root", "kept-during-shutdown"),
             completed
         );
+    }
+
+    #[test]
+    fn provisional_owner_teardown_quarantines_dead_dependents_and_reclaims_the_key() {
+        production_result_with_timeout(|| {
+            let dependent_runtime = tokio::runtime::Runtime::new().unwrap();
+            let registry = LifecycleRegistry::new();
+            let dependent = dependent_runtime.block_on(async {
+                registry
+                    .mount(
+                        PluginFactory::new_lifecycle("teardown-dead-dependent", |_, _| {
+                            LifecycleEffect::none()
+                        })
+                        .with_inject(["teardown-owned"]),
+                        ConfigValue::default(),
+                    )
+                    .unwrap()
+            });
+            let dependent_control = dependent.control().unwrap();
+
+            let owner_runtime = tokio::runtime::Runtime::new().unwrap();
+            let owner = owner_runtime.block_on(async {
+                let owner = registry
+                    .mount(
+                        PluginFactory::new_lifecycle("teardown-live-owner", |_, view| {
+                            view.provide("teardown-owned", 41_u32)?;
+                            Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                        }),
+                        ConfigValue::default(),
+                    )
+                    .unwrap();
+                owner
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                dependent
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                owner
+            });
+            assert_eq!(registry.get::<u32>("teardown-owned").as_deref(), Some(&41));
+
+            drop(dependent_runtime);
+            assert!(registry.get::<u32>("teardown-owned").is_some());
+            let restarted = owner_runtime.block_on(owner.restart()).unwrap();
+            assert_eq!(restarted.state(), FiberState::Active);
+            assert!(
+                restarted
+                    .diagnostics()
+                    .contains(&CordisError::AsyncRuntimeUnavailable)
+            );
+            assert!(!control_is_registered_locked(
+                &lock(&registry.inner.state),
+                &dependent_control,
+            ));
+            assert_eq!(registry.get::<u32>("teardown-owned").as_deref(), Some(&41));
+
+            let disposed = owner_runtime.block_on(owner.dispose_async()).unwrap();
+            assert_eq!(disposed.state(), FiberState::Disposed);
+            assert!(registry.get::<u32>("teardown-owned").is_none());
+            let replacement = registry.provide("teardown-owned", 42_u32).unwrap();
+            assert_eq!(replacement.generation(), 0);
+            assert_eq!(registry.get::<u32>("teardown-owned").as_deref(), Some(&42));
+        });
+    }
+
+    #[test]
+    fn remove_coordinator_survives_temporary_caller_runtime_drop() {
+        production_result_with_timeout(|| {
+            let driver_runtime = tokio::runtime::Runtime::new().unwrap();
+            let caller_runtime = tokio::runtime::Runtime::new().unwrap();
+            let registry = LifecycleRegistry::new();
+            let provider = registry.provide("durable-remove", 1_u32).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+            let release = Arc::new(tokio::sync::Barrier::new(2));
+            let dependent = driver_runtime.block_on(async {
+                let dependent = registry
+                    .mount(
+                        PluginFactory::new_lifecycle("durable-remove-dependent", {
+                            let entered_tx = entered_tx.clone();
+                            let release = release.clone();
+                            move |_, _| {
+                                let entered_tx = entered_tx.clone();
+                                let release = release.clone();
+                                LifecycleEffect::disposer(LifecycleDisposer::new(
+                                    move || async move {
+                                        if let Some(sender) = lock(&entered_tx).take() {
+                                            let _ = sender.send(());
+                                        }
+                                        release.wait().await;
+                                        Ok(())
+                                    },
+                                ))
+                            }
+                        })
+                        .with_inject(["durable-remove"]),
+                        ConfigValue::default(),
+                    )
+                    .unwrap();
+                dependent
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                dependent
+            });
+
+            let operation = {
+                let _runtime = caller_runtime.enter();
+                registry.begin_remove_provider(&provider).unwrap()
+            };
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            drop(operation);
+            drop(caller_runtime);
+            driver_runtime.block_on(release.wait());
+            driver_runtime.block_on(async {
+                dependent.await_current().await.unwrap();
+                for _ in 0..128 {
+                    if registry.get::<u32>("durable-remove").is_none() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                panic!("provider removal coordinator did not compare-delete");
+            });
+        });
+    }
+
+    #[test]
+    fn delete_coordinator_survives_temporary_caller_runtime_drop() {
+        production_result_with_timeout(|| {
+            let driver_runtime = tokio::runtime::Runtime::new().unwrap();
+            let caller_runtime = tokio::runtime::Runtime::new().unwrap();
+            let registry = LifecycleRegistry::new();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+            let release = Arc::new(tokio::sync::Barrier::new(2));
+            let factory = PluginFactory::new_lifecycle("durable-delete", {
+                let entered_tx = entered_tx.clone();
+                let release = release.clone();
+                move |_, _| {
+                    let entered_tx = entered_tx.clone();
+                    let release = release.clone();
+                    LifecycleEffect::disposer(LifecycleDisposer::new(move || async move {
+                        if let Some(sender) = lock(&entered_tx).take() {
+                            let _ = sender.send(());
+                        }
+                        release.wait().await;
+                        Ok(())
+                    }))
+                }
+            });
+            let handle = driver_runtime.block_on(async {
+                let handle = registry
+                    .mount(factory.clone(), ConfigValue::default())
+                    .unwrap();
+                handle
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                handle
+            });
+            let operation = {
+                let _runtime = caller_runtime.enter();
+                registry.begin_delete_factory(&factory).unwrap()
+            };
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            drop(operation);
+            drop(caller_runtime);
+            driver_runtime.block_on(release.wait());
+            driver_runtime.block_on(async {
+                let _ = handle.await_current().await;
+                for _ in 0..128 {
+                    if !lock(&registry.inner.state)
+                        .runtimes
+                        .contains_key(&factory.id())
+                    {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                panic!("factory deletion coordinator did not remove the runtime");
+            });
+        });
+    }
+
+    #[test]
+    fn shutdown_coordinator_survives_temporary_caller_runtime_drop() {
+        production_result_with_timeout(|| {
+            let driver_runtime = tokio::runtime::Runtime::new().unwrap();
+            let caller_runtime = tokio::runtime::Runtime::new().unwrap();
+            let registry = LifecycleRegistry::new();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+            let release = Arc::new(tokio::sync::Barrier::new(2));
+            let handle = driver_runtime.block_on(async {
+                let handle = registry
+                    .mount(
+                        PluginFactory::new_lifecycle("durable-shutdown", {
+                            let entered_tx = entered_tx.clone();
+                            let release = release.clone();
+                            move |_, _| {
+                                let entered_tx = entered_tx.clone();
+                                let release = release.clone();
+                                LifecycleEffect::disposer(LifecycleDisposer::new(
+                                    move || async move {
+                                        if let Some(sender) = lock(&entered_tx).take() {
+                                            let _ = sender.send(());
+                                        }
+                                        release.wait().await;
+                                        Ok(())
+                                    },
+                                ))
+                            }
+                        }),
+                        ConfigValue::default(),
+                    )
+                    .unwrap();
+                handle
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                handle
+            });
+            let operation = {
+                let _runtime = caller_runtime.enter();
+                registry.begin_shutdown().unwrap()
+            };
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            drop(operation);
+            drop(caller_runtime);
+            driver_runtime.block_on(release.wait());
+            driver_runtime.block_on(async {
+                let _ = handle.await_current().await;
+                for _ in 0..128 {
+                    if lock(&registry.inner.state).runtimes.is_empty() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                panic!("shutdown coordinator did not clear runtimes");
+            });
+        });
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one oracle exercises the shared owner fence in public and reconcile transactions"
+    )]
+    async fn managed_owner_commit_gap_rejects_public_and_reconcile_epochs() {
+        let registry = LifecycleRegistry::new();
+        let owner = registry
+            .mount(
+                PluginFactory::new_lifecycle("gap-owner", |_, _| LifecycleEffect::none()),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        owner
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let owner_control = owner.control().unwrap();
+        let public_dependent = registry
+            .mount(
+                PluginFactory::new_lifecycle("gap-public-dependent", |_, _| {
+                    LifecycleEffect::none()
+                })
+                .with_inject(["gap-public"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        let public_control = public_dependent.control().unwrap();
+        let public_before = machine_boundary_snapshot(&public_control);
+        let request = ProviderMutationRequest::Provide {
+            owner: owner.fiber(),
+            key: RuntimeProviderKey::new("root", "gap-public"),
+            value: Arc::new(1_u32),
+            guard: None,
+        };
+        let (plan, outcomes) = {
+            let state = lock(&registry.inner.state);
+            let plan = plan_provider_mutation(&state, registry.inner.id, &request).unwrap();
+            let drafts = affected_controls_locked(&state, &plan.key)
+                .into_iter()
+                .map(|control| {
+                    let observations =
+                        provider_observations_with_plan_locked(&state, &control, &plan);
+                    let (config_revision, tombstone) = {
+                        let machine = lock(&control.machine);
+                        (machine.config_revision, machine.tombstone)
+                    };
+                    ProviderControlDraft {
+                        control,
+                        config_revision,
+                        tombstone,
+                        observations,
+                    }
+                })
+                .collect();
+            (
+                plan,
+                evaluate_provider_control_drafts(registry.inner.id, drafts),
+            )
+        };
+        FiberControl::apply_transition_state_locked(
+            &mut lock(&owner_control.machine),
+            FiberState::Unloading,
+        );
+        let rejected = commit_provider_mutation_if_current(&registry.inner, &plan, &outcomes);
+        assert!(matches!(
+            rejected,
+            Ok(None) | Err(CordisError::FiberDisposed { .. })
+        ));
+        assert_eq!(machine_boundary_snapshot(&public_control), public_before);
+        assert!(registry.get::<u32>("gap-public").is_none());
+        FiberControl::apply_transition_state_locked(
+            &mut lock(&owner_control.machine),
+            FiberState::Active,
+        );
+
+        registry
+            .provide_for(
+                &owner.fiber(),
+                "root".to_string(),
+                "gap-existing".to_string(),
+                2_u32,
+                None,
+            )
+            .unwrap();
+        let reconcile_dependent = registry
+            .mount(
+                PluginFactory::new_lifecycle("gap-reconcile-dependent", |_, _| {
+                    LifecycleEffect::none()
+                })
+                .with_inject(["gap-existing"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        reconcile_dependent
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let reconcile_control = reconcile_dependent.control().unwrap();
+        {
+            let mut machine = lock(&reconcile_control.machine);
+            machine.desired = None;
+            machine.committed = None;
+            machine.state = FiberState::Pending;
+        }
+        let reconcile_before = machine_boundary_snapshot(&reconcile_control);
+        let drafts =
+            stage_reconciliation(&registry.inner, std::slice::from_ref(&reconcile_control));
+        let outcomes = evaluate_provider_control_drafts(registry.inner.id, drafts);
+        FiberControl::apply_transition_state_locked(
+            &mut lock(&owner_control.machine),
+            FiberState::Unloading,
+        );
+        assert!(
+            !commit_reconciliation_if_current(
+                &registry.inner,
+                std::slice::from_ref(&reconcile_control),
+                &outcomes,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            machine_boundary_snapshot(&reconcile_control),
+            reconcile_before
+        );
+    }
+
+    #[test]
+    fn direct_get_hides_a_managed_provider_after_its_driver_dies() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let registry = LifecycleRegistry::new();
+        let owner = runtime.block_on(async {
+            let owner = registry
+                .mount(
+                    PluginFactory::new_lifecycle("dead-get-owner", |_, view| {
+                        view.provide("dead-get", 55_u32)?;
+                        Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                    }),
+                    ConfigValue::default(),
+                )
+                .unwrap();
+            owner
+                .fiber()
+                .wait_until_active(LifecycleCancellation::default())
+                .await
+                .unwrap();
+            owner
+        });
+        assert_eq!(registry.get::<u32>("dead-get").as_deref(), Some(&55));
+        drop(runtime);
+        assert!(registry.get::<u32>("dead-get").is_none());
+        drop(owner);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provisional_commit_gap_does_not_publish_a_dead_managed_owner() {
+        let registry = LifecycleRegistry::new();
+        let owner = registry
+            .mount(
+                PluginFactory::new_lifecycle("provisional-gap-existing-owner", |_, _| {
+                    LifecycleEffect::none()
+                }),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        owner
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let owner_control = owner.control().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let guard: ProviderGuard = Arc::new({
+            let entered_tx = entered_tx.clone();
+            let release = release.clone();
+            let blocked = blocked.clone();
+            move |_| {
+                if !blocked.swap(true, Ordering::SeqCst) {
+                    if let Some(sender) = lock(&entered_tx).take() {
+                        let _ = sender.send(());
+                    }
+                    release.wait();
+                }
+                Ok(true)
+            }
+        });
+        registry
+            .provide_for(
+                &owner.fiber(),
+                "root".to_string(),
+                "provisional-gap-existing".to_string(),
+                71_u32,
+                Some(guard),
+            )
+            .unwrap();
+        let dependent = registry
+            .mount(
+                PluginFactory::new_lifecycle("provisional-gap-dependent", |_, _| {
+                    LifecycleEffect::none()
+                })
+                // Missing provisional key comes first so initial mount does
+                // not invoke the existing provider guard.
+                .with_inject(["provisional-gap-new", "provisional-gap-existing"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        let dependent_control = dependent.control().unwrap();
+        let activation_owner = registry
+            .mount(
+                PluginFactory::new_lifecycle("provisional-gap-new-owner", |_, view| {
+                    view.provide("provisional-gap-new", 72_u32)?;
+                    Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                }),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        entered_rx.await.unwrap();
+        {
+            let mut machine = lock(&owner_control.machine);
+            FiberControl::apply_transition_state_locked(&mut machine, FiberState::Unloading);
+        }
+        release.wait();
+        activation_owner.await_current().await.unwrap();
+
+        let machine = lock(&dependent_control.machine);
+        for epoch in machine.desired.iter().chain(machine.committed.iter()) {
+            assert!(
+                epoch
+                    .dependencies()
+                    .iter()
+                    .all(|dependency| dependency.owner_uid() != owner.fiber().uid())
+            );
+        }
+        assert_eq!(machine.state, FiberState::Pending);
     }
 }
