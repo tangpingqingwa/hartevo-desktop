@@ -101,7 +101,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
                 "context": "Governance / PR admission",
                 "controllerJob": "Governance / PR admission",
                 "gate": "required-check-and-commit-status",
-                "latestRunFence": "maximum-observed-target-run-id",
+                "latestRunFence": "highest-actions-run-id-after-older-drain",
                 "mutation": "exact-head-commit-status-only",
                 "beforeExactReview": "pending",
                 "validExactReview": "success",
@@ -345,30 +345,85 @@ class RepositoryGovernanceTests(unittest.TestCase):
         self.assertEqual(governance.admission_merge_gate("success", "failure"), "BLOCKED")
         self.assertEqual(governance.admission_merge_gate("success", "success"), "READY")
 
-    def test_older_ready_run_cannot_overwrite_newer_invalid_run(self) -> None:
-        context = "Governance / PR admission"
-        statuses = [
+    def test_newer_invalid_run_reconciles_after_older_ready_fence_to_post_race(self) -> None:
+        head = "a" * 40
+
+        # A passed its final fence before B existed. Once B starts, B must not
+        # publish until A has posted and completed.
+        a_alone = governance.admission_run_order(
             {
-                "context": context,
-                "state": "pending",
-                "target_url": "https://github.com/tangpingqingwa/hartevo-desktop/actions/runs/12",
+                "total_count": 1,
+                "workflow_runs": [{"id": 10, "head_sha": head, "status": "in_progress"}],
             },
+            head_sha=head,
+            run_id=10,
+        )
+        self.assertTrue(a_alone["current"])
+        self.assertEqual(a_alone["olderActiveRunIds"], [])
+
+        b_waits = governance.admission_run_order(
             {
-                "context": context,
-                "state": "success",
-                "target_url": "https://github.com/tangpingqingwa/hartevo-desktop/actions/runs/10",
+                "total_count": 2,
+                "workflow_runs": [
+                    {"id": 12, "head_sha": head, "status": "in_progress"},
+                    {"id": 10, "head_sha": head, "status": "in_progress"},
+                ],
             },
+            head_sha=head,
+            run_id=12,
+        )
+        self.assertEqual(b_waits["olderActiveRunIds"], [10])
+
+        # A may now land its stale success, but B observes A completed and is
+        # necessarily the later final writer; B's INVALID failure is final.
+        b_last = governance.admission_run_order(
             {
-                "context": "PR / Scope plan",
-                "state": "success",
-                "target_url": "https://github.com/tangpingqingwa/hartevo-desktop/actions/runs/99",
+                "total_count": 2,
+                "workflow_runs": [
+                    {"id": 12, "head_sha": head, "status": "in_progress"},
+                    {"id": 10, "head_sha": head, "status": "completed"},
+                ],
             },
-        ]
-        older = governance.admission_run_fence(statuses, context=context, run_id=10)
-        newer = governance.admission_run_fence(statuses, context=context, run_id=12)
-        self.assertFalse(older["current"])
-        self.assertEqual(older["maxObservedRunId"], 12)
-        self.assertTrue(newer["current"])
+            head_sha=head,
+            run_id=12,
+        )
+        self.assertTrue(b_last["current"])
+        self.assertEqual(b_last["olderActiveRunIds"], [])
+        self.assertEqual(governance.admission_merge_gate("success", "failure"), "BLOCKED")
+
+        a_after_b_exists = governance.admission_run_order(
+            {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"id": 12, "head_sha": head, "status": "in_progress"},
+                    {"id": 10, "head_sha": head, "status": "in_progress"},
+                ],
+            },
+            head_sha=head,
+            run_id=10,
+        )
+        self.assertFalse(a_after_b_exists["current"])
+
+    def test_admission_run_order_fails_closed_on_partial_or_unlisted_truth(self) -> None:
+        head = "a" * 40
+        with self.assertRaises(governance.GovernanceError):
+            governance.admission_run_order(
+                {
+                    "total_count": 101,
+                    "workflow_runs": [{"id": 12, "head_sha": head, "status": "in_progress"}],
+                },
+                head_sha=head,
+                run_id=12,
+            )
+        with self.assertRaises(governance.GovernanceError):
+            governance.admission_run_order(
+                {
+                    "total_count": 1,
+                    "workflow_runs": [{"id": 10, "head_sha": head, "status": "completed"}],
+                },
+                head_sha=head,
+                run_id=12,
+            )
 
     def test_exact_path_lease_rejects_outside_change(self) -> None:
         value = self.admission()

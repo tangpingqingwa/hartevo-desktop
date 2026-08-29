@@ -47,14 +47,15 @@ status, so Rust checks are not rerun merely to clear an old admission failure.
 Any code push changes the head and invalidates old records.
 
 The trusted token has `statuses: write` solely for this exact-head commit
-status. Contents and pull requests remain read-only. Checkout, review-API,
-verifier, or status-API failures fail the same-name required CheckRun, so an
-older green status cannot fail open. A maximum observed workflow-run-id fence,
-checked before pending and again before the final decision, prevents an older
-READY event from overwriting a newer WAITING or INVALID event on the same SHA.
-Same-head runs are not cancelled, avoiding cancelled required CheckRuns. The
-protected ruleset still requires the same four contexts; neither approval
-count nor bypass policy changes.
+status. Actions, contents, and pull requests remain read-only. Checkout,
+review-API, verifier, or status-API failures fail the same-name required
+CheckRun, so an older green status cannot fail open. Same-head runs are not
+cancelled. The highest GitHub Actions run ID waits until every older run has
+completed and then publishes last; an older READY event therefore cannot
+overwrite a newer WAITING or INVALID event even if it passed an earlier
+freshness check. The 100-run observation bound fails closed rather than using
+partial ordering evidence. The protected ruleset still requires the same four
+contexts; neither approval count nor bypass policy changes.
 
 ## High-risk changes
 

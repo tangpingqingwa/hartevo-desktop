@@ -96,7 +96,7 @@
     "context": "Governance / PR admission",
     "controllerJob": "Governance / PR admission",
     "gate": "required-check-and-commit-status",
-    "latestRunFence": "maximum-observed-target-run-id",
+    "latestRunFence": "highest-actions-run-id-after-older-drain",
     "mutation": "exact-head-commit-status-only",
     "beforeExactReview": "pending",
     "validExactReview": "success",

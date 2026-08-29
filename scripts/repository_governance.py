@@ -44,11 +44,10 @@ REVIEW_SCHEMA = "hartevo-independent-review-receipt/v1"
 ADMISSION_SCHEMA = "hartevo-pr-admission/v1"
 GITHUB_REVIEW_SCHEMA = "hartevo-github-review/v1"
 ADMISSION_CLASSIFICATION_SCHEMA = "hartevo-pr-admission-classification/v1"
-ADMISSION_RUN_FENCE_SCHEMA = "hartevo-admission-run-fence/v1"
+ADMISSION_RUN_ORDER_SCHEMA = "hartevo-admission-run-order/v1"
 ZERO_DIGEST = "0" * 64
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-ACTION_RUN_TARGET = re.compile(r"/actions/runs/([0-9]+)(?:$|[/?#])")
 ADMISSION_BLOCK = re.compile(r"<!--\s*hartevo-governance\s*(\{.*?\})\s*-->", re.DOTALL)
 GITHUB_REVIEW_BLOCK = re.compile(r"<!--\s*hartevo-github-review\s*(\{.*?\})\s*-->", re.DOTALL)
 REPOSITORY_LIFECYCLE_FIELDS = {
@@ -383,7 +382,7 @@ def verify_policy_value(policy: dict[str, object]) -> dict[str, object]:
         "context": "Governance / PR admission",
         "controllerJob": "Governance / PR admission",
         "gate": "required-check-and-commit-status",
-        "latestRunFence": "maximum-observed-target-run-id",
+        "latestRunFence": "highest-actions-run-id-after-older-drain",
         "mutation": "exact-head-commit-status-only",
         "beforeExactReview": "pending",
         "validExactReview": "success",
@@ -983,30 +982,45 @@ def admission_merge_gate(controller_check: object, commit_status: object) -> str
     return "READY" if controller_check == "success" and commit_status == "success" else "BLOCKED"
 
 
-def admission_run_fence(statuses: object, *, context: str, run_id: int) -> dict[str, object]:
-    """Prevent an older same-head event from overwriting a newer decision."""
+def admission_run_order(runs_payload: object, *, head_sha: str, run_id: int) -> dict[str, object]:
+    """Order same-head controller publication by GitHub Actions run id."""
 
-    if not isinstance(statuses, list):
-        raise GovernanceError("exact-head commit statuses must be a list")
-    if not context or run_id <= 0:
-        raise GovernanceError("admission run fence requires a context and positive run id")
-    observed: list[int] = []
-    for status in statuses:
-        if not isinstance(status, dict):
-            raise GovernanceError("exact-head commit status entry must be an object")
-        if status.get("context") != context:
-            continue
-        target_url = status.get("target_url")
-        match = ACTION_RUN_TARGET.search(target_url) if isinstance(target_url, str) else None
-        if match:
-            observed.append(int(match.group(1)))
-    maximum = max(observed, default=0)
+    if not isinstance(runs_payload, dict):
+        raise GovernanceError("exact-head workflow-runs response must be an object")
+    require_sha(head_sha, "admission run-order head SHA")
+    if run_id <= 0:
+        raise GovernanceError("admission run order requires a positive run id")
+    total_count = runs_payload.get("total_count")
+    runs = runs_payload.get("workflow_runs")
+    if not isinstance(total_count, int) or total_count < 0 or not isinstance(runs, list):
+        raise GovernanceError("exact-head workflow-runs response is malformed")
+    if total_count > 100 or total_count != len(runs):
+        raise GovernanceError("exact-head workflow-runs response exceeds the fail-closed page bound")
+    normalized: list[dict[str, object]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            raise GovernanceError("exact-head workflow run must be an object")
+        observed_id = run.get("id")
+        status = run.get("status")
+        if run.get("head_sha") != head_sha or not isinstance(observed_id, int) or observed_id <= 0 or not isinstance(status, str):
+            raise GovernanceError("exact-head workflow run identity is malformed")
+        normalized.append({"id": observed_id, "status": status})
+    observed = [int(run["id"]) for run in normalized]
+    if run_id not in observed:
+        raise GovernanceError("current admission workflow run is not visible in exact-head order")
+    maximum = max(observed)
+    older_active = sorted(
+        int(run["id"])
+        for run in normalized
+        if int(run["id"]) < run_id and run["status"] != "completed"
+    )
     return {
-        "schema": ADMISSION_RUN_FENCE_SCHEMA,
+        "schema": ADMISSION_RUN_ORDER_SCHEMA,
         "status": "PASS",
         "current": maximum <= run_id,
         "runId": run_id,
         "maxObservedRunId": maximum,
+        "olderActiveRunIds": older_active,
     }
 
 
@@ -1792,7 +1806,7 @@ def verify_repository(root: Path) -> dict[str, object]:
         and event["payload"].get("ordinaryPreReview") == "pending"
         and event["payload"].get("requiredContext") == "Governance / PR admission"
         and event["payload"].get("requiredCheckAndStatus") == "both"
-        and event["payload"].get("latestRunFence") == "maximum-observed-target-run-id"
+        and event["payload"].get("latestRunFence") == "highest-actions-run-id-after-older-drain"
         and event["payload"].get("statusMutation") == "exact-head-commit-status-only"
         and event["payload"].get("mainline") == "Cordis"
         and event["payload"].get("historicalPrWaves") == "frozen"
@@ -2010,10 +2024,10 @@ def main(argv: Iterable[str]) -> int:
             help="read-only GitHub API review JSON captured by trusted admission",
         )
 
-    run_fence_parser = subparsers.add_parser("admission-run-fence")
-    run_fence_parser.add_argument("--statuses", type=Path, required=True)
-    run_fence_parser.add_argument("--context", required=True)
-    run_fence_parser.add_argument("--run-id", type=int, required=True)
+    run_order_parser = subparsers.add_parser("admission-run-order")
+    run_order_parser.add_argument("--runs", type=Path, required=True)
+    run_order_parser.add_argument("--head-sha", required=True)
+    run_order_parser.add_argument("--run-id", type=int, required=True)
 
     append_parser = subparsers.add_parser("append-event")
     append_parser.add_argument("--ledger", type=Path, default=LEDGER_PATH)
@@ -2096,11 +2110,11 @@ def main(argv: Iterable[str]) -> int:
                 ),
                 None,
             )
-        elif args.command == "admission-run-fence":
+        elif args.command == "admission-run-order":
             write_json(
-                admission_run_fence(
-                    read_json(args.statuses),
-                    context=args.context,
+                admission_run_order(
+                    read_json(args.runs),
+                    head_sha=args.head_sha,
                     run_id=args.run_id,
                 ),
                 None,

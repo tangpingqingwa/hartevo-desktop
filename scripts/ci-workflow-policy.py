@@ -847,14 +847,17 @@ def validate_pr_secrets(path: Path, text: str) -> None:
             "git fetch --no-tags --no-write-fetch-head origin \"$HEAD_SHA\"",
             "--trusted-base",
             "pull_request_review:",
+            "actions: read",
             "statuses: write",
             "Mark exact head admission pending",
             "name: Governance / PR admission",
             "STATUS_CONTEXT: Governance / PR admission",
             "statuses/$HEAD_SHA",
             "Fence stale exact-head controller run",
-            "Recheck exact-head controller freshness",
-            "admission-run-fence",
+            "Order exact-head controller publication",
+            "admission-run-order",
+            "actions/workflows/governance-admission.yml/runs?head_sha=$HEAD_SHA&per_page=100",
+            "test \"$total_count\" -eq \"$listed_count\"",
             "classify-pr-event",
             "Capture read-only exact-head GitHub review evidence",
             "pulls/$PR_NUMBER/reviews",
@@ -978,11 +981,16 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "name: Governance / PR admission",
             "Mark exact head admission pending",
             "Fence stale exact-head controller run",
-            "Recheck exact-head controller freshness",
-            "commits/$HEAD_SHA/statuses?per_page=100",
+            "Order exact-head controller publication",
+            "actions/workflows/governance-admission.yml/runs?head_sha=$HEAD_SHA&per_page=100",
             "steps.final-fence.outputs.current == 'true'",
-            "repository_governance.py admission-run-fence",
+            "repository_governance.py admission-run-order",
+            "olderActiveRunIds",
+            "deadline=$((SECONDS + 600))",
+            "test \"$SECONDS\" -lt \"$deadline\"",
+            "sleep 3",
             "WAITING_REVIEW",
+            "actions: read",
             "statuses: write",
             "statuses/$HEAD_SHA",
             "github.event.pull_request.base.sha",
@@ -996,6 +1004,8 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the trusted governance admission contract")
+        if text.index("Order exact-head controller publication") > text.index("Publish exact head admission decision"):
+            raise PolicyError(f"{path} must drain older same-head runs before final status publication")
         if re.search(r"\b(contents|issues|pull-requests):\s*write\b", text):
             raise PolicyError(f"{path} trusted admission may not mutate repository or pull-request content")
     elif path.name == "release-promotion.yml":
