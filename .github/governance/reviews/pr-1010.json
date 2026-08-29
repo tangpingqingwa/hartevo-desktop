@@ -1,0 +1,16 @@
+{
+  "authorTaskId": "integration-pr-number-recovery-author-20260830",
+  "baseSha": "d6e24b1eebd6a7042690d197d6d905c89c7d66cf",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "scripts/ci-merge-train.py"
+  ],
+  "pr": 1010,
+  "receiptDigest": "7f92de3f8d5b288053084eef40ab8d46f6f68773709490794ec248df91650ef6",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-29T20:45:09Z",
+  "reviewedHeadSha": "b211b78d9392d00ee7ac75a708482ab5c55e73fe",
+  "reviewerTaskId": "integration-pr-number-recovery-review-b211b78d9392-20260830",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
