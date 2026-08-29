@@ -687,6 +687,58 @@ async fn stale_guard_result_cannot_overwrite_rebound_provider_fact() {
 }
 
 #[tokio::test]
+async fn guard_false_and_typed_error_keep_dependency_pending_and_run_lock_free() {
+    let registry = LifecycleRegistry::new();
+    registry.provide("guard-probe", 7_u8).unwrap();
+    let phase = Arc::new(AtomicUsize::new(0));
+    let expected = CordisError::PayloadType {
+        name: "guard-rejected".to_string(),
+    };
+    let provider = registry
+        .provide_guarded("guarded-dependency", 1_u32, {
+            let registry = registry.clone();
+            let phase = phase.clone();
+            let expected = expected.clone();
+            move |_value| {
+                // This reacquires the registry from inside user guard code. It
+                // would deadlock if reconcile retained the provider lock.
+                assert_eq!(registry.get::<u8>("guard-probe").as_deref(), Some(&7));
+                if phase.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(false)
+                } else {
+                    Err(expected.clone())
+                }
+            }
+        })
+        .unwrap();
+    let consumer = registry
+        .mount(
+            PluginFactory::new_lifecycle("guard-pending", |_config, _ctx| LifecycleEffect::none())
+                .with_inject(["guarded-dependency"]),
+            ConfigValue::default(),
+        )
+        .unwrap();
+
+    let false_snapshot = consumer.await_current().await.unwrap();
+    assert_eq!(false_snapshot.state(), FiberState::Pending);
+    assert!(false_snapshot.diagnostics().is_empty());
+    let replacement = registry.replace_provider(&provider, 2_u32).unwrap();
+    assert_eq!(replacement.generation(), 1);
+
+    let error_snapshot = consumer.await_current().await.unwrap();
+    assert_eq!(error_snapshot.state(), FiberState::Pending);
+    assert!(error_snapshot.diagnostics().iter().any(|diagnostic| {
+        matches!(
+            diagnostic,
+            CordisError::ProviderGuard { namespace, key, source }
+                if namespace == "root"
+                    && key == "guarded-dependency"
+                    && source.as_ref() == &expected
+        )
+    }));
+}
+
+#[tokio::test]
 async fn dropped_delete_waiter_keeps_runtime_deleting_until_cleanup_then_allows_fresh_generation() {
     let starts = Arc::new(AtomicUsize::new(0));
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
@@ -868,7 +920,7 @@ async fn one_shot_handle_rejects_restart_and_update_before_state_change() {
 }
 
 #[tokio::test]
-async fn successful_root_restart_keeps_root_and_child_ids_and_reloads_each_once() {
+async fn repeated_root_restart_keeps_root_and_child_ids_and_reloads_each_time() {
     let calls = Arc::new(AtomicUsize::new(0));
     let cleanups = Arc::new(AtomicUsize::new(0));
     let factory = PluginFactory::new_lifecycle("root-success", {
@@ -891,15 +943,18 @@ async fn successful_root_restart_keeps_root_and_child_ids_and_reloads_each_once(
         .wait_until_active(LifecycleCancellation::default())
         .await
         .unwrap();
-    let snapshots = registry.restart_root().await.unwrap();
+    let first = registry.restart_root().await.unwrap();
+    let second = registry.restart_root().await.unwrap();
 
     assert_eq!(root_uid, FiberUid::ROOT);
     assert_eq!(registry.root_fiber().uid(), root_uid);
     assert_eq!(handle.fiber().uid(), child_uid);
-    assert_eq!(snapshots.len(), 1);
-    assert_eq!(snapshots[0].state(), FiberState::Active);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_eq!(first[0].state(), FiberState::Active);
+    assert_eq!(second[0].state(), FiberState::Active);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(cleanups.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1108,4 +1163,162 @@ async fn provider_remove_during_loading_unloads_once_then_pending() {
             FiberState::Pending,
         ]
     );
+}
+
+#[tokio::test]
+async fn await_current_waiters_capture_distinct_tickets_but_settle_on_latest_commit() {
+    let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+    let cleanup_tx = Arc::new(Mutex::new(Some(cleanup_tx)));
+    let cleanup_release = Arc::new(tokio::sync::Barrier::new(2));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let factory = PluginFactory::new_lifecycle("await-ticket-linearization", {
+        let cleanup_tx = cleanup_tx.clone();
+        let cleanup_release = cleanup_release.clone();
+        let starts = starts.clone();
+        move |_config, _ctx| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            let cleanup_tx = cleanup_tx.clone();
+            let cleanup_release = cleanup_release.clone();
+            LifecycleEffect::disposer(LifecycleDisposer::new(move || async move {
+                let sender = cleanup_tx.lock().unwrap().take();
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                    cleanup_release.wait().await;
+                }
+                Ok(())
+            }))
+        }
+    });
+    let registry = LifecycleRegistry::new();
+    let handle = registry
+        .mount(factory, ConfigValue::string("initial"))
+        .unwrap();
+    handle
+        .fiber()
+        .wait_until_active(LifecycleCancellation::default())
+        .await
+        .unwrap();
+
+    let first_update_handle = handle.clone();
+    let mut first_update = Box::pin(first_update_handle.update(ConfigValue::string("first")));
+    assert!(first_update.as_mut().now_or_never().is_none());
+    cleanup_rx.await.unwrap();
+    let first_waiter_handle = handle.clone();
+    let mut first_waiter = Box::pin(first_waiter_handle.await_current());
+    assert!(first_waiter.as_mut().now_or_never().is_none());
+    let first_ticket = handle.snapshot().ticket().unwrap().serial();
+
+    let second_update_handle = handle.clone();
+    let mut second_update = Box::pin(second_update_handle.update(ConfigValue::string("second")));
+    assert!(second_update.as_mut().now_or_never().is_none());
+    let second_waiter_handle = handle.clone();
+    let mut second_waiter = Box::pin(second_waiter_handle.await_current());
+    assert!(second_waiter.as_mut().now_or_never().is_none());
+    let second_ticket = handle.snapshot().ticket().unwrap().serial();
+    assert!(second_ticket > first_ticket);
+    cleanup_release.wait().await;
+
+    let first_update_snapshot = first_update.await.unwrap();
+    let second_update_snapshot = second_update.await.unwrap();
+    let first_waiter_snapshot = first_waiter.await.unwrap();
+    let second_waiter_snapshot = second_waiter.await.unwrap();
+    assert_eq!(first_waiter_snapshot, second_waiter_snapshot);
+    assert_eq!(first_update_snapshot, second_update_snapshot);
+    assert_eq!(first_waiter_snapshot, second_update_snapshot);
+    assert_eq!(first_waiter_snapshot.state(), FiberState::Active);
+    assert_eq!(
+        first_waiter_snapshot
+            .committed_epoch()
+            .unwrap()
+            .config_revision(),
+        2
+    );
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn root_restart_linearizes_before_concurrent_one_shot_mount_without_restarting_it() {
+    let repeatable_starts = Arc::new(AtomicUsize::new(0));
+    let repeatable_cleanups = Arc::new(AtomicUsize::new(0));
+    let repeatable = PluginFactory::new_lifecycle("restart-first-repeatable", {
+        let repeatable_starts = repeatable_starts.clone();
+        let repeatable_cleanups = repeatable_cleanups.clone();
+        move |_config, _ctx| {
+            repeatable_starts.fetch_add(1, Ordering::SeqCst);
+            let repeatable_cleanups = repeatable_cleanups.clone();
+            LifecycleEffect::disposer(LifecycleDisposer::sync(move || {
+                repeatable_cleanups.fetch_add(1, Ordering::SeqCst);
+            }))
+        }
+    });
+    let one_shot_starts = Arc::new(AtomicUsize::new(0));
+    let one_shot = PluginFactory::one_shot_lifecycle("restart-first-one-shot", {
+        let one_shot_starts = one_shot_starts.clone();
+        move |_config, _ctx| {
+            one_shot_starts.fetch_add(1, Ordering::SeqCst);
+            LifecycleEffect::none()
+        }
+    });
+    let registry = LifecycleRegistry::new();
+    let repeatable = registry.mount(repeatable, ConfigValue::default()).unwrap();
+    repeatable
+        .fiber()
+        .wait_until_active(LifecycleCancellation::default())
+        .await
+        .unwrap();
+
+    // Poll once to complete the registry+all-machine linearization without
+    // yielding this current-thread runtime to the worker.
+    let mut restart = Box::pin(registry.restart_root());
+    assert!(restart.as_mut().now_or_never().is_none());
+    let one_shot = registry.mount(one_shot, ConfigValue::default()).unwrap();
+    assert_eq!(restart.await.unwrap().len(), 1);
+    one_shot
+        .fiber()
+        .wait_until_active(LifecycleCancellation::default())
+        .await
+        .unwrap();
+
+    assert_eq!(repeatable_starts.load(Ordering::SeqCst), 2);
+    assert_eq!(repeatable_cleanups.load(Ordering::SeqCst), 1);
+    assert_eq!(one_shot_starts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn owned_async_begin_operations_fail_before_mutation_without_a_runtime() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (registry, provider, factory, handle) = runtime.block_on(async {
+        let registry = LifecycleRegistry::new();
+        let provider = registry.provide("runtime-required", 1_u32).unwrap();
+        let factory = PluginFactory::new_lifecycle("runtime-required", |_config, _ctx| {
+            LifecycleEffect::none()
+        });
+        let handle = registry
+            .mount(factory.clone(), ConfigValue::default())
+            .unwrap();
+        handle
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        (registry, provider, factory, handle)
+    });
+    drop(runtime);
+    let before = handle.snapshot();
+
+    assert!(matches!(
+        registry.begin_remove_provider(&provider),
+        Err(CordisError::AsyncRuntimeUnavailable)
+    ));
+    assert!(matches!(
+        registry.begin_delete_factory(&factory),
+        Err(CordisError::AsyncRuntimeUnavailable)
+    ));
+    assert!(matches!(
+        registry.begin_shutdown(),
+        Err(CordisError::AsyncRuntimeUnavailable)
+    ));
+    assert_eq!(handle.snapshot(), before);
+    assert_eq!(registry.runtime_count(), 1);
+    assert_eq!(registry.get::<u32>("runtime-required").as_deref(), Some(&1));
 }

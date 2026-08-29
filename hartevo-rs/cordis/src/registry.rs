@@ -383,9 +383,7 @@ impl LifecycleRegistry {
         factory: PluginFactory,
         config: ConfigValue,
     ) -> Result<LifecycleHandle, CordisError> {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return Err(CordisError::AsyncRuntimeUnavailable);
-        }
+        require_async_runtime()?;
         if !factory.supports_lifecycle() {
             return Err(CordisError::LifecycleFactoryRequired {
                 id: factory.plugin_id().clone(),
@@ -652,6 +650,7 @@ impl LifecycleRegistry {
         &self,
         handle: &LifecycleProviderHandle,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
+        require_async_runtime()?;
         self.validate_provider_handle(handle)?;
         let (removal_serial, waits) = {
             let mut state = lock(&self.inner.state);
@@ -781,6 +780,7 @@ impl LifecycleRegistry {
         &self,
         factory: &PluginFactory,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
+        require_async_runtime()?;
         let (generation, controls) = {
             let mut state = lock(&self.inner.state);
             let Some(runtime) = state.runtimes.get_mut(&factory.id()) else {
@@ -899,6 +899,7 @@ impl LifecycleRegistry {
     pub fn begin_shutdown(
         &self,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
+        require_async_runtime()?;
         let mut operation_slot = lock(&self.inner.shutdown_operation);
         if let Some(operation) = operation_slot.as_ref() {
             let operation = operation.clone();
@@ -2516,6 +2517,12 @@ fn spawn_unit_operation(
         let _ = driver.await;
     });
     operation.boxed()
+}
+
+fn require_async_runtime() -> Result<(), CordisError> {
+    tokio::runtime::Handle::try_current()
+        .map(|_| ())
+        .map_err(|_| CordisError::AsyncRuntimeUnavailable)
 }
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {

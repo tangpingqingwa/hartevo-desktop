@@ -302,7 +302,17 @@ struct FiberInner {
 ///
 /// A Fiber handle carries identity and state only.  It cannot mint a reserved
 /// provider authority or mutate a Context by itself; those operations require
-/// a Context/ContextView owned by the caller.
+/// a Context/ContextView or [`crate::LifecycleHandle`] owned by the caller.
+/// This applies equally to a captured sibling, ancestor, or root Fiber.
+///
+/// ```compile_fail
+/// use hartevo_cordis::Fiber;
+///
+/// fn cannot_mutate_a_captured_relative(relative: &Fiber) {
+///     let _ = relative.restart();
+///     let _ = relative.dispose_async();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct Fiber {
     inner: Arc<FiberInner>,
