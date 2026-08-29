@@ -13019,6 +13019,15 @@ impl ApplicationService {
         command: ProposePreviewEffect,
         now: DateTime<Utc>,
     ) -> Result<EffectId, ApplicationError> {
+        if mission
+            .effects
+            .iter()
+            .any(|effect| effect.id == command.effect_id)
+        {
+            return Err(ApplicationError::DuplicatePreviewEffectId(
+                command.effect_id,
+            ));
+        }
         let expected_revision = mission.revision;
         let effect_id = mission.propose_effect(
             EffectSpec {
@@ -22587,6 +22596,8 @@ pub enum ApplicationError {
     ProposedEffectApprovalUnavailable,
     #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
     ProposedEffectApprovalDigestMismatch,
+    #[error("preview Effect id already exists in this Mission: {0}")]
+    DuplicatePreviewEffectId(EffectId),
     #[error(
         "Creator Deliverable Review requires the exact Project, Mission, task, deliverable, CAS revision, and a typed ReviewDecision"
     )]

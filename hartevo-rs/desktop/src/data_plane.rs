@@ -11372,6 +11372,86 @@ sleep 30"#;
     }
 
     #[test]
+    fn duplicate_effect_id_with_new_idempotency_is_zero_mutation() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "验证 EffectId 在 Cordis 提案边界内保持唯一",
+                now,
+            )
+            .expect("proposal Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let expected_mission_revision = started.inventory.projects[0].missions[0].revision;
+        let effect_id = EffectId::from_stable("desktop-cordis-effect-proposal-duplicate");
+        plane
+            .propose_preview_effect_with(
+                &secrets,
+                DesktopPreviewEffectProposalRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    expected_mission_revision,
+                    proposal: waiting_approval_preview_proposal(effect_id.clone(), "first"),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("first proposal");
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(2))
+            .expect("application before duplicate");
+        let before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before duplicate");
+        let events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before duplicate");
+        drop(service);
+
+        let mut swapped = waiting_approval_preview_proposal(effect_id.clone(), "swapped");
+        swapped.description = "different proposal content for the same Effect id".into();
+        let duplicate = plane.propose_preview_effect_with(
+            &secrets,
+            DesktopPreviewEffectProposalRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                expected_mission_revision: before.revision,
+                proposal: swapped,
+            },
+            now + Duration::seconds(3),
+        );
+        assert!(matches!(
+            duplicate,
+            Err(DesktopDataError::Application(
+                ApplicationError::DuplicatePreviewEffectId(duplicate_id)
+            )) if duplicate_id == effect_id
+        ));
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("application after duplicate");
+        let after = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission after duplicate");
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.effects, before.effects);
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged duplicate events"),
+            events_before
+        );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
+    }
+
+    #[test]
     fn effect_proposal_request_debug_redacts_private_content() {
         let effect_id = EffectId::from_stable("desktop-cordis-effect-proposal-debug");
         let mut proposal = waiting_approval_preview_proposal(effect_id, "debug-secret");
