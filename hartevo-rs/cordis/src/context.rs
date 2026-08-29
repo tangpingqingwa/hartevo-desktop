@@ -147,6 +147,16 @@ pub struct PendingHandle {
     fiber: Fiber,
 }
 
+impl PartialEq for PendingHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.factory_id == other.factory_id
+            && self.fiber.uid() == other.fiber.uid()
+    }
+}
+
+impl Eq for PendingHandle {}
+
 impl PendingHandle {
     #[must_use]
     pub const fn id(&self) -> u64 {
@@ -277,6 +287,12 @@ pub enum CordisError {
     #[error("plugin factory `{id}` activation failed: {source}")]
     PluginActivation {
         id: PluginFactoryId,
+        #[source]
+        source: Box<CordisError>,
+    },
+    #[error("pending factory notification failed after committing {handle:?}: {source}")]
+    PendingNotification {
+        handle: PendingHandle,
         #[source]
         source: Box<CordisError>,
     },
@@ -441,6 +457,16 @@ impl Context {
         self.current_fiber
     }
 
+    fn current_namespace(&self) -> String {
+        if self.current_fiber == self.root.uid() {
+            "root".to_string()
+        } else {
+            self.fibers
+                .get(&self.current_fiber)
+                .map_or_else(|| "root".to_string(), Fiber::namespace)
+        }
+    }
+
     /// Number of live registration records, useful for lifecycle diagnostics.
     #[must_use]
     pub fn registration_count(&self) -> usize {
@@ -591,7 +617,12 @@ impl Context {
         self.activating_factories.remove(&handle.factory_id);
         self.mounted_factories
             .insert(handle.factory_id, fiber.clone());
-        self.notify_pending()?;
+        if let Err(source) = self.notify_pending() {
+            return Err(CordisError::PendingNotification {
+                handle: handle.clone(),
+                source: Box::new(source),
+            });
+        }
         Ok(handle)
     }
 
@@ -800,12 +831,14 @@ impl Context {
 
     #[must_use]
     pub fn has(&self, key: &str) -> bool {
-        self.services.contains_key(key)
+        let namespace = self.current_namespace();
+        self.has_in_namespace(&namespace, key)
     }
 
     #[must_use]
     pub fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
-        self.services.get(key)?.clone().downcast::<T>().ok()
+        let namespace = self.current_namespace();
+        self.get_in_namespace(&namespace, key)
     }
 
     #[must_use]
@@ -860,13 +893,7 @@ impl Context {
         value: T,
     ) -> Result<ProviderHandle, CordisError> {
         let owner_uid = self.current_fiber;
-        let namespace = if owner_uid == self.root.uid() {
-            "root".to_string()
-        } else {
-            self.fibers
-                .get(&owner_uid)
-                .map_or_else(|| "root".to_string(), Fiber::namespace)
-        };
+        let namespace = self.current_namespace();
         self.provide_in_namespace(namespace, owner_uid, key.into(), value)
     }
 
@@ -1088,7 +1115,10 @@ impl Context {
             owner_uid: record.owner_uid,
             generation: record.generation,
         };
-        self.replace_provider_for(self.root.uid(), &handle, value, true)
+        match self.replace_provider_for(self.root.uid(), &handle, value, true) {
+            Err(CordisError::ProviderNotification { source, .. }) => Err(*source),
+            result => result,
+        }
     }
 
     /// Set a plugin-context interpolation variable. Reversed on teardown.
@@ -1882,7 +1912,7 @@ fn conflict(name: &str, locked: DispatchMode, requested: DispatchMode) -> Cordis
 #[allow(clippy::items_after_test_module)]
 mod provider_tests {
     use super::*;
-    use crate::surface::{HartevoSurfaces, map_surfaces, trusted_surface_authority};
+    use crate::surface::{DomainSurface, HartevoSurfaces, map_surfaces, trusted_surface_authority};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -1976,6 +2006,36 @@ mod provider_tests {
             context.provider_snapshot(keys::EFFECT_BROKER).unwrap(),
             before_broker
         );
+    }
+
+    #[test]
+    fn reserved_rebind_does_not_expose_committed_handle_on_notification_error() {
+        let mut context = Context::new();
+        let authority = trusted_surface_authority();
+        map_surfaces(&mut context, authority, HartevoSurfaces::default()).unwrap();
+
+        let fiber = Fiber::child_with_namespace(context.id, &context.root, "root".to_string());
+        context.fibers.insert(fiber.uid(), fiber.clone());
+        context.registry.push(PendingEntry {
+            factory: PluginFactory::new("reserved-rebind-failure", |_config, _ctx| {
+                Err::<(), _>(CordisError::MissingDependencies(vec![
+                    "failure".to_string(),
+                ]))
+            }),
+            fiber,
+            namespace: "root".to_string(),
+            inject: Vec::new(),
+            config: ConfigValue::default(),
+        });
+
+        let error = context
+            .replace_reserved(authority, keys::DOMAIN, DomainSurface::default())
+            .unwrap_err();
+        assert!(matches!(error, CordisError::PluginActivation { .. }));
+        assert!(!matches!(error, CordisError::ProviderNotification { .. }));
+        let snapshot = context.provider_snapshot(keys::DOMAIN).unwrap();
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.notify_count, 1);
     }
 
     #[test]

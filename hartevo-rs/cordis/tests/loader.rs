@@ -404,6 +404,34 @@ fn mount_preserves_factory_fiber_owner_until_disposal() {
 }
 
 #[test]
+fn downstream_notification_error_returns_committed_factory_handle() {
+    let mut ctx = Context::new();
+    let downstream = PluginFactory::new("downstream-fails-after-starter", |_config, _ctx| {
+        Err::<(), _>(CordisError::MissingDependencies(vec![
+            "downstream".to_string(),
+        ]))
+    })
+    .with_inject(["dependency"]);
+    let downstream = ctx.mount_pending(downstream).unwrap();
+    let starter = PluginFactory::new("starter-provides-dependency", |_config, ctx| {
+        ctx.provide("dependency", Marker("ready")).map(|_| ())
+    });
+
+    let committed = match ctx.mount_pending(starter).unwrap_err() {
+        CordisError::PendingNotification { handle, .. } => handle,
+        other => panic!("expected committed factory handle, got {other:?}"),
+    };
+    assert!(committed.is_active());
+    assert!(downstream.is_disposed());
+    assert!(ctx.has("dependency"));
+
+    assert!(ctx.dispose_pending(&committed).unwrap());
+    assert!(committed.is_disposed());
+    assert!(!ctx.has("dependency"));
+    assert_eq!(ctx.pending_count(), 0);
+}
+
+#[test]
 fn failed_ready_factory_requeues_later_ready_factories() {
     let mut ctx = Context::new();
     let first = PluginFactory::new("ready-first-fails", |_config, _ctx| {
@@ -527,4 +555,37 @@ fn pending_config_interpolates_against_the_owning_fiber_metadata() {
         *seen.lock().expect("seen"),
         Some(ConfigValue::string("child"))
     );
+}
+
+#[test]
+fn isolated_factory_context_lookups_use_its_local_namespace() {
+    let mut ctx = Context::new();
+    ctx.provide("root-only", Marker("root")).unwrap();
+    let child = ctx.new_fiber().unwrap();
+    let seen = Arc::new(AtomicBool::new(false));
+    let seen_for_factory = Arc::clone(&seen);
+    let factory = PluginFactory::new("isolated-lookups", move |_config, ctx| {
+        assert!(ctx.has("local-dependency"));
+        assert!(!ctx.has("root-only"));
+        assert_eq!(
+            ctx.get::<Marker>("local-dependency").as_deref(),
+            Some(&Marker("local"))
+        );
+        assert!(ctx.get::<Marker>("root-only").is_none());
+        seen_for_factory.store(true, Ordering::SeqCst);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["local-dependency"]);
+
+    {
+        let mut view = ctx.with_fiber(&child).isolate("tenant");
+        let pending = view.mount_pending(factory).unwrap();
+        assert!(pending.is_pending());
+        view.provide("local-dependency", Marker("local")).unwrap();
+        assert!(pending.is_active());
+    }
+
+    assert!(seen.load(Ordering::SeqCst));
+    assert!(ctx.has("root-only"));
+    assert!(!ctx.has("local-dependency"));
 }
