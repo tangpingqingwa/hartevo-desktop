@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use hartevo_cordis::{
     AgentRef, Context, CordisError, CordisHost, DispatchMode, DomainSurface, EffectBrokerSurface,
-    EnvironmentOverlay, LlmStream, LoaderContext, MAPPED_KEYS, PluginId, RuntimeSurface,
-    SurfaceOwner, ToolCall, ToolsSurface, events, expected_mode, keys, register_agent,
-    register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
+    Emit, EnvironmentOverlay, EventKey, LlmStream, LoaderContext, MAPPED_KEYS, PluginId,
+    RuntimeSurface, SurfaceOwner, ToolCall, ToolsSurface, Waterfall, events, expected_mode, keys,
+    register_agent, register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
 };
 
 fn mapped() -> Context {
@@ -61,37 +61,61 @@ fn mapped_keys_are_provided_and_looked_up() {
 fn tools_pipeline_locks_exactly_one_mode_per_event() {
     let mut ctx = mapped();
     for name in [
-        events::TOOLS_PRE_EXECUTE,
-        events::TOOLS_EXECUTE,
-        events::TOOLS_POST_EXECUTE,
-        events::TOOLS_RESULT,
+        events::TOOLS_PRE_EXECUTE.name(),
+        events::TOOLS_EXECUTE.name(),
+        events::TOOLS_POST_EXECUTE.name(),
+        events::TOOLS_RESULT.name(),
     ] {
         assert_eq!(ctx.event_mode(name), expected_mode(name));
         assert_eq!(ctx.listener_count(name), 0);
     }
 
-    let conflict = ctx
-        .on_emit(events::TOOLS_PRE_EXECUTE, |_: &ToolCall| {})
-        .unwrap_err();
-    assert_eq!(
+    let wrong_emit = EventKey::<Emit, ToolCall, ()>::new(
+        events::TOOLS_PRE_EXECUTE.schema_id(),
+        events::TOOLS_PRE_EXECUTE.name(),
+    );
+    let conflict = ctx.on_emit(wrong_emit, |_: &ToolCall| {}).unwrap_err();
+    assert!(matches!(
         conflict,
-        CordisError::ModeConflict {
-            name: events::TOOLS_PRE_EXECUTE.to_string(),
-            locked: DispatchMode::Waterfall,
-            requested: DispatchMode::Emit,
-        }
+        CordisError::SchemaConflict { ref name, ref locked, ref requested }
+            if name == events::TOOLS_PRE_EXECUTE.name()
+                && locked.mode() == DispatchMode::Waterfall
+                && requested.mode() == DispatchMode::Emit
+    ));
+    let wrong_waterfall = EventKey::<Waterfall, ToolCall, ToolCall>::new(
+        events::TOOLS_RESULT.schema_id(),
+        events::TOOLS_RESULT.name(),
     );
     let result_conflict = ctx
-        .on_waterfall(events::TOOLS_RESULT, |call: ToolCall, next| next(call))
+        .on_waterfall(wrong_waterfall, |call: ToolCall, next| next(call))
         .unwrap_err();
-    assert_eq!(
+    assert!(matches!(
         result_conflict,
-        CordisError::ModeConflict {
-            name: events::TOOLS_RESULT.to_string(),
-            locked: DispatchMode::Emit,
-            requested: DispatchMode::Waterfall,
-        }
-    );
+        CordisError::SchemaConflict { ref name, ref locked, ref requested }
+            if name == events::TOOLS_RESULT.name()
+                && locked.mode() == DispatchMode::Emit
+                && requested.mode() == DispatchMode::Waterfall
+    ));
+}
+
+#[test]
+fn all_seven_mapped_events_keep_their_exact_typed_descriptors() {
+    let ctx = mapped();
+    macro_rules! assert_mapped {
+        ($key:expr, $mode:expr) => {{
+            let key = $key;
+            assert_eq!(ctx.event_mode(key), Some($mode));
+            assert_eq!(ctx.event_descriptor(key), Some(key.descriptor()));
+            assert_eq!(expected_mode(key.name()), Some($mode));
+        }};
+    }
+    assert_mapped!(events::TOOLS_PRE_EXECUTE, DispatchMode::Waterfall);
+    assert_mapped!(events::TOOLS_EXECUTE, DispatchMode::Waterfall);
+    assert_mapped!(events::TOOLS_POST_EXECUTE, DispatchMode::Waterfall);
+    assert_mapped!(events::TOOLS_RESULT, DispatchMode::Emit);
+    assert_mapped!(events::LLM_STREAM, DispatchMode::Waterfall);
+    assert_mapped!(events::AGENT_CREATED, DispatchMode::Emit);
+    assert_mapped!(events::AGENT_DISPOSED, DispatchMode::Emit);
 }
 
 #[test]
@@ -348,13 +372,13 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
         assert!(!ctx.has(key), "{key} must reverse on teardown");
     }
     for name in [
-        events::TOOLS_PRE_EXECUTE,
-        events::TOOLS_EXECUTE,
-        events::TOOLS_POST_EXECUTE,
-        events::TOOLS_RESULT,
-        events::LLM_STREAM,
-        events::AGENT_CREATED,
-        events::AGENT_DISPOSED,
+        events::TOOLS_PRE_EXECUTE.name(),
+        events::TOOLS_EXECUTE.name(),
+        events::TOOLS_POST_EXECUTE.name(),
+        events::TOOLS_RESULT.name(),
+        events::LLM_STREAM.name(),
+        events::AGENT_CREATED.name(),
+        events::AGENT_DISPOSED.name(),
     ] {
         assert_eq!(ctx.listener_count(name), 0);
         assert_eq!(ctx.event_mode(name), None, "{name} lock must reverse");

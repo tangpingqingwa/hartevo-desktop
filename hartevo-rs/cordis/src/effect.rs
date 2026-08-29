@@ -9,6 +9,7 @@ use futures_util::future::{BoxFuture, FutureExt, Shared};
 
 use crate::config::ConfigValue;
 use crate::context::CordisError;
+use crate::event::ListenerHandle;
 use crate::fiber::FiberUid;
 
 /// Cleanup callback registered via [`crate::Context::effect`].
@@ -423,8 +424,7 @@ pub enum Registration {
     },
     Listener {
         owner_uid: FiberUid,
-        name: String,
-        id: u64,
+        listener: ListenerHandle,
         handle: RegistrationHandle,
     },
     EventLock {
@@ -466,11 +466,10 @@ impl Registration {
         }
     }
 
-    pub(crate) fn listener(owner_uid: FiberUid, name: String, id: u64) -> Self {
+    pub(crate) fn listener(owner_uid: FiberUid, listener: ListenerHandle) -> Self {
         Self::Listener {
             owner_uid,
-            name,
-            id,
+            listener,
             handle: RegistrationHandle::noop(),
         }
     }

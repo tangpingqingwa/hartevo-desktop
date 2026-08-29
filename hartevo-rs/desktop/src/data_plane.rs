@@ -2571,7 +2571,7 @@ impl DesktopDataPlane {
         }
         let scope = runtime_authority_scope(service, project_id, &mission_id)?;
         let facts = live_domain_kernel_facts(service, project_id, &mission_id, now)?;
-        match dispatch_live_runtime(
+        map_runtime_dispatch_result(dispatch_live_runtime(
             &self.cordis,
             scope,
             &facts.consent,
@@ -2596,11 +2596,7 @@ impl DesktopDataPlane {
                     now,
                 )
             },
-        ) {
-            Ok(submission) => Ok(submission),
-            Err(AuthorityDispatchError::Cordis(error)) => Err(error.into()),
-            Err(AuthorityDispatchError::Authority(error)) => Err(error),
-        }
+        ))
     }
 
     /// Advance a deterministic Application-owned checkpoint before Cordis
@@ -4804,6 +4800,19 @@ fn default_data_root() -> Result<PathBuf, DesktopDataError> {
     Err(DesktopDataError::DataDirectoryUnavailable)
 }
 
+fn map_runtime_dispatch_result<T>(
+    result: Result<T, AuthorityDispatchError<DesktopDataError>>,
+) -> Result<T, DesktopDataError> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(AuthorityDispatchError::Cordis(error)) => Err(error.into()),
+        Err(AuthorityDispatchError::Authority(error)) => Err(error),
+        Err(error @ AuthorityDispatchError::Combined(_)) => {
+            Err(DesktopDataError::RuntimeDispatch(Box::new(error)))
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DesktopDataError {
     #[error("Desktop data root must be an absolute non-symlink directory: {0}")]
@@ -4894,6 +4903,8 @@ pub enum DesktopDataError {
     RuntimeLocalApprovalMismatch,
     #[error(transparent)]
     Cordis(#[from] CordisError),
+    #[error("Cordis Runtime dispatch failed across phases: {0}")]
+    RuntimeDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -4981,6 +4992,34 @@ mod tests {
         let (_, _, authority) = launch.into_dispatch_parts();
         assert!(authority.is_exact_post_render_authority());
         authority
+    }
+
+    #[test]
+    fn combined_runtime_dispatch_mapping_retains_every_typed_phase() {
+        let started = CordisError::InvalidAuthorityScope { field: "started" };
+        let combined = AuthorityDispatchError::from_phases(
+            Some(started.clone()),
+            Some(DesktopDataError::EmptyMissionGoal),
+            None,
+            None,
+        )
+        .expect("two failures form one combined dispatch error");
+
+        let mapped = map_runtime_dispatch_result::<()>(Err(combined)).unwrap_err();
+
+        let DesktopDataError::RuntimeDispatch(dispatch) = mapped else {
+            panic!("combined dispatch must remain boxed as one Desktop error");
+        };
+        let AuthorityDispatchError::Combined(failures) = dispatch.as_ref() else {
+            panic!("boxed dispatch must retain its combined structure");
+        };
+        assert_eq!(failures.started(), Some(&started));
+        assert!(matches!(
+            failures.authority(),
+            Some(DesktopDataError::EmptyMissionGoal)
+        ));
+        assert!(failures.finish().is_none());
+        assert!(failures.disposed().is_none());
     }
 
     #[test]

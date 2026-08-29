@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hartevo_cordis::{
-    ConfigValue, Context, CordisError, EnvironmentOverlay, Loader, LoaderContext, OverlayLayer,
-    PluginEntry, PluginFactory, PluginId, PluginSpec, Service, keys, load_plugins,
-    load_plugins_pending,
+    ConfigValue, Context, CordisError, Emit, EnvironmentOverlay, EventKey, EventSchemaId, Loader,
+    LoaderContext, OverlayLayer, PluginEntry, PluginFactory, PluginId, PluginSpec, Service, keys,
+    load_plugins, load_plugins_pending,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,7 +668,16 @@ fn self_disposal_and_teardown_attempts_leave_activation_reusable() {
         });
         assert!(handle.is_disposed());
         ctx.set_var("post-dispose-var", "forbidden");
-        assert!(ctx.on("post-dispose-event", || {}).is_err());
+        assert!(
+            ctx.on(
+                EventKey::<Emit, (), ()>::new(
+                    EventSchemaId::new("test.post-dispose-event"),
+                    "post-dispose-event",
+                ),
+                || {},
+            )
+            .is_err()
+        );
         assert!(
             ctx.lock_event("post-dispose-lock", hartevo_cordis::DispatchMode::Emit)
                 .is_err()
@@ -760,7 +769,13 @@ fn panicking_disposer_cannot_orphan_partial_state_or_drop_ready_queue() {
     let mut ctx = Context::new();
     let failing = PluginFactory::new("cleanup-panics", |_config, ctx| {
         ctx.provide("partial-provider", true)?;
-        ctx.on("partial-listener", || {})?;
+        ctx.on(
+            EventKey::<Emit, (), ()>::new(
+                EventSchemaId::new("test.partial-listener"),
+                "partial-listener",
+            ),
+            || {},
+        )?;
         ctx.effect(|| panic!("intentional disposer panic"));
         Err::<(), _>(CordisError::MissingDependencies(vec![
             "factory-failure".to_string(),

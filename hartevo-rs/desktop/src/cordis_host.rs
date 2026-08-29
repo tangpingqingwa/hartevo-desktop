@@ -170,20 +170,35 @@ where
             .ok_or(CordisError::AuthorityScopeUnbound)?;
         host.authorize_runtime(&bound_scope)?
     };
-    permit.announce_started();
+    let started = permit.announce_started().err();
+    let (output, authority) = if started.is_none() {
+        match DesktopRuntimeAuthority::new(execute).execute(&permit) {
+            Ok(output) => (Some(output), None),
+            Err(error) => (None, Some(error)),
+        }
+    } else {
+        (None, None)
+    };
 
-    let authority_result = DesktopRuntimeAuthority::new(execute).execute(&permit);
-
-    let completion = cordis
-        .lock()
-        .map_err(|_| CordisError::RuntimeCoordinatorPoisoned)?
-        .finish_runtime(permit)?;
-    completion.announce();
-    authority_result.map_err(AuthorityDispatchError::Authority)
+    let completion = match cordis.lock() {
+        Ok(mut host) => host.finish_runtime(permit),
+        Err(_) => Err(CordisError::RuntimeCoordinatorPoisoned),
+    };
+    let (finish, disposed) = match completion {
+        Ok(completion) => (None, completion.announce().err()),
+        Err(error) => (Some(error), None),
+    };
+    if let Some(error) = AuthorityDispatchError::from_phases(started, authority, finish, disposed) {
+        Err(error)
+    } else {
+        Ok(output.expect("a failure-free dispatch executed the authority"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+    use std::fmt::{self, Display};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -195,7 +210,7 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use hartevo_cordis::{
         AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
-        DomainSurface, OPENINTERPRETER, RuntimeBinding, SurfaceOwner, enforce_invariants,
+        DomainSurface, OPENINTERPRETER, RuntimeBinding, SurfaceOwner, enforce_invariants, events,
         host_is_cordis_loop, invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
@@ -206,8 +221,8 @@ mod tests {
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
 
     use super::{
-        bind_live_domain_kernel, dispatch_live_runtime, mount_cordis_host,
-        openinterpreter_runtime_plugin,
+        bind_live_domain_kernel, bind_live_domain_kernel_scope, dispatch_live_runtime,
+        mount_cordis_host, openinterpreter_runtime_plugin,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -222,6 +237,173 @@ mod tests {
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct PhaseError(&'static str);
+
+    impl Display for PhaseError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl Error for PhaseError {}
+
+    fn runtime_scope() -> AuthorityScope {
+        AuthorityScope::new("tenant-a", "project-a", "mission-a", 4)
+            .unwrap()
+            .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap())
+    }
+
+    fn assert_emit_source(error: &CordisError, expected: &'static str) {
+        let CordisError::Emit { error, .. } = error else {
+            panic!("expected typed Emit phase failure: {error:?}");
+        };
+        assert_eq!(
+            error.event_source().as_error().downcast_ref::<PhaseError>(),
+            Some(&PhaseError(expected))
+        );
+    }
+
+    #[test]
+    fn started_failure_is_cached_and_lifecycle_callbacks_run_after_unlock() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let started_calls = Arc::new(AtomicUsize::new(0));
+        let later_started_calls = Arc::new(AtomicUsize::new(0));
+        let disposed_calls = Arc::new(AtomicUsize::new(0));
+        {
+            let started_host = Arc::clone(&host);
+            let started_calls = Arc::clone(&started_calls);
+            let later_started_calls = Arc::clone(&later_started_calls);
+            let disposed_host = Arc::clone(&host);
+            let disposed_calls = Arc::clone(&disposed_calls);
+            let mut locked = host.lock().unwrap();
+            locked
+                .context_mut()
+                .try_on_emit(events::AGENT_CREATED, move |_| {
+                    assert!(started_host.try_lock().is_ok());
+                    started_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(PhaseError("started"))
+                })
+                .unwrap();
+            locked
+                .on_runtime_started(move |_| {
+                    later_started_calls.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            locked
+                .on_runtime_finished(move |_| {
+                    assert!(disposed_host.try_lock().is_ok());
+                    disposed_calls.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+        }
+        let scope = runtime_scope();
+        let mut permit = {
+            let mut locked = host.lock().unwrap();
+            bind_live_domain_kernel_scope(
+                &mut locked,
+                scope.clone(),
+                &ConsentState::NotRequired,
+                None,
+                None,
+                now(),
+            )
+            .unwrap();
+            locked.authorize_runtime(&scope).unwrap()
+        };
+
+        let first = permit.announce_started().unwrap_err();
+        let second = permit.announce_started().unwrap_err();
+        assert_eq!(first, second);
+        assert_emit_source(&first, "started");
+        assert_eq!(started_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(later_started_calls.load(Ordering::SeqCst), 0);
+        let completion = host.lock().unwrap().finish_runtime(permit).unwrap();
+        completion.announce().unwrap();
+        assert_eq!(disposed_calls.load(Ordering::SeqCst), 1);
+        assert!(host.lock().unwrap().active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn started_and_disposed_failures_are_combined_and_authority_is_skipped() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        {
+            let mut locked = host.lock().unwrap();
+            locked
+                .context_mut()
+                .try_on_emit(events::AGENT_CREATED, |_| Err(PhaseError("started")))
+                .unwrap();
+            locked
+                .context_mut()
+                .try_on_emit(events::AGENT_DISPOSED, |_| Err(PhaseError("disposed")))
+                .unwrap();
+        }
+        let authority_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&authority_calls);
+        let error = dispatch_live_runtime(
+            &host,
+            runtime_scope(),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |_| {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, PhaseError>(())
+            },
+        )
+        .unwrap_err();
+        let AuthorityDispatchError::Combined(failures) = &error else {
+            panic!("expected started+disposed combined failure: {error:?}");
+        };
+        assert_emit_source(failures.started().unwrap(), "started");
+        assert!(failures.authority().is_none());
+        assert!(failures.finish().is_none());
+        assert_emit_source(failures.disposed().unwrap(), "disposed");
+        assert_eq!(authority_calls.load(Ordering::SeqCst), 0);
+        assert!(host.lock().unwrap().active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn authority_and_disposed_failures_are_combined_without_source_loss() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        host.lock()
+            .unwrap()
+            .context_mut()
+            .try_on_emit(events::AGENT_DISPOSED, |_| Err(PhaseError("disposed")))
+            .unwrap();
+        let error = dispatch_live_runtime(
+            &host,
+            runtime_scope(),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            |_| Err::<(), _>(PhaseError("authority")),
+        )
+        .unwrap_err();
+        let AuthorityDispatchError::Combined(failures) = &error else {
+            panic!("expected authority+disposed combined failure: {error:?}");
+        };
+        assert!(failures.started().is_none());
+        assert_eq!(failures.authority(), Some(&PhaseError("authority")));
+        assert!(failures.finish().is_none());
+        assert_emit_source(failures.disposed().unwrap(), "disposed");
+        assert_eq!(
+            error.source().unwrap().downcast_ref::<PhaseError>(),
+            Some(&PhaseError("authority"))
+        );
     }
 
     #[test]

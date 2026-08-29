@@ -328,7 +328,9 @@ impl CordisHost {
     where
         F: Fn(&AgentRef) + Send + Sync + 'static,
     {
-        self.ctx.on_emit(events::AGENT_CREATED, observer)
+        self.ctx
+            .on_emit(events::AGENT_CREATED, observer)
+            .map(|_| ())
     }
 
     /// Register a Runtime-finished observer. The completion notification is
@@ -337,7 +339,9 @@ impl CordisHost {
     where
         F: Fn(&AgentRef) + Send + Sync + 'static,
     {
-        self.ctx.on_emit(events::AGENT_DISPOSED, observer)
+        self.ctx
+            .on_emit(events::AGENT_DISPOSED, observer)
+            .map(|_| ())
     }
 
     fn reap_abandoned_runtime(&mut self) {
