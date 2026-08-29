@@ -161,6 +161,9 @@ impl RuntimeProviderKey {
 }
 
 type ProviderValue = Arc<dyn Any + Send + Sync>;
+/// Provider guards participate in optimistic exact revalidation and may run
+/// more than once. Implementations must therefore be repeatable and free of
+/// externally visible side effects.
 type ProviderGuard = Arc<dyn Fn(&ProviderValue) -> Result<bool, CordisError> + Send + Sync>;
 
 #[derive(Clone)]
@@ -501,6 +504,11 @@ impl LifecycleRegistry {
     fn driver_binding(&self, handle: &TokioHandle) -> DriverRuntimeBinding {
         let id = handle.id();
         let mut bindings = lock(&self.inner.driver_bindings);
+        bindings.retain(|_, binding| {
+            binding
+                .upgrade()
+                .is_some_and(|alive| alive.load(Ordering::Acquire))
+        });
         if let Some(alive) = bindings.get(&id).and_then(Weak::upgrade)
             && alive.load(Ordering::Acquire)
         {
@@ -1073,7 +1081,6 @@ impl LifecycleRegistry {
             publications,
             notifications,
         } = batch;
-        publish_deferred_batch(publications, notifications);
         let weak = Arc::downgrade(&self.inner);
         let operation = async move {
             let results = join_all(
@@ -1097,6 +1104,7 @@ impl LifecycleRegistry {
         .shared();
         *operation_slot = Some(operation.clone());
         drop(operation_slot);
+        publish_deferred_batch(publications, notifications);
         Ok(spawn_unit_operation(operation))
     }
 
@@ -3072,6 +3080,10 @@ fn finish_provider_activation_transaction(
                     );
                 }
             };
+            // Staging follows the global registry -> uid-ordered machine
+            // order. In particular, provider observation may consult this
+            // owner again, so its validation guard cannot remain held here.
+            drop(machine);
             let controls = affected_controls_for_provisional_locked(
                 &registry,
                 control,
@@ -4200,6 +4212,18 @@ mod lifecycle_boundary_tests {
         }
     }
 
+    fn production_result_with_timeout<T: Send + 'static>(
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (complete, completed) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = complete.send(work());
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("production lifecycle path timed out or panicked")
+    }
+
     #[tokio::test]
     async fn single_control_ticket_overflow_preserves_every_machine_field() {
         let registry = LifecycleRegistry::new();
@@ -4514,6 +4538,123 @@ mod lifecycle_boundary_tests {
             dependent_before
         );
         assert!(registry.get::<u32>("provisional-overflow").is_none());
+    }
+
+    #[test]
+    fn higher_uid_provider_owner_commits_without_inverting_dependent_lock_order() {
+        let (dependent_uid, owner_uid, dependent_state, owner_state) =
+            production_result_with_timeout(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let registry = LifecycleRegistry::new();
+                    let dependent = registry
+                        .mount(
+                            PluginFactory::new_lifecycle("uid-ordered-dependent", |_, _| {
+                                LifecycleEffect::none()
+                            })
+                            .with_inject(["uid-ordered-provider"]),
+                            ConfigValue::default(),
+                        )
+                        .unwrap();
+                    let owner = registry
+                        .mount(
+                            PluginFactory::new_lifecycle("higher-uid-provider-owner", |_, view| {
+                                view.provide("uid-ordered-provider", 21_u32)?;
+                                Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                            }),
+                            ConfigValue::default(),
+                        )
+                        .unwrap();
+                    let owner_state = owner
+                        .fiber()
+                        .wait_until_active(LifecycleCancellation::default())
+                        .await
+                        .unwrap()
+                        .state();
+                    let dependent_state = dependent
+                        .fiber()
+                        .wait_until_active(LifecycleCancellation::default())
+                        .await
+                        .unwrap()
+                        .state();
+                    (
+                        dependent.fiber().uid(),
+                        owner.fiber().uid(),
+                        dependent_state,
+                        owner_state,
+                    )
+                })
+            });
+
+        assert!(owner_uid > dependent_uid);
+        assert_eq!(owner_state, FiberState::Active);
+        assert_eq!(dependent_state, FiberState::Active);
+    }
+
+    #[test]
+    fn residual_same_owner_provider_observation_settles_without_recursive_owner_lock() {
+        let (owner_state, dependent_state, residual, provisional) =
+            production_result_with_timeout(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let registry = LifecycleRegistry::new();
+                    let dependent = registry
+                        .mount(
+                            PluginFactory::new_lifecycle("residual-owner-dependent", |_, _| {
+                                LifecycleEffect::none()
+                            })
+                            .with_inject(["residual-owner", "new-owner-provider"]),
+                            ConfigValue::default(),
+                        )
+                        .unwrap();
+                    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let owner = registry
+                        .mount(
+                            PluginFactory::new_lifecycle("residual-provider-owner", {
+                                let starts = starts.clone();
+                                move |_, view| {
+                                    if starts.fetch_add(1, Ordering::SeqCst) > 0 {
+                                        view.provide("new-owner-provider", 34_u32)?;
+                                    }
+                                    Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                                }
+                            }),
+                            ConfigValue::default(),
+                        )
+                        .unwrap();
+                    owner
+                        .fiber()
+                        .wait_until_active(LifecycleCancellation::default())
+                        .await
+                        .unwrap();
+                    registry
+                        .provide_for(
+                            &owner.fiber(),
+                            "root".to_string(),
+                            "residual-owner".to_string(),
+                            33_u32,
+                            None,
+                        )
+                        .unwrap();
+
+                    let owner_state = owner.restart().await.unwrap().state();
+                    let dependent_state = dependent.await_current().await.unwrap().state();
+                    (
+                        owner_state,
+                        dependent_state,
+                        registry.get::<u32>("residual-owner").as_deref().copied(),
+                        registry
+                            .get::<u32>("new-owner-provider")
+                            .as_deref()
+                            .copied(),
+                    )
+                })
+            });
+
+        assert_eq!(owner_state, FiberState::Active);
+        assert_eq!(dependent_state, FiberState::Pending);
+        assert_eq!(residual, Some(33));
+        assert_eq!(provisional, Some(34));
     }
 
     #[test]
