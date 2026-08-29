@@ -6,7 +6,7 @@
 //! N1.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::config::ConfigValue;
@@ -44,8 +44,6 @@ pub enum FiberState {
     Pending,
     /// The Fiber has successfully activated its callback.
     Active,
-    /// The Fiber is terminal and cannot be activated again.
-    Disposed,
 }
 
 impl FiberState {
@@ -53,14 +51,12 @@ impl FiberState {
         match self {
             Self::Pending => 0,
             Self::Active => 1,
-            Self::Disposed => 2,
         }
     }
 
     pub(crate) const fn from_byte(value: u8) -> Self {
         match value {
             1 => Self::Active,
-            2 => Self::Disposed,
             _ => Self::Pending,
         }
     }
@@ -73,6 +69,7 @@ struct FiberInner {
     uid: FiberUid,
     parent: Option<FiberUid>,
     state: AtomicU8,
+    disposed: AtomicBool,
     metadata: Mutex<ConfigValue>,
     namespace: String,
 }
@@ -95,6 +92,7 @@ impl Fiber {
                 uid: FiberUid::ROOT,
                 parent: None,
                 state: AtomicU8::new(FiberState::Active.as_byte()),
+                disposed: AtomicBool::new(false),
                 metadata: Mutex::new(ConfigValue::default()),
                 namespace: "root".to_string(),
             }),
@@ -110,6 +108,7 @@ impl Fiber {
                 uid,
                 parent: Some(parent.uid()),
                 state: AtomicU8::new(FiberState::Pending.as_byte()),
+                disposed: AtomicBool::new(false),
                 metadata: Mutex::new(metadata),
                 namespace,
             }),
@@ -137,11 +136,14 @@ impl Fiber {
     /// Whether this Fiber has reached its terminal state.
     #[must_use]
     pub fn is_disposed(&self) -> bool {
-        self.state() == FiberState::Disposed
+        self.inner.disposed.load(Ordering::Acquire)
     }
 
     /// Mark a pending Fiber active exactly once.
     pub(crate) fn activate(&self) -> bool {
+        if self.is_disposed() {
+            return false;
+        }
         self.inner
             .state
             .compare_exchange(
@@ -155,14 +157,11 @@ impl Fiber {
 
     /// Publish the terminal tombstone. Repeated disposal is a no-op; the root
     /// Fiber is retained as the reusable Context owner and cannot be disposed.
-    pub fn dispose(&self) -> bool {
+    pub(crate) fn dispose(&self) -> bool {
         if self.uid() == FiberUid::ROOT {
             return false;
         }
-        self.inner
-            .state
-            .swap(FiberState::Disposed.as_byte(), Ordering::AcqRel)
-            != FiberState::Disposed.as_byte()
+        !self.inner.disposed.swap(true, Ordering::AcqRel)
     }
 
     pub(crate) fn context_id(&self) -> u64 {

@@ -23,6 +23,14 @@ impl Service for ProvideTools {
     }
 }
 
+struct ChildOwnedService;
+
+impl Service for ChildOwnedService {
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
+        ctx.provide("child-owned-service", true).map(|_| ())
+    }
+}
+
 #[test]
 fn overlay_selects_plugins_instead_of_a_crate_boot_list() {
     let catalog = vec![
@@ -341,12 +349,12 @@ fn disposed_pending_factory_never_receives_late_activation() {
     .with_inject(["dependency"]);
     let handle = ctx.mount_pending(factory).unwrap();
     assert!(handle.is_pending());
-    assert!(handle.dispose());
+    assert!(ctx.dispose_pending(&handle).unwrap());
+    assert!(handle.is_disposed());
     assert_eq!(ctx.pending_count(), 0);
-    ctx.dispose_pending(&handle).unwrap();
     ctx.provide("dependency", Marker("ready")).unwrap();
     assert_eq!(starts.load(Ordering::SeqCst), 0);
-    assert_eq!(handle.state(), hartevo_cordis::FiberState::Disposed);
+    assert_eq!(handle.state(), hartevo_cordis::FiberState::Pending);
 }
 
 #[test]
@@ -374,4 +382,149 @@ fn failed_pending_activation_propagates_and_cleans_partial_records() {
     assert!(!ctx.has("partial"));
     assert_eq!(ctx.registration_count(), 0);
     assert_eq!(disposed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn mount_preserves_factory_fiber_owner_until_disposal() {
+    let mut ctx = Context::new();
+    let factory = PluginFactory::new("owner-preserving", |_config, ctx| {
+        ctx.mount(ChildOwnedService)
+    })
+    .with_inject(["dependency"]);
+    let pending = ctx.mount_pending(factory).unwrap();
+
+    ctx.provide("dependency", Marker("ready")).unwrap();
+    assert!(pending.is_active());
+    assert!(ctx.has("child-owned-service"));
+
+    ctx.dispose_pending(&pending).unwrap();
+    assert!(pending.is_disposed());
+    assert!(!ctx.has("child-owned-service"));
+    assert!(ctx.has("dependency"));
+}
+
+#[test]
+fn failed_ready_factory_requeues_later_ready_factories() {
+    let mut ctx = Context::new();
+    let first = PluginFactory::new("ready-first-fails", |_config, _ctx| {
+        Err::<(), _>(CordisError::MissingDependencies(vec!["later".to_string()]))
+    })
+    .with_inject(["dependency"]);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_second = Arc::clone(&starts);
+    let second = PluginFactory::new("ready-second-succeeds", move |_config, _ctx| {
+        starts_for_second.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["dependency"]);
+    let _first = ctx.mount_pending(first).unwrap();
+    let second = ctx.mount_pending(second).unwrap();
+
+    let error = ctx.provide("dependency", Marker("ready")).unwrap_err();
+    assert!(matches!(error, CordisError::ProviderNotification { .. }));
+    assert!(second.is_pending());
+    assert_eq!(ctx.pending_count(), 1);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+    ctx.provide("retry-notification", true).unwrap();
+    assert!(second.is_active());
+    assert_eq!(ctx.pending_count(), 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn provider_notification_errors_return_a_recoverable_current_handle() {
+    let mut ctx = Context::new();
+    let first = PluginFactory::new("notification-first-fails", |_config, _ctx| {
+        Err::<(), _>(CordisError::MissingDependencies(vec!["late".to_string()]))
+    })
+    .with_inject(["dependency"]);
+    let second = PluginFactory::new("notification-second-fails", |_config, _ctx| {
+        Err::<(), _>(CordisError::MissingDependencies(vec!["late".to_string()]))
+    })
+    .with_inject(["dependency"]);
+    let _first = ctx.mount_pending(first).unwrap();
+    let _second = ctx.mount_pending(second).unwrap();
+
+    let initial = match ctx.provide("dependency", true).unwrap_err() {
+        CordisError::ProviderNotification { handle, .. } => handle,
+        other => panic!("expected committed initial handle, got {other:?}"),
+    };
+    assert_eq!(initial.generation(), 0);
+    assert_eq!(ctx.get::<bool>("dependency").as_deref(), Some(&true));
+
+    let replacement = match initial.replace(&mut ctx, false).unwrap_err() {
+        CordisError::ProviderNotification { handle, .. } => handle,
+        other => panic!("expected committed replacement handle, got {other:?}"),
+    };
+    assert_eq!(replacement.provider_id(), initial.provider_id());
+    assert_eq!(replacement.generation(), 1);
+    assert_eq!(ctx.get::<bool>("dependency").as_deref(), Some(&false));
+
+    let current = replacement.replace(&mut ctx, true).unwrap();
+    assert_eq!(current.generation(), 2);
+    assert_eq!(ctx.get::<bool>("dependency").as_deref(), Some(&true));
+}
+
+#[test]
+fn immediate_activation_does_not_notify_dependents_before_success() {
+    let mut ctx = Context::new();
+    let dependent_starts = Arc::new(AtomicUsize::new(0));
+    let dependent_starts_for_factory = Arc::clone(&dependent_starts);
+    let dependent = PluginFactory::new("dependent-waits-for-partial", move |_config, _ctx| {
+        dependent_starts_for_factory.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["partial"]);
+    let dependent = ctx.mount_pending(dependent).unwrap();
+
+    let activating = PluginFactory::new("partial-then-fails", |_config, ctx| {
+        ctx.provide("partial", true)?;
+        Err::<(), _>(CordisError::MissingDependencies(vec![
+            "failure".to_string(),
+        ]))
+    });
+    let error = ctx.mount_pending(activating).unwrap_err();
+    assert!(matches!(error, CordisError::PluginActivation { .. }));
+    assert_eq!(dependent_starts.load(Ordering::SeqCst), 0);
+    assert!(dependent.is_pending());
+    assert!(!ctx.has("partial"));
+    assert_eq!(ctx.pending_count(), 1);
+
+    ctx.provide("partial", true).unwrap();
+    assert!(dependent.is_active());
+    assert_eq!(dependent_starts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn pending_config_interpolates_against_the_owning_fiber_metadata() {
+    let mut ctx = Context::new();
+    ctx.set_var("scope", "parent");
+    let child = ctx.new_fiber().unwrap();
+    let seen = Arc::new(Mutex::new(None));
+    let seen_for_factory = Arc::clone(&seen);
+    let factory = PluginFactory::new("scoped-config", move |config, _ctx| {
+        *seen_for_factory.lock().expect("seen") = Some(config);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["dependency"])
+    .with_config(ConfigValue::string("{scope}"));
+
+    {
+        let mut view = ctx
+            .with_fiber(&child)
+            .isolate("tenant")
+            .extend(ConfigValue::object([("scope", "child".into())]));
+        let pending = view.mount_pending(factory).unwrap();
+        assert!(pending.is_pending());
+        view.provide("dependency", true).unwrap();
+        assert!(pending.is_active());
+        assert_eq!(view.var("scope"), Some(&ConfigValue::string("child")));
+    }
+
+    assert_eq!(ctx.var("scope"), Some(&ConfigValue::string("parent")));
+    assert_eq!(
+        *seen.lock().expect("seen"),
+        Some(ConfigValue::string("child"))
+    );
 }
