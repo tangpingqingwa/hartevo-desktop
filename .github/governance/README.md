@@ -21,11 +21,22 @@ multi-PR integration, release, or an explicitly high-risk combination.
 
 The trusted `pull_request_target` admission workflow checks out only the
 protected base, fetches the event head as an object, and reads review records
-with a read-only token. A code push changes the exact head and therefore
-invalidates older GitHub review records. `requiredApprovingReviews` is zero on
-both protected branches because this repository has one GitHub collaborator;
-the admission verifier enforces task-independent exact-head review without a
-ruleset deadlock.
+without executing PR code. Its required CheckRun and replaceable exact-head
+commit status deliberately share the name `Governance / PR admission`; both
+must pass. The status is pending before review, success only after a valid
+exact-head review, and failure for invalid governance facts. Waiting and
+correctable invalid facts therefore do not create a sticky failed CheckRun,
+while a checkout, verifier, or status-API failure still fails the required
+CheckRun and cannot reuse an older green status. For concurrent same-head
+events, only the highest GitHub Actions run ID may publish after every older
+run has completed. The newest decision is therefore written last, so an older
+READY event cannot overwrite a newer WAITING or INVALID decision. The token
+may write statuses only; Actions, repository contents, and pull requests remain
+read-only. A code push changes the exact head and therefore invalidates older
+GitHub review records. `requiredApprovingReviews` is zero on both protected
+branches because this repository has one GitHub collaborator; the admission
+verifier enforces task-independent exact-head review without a ruleset
+deadlock.
 
 ## High-risk governance
 

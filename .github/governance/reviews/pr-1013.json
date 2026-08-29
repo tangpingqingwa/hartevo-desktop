@@ -1,0 +1,23 @@
+{
+  "authorTaskId": "cordis-g1-admission-controller-author-20260830",
+  "baseSha": "9cbd770430b33c123d9613851b21b9da8d3bb4b9",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    ".github/governance/README.md",
+    ".github/governance/events.jsonl",
+    ".github/policies/repository-governance-policy.json",
+    ".github/workflows/governance-admission.yml",
+    "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+    "scripts/ci-workflow-policy.py",
+    "scripts/repository_governance.py",
+    "scripts/tests/test_repository_governance.py"
+  ],
+  "pr": 1013,
+  "receiptDigest": "998e151149a589b965d3549bc3d71b5d152ca7d41c5d5ef2d796b5b7dadf6e92",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-29T22:29:21Z",
+  "reviewedHeadSha": "0b95d532f7f97ddc36af41c15e6fff670805a962",
+  "reviewerTaskId": "g1-admission-controller-review-0b95d532f-20260830c",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

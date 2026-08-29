@@ -92,6 +92,16 @@
     "requireExactHead": true,
     "requireReviewerTaskDistinctFromOwner": true
   },
+  "admissionStatus": {
+    "context": "Governance / PR admission",
+    "controllerJob": "Governance / PR admission",
+    "gate": "required-check-and-commit-status",
+    "latestRunFence": "highest-actions-run-id-after-older-drain",
+    "mutation": "exact-head-commit-status-only",
+    "beforeExactReview": "pending",
+    "validExactReview": "success",
+    "invalidAdmission": "failure"
+  },
   "integration": {
     "singleOpenTrain": true,
     "readyToTrainSlaSeconds": 120,

@@ -89,9 +89,25 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def test_checked_in_policy_and_ledger_are_valid_resumed_and_normal(self) -> None:
         self.assertEqual(governance.verify_policy_value(self.policy)["status"], "PASS")
         self.assertEqual(self.policy["admissionModeWhenUnpaused"], "normal")
-        self.assertEqual(self.events[-2]["kind"], "GLOBAL_RESUMED")
+        latest_transition = next(
+            event for event in reversed(self.events) if event["kind"] in {"GLOBAL_PAUSED", "GLOBAL_RESUMED"}
+        )
+        self.assertEqual(latest_transition["kind"], "GLOBAL_RESUMED")
         self.assertFalse(governance.global_paused(self.events))
         self.assertTrue(governance.global_paused(self.paused_events))
+        self.assertEqual(
+            self.policy["admissionStatus"],
+            {
+                "context": "Governance / PR admission",
+                "controllerJob": "Governance / PR admission",
+                "gate": "required-check-and-commit-status",
+                "latestRunFence": "highest-actions-run-id-after-older-drain",
+                "mutation": "exact-head-commit-status-only",
+                "beforeExactReview": "pending",
+                "validExactReview": "success",
+                "invalidAdmission": "failure",
+            },
+        )
 
     def test_repository_lifecycle_settings_prefer_complete_rest_truth(self) -> None:
         repository = {
@@ -286,6 +302,129 @@ class RepositoryGovernanceTests(unittest.TestCase):
         )
         self.assertEqual(restored["reviewerTaskId"], "reviewer")
 
+        with self.assertRaises(governance.AwaitingIndependentReview):
+            governance.validate_github_review_records([], head_sha=head, owner="author")
+
+    def test_admission_classification_is_pending_before_review_and_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            event_path = Path(directory) / "event.json"
+            event_path.write_text(json.dumps({"action": "opened"}), encoding="utf-8")
+            waiting = governance.AwaitingIndependentReview("no current exact-head review")
+            with mock.patch.object(governance, "verify_pr_event", side_effect=waiting):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request")
+            self.assertEqual(result["status"], "WAITING_REVIEW")
+            self.assertEqual(result["commitStatus"], "pending")
+
+            event_path.write_text(json.dumps({"action": "submitted"}), encoding="utf-8")
+            with mock.patch.object(governance, "verify_pr_event", side_effect=waiting):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request_review")
+            self.assertEqual(result["status"], "INVALID")
+            self.assertEqual(result["commitStatus"], "failure")
+
+            with mock.patch.object(governance, "verify_pr_event", return_value={"status": "PASS"}):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request_review")
+            self.assertEqual(result["status"], "READY")
+            self.assertEqual(result["commitStatus"], "success")
+
+            with mock.patch.object(
+                governance,
+                "verify_pr_event",
+                side_effect=governance.GovernanceError("invalid admission metadata"),
+            ):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request")
+            self.assertEqual(result["status"], "INVALID")
+            self.assertEqual(result["commitStatus"], "failure")
+
+    def test_same_name_check_and_status_gate_fails_closed_on_status_api_failure(self) -> None:
+        # Production-equivalent regression: this SHA was READY, a review/body
+        # event invalidated it, and the new pending status write failed.  The
+        # old commit status is still green, but the required controller
+        # CheckRun is failed, so the same-name dual gate cannot merge.
+        self.assertEqual(governance.admission_merge_gate("failure", "success"), "BLOCKED")
+        self.assertEqual(governance.admission_merge_gate("success", "pending"), "BLOCKED")
+        self.assertEqual(governance.admission_merge_gate("success", "failure"), "BLOCKED")
+        self.assertEqual(governance.admission_merge_gate("success", "success"), "READY")
+
+    def test_newer_invalid_run_reconciles_after_older_ready_fence_to_post_race(self) -> None:
+        head = "a" * 40
+
+        # A passed its final fence before B existed. Once B starts, B must not
+        # publish until A has posted and completed.
+        a_alone = governance.admission_run_order(
+            {
+                "total_count": 1,
+                "workflow_runs": [{"id": 10, "head_sha": head, "status": "in_progress"}],
+            },
+            head_sha=head,
+            run_id=10,
+        )
+        self.assertTrue(a_alone["current"])
+        self.assertEqual(a_alone["olderActiveRunIds"], [])
+
+        b_waits = governance.admission_run_order(
+            {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"id": 12, "head_sha": head, "status": "in_progress"},
+                    {"id": 10, "head_sha": head, "status": "in_progress"},
+                ],
+            },
+            head_sha=head,
+            run_id=12,
+        )
+        self.assertEqual(b_waits["olderActiveRunIds"], [10])
+
+        # A may now land its stale success, but B observes A completed and is
+        # necessarily the later final writer; B's INVALID failure is final.
+        b_last = governance.admission_run_order(
+            {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"id": 12, "head_sha": head, "status": "in_progress"},
+                    {"id": 10, "head_sha": head, "status": "completed"},
+                ],
+            },
+            head_sha=head,
+            run_id=12,
+        )
+        self.assertTrue(b_last["current"])
+        self.assertEqual(b_last["olderActiveRunIds"], [])
+        self.assertEqual(governance.admission_merge_gate("success", "failure"), "BLOCKED")
+
+        a_after_b_exists = governance.admission_run_order(
+            {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"id": 12, "head_sha": head, "status": "in_progress"},
+                    {"id": 10, "head_sha": head, "status": "in_progress"},
+                ],
+            },
+            head_sha=head,
+            run_id=10,
+        )
+        self.assertFalse(a_after_b_exists["current"])
+
+    def test_admission_run_order_fails_closed_on_partial_or_unlisted_truth(self) -> None:
+        head = "a" * 40
+        with self.assertRaises(governance.GovernanceError):
+            governance.admission_run_order(
+                {
+                    "total_count": 101,
+                    "workflow_runs": [{"id": 12, "head_sha": head, "status": "in_progress"}],
+                },
+                head_sha=head,
+                run_id=12,
+            )
+        with self.assertRaises(governance.GovernanceError):
+            governance.admission_run_order(
+                {
+                    "total_count": 1,
+                    "workflow_runs": [{"id": 10, "head_sha": head, "status": "completed"}],
+                },
+                head_sha=head,
+                run_id=12,
+            )
+
     def test_exact_path_lease_rejects_outside_change(self) -> None:
         value = self.admission()
         value["ownedPaths"] = ["scripts"]
@@ -444,6 +583,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
             head = command(root, "git", "rev-parse", "HEAD")
             command(root, "git", "switch", "--quiet", "--detach", base)
             event = {
+                "action": "opened",
                 "pull_request": {
                     "number": 7,
                     "body": (
@@ -463,6 +603,16 @@ class RepositoryGovernanceTests(unittest.TestCase):
             }
             event_path = root / "event.json"
             event_path.write_text(json.dumps(event), encoding="utf-8")
+            waiting = governance.classify_pr_event(
+                root,
+                event_path,
+                "pull_request",
+                trusted_base=True,
+                github_reviews=[],
+            )
+            self.assertEqual(waiting["status"], "WAITING_REVIEW")
+            self.assertEqual(waiting["commitStatus"], "pending")
+            self.assertEqual(command(root, "git", "rev-parse", "HEAD"), base)
             result = governance.verify_pr_event(
                 root,
                 event_path,

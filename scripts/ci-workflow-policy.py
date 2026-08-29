@@ -171,6 +171,10 @@ def validate_permissions(path: Path, text: str) -> None:
 
 
 def validate_concurrency(path: Path, text: str) -> None:
+    if path.name == "governance-admission.yml":
+        if re.search(r"^concurrency:\s*$", text, re.MULTILINE):
+            raise PolicyError(f"{path} must let every required admission CheckRun finish")
+        return
     if not re.search(r"^concurrency:\s*$", text, re.MULTILINE):
         raise PolicyError(f"{path} lacks workflow concurrency")
     if not re.search(r"^\s+group:\s*\S+", text, re.MULTILINE):
@@ -843,12 +847,33 @@ def validate_pr_secrets(path: Path, text: str) -> None:
             "git fetch --no-tags --no-write-fetch-head origin \"$HEAD_SHA\"",
             "--trusted-base",
             "pull_request_review:",
+            "actions: read",
+            "statuses: write",
+            "Mark exact head admission pending",
+            "name: Governance / PR admission",
+            "STATUS_CONTEXT: Governance / PR admission",
+            "statuses/$HEAD_SHA",
+            "Fence stale exact-head controller run",
+            "Order exact-head controller publication",
+            "admission-run-order",
+            "actions/workflows/governance-admission.yml/runs?head_sha=$HEAD_SHA&per_page=100",
+            "test \"$total_count\" -eq \"$listed_count\"",
+            "classify-pr-event",
             "Capture read-only exact-head GitHub review evidence",
             "pulls/$PR_NUMBER/reviews",
             "--github-reviews",
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the non-executing trusted-base admission contract")
+        if text.index("Mark exact head admission pending") > text.index("Checkout trusted protected governance policy"):
+            raise PolicyError(f"{path} must publish pending before checkout or verification")
+        if "cancel-in-progress" in text:
+            raise PolicyError(f"{path} must not cancel same-head required controller CheckRuns")
+        if 'test "$CLASSIFICATION" != INVALID' in text:
+            raise PolicyError(f"{path} invalid facts must use the replaceable status, not a sticky failed CheckRun")
+        write_permissions = set(re.findall(r"^\s+([a-z-]+):\s*write\s*$", text, re.MULTILINE))
+        if write_permissions != {"statuses"}:
+            raise PolicyError(f"{path} may write only exact-head commit statuses")
         if re.search(r"\bsecrets\b|secrets\.", text):
             raise PolicyError(f"{path} exposes secrets to a privileged PR event")
     if "pull_request:" in text or "pull_request_review:" in text:
@@ -953,20 +978,36 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         required = (
             "pull_request_target:",
             "pull_request_review:",
-            "Governance / PR admission",
+            "name: Governance / PR admission",
+            "Mark exact head admission pending",
+            "Fence stale exact-head controller run",
+            "Order exact-head controller publication",
+            "actions/workflows/governance-admission.yml/runs?head_sha=$HEAD_SHA&per_page=100",
+            "steps.final-fence.outputs.current == 'true'",
+            "repository_governance.py admission-run-order",
+            "olderActiveRunIds",
+            "deadline=$((SECONDS + 600))",
+            "test \"$SECONDS\" -lt \"$deadline\"",
+            "sleep 3",
+            "WAITING_REVIEW",
+            "actions: read",
+            "statuses: write",
+            "statuses/$HEAD_SHA",
             "github.event.pull_request.base.sha",
             "github.event.pull_request.head.sha",
             "github.token",
             "pulls/$PR_NUMBER/reviews",
             "github-reviews.json",
-            "repository_governance.py verify-pr-event",
+            "repository_governance.py classify-pr-event",
             "--trusted-base",
             "--github-reviews",
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the trusted governance admission contract")
+        if text.index("Order exact-head controller publication") > text.index("Publish exact head admission decision"):
+            raise PolicyError(f"{path} must drain older same-head runs before final status publication")
         if re.search(r"\b(contents|issues|pull-requests):\s*write\b", text):
-            raise PolicyError(f"{path} trusted admission workflow must remain read-only")
+            raise PolicyError(f"{path} trusted admission may not mutate repository or pull-request content")
     elif path.name == "release-promotion.yml":
         required = ("workflow_dispatch:", "environment: release-promotion", "id-token: write", "source_commit", "refs/heads/main", "release-baseline", "releaseCommit", "passed", "sha256", "rollback", "release: false", "ci-distribution-hook.sh", "ci-oidc-interface")
         if any(item not in text for item in required):
@@ -1076,6 +1117,17 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted a PR workflow without cancellation")
+
+    validate_concurrency(Path("governance-admission.yml"), "name: trusted admission\n")
+    try:
+        validate_concurrency(
+            Path("governance-admission.yml"),
+            "concurrency:\n  group: admission\n  cancel-in-progress: false\n",
+        )
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted cancellation-prone admission concurrency")
 
     ci_fixture = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
     validate_required_workflow_contract(Path("ci.yml"), ci_fixture)

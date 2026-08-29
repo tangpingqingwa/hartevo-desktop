@@ -43,6 +43,8 @@ NOMINATION_SCHEMA = "hartevo-lifecycle-nominations/v1"
 REVIEW_SCHEMA = "hartevo-independent-review-receipt/v1"
 ADMISSION_SCHEMA = "hartevo-pr-admission/v1"
 GITHUB_REVIEW_SCHEMA = "hartevo-github-review/v1"
+ADMISSION_CLASSIFICATION_SCHEMA = "hartevo-pr-admission-classification/v1"
+ADMISSION_RUN_ORDER_SCHEMA = "hartevo-admission-run-order/v1"
 ZERO_DIGEST = "0" * 64
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -85,6 +87,10 @@ DEPENDENCY_PATHS = frozenset({
 
 class GovernanceError(ValueError):
     """A governance fact or contract failed closed."""
+
+
+class AwaitingIndependentReview(GovernanceError):
+    """An otherwise admissible ordinary PR has no current exact-head review."""
 
 
 def utc_now() -> dt.datetime:
@@ -371,6 +377,18 @@ def verify_policy_value(policy: dict[str, object]) -> dict[str, object]:
         "requireReviewerTaskDistinctFromOwner": True,
     }:
         raise GovernanceError("GitHub review contract drifted")
+    admission_status = policy.get("admissionStatus")
+    if admission_status != {
+        "context": "Governance / PR admission",
+        "controllerJob": "Governance / PR admission",
+        "gate": "required-check-and-commit-status",
+        "latestRunFence": "highest-actions-run-id-after-older-drain",
+        "mutation": "exact-head-commit-status-only",
+        "beforeExactReview": "pending",
+        "validExactReview": "success",
+        "invalidAdmission": "failure",
+    }:
+        raise GovernanceError("admission status controller contract drifted")
     lifecycle = policy.get("lifecycle")
     if not isinstance(lifecycle, dict):
         raise GovernanceError("lifecycle policy is missing")
@@ -723,7 +741,7 @@ def validate_github_review_records(
         except GovernanceError as error:
             failures.append(str(error))
     detail = failures[-1] if failures else "no current latest review records were returned"
-    raise GovernanceError(f"no exact-head independent GitHub review is valid: {detail}")
+    raise AwaitingIndependentReview(f"no exact-head independent GitHub review is valid: {detail}")
 
 
 # Short aliases make the pure verifier convenient for focused CI fixtures.
@@ -893,6 +911,117 @@ def verify_pr_event(
             result["reviewReceipt"] = verify_review_commit(root, number, base_sha, head_sha)
     result.update({"pr": number, "baseSha": base_sha, "headSha": head_sha, "headBranch": head_ref})
     return result
+
+
+def classify_pr_event(
+    root: Path,
+    event_path: Path,
+    event_name: str,
+    *,
+    trusted_base: bool = False,
+    github_reviews: object | None = None,
+) -> dict[str, object]:
+    """Map trusted admission to one recoverable exact-head commit-status state.
+
+    A valid ordinary PR without a current exact-head review is not an error on
+    PR lifecycle events: it remains pending and therefore unmergeable.  A
+    review event that does not produce valid exact-head evidence is invalid,
+    as are every other governance failure.  The workflow publishes this
+    classification to one replaceable commit-status context, avoiding sticky
+    same-SHA failures without weakening the merge gate.
+    """
+
+    try:
+        result = verify_pr_event(
+            root,
+            event_path,
+            event_name,
+            trusted_base=trusted_base,
+            github_reviews=github_reviews,
+        )
+    except AwaitingIndependentReview as error:
+        event = read_json(event_path)
+        action = event.get("action") if isinstance(event, dict) else None
+        if event_name == "pull_request" and action in {
+            "opened",
+            "synchronize",
+            "reopened",
+            "ready_for_review",
+            "edited",
+        }:
+            return {
+                "schema": ADMISSION_CLASSIFICATION_SCHEMA,
+                "status": "WAITING_REVIEW",
+                "commitStatus": "pending",
+                "message": str(error),
+            }
+        return {
+            "schema": ADMISSION_CLASSIFICATION_SCHEMA,
+            "status": "INVALID",
+            "commitStatus": "failure",
+            "message": str(error),
+        }
+    except GovernanceError as error:
+        return {
+            "schema": ADMISSION_CLASSIFICATION_SCHEMA,
+            "status": "INVALID",
+            "commitStatus": "failure",
+            "message": str(error),
+        }
+    return {
+        "schema": ADMISSION_CLASSIFICATION_SCHEMA,
+        "status": "READY",
+        "commitStatus": "success",
+        "admission": result,
+    }
+
+
+def admission_merge_gate(controller_check: object, commit_status: object) -> str:
+    """Model the same-name required CheckRun and commit-status merge gate."""
+
+    return "READY" if controller_check == "success" and commit_status == "success" else "BLOCKED"
+
+
+def admission_run_order(runs_payload: object, *, head_sha: str, run_id: int) -> dict[str, object]:
+    """Order same-head controller publication by GitHub Actions run id."""
+
+    if not isinstance(runs_payload, dict):
+        raise GovernanceError("exact-head workflow-runs response must be an object")
+    require_sha(head_sha, "admission run-order head SHA")
+    if run_id <= 0:
+        raise GovernanceError("admission run order requires a positive run id")
+    total_count = runs_payload.get("total_count")
+    runs = runs_payload.get("workflow_runs")
+    if not isinstance(total_count, int) or total_count < 0 or not isinstance(runs, list):
+        raise GovernanceError("exact-head workflow-runs response is malformed")
+    if total_count > 100 or total_count != len(runs):
+        raise GovernanceError("exact-head workflow-runs response exceeds the fail-closed page bound")
+    normalized: list[dict[str, object]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            raise GovernanceError("exact-head workflow run must be an object")
+        observed_id = run.get("id")
+        status = run.get("status")
+        if run.get("head_sha") != head_sha or not isinstance(observed_id, int) or observed_id <= 0 or not isinstance(status, str):
+            raise GovernanceError("exact-head workflow run identity is malformed")
+        normalized.append({"id": observed_id, "status": status})
+    observed = [int(run["id"]) for run in normalized]
+    if run_id not in observed:
+        raise GovernanceError("current admission workflow run is not visible in exact-head order")
+    maximum = max(observed)
+    older_active = sorted(
+        int(run["id"])
+        for run in normalized
+        if int(run["id"]) < run_id and run["status"] != "completed"
+    )
+    return {
+        "schema": ADMISSION_RUN_ORDER_SCHEMA,
+        "status": "PASS",
+        "current": maximum <= run_id,
+        "runId": run_id,
+        "maxObservedRunId": maximum,
+        "olderActiveRunIds": older_active,
+    }
 
 
 def review_path(number: int) -> Path:
@@ -1672,6 +1801,18 @@ def verify_repository(root: Path) -> dict[str, object]:
         for event in mode_events
     ):
         raise GovernanceError("lightweight Cordis governance-mode event is missing")
+    if not any(
+        isinstance(event.get("payload"), dict)
+        and event["payload"].get("ordinaryPreReview") == "pending"
+        and event["payload"].get("requiredContext") == "Governance / PR admission"
+        and event["payload"].get("requiredCheckAndStatus") == "both"
+        and event["payload"].get("latestRunFence") == "highest-actions-run-id-after-older-drain"
+        and event["payload"].get("statusMutation") == "exact-head-commit-status-only"
+        and event["payload"].get("mainline") == "Cordis"
+        and event["payload"].get("historicalPrWaves") == "frozen"
+        for event in mode_events
+    ):
+        raise GovernanceError("recoverable pending ordinary-admission event is missing")
     if (root / ".github/merge-train/current.json").exists():
         raise GovernanceError("stale merge-train current.json must not exist")
     if not (root / ".github/merge-train/README.md").is_file():
@@ -1688,7 +1829,16 @@ def verify_repository(root: Path) -> dict[str, object]:
     governance_readme = (root / ".github/governance/README.md").read_text(encoding="utf-8")
     runbook = (root / "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md").read_text(encoding="utf-8")
     documentation = (governance_readme + "\n" + runbook).lower()
-    for required in ("Cordis", "lightweight", "scoped checks", "independent GitHub review", "directly merge", "Full Integration"):
+    for required in (
+        "Cordis",
+        "lightweight",
+        "scoped checks",
+        "independent GitHub review",
+        "directly merge",
+        "Full Integration",
+        "exact-head commit status",
+        "pending before review",
+    ):
         if required.lower() not in documentation:
             raise GovernanceError(f"governance documentation is missing {required!r}")
     ordinary_steps = (
@@ -1861,17 +2011,23 @@ def main(argv: Iterable[str]) -> int:
     subparsers.add_parser("verify-ledger")
     subparsers.add_parser("self-test")
 
-    admission_parser = subparsers.add_parser("verify-pr-event")
-    admission_parser.add_argument("--event", type=Path, required=True)
-    admission_parser.add_argument("--event-name", required=True)
-    admission_parser.add_argument("--root", type=Path, default=Path("."))
-    admission_parser.add_argument("--trusted-base", action="store_true")
-    admission_parser.add_argument(
-        "--github-reviews",
-        "--reviews",
-        type=Path,
-        help="read-only GitHub API review JSON captured by trusted admission",
-    )
+    for command in ("verify-pr-event", "classify-pr-event"):
+        admission_parser = subparsers.add_parser(command)
+        admission_parser.add_argument("--event", type=Path, required=True)
+        admission_parser.add_argument("--event-name", required=True)
+        admission_parser.add_argument("--root", type=Path, default=Path("."))
+        admission_parser.add_argument("--trusted-base", action="store_true")
+        admission_parser.add_argument(
+            "--github-reviews",
+            "--reviews",
+            type=Path,
+            help="read-only GitHub API review JSON captured by trusted admission",
+        )
+
+    run_order_parser = subparsers.add_parser("admission-run-order")
+    run_order_parser.add_argument("--runs", type=Path, required=True)
+    run_order_parser.add_argument("--head-sha", required=True)
+    run_order_parser.add_argument("--run-id", type=int, required=True)
 
     append_parser = subparsers.add_parser("append-event")
     append_parser.add_argument("--ledger", type=Path, default=LEDGER_PATH)
@@ -1940,6 +2096,26 @@ def main(argv: Iterable[str]) -> int:
                     args.event_name,
                     trusted_base=args.trusted_base,
                     github_reviews=read_json(args.github_reviews) if args.github_reviews else None,
+                ),
+                None,
+            )
+        elif args.command == "classify-pr-event":
+            write_json(
+                classify_pr_event(
+                    args.root.resolve(),
+                    args.event.resolve(),
+                    args.event_name,
+                    trusted_base=args.trusted_base,
+                    github_reviews=read_json(args.github_reviews) if args.github_reviews else None,
+                ),
+                None,
+            )
+        elif args.command == "admission-run-order":
+            write_json(
+                admission_run_order(
+                    read_json(args.runs),
+                    head_sha=args.head_sha,
+                    run_id=args.run_id,
                 ),
                 None,
             )
