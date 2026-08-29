@@ -36,10 +36,9 @@ use hartevo_catalog::{
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
 #[cfg(test)]
-use hartevo_cordis::{AgentStep, AgentStepResult};
+use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
-    AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, RuntimeBinding,
-    RuntimeRecordBinding,
+    AuthorityDispatchError, AuthorityScope, CordisError, RuntimeBinding, RuntimeRecordBinding,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -65,11 +64,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::cordis_host::{DesktopCordisCoordinator, dispatch_live_runtime, mount_cordis_host};
 #[cfg(test)]
 use crate::cordis_host::{
-    bind_live_domain_kernel, bind_live_domain_kernel_scope as bind_host_live_domain_kernel_scope,
+    bind_live_domain_kernel,
+    bind_live_domain_kernel_scope_for_test as bind_host_live_domain_kernel_scope,
 };
-use crate::cordis_host::{dispatch_live_runtime, mount_cordis_host};
 use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
     discover_runtime, ensure_project_runtime_home,
@@ -739,7 +739,7 @@ pub struct DesktopDataPlane {
     database_path: PathBuf,
     database_key_reference: SecretReference,
     device_id: DeviceId,
-    cordis: Arc<Mutex<CordisHost>>,
+    cordis: Arc<Mutex<DesktopCordisCoordinator>>,
 }
 
 impl DesktopDataPlane {
@@ -776,7 +776,7 @@ impl DesktopDataPlane {
     /// Test-only inspection seam for the isolated Cordis host.
     #[cfg(test)]
     pub fn with_cordis_host<T>(&self, f: impl FnOnce(&mut CordisHost) -> T) -> T {
-        f(&mut self.lock_cordis())
+        f(self.lock_cordis().host_mut())
     }
 
     /// Test-only unscoped Domain Kernel fact binding.
@@ -3876,7 +3876,7 @@ impl DesktopDataPlane {
     }
 
     #[cfg(test)]
-    fn lock_cordis(&self) -> std::sync::MutexGuard<'_, CordisHost> {
+    fn lock_cordis(&self) -> std::sync::MutexGuard<'_, DesktopCordisCoordinator> {
         self.cordis
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
