@@ -330,6 +330,30 @@ pub(crate) struct HartevoSurfaces {
     pub(crate) desktop: DesktopSurface,
 }
 
+/// Non-forgeable crate-internal authority for Hartevo surface registration.
+/// The public owner label on [`HartevoSurfaces`] is configuration data only;
+/// it never creates this token.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HartevoSurfaceAuthority {
+    marker: AuthorityMarker,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthorityMarker;
+
+impl HartevoSurfaceAuthority {
+    pub(crate) const fn is_valid(self) -> bool {
+        let _ = self.marker;
+        true
+    }
+}
+
+fn trusted_surface_authority() -> HartevoSurfaceAuthority {
+    HartevoSurfaceAuthority {
+        marker: AuthorityMarker,
+    }
+}
+
 impl Default for HartevoSurfaces {
     fn default() -> Self {
         Self {
@@ -356,6 +380,12 @@ pub(crate) fn map_surfaces(
     ctx: &mut Context,
     surfaces: HartevoSurfaces,
 ) -> Result<(), CordisError> {
+    let authority = trusted_surface_authority();
+    if !authority.is_valid() {
+        return Err(CordisError::ReservedServiceKey {
+            key: keys::DOMAIN.to_string(),
+        });
+    }
     require_hartevo_owned("domain", surfaces.domain.owner)?;
     require_hartevo_owned("effect_broker", surfaces.effect_broker.owner)?;
     require_hartevo_owned("runtime", surfaces.runtime.owner)?;
@@ -363,15 +393,49 @@ pub(crate) fn map_surfaces(
     if let Some(key) = MAPPED_KEYS.iter().copied().find(|key| ctx.has(key)) {
         return Err(CordisError::SurfaceAlreadyMapped { key });
     }
+    validate_mapped_events(ctx)?;
 
     ctx.provide(keys::TOOLS, ToolsSurface::new())?;
     ctx.provide(keys::LLM, LlmSurface::new())?;
     ctx.provide(keys::AGENTS, AgentsSurface::new())?;
-    ctx.provide_reserved(keys::DOMAIN, surfaces.domain)?;
-    ctx.provide_reserved(keys::EFFECT_BROKER, surfaces.effect_broker)?;
-    ctx.provide_reserved(keys::RUNTIME, surfaces.runtime)?;
-    ctx.provide_reserved(keys::DESKTOP, surfaces.desktop)?;
+    ctx.provide_reserved(authority, keys::DOMAIN, surfaces.domain)?;
+    ctx.provide_reserved(authority, keys::EFFECT_BROKER, surfaces.effect_broker)?;
+    ctx.provide_reserved(authority, keys::RUNTIME, surfaces.runtime)?;
+    ctx.provide_reserved(authority, keys::DESKTOP, surfaces.desktop)?;
     lock_mapped_events(ctx)
+}
+
+fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
+    for (name, mode) in [
+        (events::TOOLS_PRE_EXECUTE, DispatchMode::Waterfall),
+        (events::TOOLS_EXECUTE, DispatchMode::Waterfall),
+        (events::TOOLS_POST_EXECUTE, DispatchMode::Waterfall),
+        (events::TOOLS_RESULT, DispatchMode::Emit),
+        (events::LLM_STREAM, DispatchMode::Waterfall),
+        (events::AGENT_CREATED, DispatchMode::Emit),
+        (events::AGENT_DISPOSED, DispatchMode::Emit),
+    ] {
+        if let Some(locked) = ctx.event_mode(name)
+            && locked != mode
+        {
+            return Err(CordisError::ModeConflict {
+                name: name.to_string(),
+                locked,
+                requested: mode,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Rebind only the Hartevo Domain provider in place. Its provider identity and
+/// owner stay stable while generation/notification advance exactly once.
+pub(crate) fn rebind_hartevo_domain(
+    ctx: &mut Context,
+    domain: DomainSurface,
+) -> Result<(), CordisError> {
+    let _ = ctx.replace_hartevo_domain(trusted_surface_authority(), domain)?;
+    Ok(())
 }
 
 fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
@@ -498,5 +562,30 @@ mod tests {
             ctx.domain::<DomainSurface>().unwrap().owner(),
             SurfaceOwner::Hartevo
         );
+    }
+
+    #[test]
+    fn authorized_domain_rebind_preserves_identity_and_never_touches_broker() {
+        let mut ctx = Context::new();
+        map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap();
+        let domain_before = ctx.provider_snapshot(keys::DOMAIN).unwrap();
+        let broker_before = ctx.provider_snapshot(keys::EFFECT_BROKER).unwrap();
+        let bound = DomainSurface {
+            consent: true,
+            approved: true,
+            ..DomainSurface::default()
+        };
+
+        rebind_hartevo_domain(&mut ctx, bound).unwrap();
+        let domain_after = ctx.provider_snapshot(keys::DOMAIN).unwrap();
+        let broker_after = ctx.provider_snapshot(keys::EFFECT_BROKER).unwrap();
+        assert_eq!(domain_after.provider_id, domain_before.provider_id);
+        assert_eq!(domain_after.owner_uid, domain_before.owner_uid);
+        assert_eq!(domain_after.generation, domain_before.generation + 1);
+        assert_eq!(domain_after.notify_count, domain_before.notify_count + 1);
+        assert_eq!(domain_after.disposer_count, domain_before.disposer_count);
+        assert_eq!(broker_after, broker_before);
+        assert!(ctx.domain::<DomainSurface>().unwrap().consent());
+        assert!(ctx.domain::<DomainSurface>().unwrap().approved());
     }
 }

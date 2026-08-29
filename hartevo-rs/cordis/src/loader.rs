@@ -8,11 +8,122 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{ConfigValue, InterpolateError, coerce_disabled};
 use crate::context::{Context, CordisError};
 
-type StartFn = Arc<dyn Fn(ConfigValue, &mut Context) + Send + Sync>;
+/// Conversion boundary for legacy unit-returning loader callbacks.
+pub trait IntoPluginResult {
+    fn into_plugin_result(self) -> Result<(), CordisError>;
+}
+
+impl IntoPluginResult for () {
+    fn into_plugin_result(self) -> Result<(), CordisError> {
+        Ok(())
+    }
+}
+
+impl IntoPluginResult for Result<(), CordisError> {
+    fn into_plugin_result(self) -> Result<(), CordisError> {
+        self
+    }
+}
+
+type StartFn = Arc<dyn Fn(ConfigValue, &mut Context) -> Result<(), CordisError> + Send + Sync>;
+
+static NEXT_FACTORY_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque repeatable plugin-factory identity.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PluginFactoryId(u64);
+
+impl fmt::Debug for PluginFactoryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("PluginFactoryId")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl fmt::Display for PluginFactoryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Cloneable callback plus metadata for pending activation.
+#[derive(Clone)]
+pub struct PluginFactory {
+    id: PluginFactoryId,
+    start: StartFn,
+    inject: Vec<String>,
+    config: ConfigValue,
+}
+
+impl fmt::Debug for PluginFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PluginFactory")
+            .field("id", &self.id)
+            .field("inject", &self.inject)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PluginFactory {
+    pub fn new<F, R>(id: impl Into<PluginId>, start: F) -> Self
+    where
+        F: Fn(ConfigValue, &mut Context) -> R + Send + Sync + 'static,
+        R: IntoPluginResult + 'static,
+    {
+        let _plugin_id: PluginId = id.into();
+        let start: StartFn = Arc::new(move |config, ctx| start(config, ctx).into_plugin_result());
+        Self {
+            id: PluginFactoryId(NEXT_FACTORY_ID.fetch_add(1, Ordering::Relaxed)),
+            start,
+            inject: Vec::new(),
+            config: ConfigValue::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_inject<I, S>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inject = keys.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_config(mut self, config: ConfigValue) -> Self {
+        self.config = config;
+        self
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> PluginFactoryId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn inject(&self) -> &[String] {
+        &self.inject
+    }
+
+    #[must_use]
+    pub fn config(&self) -> ConfigValue {
+        self.config.clone()
+    }
+
+    pub(crate) fn start(&self, config: ConfigValue, ctx: &mut Context) -> Result<(), CordisError> {
+        (self.start)(config, ctx)
+    }
+}
 
 /// Plugin identity selected by an overlay, independent of crate boot order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -384,7 +495,7 @@ pub struct PluginSpec {
     pub inject: Vec<String>,
     pub disabled: Option<ConfigValue>,
     pub config: ConfigValue,
-    start: StartFn,
+    factory: PluginFactory,
 }
 
 impl fmt::Debug for PluginSpec {
@@ -399,16 +510,18 @@ impl fmt::Debug for PluginSpec {
 }
 
 impl PluginSpec {
-    pub fn new<F>(id: impl Into<PluginId>, start: F) -> Self
+    pub fn new<F, R>(id: impl Into<PluginId>, start: F) -> Self
     where
-        F: Fn(ConfigValue, &mut Context) + Send + Sync + 'static,
+        F: Fn(ConfigValue, &mut Context) -> R + Send + Sync + 'static,
+        R: IntoPluginResult + 'static,
     {
+        let id = id.into();
         Self {
-            id: id.into(),
+            id: id.clone(),
             inject: Vec::new(),
             disabled: None,
             config: ConfigValue::default(),
-            start: Arc::new(start),
+            factory: PluginFactory::new(id, start),
         }
     }
 
@@ -419,6 +532,7 @@ impl PluginSpec {
         S: Into<String>,
     {
         self.inject = keys.into_iter().map(Into::into).collect();
+        self.factory = self.factory.with_inject(self.inject.clone());
         self
     }
 
@@ -430,8 +544,20 @@ impl PluginSpec {
 
     #[must_use]
     pub fn with_config(mut self, config: ConfigValue) -> Self {
-        self.config = config;
+        self.config = config.clone();
+        self.factory = self.factory.with_config(config);
         self
+    }
+
+    /// Stable identity retained by factory clones.
+    #[must_use]
+    pub const fn factory_id(&self) -> PluginFactoryId {
+        self.factory.id()
+    }
+
+    #[must_use]
+    pub fn factory(&self) -> PluginFactory {
+        self.factory.clone()
     }
 
     #[must_use]
@@ -472,7 +598,7 @@ pub fn load_plugins(
             report.omitted.push(spec.id.clone());
         }
     }
-    let mut pending: Vec<(PluginEntry, StartFn)> = Vec::new();
+    let mut pending: Vec<(PluginEntry, PluginFactory)> = Vec::new();
 
     for entry in selected {
         let Some(spec) = specs_by_id.get(entry.id.as_str()) else {
@@ -483,7 +609,7 @@ pub fn load_plugins(
             report.disabled.push(entry.id);
             continue;
         }
-        pending.push((entry, Arc::clone(&spec.start)));
+        pending.push((entry.clone(), spec.factory()));
     }
 
     loop {
@@ -495,7 +621,7 @@ pub fn load_plugins(
                 continue;
             }
             let config = interpolate_plugin_config(ctx, &entry.config)?;
-            (start)(config, ctx);
+            start.start(config, ctx)?;
             report.started.push(entry.id);
             progress = true;
         }
@@ -518,6 +644,54 @@ pub fn load_plugins(
     Ok(report)
 }
 
+/// Load selected plugins while retaining unresolved entries as pending
+/// Fiber-owned factories. Unlike [`load_plugins`], this route never converts
+/// missing dependencies into a terminal error.
+pub fn load_plugins_pending(
+    ctx: &mut Context,
+    loader: &LoaderContext,
+    overlay: &EnvironmentOverlay,
+    specs: &[PluginSpec],
+) -> Result<LoadReport, CordisError> {
+    let catalog: Vec<PluginEntry> = specs.iter().map(PluginSpec::entry).collect();
+    let selected = overlay.select(&catalog);
+    let selected_ids: BTreeSet<&str> = selected.iter().map(|entry| entry.id.as_str()).collect();
+    let specs_by_id: BTreeMap<&str, &PluginSpec> =
+        specs.iter().map(|spec| (spec.id.as_str(), spec)).collect();
+    let mut report = LoadReport::default();
+    for spec in specs {
+        if !selected_ids.contains(spec.id.as_str()) {
+            report.omitted.push(spec.id.clone());
+        }
+    }
+
+    let mut handles = Vec::new();
+    for entry in selected {
+        let Some(spec) = specs_by_id.get(entry.id.as_str()) else {
+            report.skipped_unregistered.push(entry.id);
+            continue;
+        };
+        if loader.interpolate_disabled(entry.disabled.as_ref())? {
+            report.disabled.push(entry.id);
+            continue;
+        }
+        let factory = spec
+            .factory()
+            .with_inject(entry.inject.clone())
+            .with_config(entry.config.clone());
+        let handle = ctx.mount_pending(factory)?;
+        handles.push((entry.id, handle));
+    }
+    for (id, handle) in handles {
+        if handle.is_pending() {
+            report.pending.push(id);
+        } else if handle.is_active() {
+            report.started.push(id);
+        }
+    }
+    Ok(report)
+}
+
 /// Outcome of one loader pass.
 ///
 /// Overlay omission (`omitted`) is not the same as interpolated `disabled`.
@@ -527,4 +701,7 @@ pub struct LoadReport {
     pub disabled: Vec<PluginId>,
     pub omitted: Vec<PluginId>,
     pub skipped_unregistered: Vec<PluginId>,
+    /// Factories retained by `load_plugins_pending` because inject keys are
+    /// not ready yet. `load_plugins` intentionally leaves this empty.
+    pub pending: Vec<PluginId>,
 }

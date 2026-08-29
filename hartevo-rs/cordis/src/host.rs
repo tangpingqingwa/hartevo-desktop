@@ -2,8 +2,6 @@
 //! InvariantGate, and issues typed Runtime permits. The symbolic AgentLoop is
 //! not Desktop Runtime authority; OpenInterpreter remains an optional adapter.
 
-use std::sync::{Arc, Mutex};
-
 use chrono::{DateTime, Utc};
 
 use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
@@ -24,6 +22,7 @@ use crate::service::Service;
 use crate::surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
     LlmSurface, RuntimeSurface, SurfaceOwner, ToolsSurface, events, map_surfaces,
+    rebind_hartevo_domain,
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
@@ -86,26 +85,15 @@ impl CordisHost {
     ) -> Result<(Self, LoadReport), CordisError> {
         let mut ctx = Context::new();
         let mapping_surfaces = desktop_surfaces(openinterpreter);
-        let mapping_error = Arc::new(Mutex::new(None));
-        let mapping_error_out = Arc::clone(&mapping_error);
         let mapping = PluginSpec::new("surfaces", move |_config, ctx| {
-            if let Err(error) = map_surfaces(ctx, mapping_surfaces)
-                && let Ok(mut slot) = mapping_error_out.lock()
-            {
-                *slot = Some(error);
-            }
+            map_surfaces(ctx, mapping_surfaces)
         });
-        let loop_plugin = PluginSpec::new("agent-loop", |_config, ctx| {
-            AgentLoop.apply(ctx);
-        })
-        .with_inject(AgentLoop::inject().iter().copied());
-        let gate = PluginSpec::new("invariants", |_config, ctx| {
-            InvariantGate.apply(ctx);
-        })
-        .with_inject(InvariantGate::inject().iter().copied());
+        let loop_plugin = PluginSpec::new("agent-loop", |_config, ctx| AgentLoop.apply(ctx))
+            .with_inject(AgentLoop::inject().iter().copied());
+        let gate = PluginSpec::new("invariants", |_config, ctx| InvariantGate.apply(ctx))
+            .with_inject(InvariantGate::inject().iter().copied());
         let adapter = PluginSpec::new(OPENINTERPRETER_PLUGIN_ID, |_config, ctx| {
-            ctx.provide(OPENINTERPRETER, "adapter")
-                .expect("OpenInterpreter adapter registration");
+            ctx.provide(OPENINTERPRETER, "adapter").map(|_| ())
         })
         .with_inject([keys::RUNTIME])
         .with_disabled(!openinterpreter);
@@ -116,13 +104,6 @@ impl CordisHost {
             overlay,
             &[mapping, loop_plugin, gate, adapter],
         )?;
-        if let Some(error) = mapping_error
-            .lock()
-            .map_err(|_| CordisError::RuntimeCoordinatorPoisoned)?
-            .take()
-        {
-            return Err(error);
-        }
         Ok((
             Self {
                 ctx,
@@ -297,8 +278,7 @@ impl CordisHost {
             ]));
         };
         let bound = bind_domain_kernel_facts(*mounted, consent, record, approval, now);
-        self.ctx.replace_reserved(keys::DOMAIN, bound)?;
-        Ok(())
+        rebind_hartevo_domain(&mut self.ctx, bound)
     }
 
     #[must_use]
