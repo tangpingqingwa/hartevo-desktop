@@ -45,6 +45,16 @@ const DROP_TARGET: EventKey<Emit, (), ()> = EventKey::new(
     EventSchemaId::new("conformance.drop-target.v1"),
     "drop-target",
 );
+const SELF_TEARDOWN: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.self-teardown.v1"),
+    "self-teardown",
+);
+const SELF_DROP: EventKey<Emit, u8, ()> =
+    EventKey::new(EventSchemaId::new("conformance.self-drop.v1"), "self-drop");
+const PANIC_CLEANUP: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.panic-cleanup.v1"),
+    "panic-cleanup",
+);
 const SCOPED: EventKey<Emit, (), ()> =
     EventKey::new(EventSchemaId::new("conformance.scope.v1"), "scope");
 const FALLIBLE_EMIT: EventKey<Emit, (), ()> = EventKey::new(
@@ -107,6 +117,28 @@ impl Drop for RegisterOnDrop {
 struct InspectHandleOnDrop {
     handle: ListenerHandle,
     completed: Option<std_mpsc::SyncSender<bool>>,
+}
+
+struct PanicOnDrop {
+    label: &'static str,
+    dropped: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        self.dropped.lock().unwrap().push(self.label);
+        std::panic::panic_any(self.label.to_string());
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 impl Drop for InspectHandleOnDrop {
@@ -483,6 +515,237 @@ fn context_drop_waits_for_an_operation_that_linearized_first() {
 }
 
 #[test]
+fn callback_reusable_teardown_is_a_preclose_noop_and_keeps_context_open() {
+    let context = Arc::new(Mutex::new(Context::new()));
+    let events = context.lock().unwrap().event_reentry().unwrap();
+    let callback_context = Arc::clone(&context);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = Arc::clone(&calls);
+    let teardown_listener = events
+        .on_emit(SELF_TEARDOWN, move |()| {
+            callback_context.lock().unwrap().teardown();
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+    let dispatched = std_mpsc::sync_channel(1);
+    let dispatch_events = events.clone();
+    std::thread::spawn(move || {
+        let _ = dispatched.0.send(dispatch_events.emit(SELF_TEARDOWN, &()));
+    });
+    dispatched
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("callback teardown must not wait for its own event permit")
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(context.lock().unwrap().listener_count(SELF_TEARDOWN), 1);
+
+    let candidate_calls = Arc::new(AtomicUsize::new(0));
+    let candidate_calls_for_listener = Arc::clone(&candidate_calls);
+    let candidate = events
+        .on_emit(FENCE_CANDIDATE, move |()| {
+            candidate_calls_for_listener.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("the same generation must remain open after a callback teardown no-op");
+    events.emit(FENCE_CANDIDATE, &()).unwrap();
+    assert_eq!(candidate_calls.load(Ordering::SeqCst), 1);
+
+    assert!(teardown_listener.dispose());
+    assert!(candidate.dispose());
+}
+
+#[test]
+fn nested_callback_can_take_and_drop_the_final_context_without_self_wait() {
+    let context = Arc::new(Mutex::new(Some(Context::new())));
+    let events = context
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .event_reentry()
+        .unwrap();
+    let blocking_entered = std_mpsc::sync_channel(1);
+    let blocking_release = Arc::new(Barrier::new(2));
+    let blocking_release_for_listener = Arc::clone(&blocking_release);
+    let blocking = events
+        .on_emit(FENCE_BLOCK, move |()| {
+            blocking_entered.0.send(()).unwrap();
+            blocking_release_for_listener.wait();
+        })
+        .unwrap();
+    let nested = events.clone();
+    let callback_context = Arc::clone(&context);
+    let handle = events
+        .on_emit(SELF_DROP, move |depth| {
+            if *depth == 0 {
+                nested.emit(SELF_DROP, &1).unwrap();
+                return;
+            }
+            let context = callback_context
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the nested callback owns the final Context");
+            drop(context);
+        })
+        .unwrap();
+
+    let blocking_dispatched = std_mpsc::sync_channel(1);
+    let blocking_events = events.clone();
+    std::thread::spawn(move || {
+        let _ = blocking_dispatched
+            .0
+            .send(blocking_events.emit(FENCE_BLOCK, &()));
+    });
+    blocking_entered
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the other-thread permit must enter before self-owning Context Drop");
+
+    let dispatched = std_mpsc::sync_channel(1);
+    let dispatch_events = events.clone();
+    std::thread::spawn(move || {
+        let _ = dispatched.0.send(dispatch_events.emit(SELF_DROP, &0));
+    });
+    wait_for_event_gate_to_close(&events);
+    assert!(matches!(
+        dispatched.1.try_recv(),
+        Err(std_mpsc::TryRecvError::Empty)
+    ));
+
+    blocking_release.wait();
+    blocking_dispatched
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the other-thread operation must settle")
+        .unwrap();
+    dispatched
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Context Drop must exclude both nested own permits and drain the other thread")
+        .unwrap();
+
+    assert!(context.lock().unwrap().is_none());
+    assert!(blocking.is_disposed());
+    assert!(handle.is_disposed());
+    assert!(matches!(
+        events.emit(SELF_DROP, &0),
+        Err(CordisError::FiberContextMismatch { .. })
+    ));
+}
+
+#[test]
+fn root_teardown_drops_all_panicking_callbacks_then_reopens_a_fresh_generation() {
+    let mut context = Context::new();
+    let child = context.new_fiber().unwrap();
+    let child_events = context.with_fiber(&child).event_reentry().unwrap();
+    let normal = context
+        .with_fiber(&child)
+        .on_emit(DROP_TARGET, |()| {})
+        .unwrap();
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    for label in ["root-first", "root-second"] {
+        let probe = PanicOnDrop {
+            label,
+            dropped: Arc::clone(&dropped),
+        };
+        child_events
+            .on_emit(PANIC_CLEANUP, move |()| {
+                let _ = &probe;
+            })
+            .unwrap();
+    }
+
+    let torn_down = std_mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| context.teardown()))
+            .expect_err("callback-capture destruction must preserve its first panic");
+        let _ = torn_down.0.send((panic_message(panic.as_ref()), context));
+    });
+    let (message, mut context) = torn_down
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("root teardown must finish structural cleanup before propagating panic");
+
+    assert_eq!(message, "root-first");
+    assert_eq!(*dropped.lock().unwrap(), ["root-first", "root-second"]);
+    assert!(child.is_disposed());
+    assert!(normal.is_disposed());
+    assert_eq!(context.registration_count(), 0);
+    assert_eq!(context.listener_count(DROP_TARGET), 0);
+    assert_eq!(context.listener_count(PANIC_CLEANUP), 0);
+    assert!(matches!(
+        child_events.on_emit(PANIC_CLEANUP, |()| {}),
+        Err(CordisError::FiberContextMismatch { .. } | CordisError::FiberDisposed { .. })
+    ));
+    assert!(matches!(
+        context.with_fiber(&child).event_reentry(),
+        Err(CordisError::FiberContextMismatch { .. } | CordisError::FiberDisposed { .. })
+    ));
+
+    let fresh = context.event_reentry().unwrap();
+    let fresh_listener = fresh.on_emit(PANIC_CLEANUP, |()| {}).unwrap();
+    assert!(fresh_listener.dispose());
+}
+
+#[test]
+fn child_cleanup_converts_first_destructor_panic_after_removing_every_record() {
+    let mut context = Context::new();
+    let child = context.new_fiber().unwrap();
+    let child_events = context.with_fiber(&child).event_reentry().unwrap();
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let mut panicking_handles = Vec::new();
+    for label in ["child-first", "child-second"] {
+        let probe = PanicOnDrop {
+            label,
+            dropped: Arc::clone(&dropped),
+        };
+        panicking_handles.push(
+            child_events
+                .on_emit(PANIC_CLEANUP, move |()| {
+                    let _ = &probe;
+                })
+                .unwrap(),
+        );
+    }
+    let recorded = context
+        .with_fiber(&child)
+        .on_emit(PANIC_CLEANUP, |()| {})
+        .unwrap();
+
+    let cleaned = std_mpsc::sync_channel(1);
+    let child_for_cleanup = child.clone();
+    std::thread::spawn(move || {
+        let result = context.dispose_fiber(&child_for_cleanup);
+        let _ = cleaned.0.send((result, context));
+    });
+    let (result, mut context) = cleaned
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("child cleanup must convert callback destructor panic without stopping cleanup");
+
+    assert!(matches!(
+        result,
+        Err(CordisError::CleanupPanicked { ref message }) if message == "child-first"
+    ));
+    assert_eq!(*dropped.lock().unwrap(), ["child-first", "child-second"]);
+    assert!(child.is_disposed());
+    assert!(recorded.is_disposed());
+    assert!(panicking_handles.iter().all(ListenerHandle::is_disposed));
+    assert_eq!(context.registration_count(), 0);
+    assert_eq!(context.listener_count(PANIC_CLEANUP), 0);
+    assert!(matches!(
+        context.with_fiber(&child).event_reentry(),
+        Err(CordisError::FiberContextMismatch { .. } | CordisError::FiberDisposed { .. })
+    ));
+    assert!(matches!(
+        child_events.emit(PANIC_CLEANUP, &()),
+        Err(CordisError::FiberDisposed { .. } | CordisError::FiberContextMismatch { .. })
+    ));
+}
+
+#[test]
 fn explicit_handle_disposal_drops_callback_capture_after_unlocking() {
     let context = Context::new();
     let events = context.event_reentry().unwrap();
@@ -520,6 +783,40 @@ fn explicit_handle_disposal_drops_callback_capture_after_unlocking() {
     assert_eq!(context.listener_count(DROP_TARGET), 1);
     events.emit(DROP_TARGET, &()).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn explicit_handle_disposal_commits_removal_before_destructor_panic() {
+    let context = Context::new();
+    let events = context.event_reentry().unwrap();
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let probe = PanicOnDrop {
+        label: "explicit-handle",
+        dropped: Arc::clone(&dropped),
+    };
+    let handle = events
+        .on_emit(PANIC_CLEANUP, move |()| {
+            let _ = &probe;
+        })
+        .unwrap();
+    let observed = handle.clone();
+
+    let disposed = std_mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| handle.dispose()))
+            .expect_err("the callback capture destructor must retain its panic");
+        let _ = disposed.0.send(panic_message(panic.as_ref()));
+    });
+    assert_eq!(
+        disposed
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("explicit disposal must not hold the event table while dropping callbacks"),
+        "explicit-handle"
+    );
+    assert_eq!(*dropped.lock().unwrap(), ["explicit-handle"]);
+    assert!(observed.is_disposed());
+    assert_eq!(context.listener_count(PANIC_CLEANUP), 0);
 }
 
 #[test]

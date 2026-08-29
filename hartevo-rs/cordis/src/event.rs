@@ -8,7 +8,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::panic::{AssertUnwindSafe, resume_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -790,6 +790,8 @@ struct EventBusState {
     next_id: u64,
 }
 
+pub(crate) type CallbackDropPanic = Box<dyn Any + Send + 'static>;
+
 /// Idempotent handle for one exact Fiber-owned listener registration.
 #[derive(Clone)]
 pub struct ListenerHandle {
@@ -945,22 +947,25 @@ impl EventBus {
             }
             take_empty_slot(&mut state, name)
         };
-        drop(removed_slot);
+        resume_first_drop_panic(drop_detached(Vec::new(), removed_slot));
     }
 
-    pub(crate) fn clear(&self) {
+    /// Clear the table structurally, then destroy every callback capture one at
+    /// a time outside the table lock. The caller decides when to propagate the
+    /// first destructor panic after completing its wider cleanup transaction.
+    pub(crate) fn clear(&self) -> Option<CallbackDropPanic> {
         let removed_slots = {
             let mut state = lock_recover(&self.inner);
             std::mem::take(&mut state.slots)
         };
-        drop(removed_slots);
+        drop_detached(Vec::new(), removed_slots.into_values())
     }
 
     /// Remove every listener owned by a terminal Fiber. The owner tombstone is
     /// published before this sweep, while registration rechecks that same
     /// tombstone under the event-table lock. Consequently a cloneable event
     /// capability cannot race cleanup and leave an inactive listener behind.
-    pub(crate) fn remove_owners(&self, owners: &HashSet<FiberUid>) {
+    pub(crate) fn remove_owners(&self, owners: &HashSet<FiberUid>) -> Option<CallbackDropPanic> {
         let (removed_listeners, removed_slots) = {
             let mut state = lock_recover(&self.inner);
             let mut removed_listeners = Vec::new();
@@ -990,8 +995,7 @@ impl EventBus {
                 .collect::<Vec<_>>();
             (removed_listeners, removed_slots)
         };
-        drop(removed_listeners);
-        drop(removed_slots);
+        drop_detached(removed_listeners, removed_slots)
     }
 
     pub(crate) fn register_emit<P, F>(
@@ -1722,6 +1726,46 @@ fn take_empty_slot(state: &mut EventBusState, name: &str) -> Option<Slot> {
     }
 }
 
+/// Drop all callback-bearing values independently after their table mutation
+/// has committed. A destructor panic cannot prevent later callbacks from
+/// being released; only the first panic payload is retained for diagnostics.
+fn drop_detached(
+    listeners: impl IntoIterator<Item = Listener>,
+    slots: impl IntoIterator<Item = Slot>,
+) -> Option<CallbackDropPanic> {
+    let mut first_panic = None;
+    for listener in listeners {
+        drop_one_catching(listener, &mut first_panic);
+    }
+    for slot in slots {
+        let Slot {
+            descriptor,
+            listeners,
+            explicit_lock: _,
+            dispatch_lock: _,
+        } = slot;
+        for listener in listeners {
+            drop_one_catching(listener, &mut first_panic);
+        }
+        drop(descriptor);
+    }
+    first_panic
+}
+
+fn drop_one_catching<T>(value: T, first_panic: &mut Option<CallbackDropPanic>) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value)))
+        && first_panic.is_none()
+    {
+        *first_panic = Some(payload);
+    }
+}
+
+fn resume_first_drop_panic(first_panic: Option<CallbackDropPanic>) {
+    if let Some(payload) = first_panic {
+        resume_unwind(payload);
+    }
+}
+
 fn remove_listener_locked(bus: &Mutex<EventBusState>, name: &str, id: u64) -> bool {
     let (removed_listener, removed_slot) = {
         let mut state = lock_recover(bus);
@@ -1735,8 +1779,7 @@ fn remove_listener_locked(bus: &Mutex<EventBusState>, name: &str, id: u64) -> bo
         let removed_slot = take_empty_slot(&mut state, name);
         (removed_listener, removed_slot)
     };
-    drop(removed_listener);
-    drop(removed_slot);
+    resume_first_drop_panic(drop_detached([removed_listener], removed_slot));
     true
 }
 
@@ -1757,8 +1800,7 @@ fn claim_once_by_id(bus: &Mutex<EventBusState>, id: u64) -> bool {
         let removed_slot = take_empty_slot(&mut state, &name);
         (removed_listener, removed_slot)
     };
-    drop(removed_listener);
-    drop(removed_slot);
+    resume_first_drop_panic(drop_detached([removed_listener], removed_slot));
     true
 }
 

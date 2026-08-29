@@ -6,6 +6,7 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
 
 use crate::config::ConfigValue;
 use crate::effect::{Disposer, Registration, RegistrationHandle};
@@ -436,6 +437,7 @@ struct EventOperationState {
     generation: Arc<EventGeneration>,
     open: bool,
     active: usize,
+    active_by_thread: HashMap<ThreadId, usize>,
 }
 
 struct EventOperationGate {
@@ -450,6 +452,7 @@ impl EventOperationGate {
                 generation: Arc::new(EventGeneration),
                 open: true,
                 active: 0,
+                active_by_thread: HashMap::new(),
             }),
             drained: Condvar::new(),
         }
@@ -471,17 +474,36 @@ impl EventOperationGate {
         if !state.open || !Arc::ptr_eq(&state.generation, generation) {
             return None;
         }
-        state.active = state.active.checked_add(1)?;
+        let thread_id = std::thread::current().id();
+        let next_active = state.active.checked_add(1)?;
+        let next_thread_active = state
+            .active_by_thread
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)?;
+        state.active = next_active;
+        state.active_by_thread.insert(thread_id, next_thread_active);
         Some(EventOperationPermit {
             gate: Arc::clone(self),
+            thread_id,
         })
     }
 
-    fn close_and_drain(self: &Arc<Self>, reopen: bool) -> ClosedEventGeneration {
+    /// Close a reusable Context generation and drain every operation. Calling
+    /// this from an operation on the same thread is rejected before `open` is
+    /// changed, because that operation cannot drain until the callback returns.
+    fn try_close_and_drain_reusable(&self) -> bool {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if state
+            .active_by_thread
+            .contains_key(&std::thread::current().id())
+        {
+            return false;
+        }
         state.open = false;
         while state.active != 0 {
             state = match self.drained.wait(state) {
@@ -489,13 +511,36 @@ impl EventOperationGate {
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
-        ClosedEventGeneration {
-            gate: Arc::clone(self),
-            reopen,
+        true
+    }
+
+    /// Permanently close a Context while allowing Drop to run from inside one
+    /// of its own callbacks. The caller's exact outstanding permits remain
+    /// valid until their stack frames return; permits on every other thread
+    /// must drain before structural cleanup starts.
+    fn close_and_drain_for_drop(&self) {
+        let thread_id = std::thread::current().id();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.open = false;
+        let caller_active = state
+            .active_by_thread
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_default();
+        while state.active != caller_active {
+            state = match self.drained.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         }
     }
 
-    fn reopen(&self) {
+    /// Publish a fresh generation only after reusable teardown completed all
+    /// structural cleanup. There is deliberately no RAII reopen on unwind.
+    fn reopen_after_completed_teardown(&self) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -508,6 +553,7 @@ impl EventOperationGate {
 
 struct EventOperationPermit {
     gate: Arc<EventOperationGate>,
+    thread_id: ThreadId,
 }
 
 impl Drop for EventOperationPermit {
@@ -520,22 +566,22 @@ impl Drop for EventOperationPermit {
             .active
             .checked_sub(1)
             .expect("an event operation permit owns one active count");
-        if state.active == 0 {
-            self.gate.drained.notify_all();
+        let remove_thread = {
+            let thread_active = state
+                .active_by_thread
+                .get_mut(&self.thread_id)
+                .expect("an event operation permit owns one thread-local active count");
+            *thread_active = thread_active
+                .checked_sub(1)
+                .expect("an event operation permit owns one thread-local active count");
+            *thread_active == 0
+        };
+        if remove_thread {
+            state.active_by_thread.remove(&self.thread_id);
         }
-    }
-}
-
-struct ClosedEventGeneration {
-    gate: Arc<EventOperationGate>,
-    reopen: bool,
-}
-
-impl Drop for ClosedEventGeneration {
-    fn drop(&mut self) {
-        if self.reopen {
-            self.gate.reopen();
-        }
+        // A self-excluding Context Drop waits for `active == caller_active`,
+        // so every other-thread decrement can satisfy its predicate.
+        self.gate.drained.notify_all();
     }
 }
 
@@ -1211,7 +1257,10 @@ impl Context {
     }
 
     fn cleanup_fibers(&mut self, disposed: &HashSet<FiberUid>) -> Result<(), CordisError> {
-        self.events.remove_owners(disposed);
+        let mut first_panic = self
+            .events
+            .remove_owners(disposed)
+            .map(|payload| panic_payload_message(payload.as_ref()));
         for uid in disposed {
             self.registry.remove_fiber(*uid);
         }
@@ -1230,7 +1279,6 @@ impl Context {
         }
         retained.reverse();
         self.effects = retained;
-        let mut first_panic = None;
         for registration in owned {
             let result = catch_unwind(AssertUnwindSafe(|| self.run_registration(registration)));
             if let Err(payload) = result
@@ -2656,6 +2704,11 @@ impl Context {
 
     /// Run registrations newest-first, then drop remaining state. The root
     /// Context remains reusable and its root Fiber keeps uid zero.
+    ///
+    /// A listener that calls `teardown` through shared synchronization already
+    /// owns an event-operation permit on its thread. Such a request is a
+    /// fail-closed no-op: it does not close the current generation or wait for
+    /// itself. An external caller may retry after the callback returns.
     pub fn teardown(&mut self) {
         // A callback cannot tear down the owner whose activation bookkeeping
         // is still on the stack. N1 will model explicit async unload; N0 keeps
@@ -2663,13 +2716,19 @@ impl Context {
         if self.activation_depth != 0 {
             return;
         }
-        let _closed_generation = self.event_gate.close_and_drain(true);
-        self.teardown_closed();
+        if !self.event_gate.try_close_and_drain_reusable() {
+            return;
+        }
+        let first_panic = self.teardown_closed();
+        self.event_gate.reopen_after_completed_teardown();
+        if let Some(payload) = first_panic {
+            resume_unwind(payload);
+        }
     }
 
     /// Teardown body entered only while the current public event-capability
     /// generation is closed and every winning operation has drained.
-    fn teardown_closed(&mut self) {
+    fn teardown_closed(&mut self) -> Option<Box<dyn Any + Send + 'static>> {
         let mut first_panic = None;
         while let Some(registration) = self.effects.pop() {
             let result = catch_unwind(AssertUnwindSafe(|| self.run_registration(registration)));
@@ -2683,7 +2742,11 @@ impl Context {
         self.providers.clear();
         self.reserved_services.clear();
         self.vars = ConfigValue::default();
-        self.events.clear();
+        if let Some(payload) = self.events.clear()
+            && first_panic.is_none()
+        {
+            first_panic = Some(payload);
+        }
         self.registry = Registry::new();
         self.mounted_factories.clear();
         self.activating_factories.clear();
@@ -2695,9 +2758,7 @@ impl Context {
         self.fibers.clear();
         self.current_fiber = self.root.uid();
         self.root.replace_metadata(self.vars.clone());
-        if let Some(payload) = first_panic {
-            resume_unwind(payload);
-        }
+        first_panic
     }
 }
 
@@ -3981,8 +4042,10 @@ mod provider_tests {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        let _closed_generation = self.event_gate.close_and_drain(false);
-        self.teardown_closed();
+        self.event_gate.close_and_drain_for_drop();
+        if let Some(payload) = self.teardown_closed() {
+            resume_unwind(payload);
+        }
     }
 }
 
