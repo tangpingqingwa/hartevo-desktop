@@ -8,6 +8,11 @@
 //! lifecycle-owned typed-Emit bridge for repeatable plugins. The owned bridge
 //! deliberately does not yet claim Parallel, Serial, Bail, Waterfall, or
 //! Accumulate parity.
+//!
+//! Typed [`ServiceHandle`] values make Cordis caller/shadow tracing explicit
+//! in Rust, preserve isolate lookup boundaries, provide opt-in callable
+//! services, and resolve Fiber-owned dotted associations and ordered service
+//! config interception without changing the consuming [`Service`] adapter.
 
 mod agent;
 mod authority;
@@ -68,7 +73,11 @@ pub use registry::{
     LifecycleContextView, LifecycleEventDispatcher, LifecycleHandle, LifecycleProviderHandle,
     LifecycleRegistry,
 };
-pub use service::Service;
+pub use service::{
+    AssociatedAccessor, AssociatedAccessorHandle, CallableService, Service, ServiceAssociation,
+    ServiceCall, ServiceCaller, ServiceHandle, ServiceOptions, ServiceOrigin, ServiceShadow,
+    ServiceViewKind, associated_key, merge_service_config,
+};
 pub use surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmStream,
     LlmSurface, MAPPED_KEYS, RuntimeSurface, SurfaceOwner, ToolCall, ToolsSurface, events,
