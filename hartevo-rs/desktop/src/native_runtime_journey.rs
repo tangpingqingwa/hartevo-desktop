@@ -981,9 +981,8 @@ async fn run_complete_runtime_journey_inner(
     launch: DesktopRuntimeExecutionLaunch,
 ) -> Result<(), NativeJourneyError> {
     let context = journey.read().context.clone();
-    let (selection, handle, identity, coordinator, prepared_sequence, render_ack_sequence) =
-        launch.into_parts();
-    if render_ack_sequence <= prepared_sequence || coordinator.identity() != &identity {
+    let (selection, identity, authority) = launch.into_dispatch_parts();
+    if !authority.is_exact_post_render_authority() || authority.identity() != &identity {
         return Err(NativeJourneyError::new("NATIVE_RUNTIME_AUTHORITY_INVALID"));
     }
     let plane = context.plane.clone();
@@ -993,13 +992,7 @@ async fn run_complete_runtime_journey_inner(
         .map_err(|_| NativeJourneyError::new("NATIVE_RUNTIME_PROGRAM_UNAVAILABLE"))?;
     let runtime_task = tokio::task::spawn_blocking(move || {
         let runtime = controlled_runtime_source(runtime_program, control_root);
-        plane.resume_mission_runtime_native(
-            secrets.as_ref(),
-            &handle,
-            runtime,
-            coordinator.cancellation(),
-            Utc::now(),
-        )
+        plane.resume_mission_runtime_native(secrets.as_ref(), authority, runtime, Utc::now())
     });
     let mut drive = NativeRuntimeDrive::new(runtime_task, selection);
     loop {

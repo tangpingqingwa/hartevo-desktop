@@ -1046,6 +1046,29 @@ impl DesktopRuntimeSubscriptionReducer {
         }
     }
 
+    /// Opens a new ephemeral Desktop command view for an exact selection.
+    /// This is a local paint transition, not a claim that durable Runtime
+    /// history disappeared; the next Application delivery must still reset or
+    /// acknowledge the newly selected generation through the normal reducer.
+    fn prepare_runtime_command(
+        &mut self,
+        selection: &DesktopRuntimeSelection,
+    ) -> Result<(), RuntimeSubscriptionError> {
+        if self.selected.as_ref() != Some(&(selection.scope.clone(), selection.epoch)) {
+            return Err(RuntimeSubscriptionError::ScopeNotSelected);
+        }
+        let viewport = self
+            .viewports
+            .get_mut(&selection.scope)
+            .ok_or(RuntimeSubscriptionError::ViewportMissing)?;
+        viewport.validate()?;
+        viewport.cursor = None;
+        viewport.projection = None;
+        viewport.transport_state = DesktopRuntimeTransportState::AwaitingTurn;
+        viewport.last_delivery_fingerprint = None;
+        viewport.validate()
+    }
+
     fn replay_effect(
         viewport: &DesktopRuntimeViewportState,
         fingerprint: &DesktopRuntimeDeliveryFingerprint,
@@ -1600,6 +1623,10 @@ impl DesktopRuntimePaintCommit {
     pub(crate) fn selection(&self) -> &DesktopRuntimeSelection {
         &self.selection
     }
+
+    pub(crate) fn identity(&self) -> &DesktopRuntimeCommandIdentity {
+        &self.identity
+    }
 }
 
 /// Token produced only after a post-render Dioxus effect acknowledges the
@@ -1623,10 +1650,6 @@ impl DesktopRuntimeExecutionLaunch {
         &self.identity
     }
 
-    pub(crate) fn handle(&self) -> &CatalogMissionExecutionHandle {
-        &self.handle
-    }
-
     pub(crate) const fn prepared_sequence(&self) -> u64 {
         self.prepared_sequence
     }
@@ -1635,23 +1658,22 @@ impl DesktopRuntimeExecutionLaunch {
         self.render_ack_sequence
     }
 
-    pub(crate) fn into_parts(
+    pub(crate) fn into_dispatch_parts(
         self,
     ) -> (
         DesktopRuntimeSelection,
-        CatalogMissionExecutionHandle,
         DesktopRuntimeCommandIdentity,
-        DesktopRuntimeCoordinatorControl,
-        u64,
-        u64,
+        DesktopCatalogRuntimeDispatchAuthority,
     ) {
         (
             self.selection,
-            self.handle,
             self.identity,
-            self.coordinator,
-            self.prepared_sequence,
-            self.render_ack_sequence,
+            DesktopCatalogRuntimeDispatchAuthority {
+                handle: self.handle,
+                coordinator: self.coordinator,
+                prepared_sequence: self.prepared_sequence,
+                render_ack_sequence: self.render_ack_sequence,
+            },
         )
     }
 }
@@ -1666,6 +1688,48 @@ impl fmt::Debug for DesktopRuntimeExecutionLaunch {
             .field("prepared_sequence", &self.prepared_sequence)
             .field("render_ack_sequence", &self.render_ack_sequence)
             .finish_non_exhaustive()
+    }
+}
+
+/// Non-cloneable proof that the exact Catalog handle crossed the Desktop
+/// post-render acknowledgement fence. Catalog Runtime and continuation data
+/// paths consume this value; a durable read handle alone cannot construct it.
+pub(crate) struct DesktopCatalogRuntimeDispatchAuthority {
+    handle: CatalogMissionExecutionHandle,
+    coordinator: DesktopRuntimeCoordinatorControl,
+    prepared_sequence: u64,
+    render_ack_sequence: u64,
+}
+
+impl DesktopCatalogRuntimeDispatchAuthority {
+    pub(crate) fn identity(&self) -> &DesktopRuntimeCommandIdentity {
+        self.coordinator.identity()
+    }
+
+    pub(crate) fn is_exact_post_render_authority(&self) -> bool {
+        let scope = &self.coordinator.identity().scope;
+        self.render_ack_sequence > self.prepared_sequence
+            && scope.project_id() == self.handle.project_id()
+            && scope.mission_id() == self.handle.mission_id()
+            && scope.handle_digest() == self.handle.handle_digest()
+    }
+
+    pub(crate) fn into_runtime_parts(
+        self,
+    ) -> (CatalogMissionExecutionHandle, DesktopRuntimeCancellation) {
+        (self.handle, self.coordinator.cancellation)
+    }
+}
+
+impl fmt::Debug for DesktopCatalogRuntimeDispatchAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopCatalogRuntimeDispatchAuthority")
+            .field("handle", &self.handle)
+            .field("identity", &self.coordinator.identity())
+            .field("prepared_sequence", &self.prepared_sequence)
+            .field("render_ack_sequence", &self.render_ack_sequence)
+            .finish()
     }
 }
 
@@ -1744,6 +1808,7 @@ impl DesktopRuntimeExecutionPaintState {
             .reducer
             .select_scope(Some(scope.clone()))?
             .ok_or(RuntimeSubscriptionError::ScopeNotSelected)?;
+        self.reducer.prepare_runtime_command(&selection)?;
         let awaiting = DesktopRuntimeDelivery::AwaitingTurn {
             scope: scope.clone(),
             epoch: selection.epoch,
@@ -1774,6 +1839,50 @@ impl DesktopRuntimeExecutionPaintState {
             identity,
             prepared_sequence,
         })
+    }
+
+    /// Starts a fresh paint/ack cycle for one already acknowledged Catalog
+    /// Mission before a continuation is allowed to append or dispatch. The
+    /// retained durable handle remains read-only; only the resulting launch
+    /// can become data-plane execution authority after the next render.
+    pub(crate) fn commit_catalog_continuation_for_selection(
+        &mut self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<DesktopRuntimePaintCommit, RuntimeSubscriptionError> {
+        let scope = self
+            .selected_scope_for(project_id, mission_id)
+            .cloned()
+            .ok_or(RuntimeSubscriptionError::ScopeNotSelected)?;
+        if !self.acknowledged_handles.contains(&scope) {
+            return Err(RuntimeSubscriptionError::PaintAcknowledgementMismatch);
+        }
+        let handle = self
+            .handles
+            .get(&scope)
+            .filter(|handle| handle.handle_digest() == scope.handle_digest())
+            .cloned()
+            .ok_or(RuntimeSubscriptionError::ScopeHandleMismatch)?;
+        self.commit_catalog_start(handle)
+    }
+
+    /// Reports only whether a fresh continuation paint may be prepared. The
+    /// durable handle stays inside this state machine and is never returned to
+    /// the window or data plane as execution authority.
+    pub(crate) fn catalog_continuation_ready_for_selection(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> bool {
+        let Some(scope) = self.selected_scope_for(project_id, mission_id) else {
+            return false;
+        };
+        !self.command_slot.has_active_command()
+            && self.acknowledged_handles.contains(scope)
+            && self
+                .handles
+                .get(scope)
+                .is_some_and(|handle| handle.handle_digest() == scope.handle_digest())
     }
 
     pub(crate) fn pending_paint_commit(&self) -> Option<DesktopRuntimePaintCommit> {
@@ -1978,21 +2087,6 @@ impl DesktopRuntimeExecutionPaintState {
             handle,
             cursor,
         })
-    }
-
-    /// Return only a handle that crossed this process's post-render
-    /// acknowledgement fence for the exact selected Catalog Mission.
-    pub(crate) fn acknowledged_handle_for_selection(
-        &self,
-        project_id: &ProjectId,
-        mission_id: &MissionId,
-    ) -> Option<CatalogMissionExecutionHandle> {
-        let scope = self.selected_scope_for(project_id, mission_id)?;
-        if !self.acknowledged_handles.contains(scope) {
-            return None;
-        }
-        let handle = self.handles.get(scope)?;
-        (handle.handle_digest() == scope.handle_digest()).then(|| handle.clone())
     }
 
     pub(crate) fn apply_delivery(
@@ -3677,7 +3771,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_handle_exists_only_after_exact_render_ack() {
+    fn catalog_continuation_requires_a_fresh_exact_render_ack() {
         let project_id = ProjectId::from("project-continuation-paint");
         let mission_id = MissionId::from("mission-continuation-paint");
         let handle = catalog_handle(project_id.as_str(), mission_id.as_str(), 'a');
@@ -3685,24 +3779,66 @@ mod tests {
         let commit = state
             .commit_catalog_start(handle.clone())
             .expect("prepare first paint");
-        assert!(
-            state
-                .acknowledged_handle_for_selection(&project_id, &mission_id)
-                .is_none()
-        );
+        assert!(!state.catalog_continuation_ready_for_selection(&project_id, &mission_id));
+        assert!(matches!(
+            state.commit_catalog_continuation_for_selection(&project_id, &mission_id),
+            Err(RuntimeSubscriptionError::PaintAcknowledgementMismatch)
+        ));
 
-        state
+        let launch = state
             .acknowledge_rendered_paint(&commit)
             .expect("exact post-render acknowledgement");
-        assert_eq!(
-            state.acknowledged_handle_for_selection(&project_id, &mission_id),
-            Some(handle)
-        );
+        assert!(launch.render_ack_sequence() > launch.prepared_sequence());
+        let selection = launch.selection().clone();
+        let initial_identity = launch.identity().clone();
+        let (_, _, initial_authority) = launch.into_dispatch_parts();
+        assert!(initial_authority.is_exact_post_render_authority());
+        drop(initial_authority);
         assert!(
             state
-                .acknowledged_handle_for_selection(&ProjectId::from("other-project"), &mission_id,)
-                .is_none()
+                .mark_runtime_returned(&initial_identity)
+                .expect("record initial Runtime return")
         );
+        apply_terminal_two_delta_turn(&mut state, &selection, RuntimeTurnStatus::Completed, 2, 'e');
+        assert!(state.completion_ready(&initial_identity));
+        assert!(matches!(
+            state.finish_runtime(&initial_identity, &selection),
+            Ok(DesktopRuntimeCompletionDisposition::Accepted(_))
+        ));
+        assert!(
+            state
+                .paint_view(&project_id, &mission_id)
+                .and_then(|view| view.stream().cloned())
+                .is_some()
+        );
+        assert!(state.catalog_continuation_ready_for_selection(&project_id, &mission_id));
+        assert!(!state.catalog_continuation_ready_for_selection(
+            &ProjectId::from("other-project"),
+            &mission_id,
+        ));
+
+        let continuation_commit = state
+            .commit_catalog_continuation_for_selection(&project_id, &mission_id)
+            .expect("prepare continuation paint");
+        let continuation_view = state
+            .paint_view(&project_id, &mission_id)
+            .expect("continuation awaiting paint");
+        assert!(continuation_view.awaiting_turn());
+        assert!(continuation_view.stream().is_none());
+        assert_ne!(continuation_commit.identity(), &initial_identity);
+        assert!(!state.catalog_continuation_ready_for_selection(&project_id, &mission_id));
+        assert!(matches!(
+            state.commit_catalog_continuation_for_selection(&project_id, &mission_id),
+            Err(RuntimeSubscriptionError::PaintAcknowledgementMismatch)
+        ));
+
+        let continuation_launch = state
+            .acknowledge_rendered_paint(&continuation_commit)
+            .expect("fresh continuation post-render acknowledgement");
+        let (_, continuation_identity, continuation_authority) =
+            continuation_launch.into_dispatch_parts();
+        assert_ne!(continuation_identity, initial_identity);
+        assert!(continuation_authority.is_exact_post_render_authority());
     }
 
     #[test]

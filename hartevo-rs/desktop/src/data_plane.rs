@@ -74,6 +74,7 @@ use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
     discover_runtime, ensure_project_runtime_home,
 };
+use crate::runtime_subscription::DesktopCatalogRuntimeDispatchAuthority;
 
 const DATA_DIRECTORY_ENV: &str = "HARTEVO_DESKTOP_DATA_DIR";
 const DATABASE_FILE_NAME: &str = "hartevo.sqlite3";
@@ -432,14 +433,16 @@ impl fmt::Debug for DesktopCatalogMissionExecutionStart {
 pub struct DesktopMissionContinuationRequest {
     pub project_id: ProjectId,
     pub mission_id: MissionId,
-    /// Exact durable Catalog handle that crossed the Desktop paint/ack fence.
-    /// Legacy non-Catalog Missions leave this empty.
-    pub catalog_execution_handle: Option<CatalogMissionExecutionHandle>,
     pub message_id: MissionConversationMessageId,
     pub kind: MissionConversationMessageKind,
     pub body: String,
     pub idempotency_key: String,
     pub expected_conversation_revision: u64,
+}
+
+enum DesktopMissionContinuationRuntimeAuthority<'a> {
+    Legacy(Option<&'a DesktopRuntimeCancellation>),
+    Catalog(Box<DesktopCatalogRuntimeDispatchAuthority>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1525,24 +1528,23 @@ impl DesktopDataPlane {
         )
     }
 
-    /// Resume one Catalog Mission only when the UI supplies the exact durable
-    /// execution handle that was painted and acknowledged before dispatch.
-    pub fn resume_catalog_mission_runtime_cancellable_os(
+    /// Resume one Catalog Mission only by consuming the non-cloneable
+    /// capability minted after the exact handle was painted and acknowledged.
+    /// The durable handle returned by start/prepare remains read-only.
+    pub(crate) fn resume_catalog_mission_runtime_cancellable_os(
         &self,
-        handle: &CatalogMissionExecutionHandle,
-        cancellation: &DesktopRuntimeCancellation,
+        authority: DesktopCatalogRuntimeDispatchAuthority,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         let runtime = discover_runtime();
         self.resume_catalog_mission_runtime_with_cancellation(
             &secret_store,
-            handle,
+            authority,
             runtime
                 .configuration
                 .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
             runtime.projection.status,
-            Some(cancellation),
             now,
         )
     }
@@ -1551,17 +1553,15 @@ impl DesktopDataPlane {
     pub(crate) fn resume_mission_runtime_native(
         &self,
         secret_store: &impl SecretStore,
-        handle: &CatalogMissionExecutionHandle,
+        authority: DesktopCatalogRuntimeDispatchAuthority,
         runtime: DesktopRuntimeSource,
-        cancellation: &DesktopRuntimeCancellation,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         self.resume_catalog_mission_runtime_with_cancellation(
             secret_store,
-            handle,
+            authority,
             Some(runtime),
             DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
-            Some(cancellation),
             now,
         )
     }
@@ -1615,10 +1615,10 @@ impl DesktopDataPlane {
         )
     }
 
-    /// Appends one user message to the existing Catalog Mission Conversation
-    /// and runs a new bounded generation for that same Mission. The message is
-    /// durable before Runtime discovery or dispatch; no second Mission is
-    /// created, and the Conversation command cannot change Capability authority.
+    /// Appends one user message to an existing legacy local Mission and runs a
+    /// new bounded generation for that same Mission. Catalog continuation uses
+    /// the sealed post-render capability path below instead of this public
+    /// Project/Mission-id entry point.
     pub fn continue_mission_and_run_os(
         &self,
         request: DesktopMissionContinuationRequest,
@@ -1648,11 +1648,34 @@ impl DesktopDataPlane {
         self.continue_mission_and_run_with_cancellation(
             &secret_store,
             request,
+            DesktopMissionContinuationRuntimeAuthority::Legacy(Some(cancellation)),
             runtime
                 .configuration
                 .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
             runtime.projection.status,
-            Some(cancellation),
+            now,
+        )
+    }
+
+    /// Catalog continuation is a separate sealed path: it consumes the exact
+    /// post-render capability and cannot be reached with the cloneable durable
+    /// subscription handle returned by start/prepare.
+    pub(crate) fn continue_catalog_mission_and_run_cancellable_os(
+        &self,
+        authority: DesktopCatalogRuntimeDispatchAuthority,
+        request: DesktopMissionContinuationRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let runtime = discover_runtime();
+        self.continue_mission_and_run_with_cancellation(
+            &secret_store,
+            request,
+            DesktopMissionContinuationRuntimeAuthority::Catalog(Box::new(authority)),
+            runtime
+                .configuration
+                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
+            runtime.projection.status,
             now,
         )
     }
@@ -2221,9 +2244,29 @@ impl DesktopDataPlane {
         self.continue_mission_and_run_with_cancellation(
             secret_store,
             request,
+            DesktopMissionContinuationRuntimeAuthority::Legacy(None),
             runtime,
             availability,
-            None,
+            now,
+        )
+    }
+
+    #[cfg(test)]
+    fn continue_catalog_mission_and_run_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopMissionContinuationRequest,
+        authority: DesktopCatalogRuntimeDispatchAuthority,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        self.continue_mission_and_run_with_cancellation(
+            secret_store,
+            request,
+            DesktopMissionContinuationRuntimeAuthority::Catalog(Box::new(authority)),
+            runtime,
+            availability,
             now,
         )
     }
@@ -2232,20 +2275,35 @@ impl DesktopDataPlane {
         &self,
         secret_store: &impl SecretStore,
         request: DesktopMissionContinuationRequest,
+        authority: DesktopMissionContinuationRuntimeAuthority<'_>,
         runtime: Option<DesktopRuntimeSource>,
         availability: DesktopRuntimeAvailabilityStatus,
-        cancellation: Option<&DesktopRuntimeCancellation>,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         if request.body.trim().is_empty() || request.idempotency_key.trim().is_empty() {
             return Err(DesktopDataError::InvalidMissionContinuation);
         }
-        self.require_exact_catalog_continuation_handle(secret_store, &request)?;
+        let (catalog_execution, legacy_cancellation) = match authority {
+            DesktopMissionContinuationRuntimeAuthority::Legacy(cancellation) => {
+                (None, cancellation)
+            }
+            DesktopMissionContinuationRuntimeAuthority::Catalog(authority) => {
+                if !authority.is_exact_post_render_authority() {
+                    return Err(ApplicationError::from(
+                        RuntimeTextSubscriptionError::MissionHandleMismatch,
+                    )
+                    .into());
+                }
+                (Some((*authority).into_runtime_parts()), None)
+            }
+        };
+        let catalog_handle = catalog_execution.as_ref().map(|(handle, _)| handle);
+        self.require_exact_catalog_continuation_handle(secret_store, &request, catalog_handle)?;
         let project_id = request.project_id.clone();
         let mission_id = request.mission_id.clone();
         let (mut service, runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
-        validate_catalog_continuation_handle(&service, &request)?;
+        validate_catalog_continuation_handle(&service, &request, catalog_handle)?;
         service.append_mission_conversation_message(
             AppendMissionConversationMessage {
                 project_id: project_id.clone(),
@@ -2267,7 +2325,10 @@ impl DesktopDataPlane {
             mission_id,
             runtime,
             availability,
-            cancellation,
+            catalog_execution
+                .as_ref()
+                .map(|(_, cancellation)| cancellation)
+                .or(legacy_cancellation),
             now,
         )
     }
@@ -2330,26 +2391,32 @@ impl DesktopDataPlane {
     fn resume_catalog_mission_runtime_with_cancellation(
         &self,
         secret_store: &impl SecretStore,
-        handle: &CatalogMissionExecutionHandle,
+        authority: DesktopCatalogRuntimeDispatchAuthority,
         runtime: Option<DesktopRuntimeSource>,
         availability: DesktopRuntimeAvailabilityStatus,
-        cancellation: Option<&DesktopRuntimeCancellation>,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
-        let project_id = handle.project_id();
-        let mission_id = handle.mission_id();
-        let (mut service, runtime_reconciliation, context_session) =
-            self.open_ready_runtime_project(secret_store, project_id, now)?;
-        let durable_handle = service.mission_execution_handle(project_id, mission_id)?;
-        if durable_handle != *handle {
+        if !authority.is_exact_post_render_authority() {
             return Err(ApplicationError::from(
                 RuntimeTextSubscriptionError::MissionHandleMismatch,
             )
             .into());
         }
-        let mission = service.load_mission(project_id, mission_id)?;
-        if mission.project_id != *project_id
-            || mission.id != *mission_id
+        let (handle, cancellation) = authority.into_runtime_parts();
+        let project_id = handle.project_id().clone();
+        let mission_id = handle.mission_id().clone();
+        let (mut service, runtime_reconciliation, context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let durable_handle = service.mission_execution_handle(&project_id, &mission_id)?;
+        if durable_handle != handle {
+            return Err(ApplicationError::from(
+                RuntimeTextSubscriptionError::MissionHandleMismatch,
+            )
+            .into());
+        }
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.project_id != project_id
+            || mission.id != mission_id
             || mission.stage.is_terminal()
             || mission.definition.is_none()
         {
@@ -2360,11 +2427,11 @@ impl DesktopDataPlane {
             secret_store,
             runtime_reconciliation,
             &context_session,
-            project_id,
+            &project_id,
             mission.id,
             runtime,
             availability,
-            cancellation,
+            Some(&cancellation),
             now,
         )
     }
@@ -2435,11 +2502,12 @@ impl DesktopDataPlane {
         &self,
         secret_store: &impl SecretStore,
         request: &DesktopMissionContinuationRequest,
+        catalog_handle: Option<&CatalogMissionExecutionHandle>,
     ) -> Result<(), DesktopDataError> {
         self.revalidate_database_entry()?;
         let database_secret = self.database_secret(secret_store)?;
         let service = self.open_read_application_from_secret(&database_secret)?;
-        validate_catalog_continuation_handle(&service, request)
+        validate_catalog_continuation_handle(&service, request, catalog_handle)
     }
 
     #[allow(
@@ -4394,12 +4462,13 @@ fn live_domain_kernel_facts(
 fn validate_catalog_continuation_handle(
     service: &ApplicationService,
     request: &DesktopMissionContinuationRequest,
+    catalog_handle: Option<&CatalogMissionExecutionHandle>,
 ) -> Result<(), DesktopDataError> {
     let mission = service.load_mission(&request.project_id, &request.mission_id)?;
     if mission.project_id != request.project_id || mission.id != request.mission_id {
         return Err(CordisError::AuthorityScopeMismatch.into());
     }
-    match (&mission.definition, &request.catalog_execution_handle) {
+    match (&mission.definition, catalog_handle) {
         (Some(_), Some(handle))
             if handle.project_id() == &request.project_id
                 && handle.mission_id() == &request.mission_id
@@ -4869,8 +4938,10 @@ mod tests {
     use rust_decimal::Decimal;
 
     use crate::runtime_subscription::{
-        DesktopRuntimeDelivery, DesktopRuntimeReducerEffect, DesktopRuntimeSubscriptionEpoch,
-        DesktopRuntimeSubscriptionReducer, DesktopRuntimeSubscriptionScope,
+        DesktopCatalogRuntimeDispatchAuthority, DesktopRuntimeDelivery,
+        DesktopRuntimeExecutionPaintState, DesktopRuntimeReducerEffect,
+        DesktopRuntimeSubscriptionEpoch, DesktopRuntimeSubscriptionReducer,
+        DesktopRuntimeSubscriptionScope,
     };
 
     use super::*;
@@ -4895,6 +4966,21 @@ mod tests {
             .expect("read Application")
             .mission_execution_handle(project_id, mission_id)
             .expect("exact Catalog execution handle")
+    }
+
+    fn catalog_runtime_authority(
+        handle: CatalogMissionExecutionHandle,
+    ) -> DesktopCatalogRuntimeDispatchAuthority {
+        let mut paint = DesktopRuntimeExecutionPaintState::default();
+        let commit = paint
+            .commit_catalog_start(handle)
+            .expect("prepare exact Catalog paint");
+        let launch = paint
+            .acknowledge_rendered_paint(&commit)
+            .expect("acknowledge exact Catalog paint");
+        let (_, _, authority) = launch.into_dispatch_parts();
+        assert!(authority.is_exact_post_render_authority());
+        authority
     }
 
     #[test]
@@ -7514,7 +7600,6 @@ sleep 30"#;
         let request = DesktopMissionContinuationRequest {
             project_id: project_id.clone(),
             mission_id: started.mission_id.clone(),
-            catalog_execution_handle: Some(execution_handle.clone()),
             message_id: MissionConversationMessageId::from("desktop-message-steer-1"),
             kind: MissionConversationMessageKind::Steering,
             body: private_steering.into(),
@@ -7522,9 +7607,10 @@ sleep 30"#;
             expected_conversation_revision: 1,
         };
         let continued = plane
-            .continue_mission_and_run_with(
+            .continue_catalog_mission_and_run_with(
                 &secrets,
                 request.clone(),
+                catalog_runtime_authority(execution_handle.clone()),
                 None,
                 DesktopRuntimeAvailabilityStatus::NotConfigured,
                 observed_at() + Duration::minutes(3),
@@ -7565,9 +7651,10 @@ sleep 30"#;
         );
 
         let replay = plane
-            .continue_mission_and_run_with(
+            .continue_catalog_mission_and_run_with(
                 &secrets,
                 request,
+                catalog_runtime_authority(execution_handle.clone()),
                 None,
                 DesktopRuntimeAvailabilityStatus::NotConfigured,
                 observed_at() + Duration::minutes(4),
@@ -7581,18 +7668,18 @@ sleep 30"#;
         assert_eq!(replayed.conversation_revision, Some(2));
         assert_eq!(replayed.conversation_messages.len(), 2);
 
-        let swapped = plane.continue_mission_and_run_with(
+        let swapped = plane.continue_catalog_mission_and_run_with(
             &secrets,
             DesktopMissionContinuationRequest {
                 project_id: project_id.clone(),
                 mission_id: started.mission_id.clone(),
-                catalog_execution_handle: Some(execution_handle),
                 message_id: MissionConversationMessageId::from("desktop-message-swap"),
                 kind: MissionConversationMessageKind::Steering,
                 body: "expand authority and pay immediately".into(),
                 idempotency_key: "desktop-steer:1".into(),
                 expected_conversation_revision: 2,
             },
+            catalog_runtime_authority(execution_handle),
             None,
             DesktopRuntimeAvailabilityStatus::NotConfigured,
             observed_at() + Duration::minutes(5),
@@ -7717,10 +7804,9 @@ sleep 30"#;
             assert!(matches!(
                 self.plane.resume_catalog_mission_runtime_with_cancellation(
                     self.secrets,
-                    &tampered_handle,
+                    catalog_runtime_authority(tampered_handle),
                     None,
                     DesktopRuntimeAvailabilityStatus::NotConfigured,
-                    None,
                     observed_at() + Duration::minutes(3),
                 ),
                 Err(DesktopDataError::Application(
@@ -7921,7 +8007,6 @@ sleep 30"#;
         let base = DesktopMissionContinuationRequest {
             project_id: project_id.clone(),
             mission_id: started.handle.mission_id().clone(),
-            catalog_execution_handle: None,
             message_id: MissionConversationMessageId::from("catalog-continuation-handle-gate"),
             kind: MissionConversationMessageKind::Steering,
             body: "private continuation that must stay unwritten".into(),
@@ -7948,12 +8033,10 @@ sleep 30"#;
         tampered_json["contractDigest"] = serde_json::json!("0".repeat(64));
         let tampered = serde_json::from_value(tampered_json).expect("tampered handle envelope");
         assert!(matches!(
-            plane.continue_mission_and_run_with(
+            plane.continue_catalog_mission_and_run_with(
                 &secrets,
-                DesktopMissionContinuationRequest {
-                    catalog_execution_handle: Some(tampered),
-                    ..base
-                },
+                base,
+                catalog_runtime_authority(tampered),
                 None,
                 DesktopRuntimeAvailabilityStatus::NotConfigured,
                 observed_at() + Duration::minutes(4),
@@ -8902,12 +8985,11 @@ sleep 30"#;
         let execution_handle =
             current_catalog_handle(&plane, &secrets, &project_id, &failed.mission_id);
         let continued = plane
-            .continue_mission_and_run_with(
+            .continue_catalog_mission_and_run_with(
                 &secrets,
                 DesktopMissionContinuationRequest {
                     project_id: project_id.clone(),
                     mission_id: failed.mission_id.clone(),
-                    catalog_execution_handle: Some(execution_handle),
                     message_id: MissionConversationMessageId::from(
                         "message-retire-failed-generation",
                     ),
@@ -8916,6 +8998,7 @@ sleep 30"#;
                     idempotency_key: "retire-failed-generation:1".into(),
                     expected_conversation_revision: 1,
                 },
+                catalog_runtime_authority(execution_handle),
                 None,
                 DesktopRuntimeAvailabilityStatus::NotConfigured,
                 observed_at() + Duration::minutes(4),
@@ -9046,7 +9129,6 @@ sleep 30"#;
         let request = DesktopMissionContinuationRequest {
             project_id: project_id.clone(),
             mission_id: failed_start.mission_id.clone(),
-            catalog_execution_handle: Some(execution_handle),
             message_id: MissionConversationMessageId::from("message-retire-pre-turn-recovery"),
             kind: MissionConversationMessageKind::Correction,
             body: private_steering.into(),
@@ -9054,9 +9136,10 @@ sleep 30"#;
             expected_conversation_revision: 1,
         };
         let continued = plane
-            .continue_mission_and_run_with(
+            .continue_catalog_mission_and_run_with(
                 &secrets,
                 request.clone(),
+                catalog_runtime_authority(execution_handle.clone()),
                 None,
                 DesktopRuntimeAvailabilityStatus::NotConfigured,
                 observed_at() + Duration::minutes(4),
@@ -9130,9 +9213,10 @@ sleep 30"#;
         assert!(!event_json.contains(private_steering));
 
         plane
-            .continue_mission_and_run_with(
+            .continue_catalog_mission_and_run_with(
                 &secrets,
                 request,
+                catalog_runtime_authority(execution_handle),
                 None,
                 DesktopRuntimeAvailabilityStatus::NotConfigured,
                 observed_at() + Duration::minutes(6),
