@@ -401,6 +401,7 @@ impl UiFailure {
             ),
             DesktopDataError::InvalidVm11OutcomeDecision
             | DesktopDataError::InvalidVm11NextContractResolution
+            | DesktopDataError::InvalidEffectProposal
             | DesktopDataError::InvalidWaitingApprovalGrant
             | DesktopDataError::InvalidBrowserWorkspaceContinue
             | DesktopDataError::InvalidCreatorDeliverableReview => Self::coded(

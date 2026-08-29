@@ -167,6 +167,7 @@ impl AuthorityScope {
 /// names the command crossing Cordis; it grants no Effect execution authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DomainCommandKind {
+    ProposeEffect,
     ApproveProposedEffect,
 }
 
@@ -174,24 +175,46 @@ impl DomainCommandKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ProposeEffect => "propose_effect",
             Self::ApproveProposedEffect => "approve_proposed_effect",
         }
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum DomainCommandDigest {
+    Proposal(String),
+    ApprovalScope(String),
+}
+
 /// Content-minimized binding for one exact Domain command.
 ///
-/// Mission identity and revision stay in [`AuthorityScope`]. The approval
-/// digest is the existing Application/Effect Broker scope digest, not a
-/// Receipt, Verification, provider lease, or execution capability.
+/// Mission identity and revision stay in [`AuthorityScope`]. Proposal and
+/// approval-scope digests are distinct variants so neither command can be
+/// mistaken for the other. Neither digest is a Receipt, Verification,
+/// provider lease, or execution capability.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DomainCommandBinding {
     kind: DomainCommandKind,
     effect_id: String,
-    approval_scope_digest: String,
+    digest: DomainCommandDigest,
 }
 
 impl DomainCommandBinding {
+    pub fn propose_effect(
+        effect_id: impl Into<String>,
+        proposal_digest: impl Into<String>,
+    ) -> Result<Self, CordisError> {
+        Ok(Self {
+            kind: DomainCommandKind::ProposeEffect,
+            effect_id: normalized_id(effect_id.into(), "domain_command_effect_id")?,
+            digest: DomainCommandDigest::Proposal(canonical_digest(
+                proposal_digest.into(),
+                "domain_command_proposal_digest",
+            )?),
+        })
+    }
+
     pub fn approve_proposed_effect(
         effect_id: impl Into<String>,
         approval_scope_digest: impl Into<String>,
@@ -199,10 +222,10 @@ impl DomainCommandBinding {
         Ok(Self {
             kind: DomainCommandKind::ApproveProposedEffect,
             effect_id: normalized_id(effect_id.into(), "domain_command_effect_id")?,
-            approval_scope_digest: canonical_digest(
+            digest: DomainCommandDigest::ApprovalScope(canonical_digest(
                 approval_scope_digest.into(),
                 "domain_command_approval_scope_digest",
-            )?,
+            )?),
         })
     }
 
@@ -217,8 +240,19 @@ impl DomainCommandBinding {
     }
 
     #[must_use]
-    pub fn approval_scope_digest(&self) -> &str {
-        &self.approval_scope_digest
+    pub fn proposal_digest(&self) -> Option<&str> {
+        match &self.digest {
+            DomainCommandDigest::Proposal(digest) => Some(digest),
+            DomainCommandDigest::ApprovalScope(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn approval_scope_digest(&self) -> Option<&str> {
+        match &self.digest {
+            DomainCommandDigest::Proposal(_) => None,
+            DomainCommandDigest::ApprovalScope(digest) => Some(digest),
+        }
     }
 }
 
@@ -807,12 +841,33 @@ mod tests {
             }
         );
 
+        let approval_digest = "b".repeat(64);
         let command =
-            DomainCommandBinding::approve_proposed_effect("effect-a", "b".repeat(64)).unwrap();
+            DomainCommandBinding::approve_proposed_effect("effect-a", approval_digest.clone())
+                .unwrap();
         assert_eq!(command.kind(), DomainCommandKind::ApproveProposedEffect);
         assert_eq!(command.kind().as_str(), "approve_proposed_effect");
         assert_eq!(command.effect_id(), "effect-a");
-        assert_eq!(command.approval_scope_digest(), "b".repeat(64));
+        assert_eq!(command.proposal_digest(), None);
+        assert_eq!(
+            command.approval_scope_digest(),
+            Some(approval_digest.as_str())
+        );
+
+        assert_eq!(
+            DomainCommandBinding::propose_effect("effect-a", "A".repeat(64)).unwrap_err(),
+            CordisError::InvalidAuthorityDigest {
+                field: "domain_command_proposal_digest"
+            }
+        );
+        let proposal_digest = "c".repeat(64);
+        let proposal =
+            DomainCommandBinding::propose_effect("effect-a", proposal_digest.clone()).unwrap();
+        assert_eq!(proposal.kind(), DomainCommandKind::ProposeEffect);
+        assert_eq!(proposal.kind().as_str(), "propose_effect");
+        assert_eq!(proposal.effect_id(), "effect-a");
+        assert_eq!(proposal.proposal_digest(), Some(proposal_digest.as_str()));
+        assert_eq!(proposal.approval_scope_digest(), None);
     }
 
     #[test]

@@ -521,7 +521,7 @@ pub struct WorkProductMutation {
     pub work_product: WorkProduct,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ProposePreviewEffect {
     pub effect_id: EffectId,
     pub actor_id: ActorId,
@@ -544,6 +544,15 @@ pub struct ProposePreviewEffect {
     pub amount: Money,
     pub idempotency_key: String,
     pub expires_in: Duration,
+}
+
+impl ProposePreviewEffect {
+    /// Deterministic Application-owned encoding used only to bind this typed
+    /// proposal to a content-minimized Cordis command digest. No provider or
+    /// execution adapter receives these bytes.
+    pub fn authority_payload_bytes(&self) -> Result<Vec<u8>, ApplicationError> {
+        Ok(serde_json::to_vec(self)?)
+    }
 }
 
 /// Window-bound ApprovalGrant for one Proposed Effect. The frozen digest and
@@ -12983,7 +12992,42 @@ impl ApplicationService {
         command: ProposePreviewEffect,
         now: DateTime<Utc>,
     ) -> Result<EffectId, ApplicationError> {
-        let mut mission = self.store.load_mission(project_id, mission_id)?;
+        let mission = self.store.load_mission(project_id, mission_id)?;
+        self.persist_preview_effect(mission, command, now)
+    }
+
+    /// Propose one preview Effect only at the exact caller-observed Mission
+    /// revision. Desktop uses this entry point after Cordis admits the typed
+    /// proposal; it still creates Domain state only and never invokes a
+    /// provider, Effect Ledger, Receipt, or Verification path.
+    pub fn propose_preview_effect_at_revision(
+        &mut self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        expected_mission_revision: u64,
+        command: ProposePreviewEffect,
+        now: DateTime<Utc>,
+    ) -> Result<EffectId, ApplicationError> {
+        let mission = self.store.load_mission(project_id, mission_id)?;
+        require_mission_revision(&mission, expected_mission_revision)?;
+        self.persist_preview_effect(mission, command, now)
+    }
+
+    fn persist_preview_effect(
+        &mut self,
+        mut mission: Mission,
+        command: ProposePreviewEffect,
+        now: DateTime<Utc>,
+    ) -> Result<EffectId, ApplicationError> {
+        if mission
+            .effects
+            .iter()
+            .any(|effect| effect.id == command.effect_id)
+        {
+            return Err(ApplicationError::DuplicatePreviewEffectId(
+                command.effect_id,
+            ));
+        }
         let expected_revision = mission.revision;
         let effect_id = mission.propose_effect(
             EffectSpec {
@@ -22552,6 +22596,8 @@ pub enum ApplicationError {
     ProposedEffectApprovalUnavailable,
     #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
     ProposedEffectApprovalDigestMismatch,
+    #[error("preview Effect id already exists in this Mission: {0}")]
+    DuplicatePreviewEffectId(EffectId),
     #[error(
         "Creator Deliverable Review requires the exact Project, Mission, task, deliverable, CAS revision, and a typed ReviewDecision"
     )]

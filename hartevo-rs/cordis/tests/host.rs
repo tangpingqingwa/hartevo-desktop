@@ -62,6 +62,45 @@ fn approval_command(effect: &str, digest_byte: char) -> DomainCommandBinding {
         .unwrap()
 }
 
+fn proposal_command(effect: &str, digest_byte: char) -> DomainCommandBinding {
+    DomainCommandBinding::propose_effect(effect, digest_byte.to_string().repeat(64)).unwrap()
+}
+
+#[test]
+fn effect_proposal_command_is_exact_and_domain_only() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 3);
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+
+    let proposal_digest = "c".repeat(64);
+    let command = proposal_command("effect-a", 'c');
+    let permit = host
+        .authorize_domain_command(&scope, command.clone())
+        .unwrap();
+    assert_eq!(permit.scope(), &scope);
+    assert_eq!(permit.command(), &command);
+    assert_eq!(permit.command().kind(), DomainCommandKind::ProposeEffect);
+    assert_eq!(permit.command().effect_id(), "effect-a");
+    assert_eq!(
+        permit.command().proposal_digest(),
+        Some(proposal_digest.as_str())
+    );
+    assert_eq!(permit.command().approval_scope_digest(), None);
+    assert!(scope.runtime().is_none());
+    assert!(host.active_runtime_scope().is_none());
+
+    host.finish_domain_command(permit).unwrap();
+    assert_eq!(host.active_domain_command_scope(), None);
+    assert!(host.active_runtime_scope().is_none());
+}
+
 #[test]
 fn domain_command_requires_and_preserves_exact_bound_scope() {
     let mut host = CordisHost::boot(false).unwrap();
