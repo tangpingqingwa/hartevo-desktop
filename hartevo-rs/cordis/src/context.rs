@@ -5,7 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::config::ConfigValue;
 use crate::effect::{Disposer, Registration, RegistrationHandle};
@@ -411,7 +411,7 @@ pub enum CordisError {
 /// Service container and plugin host.
 pub struct Context {
     id: u64,
-    event_authority: Arc<()>,
+    event_gate: Arc<EventOperationGate>,
     services: HashMap<String, Arc<dyn Any + Send + Sync>>,
     providers: HashMap<ProviderKey, ProviderRecord>,
     next_provider_id: u64,
@@ -430,6 +430,115 @@ pub struct Context {
     activation_depth: usize,
 }
 
+struct EventGeneration;
+
+struct EventOperationState {
+    generation: Arc<EventGeneration>,
+    open: bool,
+    active: usize,
+}
+
+struct EventOperationGate {
+    state: Mutex<EventOperationState>,
+    drained: Condvar,
+}
+
+impl EventOperationGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(EventOperationState {
+                generation: Arc::new(EventGeneration),
+                open: true,
+                active: 0,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+
+    fn current_generation(&self) -> Option<Arc<EventGeneration>> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.open.then(|| Arc::clone(&state.generation))
+    }
+
+    fn enter(self: &Arc<Self>, generation: &Arc<EventGeneration>) -> Option<EventOperationPermit> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.open || !Arc::ptr_eq(&state.generation, generation) {
+            return None;
+        }
+        state.active = state.active.checked_add(1)?;
+        Some(EventOperationPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn close_and_drain(self: &Arc<Self>, reopen: bool) -> ClosedEventGeneration {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.open = false;
+        while state.active != 0 {
+            state = match self.drained.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        ClosedEventGeneration {
+            gate: Arc::clone(self),
+            reopen,
+        }
+    }
+
+    fn reopen(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug_assert_eq!(state.active, 0);
+        state.generation = Arc::new(EventGeneration);
+        state.open = true;
+    }
+}
+
+struct EventOperationPermit {
+    gate: Arc<EventOperationGate>,
+}
+
+impl Drop for EventOperationPermit {
+    fn drop(&mut self) {
+        let mut state = match self.gate.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("an event operation permit owns one active count");
+        if state.active == 0 {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
+struct ClosedEventGeneration {
+    gate: Arc<EventOperationGate>,
+    reopen: bool,
+}
+
+impl Drop for ClosedEventGeneration {
+    fn drop(&mut self) {
+        if self.reopen {
+            self.gate.reopen();
+        }
+    }
+}
+
 /// Cloneable typed-Emit capability for safe callback re-entry.
 ///
 /// The capability captures one exact Context, active Fiber owner, and event
@@ -444,7 +553,8 @@ pub struct Context {
 #[derive(Clone)]
 pub struct EventReentry {
     context_id: u64,
-    context_authority: Weak<()>,
+    gate: Arc<EventOperationGate>,
+    generation: Arc<EventGeneration>,
     events: EventBus,
     owner: Fiber,
     listener_scope: EventScope,
@@ -454,7 +564,8 @@ pub struct EventReentry {
 impl EventReentry {
     fn new(
         context_id: u64,
-        context_authority: Weak<()>,
+        gate: Arc<EventOperationGate>,
+        generation: Arc<EventGeneration>,
         events: EventBus,
         owner: Fiber,
         listener_scope: EventScope,
@@ -462,7 +573,8 @@ impl EventReentry {
     ) -> Self {
         Self {
             context_id,
-            context_authority,
+            gate,
+            generation,
             events,
             owner,
             listener_scope,
@@ -470,19 +582,24 @@ impl EventReentry {
         }
     }
 
-    fn ensure_active(&self) -> Result<(), CordisError> {
-        if self.context_authority.upgrade().is_none() || self.owner.context_id() != self.context_id
-        {
+    fn enter(&self) -> Result<EventOperationPermit, CordisError> {
+        if self.owner.context_id() != self.context_id {
             return Err(CordisError::FiberContextMismatch {
                 uid: self.owner.uid(),
             });
         }
+        let permit =
+            self.gate
+                .enter(&self.generation)
+                .ok_or(CordisError::FiberContextMismatch {
+                    uid: self.owner.uid(),
+                })?;
         if self.owner.is_disposed() || self.owner.state() != FiberState::Active {
             return Err(CordisError::FiberDisposed {
                 uid: self.owner.uid(),
             });
         }
-        Ok(())
+        Ok(permit)
     }
 
     fn finish_listener(
@@ -516,7 +633,7 @@ impl EventReentry {
         P: Any + Send + Sync + 'static,
         F: Fn(&P) + Send + Sync + 'static,
     {
-        self.ensure_active()?;
+        let _permit = self.enter()?;
         let result = self.events.register_emit(
             key,
             self.owner.clone(),
@@ -552,7 +669,7 @@ impl EventReentry {
         P: Any + Send + Sync + 'static,
         F: Fn(&P) + Send + Sync + 'static,
     {
-        self.ensure_active()?;
+        let _permit = self.enter()?;
         let result = self.events.register_emit(
             key,
             self.owner.clone(),
@@ -590,7 +707,7 @@ impl EventReentry {
         E: Error + Send + Sync + 'static,
         F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
     {
-        self.ensure_active()?;
+        let _permit = self.enter()?;
         let result = self.events.register_try_emit(
             key,
             self.owner.clone(),
@@ -607,9 +724,9 @@ impl EventReentry {
     where
         P: Any + Send + Sync + 'static,
     {
-        self.ensure_active()?;
+        let _permit = self.enter()?;
         self.events
-            .emit(key, payload, self.dispatch_target.as_ref())
+            .emit_owned(key, payload, self.dispatch_target.as_ref(), &self.owner)
             .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
     }
 }
@@ -639,7 +756,7 @@ impl Context {
         let root = Fiber::root(context_id);
         Self {
             id: context_id,
-            event_authority: Arc::new(()),
+            event_gate: Arc::new(EventOperationGate::new()),
             services: HashMap::new(),
             providers: HashMap::new(),
             next_provider_id: 1,
@@ -1648,9 +1765,14 @@ impl Context {
     /// Use [`ContextView::event_reentry`] to retain an isolated/shared target.
     pub fn event_reentry(&self) -> Result<EventReentry, CordisError> {
         let (owner, scope) = self.current_event_owner()?;
+        let generation = self
+            .event_gate
+            .current_generation()
+            .ok_or(CordisError::FiberContextMismatch { uid: owner.uid() })?;
         Ok(EventReentry::new(
             self.id,
-            Arc::downgrade(&self.event_authority),
+            Arc::clone(&self.event_gate),
+            generation,
             self.events.clone(),
             owner,
             scope,
@@ -2541,6 +2663,13 @@ impl Context {
         if self.activation_depth != 0 {
             return;
         }
+        let _closed_generation = self.event_gate.close_and_drain(true);
+        self.teardown_closed();
+    }
+
+    /// Teardown body entered only while the current public event-capability
+    /// generation is closed and every winning operation has drained.
+    fn teardown_closed(&mut self) {
         let mut first_panic = None;
         while let Some(registration) = self.effects.pop() {
             let result = catch_unwind(AssertUnwindSafe(|| self.run_registration(registration)));
@@ -2851,9 +2980,15 @@ impl ContextView<'_> {
             return Err(self.ownership_error());
         }
         let scope = self.event_scope();
+        let generation = self.context.event_gate.current_generation().ok_or(
+            CordisError::FiberContextMismatch {
+                uid: self.fiber.uid(),
+            },
+        )?;
         Ok(EventReentry::new(
             self.context.id,
-            Arc::downgrade(&self.context.event_authority),
+            Arc::clone(&self.context.event_gate),
+            generation,
             self.context.events.clone(),
             self.fiber.clone(),
             scope.clone(),
@@ -3846,7 +3981,8 @@ mod provider_tests {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        self.teardown();
+        let _closed_generation = self.event_gate.close_and_drain(false);
+        self.teardown_closed();
     }
 }
 

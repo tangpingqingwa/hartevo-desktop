@@ -938,15 +938,22 @@ impl EventBus {
     }
 
     pub(crate) fn unlock(&self, name: &str) {
-        let mut state = lock_recover(&self.inner);
-        if let Some(slot) = state.slots.get_mut(name) {
-            slot.explicit_lock = false;
-        }
-        remove_empty_slot(&mut state, name);
+        let removed_slot = {
+            let mut state = lock_recover(&self.inner);
+            if let Some(slot) = state.slots.get_mut(name) {
+                slot.explicit_lock = false;
+            }
+            take_empty_slot(&mut state, name)
+        };
+        drop(removed_slot);
     }
 
     pub(crate) fn clear(&self) {
-        lock_recover(&self.inner).slots.clear();
+        let removed_slots = {
+            let mut state = lock_recover(&self.inner);
+            std::mem::take(&mut state.slots)
+        };
+        drop(removed_slots);
     }
 
     /// Remove every listener owned by a terminal Fiber. The owner tombstone is
@@ -954,22 +961,37 @@ impl EventBus {
     /// tombstone under the event-table lock. Consequently a cloneable event
     /// capability cannot race cleanup and leave an inactive listener behind.
     pub(crate) fn remove_owners(&self, owners: &HashSet<FiberUid>) {
-        let mut state = lock_recover(&self.inner);
-        for slot in state.slots.values_mut() {
-            slot.listeners
-                .retain(|listener| !owners.contains(&listener.owner.uid()));
-        }
-        let empty = state
-            .slots
-            .iter()
-            .filter(|(_, slot)| {
-                slot.listeners.is_empty() && !slot.explicit_lock && !slot.dispatch_lock
-            })
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        for name in empty {
-            state.slots.remove(&name);
-        }
+        let (removed_listeners, removed_slots) = {
+            let mut state = lock_recover(&self.inner);
+            let mut removed_listeners = Vec::new();
+            for slot in state.slots.values_mut() {
+                let listeners = std::mem::take(&mut slot.listeners);
+                let mut retained = Vec::with_capacity(listeners.len());
+                for listener in listeners {
+                    if owners.contains(&listener.owner.uid()) {
+                        removed_listeners.push(listener);
+                    } else {
+                        retained.push(listener);
+                    }
+                }
+                slot.listeners = retained;
+            }
+            let empty = state
+                .slots
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.listeners.is_empty() && !slot.explicit_lock && !slot.dispatch_lock
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            let removed_slots = empty
+                .into_iter()
+                .filter_map(|name| state.slots.remove(&name))
+                .collect::<Vec<_>>();
+            (removed_listeners, removed_slots)
+        };
+        drop(removed_listeners);
+        drop(removed_slots);
     }
 
     pub(crate) fn register_emit<P, F>(
@@ -1276,22 +1298,26 @@ impl EventBus {
     fn register(&self, spec: RegistrationSpec) -> Result<ListenerHandle, EventBusError> {
         let mut state = lock_recover(&self.inner);
         if spec.owner.is_disposed() || spec.owner.state() != FiberState::Active {
-            return Err(EventBusError::OwnerInactive {
+            let error = EventBusError::OwnerInactive {
                 uid: spec.owner.uid(),
-            });
+            };
+            drop(state);
+            return Err(error);
         }
         if let Some(slot) = state.slots.get(spec.name)
             && slot.descriptor != spec.descriptor
         {
-            return Err(EventBusError::Schema {
+            let error = EventBusError::Schema {
                 locked: slot.descriptor.clone(),
-                requested: spec.descriptor,
-            });
+                requested: spec.descriptor.clone(),
+            };
+            drop(state);
+            return Err(error);
         }
-        let next_id = state
-            .next_id
-            .checked_add(1)
-            .ok_or(EventBusError::ListenerIdentityOverflow)?;
+        let Some(next_id) = state.next_id.checked_add(1) else {
+            drop(state);
+            return Err(EventBusError::ListenerIdentityOverflow);
+        };
         let id = state.next_id;
         let owner_uid = spec.owner.uid();
         let listener = Listener {
@@ -1331,9 +1357,15 @@ impl EventBus {
         name: &'static str,
         descriptor: EventDescriptor,
         target: Option<&EventScope>,
+        emitter: Option<&Fiber>,
     ) -> Result<Vec<Listener>, EventBusError> {
         let snapshots = {
             let mut state = lock_recover(&self.inner);
+            if let Some(emitter) = emitter
+                && (emitter.is_disposed() || emitter.state() != FiberState::Active)
+            {
+                return Err(EventBusError::OwnerInactive { uid: emitter.uid() });
+            }
             if let Some(slot) = state.slots.get(name) {
                 if slot.descriptor != descriptor {
                     return Err(EventBusError::Schema {
@@ -1381,7 +1413,24 @@ impl EventBus {
     where
         P: Any + Send + Sync + 'static,
     {
-        let snapshots = self.snapshots(key.name(), key.descriptor(), target)?;
+        let snapshots = self.snapshots(key.name(), key.descriptor(), target, None)?;
+        self.run_emit_snapshots(payload, snapshots)
+    }
+
+    /// Emit on behalf of one exact callback-reentry owner. Owner validity is
+    /// checked while the snapshot linearization lock is held, before an empty
+    /// slot or callback snapshot can be published.
+    pub(crate) fn emit_owned<P>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        payload: &P,
+        target: Option<&EventScope>,
+        owner: &Fiber,
+    ) -> Result<(), EventBusError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        let snapshots = self.snapshots(key.name(), key.descriptor(), target, Some(owner))?;
         self.run_emit_snapshots(payload, snapshots)
     }
 
@@ -1411,7 +1460,7 @@ impl EventBus {
     where
         P: Any + Send + Sync + 'static,
     {
-        let listeners = self.snapshots(key.name(), key.descriptor(), target)?;
+        let listeners = self.snapshots(key.name(), key.descriptor(), target, None)?;
         Ok(PreparedEmit {
             bus: self.clone(),
             name: key.name(),
@@ -1429,7 +1478,7 @@ impl EventBus {
     where
         P: Any + Send + Sync + 'static,
     {
-        let snapshots = self.snapshots(key.name(), key.descriptor(), target)?;
+        let snapshots = self.snapshots(key.name(), key.descriptor(), target, None)?;
         let payload: ArcPayload = Arc::new(payload);
         let futures = snapshots.into_iter().map(|listener| {
             let bus = self.clone();
@@ -1477,7 +1526,7 @@ impl EventBus {
         P: Any + Send + Sync + 'static,
         R: Any + Send + 'static,
     {
-        let snapshots = self.snapshots(key.name(), key.descriptor(), target)?;
+        let snapshots = self.snapshots(key.name(), key.descriptor(), target, None)?;
         let payload: ArcPayload = Arc::new(payload);
         for listener in snapshots {
             if !self.should_invoke(&listener) {
@@ -1510,7 +1559,7 @@ impl EventBus {
         P: Any + Send + Sync + 'static,
         R: Any + Send + 'static,
     {
-        let snapshots = self.snapshots(key.name(), key.descriptor(), target)?;
+        let snapshots = self.snapshots(key.name(), key.descriptor(), target, None)?;
         for listener in snapshots {
             if !self.should_invoke(&listener) {
                 continue;
@@ -1540,7 +1589,7 @@ impl EventBus {
     where
         P: Any + Send + 'static,
     {
-        let chain = Arc::new(self.snapshots(key.name(), key.descriptor(), target)?);
+        let chain = Arc::new(self.snapshots(key.name(), key.descriptor(), target, None)?);
         run_waterfall(self.clone(), 0, chain, Box::new(payload))?
             .downcast::<P>()
             .map(|payload| *payload)
@@ -1556,7 +1605,7 @@ impl EventBus {
     where
         P: Any + Send + 'static,
     {
-        let chain = Arc::new(self.snapshots(key.name(), key.descriptor(), target)?);
+        let chain = Arc::new(self.snapshots(key.name(), key.descriptor(), target, None)?);
         run_try_waterfall(self.clone(), 0, chain, Box::new(payload))
             .map_err(|failure| {
                 failure
@@ -1577,7 +1626,7 @@ impl EventBus {
     where
         P: Any + Send + 'static,
     {
-        let snapshots = self.snapshots(key.name(), key.descriptor(), target)?;
+        let snapshots = self.snapshots(key.name(), key.descriptor(), target, None)?;
         let mut payload: BoxedPayload = Box::new(payload);
         for listener in snapshots {
             if !self.should_invoke(&listener) {
@@ -1662,41 +1711,54 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-fn remove_empty_slot(state: &mut EventBusState, name: &str) {
+fn take_empty_slot(state: &mut EventBusState, name: &str) -> Option<Slot> {
     let remove = state.slots.get(name).is_some_and(|slot| {
         slot.listeners.is_empty() && !slot.explicit_lock && !slot.dispatch_lock
     });
     if remove {
-        state.slots.remove(name);
+        state.slots.remove(name)
+    } else {
+        None
     }
 }
 
 fn remove_listener_locked(bus: &Mutex<EventBusState>, name: &str, id: u64) -> bool {
-    let mut state = lock_recover(bus);
-    let Some(slot) = state.slots.get_mut(name) else {
-        return false;
+    let (removed_listener, removed_slot) = {
+        let mut state = lock_recover(bus);
+        let Some(slot) = state.slots.get_mut(name) else {
+            return false;
+        };
+        let Some(index) = slot.listeners.iter().position(|listener| listener.id == id) else {
+            return false;
+        };
+        let removed_listener = slot.listeners.remove(index);
+        let removed_slot = take_empty_slot(&mut state, name);
+        (removed_listener, removed_slot)
     };
-    let before = slot.listeners.len();
-    slot.listeners.retain(|listener| listener.id != id);
-    let removed = slot.listeners.len() != before;
-    remove_empty_slot(&mut state, name);
-    removed
+    drop(removed_listener);
+    drop(removed_slot);
+    true
 }
 
 fn claim_once_by_id(bus: &Mutex<EventBusState>, id: u64) -> bool {
-    let mut state = lock_recover(bus);
-    let name = state.slots.iter().find_map(|(name, slot)| {
-        slot.listeners
-            .iter()
-            .any(|listener| listener.id == id)
-            .then(|| name.clone())
-    });
-    let Some(name) = name else {
-        return false;
+    let (removed_listener, removed_slot) = {
+        let mut state = lock_recover(bus);
+        let found = state.slots.iter().find_map(|(name, slot)| {
+            slot.listeners
+                .iter()
+                .position(|listener| listener.id == id)
+                .map(|index| (name.clone(), index))
+        });
+        let Some((name, index)) = found else {
+            return false;
+        };
+        let slot = state.slots.get_mut(&name).expect("located slot exists");
+        let removed_listener = slot.listeners.remove(index);
+        let removed_slot = take_empty_slot(&mut state, &name);
+        (removed_listener, removed_slot)
     };
-    let slot = state.slots.get_mut(&name).expect("located slot exists");
-    slot.listeners.retain(|listener| listener.id != id);
-    remove_empty_slot(&mut state, &name);
+    drop(removed_listener);
+    drop(removed_slot);
     true
 }
 

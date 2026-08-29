@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc as std_mpsc};
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use hartevo_cordis::{
     Accumulate, Bail, BailOutcome, Context, CordisError, DispatchMode, Emit, EventKey,
-    EventOptions, EventSchemaId, NonBail, Parallel, Serial, Waterfall, WaterfallFailure,
+    EventOptions, EventReentry, EventSchemaId, ListenerHandle, NonBail, Parallel, Serial,
+    Waterfall, WaterfallFailure,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -22,6 +24,26 @@ const DIRECT_REENTRY: EventKey<Emit, (), ()> = EventKey::new(
 const VIEW_REENTRY: EventKey<Emit, u8, ()> = EventKey::new(
     EventSchemaId::new("conformance.view-reentry.v1"),
     "view-reentry",
+);
+const FENCE_BLOCK: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.fence-block.v1"),
+    "fence-block",
+);
+const FENCE_PROBE: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.fence-probe.v1"),
+    "fence-probe",
+);
+const FENCE_CANDIDATE: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.fence-candidate.v1"),
+    "fence-candidate",
+);
+const DROP_SOURCE: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.drop-source.v1"),
+    "drop-source",
+);
+const DROP_TARGET: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.drop-target.v1"),
+    "drop-target",
 );
 const SCOPED: EventKey<Emit, (), ()> =
     EventKey::new(EventSchemaId::new("conformance.scope.v1"), "scope");
@@ -60,6 +82,53 @@ impl std::fmt::Display for TestEventError {
 }
 
 impl Error for TestEventError {}
+
+struct RegisterOnDrop {
+    events: EventReentry,
+    calls: Arc<AtomicUsize>,
+    completed: Option<std_mpsc::SyncSender<Result<u64, CordisError>>>,
+}
+
+impl Drop for RegisterOnDrop {
+    fn drop(&mut self) {
+        let calls = Arc::clone(&self.calls);
+        let result = self
+            .events
+            .on_emit(DROP_TARGET, move |()| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .map(|handle| handle.id());
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(result);
+        }
+    }
+}
+
+struct InspectHandleOnDrop {
+    handle: ListenerHandle,
+    completed: Option<std_mpsc::SyncSender<bool>>,
+}
+
+impl Drop for InspectHandleOnDrop {
+    fn drop(&mut self) {
+        let disposed = self.handle.is_disposed();
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(disposed);
+        }
+    }
+}
+
+fn wait_for_event_gate_to_close(events: &EventReentry) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match events.emit(FENCE_PROBE, &()) {
+            Err(CordisError::FiberContextMismatch { .. }) => return,
+            Ok(()) if Instant::now() < deadline => std::thread::yield_now(),
+            Ok(()) => panic!("event generation did not close before the bounded deadline"),
+            Err(error) => panic!("unexpected event-gate error while closing: {error}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 enum JsValue {
@@ -294,6 +363,244 @@ fn public_context_reentry_fails_closed_after_its_context_drops() {
 }
 
 #[test]
+fn explicit_teardown_closes_then_drains_and_reopens_only_a_fresh_generation() {
+    let mut context = Context::new();
+    let events = context.event_reentry().unwrap();
+    let entered = std_mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    let release_for_listener = Arc::clone(&release);
+    events
+        .on_emit(FENCE_BLOCK, move |()| {
+            entered.0.send(()).unwrap();
+            release_for_listener.wait();
+        })
+        .unwrap();
+
+    let dispatched = std_mpsc::sync_channel(1);
+    let dispatch_events = events.clone();
+    std::thread::spawn(move || {
+        let _ = dispatched.0.send(dispatch_events.emit(FENCE_BLOCK, &()));
+    });
+    entered
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the winning event operation must enter its callback");
+
+    let torn_down = std_mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        context.teardown();
+        let _ = torn_down.0.send(context);
+    });
+    wait_for_event_gate_to_close(&events);
+
+    let rejected_calls = Arc::new(AtomicUsize::new(0));
+    let rejected_calls_for_listener = Arc::clone(&rejected_calls);
+    assert!(matches!(
+        events.on_emit(FENCE_CANDIDATE, move |()| {
+            rejected_calls_for_listener.fetch_add(1, Ordering::SeqCst);
+        }),
+        Err(CordisError::FiberContextMismatch { .. })
+    ));
+    assert!(matches!(
+        events.emit(FENCE_CANDIDATE, &()),
+        Err(CordisError::FiberContextMismatch { .. })
+    ));
+    assert_eq!(rejected_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        torn_down.1.try_recv(),
+        Err(std_mpsc::TryRecvError::Empty)
+    ));
+
+    release.wait();
+    dispatched
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the winning dispatch must settle")
+        .unwrap();
+    let context = torn_down
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("teardown must finish after the winning operation drains");
+    assert_eq!(context.listener_count(FENCE_CANDIDATE), 0);
+    assert!(matches!(
+        events.emit(FENCE_CANDIDATE, &()),
+        Err(CordisError::FiberContextMismatch { .. })
+    ));
+    let fresh = context.event_reentry().unwrap();
+    let fresh_handle = fresh.on_emit(FENCE_CANDIDATE, |()| {}).unwrap();
+    assert_eq!(fresh_handle.owner_uid(), context.root().uid());
+}
+
+#[test]
+fn context_drop_waits_for_an_operation_that_linearized_first() {
+    let context = Context::new();
+    let events = context.event_reentry().unwrap();
+    let entered = std_mpsc::sync_channel(1);
+    let release = Arc::new(Barrier::new(2));
+    let release_for_listener = Arc::clone(&release);
+    events
+        .on_emit(FENCE_BLOCK, move |()| {
+            entered.0.send(()).unwrap();
+            release_for_listener.wait();
+        })
+        .unwrap();
+
+    let dispatched = std_mpsc::sync_channel(1);
+    let dispatch_events = events.clone();
+    std::thread::spawn(move || {
+        let _ = dispatched.0.send(dispatch_events.emit(FENCE_BLOCK, &()));
+    });
+    entered
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the winning event operation must enter its callback");
+
+    let dropped = std_mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        drop(context);
+        let _ = dropped.0.send(());
+    });
+    wait_for_event_gate_to_close(&events);
+    assert!(matches!(
+        dropped.1.try_recv(),
+        Err(std_mpsc::TryRecvError::Empty)
+    ));
+
+    release.wait();
+    dispatched
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the winning dispatch must settle")
+        .unwrap();
+    dropped
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Context Drop must finish after draining the winning operation");
+    assert!(matches!(
+        events.emit(FENCE_BLOCK, &()),
+        Err(CordisError::FiberContextMismatch { .. })
+    ));
+}
+
+#[test]
+fn explicit_handle_disposal_drops_callback_capture_after_unlocking() {
+    let context = Context::new();
+    let events = context.event_reentry().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let completed = std_mpsc::sync_channel(1);
+    let probe = RegisterOnDrop {
+        events: events.clone(),
+        calls: Arc::clone(&calls),
+        completed: Some(completed.0),
+    };
+    let handle = events
+        .on_emit(DROP_SOURCE, move |()| {
+            let _ = &probe;
+        })
+        .unwrap();
+
+    let disposed = std_mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = disposed.0.send(handle.dispose());
+    });
+    assert!(
+        completed
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("callback destructor must re-enter registration without deadlock")
+            .is_ok()
+    );
+    assert!(
+        disposed
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("explicit listener disposal must finish")
+    );
+    assert_eq!(context.listener_count(DROP_SOURCE), 0);
+    assert_eq!(context.listener_count(DROP_TARGET), 1);
+    events.emit(DROP_TARGET, &()).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn owner_cleanup_drops_callback_capture_after_unlocking() {
+    let mut context = Context::new();
+    let root_events = context.event_reentry().unwrap();
+    let child = context.new_fiber().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let completed = std_mpsc::sync_channel(1);
+    let probe = RegisterOnDrop {
+        events: root_events.clone(),
+        calls: Arc::clone(&calls),
+        completed: Some(completed.0),
+    };
+    context
+        .with_fiber(&child)
+        .on_emit(DROP_SOURCE, move |()| {
+            let _ = &probe;
+        })
+        .unwrap();
+
+    let cleaned = std_mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = context.dispose_fiber(&child);
+        let _ = cleaned.0.send((result, context));
+    });
+    assert!(
+        completed
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("owner cleanup destructor must re-enter registration without deadlock")
+            .is_ok()
+    );
+    let (result, context) = cleaned
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("owner cleanup must finish");
+    assert!(result.unwrap());
+    assert_eq!(context.listener_count(DROP_SOURCE), 0);
+    assert_eq!(context.listener_count(DROP_TARGET), 1);
+    root_events.emit(DROP_TARGET, &()).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn context_teardown_drops_callback_capture_after_clearing_under_unlock() {
+    let mut context = Context::new();
+    let events = context.event_reentry().unwrap();
+    let inspected = events.on_emit(DROP_TARGET, |()| {}).unwrap();
+    let completed = std_mpsc::sync_channel(1);
+    let probe = InspectHandleOnDrop {
+        handle: inspected.clone(),
+        completed: Some(completed.0),
+    };
+    events
+        .on_emit(DROP_SOURCE, move |()| {
+            let _ = &probe;
+        })
+        .unwrap();
+
+    let torn_down = std_mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        context.teardown();
+        let _ = torn_down.0.send(context);
+    });
+    assert!(
+        completed
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("teardown destructor must re-enter the event table without deadlock")
+    );
+    let context = torn_down
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Context teardown must finish");
+    assert!(inspected.is_disposed());
+    assert_eq!(context.listener_count(DROP_SOURCE), 0);
+    assert_eq!(context.listener_count(DROP_TARGET), 0);
+}
+
+#[test]
 fn borrowed_view_reentry_registers_into_next_snapshot_and_stays_owner_bound() {
     let mut context = Context::new();
     let fiber = context.new_fiber().unwrap();
@@ -357,6 +664,11 @@ fn borrowed_view_reentry_registers_into_next_snapshot_and_stays_owner_bound() {
         events.emit(VIEW_REENTRY, &3).unwrap_err(),
         CordisError::FiberDisposed { uid: fiber.uid() }
     );
+    assert_eq!(
+        *order.lock().unwrap(),
+        [("outer", 0), ("nested", 1), ("nested", 2)]
+    );
+    assert_eq!(context.listener_count(VIEW_REENTRY), 0);
 }
 
 #[test]
