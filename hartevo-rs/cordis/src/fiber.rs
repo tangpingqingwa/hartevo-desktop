@@ -1,9 +1,4 @@
-//! Minimal synchronous Fiber ownership used by the N0 Cordis foundation.
-//!
-//! N0 deliberately implements only the small state surface needed to make
-//! provider ownership and pending activation safe.  The remaining lifecycle
-//! states, asynchronous transitions, and restart/update semantics belong to
-//! N1.
+//! Fiber identity and lifecycle value types.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -37,28 +32,150 @@ impl fmt::Display for FiberUid {
     }
 }
 
-/// The intentionally small N0 Fiber lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Complete Cordis Fiber lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FiberState {
     /// Dependencies are not ready and no callback has run yet.
     Pending,
+    /// The selected activation epoch is starting.
+    Loading,
     /// The Fiber has successfully activated its callback.
     Active,
+    /// Plugin start failed and the typed cause is retained.
+    Failed,
+    /// The child Fiber has published its terminal tombstone.
+    Disposed,
+    /// Registrations from the previous activation are being cleaned up.
+    Unloading,
 }
 
 impl FiberState {
     pub(crate) const fn as_byte(self) -> u8 {
         match self {
             Self::Pending => 0,
-            Self::Active => 1,
+            Self::Loading => 1,
+            Self::Active => 2,
+            Self::Failed => 3,
+            Self::Disposed => 4,
+            Self::Unloading => 5,
         }
     }
 
     pub(crate) const fn from_byte(value: u8) -> Self {
         match value {
-            1 => Self::Active,
+            1 => Self::Loading,
+            2 => Self::Active,
+            3 => Self::Failed,
+            4 => Self::Disposed,
+            5 => Self::Unloading,
             _ => Self::Pending,
         }
+    }
+}
+
+/// Provider facts which participate in an activation epoch.
+///
+/// Provider authorization ids are deliberately absent: replacing a provider
+/// handle without changing its active owner or generation does not create a
+/// different activation epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProviderFingerprint {
+    namespace: String,
+    key: String,
+    owner_uid: FiberUid,
+    generation: u64,
+}
+
+impl ProviderFingerprint {
+    #[must_use]
+    pub fn new(
+        namespace: impl Into<String>,
+        key: impl Into<String>,
+        owner_uid: FiberUid,
+        generation: u64,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            key: key.into(),
+            owner_uid,
+            generation,
+        }
+    }
+
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn owner_uid(&self) -> FiberUid {
+        self.owner_uid
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Stable activation target: config revision plus ordered dependency facts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActivationEpoch {
+    config_revision: u64,
+    dependencies: Vec<ProviderFingerprint>,
+}
+
+impl ActivationEpoch {
+    #[must_use]
+    pub fn new(
+        config_revision: u64,
+        dependencies: impl IntoIterator<Item = ProviderFingerprint>,
+    ) -> Self {
+        let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        dependencies.sort();
+        Self {
+            config_revision,
+            dependencies,
+        }
+    }
+
+    #[must_use]
+    pub const fn config_revision(&self) -> u64 {
+        self.config_revision
+    }
+
+    #[must_use]
+    pub fn dependencies(&self) -> &[ProviderFingerprint] {
+        &self.dependencies
+    }
+}
+
+/// Monotonic transition identity bound to one desired activation epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TransitionTicket {
+    serial: u64,
+    target: Option<ActivationEpoch>,
+}
+
+impl TransitionTicket {
+    #[must_use]
+    pub fn new(serial: u64, target: Option<ActivationEpoch>) -> Self {
+        Self { serial, target }
+    }
+
+    #[must_use]
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    #[must_use]
+    pub fn target(&self) -> Option<&ActivationEpoch> {
+        self.target.as_ref()
     }
 }
 

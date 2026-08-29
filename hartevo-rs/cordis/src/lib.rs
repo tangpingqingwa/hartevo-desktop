@@ -27,9 +27,14 @@ pub use config::{ConfigValue, InterpolateError};
 pub use context::{
     Context, ContextView, CordisError, PendingHandle, ProviderHandle, ProviderId, keys,
 };
-pub use effect::{Disposer, RegistrationHandle};
+pub use effect::{
+    Disposer, IntoLifecycleEffect, LifecycleDisposeFuture, LifecycleDisposer,
+    LifecycleDisposerFuture, LifecycleDisposerStream, LifecycleEffect, RegistrationHandle,
+};
 pub use event::{DispatchMode, WaterfallNext};
-pub use fiber::{Fiber, FiberState, FiberUid};
+pub use fiber::{
+    ActivationEpoch, Fiber, FiberState, FiberUid, ProviderFingerprint, TransitionTicket,
+};
 pub use host::{
     CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, host_is_cordis_loop, host_plugin_ids,
 };
