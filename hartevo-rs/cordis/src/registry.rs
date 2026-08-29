@@ -5775,6 +5775,34 @@ mod lifecycle_boundary_tests {
             .expect("production lifecycle path timed out or panicked")
     }
 
+    async fn wait_for_registry_condition(description: &'static str, condition: impl Fn() -> bool) {
+        let (expired_tx, expired_rx) = oneshot::channel();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if matches!(
+                cancel_rx.recv_timeout(std::time::Duration::from_secs(2)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = expired_tx.send(());
+            }
+        });
+        let observation = async {
+            loop {
+                if condition() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::pin!(observation);
+        tokio::select! {
+            () = &mut observation => {
+                let _ = cancel_tx.send(());
+            }
+            _ = expired_rx => panic!("timed out waiting for {description}"),
+        }
+    }
+
     fn permanently_gated_disposer(
         entered: Arc<Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
     ) -> LifecycleDisposer {
@@ -6643,13 +6671,10 @@ mod lifecycle_boundary_tests {
             driver_runtime.block_on(release.wait());
             driver_runtime.block_on(async {
                 dependent.await_current().await.unwrap();
-                for _ in 0..128 {
-                    if registry.get::<u32>("durable-remove").is_none() {
-                        return;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                panic!("provider removal coordinator did not compare-delete");
+                wait_for_registry_condition("provider removal compare-delete", || {
+                    registry.get::<u32>("durable-remove").is_none()
+                })
+                .await;
             });
         });
     }
@@ -6701,16 +6726,12 @@ mod lifecycle_boundary_tests {
             driver_runtime.block_on(release.wait());
             driver_runtime.block_on(async {
                 let _ = handle.await_current().await;
-                for _ in 0..128 {
-                    if !lock(&registry.inner.state)
+                wait_for_registry_condition("factory runtime deletion", || {
+                    !lock(&registry.inner.state)
                         .runtimes
                         .contains_key(&factory.id())
-                    {
-                        return;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                panic!("factory deletion coordinator did not remove the runtime");
+                })
+                .await;
             });
         });
     }
@@ -6766,13 +6787,10 @@ mod lifecycle_boundary_tests {
             driver_runtime.block_on(release.wait());
             driver_runtime.block_on(async {
                 let _ = handle.await_current().await;
-                for _ in 0..128 {
-                    if lock(&registry.inner.state).runtimes.is_empty() {
-                        return;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                panic!("shutdown coordinator did not clear runtimes");
+                wait_for_registry_condition("shutdown runtime clearance", || {
+                    lock(&registry.inner.state).runtimes.is_empty()
+                })
+                .await;
             });
         });
     }
