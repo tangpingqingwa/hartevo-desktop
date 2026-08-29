@@ -19,7 +19,10 @@ use crate::event::{
 use crate::fiber::{Fiber, FiberState, FiberUid};
 use crate::loader::{PluginFactory, PluginFactoryId};
 use crate::registry::{PendingEntry, Registry};
-use crate::service::Service;
+use crate::service::{
+    Service, ServiceAssociation, ServiceCaller, ServiceHandle, ServiceIntercept, ServiceLookup,
+    ServiceOptions, ServiceOrigin, ServiceScope, ServiceShadow, associated_key,
+};
 use crate::surface::{DomainSurface, HartevoSurfaceAuthority};
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -127,6 +130,23 @@ struct ProviderRecord {
     owner_uid: FiberUid,
     generation: u64,
     notify_count: u64,
+    service_options: ServiceOptions,
+    origin: ProviderOriginSnapshot,
+}
+
+#[derive(Clone)]
+struct ProviderOriginSnapshot {
+    shared_namespaces: Vec<String>,
+    metadata: ConfigValue,
+}
+
+impl ProviderOriginSnapshot {
+    fn new(shared_namespaces: Vec<String>, metadata: ConfigValue) -> Self {
+        Self {
+            shared_namespaces,
+            metadata,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +354,8 @@ pub enum CordisError {
     ProviderGenerationOverflow { key: String },
     #[error("provider identity allocation overflowed")]
     ProviderIdentityOverflow,
+    #[error("associated accessor `{key}` is read-only")]
+    ReadOnlyAssociatedAccessor { key: String },
     #[error("pending plugin factory `{id}` is already mounted")]
     DuplicatePluginFactory { id: PluginFactoryId },
     #[error("plugin factory `{id}` activation failed: {source}")]
@@ -910,6 +932,7 @@ impl Context {
             fiber: fiber.clone(),
             namespace: fiber.namespace(),
             shared_namespaces: Vec::new(),
+            service_intercepts: Vec::new(),
             metadata,
             context_valid,
             scope_valid,
@@ -1446,6 +1469,110 @@ impl Context {
         self.get_in_namespace(&namespace, key)
     }
 
+    fn metadata_for_fiber(&self, fiber_uid: FiberUid) -> Option<ConfigValue> {
+        if fiber_uid == self.root.uid() {
+            (!self.root.is_disposed()).then(|| self.root.metadata_snapshot())
+        } else {
+            self.fibers
+                .get(&fiber_uid)
+                .filter(|fiber| !fiber.is_disposed() && fiber.state() == FiberState::Active)
+                .map(Fiber::metadata_snapshot)
+        }
+    }
+
+    fn current_service_lookup(&self) -> Option<(ServiceLookup, ServiceCaller)> {
+        self.ensure_owner_active(self.current_fiber).ok()?;
+        let namespace = self.current_namespace()?;
+        let metadata = self.metadata_for_fiber(self.current_fiber)?;
+        let scope = ServiceScope::new(
+            self.id,
+            self.current_fiber,
+            namespace,
+            Vec::new(),
+            metadata,
+            None,
+        );
+        Some((
+            ServiceLookup::new(scope.clone(), Vec::new()),
+            ServiceCaller::new(scope),
+        ))
+    }
+
+    pub(crate) fn service_from_lookup<'ctx, T>(
+        &'ctx self,
+        lookup: ServiceLookup,
+        caller: ServiceCaller,
+        key: &str,
+    ) -> Option<ServiceHandle<'ctx, T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let resolved = lookup.namespaces().find_map(|namespace| {
+            let record = self.providers.get(&ProviderKey::new(namespace, key))?;
+            let value = Arc::clone(&record.value).downcast::<T>().ok()?;
+            Some((
+                namespace.to_string(),
+                value,
+                record.provider_id,
+                record.owner_uid,
+                record.generation,
+                record.service_options,
+                record.origin.clone(),
+            ))
+        })?;
+        let (namespace, value, provider_id, owner_uid, generation, options, provider_origin) =
+            resolved;
+        let shadow = if options.is_no_shadow() {
+            None
+        } else {
+            let origin = ServiceOrigin::new(
+                self.id,
+                owner_uid,
+                namespace.clone(),
+                provider_id,
+                generation,
+            );
+            Some(ServiceShadow::new(
+                ServiceScope::new(
+                    self.id,
+                    owner_uid,
+                    namespace,
+                    provider_origin.shared_namespaces,
+                    provider_origin.metadata,
+                    None,
+                ),
+                origin,
+            ))
+        };
+        Some(ServiceHandle::new(
+            self,
+            key.to_string(),
+            value,
+            lookup,
+            caller,
+            shadow,
+        ))
+    }
+
+    /// Resolve a typed service from the current Fiber namespace. This is
+    /// additive to [`Context::get`] and does not change its behavior.
+    #[must_use]
+    pub fn service<T>(&self, key: &str) -> Option<ServiceHandle<'_, T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let (lookup, caller) = self.current_service_lookup()?;
+        self.service_from_lookup(lookup, caller, key)
+    }
+
+    /// Resolve explicit `association.property` entries from the current
+    /// Fiber namespace without adding an implicit parent/root fallback.
+    #[must_use]
+    pub fn association(&self, name: impl Into<String>) -> Option<ServiceAssociation<'_>> {
+        let (lookup, caller) = self.current_service_lookup()?;
+        Some(ServiceAssociation::new(self, name.into(), lookup, caller))
+    }
+
     #[must_use]
     pub fn tools<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::TOOLS)
@@ -1502,7 +1629,53 @@ impl Context {
             .current_namespace()
             .ok_or(CordisError::FiberDisposed { uid: owner_uid })?;
         self.ensure_owner_active(owner_uid)?;
-        self.provide_in_namespace(namespace, owner_uid, key.into(), value)
+        let origin_metadata = self
+            .metadata_for_fiber(owner_uid)
+            .ok_or(CordisError::FiberDisposed { uid: owner_uid })?;
+        self.provide_in_namespace(
+            namespace,
+            owner_uid,
+            key.into(),
+            value,
+            ProviderOriginSnapshot::new(Vec::new(), origin_metadata),
+        )
+    }
+
+    /// Provide a typed service with explicit tracing options. The provider is
+    /// still owned and replaced through the ordinary Fiber-bound machinery.
+    pub fn provide_service<T: Any + Send + Sync>(
+        &mut self,
+        key: impl Into<String>,
+        value: T,
+        options: ServiceOptions,
+    ) -> Result<ProviderHandle, CordisError> {
+        let owner_uid = self.current_fiber;
+        let namespace = self
+            .current_namespace()
+            .ok_or(CordisError::FiberDisposed { uid: owner_uid })?;
+        self.ensure_owner_active(owner_uid)?;
+        let origin_metadata = self
+            .metadata_for_fiber(owner_uid)
+            .ok_or(CordisError::FiberDisposed { uid: owner_uid })?;
+        self.provide_service_in_namespace(
+            namespace,
+            owner_uid,
+            key.into(),
+            value,
+            options,
+            ProviderOriginSnapshot::new(Vec::new(), origin_metadata),
+        )
+    }
+
+    /// Provide `association.property` through the same owner-bound provider
+    /// table used for ordinary services and typed accessors.
+    pub fn provide_associated<T: Any + Send + Sync>(
+        &mut self,
+        association: &str,
+        property: &str,
+        value: T,
+    ) -> Result<ProviderHandle, CordisError> {
+        self.provide(associated_key(association, property), value)
     }
 
     fn provide_in_namespace<T: Any + Send + Sync>(
@@ -1511,6 +1684,26 @@ impl Context {
         owner_uid: FiberUid,
         key: String,
         value: T,
+        origin: ProviderOriginSnapshot,
+    ) -> Result<ProviderHandle, CordisError> {
+        self.provide_service_in_namespace(
+            namespace,
+            owner_uid,
+            key,
+            value,
+            ServiceOptions::default(),
+            origin,
+        )
+    }
+
+    fn provide_service_in_namespace<T: Any + Send + Sync>(
+        &mut self,
+        namespace: impl Into<String>,
+        owner_uid: FiberUid,
+        key: String,
+        value: T,
+        service_options: ServiceOptions,
+        origin: ProviderOriginSnapshot,
     ) -> Result<ProviderHandle, CordisError> {
         if authority_reserved_key(&key) || self.reserved_services.contains(&key) {
             return Err(CordisError::ReservedServiceKey { key });
@@ -1546,6 +1739,8 @@ impl Context {
                 owner_uid,
                 generation: 0,
                 notify_count: 0,
+                service_options,
+                origin,
             },
         );
         self.effects.push(Registration::provider(
@@ -1599,6 +1794,8 @@ impl Context {
                 owner_uid: self.root.uid(),
                 generation: 0,
                 notify_count: 0,
+                service_options: ServiceOptions::default(),
+                origin: ProviderOriginSnapshot::new(Vec::new(), self.root.metadata_snapshot()),
             },
         );
         self.effects.push(Registration::provider(
@@ -2836,6 +3033,7 @@ pub struct ContextView<'a> {
     fiber: Fiber,
     namespace: String,
     shared_namespaces: Vec<String>,
+    service_intercepts: Vec<ServiceIntercept>,
     metadata: ConfigValue,
     context_valid: bool,
     scope_valid: bool,
@@ -2848,6 +3046,7 @@ impl fmt::Debug for ContextView<'_> {
             .field("fiber", &self.fiber)
             .field("namespace", &self.namespace)
             .field("shared_namespaces", &self.shared_namespaces)
+            .field("service_intercepts", &self.service_intercepts)
             .finish_non_exhaustive()
     }
 }
@@ -2920,6 +3119,15 @@ impl ContextView<'_> {
         self.share_label(label)
     }
 
+    /// Append one service-config interception layer. Repeated declarations
+    /// retain outer-to-inner call order.
+    #[must_use]
+    pub fn intercept(mut self, name: impl Into<String>, config: ConfigValue) -> Self {
+        self.service_intercepts
+            .push(ServiceIntercept::new(name.into(), config));
+        self
+    }
+
     fn lookup_namespaces(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.namespace.as_str())
             .chain(self.shared_namespaces.iter().map(String::as_str))
@@ -2941,6 +3149,46 @@ impl ContextView<'_> {
         }
         self.lookup_namespaces()
             .find_map(|namespace| self.context.get_in_namespace(namespace, key))
+    }
+
+    fn service_lookup(&self) -> Option<(ServiceLookup, ServiceCaller)> {
+        if !self.is_active() {
+            return None;
+        }
+        let scope = ServiceScope::new(
+            self.context.id,
+            self.fiber.uid(),
+            self.namespace.clone(),
+            self.shared_namespaces.clone(),
+            self.metadata.clone(),
+            None,
+        );
+        Some((
+            ServiceLookup::new(scope.clone(), self.service_intercepts.clone()),
+            ServiceCaller::new(scope),
+        ))
+    }
+
+    /// Resolve a typed service while preserving this view's exact isolation,
+    /// explicit shares, caller identity, and config interception order.
+    #[must_use]
+    pub fn service<T>(&self, key: &str) -> Option<ServiceHandle<'_, T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let (lookup, caller) = self.service_lookup()?;
+        self.context.service_from_lookup(lookup, caller, key)
+    }
+
+    #[must_use]
+    pub fn association(&self, name: impl Into<String>) -> Option<ServiceAssociation<'_>> {
+        let (lookup, caller) = self.service_lookup()?;
+        Some(ServiceAssociation::new(
+            self.context,
+            name.into(),
+            lookup,
+            caller,
+        ))
     }
 
     #[must_use]
@@ -2996,7 +3244,36 @@ impl ContextView<'_> {
             self.fiber.uid(),
             key.into(),
             value,
+            ProviderOriginSnapshot::new(self.shared_namespaces.clone(), self.metadata.clone()),
         )
+    }
+
+    pub fn provide_service<T: Any + Send + Sync>(
+        &mut self,
+        key: impl Into<String>,
+        value: T,
+        options: ServiceOptions,
+    ) -> Result<ProviderHandle, CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.provide_service_in_namespace(
+            self.namespace.clone(),
+            self.fiber.uid(),
+            key.into(),
+            value,
+            options,
+            ProviderOriginSnapshot::new(self.shared_namespaces.clone(), self.metadata.clone()),
+        )
+    }
+
+    pub fn provide_associated<T: Any + Send + Sync>(
+        &mut self,
+        association: &str,
+        property: &str,
+        value: T,
+    ) -> Result<ProviderHandle, CordisError> {
+        self.provide(associated_key(association, property), value)
     }
 
     pub fn replace_provider<T: Any + Send + Sync>(
