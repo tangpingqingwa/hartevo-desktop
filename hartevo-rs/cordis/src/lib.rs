@@ -3,10 +3,11 @@
 //! a Cordis-hosted agent loop, a fail-closed Domain Kernel invariant gate, and
 //! the desktop host that mounts those three services.
 //!
-//! Typed events currently integrate with synchronous [`Context`], its borrowed
-//! [`ContextView`], and the Desktop prepared lifecycle notifications. The owned
-//! repeatable-plugin [`LifecycleContextView`] event bridge is deliberately not
-//! part of this slice; it remains the follow-up N2B boundary.
+//! Typed events integrate with synchronous [`Context`], its borrowed
+//! [`ContextView`], Desktop prepared lifecycle notifications, and an N2B
+//! lifecycle-owned typed-Emit bridge for repeatable plugins. The owned bridge
+//! deliberately does not yet claim Parallel, Serial, Bail, Waterfall, or
+//! Accumulate parity.
 
 mod agent;
 mod authority;
@@ -64,7 +65,8 @@ pub use loader::{
     ResolvedPlugin, interpolate_plugin_config, load_plugins, load_plugins_pending,
 };
 pub use registry::{
-    LifecycleContextView, LifecycleHandle, LifecycleProviderHandle, LifecycleRegistry,
+    LifecycleContextView, LifecycleEventDispatcher, LifecycleHandle, LifecycleProviderHandle,
+    LifecycleRegistry,
 };
 pub use service::Service;
 pub use surface::{

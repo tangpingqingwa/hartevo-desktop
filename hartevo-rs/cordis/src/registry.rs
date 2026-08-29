@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +17,10 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use crate::config::ConfigValue;
 use crate::context::CordisError;
 use crate::effect::{LifecycleDisposer, LifecycleEffect};
+use crate::event::{
+    DispatchMode, Emit, EventBus, EventKey, EventOptions, EventScope, LifecycleEventEpoch,
+    PendingLifecycleListener, drop_pending_lifecycle_listeners, into_cordis_error,
+};
 use crate::fiber::{
     ActivationEpoch, Fiber, FiberFuture, FiberLifecycle, FiberSnapshot, FiberState, FiberUid,
     LifecycleCancellation, ProviderFingerprint, TransitionTicket,
@@ -510,6 +515,7 @@ struct LifecycleRegistryState {
 struct LifecycleRegistryInner {
     id: u64,
     root: Fiber,
+    events: EventBus,
     state: Mutex<LifecycleRegistryState>,
     driver_bindings: Mutex<HashMap<TokioRuntimeId, Weak<DriverRuntimeState>>>,
     supervisor: Mutex<Option<RegistrySupervisor>>,
@@ -629,6 +635,34 @@ impl fmt::Debug for LifecycleRegistry {
     }
 }
 
+impl Drop for LifecycleRegistryInner {
+    fn drop(&mut self) {
+        let mut recoveries = Vec::new();
+        {
+            let state = lock(&self.state);
+            let mut controls = state
+                .runtimes
+                .values()
+                .flat_map(|runtime| runtime.fibers.values().cloned())
+                .collect::<Vec<_>>();
+            controls.sort_by_key(|control| control.fiber.uid());
+            for control in controls {
+                let mut machine = lock(&control.machine);
+                recoveries.extend(take_dead_machine_event_recoveries(&mut machine));
+            }
+        }
+        for recovery in recoveries {
+            recovery.epoch.close();
+            recovery.epoch.close_and_drain_for_drop();
+            let _ = self.events.remove_lifecycle_epoch(&recovery.epoch);
+            let _ = drop_pending_lifecycle_listeners(recovery.staged);
+        }
+        // Permanent drop cannot report a callback destructor panic. EventBus
+        // clear removes all structure first and catches each capture drop.
+        let _ = self.events.clear();
+    }
+}
+
 impl Default for LifecycleRegistry {
     fn default() -> Self {
         Self::new()
@@ -644,6 +678,7 @@ impl LifecycleRegistry {
             inner: Arc::new(LifecycleRegistryInner {
                 id,
                 root,
+                events: EventBus::new(),
                 state: Mutex::new(LifecycleRegistryState {
                     next_runtime_generation: 1,
                     next_provider_id: 1,
@@ -1134,6 +1169,11 @@ impl LifecycleRegistry {
         // Slot absence and every dependent ticket publish in one registry ->
         // uid-ordered machine critical section. No fallible operation remains
         // after the slot mutation begins.
+        for (machine, next_ticket) in machines.iter().zip(&next_tickets) {
+            if next_ticket.is_some() {
+                machine.close_committed_event_epoch();
+            }
+        }
         if let Some(slot) = state.providers.get_mut(&provider_key) {
             slot.removal_serial = removal_serial;
             slot.revision = marked_revision;
@@ -1265,6 +1305,9 @@ impl LifecycleRegistry {
                 control.driver_runtime.require_alive()?;
             }
             let drivers = driver_runtimes_for_controls(&controls);
+            for machine in &machines {
+                machine.close_event_epochs();
+            }
             if let Some(runtime) = state.runtimes.get_mut(&factory.id()) {
                 runtime.status = RuntimeStatus::Deleting;
             }
@@ -1368,6 +1411,7 @@ impl LifecycleRegistry {
             for ((control, machine), next_ticket) in
                 controls.iter().zip(&mut machines).zip(next_tickets)
             {
+                machine.close_event_epochs();
                 machine.force_restart = true;
                 let ticket = machine.publish_ticket(next_ticket);
                 let serial = ticket.serial();
@@ -1440,6 +1484,9 @@ impl LifecycleRegistry {
                 control.driver_runtime.require_alive()?;
             }
             let drivers = driver_runtimes_for_controls(&controls);
+            for machine in &machines {
+                machine.close_event_epochs();
+            }
             state.shutting_down = true;
             for runtime in state.runtimes.values_mut() {
                 runtime.status = RuntimeStatus::Deleting;
@@ -1477,6 +1524,14 @@ impl LifecycleRegistry {
                 state.runtimes.clear();
                 state.catalog.clear();
                 state.providers.clear();
+                drop(state);
+                if let Some(payload) = inner.events.clear() {
+                    summary
+                        .first_error
+                        .get_or_insert(CordisError::CleanupPanicked {
+                            message: panic_payload_message(payload.as_ref()),
+                        });
+                }
             }
             summary.first_error.map_or(Ok(()), Err)
         }
@@ -1793,6 +1848,14 @@ fn commit_provider_mutation_if_current(
         })
         .collect::<Result<Vec<_>, CordisError>>()?;
 
+    for (outcome, next_ticket) in outcomes.iter().zip(&next_tickets) {
+        if next_ticket.is_none() || outcome.draft.tombstone {
+            continue;
+        }
+        let index = control_index(&transaction_controls, &outcome.draft.control)
+            .expect("affected control must be transaction-locked");
+        machines[index].close_committed_event_epoch();
+    }
     commit_provider_plan(&mut state, plan);
     let (publications, notifications) =
         apply_provider_outcomes(&transaction_controls, &mut machines, outcomes, next_tickets);
@@ -2813,11 +2876,13 @@ struct ActivationCollectorState {
     metadata: ConfigValue,
     providers: Vec<ProvisionalProvider>,
     mounts: Vec<ProvisionalMount>,
+    event_listeners: Vec<PendingLifecycleListener>,
 }
 
 struct ActivationCollector {
     fiber_uid: FiberUid,
     epoch: ActivationEpoch,
+    event_epoch: Arc<LifecycleEventEpoch>,
     state: Mutex<ActivationCollectorState>,
 }
 
@@ -2843,6 +2908,8 @@ struct FinishedActivation {
     metadata: ConfigValue,
     providers: Vec<ProvisionalProvider>,
     mounts: Vec<ProvisionalMount>,
+    event_epoch: Arc<LifecycleEventEpoch>,
+    event_listeners: Vec<PendingLifecycleListener>,
 }
 
 impl ActivationCollector {
@@ -2855,6 +2922,7 @@ impl ActivationCollector {
         Self {
             fiber_uid,
             epoch,
+            event_epoch: LifecycleEventEpoch::new(),
             state: Mutex::new(ActivationCollectorState {
                 ticket_serial,
                 closed: false,
@@ -2863,6 +2931,7 @@ impl ActivationCollector {
                 metadata,
                 providers: Vec::new(),
                 mounts: Vec::new(),
+                event_listeners: Vec::new(),
             }),
         }
     }
@@ -2903,6 +2972,8 @@ impl ActivationCollector {
             metadata: state.metadata.clone(),
             providers: std::mem::take(&mut state.providers),
             mounts: std::mem::take(&mut state.mounts),
+            event_epoch: self.event_epoch.clone(),
+            event_listeners: std::mem::take(&mut state.event_listeners),
         }
     }
 }
@@ -3060,6 +3131,25 @@ impl LifecycleContextView {
         Ok(child)
     }
 
+    /// Capture the exact activation's owned typed-Emit authority.
+    ///
+    /// Registration is allowed while this view belongs to the exact Loading
+    /// activation. Dispatch remains closed until that activation commits.
+    pub fn event_dispatcher(&self) -> Result<LifecycleEventDispatcher, CordisError> {
+        self.with_activation_read(|_| ())?;
+        Ok(LifecycleEventDispatcher {
+            registry: self.registry.clone(),
+            control: self.control.clone(),
+            collector: Arc::downgrade(&self.collector),
+            fiber: self.fiber.clone(),
+            namespace: self.namespace.clone(),
+            shared_namespaces: Vec::new(),
+            runtime_generation: self.runtime_generation,
+            activation_epoch: self.collector.epoch.clone(),
+            event_epoch: self.collector.event_epoch.clone(),
+        })
+    }
+
     fn authority(&self) -> Result<(Arc<LifecycleRegistryInner>, Arc<FiberControl>), CordisError> {
         let inner = self
             .registry
@@ -3154,6 +3244,399 @@ impl LifecycleContextView {
     }
 }
 
+/// Cloneable typed-Emit capability owned by one exact lifecycle activation.
+///
+/// A dispatcher never keeps its registry alive. Each operation upgrades and
+/// retains the exact registry only for that complete registration or dispatch.
+#[derive(Clone)]
+pub struct LifecycleEventDispatcher {
+    registry: Weak<LifecycleRegistryInner>,
+    control: Weak<FiberControl>,
+    collector: Weak<ActivationCollector>,
+    fiber: Fiber,
+    namespace: String,
+    shared_namespaces: Vec<String>,
+    runtime_generation: u64,
+    activation_epoch: ActivationEpoch,
+    event_epoch: Arc<LifecycleEventEpoch>,
+}
+
+impl LifecycleEventDispatcher {
+    /// Switch only this event capability to a derived isolated scope.
+    #[must_use]
+    pub fn isolate(mut self, label: impl Into<String>) -> Self {
+        self.namespace = format!("{}::{}", self.namespace, label.into());
+        self.shared_namespaces.clear();
+        self
+    }
+
+    /// Add one explicit event-scope intersection label.
+    #[must_use]
+    pub fn share_label(mut self, label: impl Into<String>) -> Self {
+        self.shared_namespaces.push(label.into());
+        self
+    }
+
+    /// Alias matching upstream Cordis terminology.
+    #[must_use]
+    pub fn shared_label(self, label: impl Into<String>) -> Self {
+        self.share_label(label)
+    }
+
+    pub fn on_emit<P, F>(&self, key: EventKey<Emit, P, ()>, listener: F) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_emit_with_options<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.register(PendingLifecycleListener::emit(
+            self.event_epoch.clone(),
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        ))
+    }
+
+    pub fn once_emit<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.once_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn once_emit_with_options<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.register(PendingLifecycleListener::emit(
+            self.event_epoch.clone(),
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        ))
+    }
+
+    pub fn try_on_emit<P, E, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        self.try_on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn try_on_emit_with_options<P, E, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        self.register(PendingLifecycleListener::try_emit(
+            self.event_epoch.clone(),
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        ))
+    }
+
+    pub fn emit<P>(&self, key: EventKey<Emit, P, ()>, payload: &P) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        let (inner, control) = self.authority()?;
+        let registry = lock(&inner.state);
+        let machine = lock(&control.machine);
+        if !self.active_is_exact_locked(&registry, &control, &machine) {
+            return Err(self.stale_error());
+        }
+        let permit = self
+            .event_epoch
+            .try_active_permit()
+            .ok_or_else(|| self.stale_error())?;
+        let prepared = inner
+            .events
+            .prepare_lifecycle_emit_owned(key, payload, Some(&self.event_scope()), &permit)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))?;
+        drop(machine);
+        drop(registry);
+        let result = prepared.dispatch();
+        drop(permit);
+        // `inner` remains strongly held until the snapshot and every callback
+        // capture owned by `prepared` have been destroyed.
+        drop(control);
+        drop(inner);
+        result
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep Loading and Active registration transactions visibly symmetric"
+    )]
+    fn register(&self, pending: PendingLifecycleListener) -> Result<(), CordisError> {
+        let Some(inner) = self.registry.upgrade() else {
+            drop_pending_with_diagnostic(None, vec![pending]);
+            return Err(self.stale_error());
+        };
+        let Some(control) = self.control.upgrade() else {
+            drop_pending_with_diagnostic(None, vec![pending]);
+            drop(inner);
+            return Err(self.stale_error());
+        };
+        if inner.id != self.fiber.context_id()
+            || control.fiber.uid() != self.fiber.uid()
+            || control.runtime_generation != self.runtime_generation
+        {
+            drop_pending_with_diagnostic(None, vec![pending]);
+            drop(control);
+            drop(inner);
+            return Err(self.stale_error());
+        }
+        let registry = lock(&inner.state);
+        if !self.registry_membership_is_exact_locked(&registry, &control) {
+            drop(registry);
+            drop_pending_with_diagnostic(None, vec![pending]);
+            drop(control);
+            drop(inner);
+            return Err(self.stale_error());
+        }
+        let machine = lock(&control.machine);
+        match machine.state {
+            FiberState::Loading => {
+                let Some(collector) = self.collector.upgrade() else {
+                    drop(machine);
+                    drop(registry);
+                    drop_pending_with_diagnostic(None, vec![pending]);
+                    drop(control);
+                    drop(inner);
+                    return Err(self.stale_error());
+                };
+                let mut collector_state = lock(&collector.state);
+                if !self.loading_is_exact_locked(
+                    &registry,
+                    &control,
+                    &machine,
+                    &collector,
+                    &collector_state,
+                ) {
+                    drop(collector_state);
+                    drop(machine);
+                    drop(registry);
+                    drop_pending_with_diagnostic(None, vec![pending]);
+                    drop(control);
+                    drop(inner);
+                    return Err(self.stale_error());
+                }
+                let Some(permit) = self.event_epoch.try_registration_permit() else {
+                    drop(collector_state);
+                    drop(machine);
+                    drop(registry);
+                    drop_pending_with_diagnostic(None, vec![pending]);
+                    drop(control);
+                    drop(inner);
+                    return Err(self.stale_error());
+                };
+                collector_state.event_listeners.push(pending);
+                drop(collector_state);
+                drop(machine);
+                drop(registry);
+                drop(permit);
+                drop(collector);
+                drop(control);
+                drop(inner);
+                Ok(())
+            }
+            FiberState::Active => {
+                if !self.active_is_exact_locked(&registry, &control, &machine) {
+                    drop(machine);
+                    drop(registry);
+                    drop_pending_with_diagnostic(None, vec![pending]);
+                    drop(control);
+                    drop(inner);
+                    return Err(self.stale_error());
+                }
+                let Some(permit) = self.event_epoch.try_registration_permit() else {
+                    drop(machine);
+                    drop(registry);
+                    drop_pending_with_diagnostic(None, vec![pending]);
+                    drop(control);
+                    drop(inner);
+                    return Err(self.stale_error());
+                };
+                let prepared =
+                    match inner
+                        .events
+                        .prepare_lifecycle_emit(&self.event_epoch, &permit, &pending)
+                    {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            drop(machine);
+                            drop(registry);
+                            drop_pending_with_diagnostic(None, vec![pending]);
+                            return Err(error);
+                        }
+                    };
+                let commit = prepared.insert();
+                commit.commit();
+                drop(machine);
+                drop(registry);
+                drop(permit);
+                drop(pending);
+                drop(control);
+                drop(inner);
+                Ok(())
+            }
+            FiberState::Pending
+            | FiberState::Failed
+            | FiberState::Disposed
+            | FiberState::Unloading => {
+                drop(machine);
+                drop(registry);
+                drop_pending_with_diagnostic(None, vec![pending]);
+                drop(control);
+                drop(inner);
+                Err(self.stale_error())
+            }
+        }
+    }
+
+    fn authority(&self) -> Result<(Arc<LifecycleRegistryInner>, Arc<FiberControl>), CordisError> {
+        let inner = self.registry.upgrade().ok_or_else(|| self.stale_error())?;
+        let control = self.control.upgrade().ok_or_else(|| self.stale_error())?;
+        if inner.id != self.fiber.context_id()
+            || control.fiber.uid() != self.fiber.uid()
+            || control.runtime_generation != self.runtime_generation
+        {
+            return Err(self.stale_error());
+        }
+        Ok((inner, control))
+    }
+
+    fn registry_membership_is_exact_locked(
+        &self,
+        registry: &LifecycleRegistryState,
+        control: &Arc<FiberControl>,
+    ) -> bool {
+        !registry.shutting_down
+            && control.driver_runtime.require_alive().is_ok()
+            && registry
+                .runtimes
+                .get(&control.factory.id())
+                .filter(|runtime| runtime.generation == self.runtime_generation)
+                .and_then(|runtime| runtime.fibers.get(&self.fiber.uid()))
+                .is_some_and(|registered| Arc::ptr_eq(registered, control))
+    }
+
+    fn loading_is_exact_locked(
+        &self,
+        registry: &LifecycleRegistryState,
+        control: &Arc<FiberControl>,
+        machine: &FiberMachine,
+        collector: &Arc<ActivationCollector>,
+        collector_state: &ActivationCollectorState,
+    ) -> bool {
+        self.registry_membership_is_exact_locked(registry, control)
+            && !machine.tombstone
+            && machine.state == FiberState::Loading
+            && machine.desired.as_ref() == Some(&self.activation_epoch)
+            && collector.epoch == self.activation_epoch
+            && LifecycleEventEpoch::ptr_eq(&collector.event_epoch, &self.event_epoch)
+            && machine
+                .current_ticket
+                .as_ref()
+                .is_some_and(|ticket| ticket.serial() == collector_state.ticket_serial)
+            && machine
+                .active_activation
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, collector))
+            && !collector_state.closed
+    }
+
+    fn active_is_exact_locked(
+        &self,
+        registry: &LifecycleRegistryState,
+        control: &Arc<FiberControl>,
+        machine: &FiberMachine,
+    ) -> bool {
+        self.registry_membership_is_exact_locked(registry, control)
+            && !machine.tombstone
+            && machine.state == FiberState::Active
+            && !machine.force_restart
+            && machine.desired.as_ref() == Some(&self.activation_epoch)
+            && machine.committed.as_ref() == Some(&self.activation_epoch)
+            && machine
+                .active_event_epoch
+                .as_ref()
+                .is_some_and(|epoch| LifecycleEventEpoch::ptr_eq(epoch, &self.event_epoch))
+            && machine.current_ticket.as_ref().is_none_or(|ticket| {
+                ticket.serial() <= machine.settled_ticket
+                    && ticket.target() == Some(&self.activation_epoch)
+            })
+    }
+
+    fn event_scope(&self) -> EventScope {
+        EventScope::new(self.namespace.clone(), &self.shared_namespaces)
+    }
+
+    fn stale_error(&self) -> CordisError {
+        CordisError::StaleLifecycleView {
+            uid: self.fiber.uid(),
+        }
+    }
+}
+
+impl fmt::Debug for LifecycleEventDispatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LifecycleEventDispatcher")
+            .field("fiber", &self.fiber)
+            .field("namespace", &self.namespace)
+            .field("shared_namespaces", &self.shared_namespaces)
+            .field("activation_epoch", &self.activation_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 struct FiberMachine {
     config: ConfigValue,
     config_revision: u64,
@@ -3173,6 +3656,7 @@ struct FiberMachine {
     baseline_metadata: ConfigValue,
     metadata: ConfigValue,
     active_activation: Option<Arc<ActivationCollector>>,
+    active_event_epoch: Option<Arc<LifecycleEventEpoch>>,
 }
 
 impl FiberMachine {
@@ -3198,6 +3682,26 @@ impl FiberMachine {
         self.current_ticket = Some(ticket.clone());
         ticket
     }
+
+    /// Close lifecycle event authority as the first infallible transition
+    /// mutation after the caller has completed every fallible preflight.
+    fn close_event_epochs(&self) {
+        self.close_committed_event_epoch();
+        if let Some(collector) = &self.active_activation {
+            collector.event_epoch.close();
+        }
+    }
+
+    /// Provider recomputation may transiently remove and then rebind the same
+    /// generation while one Loading activation continues. Its staged epoch is
+    /// still private and machine-fenced, so only committed authority closes at
+    /// that transaction point; a truly retired Loading attempt closes in its
+    /// stale-finish or recovery cleanup.
+    fn close_committed_event_epoch(&self) {
+        if let Some(epoch) = &self.active_event_epoch {
+            epoch.close();
+        }
+    }
 }
 
 struct FiberControl {
@@ -3209,6 +3713,7 @@ struct FiberControl {
     runtime_generation: u64,
     driver_runtime: DriverRuntimeBinding,
     namespace: String,
+    events: EventBus,
     machine: Mutex<FiberMachine>,
     wake: Notify,
     snapshots: watch::Sender<FiberSnapshot>,
@@ -3228,6 +3733,9 @@ impl FiberControl {
         let (snapshots, _) = watch::channel(initial);
         Arc::new_cyclic(|self_weak| Self {
             self_weak: self_weak.clone(),
+            events: registry
+                .upgrade()
+                .map_or_else(EventBus::new, |inner| inner.events.clone()),
             registry,
             namespace: fiber.namespace(),
             fiber,
@@ -3254,6 +3762,7 @@ impl FiberControl {
                 baseline_metadata: ConfigValue::default(),
                 metadata: ConfigValue::default(),
                 active_activation: None,
+                active_event_epoch: None,
             }),
             wake: Notify::new(),
             snapshots,
@@ -3299,6 +3808,9 @@ impl FiberControl {
         diagnostic: Option<CordisError>,
         next_ticket: Option<u64>,
     ) -> (bool, u64) {
+        if next_ticket.is_some() {
+            machine.close_committed_event_epoch();
+        }
         if let Some(diagnostic) = diagnostic
             && !machine.diagnostics.contains(&diagnostic)
         {
@@ -3396,6 +3908,7 @@ impl FiberControl {
                 });
             }
             let next_ticket = machine.preflight_next_ticket()?;
+            machine.close_event_epochs();
             machine.force_restart = true;
             machine.publish_ticket(next_ticket).serial()
         };
@@ -3421,6 +3934,7 @@ impl FiberControl {
                 .checked_add(1)
                 .ok_or(CordisError::ConfigRevisionOverflow)?;
             let next_ticket = machine.preflight_next_ticket()?;
+            machine.close_event_epochs();
             machine.config_revision = config_revision;
             machine.config = config;
             machine.error = None;
@@ -3476,6 +3990,7 @@ impl FiberControl {
     ) -> (bool, u64) {
         let changed = next_ticket.is_some();
         if let Some(next_ticket) = next_ticket {
+            machine.close_event_epochs();
             machine.tombstone = true;
             machine.desired = None;
             self.fiber.publish_tombstone();
@@ -3665,7 +4180,10 @@ fn publish_deferred_batch(
 }
 
 enum DriveAction {
-    Cleanup(Vec<Vec<LifecycleDisposer>>),
+    Cleanup {
+        groups: Vec<Vec<LifecycleDisposer>>,
+        event_epoch: Option<Arc<LifecycleEventEpoch>>,
+    },
     Start {
         epoch: ActivationEpoch,
         config: ConfigValue,
@@ -3682,8 +4200,11 @@ fn run_fiber(control: Arc<FiberControl>) -> BoxFuture<'static, ()> {
             loop {
                 let action = next_action(&control);
                 match action {
-                    DriveAction::Cleanup(groups) => {
-                        let errors = cleanup_groups(groups).await;
+                    DriveAction::Cleanup {
+                        groups,
+                        event_epoch,
+                    } => {
+                        let errors = cleanup_activation(&control.events, event_epoch, groups).await;
                         if !errors.is_empty() {
                             let mut machine = lock(&control.machine);
                             machine.diagnostics.extend(errors);
@@ -3729,6 +4250,10 @@ fn run_fiber(control: Arc<FiberControl>) -> BoxFuture<'static, ()> {
     .boxed()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep exact activation validation, event preflight, and commit ordering contiguous"
+)]
 fn finish_activation(
     control: &Arc<FiberControl>,
     collector: &Arc<ActivationCollector>,
@@ -3737,13 +4262,20 @@ fn finish_activation(
     finished: FinishedActivation,
 ) -> Vec<Arc<FiberControl>> {
     let Some(inner) = control.registry.upgrade() else {
-        let FinishedActivation { groups, mounts, .. } = finished;
+        let FinishedActivation {
+            groups,
+            mounts,
+            event_epoch,
+            event_listeners,
+            ..
+        } = finished;
         let mut machine = lock(&control.machine);
         retain_effect_groups(&mut machine, epoch, groups);
         machine.active_activation = None;
         machine.tombstone = true;
         control.transition_locked(&mut machine, FiberState::Disposed);
         drop(machine);
+        discard_activation_events(control, event_epoch, event_listeners);
         dispose_provisional_mounts(mounts);
         return Vec::new();
     };
@@ -3751,10 +4283,17 @@ fn finish_activation(
     let mut registry = lock(&inner.state);
     let mut machine = lock(&control.machine);
     if !activation_finish_is_exact(&registry, control, &machine, collector, epoch, &finished) {
-        let FinishedActivation { groups, mounts, .. } = finished;
+        let FinishedActivation {
+            groups,
+            mounts,
+            event_epoch,
+            event_listeners,
+            ..
+        } = finished;
         record_stale_activation(control, collector, epoch, &mut machine, groups);
         drop(machine);
         drop(registry);
+        discard_activation_events(control, event_epoch, event_listeners);
         dispose_provisional_mounts(mounts);
         return Vec::new();
     }
@@ -3764,11 +4303,14 @@ fn finish_activation(
             ticket_serial,
             groups,
             mounts,
+            event_epoch,
+            event_listeners,
             ..
         } = finished;
         record_failed_activation(control, epoch, &mut machine, groups, error, ticket_serial);
         drop(machine);
         drop(registry);
+        discard_activation_events(control, event_epoch, event_listeners);
         dispose_provisional_mounts(mounts);
         return Vec::new();
     }
@@ -3787,15 +4329,49 @@ fn finish_activation(
                 ticket_serial,
                 groups,
                 mounts,
+                event_epoch,
+                event_listeners,
                 ..
             } = finished;
             record_failed_activation(control, epoch, &mut machine, groups, error, ticket_serial);
             drop(machine);
             drop(registry);
+            discard_activation_events(control, event_epoch, event_listeners);
             dispose_provisional_mounts(mounts);
             return Vec::new();
         }
     };
+
+    let event_batch_result = inner
+        .events
+        .prepare_lifecycle_batch(&finished.event_epoch, &finished.event_listeners);
+    let mut event_error = None;
+    let event_batch = match event_batch_result {
+        Ok(batch) => Some(batch),
+        Err(error) => {
+            event_error = Some(error);
+            None
+        }
+    };
+    if let Some(error) = event_error {
+        drop(event_batch);
+        let FinishedActivation {
+            ticket_serial,
+            groups,
+            mounts,
+            event_epoch,
+            event_listeners,
+            ..
+        } = finished;
+        record_failed_activation(control, epoch, &mut machine, groups, error, ticket_serial);
+        drop(machine);
+        drop(registry);
+        discard_activation_events(control, event_epoch, event_listeners);
+        dispose_provisional_mounts(mounts);
+        return Vec::new();
+    }
+    let event_batch = event_batch.expect("successful event preflight returns its batch");
+    let event_commit = event_batch.insert();
 
     let spawned = commit_prepared_activation(
         &inner,
@@ -3803,9 +4379,11 @@ fn finish_activation(
         epoch,
         &mut registry,
         &mut machine,
-        finished,
+        &finished,
         prepared,
     );
+    event_commit.commit();
+    control.publish_locked(&machine);
     drop(machine);
     drop(registry);
     spawned
@@ -3988,10 +4566,61 @@ fn finish_provider_activation_transaction(
                 drop(machines);
                 drop(registry);
                 control.publish_deferred(owner_snapshot);
-                dispose_provisional_mounts(finished.mounts);
+                let FinishedActivation {
+                    mounts,
+                    event_epoch,
+                    event_listeners,
+                    ..
+                } = finished;
+                discard_activation_events(control, event_epoch, event_listeners);
+                dispose_provisional_mounts(mounts);
                 return Vec::new();
             }
         };
+
+        let event_batch_result = inner
+            .events
+            .prepare_lifecycle_batch(&finished.event_epoch, &finished.event_listeners);
+        let mut event_error = None;
+        let event_batch = match event_batch_result {
+            Ok(batch) => Some(batch),
+            Err(error) => {
+                event_error = Some(error);
+                None
+            }
+        };
+        if let Some(error) = event_error {
+            drop(event_batch);
+            apply_failed_activation(control, epoch, &mut machines[owner_index], &finished, error);
+            let owner_snapshot = machines[owner_index].snapshot();
+            drop(machines);
+            drop(registry);
+            control.publish_deferred(owner_snapshot);
+            let FinishedActivation {
+                mounts,
+                event_epoch,
+                event_listeners,
+                ..
+            } = finished;
+            discard_activation_events(control, event_epoch, event_listeners);
+            dispose_provisional_mounts(mounts);
+            return Vec::new();
+        }
+        let event_batch = event_batch.expect("successful event preflight returns its batch");
+
+        for ((outcome, next_ticket), affected_control) in
+            outcomes.iter().zip(&next_tickets).zip(&affected)
+        {
+            if outcome.draft.tombstone || next_ticket.is_none() {
+                continue;
+            }
+            let index = controls
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, affected_control))
+                .expect("affected control must be part of activation commit batch");
+            machines[index].close_committed_event_epoch();
+        }
+        let event_commit = event_batch.insert();
 
         registry.next_provider_id = current_prepared.next_provider_id;
         registry.next_runtime_generation = current_prepared.next_runtime_generation;
@@ -4001,7 +4630,7 @@ fn finish_provider_activation_transaction(
             inner,
             control,
             &mut registry,
-            finished.mounts,
+            finished.mounts.clone(),
             &current_prepared.runtime_generations,
         );
         owner_groups.extend(mount_groups);
@@ -4034,23 +4663,19 @@ fn finish_provider_activation_transaction(
             }
         }
 
-        let FinishedActivation {
-            ticket_serial,
-            groups,
-            metadata,
-            providers: _,
-            mounts: _,
-        } = finished;
         let owner_machine = &mut machines[owner_index];
-        retain_effect_groups(owner_machine, epoch, groups);
+        retain_effect_groups(owner_machine, epoch, finished.groups.clone());
         retain_effect_groups(owner_machine, epoch, owner_groups);
         owner_machine.committed = Some(epoch.clone());
         owner_machine.error = None;
-        owner_machine.metadata = metadata;
+        owner_machine.metadata = finished.metadata.clone();
         owner_machine.active_activation = None;
-        owner_machine.settled_ticket = ticket_serial;
+        owner_machine.active_event_epoch = Some(finished.event_epoch.clone());
+        owner_machine.settled_ticket = finished.ticket_serial;
         FiberControl::apply_transition_state_locked(owner_machine, FiberState::Active);
+        finished.event_epoch.activate();
         let owner_snapshot = owner_machine.snapshot();
+        event_commit.commit();
 
         drop(machines);
         drop(registry);
@@ -4129,7 +4754,13 @@ fn finish_stale_provider_activation(
     epoch: &ActivationEpoch,
     finished: FinishedActivation,
 ) -> Vec<Arc<FiberControl>> {
-    let FinishedActivation { groups, mounts, .. } = finished;
+    let FinishedActivation {
+        groups,
+        mounts,
+        event_epoch,
+        event_listeners,
+        ..
+    } = finished;
     let snapshot = {
         let mut machine = lock(&control.machine);
         retain_effect_groups(&mut machine, epoch, groups);
@@ -4143,6 +4774,7 @@ fn finish_stale_provider_activation(
         machine.snapshot()
     };
     control.publish_deferred(snapshot);
+    discard_activation_events(control, event_epoch, event_listeners);
     dispose_provisional_mounts(mounts);
     Vec::new()
 }
@@ -4161,6 +4793,8 @@ fn finish_failed_provider_activation(
         ticket_serial,
         groups,
         mounts,
+        event_epoch,
+        event_listeners,
         ..
     } = finished;
     let snapshot = {
@@ -4188,6 +4822,7 @@ fn finish_failed_provider_activation(
         machine.snapshot()
     };
     control.publish_deferred(snapshot);
+    discard_activation_events(control, event_epoch, event_listeners);
     dispose_provisional_mounts(mounts);
     Vec::new()
 }
@@ -4255,22 +4890,48 @@ fn dispose_provisional_mounts(mounts: Vec<ProvisionalMount>) {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "consume the exact epoch token and keep it alive through staged callback destruction"
+)]
+fn discard_activation_events(
+    control: &FiberControl,
+    event_epoch: Arc<LifecycleEventEpoch>,
+    listeners: Vec<PendingLifecycleListener>,
+) {
+    event_epoch.close();
+    drop_pending_with_diagnostic(Some(control), listeners);
+}
+
+fn drop_pending_with_diagnostic(
+    control: Option<&FiberControl>,
+    listeners: Vec<PendingLifecycleListener>,
+) {
+    let Some(payload) = drop_pending_lifecycle_listeners(listeners) else {
+        return;
+    };
+    let Some(control) = control else {
+        return;
+    };
+    let error = CordisError::CleanupPanicked {
+        message: panic_payload_message(payload.as_ref()),
+    };
+    let mut machine = lock(&control.machine);
+    if !machine.diagnostics.contains(&error) {
+        machine.diagnostics.push(error);
+        control.publish_locked(&machine);
+    }
+}
+
 fn commit_prepared_activation(
     inner: &Arc<LifecycleRegistryInner>,
     control: &Arc<FiberControl>,
     epoch: &ActivationEpoch,
     registry: &mut LifecycleRegistryState,
     machine: &mut FiberMachine,
-    finished: FinishedActivation,
+    finished: &FinishedActivation,
     prepared: PreparedActivation,
 ) -> Vec<Arc<FiberControl>> {
-    let FinishedActivation {
-        ticket_serial,
-        groups,
-        metadata,
-        providers: _,
-        mounts,
-    } = finished;
     registry.next_provider_id = prepared.next_provider_id;
     registry.next_runtime_generation = prepared.next_runtime_generation;
     let mut owner_groups = commit_provisional_providers(inner, registry, prepared.provider_plans);
@@ -4278,18 +4939,20 @@ fn commit_prepared_activation(
         inner,
         control,
         registry,
-        mounts,
+        finished.mounts.clone(),
         &prepared.runtime_generations,
     );
     owner_groups.extend(mount_groups);
-    retain_effect_groups(machine, epoch, groups);
+    retain_effect_groups(machine, epoch, finished.groups.clone());
     retain_effect_groups(machine, epoch, owner_groups);
     machine.committed = Some(epoch.clone());
     machine.error = None;
-    machine.metadata = metadata;
+    machine.metadata = finished.metadata.clone();
     machine.active_activation = None;
-    machine.settled_ticket = ticket_serial;
-    control.transition_locked(machine, FiberState::Active);
+    machine.active_event_epoch = Some(finished.event_epoch.clone());
+    machine.settled_ticket = finished.ticket_serial;
+    FiberControl::apply_transition_state_locked(machine, FiberState::Active);
+    finished.event_epoch.activate();
     spawned
 }
 
@@ -4582,15 +5245,27 @@ fn provisional_runtime_generation(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the six-state transition decision and event cleanup token transfer together"
+)]
 fn next_action(control: &Arc<FiberControl>) -> DriveAction {
     let mut machine = lock(&control.machine);
     if machine.tombstone {
-        if !machine.effects.is_empty() || machine.committed.is_some() {
+        if !machine.effects.is_empty()
+            || machine.committed.is_some()
+            || machine.active_event_epoch.is_some()
+        {
+            machine.close_event_epochs();
             let groups = std::mem::take(&mut machine.effects);
+            let event_epoch = machine.active_event_epoch.take();
             machine.effects_epoch = None;
             machine.committed = None;
             control.transition_locked(&mut machine, FiberState::Unloading);
-            return DriveAction::Cleanup(groups);
+            return DriveAction::Cleanup {
+                groups,
+                event_epoch,
+            };
         }
         machine.metadata = machine.baseline_metadata.clone();
         machine.settled_ticket = machine
@@ -4609,17 +5284,25 @@ fn next_action(control: &Arc<FiberControl>) -> DriveAction {
         .effects_epoch
         .as_ref()
         .is_some_and(|effects_epoch| Some(effects_epoch) != machine.desired.as_ref());
+    let event_epoch_stale = machine.active_event_epoch.is_some()
+        && (machine.force_restart || committed_stale || effects_stale);
     let needs_unload = (machine.force_restart || committed_stale || effects_stale)
         && (!machine.effects.is_empty()
             || machine.effects_epoch.is_some()
-            || machine.committed.is_some());
+            || machine.committed.is_some()
+            || event_epoch_stale);
     if needs_unload {
+        machine.close_event_epochs();
         let groups = std::mem::take(&mut machine.effects);
+        let event_epoch = machine.active_event_epoch.take();
         machine.effects_epoch = None;
         machine.committed = None;
         machine.metadata = machine.baseline_metadata.clone();
         control.transition_locked(&mut machine, FiberState::Unloading);
-        return DriveAction::Cleanup(groups);
+        return DriveAction::Cleanup {
+            groups,
+            event_epoch,
+        };
     }
 
     let Some(epoch) = machine.desired.clone() else {
@@ -4813,6 +5496,25 @@ async fn cleanup_groups(groups: Vec<Vec<LifecycleDisposer>>) -> Vec<CordisError>
     .collect()
 }
 
+async fn cleanup_activation(
+    events: &EventBus,
+    event_epoch: Option<Arc<LifecycleEventEpoch>>,
+    groups: Vec<Vec<LifecycleDisposer>>,
+) -> Vec<CordisError> {
+    let mut errors = Vec::new();
+    if let Some(event_epoch) = event_epoch {
+        event_epoch.close();
+        event_epoch.drain().await;
+        if let Some(payload) = events.remove_lifecycle_epoch(&event_epoch) {
+            errors.push(CordisError::CleanupPanicked {
+                message: panic_payload_message(payload.as_ref()),
+            });
+        }
+    }
+    errors.extend(cleanup_groups(groups).await);
+    errors
+}
+
 fn driver_runtimes_for_controls(controls: &[Arc<FiberControl>]) -> Vec<DriverRuntimeBinding> {
     let mut drivers = Vec::<DriverRuntimeBinding>::new();
     for control in controls {
@@ -4849,7 +5551,13 @@ struct FiberTicketSummary {
 enum RecoveryWaitOutcome {
     TicketSettled(Result<FiberSnapshot, CordisError>),
     TerminalSettled(Arc<FiberControl>),
+    EventEpochSettled(Option<CordisError>),
     DriverDied(DriverRuntimeBinding),
+}
+
+struct LifecycleEventRecovery {
+    epoch: Arc<LifecycleEventEpoch>,
+    staged: Vec<PendingLifecycleListener>,
 }
 
 #[derive(Default)]
@@ -4858,6 +5566,7 @@ struct RecoveryPlan {
     terminal_waits: Vec<Arc<FiberControl>>,
     drivers: Vec<DriverRuntimeBinding>,
     provider_reclaims: Vec<ProviderReclaimPlan>,
+    event_recoveries: Vec<LifecycleEventRecovery>,
 }
 
 impl RecoveryPlan {
@@ -4868,6 +5577,7 @@ impl RecoveryPlan {
             push_binding_once(&mut self.drivers, driver);
         }
         self.provider_reclaims.extend(other.provider_reclaims);
+        self.event_recoveries.extend(other.event_recoveries);
     }
 
     fn driver_runtimes(&self) -> Vec<DriverRuntimeBinding> {
@@ -4970,7 +5680,9 @@ fn enqueue_recovery_plan(
     pending: &mut futures_util::stream::FuturesUnordered<BoxFuture<'static, RecoveryWaitOutcome>>,
     seen_tickets: &mut Vec<FiberTicketWait>,
     seen_terminals: &mut Vec<Arc<FiberControl>>,
+    seen_event_epochs: &mut Vec<Arc<LifecycleEventEpoch>>,
     provider_reclaims: &mut Vec<ProviderReclaimPlan>,
+    events: &EventBus,
     plan: RecoveryPlan,
 ) {
     for reclaim in plan.provider_reclaims {
@@ -5013,6 +5725,45 @@ fn enqueue_recovery_plan(
         seen_terminals.push(control.clone());
         pending.push(await_terminal_or_driver_death(control).boxed());
     }
+    for recovery in plan.event_recoveries {
+        if seen_event_epochs
+            .iter()
+            .any(|seen| LifecycleEventEpoch::ptr_eq(seen, &recovery.epoch))
+        {
+            continue;
+        }
+        seen_event_epochs.push(recovery.epoch.clone());
+        let events = events.clone();
+        pending.push(
+            async move {
+                RecoveryWaitOutcome::EventEpochSettled(
+                    settle_lifecycle_event_recovery(events, recovery).await,
+                )
+            }
+            .boxed(),
+        );
+    }
+}
+
+async fn settle_lifecycle_event_recovery(
+    events: EventBus,
+    recovery: LifecycleEventRecovery,
+) -> Option<CordisError> {
+    recovery.epoch.close();
+    recovery.epoch.drain().await;
+    let mut first = events
+        .remove_lifecycle_epoch(&recovery.epoch)
+        .map(|payload| CordisError::CleanupPanicked {
+            message: panic_payload_message(payload.as_ref()),
+        });
+    if let Some(payload) = drop_pending_lifecycle_listeners(recovery.staged)
+        && first.is_none()
+    {
+        first = Some(CordisError::CleanupPanicked {
+            message: panic_payload_message(payload.as_ref()),
+        });
+    }
+    first
 }
 
 async fn settle_recovery_plan(
@@ -5023,12 +5774,15 @@ async fn settle_recovery_plan(
     let mut pending = futures_util::stream::FuturesUnordered::new();
     let mut seen_tickets = Vec::new();
     let mut seen_terminals = Vec::new();
+    let mut seen_event_epochs = Vec::new();
     let mut provider_reclaims = Vec::new();
     enqueue_recovery_plan(
         &mut pending,
         &mut seen_tickets,
         &mut seen_terminals,
+        &mut seen_event_epochs,
         &mut provider_reclaims,
+        &inner.events,
         plan,
     );
     while let Some(outcome) = pending.next().await {
@@ -5039,6 +5793,11 @@ async fn settle_recovery_plan(
             }
             RecoveryWaitOutcome::TerminalSettled(control) => {
                 finalize_recovered_terminal(&inner, &control);
+            }
+            RecoveryWaitOutcome::EventEpochSettled(error) => {
+                if let Some(error) = error {
+                    first_error.get_or_insert(error);
+                }
             }
             RecoveryWaitOutcome::DriverDied(binding) => {
                 first_error.get_or_insert(CordisError::AsyncRuntimeUnavailable);
@@ -5053,7 +5812,9 @@ async fn settle_recovery_plan(
                     &mut pending,
                     &mut seen_tickets,
                     &mut seen_terminals,
+                    &mut seen_event_epochs,
                     &mut provider_reclaims,
+                    &inner.events,
                     next,
                 );
             }
@@ -5181,6 +5942,36 @@ fn exact_forced_provider_facts_locked(
         });
     }
     facts
+}
+
+fn take_dead_machine_event_recoveries(machine: &mut FiberMachine) -> Vec<LifecycleEventRecovery> {
+    machine.close_event_epochs();
+    let mut recoveries = Vec::new();
+    if let Some(epoch) = machine.active_event_epoch.take() {
+        recoveries.push(LifecycleEventRecovery {
+            epoch,
+            staged: Vec::new(),
+        });
+    }
+    if let Some(collector) = machine.active_activation.take() {
+        let staged = {
+            let mut state = lock(&collector.state);
+            state.closed = true;
+            std::mem::take(&mut state.event_listeners)
+        };
+        if let Some(existing) = recoveries
+            .iter_mut()
+            .find(|existing| LifecycleEventEpoch::ptr_eq(&existing.epoch, &collector.event_epoch))
+        {
+            existing.staged.extend(staged);
+        } else {
+            recoveries.push(LifecycleEventRecovery {
+                epoch: collector.event_epoch.clone(),
+                staged,
+            });
+        }
+    }
+    recoveries
 }
 
 /// Fail-closed recovery for an exact dead executor plus any live controls that
@@ -5443,6 +6234,27 @@ fn quarantine_dead_bindings_transaction(
             });
         }
 
+        for control in &dead_controls {
+            let index = control_index(&locked_controls, control).expect("dead control locked");
+            machines[index].close_event_epochs();
+        }
+        for control in &live_cleanup {
+            let index = control_index(&locked_controls, control).expect("live control locked");
+            machines[index].close_event_epochs();
+        }
+        for (control, next_ticket) in live_affected.iter().zip(&next_tickets) {
+            if next_ticket.is_none() {
+                continue;
+            }
+            let index = control_index(&locked_controls, control).expect("affected control locked");
+            machines[index].close_event_epochs();
+        }
+        let mut event_recoveries = Vec::new();
+        for control in &dead_controls {
+            let index = control_index(&locked_controls, control).expect("dead control locked");
+            event_recoveries.extend(take_dead_machine_event_recoveries(&mut machines[index]));
+        }
+
         let mut publications = Vec::new();
         let mut notifications = Vec::new();
         let mut terminals = Vec::new();
@@ -5569,6 +6381,7 @@ fn quarantine_dead_bindings_transaction(
             terminal_waits,
             drivers,
             provider_reclaims,
+            event_recoveries,
         };
     }
 }
@@ -5620,6 +6433,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod lifecycle_boundary_tests {
     use super::*;
 
+    const INVALIDATION_EVENT: EventKey<Emit, (), ()> = EventKey::new(
+        crate::event::EventSchemaId::new("cordis.lifecycle.invalidation.v1"),
+        "lifecycle-invalidation",
+    );
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct MachineBoundarySnapshot {
         config: ConfigValue,
@@ -5637,6 +6455,7 @@ mod lifecycle_boundary_tests {
         history: Vec<FiberState>,
         baseline_metadata: ConfigValue,
         metadata: ConfigValue,
+        active_event_epoch_identity: Option<usize>,
         flags: [bool; 4],
     }
 
@@ -5667,6 +6486,14 @@ mod lifecycle_boundary_tests {
         status: RuntimeStatus,
         fiber_count: usize,
         has_shutdown_operation: bool,
+    }
+
+    struct CountingDrop(Arc<AtomicU64>);
+
+    impl Drop for CountingDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn detached_control(registry: &LifecycleRegistry, id: &str) -> Arc<FiberControl> {
@@ -5707,6 +6534,10 @@ mod lifecycle_boundary_tests {
             history: machine.history.clone(),
             baseline_metadata: machine.baseline_metadata.clone(),
             metadata: machine.metadata.clone(),
+            active_event_epoch_identity: machine
+                .active_event_epoch
+                .as_ref()
+                .map(|epoch| Arc::as_ptr(epoch) as usize),
             flags: [
                 machine.force_restart,
                 machine.tombstone,
@@ -5854,6 +6685,110 @@ mod lifecycle_boundary_tests {
             Err(CordisError::TransitionTicketOverflow)
         ));
         assert_eq!(machine_boundary_snapshot(&control), before);
+    }
+
+    #[tokio::test]
+    async fn restart_ticket_overflow_keeps_the_active_event_epoch_usable() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let (dispatcher_tx, dispatcher_rx) = oneshot::channel();
+        let dispatcher_tx = Arc::new(Mutex::new(Some(dispatcher_tx)));
+        let factory = PluginFactory::new_lifecycle("event-invalidation-overflow", {
+            let calls = calls.clone();
+            let dispatcher_tx = dispatcher_tx.clone();
+            move |_, view| {
+                let dispatcher = view.event_dispatcher()?;
+                dispatcher.on_emit(INVALIDATION_EVENT, {
+                    let calls = calls.clone();
+                    move |()| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                })?;
+                if let Some(sender) = lock(&dispatcher_tx).take() {
+                    let _ = sender.send(dispatcher);
+                }
+                Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+            }
+        });
+        let registry = LifecycleRegistry::new();
+        let handle = registry.mount(factory, ConfigValue::default()).unwrap();
+        let dispatcher = dispatcher_rx.await.unwrap();
+        handle
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let control = handle.control().unwrap();
+        lock(&control.machine).next_ticket = u64::MAX;
+        let machine_before = machine_boundary_snapshot(&control);
+        let event_names_before = registry.inner.events.event_names();
+        let listener_count_before = registry
+            .inner
+            .events
+            .listener_count(INVALIDATION_EVENT.name());
+        let next_id_before = registry.inner.events.next_id();
+
+        assert!(matches!(
+            handle.restart().await,
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(machine_boundary_snapshot(&control), machine_before);
+        assert_eq!(registry.inner.events.event_names(), event_names_before);
+        assert_eq!(
+            registry
+                .inner
+                .events
+                .listener_count(INVALIDATION_EVENT.name()),
+            listener_count_before
+        );
+        assert_eq!(registry.inner.events.next_id(), next_id_before);
+        dispatcher.emit(INVALIDATION_EVENT, &()).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_shutdown_leaves_the_registry_event_bus_empty() {
+        let dispatcher_slot = Arc::new(Mutex::new(None));
+        let factory = PluginFactory::new_lifecycle("event-shutdown-empty", {
+            let dispatcher_slot = dispatcher_slot.clone();
+            move |_, view| {
+                let dispatcher = view.event_dispatcher()?;
+                dispatcher.on_emit(INVALIDATION_EVENT, |()| {})?;
+                *lock(&dispatcher_slot) = Some(dispatcher);
+                Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+            }
+        });
+        let registry = LifecycleRegistry::new();
+        let handle = registry.mount(factory, ConfigValue::default()).unwrap();
+        handle
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let dispatcher = lock(&dispatcher_slot)
+            .take()
+            .expect("active dispatcher captured");
+        assert_eq!(
+            registry
+                .inner
+                .events
+                .listener_count(INVALIDATION_EVENT.name()),
+            1
+        );
+
+        registry.shutdown().await.unwrap();
+
+        assert!(registry.inner.events.event_names().is_empty());
+        assert_eq!(
+            registry
+                .inner
+                .events
+                .listener_count(INVALIDATION_EVENT.name()),
+            0
+        );
+        assert!(matches!(
+            dispatcher.emit(INVALIDATION_EVENT, &()),
+            Err(CordisError::StaleLifecycleView { .. })
+        ));
     }
 
     #[tokio::test]
@@ -6005,6 +6940,10 @@ mod lifecycle_boundary_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one boundary test compares dead-driver rejection with delete and shutdown recovery"
+    )]
     fn public_mutations_reject_dead_drivers_but_delete_and_shutdown_recover() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (registry, pending, pending_control) = runtime.block_on(async {
@@ -6034,23 +6973,35 @@ mod lifecycle_boundary_tests {
         drop(pending);
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (registry, provider, factory, active, active_control) = runtime.block_on(async {
-            let registry = LifecycleRegistry::new();
-            let provider = registry.provide("dead-replace", 3_u32).unwrap();
-            let factory =
-                PluginFactory::new_lifecycle("dead-replace", |_, _| LifecycleEffect::none())
-                    .with_inject(["dead-replace"]);
-            let active = registry
-                .mount(factory.clone(), ConfigValue::default())
-                .unwrap();
-            active
-                .fiber()
-                .wait_until_active(LifecycleCancellation::default())
-                .await
-                .unwrap();
-            let control = active.control().unwrap();
-            (registry, provider, factory, active, control)
-        });
+        let dispatcher_slot = Arc::new(Mutex::new(None));
+        let (registry, provider, factory, active, active_control, active_dispatcher) = runtime
+            .block_on(async {
+                let registry = LifecycleRegistry::new();
+                let provider = registry.provide("dead-replace", 3_u32).unwrap();
+                let factory = PluginFactory::new_lifecycle("dead-replace", {
+                    let dispatcher_slot = dispatcher_slot.clone();
+                    move |_, view| {
+                        let dispatcher = view.event_dispatcher()?;
+                        dispatcher.on_emit(INVALIDATION_EVENT, |()| {})?;
+                        *lock(&dispatcher_slot) = Some(dispatcher);
+                        Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                    }
+                })
+                .with_inject(["dead-replace"]);
+                let active = registry
+                    .mount(factory.clone(), ConfigValue::default())
+                    .unwrap();
+                active
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                let control = active.control().unwrap();
+                let dispatcher = lock(&dispatcher_slot)
+                    .take()
+                    .expect("active lifecycle dispatcher captured");
+                (registry, provider, factory, active, control, dispatcher)
+            });
         drop(runtime);
         let provider_before = provider_boundary_snapshot(&registry, "root", "dead-replace");
         let runtime_before = runtime_boundary_snapshot(&registry, &factory);
@@ -6091,6 +7042,17 @@ mod lifecycle_boundary_tests {
                 .runtimes
                 .contains_key(&factory.id())
         );
+        assert_eq!(
+            registry
+                .inner
+                .events
+                .listener_count(INVALIDATION_EVENT.name()),
+            0
+        );
+        assert!(matches!(
+            active_dispatcher.emit(INVALIDATION_EVENT, &()),
+            Err(CordisError::StaleLifecycleView { .. })
+        ));
         let recovered = machine_boundary_snapshot(&active_control);
         assert_eq!(recovered.state, FiberState::Disposed);
         assert!(
@@ -6106,6 +7068,81 @@ mod lifecycle_boundary_tests {
         assert!(lock(&registry.inner.state).runtimes.is_empty());
         assert!(registry.get::<u32>("dead-replace").is_none());
         drop(active);
+    }
+
+    #[test]
+    fn dead_loading_driver_recovery_drops_staged_events_without_publication() {
+        production_result_with_timeout(|| {
+            let driver_runtime = tokio::runtime::Runtime::new().unwrap();
+            let registry = LifecycleRegistry::new();
+            let drops = Arc::new(AtomicU64::new(0));
+            let capture = Arc::new(Mutex::new(Some(CountingDrop(drops.clone()))));
+            let (dispatcher_tx, dispatcher_rx) = oneshot::channel();
+            let dispatcher_tx = Arc::new(Mutex::new(Some(dispatcher_tx)));
+            let factory = PluginFactory::new_lifecycle("dead-loading-event", {
+                let capture = capture.clone();
+                let dispatcher_tx = dispatcher_tx.clone();
+                move |_, view| {
+                    let dispatcher = view.event_dispatcher()?;
+                    let capture = lock(&capture)
+                        .take()
+                        .expect("the Loading activation owns one capture");
+                    dispatcher.on_emit(INVALIDATION_EVENT, move |()| {
+                        let _capture = &capture;
+                    })?;
+                    if let Some(sender) = lock(&dispatcher_tx).take() {
+                        let _ = sender.send(dispatcher);
+                    }
+                    Ok::<LifecycleEffect, CordisError>(LifecycleEffect::future(
+                        std::future::pending::<Result<Option<LifecycleDisposer>, CordisError>>(),
+                    ))
+                }
+            });
+            let (handle, dispatcher) = driver_runtime.block_on(async {
+                let handle = registry
+                    .mount(factory.clone(), ConfigValue::default())
+                    .unwrap();
+                let dispatcher = dispatcher_rx.await.unwrap();
+                (handle, dispatcher)
+            });
+            assert_eq!(handle.snapshot().state(), FiberState::Loading);
+            assert_eq!(
+                registry
+                    .inner
+                    .events
+                    .listener_count(INVALIDATION_EVENT.name()),
+                0
+            );
+            assert_eq!(registry.inner.events.next_id(), 1);
+
+            drop(driver_runtime);
+            let recovery_runtime = tokio::runtime::Runtime::new().unwrap();
+            recovery_runtime
+                .block_on(async { registry.begin_delete_factory(&factory).unwrap().await })
+                .unwrap();
+
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                registry
+                    .inner
+                    .events
+                    .listener_count(INVALIDATION_EVENT.name()),
+                0
+            );
+            assert_eq!(registry.inner.events.next_id(), 1);
+            assert!(
+                !registry
+                    .inner
+                    .events
+                    .event_names()
+                    .contains(&INVALIDATION_EVENT.name().to_string())
+            );
+            assert!(matches!(
+                dispatcher.emit(INVALIDATION_EVENT, &()),
+                Err(CordisError::StaleLifecycleView { .. })
+            ));
+            assert_eq!(handle.snapshot().state(), FiberState::Disposed);
+        });
     }
 
     #[tokio::test]
