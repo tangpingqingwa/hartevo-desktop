@@ -2827,9 +2827,10 @@ impl Context {
 /// raw `&mut Context`.  `isolate` switches to a fresh namespace; a caller must
 /// explicitly opt into another namespace with `share_label`.
 ///
-/// This borrowed synchronous view owns the current typed-event integration.
-/// It is distinct from the repeatable registry's owned
-/// [`crate::LifecycleContextView`], whose event bridge is a later boundary.
+/// This borrowed synchronous view owns the full N2 typed-event integration.
+/// It remains distinct from the repeatable registry's owned
+/// [`crate::LifecycleContextView`], whose N2B bridge intentionally exposes
+/// lifecycle-owned typed Emit only.
 pub struct ContextView<'a> {
     context: &'a mut Context,
     fiber: Fiber,
