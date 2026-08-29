@@ -1382,6 +1382,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::RuntimeLocalApprovalUnavailable
         | DesktopDataError::RuntimeLocalApprovalMismatch
         | DesktopDataError::RuntimeDispatch(_)
+        | DesktopDataError::DomainCommandDispatch(_)
         | DesktopDataError::Cordis(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
     };
     NativeJourneyError::new(code)

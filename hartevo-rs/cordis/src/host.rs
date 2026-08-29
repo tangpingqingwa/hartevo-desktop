@@ -1,12 +1,14 @@
 //! Desktop-facing Cordis host. Mounts SurfaceMapping, AgentLoop, and
-//! InvariantGate, and issues typed Runtime permits. The symbolic AgentLoop is
-//! not Desktop Runtime authority; OpenInterpreter remains an optional adapter.
+//! InvariantGate, and issues typed Domain-command and Runtime permits. The
+//! symbolic AgentLoop is not Desktop Runtime authority; OpenInterpreter
+//! remains an optional adapter.
 
 use chrono::{DateTime, Utc};
 
 use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 use crate::authority::{
-    AuthorityScope, RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
+    AuthorityScope, DomainCommandBinding, DomainCommandLease, DomainCommandPermit,
+    RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
 };
 use crate::context::{Context, CordisError, TeardownTransaction, keys};
 use crate::invariants::{
@@ -35,8 +37,18 @@ pub const OPENINTERPRETER_PLUGIN_ID: &str = OPENINTERPRETER;
 pub struct CordisHost {
     ctx: Context,
     bound_scope: Option<AuthorityScope>,
+    active_domain_command: Option<ActiveDomainCommand>,
+    next_domain_command_serial: u64,
     active_runtime: Option<ActiveRuntimeDispatch>,
     next_runtime_serial: u64,
+}
+
+#[derive(Debug)]
+struct ActiveDomainCommand {
+    serial: u64,
+    scope: AuthorityScope,
+    command: DomainCommandBinding,
+    lease: std::sync::Arc<DomainCommandLease>,
 }
 
 #[derive(Debug)]
@@ -52,6 +64,11 @@ impl std::fmt::Debug for CordisHost {
         f.debug_struct("CordisHost")
             .field("ctx", &self.ctx)
             .field("bound_scope", &self.bound_scope)
+            .field("active_domain_command", &self.active_domain_command)
+            .field(
+                "next_domain_command_serial",
+                &self.next_domain_command_serial,
+            )
             .field("active_runtime", &self.active_runtime)
             .field("next_runtime_serial", &self.next_runtime_serial)
             .finish()
@@ -72,6 +89,8 @@ impl CordisHost {
         Ok(Self {
             ctx,
             bound_scope: None,
+            active_domain_command: None,
+            next_domain_command_serial: 0,
             active_runtime: None,
             next_runtime_serial: 0,
         })
@@ -108,6 +127,8 @@ impl CordisHost {
             Self {
                 ctx,
                 bound_scope: None,
+                active_domain_command: None,
+                next_domain_command_serial: 0,
                 active_runtime: None,
                 next_runtime_serial: 0,
             },
@@ -144,7 +165,11 @@ impl CordisHost {
         &mut self,
         scope: &AuthorityScope,
     ) -> Result<RuntimeDispatchPermit, CordisError> {
+        self.reap_abandoned_domain_command();
         self.reap_abandoned_runtime();
+        if self.active_domain_command.is_some() {
+            return Err(CordisError::DomainCommandDispatchBusy);
+        }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
         }
@@ -222,6 +247,72 @@ impl CordisHost {
         Ok(permit.complete())
     }
 
+    /// Issue a one-shot permit for one exact Application-owned Domain command.
+    ///
+    /// This admits scope only. Application/Domain Kernel still validate and
+    /// persist the command, while Effect Broker retains every external-write
+    /// capability.
+    pub fn authorize_domain_command(
+        &mut self,
+        scope: &AuthorityScope,
+        command: DomainCommandBinding,
+    ) -> Result<DomainCommandPermit, CordisError> {
+        self.reap_abandoned_domain_command();
+        self.reap_abandoned_runtime();
+        if self.active_runtime.is_some() {
+            return Err(CordisError::RuntimeDispatchBusy);
+        }
+        if self.active_domain_command.is_some() {
+            return Err(CordisError::DomainCommandDispatchBusy);
+        }
+        if scope.runtime().is_some() {
+            return Err(CordisError::DomainCommandRuntimeBound);
+        }
+        let Some(bound_scope) = self.bound_scope.as_ref() else {
+            return Err(CordisError::AuthorityScopeUnbound);
+        };
+        if bound_scope != scope {
+            return Err(CordisError::AuthorityScopeMismatch);
+        }
+        host_is_cordis_loop(self)?;
+        enforce_runtime_invariants(&self.ctx)?;
+
+        let serial = self
+            .next_domain_command_serial
+            .checked_add(1)
+            .ok_or(CordisError::DomainCommandSerialOverflow)?;
+        let (permit, lease) = DomainCommandPermit::issue(serial, scope.clone(), command.clone());
+        self.next_domain_command_serial = serial;
+        self.active_domain_command = Some(ActiveDomainCommand {
+            serial,
+            scope: scope.clone(),
+            command,
+            lease,
+        });
+        Ok(permit)
+    }
+
+    /// Settle one exact Domain command after Application returns.
+    pub fn finish_domain_command(
+        &mut self,
+        permit: DomainCommandPermit,
+    ) -> Result<(), CordisError> {
+        self.reap_abandoned_domain_command();
+        let Some(active) = self.active_domain_command.as_ref() else {
+            return Err(CordisError::DomainCommandPermitMismatch);
+        };
+        if active.serial != permit.serial()
+            || active.scope != *permit.scope()
+            || active.command != *permit.command()
+            || !permit.owns_lease(&active.lease)
+        {
+            return Err(CordisError::DomainCommandPermitMismatch);
+        }
+        self.active_domain_command = None;
+        permit.complete();
+        Ok(())
+    }
+
     /// External write path. Invariants must pass; OpenInterpreter cannot write.
     pub fn apply_effect(&self) -> Result<(), CordisError> {
         apply_effect(&self.ctx)
@@ -239,7 +330,11 @@ impl CordisHost {
         approval: Option<KernelApproval>,
         now: DateTime<Utc>,
     ) -> Result<(), CordisError> {
+        self.reap_abandoned_domain_command();
         self.reap_abandoned_runtime();
+        if self.active_domain_command.is_some() {
+            return Err(CordisError::DomainCommandDispatchBusy);
+        }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
         }
@@ -256,7 +351,11 @@ impl CordisHost {
         approval: Option<KernelApproval>,
         now: DateTime<Utc>,
     ) -> Result<(), CordisError> {
+        self.reap_abandoned_domain_command();
         self.reap_abandoned_runtime();
+        if self.active_domain_command.is_some() {
+            return Err(CordisError::DomainCommandDispatchBusy);
+        }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
         }
@@ -295,6 +394,14 @@ impl CordisHost {
     }
 
     #[must_use]
+    pub fn active_domain_command_scope(&self) -> Option<&AuthorityScope> {
+        self.active_domain_command
+            .as_ref()
+            .filter(|active| active.lease.is_active())
+            .map(|active| &active.scope)
+    }
+
+    #[must_use]
     pub fn runtime_plugin(&self) -> Option<&'static str> {
         self.ctx
             .runtime::<RuntimeSurface>()
@@ -318,6 +425,9 @@ impl CordisHost {
         let TeardownTransaction::Acquired(permit) = self.ctx.try_begin_teardown() else {
             return;
         };
+        if let Some(active) = self.active_domain_command.take() {
+            active.lease.release();
+        }
         if let Some(active) = self.active_runtime.take() {
             active.lease.release();
         }
@@ -354,6 +464,16 @@ impl CordisHost {
             .is_some_and(|active| !active.lease.is_active())
         {
             self.active_runtime = None;
+        }
+    }
+
+    fn reap_abandoned_domain_command(&mut self) {
+        if self
+            .active_domain_command
+            .as_ref()
+            .is_some_and(|active| !active.lease.is_active())
+        {
+            self.active_domain_command = None;
         }
     }
 }
