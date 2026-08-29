@@ -27,10 +27,10 @@ fn approved(valid_until: chrono::DateTime<Utc>) -> KernelApproval {
 #[test]
 fn confirmed_or_live_granted_record_sets_consent_true() {
     let from_state = DomainSurface::from_kernel(KernelConsentState::Confirmed, None, None, now());
-    assert!(from_state.consent);
-    assert!(!from_state.approved);
-    assert_eq!(from_state.owner, SurfaceOwner::Hartevo);
-    assert!(from_state.local_first && from_state.sqlcipher && from_state.eval_gate);
+    assert!(from_state.consent());
+    assert!(!from_state.approved());
+    assert_eq!(from_state.owner(), SurfaceOwner::Hartevo);
+    assert!(from_state.local_first() && from_state.sqlcipher() && from_state.eval_gate());
 
     let from_record = DomainSurface::from_kernel(
         KernelConsentState::NotRequired,
@@ -38,8 +38,8 @@ fn confirmed_or_live_granted_record_sets_consent_true() {
         None,
         now() + Duration::hours(1),
     );
-    assert!(from_record.consent);
-    assert!(!from_record.approved);
+    assert!(from_record.consent());
+    assert!(!from_record.approved());
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn missing_withdrawn_denied_expired_and_future_grant_stay_false() {
     ] {
         let domain = DomainSurface::from_kernel(state, record, None, now());
         assert!(
-            !domain.consent,
+            !domain.consent(),
             "consent must stay false for {state:?} / {record:?}"
         );
     }
@@ -110,7 +110,7 @@ fn approved_is_true_only_inside_valid_until() {
         Some(approved(now() + Duration::minutes(5))),
         now(),
     );
-    assert!(live.approved);
+    assert!(live.approved());
 
     let expired = DomainSurface::from_kernel(
         KernelConsentState::Confirmed,
@@ -118,7 +118,7 @@ fn approved_is_true_only_inside_valid_until() {
         Some(approved(now())),
         now(),
     );
-    assert!(!expired.approved);
+    assert!(!expired.approved());
 
     let rejected = DomainSurface::from_kernel(
         KernelConsentState::Confirmed,
@@ -129,19 +129,12 @@ fn approved_is_true_only_inside_valid_until() {
         }),
         now(),
     );
-    assert!(!rejected.approved);
+    assert!(!rejected.approved());
 }
 
 #[test]
 fn bind_preserves_mounted_owner_and_gates() {
-    let mounted = DomainSurface {
-        owner: SurfaceOwner::Hartevo,
-        consent: false,
-        approved: false,
-        local_first: true,
-        sqlcipher: true,
-        eval_gate: true,
-    };
+    let mounted = DomainSurface::default();
     let bound = bind_domain_kernel_facts(
         mounted,
         KernelConsentState::Confirmed,
@@ -149,10 +142,10 @@ fn bind_preserves_mounted_owner_and_gates() {
         Some(approved(now() + Duration::minutes(5))),
         now(),
     );
-    assert!(bound.consent);
-    assert!(bound.approved);
-    assert_eq!(bound.owner, mounted.owner);
-    assert_eq!(bound.local_first, mounted.local_first);
-    assert_eq!(bound.sqlcipher, mounted.sqlcipher);
-    assert_eq!(bound.eval_gate, mounted.eval_gate);
+    assert!(bound.consent());
+    assert!(bound.approved());
+    assert_eq!(bound.owner(), mounted.owner());
+    assert_eq!(bound.local_first(), mounted.local_first());
+    assert_eq!(bound.sqlcipher(), mounted.sqlcipher());
+    assert_eq!(bound.eval_gate(), mounted.eval_gate());
 }

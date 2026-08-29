@@ -38,6 +38,25 @@ impl Service for InvariantGate {
 /// Fail closed if the host is missing Hartevo-owned surfaces or tries to
 /// bypass Domain Kernel invariants.
 pub fn enforce_invariants(ctx: &Context) -> Result<(), CordisError> {
+    enforce_runtime_invariants(ctx)?;
+    let Some(domain) = ctx.domain::<DomainSurface>() else {
+        return Err(missing_dep(keys::DOMAIN));
+    };
+    if !domain.consent {
+        return Err(missing_dep(missing::CONSENT));
+    }
+    if !domain.approved {
+        return Err(missing_dep(missing::APPROVAL));
+    }
+    Ok(())
+}
+
+/// Invariants for read/plan/runtime composition.
+///
+/// Runtime output is only a draft/evidence input. Consent and approval remain
+/// mandatory for [`apply_effect`], but are not invented as prerequisites for a
+/// read/plan operation that has no external effect scope.
+pub fn enforce_runtime_invariants(ctx: &Context) -> Result<(), CordisError> {
     let Some(domain) = ctx.domain::<DomainSurface>() else {
         return Err(missing_dep(keys::DOMAIN));
     };
@@ -54,12 +73,6 @@ pub fn enforce_invariants(ctx: &Context) -> Result<(), CordisError> {
 
     if broker.receipt_is_verification {
         return Err(missing_dep(missing::VERIFICATION));
-    }
-    if !domain.consent {
-        return Err(missing_dep(missing::CONSENT));
-    }
-    if !domain.approved {
-        return Err(missing_dep(missing::APPROVAL));
     }
     if !domain.local_first {
         return Err(missing_dep(missing::LOCAL_FIRST));

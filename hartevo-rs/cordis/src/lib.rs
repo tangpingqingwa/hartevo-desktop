@@ -4,6 +4,7 @@
 //! the desktop host that mounts those three services.
 
 mod agent;
+mod authority;
 mod config;
 mod context;
 mod effect;
@@ -16,16 +17,20 @@ mod service;
 mod surface;
 
 pub use agent::{AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, run_agent_step};
+pub use authority::{
+    AuthorityDispatchError, AuthorityScope, RuntimeAuthority, RuntimeBinding,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
+};
 pub use config::{ConfigValue, InterpolateError};
 pub use context::{Context, CordisError, keys};
 pub use effect::Disposer;
 pub use event::{DispatchMode, WaterfallNext};
 pub use host::{
-    CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, desktop_surfaces, host_is_cordis_loop,
-    host_plugin_ids,
+    CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, host_is_cordis_loop, host_plugin_ids,
 };
 pub use invariants::{
-    InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, missing as invariant_missing,
+    InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, enforce_runtime_invariants,
+    missing as invariant_missing,
 };
 pub use kernel::{
     KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
@@ -37,8 +42,8 @@ pub use loader::{
 };
 pub use service::Service;
 pub use surface::{
-    AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
-    LlmStream, LlmSurface, MAPPED_KEYS, RuntimeSurface, SurfaceMapping, SurfaceOwner, ToolCall,
-    ToolsSurface, events, expected_mode, map_surfaces, register_agent, register_llm_stream,
-    register_tool, run_tools_pipeline, stream_llm,
+    AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmStream,
+    LlmSurface, MAPPED_KEYS, RuntimeSurface, SurfaceOwner, ToolCall, ToolsSurface, events,
+    expected_mode, register_agent, register_llm_stream, register_tool, run_tools_pipeline,
+    stream_llm,
 };

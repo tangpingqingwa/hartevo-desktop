@@ -10,7 +10,7 @@ struct ProvideTools;
 
 impl Service for ProvideTools {
     fn apply(self, ctx: &mut Context) {
-        ctx.provide(keys::TOOLS, Marker("tools"));
+        ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
     }
 }
 

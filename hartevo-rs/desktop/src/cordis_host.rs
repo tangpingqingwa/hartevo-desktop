@@ -1,14 +1,17 @@
-//! One-call-site Cordis mount for the desktop shell.
+//! One-call-site Cordis mount and typed Runtime adapter for the desktop shell.
 //!
-//! The live loop is [`hartevo_cordis::CordisHost::step`] → `run_agent_step`
-//! after `enforce_invariants`. OpenInterpreter may occupy
-//! `RuntimeSurface.plugin`; it is never the loop and never owns Domain or
-//! Effect. Consent/approval are bound from Domain Kernel facts after boot.
+//! Production Runtime enters through [`dispatch_live_runtime`]: Cordis issues
+//! a short-lived scoped permit, Desktop releases the host lock, and the real
+//! Application coordinator runs exactly once. OpenInterpreter may occupy the
+//! optional plugin slot; it never owns Domain, Effect, or execution authority.
+
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use hartevo_cordis::{
-    CordisError, CordisHost, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
-    KernelConsentState, KernelConsentStatus, desktop_surfaces, host_is_cordis_loop,
+    AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, KernelApproval,
+    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
+    RuntimeAuthority, RuntimeDispatchPermit, host_is_cordis_loop,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -29,9 +32,11 @@ fn openinterpreter_runtime_plugin(runtime: &DesktopRuntimeProjection) -> bool {
 /// Boot SurfaceMapping + AgentLoop + InvariantGate for this desktop process.
 ///
 /// Production mount is fail-closed: consent/approval stay false until
-/// [`bind_live_domain_kernel`] reads live Domain Kernel facts.
-pub fn mount_cordis_host(runtime: &DesktopRuntimeProjection) -> Result<CordisHost, CordisError> {
-    let host = CordisHost::boot(desktop_surfaces(openinterpreter_runtime_plugin(runtime)))?;
+/// the exact scoped runtime adapter reads live Domain Kernel facts.
+pub(crate) fn mount_cordis_host(
+    runtime: &DesktopRuntimeProjection,
+) -> Result<CordisHost, CordisError> {
+    let host = CordisHost::boot(openinterpreter_runtime_plugin(runtime))?;
     host_is_cordis_loop(&host)?;
     Ok(host)
 }
@@ -75,10 +80,9 @@ fn kernel_approval(approval: &Approval) -> KernelApproval {
     }
 }
 
-/// Bind live Domain Kernel consent/approval onto the mounted DomainSurface.
-///
-/// Production desktop reads kernel types here; it never hardcodes `true`.
-pub fn bind_live_domain_kernel(
+/// Test-only unscoped Domain Kernel fact binding.
+#[cfg(test)]
+pub(crate) fn bind_live_domain_kernel(
     host: &mut CordisHost,
     consent: &ConsentState,
     record: Option<&ConsentRecord>,
@@ -93,12 +97,106 @@ pub fn bind_live_domain_kernel(
     )
 }
 
+/// Bind live Domain facts to one exact Project/Mission scope.
+///
+/// Production Runtime dispatch uses this path; a fact from another Mission can
+/// never authorize the scoped Cordis adapter call.
+pub(crate) fn bind_live_domain_kernel_scope(
+    host: &mut CordisHost,
+    scope: AuthorityScope,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+) -> Result<(), CordisError> {
+    host.bind_domain_kernel_scope(
+        scope,
+        kernel_consent_state(consent),
+        record.map(kernel_consent_record),
+        approval.map(kernel_approval),
+        now,
+    )
+}
+
+/// Private Desktop adapter for the one Cordis-authorized Application call.
+///
+/// Keeping the closure inside this type makes the production composition seam
+/// explicit without making generic Cordis depend on ApplicationService.
+pub(crate) struct DesktopRuntimeAuthority<Execute> {
+    execute: Execute,
+}
+
+impl<Execute> DesktopRuntimeAuthority<Execute> {
+    pub(crate) fn new(execute: Execute) -> Self {
+        Self { execute }
+    }
+}
+
+impl<Execute, Output, AdapterError> RuntimeAuthority for DesktopRuntimeAuthority<Execute>
+where
+    Execute: FnOnce(&RuntimeDispatchPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn execute(self, permit: &RuntimeDispatchPermit) -> Result<Self::Output, Self::Error> {
+        (self.execute)(permit)
+    }
+}
+
+/// Bind exact live facts, obtain an unforgeable Cordis permit, release the
+/// host lock, execute the real Desktop/Application adapter exactly once, and
+/// settle the lifecycle under a second short lock.
+pub(crate) fn dispatch_live_runtime<Execute, Output, AdapterError>(
+    cordis: &Arc<Mutex<CordisHost>>,
+    scope: AuthorityScope,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+    execute: Execute,
+) -> Result<Output, AuthorityDispatchError<AdapterError>>
+where
+    Execute: FnOnce(&RuntimeDispatchPermit) -> Result<Output, AdapterError>,
+{
+    let mut permit = {
+        let mut host = cordis
+            .lock()
+            .map_err(|_| CordisError::RuntimeCoordinatorPoisoned)?;
+        bind_live_domain_kernel_scope(&mut host, scope, consent, record, approval, now)?;
+        let bound_scope = host
+            .bound_scope()
+            .cloned()
+            .ok_or(CordisError::AuthorityScopeUnbound)?;
+        host.authorize_runtime(&bound_scope)?
+    };
+    permit.announce_started();
+
+    let authority_result = DesktopRuntimeAuthority::new(execute).execute(&permit);
+
+    let completion = cordis
+        .lock()
+        .map_err(|_| CordisError::RuntimeCoordinatorPoisoned)?
+        .finish_runtime(permit)?;
+    completion.announce();
+    authority_result.map_err(AuthorityDispatchError::Authority)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
     use chrono::{Duration, TimeZone, Utc};
     use hartevo_cordis::{
-        AgentStep, CordisError, DomainSurface, OPENINTERPRETER, SurfaceOwner, desktop_surfaces,
-        enforce_invariants, host_is_cordis_loop, invariant_missing, keys,
+        AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
+        DomainSurface, OPENINTERPRETER, RuntimeBinding, SurfaceOwner, enforce_invariants,
+        host_is_cordis_loop, invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -107,7 +205,10 @@ mod tests {
     };
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
 
-    use super::{bind_live_domain_kernel, mount_cordis_host, openinterpreter_runtime_plugin};
+    use super::{
+        bind_live_domain_kernel, dispatch_live_runtime, mount_cordis_host,
+        openinterpreter_runtime_plugin,
+    };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
     fn projection(status: DesktopRuntimeAvailabilityStatus) -> DesktopRuntimeProjection {
@@ -121,6 +222,270 @@ mod tests {
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         }
+    }
+
+    #[test]
+    fn desktop_runtime_adapter_releases_host_lock_and_calls_authority_once() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let scope = AuthorityScope::new("tenant-a", "project-a", "mission-a", 4)
+            .unwrap()
+            .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap());
+        let probe = Arc::clone(&host);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let expected_scope = scope.clone();
+        let nested_calls = Arc::new(AtomicUsize::new(0));
+        let observed_nested_calls = Arc::clone(&nested_calls);
+
+        let output = dispatch_live_runtime(
+            &host,
+            scope,
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                assert_eq!(permit.scope(), &expected_scope);
+                assert!(
+                    probe.try_lock().is_ok(),
+                    "Application adapter must run without the Cordis host lock"
+                );
+                let nested_scope = permit.scope().clone();
+                let nested = dispatch_live_runtime(
+                    &probe,
+                    nested_scope,
+                    &ConsentState::NotRequired,
+                    None,
+                    None,
+                    now(),
+                    move |_| {
+                        observed_nested_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, &'static str>(())
+                    },
+                );
+                assert_eq!(
+                    nested.unwrap_err(),
+                    AuthorityDispatchError::Cordis(CordisError::RuntimeDispatchBusy)
+                );
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, &'static str>("application-runtime")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, "application-runtime");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(nested_calls.load(Ordering::SeqCst), 0);
+        let host = host.lock().unwrap();
+        assert!(host.active_runtime_scope().is_none());
+        assert!(
+            host.context()
+                .agents::<AgentsSurface>()
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn concurrent_same_scope_dispatch_runs_exactly_one_authority() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let scope = AuthorityScope::new("tenant-a", "project-a", "mission-a", 4)
+            .unwrap()
+            .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_host = Arc::clone(&host);
+        let first_scope = scope.clone();
+        let first_calls = Arc::clone(&calls);
+        let first = thread::spawn(move || {
+            dispatch_live_runtime(
+                &first_host,
+                first_scope,
+                &ConsentState::NotRequired,
+                None,
+                None,
+                now(),
+                move |_| {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, &'static str>("first")
+                },
+            )
+        });
+        entered_rx
+            .recv_timeout(StdDuration::from_secs(2))
+            .expect("first authority entered");
+
+        let second_calls = Arc::clone(&calls);
+        let second = dispatch_live_runtime(
+            &host,
+            scope,
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |_| {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, &'static str>("second")
+            },
+        );
+        assert_eq!(
+            second.unwrap_err(),
+            AuthorityDispatchError::Cordis(CordisError::RuntimeDispatchBusy)
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), "first");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lifecycle_observers_reenter_only_after_host_unlock() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let scope = AuthorityScope::new("tenant-a", "project-a", "mission-a", 4)
+            .unwrap()
+            .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap());
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        {
+            let started_host = Arc::clone(&host);
+            let started_scope = scope.clone();
+            let started_count = Arc::clone(&started);
+            let finished_host = Arc::clone(&host);
+            let finished_count = Arc::clone(&finished);
+            let mut locked = host.lock().unwrap();
+            locked
+                .on_runtime_started(move |_| {
+                    let nested = dispatch_live_runtime(
+                        &started_host,
+                        started_scope.clone(),
+                        &ConsentState::NotRequired,
+                        None,
+                        None,
+                        now(),
+                        |_| Ok::<_, &'static str>(()),
+                    );
+                    assert_eq!(
+                        nested.unwrap_err(),
+                        AuthorityDispatchError::Cordis(CordisError::RuntimeDispatchBusy)
+                    );
+                    started_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            locked
+                .on_runtime_finished(move |_| {
+                    assert!(
+                        finished_host.try_lock().is_ok(),
+                        "finished observer must run after host unlock"
+                    );
+                    finished_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+        }
+
+        dispatch_live_runtime(
+            &host,
+            scope,
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            |_| Ok::<_, &'static str>(()),
+        )
+        .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poisoned_host_fails_closed_without_calling_authority() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let poison = Arc::clone(&host);
+        let _ = thread::spawn(move || {
+            let _locked = poison.lock().unwrap();
+            panic!("poison Cordis coordinator for fail-closed test");
+        })
+        .join();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let scope = AuthorityScope::new("tenant-a", "project-a", "mission-a", 4)
+            .unwrap()
+            .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap());
+        let result = dispatch_live_runtime(
+            &host,
+            scope,
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |_| {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, &'static str>(())
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            AuthorityDispatchError::Cordis(CordisError::RuntimeCoordinatorPoisoned)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn authority_panic_drops_permit_and_next_dispatch_can_recover() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let scope = AuthorityScope::new("tenant-a", "project-a", "mission-a", 4)
+            .unwrap()
+            .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap());
+        let panic_host = Arc::clone(&host);
+        let panic_scope = scope.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = dispatch_live_runtime(
+                &panic_host,
+                panic_scope,
+                &ConsentState::NotRequired,
+                None,
+                None,
+                now(),
+                |_| -> Result<(), &'static str> { panic!("authority panic") },
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            host.lock()
+                .unwrap()
+                .context()
+                .agents::<AgentsSurface>()
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+        dispatch_live_runtime(
+            &host,
+            scope,
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            |_| Ok::<_, &'static str>(()),
+        )
+        .unwrap();
     }
 
     fn now() -> chrono::DateTime<Utc> {
@@ -160,14 +525,21 @@ mod tests {
     #[test]
     fn production_desktop_surfaces_do_not_pre_grant_consent_or_approval() {
         for openinterpreter in [false, true] {
-            let surfaces = desktop_surfaces(openinterpreter);
-            assert!(!surfaces.domain.consent);
-            assert!(!surfaces.domain.approved);
-            assert_eq!(surfaces.domain.owner, SurfaceOwner::Hartevo);
-            assert!(surfaces.domain.local_first);
-            assert!(surfaces.domain.sqlcipher);
-            assert!(surfaces.domain.eval_gate);
-            assert!(!surfaces.effect_broker.receipt_is_verification);
+            let host = CordisHost::boot(openinterpreter).unwrap();
+            let domain = host.context().domain::<DomainSurface>().unwrap();
+            assert!(!domain.consent());
+            assert!(!domain.approved());
+            assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+            assert!(domain.local_first());
+            assert!(domain.sqlcipher());
+            assert!(domain.eval_gate());
+            assert!(
+                !host
+                    .context()
+                    .effect_broker::<hartevo_cordis::EffectBrokerSurface>()
+                    .unwrap()
+                    .receipt_is_verification()
+            );
         }
     }
 
@@ -181,9 +553,9 @@ mod tests {
         host_is_cordis_loop(&host).unwrap();
         assert_eq!(host.runtime_plugin(), None);
         let domain = host.context().domain::<DomainSurface>().unwrap();
-        assert_eq!(domain.owner, SurfaceOwner::Hartevo);
-        assert!(!domain.consent);
-        assert!(!domain.approved);
+        assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+        assert!(!domain.consent());
+        assert!(!domain.approved());
         assert!(host.context().get::<String>(OPENINTERPRETER).is_none());
     }
 
@@ -202,7 +574,7 @@ mod tests {
             host.context()
                 .runtime::<hartevo_cordis::RuntimeSurface>()
                 .unwrap()
-                .owner,
+                .owner(),
             SurfaceOwner::Hartevo
         );
         assert_eq!(

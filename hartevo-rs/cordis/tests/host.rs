@@ -1,10 +1,11 @@
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentStep, CordisError, CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay,
-    HOST_PLUGIN_IDS, HartevoSurfaces, InvariantGate, KernelApproval, KernelApprovalDecision,
-    KernelConsentRecord, KernelConsentState, KernelConsentStatus, LoaderContext, OPENINTERPRETER,
-    OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeSurface, SurfaceOwner, ToolCall, desktop_surfaces,
-    enforce_invariants, host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
+    AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost, DomainSurface,
+    EffectBrokerSurface, EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate, KernelApproval,
+    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
+    LoaderContext, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding,
+    RuntimeSurface, SurfaceOwner, ToolCall, enforce_invariants, host_is_cordis_loop,
+    host_plugin_ids, invariant_missing, keys,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -37,18 +38,184 @@ fn bind_confirmed_approved(host: &mut CordisHost) {
     .unwrap();
 }
 
+fn runtime_scope(
+    project: &str,
+    mission: &str,
+    mission_revision: u64,
+    generation: u64,
+    digest_byte: char,
+) -> AuthorityScope {
+    AuthorityScope::new("tenant-a", project, mission, mission_revision)
+        .unwrap()
+        .with_runtime(
+            RuntimeBinding::new(generation, None, None, digest_byte.to_string().repeat(64))
+                .unwrap(),
+        )
+}
+
+#[test]
+fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    assert_eq!(
+        host.authorize_runtime(&scope).unwrap_err(),
+        CordisError::AuthorityScopeUnbound
+    );
+
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::Missing,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let other = runtime_scope("project-a", "mission-b", 3, 2, 'a');
+    assert_eq!(
+        host.authorize_runtime(&other).unwrap_err(),
+        CordisError::AuthorityScopeMismatch
+    );
+
+    let permit = host.authorize_runtime(&scope).unwrap();
+    assert_eq!(permit.scope(), &scope);
+    assert_eq!(host.active_runtime_scope(), Some(&scope));
+    assert_eq!(
+        host.authorize_runtime(&scope).unwrap_err(),
+        CordisError::RuntimeDispatchBusy
+    );
+    assert_eq!(
+        host.bind_domain_kernel_scope(
+            scope.clone(),
+            KernelConsentState::Missing,
+            None,
+            None,
+            now(),
+        )
+        .unwrap_err(),
+        CordisError::RuntimeDispatchBusy
+    );
+    assert_eq!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .len(),
+        1
+    );
+    host.finish_runtime(permit).unwrap();
+    assert_eq!(host.bound_scope(), Some(&scope));
+    assert_eq!(host.active_runtime_scope(), None);
+    assert!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .is_empty(),
+        "the scoped runtime agent must be disposed after the adapter returns"
+    );
+}
+
+#[test]
+fn runtime_dispatch_rejects_missing_and_stale_durable_bindings() {
+    let mut host = CordisHost::boot(true).unwrap();
+    let base = AuthorityScope::new("tenant-a", "project-a", "mission-a", 3).unwrap();
+    host.bind_domain_kernel_scope(
+        base.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        host.authorize_runtime(&base).unwrap_err(),
+        CordisError::RuntimeAuthorityUnbound
+    );
+    let bound = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        bound.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    for stale in [
+        runtime_scope("project-a", "mission-a", 2, 2, 'a'),
+        runtime_scope("project-a", "mission-a", 3, 1, 'a'),
+        runtime_scope("project-a", "mission-a", 3, 2, 'b'),
+    ] {
+        assert_eq!(
+            host.authorize_runtime(&stale).unwrap_err(),
+            CordisError::AuthorityScopeMismatch
+        );
+    }
+    let permit = host.authorize_runtime(&bound).unwrap();
+    host.finish_runtime(permit).unwrap();
+    assert!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .is_empty()
+    );
+    assert_eq!(host.runtime_plugin(), Some(OPENINTERPRETER));
+}
+
+#[test]
+fn abandoned_runtime_permit_releases_agent_and_active_slot() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let permit = host.authorize_runtime(&scope).unwrap();
+    assert_eq!(host.active_runtime_scope(), Some(&scope));
+    drop(permit);
+    assert_eq!(host.active_runtime_scope(), None);
+    assert!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .is_empty()
+    );
+
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let permit = host.authorize_runtime(&scope).unwrap();
+    host.finish_runtime(permit).unwrap();
+}
+
 #[test]
 fn production_desktop_surfaces_do_not_pre_grant_consent_or_approval() {
     for openinterpreter in [false, true] {
-        let surfaces = desktop_surfaces(openinterpreter);
-        assert!(!surfaces.domain.consent);
-        assert!(!surfaces.domain.approved);
-        assert_eq!(surfaces.domain, DomainSurface::default());
-        assert!(!surfaces.effect_broker.receipt_is_verification);
-        assert_eq!(surfaces.domain.owner, SurfaceOwner::Hartevo);
-        assert_eq!(surfaces.effect_broker.owner, SurfaceOwner::Hartevo);
+        let host = CordisHost::boot(openinterpreter).unwrap();
+        let domain = host.context().domain::<DomainSurface>().unwrap();
+        let broker = host
+            .context()
+            .effect_broker::<EffectBrokerSurface>()
+            .unwrap();
+        assert!(!domain.consent());
+        assert!(!domain.approved());
+        assert_eq!(domain.as_ref(), &DomainSurface::default());
+        assert!(!broker.receipt_is_verification());
+        assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+        assert_eq!(broker.owner(), SurfaceOwner::Hartevo);
         assert_eq!(
-            surfaces.runtime.plugin,
+            host.runtime_plugin(),
             openinterpreter.then_some(OPENINTERPRETER)
         );
     }
@@ -56,7 +223,7 @@ fn production_desktop_surfaces_do_not_pre_grant_consent_or_approval() {
 
 #[test]
 fn boot_mounts_surfaces_loop_and_gate() {
-    let mut host = CordisHost::boot(desktop_surfaces(false)).unwrap();
+    let mut host = CordisHost::boot(false).unwrap();
     host_is_cordis_loop(&host).unwrap();
     assert_eq!(
         enforce_invariants(host.context()).unwrap_err(),
@@ -72,17 +239,17 @@ fn boot_mounts_surfaces_loop_and_gate() {
     }
     assert_eq!(host.runtime_plugin(), None);
     let domain = host.context().domain::<DomainSurface>().unwrap();
-    assert_eq!(domain.owner, SurfaceOwner::Hartevo);
-    assert!(!domain.consent);
-    assert!(!domain.approved);
-    assert!(domain.local_first);
-    assert!(domain.sqlcipher);
-    assert!(domain.eval_gate);
+    assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+    assert!(!domain.consent());
+    assert!(!domain.approved());
+    assert!(domain.local_first());
+    assert!(domain.sqlcipher());
+    assert!(domain.eval_gate());
     assert_eq!(
         host.context()
             .effect_broker::<EffectBrokerSurface>()
             .unwrap()
-            .owner,
+            .owner(),
         SurfaceOwner::Hartevo
     );
     assert!(
@@ -90,7 +257,7 @@ fn boot_mounts_surfaces_loop_and_gate() {
             .context()
             .effect_broker::<EffectBrokerSurface>()
             .unwrap()
-            .receipt_is_verification
+            .receipt_is_verification()
     );
     assert!(host.context().get::<String>(OPENINTERPRETER).is_none());
 
@@ -102,15 +269,15 @@ fn boot_mounts_surfaces_loop_and_gate() {
 
 #[test]
 fn boot_keeps_openinterpreter_as_optional_runtime_plugin() {
-    let mut host = CordisHost::boot(desktop_surfaces(true)).unwrap();
+    let mut host = CordisHost::boot(true).unwrap();
     host_is_cordis_loop(&host).unwrap();
     assert_eq!(host.runtime_plugin(), Some(OPENINTERPRETER));
     assert_eq!(
-        host.context().runtime::<RuntimeSurface>().unwrap().owner,
+        host.context().runtime::<RuntimeSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        host.context().domain::<DomainSurface>().unwrap().owner,
+        host.context().domain::<DomainSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
@@ -125,7 +292,7 @@ fn boot_keeps_openinterpreter_as_optional_runtime_plugin() {
 
 #[test]
 fn step_fails_closed_without_consent_or_approval() {
-    let mut host = CordisHost::boot(HartevoSurfaces::default()).unwrap();
+    let mut host = CordisHost::boot(false).unwrap();
     assert_eq!(
         host.step(AgentStep::new("mission-1", "grow")).unwrap_err(),
         CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
@@ -136,15 +303,9 @@ fn step_fails_closed_without_consent_or_approval() {
     );
 
     host.teardown();
-    let mut host = CordisHost::boot(HartevoSurfaces {
-        domain: DomainSurface {
-            consent: true,
-            approved: false,
-            ..DomainSurface::default()
-        },
-        ..HartevoSurfaces::default()
-    })
-    .unwrap();
+    let mut host = CordisHost::boot(false).unwrap();
+    host.bind_domain_kernel(KernelConsentState::Confirmed, None, None, now())
+        .unwrap();
     assert_eq!(
         host.step(AgentStep::new("mission-1", "grow")).unwrap_err(),
         CordisError::MissingDependencies(vec![invariant_missing::APPROVAL.to_string()])
@@ -153,35 +314,24 @@ fn step_fails_closed_without_consent_or_approval() {
 
 #[test]
 fn receipt_is_not_verification_on_host_effect() {
-    let host = CordisHost::boot(HartevoSurfaces {
-        domain: DomainSurface {
-            consent: true,
-            approved: true,
-            ..DomainSurface::default()
-        },
-        effect_broker: EffectBrokerSurface {
-            receipt_is_verification: true,
-            ..EffectBrokerSurface::default()
-        },
-        ..HartevoSurfaces::default()
-    })
-    .unwrap();
-    assert_eq!(
-        host.apply_effect().unwrap_err(),
-        CordisError::MissingDependencies(vec![invariant_missing::VERIFICATION.to_string()])
+    let mut host = CordisHost::boot(false).unwrap();
+    assert!(
+        !host
+            .context()
+            .effect_broker::<EffectBrokerSurface>()
+            .unwrap()
+            .receipt_is_verification()
     );
-    assert_eq!(
-        host_is_cordis_loop(&host).unwrap_err(),
-        CordisError::MissingDependencies(vec![invariant_missing::VERIFICATION.to_string()])
-    );
+    bind_confirmed_approved(&mut host);
+    host_is_cordis_loop(&host).unwrap();
+    host.apply_effect().unwrap();
 }
 
 #[test]
 fn overlay_boot_starts_three_host_plugins_and_can_disable_openinterpreter() {
     let overlay = EnvironmentOverlay::new("macos-r0");
     let loader = LoaderContext::new();
-    let (mut host, report) =
-        CordisHost::boot_overlay(&overlay, &loader, &desktop_surfaces(false), false).unwrap();
+    let (mut host, report) = CordisHost::boot_overlay(&overlay, &loader, false).unwrap();
 
     assert_eq!(report.started, host_plugin_ids());
     assert_eq!(report.disabled, [PluginId::new(OPENINTERPRETER_PLUGIN_ID)]);
@@ -208,8 +358,7 @@ fn overlay_boot_starts_three_host_plugins_and_can_disable_openinterpreter() {
 fn overlay_boot_may_start_openinterpreter_adapter_without_owning_domain() {
     let overlay = EnvironmentOverlay::new("macos-r0");
     let loader = LoaderContext::new();
-    let (mut host, report) =
-        CordisHost::boot_overlay(&overlay, &loader, &desktop_surfaces(true), true).unwrap();
+    let (mut host, report) = CordisHost::boot_overlay(&overlay, &loader, true).unwrap();
 
     assert_eq!(
         report.started,
@@ -226,7 +375,7 @@ fn overlay_boot_may_start_openinterpreter_adapter_without_owning_domain() {
         Some(&"adapter")
     );
     assert_eq!(
-        host.context().domain::<DomainSurface>().unwrap().owner,
+        host.context().domain::<DomainSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     host_is_cordis_loop(&host).unwrap();
@@ -259,76 +408,29 @@ fn boot_without_surfaces_cannot_mount_gate() {
 
 #[test]
 fn boot_time_host_check_requires_local_first_sqlcipher_eval_and_hartevo_ownership() {
-    for (domain, missing) in [
-        (
-            DomainSurface {
-                local_first: false,
-                ..DomainSurface::default()
-            },
-            invariant_missing::LOCAL_FIRST,
-        ),
-        (
-            DomainSurface {
-                sqlcipher: false,
-                ..DomainSurface::default()
-            },
-            invariant_missing::SQLCIPHER,
-        ),
-        (
-            DomainSurface {
-                eval_gate: false,
-                ..DomainSurface::default()
-            },
-            invariant_missing::EVAL,
-        ),
-    ] {
-        let host = CordisHost::boot(HartevoSurfaces {
-            domain,
-            ..HartevoSurfaces::default()
-        })
-        .unwrap();
+    for openinterpreter in [false, true] {
+        let host = CordisHost::boot(openinterpreter).unwrap();
+        host_is_cordis_loop(&host).unwrap();
+        let domain = host.context().domain::<DomainSurface>().unwrap();
+        assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+        assert!(domain.local_first() && domain.sqlcipher() && domain.eval_gate());
         assert_eq!(
-            host_is_cordis_loop(&host).unwrap_err(),
-            CordisError::MissingDependencies(vec![missing.to_string()])
+            host.context()
+                .effect_broker::<EffectBrokerSurface>()
+                .unwrap()
+                .owner(),
+            SurfaceOwner::Hartevo
+        );
+        assert_eq!(
+            host.runtime_plugin(),
+            openinterpreter.then_some(OPENINTERPRETER)
         );
     }
-
-    let host = CordisHost::boot(HartevoSurfaces {
-        domain: DomainSurface {
-            owner: SurfaceOwner::Hartevo,
-            consent: false,
-            approved: false,
-            ..DomainSurface::default()
-        },
-        effect_broker: EffectBrokerSurface {
-            owner: SurfaceOwner::Hartevo,
-            receipt_is_verification: false,
-        },
-        runtime: RuntimeSurface {
-            owner: SurfaceOwner::Hartevo,
-            plugin: Some(OPENINTERPRETER),
-        },
-        ..HartevoSurfaces::default()
-    })
-    .unwrap();
-    host_is_cordis_loop(&host).unwrap();
-    assert_eq!(host.runtime_plugin(), Some(OPENINTERPRETER));
-    assert_eq!(
-        host.context().domain::<DomainSurface>().unwrap().owner,
-        SurfaceOwner::Hartevo
-    );
-    assert_eq!(
-        host.context()
-            .effect_broker::<EffectBrokerSurface>()
-            .unwrap()
-            .owner,
-        SurfaceOwner::Hartevo
-    );
 }
 
 #[test]
 fn kernel_facts_fail_closed_without_live_consent() {
-    let mut host = CordisHost::boot(desktop_surfaces(false)).unwrap();
+    let mut host = CordisHost::boot(false).unwrap();
     host_is_cordis_loop(&host).unwrap();
 
     host.bind_domain_kernel(KernelConsentState::Confirmed, None, None, now())
@@ -382,7 +484,7 @@ fn kernel_facts_fail_closed_without_live_consent() {
 
 #[test]
 fn kernel_facts_bind_live_consent_and_in_window_approval() {
-    let mut host = CordisHost::boot(desktop_surfaces(false)).unwrap();
+    let mut host = CordisHost::boot(false).unwrap();
     host_is_cordis_loop(&host).unwrap();
 
     host.bind_domain_kernel(
@@ -433,15 +535,15 @@ fn kernel_facts_bind_live_consent_and_in_window_approval() {
     host.step(AgentStep::new("mission-confirmed", "grow"))
         .unwrap();
     let domain = host.context().domain::<DomainSurface>().unwrap();
-    assert!(domain.consent);
-    assert!(domain.approved);
-    assert_eq!(domain.owner, SurfaceOwner::Hartevo);
-    assert!(domain.local_first && domain.sqlcipher && domain.eval_gate);
+    assert!(domain.consent());
+    assert!(domain.approved());
+    assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+    assert!(domain.local_first() && domain.sqlcipher() && domain.eval_gate());
 }
 
 #[test]
 fn teardown_reverses_host_mounts() {
-    let mut host = CordisHost::boot(desktop_surfaces(true)).unwrap();
+    let mut host = CordisHost::boot(true).unwrap();
     bind_confirmed_approved(&mut host);
     host.step(AgentStep::new("mission-1", "grow")).unwrap();
     host.teardown();

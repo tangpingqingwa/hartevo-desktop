@@ -61,6 +61,41 @@ pub(crate) type SerialFn = Arc<
         + Sync,
 >;
 
+/// Owned emit snapshot that can be dispatched after a caller releases its
+/// coordination lock. Listener registration changes after preparation do not
+/// affect this one notification.
+pub(crate) struct PreparedEmit {
+    payload: Arc<dyn Any + Send + Sync>,
+    listeners: Vec<EmitFn>,
+}
+
+impl PreparedEmit {
+    pub(crate) fn new<T>(payload: T, listeners: Vec<EmitFn>) -> Self
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        Self {
+            payload: Arc::new(payload),
+            listeners,
+        }
+    }
+
+    pub(crate) fn dispatch(self) {
+        for listener in self.listeners {
+            listener(self.payload.as_ref());
+        }
+    }
+}
+
+impl fmt::Debug for PreparedEmit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedEmit")
+            .field("listener_count", &self.listeners.len())
+            .finish_non_exhaustive()
+    }
+}
+
 enum Callback {
     Emit(EmitFn),
     Waterfall(WaterfallFn),
@@ -224,6 +259,25 @@ impl EventBus {
             listener(payload);
         }
         Ok(())
+    }
+
+    /// Snapshot emit listeners without invoking user code. The caller can
+    /// release any outer coordination lock before dispatching the snapshot.
+    pub(crate) fn prepare_emit(&self, name: &str) -> Result<Vec<EmitFn>, DispatchMode> {
+        let Some(slot) = self.slots.get(name) else {
+            return Ok(Vec::new());
+        };
+        if slot.mode != DispatchMode::Emit {
+            return Err(slot.mode);
+        }
+        Ok(slot
+            .listeners
+            .iter()
+            .filter_map(|listener| match &listener.callback {
+                Callback::Emit(callback) => Some(Arc::clone(callback)),
+                _ => None,
+            })
+            .collect())
     }
 
     pub(crate) fn waterfall(
