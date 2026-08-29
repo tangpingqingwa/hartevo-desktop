@@ -42,6 +42,7 @@ MANIFEST_DIRECTORY = Path(".github/merge-train/manifests")
 MAX_CANDIDATES = 4
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 GITHUB_MERGE_PATTERN = re.compile(r"^Merge pull request #([1-9][0-9]*) from [^\n]+(?:\n|$)")
+GITHUB_PR_SUFFIX_PATTERN = re.compile(r"\(#([1-9][0-9]*)\)$")
 TRUSTED_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = TRUSTED_REPOSITORY_ROOT / ".github/policies/branch-ruleset-policy.json"
 
@@ -72,6 +73,16 @@ def command(
 
 def git(*args: str, check: bool = True) -> str:
     return command(("git", *args), check=check).stdout.strip()
+
+
+def recover_github_pull_request_number(merge_message: str) -> int | None:
+    """Recover a PR number from either accepted GitHub merge-title form."""
+    match = GITHUB_MERGE_PATTERN.match(merge_message)
+    if match is not None:
+        return int(match.group(1))
+    subject = merge_message.partition("\n")[0]
+    match = GITHUB_PR_SUFFIX_PATTERN.search(subject)
+    return int(match.group(1)) if match is not None else None
 
 
 def gh_json(*args: str) -> object:
@@ -932,10 +943,9 @@ def verify_bootstrap_push(event_path: Path) -> dict[str, object]:
     if git("rev-parse", f"{after}^{{tree}}") != git("rev-parse", f"{pull_request_head}^{{tree}}"):
         raise TrainError("protected merge tree differs from the direct pull request head tree")
     merge_message = git("show", "-s", "--format=%B", after)
-    match = GITHUB_MERGE_PATTERN.match(merge_message)
-    if match is None:
+    number = recover_github_pull_request_number(merge_message)
+    if number is None:
         raise TrainError("direct protected merge has no recoverable GitHub pull request number")
-    number = int(match.group(1))
     return {
         "schema": "hartevo-bootstrap-integration-gate/v1",
         "status": "PASS",
@@ -1197,6 +1207,37 @@ def self_test_exact_composite() -> None:
             direct_result = verify_bootstrap_push(event_path)
             if direct_result.get("mode") != "DIRECT" or direct_result.get("pr") != 42 or direct_result.get("head") != direct_head:
                 raise AssertionError("bootstrap gate lost the recoverable direct pull request record")
+
+            custom_title_merge = git(
+                "commit-tree",
+                f"{direct_head}^{{tree}}",
+                "-p",
+                base,
+                "-p",
+                direct_head,
+                "-m",
+                "feat(cordis): authorize desktop domain commands (#42)",
+            )
+            git("switch", "--quiet", "--detach", custom_title_merge)
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "ref": f"refs/heads/{BASE_BRANCH}",
+                        "before": base,
+                        "after": custom_title_merge,
+                        "forced": False,
+                        "created": False,
+                        "deleted": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            custom_title_result = verify_bootstrap_push(event_path)
+            if custom_title_result.get("pr") != 42 or custom_title_result.get("head") != direct_head:
+                raise AssertionError("bootstrap gate lost the PR suffix from a custom GitHub merge title")
+
+            if recover_github_pull_request_number("custom title\n\nBody only reference (#42)") is not None:
+                raise AssertionError("bootstrap gate accepted a PR number outside the merge subject")
 
             tampered_tree_merge = git(
                 "commit-tree",
