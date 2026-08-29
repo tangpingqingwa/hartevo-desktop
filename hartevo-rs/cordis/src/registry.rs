@@ -4,11 +4,12 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::future::{BoxFuture, FutureExt, Shared, join_all};
 use futures_util::stream::StreamExt;
+use tokio::runtime::{Handle as TokioHandle, Id as TokioRuntimeId};
 use tokio::sync::{Notify, watch};
 
 use crate::config::ConfigValue;
@@ -21,6 +22,56 @@ use crate::fiber::{
 use crate::loader::{PluginFactory, PluginFactoryId, PluginId};
 
 type SharedUnitOperation = Shared<BoxFuture<'static, Result<(), CordisError>>>;
+type FiberTicketWait = (Arc<FiberControl>, u64);
+type FiberPublication = (Arc<FiberControl>, FiberSnapshot);
+
+struct FiberTicketBatch {
+    waits: Vec<FiberTicketWait>,
+    publications: Vec<FiberPublication>,
+    notifications: Vec<Arc<FiberControl>>,
+}
+
+#[derive(Clone)]
+struct DriverRuntimeBinding {
+    id: TokioRuntimeId,
+    alive: Arc<AtomicBool>,
+}
+
+impl DriverRuntimeBinding {
+    fn new(handle: &TokioHandle) -> Self {
+        let alive = Arc::new(AtomicBool::new(true));
+        let sentinel = DriverRuntimeSentinel(alive.clone());
+        drop(handle.spawn(async move {
+            let _sentinel = sentinel;
+            std::future::pending::<()>().await;
+        }));
+        Self {
+            id: handle.id(),
+            alive,
+        }
+    }
+
+    fn require_current(&self) -> Result<(), CordisError> {
+        let current = current_async_runtime()?;
+        self.require_handle(&current)
+    }
+
+    fn require_handle(&self, current: &TokioHandle) -> Result<(), CordisError> {
+        if self.alive.load(Ordering::Acquire) && current.id() == self.id {
+            Ok(())
+        } else {
+            Err(CordisError::AsyncRuntimeUnavailable)
+        }
+    }
+}
+
+struct DriverRuntimeSentinel(Arc<AtomicBool>);
+
+impl Drop for DriverRuntimeSentinel {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 pub(crate) type PendingId = u64;
 
@@ -121,6 +172,13 @@ struct RuntimeProviderSlot {
     record: Option<RuntimeProviderRecord>,
     revision: u64,
     removal_serial: u64,
+}
+
+struct ProviderRemovalPlan {
+    removal_serial: u64,
+    marked_revision: u64,
+    completed_revision: u64,
+    batch: FiberTicketBatch,
 }
 
 impl RuntimeProviderSlot {
@@ -243,6 +301,7 @@ pub struct LifecycleHandle {
     registry: Weak<LifecycleRegistryInner>,
     factory_id: PluginFactoryId,
     runtime_generation: u64,
+    driver_runtime: DriverRuntimeBinding,
     caller_uid: FiberUid,
     fiber: Fiber,
 }
@@ -275,14 +334,17 @@ impl LifecycleHandle {
     }
 
     pub async fn restart(&self) -> Result<FiberSnapshot, CordisError> {
+        self.driver_runtime.require_current()?;
         self.control()?.restart_and_wait().await
     }
 
     pub async fn update(&self, config: ConfigValue) -> Result<FiberSnapshot, CordisError> {
+        self.driver_runtime.require_current()?;
         self.control()?.update_and_wait(config).await
     }
 
     pub async fn dispose_async(&self) -> Result<FiberSnapshot, CordisError> {
+        self.driver_runtime.require_current()?;
         self.control()?.dispose_and_wait().await
     }
 
@@ -383,7 +445,7 @@ impl LifecycleRegistry {
         factory: PluginFactory,
         config: ConfigValue,
     ) -> Result<LifecycleHandle, CordisError> {
-        require_async_runtime()?;
+        let driver_handle = current_async_runtime()?;
         if !factory.supports_lifecycle() {
             return Err(CordisError::LifecycleFactoryRequired {
                 id: factory.plugin_id().clone(),
@@ -450,6 +512,7 @@ impl LifecycleRegistry {
             parent.uid(),
             factory,
             runtime_generation,
+            DriverRuntimeBinding::new(&driver_handle),
             config,
         );
         let lifecycle: Arc<dyn FiberLifecycle> = control.clone();
@@ -470,6 +533,7 @@ impl LifecycleRegistry {
             registry: Arc::downgrade(&self.inner),
             factory_id,
             runtime_generation,
+            driver_runtime: control.driver_runtime.clone(),
             caller_uid: parent.uid(),
             fiber,
         })
@@ -538,6 +602,9 @@ impl LifecycleRegistry {
         let provider_key = RuntimeProviderKey::new(namespace.clone(), key.clone());
         let handle = {
             let mut state = lock(&self.inner.state);
+            if state.shutting_down {
+                return Err(CordisError::RuntimeShuttingDown);
+            }
             let provider_id = state.next_provider_id;
             let next_provider_id = provider_id
                 .checked_add(1)
@@ -591,6 +658,9 @@ impl LifecycleRegistry {
         self.validate_provider_handle(handle)?;
         let current = {
             let mut state = lock(&self.inner.state);
+            if state.shutting_down {
+                return Err(CordisError::RuntimeShuttingDown);
+            }
             let provider_key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
             let Some(slot) = state.providers.get_mut(&provider_key) else {
                 return Err(CordisError::ProviderNotFound {
@@ -652,65 +722,18 @@ impl LifecycleRegistry {
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         require_async_runtime()?;
         self.validate_provider_handle(handle)?;
-        let (removal_serial, waits) = {
-            let mut state = lock(&self.inner.state);
-            let provider_key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
-            let Some(slot) = state.providers.get_mut(&provider_key) else {
-                return Err(CordisError::ProviderNotFound {
-                    namespace: handle.namespace.clone(),
-                    key: handle.key.clone(),
-                });
-            };
-            let Some(record) = slot.record.as_mut() else {
-                return Err(CordisError::ProviderNotFound {
-                    namespace: handle.namespace.clone(),
-                    key: handle.key.clone(),
-                });
-            };
-            if record.provider_id != handle.provider_id
-                || record.owner.uid() != handle.owner_uid
-                || record.generation != handle.generation
-            {
-                return Err(CordisError::StaleProviderHandle {
-                    key: handle.key.clone(),
-                });
-            }
-            slot.removal_serial = slot.removal_serial.checked_add(1).ok_or_else(|| {
-                CordisError::ProviderGenerationOverflow {
-                    key: handle.key.clone(),
-                }
-            })?;
-            slot.revision = slot.revision.checked_add(1).ok_or_else(|| {
-                CordisError::ProviderGenerationOverflow {
-                    key: handle.key.clone(),
-                }
-            })?;
-            let removal_serial = slot.removal_serial;
-            record.removing = true;
-            let controls = state
-                .runtimes
-                .values()
-                .flat_map(|runtime| runtime.fibers.values())
-                .filter(|control| {
-                    control.namespace == handle.namespace
-                        && control
-                            .factory
-                            .inject()
-                            .iter()
-                            .any(|key| key == &handle.key)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            // Absence and every dependent's desired ticket linearize before
-            // this lock is released. A same-key reprovide can race only after
-            // all dependents have observed the absence epoch.
-            let mut waits = Vec::with_capacity(controls.len());
-            for control in controls {
-                let serial = control.set_desired(None, None)?;
-                waits.push((control, serial));
-            }
-            (removal_serial, waits)
-        };
+        let ProviderRemovalPlan {
+            removal_serial,
+            marked_revision,
+            completed_revision,
+            batch:
+                FiberTicketBatch {
+                    waits,
+                    publications,
+                    notifications,
+                },
+        } = self.prepare_provider_removal(handle)?;
+        publish_deferred_batch(publications, notifications);
         let weak = Arc::downgrade(&self.inner);
         let handle = handle.clone();
         let operation = async move {
@@ -726,12 +749,13 @@ impl LifecycleRegistry {
                 let provider_key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
                 if let Some(slot) = state.providers.get_mut(&provider_key) {
                     let remove = slot.removal_serial == removal_serial
+                        && slot.revision == marked_revision
                         && slot.record.as_ref().is_some_and(|record| {
                             record.provider_id == handle.provider_id && record.removing
                         });
                     if remove {
                         slot.record = None;
-                        slot.revision = slot.revision.saturating_add(1);
+                        slot.revision = completed_revision;
                     }
                 }
             }
@@ -747,6 +771,76 @@ impl LifecycleRegistry {
         Ok(operation.boxed())
     }
 
+    fn prepare_provider_removal(
+        &self,
+        handle: &LifecycleProviderHandle,
+    ) -> Result<ProviderRemovalPlan, CordisError> {
+        let mut state = lock(&self.inner.state);
+        let provider_key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
+        let (removal_serial, marked_revision, completed_revision) =
+            preflight_provider_removal(&state, &provider_key, handle)?;
+        let mut controls = state
+            .runtimes
+            .values()
+            .flat_map(|runtime| runtime.fibers.values())
+            .filter(|control| {
+                control.namespace == handle.namespace
+                    && control
+                        .factory
+                        .inject()
+                        .iter()
+                        .any(|key| key == &handle.key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        controls.sort_by_key(|control| control.fiber.uid());
+        let mut machines = controls
+            .iter()
+            .map(|control| lock(&control.machine))
+            .collect::<Vec<_>>();
+        let next_tickets = machines
+            .iter()
+            .map(|machine| FiberControl::preflight_desired_locked(machine, None))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Slot absence and every dependent ticket publish in one registry ->
+        // uid-ordered machine critical section. No fallible operation remains
+        // after the slot mutation begins.
+        if let Some(slot) = state.providers.get_mut(&provider_key) {
+            slot.removal_serial = removal_serial;
+            slot.revision = marked_revision;
+            if let Some(record) = slot.record.as_mut() {
+                record.removing = true;
+            }
+        }
+        let mut waits = Vec::with_capacity(controls.len());
+        let mut publications = Vec::new();
+        let mut notifications = Vec::new();
+        for ((control, machine), next_ticket) in
+            controls.iter().zip(&mut machines).zip(next_tickets)
+        {
+            let (changed, serial) =
+                FiberControl::apply_desired_locked(machine, None, None, next_ticket);
+            waits.push((control.clone(), serial));
+            if changed {
+                publications.push((control.clone(), machine.snapshot()));
+                notifications.push(control.clone());
+            }
+        }
+        drop(machines);
+        drop(state);
+        Ok(ProviderRemovalPlan {
+            removal_serial,
+            marked_revision,
+            completed_revision,
+            batch: FiberTicketBatch {
+                waits,
+                publications,
+                notifications,
+            },
+        })
+    }
+
     pub async fn remove_provider(
         &self,
         handle: &LifecycleProviderHandle,
@@ -759,21 +853,18 @@ impl LifecycleRegistry {
     }
 
     fn get_in_namespace<T: Any + Send + Sync>(&self, namespace: &str, key: &str) -> Option<Arc<T>> {
-        let value = {
+        let observation = {
             let state = lock(&self.inner.state);
-            let slot = state
-                .providers
-                .get(&RuntimeProviderKey::new(namespace, key))?;
-            let record = slot.record.as_ref()?;
-            if record.removing
-                || record.owner.is_disposed()
-                || record.owner.state() != FiberState::Active
-            {
-                return None;
-            }
-            record.value.clone()
+            provider_observation_locked(&state, namespace, key)?
         };
-        value.downcast::<T>().ok()
+        if !provider_guard_allows(&observation) {
+            return None;
+        }
+        let state = lock(&self.inner.state);
+        if !provider_observations_are_current(&state, std::slice::from_ref(&observation)) {
+            return None;
+        }
+        observation.value.downcast::<T>().ok()
     }
 
     pub fn begin_delete_factory(
@@ -781,24 +872,33 @@ impl LifecycleRegistry {
         factory: &PluginFactory,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         require_async_runtime()?;
-        let (generation, controls) = {
+        let (generation, batch) = {
             let mut state = lock(&self.inner.state);
-            let Some(runtime) = state.runtimes.get_mut(&factory.id()) else {
+            let Some(runtime) = state.runtimes.get(&factory.id()) else {
                 return Ok(async { Ok(()) }.boxed());
             };
-            runtime.status = RuntimeStatus::Deleting;
-            (
-                runtime.generation,
-                runtime.fibers.values().cloned().collect::<Vec<_>>(),
-            )
+            let generation = runtime.generation;
+            let mut controls = runtime.fibers.values().cloned().collect::<Vec<_>>();
+            controls.sort_by_key(|control| control.fiber.uid());
+            let mut machines = controls
+                .iter()
+                .map(|control| lock(&control.machine))
+                .collect::<Vec<_>>();
+            let next_tickets = preflight_dispose_batch(&machines)?;
+            if let Some(runtime) = state.runtimes.get_mut(&factory.id()) {
+                runtime.status = RuntimeStatus::Deleting;
+            }
+            let batch = publish_dispose_batch(&controls, &mut machines, next_tickets);
+            drop(machines);
+            drop(state);
+            (generation, batch)
         };
-        let waits = controls
-            .into_iter()
-            .map(|control| {
-                let serial = control.request_dispose();
-                (control, serial)
-            })
-            .collect::<Vec<_>>();
+        let FiberTicketBatch {
+            waits,
+            publications,
+            notifications,
+        } = batch;
+        publish_deferred_batch(publications, notifications);
         let weak = Arc::downgrade(&self.inner);
         let factory = factory.clone();
         let operation = async move {
@@ -833,7 +933,8 @@ impl LifecycleRegistry {
     }
 
     pub async fn restart_root(&self) -> Result<Vec<FiberSnapshot>, CordisError> {
-        let waits = {
+        let driver_handle = current_async_runtime()?;
+        let batch = {
             let state = lock(&self.inner.state);
             let mut controls = state
                 .runtimes
@@ -843,6 +944,9 @@ impl LifecycleRegistry {
                 .cloned()
                 .collect::<Vec<_>>();
             controls.sort_by_key(|control| control.fiber.uid());
+            for control in &controls {
+                control.driver_runtime.require_handle(&driver_handle)?;
+            }
             let mut offenders = controls
                 .iter()
                 .filter(|control| !control.factory.is_repeatable())
@@ -860,33 +964,42 @@ impl LifecycleRegistry {
                 .iter()
                 .map(|control| lock(&control.machine))
                 .collect::<Vec<_>>();
+            let mut next_tickets = Vec::with_capacity(machines.len());
             for (control, machine) in controls.iter().zip(&machines) {
                 if machine.tombstone {
                     return Err(CordisError::FiberDisposed {
                         uid: control.fiber.uid(),
                     });
                 }
-                if machine.next_ticket == u64::MAX {
-                    return Err(CordisError::TransitionTicketOverflow);
-                }
+                next_tickets.push(machine.preflight_next_ticket()?);
             }
             let mut waits = Vec::with_capacity(controls.len());
-            for (control, machine) in controls.iter().zip(&mut machines) {
+            let mut publications = Vec::with_capacity(controls.len());
+            let mut notifications = Vec::with_capacity(controls.len());
+            for ((control, machine), next_ticket) in
+                controls.iter().zip(&mut machines).zip(next_tickets)
+            {
                 machine.force_restart = true;
-                machine.next_ticket += 1;
-                let ticket = TransitionTicket::new(machine.next_ticket, machine.desired.clone());
+                let ticket = machine.publish_ticket(next_ticket);
                 let serial = ticket.serial();
-                machine.current_ticket = Some(ticket);
-                control.publish_locked(machine);
                 waits.push((control.clone(), serial));
+                publications.push((control.clone(), machine.snapshot()));
+                notifications.push(control.clone());
             }
             drop(machines);
             drop(state);
-            for (control, _) in &waits {
-                control.wake.notify_one();
+            FiberTicketBatch {
+                waits,
+                publications,
+                notifications,
             }
-            waits
         };
+        let FiberTicketBatch {
+            waits,
+            publications,
+            notifications,
+        } = batch;
+        publish_deferred_batch(publications, notifications);
         let results = join_all(
             waits
                 .into_iter()
@@ -905,25 +1018,34 @@ impl LifecycleRegistry {
             let operation = operation.clone();
             return Ok(operation.boxed());
         }
-        let controls = {
+        let batch = {
             let mut state = lock(&self.inner.state);
-            state.shutting_down = true;
-            state
+            let mut controls = state
                 .runtimes
-                .values_mut()
-                .flat_map(|runtime| {
-                    runtime.status = RuntimeStatus::Deleting;
-                    runtime.fibers.values().cloned()
-                })
-                .collect::<Vec<_>>()
+                .values()
+                .flat_map(|runtime| runtime.fibers.values().cloned())
+                .collect::<Vec<_>>();
+            controls.sort_by_key(|control| control.fiber.uid());
+            let mut machines = controls
+                .iter()
+                .map(|control| lock(&control.machine))
+                .collect::<Vec<_>>();
+            let next_tickets = preflight_dispose_batch(&machines)?;
+            state.shutting_down = true;
+            for runtime in state.runtimes.values_mut() {
+                runtime.status = RuntimeStatus::Deleting;
+            }
+            let result = publish_dispose_batch(&controls, &mut machines, next_tickets);
+            drop(machines);
+            drop(state);
+            result
         };
-        let waits = controls
-            .into_iter()
-            .map(|control| {
-                let serial = control.request_dispose();
-                (control, serial)
-            })
-            .collect::<Vec<_>>();
+        let FiberTicketBatch {
+            waits,
+            publications,
+            notifications,
+        } = batch;
+        publish_deferred_batch(publications, notifications);
         let weak = Arc::downgrade(&self.inner);
         let operation = async move {
             let results = join_all(
@@ -1036,29 +1158,12 @@ impl LifecycleRegistry {
 
     fn provider_observations(&self, control: &FiberControl) -> Option<Vec<ProviderObservation>> {
         let state = lock(&self.inner.state);
-        let mut observations = Vec::with_capacity(control.factory.inject().len());
-        for key in control.factory.inject() {
-            let provider_key = RuntimeProviderKey::new(&control.namespace, key);
-            let slot = state.providers.get(&provider_key)?;
-            let record = slot.record.as_ref()?;
-            if record.removing
-                || record.owner.is_disposed()
-                || record.owner.state() != FiberState::Active
-            {
-                return None;
-            }
-            observations.push(ProviderObservation {
-                key: provider_key,
-                value: record.value.clone(),
-                guard: record.guard.clone(),
-                provider_id: record.provider_id,
-                owner_uid: record.owner.uid(),
-                generation: record.generation,
-                revision: slot.revision,
-                removal_serial: slot.removal_serial,
-            });
-        }
-        Some(observations)
+        control
+            .factory
+            .inject()
+            .iter()
+            .map(|key| provider_observation_locked(&state, &control.namespace, key))
+            .collect()
     }
 
     fn remove_terminal_child(
@@ -1124,24 +1229,95 @@ fn evaluate_provider_guards(
     (true, None)
 }
 
+fn provider_guard_allows(observation: &ProviderObservation) -> bool {
+    let Some(guard) = &observation.guard else {
+        return true;
+    };
+    matches!(
+        catch_unwind(AssertUnwindSafe(|| guard(&observation.value))),
+        Ok(Ok(true))
+    )
+}
+
+fn preflight_provider_removal(
+    state: &LifecycleRegistryState,
+    provider_key: &RuntimeProviderKey,
+    handle: &LifecycleProviderHandle,
+) -> Result<(u64, u64, u64), CordisError> {
+    let Some(slot) = state.providers.get(provider_key) else {
+        return Err(CordisError::ProviderNotFound {
+            namespace: handle.namespace.clone(),
+            key: handle.key.clone(),
+        });
+    };
+    let Some(record) = slot.record.as_ref() else {
+        return Err(CordisError::ProviderNotFound {
+            namespace: handle.namespace.clone(),
+            key: handle.key.clone(),
+        });
+    };
+    if record.provider_id != handle.provider_id
+        || record.owner.uid() != handle.owner_uid
+        || record.generation != handle.generation
+    {
+        return Err(CordisError::StaleProviderHandle {
+            key: handle.key.clone(),
+        });
+    }
+    let overflow = || CordisError::ProviderGenerationOverflow {
+        key: handle.key.clone(),
+    };
+    let removal_serial = slot.removal_serial.checked_add(1).ok_or_else(&overflow)?;
+    let marked_revision = slot.revision.checked_add(1).ok_or_else(&overflow)?;
+    let completed_revision = marked_revision.checked_add(1).ok_or_else(overflow)?;
+    Ok((removal_serial, marked_revision, completed_revision))
+}
+
+fn provider_observation_locked(
+    state: &LifecycleRegistryState,
+    namespace: &str,
+    key: &str,
+) -> Option<ProviderObservation> {
+    if state.shutting_down {
+        return None;
+    }
+    let provider_key = RuntimeProviderKey::new(namespace, key);
+    let slot = state.providers.get(&provider_key)?;
+    let record = slot.record.as_ref()?;
+    if record.removing || record.owner.is_disposed() || record.owner.state() != FiberState::Active {
+        return None;
+    }
+    Some(ProviderObservation {
+        key: provider_key,
+        value: record.value.clone(),
+        guard: record.guard.clone(),
+        provider_id: record.provider_id,
+        owner_uid: record.owner.uid(),
+        generation: record.generation,
+        revision: slot.revision,
+        removal_serial: slot.removal_serial,
+    })
+}
+
 fn provider_observations_are_current(
     state: &LifecycleRegistryState,
     observations: &[ProviderObservation],
 ) -> bool {
-    observations.iter().all(|observation| {
-        state.providers.get(&observation.key).is_some_and(|slot| {
-            slot.revision == observation.revision
-                && slot.removal_serial == observation.removal_serial
-                && slot.record.as_ref().is_some_and(|record| {
-                    !record.removing
-                        && record.provider_id == observation.provider_id
-                        && record.owner.uid() == observation.owner_uid
-                        && record.generation == observation.generation
-                        && !record.owner.is_disposed()
-                        && record.owner.state() == FiberState::Active
-                })
+    !state.shutting_down
+        && observations.iter().all(|observation| {
+            state.providers.get(&observation.key).is_some_and(|slot| {
+                slot.revision == observation.revision
+                    && slot.removal_serial == observation.removal_serial
+                    && slot.record.as_ref().is_some_and(|record| {
+                        !record.removing
+                            && record.provider_id == observation.provider_id
+                            && record.owner.uid() == observation.owner_uid
+                            && record.generation == observation.generation
+                            && !record.owner.is_disposed()
+                            && record.owner.state() == FiberState::Active
+                    })
+            })
         })
-    })
 }
 
 struct ActivationCollectorState {
@@ -1273,7 +1449,9 @@ impl LifecycleContextView {
 
     #[must_use]
     pub fn var(&self, key: &str) -> Option<ConfigValue> {
-        lock(&self.collector.state).metadata.lookup(key).cloned()
+        self.with_activation_read(|collector| collector.metadata.lookup(key).cloned())
+            .ok()
+            .flatten()
     }
 
     pub fn set_var(
@@ -1334,7 +1512,28 @@ impl LifecycleContextView {
     }
 
     pub fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
-        self.registry().ok()?.get_in_namespace(&self.namespace, key)
+        let (inner, control) = self.authority().ok()?;
+        let observation = {
+            let registry = lock(&inner.state);
+            let observation = provider_observation_locked(&registry, &self.namespace, key)?;
+            let machine = lock(&control.machine);
+            let collector = lock(&self.collector.state);
+            self.activation_is_valid_locked(&registry, &control, &machine, &collector)
+                .then_some(observation)?
+        };
+        if !provider_guard_allows(&observation) {
+            return None;
+        }
+        let registry = lock(&inner.state);
+        if !provider_observations_are_current(&registry, std::slice::from_ref(&observation)) {
+            return None;
+        }
+        let machine = lock(&control.machine);
+        let collector = lock(&self.collector.state);
+        if !self.activation_is_valid_locked(&registry, &control, &machine, &collector) {
+            return None;
+        }
+        observation.value.downcast::<T>().ok()
     }
 
     pub fn mount(&self, factory: PluginFactory, config: ConfigValue) -> Result<Fiber, CordisError> {
@@ -1360,23 +1559,7 @@ impl LifecycleContextView {
         Ok(child)
     }
 
-    fn registry(&self) -> Result<LifecycleRegistry, CordisError> {
-        self.registry
-            .upgrade()
-            .map(|inner| LifecycleRegistry { inner })
-            .ok_or(CordisError::StaleLifecycleView {
-                uid: self.fiber.uid(),
-            })
-    }
-
-    fn with_activation_write<R>(
-        &self,
-        write: impl FnOnce(
-            &mut LifecycleRegistryState,
-            &mut FiberMachine,
-            &mut ActivationCollectorState,
-        ) -> Result<R, CordisError>,
-    ) -> Result<R, CordisError> {
+    fn authority(&self) -> Result<(Arc<LifecycleRegistryInner>, Arc<FiberControl>), CordisError> {
         let inner = self
             .registry
             .upgrade()
@@ -1398,25 +1581,24 @@ impl LifecycleContextView {
                 uid: self.fiber.uid(),
             });
         }
+        Ok((inner, control))
+    }
 
-        // Global lock order is registry -> machine -> collector.  Runtime
-        // membership, ticket/state validity, and the write therefore
-        // linearize together; no validate-then-write gap is exposed.
-        let mut registry = lock(&inner.state);
-        let registered = registry
-            .runtimes
-            .get(&control.factory.id())
-            .filter(|runtime| runtime.generation == self.runtime_generation)
-            .and_then(|runtime| runtime.fibers.get(&self.fiber.uid()))
-            .is_some_and(|registered| Arc::ptr_eq(registered, &control));
-        if !registered {
-            return Err(CordisError::StaleLifecycleView {
-                uid: self.fiber.uid(),
-            });
-        }
-        let mut machine = lock(&control.machine);
-        let mut collector = lock(&self.collector.state);
-        let valid = !machine.tombstone
+    fn activation_is_valid_locked(
+        &self,
+        registry: &LifecycleRegistryState,
+        control: &Arc<FiberControl>,
+        machine: &FiberMachine,
+        collector: &ActivationCollectorState,
+    ) -> bool {
+        !registry.shutting_down
+            && registry
+                .runtimes
+                .get(&control.factory.id())
+                .filter(|runtime| runtime.generation == self.runtime_generation)
+                .and_then(|runtime| runtime.fibers.get(&self.fiber.uid()))
+                .is_some_and(|registered| Arc::ptr_eq(registered, control))
+            && !machine.tombstone
             && machine.state == FiberState::Loading
             && machine.desired.as_ref() == Some(&self.collector.epoch)
             && machine
@@ -1427,8 +1609,42 @@ impl LifecycleContextView {
                 .active_activation
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(active, &self.collector))
-            && !collector.closed;
-        if !valid {
+            && !collector.closed
+    }
+
+    fn with_activation_read<R>(
+        &self,
+        read: impl FnOnce(&ActivationCollectorState) -> R,
+    ) -> Result<R, CordisError> {
+        let (inner, control) = self.authority()?;
+        let registry = lock(&inner.state);
+        let machine = lock(&control.machine);
+        let collector = lock(&self.collector.state);
+        if !self.activation_is_valid_locked(&registry, &control, &machine, &collector) {
+            return Err(CordisError::StaleLifecycleView {
+                uid: self.fiber.uid(),
+            });
+        }
+        Ok(read(&collector))
+    }
+
+    fn with_activation_write<R>(
+        &self,
+        write: impl FnOnce(
+            &mut LifecycleRegistryState,
+            &mut FiberMachine,
+            &mut ActivationCollectorState,
+        ) -> Result<R, CordisError>,
+    ) -> Result<R, CordisError> {
+        let (inner, control) = self.authority()?;
+
+        // Global lock order is registry -> machine -> collector.  Runtime
+        // membership, ticket/state validity, and the write therefore
+        // linearize together; no validate-then-write gap is exposed.
+        let mut registry = lock(&inner.state);
+        let mut machine = lock(&control.machine);
+        let mut collector = lock(&self.collector.state);
+        if !self.activation_is_valid_locked(&registry, &control, &machine, &collector) {
             return Err(CordisError::StaleLifecycleView {
                 uid: self.fiber.uid(),
             });
@@ -1469,14 +1685,17 @@ impl FiberMachine {
         )
     }
 
-    fn allocate_ticket(&mut self) -> Result<TransitionTicket, CordisError> {
-        self.next_ticket = self
-            .next_ticket
+    fn preflight_next_ticket(&self) -> Result<u64, CordisError> {
+        self.next_ticket
             .checked_add(1)
-            .ok_or(CordisError::TransitionTicketOverflow)?;
-        let ticket = TransitionTicket::new(self.next_ticket, self.desired.clone());
+            .ok_or(CordisError::TransitionTicketOverflow)
+    }
+
+    fn publish_ticket(&mut self, serial: u64) -> TransitionTicket {
+        self.next_ticket = serial;
+        let ticket = TransitionTicket::new(serial, self.desired.clone());
         self.current_ticket = Some(ticket.clone());
-        Ok(ticket)
+        ticket
     }
 }
 
@@ -1487,6 +1706,7 @@ struct FiberControl {
     parent_uid: FiberUid,
     factory: PluginFactory,
     runtime_generation: u64,
+    driver_runtime: DriverRuntimeBinding,
     namespace: String,
     machine: Mutex<FiberMachine>,
     wake: Notify,
@@ -1500,6 +1720,7 @@ impl FiberControl {
         parent_uid: FiberUid,
         factory: PluginFactory,
         runtime_generation: u64,
+        driver_runtime: DriverRuntimeBinding,
         config: ConfigValue,
     ) -> Arc<Self> {
         let initial = FiberSnapshot::new(FiberState::Pending, None, None, None, Vec::new());
@@ -1512,6 +1733,7 @@ impl FiberControl {
             parent_uid,
             factory,
             runtime_generation,
+            driver_runtime,
             machine: Mutex::new(FiberMachine {
                 config,
                 config_revision: 0,
@@ -1535,21 +1757,6 @@ impl FiberControl {
             wake: Notify::new(),
             snapshots,
         })
-    }
-
-    fn set_desired(
-        &self,
-        desired: Option<ActivationEpoch>,
-        diagnostic: Option<CordisError>,
-    ) -> Result<u64, CordisError> {
-        let (changed, serial) = {
-            let mut machine = lock(&self.machine);
-            self.set_desired_locked(&mut machine, desired, diagnostic)?
-        };
-        if changed {
-            self.wake.notify_one();
-        }
-        Ok(serial)
     }
 
     fn set_desired_if_revision(
@@ -1577,15 +1784,46 @@ impl FiberControl {
         desired: Option<ActivationEpoch>,
         diagnostic: Option<CordisError>,
     ) -> Result<(bool, u64), CordisError> {
+        let next_ticket = Self::preflight_desired_locked(machine, desired.as_ref())?;
+        Ok(self.publish_desired_locked(machine, desired, diagnostic, next_ticket))
+    }
+
+    fn preflight_desired_locked(
+        machine: &FiberMachine,
+        desired: Option<&ActivationEpoch>,
+    ) -> Result<Option<u64>, CordisError> {
+        (machine.desired.as_ref() != desired)
+            .then(|| machine.preflight_next_ticket())
+            .transpose()
+    }
+
+    fn publish_desired_locked(
+        &self,
+        machine: &mut FiberMachine,
+        desired: Option<ActivationEpoch>,
+        diagnostic: Option<CordisError>,
+        next_ticket: Option<u64>,
+    ) -> (bool, u64) {
+        let result = Self::apply_desired_locked(machine, desired, diagnostic, next_ticket);
+        self.publish_locked(machine);
+        result
+    }
+
+    fn apply_desired_locked(
+        machine: &mut FiberMachine,
+        desired: Option<ActivationEpoch>,
+        diagnostic: Option<CordisError>,
+        next_ticket: Option<u64>,
+    ) -> (bool, u64) {
         if let Some(diagnostic) = diagnostic
             && !machine.diagnostics.contains(&diagnostic)
         {
             machine.diagnostics.push(diagnostic);
         }
-        let changed = machine.desired != desired;
-        if changed {
+        let changed = next_ticket.is_some();
+        if let Some(next_ticket) = next_ticket {
             machine.desired = desired;
-            let ticket = machine.allocate_ticket()?;
+            let ticket = machine.publish_ticket(next_ticket);
             if machine.state == FiberState::Loading
                 && let Some(active) = machine.active_activation.as_ref()
                 && machine.desired.as_ref() == Some(&active.epoch)
@@ -1596,12 +1834,11 @@ impl FiberControl {
                 }
             }
         }
-        self.publish_locked(machine);
         let serial = machine
             .current_ticket
             .as_ref()
             .map_or(machine.settled_ticket, TransitionTicket::serial);
-        Ok((changed, serial))
+        (changed, serial)
     }
 
     fn transition_locked(&self, machine: &mut FiberMachine, state: FiberState) {
@@ -1614,6 +1851,18 @@ impl FiberControl {
 
     fn publish_locked(&self, machine: &FiberMachine) {
         self.snapshots.send_replace(machine.snapshot());
+    }
+
+    fn publish_deferred(&self, candidate: FiberSnapshot) {
+        let candidate_serial = candidate.ticket().map_or(0, TransitionTicket::serial);
+        self.snapshots.send_if_modified(move |current| {
+            let current_serial = current.ticket().map_or(0, TransitionTicket::serial);
+            if candidate_serial <= current_serial {
+                return false;
+            }
+            *current = candidate;
+            true
+        });
     }
 
     fn request_restart(&self) -> Result<u64, CordisError> {
@@ -1629,8 +1878,9 @@ impl FiberControl {
                     uid: self.fiber.uid(),
                 });
             }
+            let next_ticket = machine.preflight_next_ticket()?;
             machine.force_restart = true;
-            machine.allocate_ticket()?.serial()
+            machine.publish_ticket(next_ticket).serial()
         };
         self.wake.notify_one();
         Ok(serial)
@@ -1649,20 +1899,22 @@ impl FiberControl {
                     uid: self.fiber.uid(),
                 });
             }
-            machine.config_revision = machine
+            let config_revision = machine
                 .config_revision
                 .checked_add(1)
                 .ok_or(CordisError::ConfigRevisionOverflow)?;
+            let next_ticket = machine.preflight_next_ticket()?;
+            machine.config_revision = config_revision;
             machine.config = config;
             machine.error = None;
             machine.force_restart = true;
             if let Some(desired) = &machine.desired {
                 machine.desired = Some(ActivationEpoch::new(
-                    machine.config_revision,
+                    config_revision,
                     desired.dependencies().iter().cloned(),
                 ));
             }
-            let serial = machine.allocate_ticket()?.serial();
+            let serial = machine.publish_ticket(next_ticket).serial();
             self.publish_locked(&machine);
             serial
         };
@@ -1670,27 +1922,53 @@ impl FiberControl {
         Ok(serial)
     }
 
-    fn request_dispose(&self) -> u64 {
-        let serial = {
+    fn request_dispose(&self) -> Result<u64, CordisError> {
+        let (changed, serial) = {
             let mut machine = lock(&self.machine);
-            if machine.tombstone {
-                return machine
-                    .current_ticket
-                    .as_ref()
-                    .map_or(0, TransitionTicket::serial);
-            }
+            let next_ticket = Self::preflight_dispose_locked(&machine)?;
+            self.publish_dispose_locked(&mut machine, next_ticket)
+        };
+        if changed {
+            self.wake.notify_one();
+        }
+        Ok(serial)
+    }
+
+    fn preflight_dispose_locked(machine: &FiberMachine) -> Result<Option<u64>, CordisError> {
+        (!machine.tombstone)
+            .then(|| machine.preflight_next_ticket())
+            .transpose()
+    }
+
+    fn publish_dispose_locked(
+        &self,
+        machine: &mut FiberMachine,
+        next_ticket: Option<u64>,
+    ) -> (bool, u64) {
+        let result = self.apply_dispose_locked(machine, next_ticket);
+        if result.0 {
+            self.publish_locked(machine);
+        }
+        result
+    }
+
+    fn apply_dispose_locked(
+        &self,
+        machine: &mut FiberMachine,
+        next_ticket: Option<u64>,
+    ) -> (bool, u64) {
+        let changed = next_ticket.is_some();
+        if let Some(next_ticket) = next_ticket {
             machine.tombstone = true;
             machine.desired = None;
             self.fiber.publish_tombstone();
-            let _ = machine.allocate_ticket();
-            self.publish_locked(&machine);
-            machine
-                .current_ticket
-                .as_ref()
-                .map_or(0, TransitionTicket::serial)
-        };
-        self.wake.notify_one();
-        serial
+            machine.publish_ticket(next_ticket);
+        }
+        let serial = machine
+            .current_ticket
+            .as_ref()
+            .map_or(machine.settled_ticket, TransitionTicket::serial);
+        (changed, serial)
     }
 
     async fn await_ticket(&self, serial: u64) -> Result<FiberSnapshot, CordisError> {
@@ -1820,8 +2098,52 @@ impl FiberControl {
     }
 
     async fn dispose_and_wait(self: &Arc<Self>) -> Result<FiberSnapshot, CordisError> {
-        let serial = self.request_dispose();
+        let serial = self.request_dispose()?;
         self.await_ticket(serial).await
+    }
+}
+
+fn preflight_dispose_batch(
+    machines: &[std::sync::MutexGuard<'_, FiberMachine>],
+) -> Result<Vec<Option<u64>>, CordisError> {
+    machines
+        .iter()
+        .map(|machine| FiberControl::preflight_dispose_locked(machine))
+        .collect()
+}
+
+fn publish_dispose_batch(
+    controls: &[Arc<FiberControl>],
+    machines: &mut [std::sync::MutexGuard<'_, FiberMachine>],
+    next_tickets: Vec<Option<u64>>,
+) -> FiberTicketBatch {
+    let mut waits = Vec::with_capacity(controls.len());
+    let mut publications = Vec::new();
+    let mut notifications = Vec::new();
+    for ((control, machine), next_ticket) in controls.iter().zip(machines).zip(next_tickets) {
+        let (changed, serial) = control.apply_dispose_locked(machine, next_ticket);
+        waits.push((control.clone(), serial));
+        if changed {
+            publications.push((control.clone(), machine.snapshot()));
+            notifications.push(control.clone());
+        }
+    }
+    FiberTicketBatch {
+        waits,
+        publications,
+        notifications,
+    }
+}
+
+fn publish_deferred_batch(
+    publications: Vec<FiberPublication>,
+    notifications: Vec<Arc<FiberControl>>,
+) {
+    for (control, snapshot) in publications {
+        control.publish_deferred(snapshot);
+    }
+    for control in notifications {
+        control.wake.notify_one();
     }
 }
 
@@ -2157,6 +2479,7 @@ fn commit_provisional_mounts(
             control.fiber.uid(),
             mount.factory.clone(),
             generation,
+            control.driver_runtime.clone(),
             mount.config,
         );
         let lifecycle: Arc<dyn FiberLifecycle> = child.clone();
@@ -2520,9 +2843,11 @@ fn spawn_unit_operation(
 }
 
 fn require_async_runtime() -> Result<(), CordisError> {
-    tokio::runtime::Handle::try_current()
-        .map(|_| ())
-        .map_err(|_| CordisError::AsyncRuntimeUnavailable)
+    current_async_runtime().map(drop)
+}
+
+fn current_async_runtime() -> Result<TokioHandle, CordisError> {
+    TokioHandle::try_current().map_err(|_| CordisError::AsyncRuntimeUnavailable)
 }
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -2539,5 +2864,402 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_boundary_tests {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MachineBoundarySnapshot {
+        config: ConfigValue,
+        config_revision: u64,
+        desired: Option<ActivationEpoch>,
+        committed: Option<ActivationEpoch>,
+        next_ticket: u64,
+        current_ticket: Option<TransitionTicket>,
+        settled_ticket: u64,
+        state: FiberState,
+        error: Option<CordisError>,
+        diagnostics: Vec<CordisError>,
+        effects_len: usize,
+        effects_epoch: Option<ActivationEpoch>,
+        history: Vec<FiberState>,
+        baseline_metadata: ConfigValue,
+        metadata: ConfigValue,
+        flags: [bool; 4],
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ProviderBoundarySnapshot {
+        next_provider_id: u64,
+        provider_count: usize,
+        shutting_down: bool,
+        slot: Option<ProviderSlotBoundarySnapshot>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ProviderSlotBoundarySnapshot {
+        revision: u64,
+        removal_serial: u64,
+        provider_id: Option<u64>,
+        generation: Option<u64>,
+        owner_uid: Option<FiberUid>,
+        removing: bool,
+        value_identity: Option<usize>,
+        has_guard: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RuntimeBoundarySnapshot {
+        shutting_down: bool,
+        generation: u64,
+        status: RuntimeStatus,
+        fiber_count: usize,
+        has_shutdown_operation: bool,
+    }
+
+    fn detached_control(registry: &LifecycleRegistry, id: &str) -> Arc<FiberControl> {
+        let factory = PluginFactory::new_lifecycle(id, |_config, _ctx| LifecycleEffect::none());
+        let fiber = Fiber::child_with_namespace(
+            registry.inner.id,
+            &registry.inner.root,
+            "root".to_string(),
+        );
+        let driver_runtime = DriverRuntimeBinding::new(&current_async_runtime().unwrap());
+        FiberControl::new(
+            Arc::downgrade(&registry.inner),
+            fiber,
+            FiberUid::ROOT,
+            factory,
+            1,
+            driver_runtime,
+            ConfigValue::string("initial"),
+        )
+    }
+
+    fn machine_boundary_snapshot(control: &FiberControl) -> MachineBoundarySnapshot {
+        let fiber_disposed = control.fiber.is_disposed();
+        let machine = lock(&control.machine);
+        MachineBoundarySnapshot {
+            config: machine.config.clone(),
+            config_revision: machine.config_revision,
+            desired: machine.desired.clone(),
+            committed: machine.committed.clone(),
+            next_ticket: machine.next_ticket,
+            current_ticket: machine.current_ticket.clone(),
+            settled_ticket: machine.settled_ticket,
+            state: machine.state,
+            error: machine.error.clone(),
+            diagnostics: machine.diagnostics.clone(),
+            effects_len: machine.effects.len(),
+            effects_epoch: machine.effects_epoch.clone(),
+            history: machine.history.clone(),
+            baseline_metadata: machine.baseline_metadata.clone(),
+            metadata: machine.metadata.clone(),
+            flags: [
+                machine.force_restart,
+                machine.tombstone,
+                machine.active_activation.is_some(),
+                fiber_disposed,
+            ],
+        }
+    }
+
+    fn provider_boundary_snapshot(
+        registry: &LifecycleRegistry,
+        namespace: &str,
+        key: &str,
+    ) -> ProviderBoundarySnapshot {
+        let state = lock(&registry.inner.state);
+        let slot = state
+            .providers
+            .get(&RuntimeProviderKey::new(namespace, key))
+            .map(|slot| ProviderSlotBoundarySnapshot {
+                revision: slot.revision,
+                removal_serial: slot.removal_serial,
+                provider_id: slot.record.as_ref().map(|record| record.provider_id),
+                generation: slot.record.as_ref().map(|record| record.generation),
+                owner_uid: slot.record.as_ref().map(|record| record.owner.uid()),
+                removing: slot.record.as_ref().is_some_and(|record| record.removing),
+                value_identity: slot
+                    .record
+                    .as_ref()
+                    .map(|record| Arc::as_ptr(&record.value).cast::<()>() as usize),
+                has_guard: slot
+                    .record
+                    .as_ref()
+                    .is_some_and(|record| record.guard.is_some()),
+            });
+        ProviderBoundarySnapshot {
+            next_provider_id: state.next_provider_id,
+            provider_count: state.providers.len(),
+            shutting_down: state.shutting_down,
+            slot,
+        }
+    }
+
+    fn runtime_boundary_snapshot(
+        registry: &LifecycleRegistry,
+        factory: &PluginFactory,
+    ) -> RuntimeBoundarySnapshot {
+        let has_shutdown_operation = lock(&registry.inner.shutdown_operation).is_some();
+        let state = lock(&registry.inner.state);
+        let runtime = &state.runtimes[&factory.id()];
+        RuntimeBoundarySnapshot {
+            shutting_down: state.shutting_down,
+            generation: runtime.generation,
+            status: runtime.status,
+            fiber_count: runtime.fibers.len(),
+            has_shutdown_operation,
+        }
+    }
+
+    #[tokio::test]
+    async fn single_control_ticket_overflow_preserves_every_machine_field() {
+        let registry = LifecycleRegistry::new();
+        let control = detached_control(&registry, "single-overflow");
+        lock(&control.machine).next_ticket = u64::MAX;
+        let before = machine_boundary_snapshot(&control);
+        let desired = Some(ActivationEpoch::new(1, []));
+        let diagnostic = CordisError::PayloadType {
+            name: "must-not-commit".to_string(),
+        };
+
+        let desired_result = {
+            let mut machine = lock(&control.machine);
+            control.set_desired_locked(&mut machine, desired, Some(diagnostic))
+        };
+        assert!(matches!(
+            desired_result,
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(machine_boundary_snapshot(&control), before);
+        assert!(matches!(
+            control.request_restart(),
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(machine_boundary_snapshot(&control), before);
+        assert!(matches!(
+            control.request_update(ConfigValue::string("must-not-commit")),
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(machine_boundary_snapshot(&control), before);
+        assert!(matches!(
+            control.request_dispose(),
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(machine_boundary_snapshot(&control), before);
+    }
+
+    #[tokio::test]
+    async fn update_config_revision_overflow_preserves_every_machine_field() {
+        let registry = LifecycleRegistry::new();
+        let control = detached_control(&registry, "config-overflow");
+        lock(&control.machine).config_revision = u64::MAX;
+        let before = machine_boundary_snapshot(&control);
+
+        assert!(matches!(
+            control.request_update(ConfigValue::string("must-not-commit")),
+            Err(CordisError::ConfigRevisionOverflow)
+        ));
+        assert_eq!(machine_boundary_snapshot(&control), before);
+    }
+
+    #[tokio::test]
+    async fn remove_overflow_preserves_provider_and_every_dependent() {
+        let registry = LifecycleRegistry::new();
+        let provider = registry.provide("remove-overflow", 1_u32).unwrap();
+        let factory = PluginFactory::new_lifecycle("remove-overflow-consumer", |_config, _ctx| {
+            LifecycleEffect::none()
+        })
+        .with_inject(["remove-overflow"]);
+        let left = registry
+            .mount(factory.clone(), ConfigValue::default())
+            .unwrap();
+        let right = registry.mount(factory, ConfigValue::default()).unwrap();
+        left.fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        right
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let left_control = left.control().unwrap();
+        let right_control = right.control().unwrap();
+        lock(&right_control.machine).next_ticket = u64::MAX;
+        let provider_before = provider_boundary_snapshot(&registry, "root", "remove-overflow");
+        let left_before = machine_boundary_snapshot(&left_control);
+        let right_before = machine_boundary_snapshot(&right_control);
+
+        assert!(matches!(
+            registry.begin_remove_provider(&provider),
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(
+            provider_boundary_snapshot(&registry, "root", "remove-overflow"),
+            provider_before
+        );
+        assert_eq!(machine_boundary_snapshot(&left_control), left_before);
+        assert_eq!(machine_boundary_snapshot(&right_control), right_before);
+        assert_eq!(registry.get::<u32>("remove-overflow").as_deref(), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn remove_reserves_completion_revision_before_marking() {
+        let registry = LifecycleRegistry::new();
+        let provider = registry.provide("remove-revision", 1_u32).unwrap();
+        {
+            let mut state = lock(&registry.inner.state);
+            state
+                .providers
+                .get_mut(&RuntimeProviderKey::new("root", "remove-revision"))
+                .unwrap()
+                .revision = u64::MAX - 1;
+        }
+        let before = provider_boundary_snapshot(&registry, "root", "remove-revision");
+
+        assert!(matches!(
+            registry.begin_remove_provider(&provider),
+            Err(CordisError::ProviderGenerationOverflow { .. })
+        ));
+        assert_eq!(
+            provider_boundary_snapshot(&registry, "root", "remove-revision"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn root_restart_delete_and_shutdown_overflow_leave_all_state_unchanged() {
+        let registry = LifecycleRegistry::new();
+        let factory = PluginFactory::new_lifecycle("batch-dispose-overflow", |_config, _ctx| {
+            LifecycleEffect::none()
+        });
+        let left = registry
+            .mount(factory.clone(), ConfigValue::default())
+            .unwrap();
+        let right = registry
+            .mount(factory.clone(), ConfigValue::default())
+            .unwrap();
+        left.fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        right
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let left_control = left.control().unwrap();
+        let right_control = right.control().unwrap();
+        lock(&right_control.machine).next_ticket = u64::MAX;
+        let runtime_before = runtime_boundary_snapshot(&registry, &factory);
+        let left_before = machine_boundary_snapshot(&left_control);
+        let right_before = machine_boundary_snapshot(&right_control);
+
+        assert!(matches!(
+            registry.restart_root().await,
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(
+            runtime_boundary_snapshot(&registry, &factory),
+            runtime_before
+        );
+        assert_eq!(machine_boundary_snapshot(&left_control), left_before);
+        assert_eq!(machine_boundary_snapshot(&right_control), right_before);
+        assert!(matches!(
+            registry.begin_delete_factory(&factory),
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(
+            runtime_boundary_snapshot(&registry, &factory),
+            runtime_before
+        );
+        assert_eq!(machine_boundary_snapshot(&left_control), left_before);
+        assert_eq!(machine_boundary_snapshot(&right_control), right_before);
+        assert!(matches!(
+            registry.begin_shutdown(),
+            Err(CordisError::TransitionTicketOverflow)
+        ));
+        assert_eq!(
+            runtime_boundary_snapshot(&registry, &factory),
+            runtime_before
+        );
+        assert_eq!(machine_boundary_snapshot(&left_control), left_before);
+        assert_eq!(machine_boundary_snapshot(&right_control), right_before);
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_providers_before_identity_or_slot_mutation() {
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+        let cleanup_tx = Arc::new(Mutex::new(Some(cleanup_tx)));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let registry = LifecycleRegistry::new();
+        let provider = registry.provide("kept-during-shutdown", 1_u32).unwrap();
+        let factory = PluginFactory::new_lifecycle("shutdown-provider-gate", {
+            let cleanup_tx = cleanup_tx.clone();
+            let release = release.clone();
+            move |_config, _ctx| {
+                let cleanup_tx = cleanup_tx.clone();
+                let release = release.clone();
+                LifecycleEffect::disposer(LifecycleDisposer::new(move || async move {
+                    let sender = lock(&cleanup_tx).take();
+                    if let Some(sender) = sender {
+                        let _ = sender.send(());
+                    }
+                    release.wait().await;
+                    Ok(())
+                }))
+            }
+        });
+        let handle = registry.mount(factory, ConfigValue::default()).unwrap();
+        handle
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let shutdown = registry.begin_shutdown().unwrap();
+        cleanup_rx.await.unwrap();
+        let before = provider_boundary_snapshot(&registry, "root", "kept-during-shutdown");
+
+        assert!(matches!(
+            registry.provide("zombie", 2_u32),
+            Err(CordisError::RuntimeShuttingDown)
+        ));
+        assert!(matches!(
+            registry.provide_guarded("guarded-zombie", 3_u32, |_value| Ok(true)),
+            Err(CordisError::RuntimeShuttingDown)
+        ));
+        assert!(matches!(
+            registry.replace_provider(&provider, 4_u32),
+            Err(CordisError::RuntimeShuttingDown)
+        ));
+        assert_eq!(
+            provider_boundary_snapshot(&registry, "root", "kept-during-shutdown"),
+            before
+        );
+        release.wait().await;
+        shutdown.await.unwrap();
+
+        let completed = provider_boundary_snapshot(&registry, "root", "kept-during-shutdown");
+        assert!(matches!(
+            registry.provide("completed-zombie", 5_u32),
+            Err(CordisError::RuntimeShuttingDown)
+        ));
+        assert!(matches!(
+            registry.provide_guarded("completed-guarded-zombie", 6_u32, |_value| Ok(true)),
+            Err(CordisError::RuntimeShuttingDown)
+        ));
+        assert!(matches!(
+            registry.replace_provider(&provider, 7_u32),
+            Err(CordisError::RuntimeShuttingDown)
+        ));
+        assert_eq!(
+            provider_boundary_snapshot(&registry, "root", "kept-during-shutdown"),
+            completed
+        );
     }
 }

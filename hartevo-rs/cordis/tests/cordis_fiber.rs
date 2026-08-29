@@ -158,8 +158,10 @@ async fn stale_context_view_and_dropped_dispose_waiter_cannot_publish_after_tomb
         }
     });
     let registry = LifecycleRegistry::new();
+    registry.provide("stale-read-target", 9_u32).unwrap();
     let handle = registry.mount(factory, ConfigValue::default()).unwrap();
     let view = view_rx.await.unwrap();
+    assert_eq!(view.get::<u32>("stale-read-target").as_deref(), Some(&9));
 
     let mut disposal = Box::pin(handle.dispose_async());
     assert!(disposal.as_mut().now_or_never().is_none());
@@ -173,6 +175,7 @@ async fn stale_context_view_and_dropped_dispose_waiter_cannot_publish_after_tomb
         view.provide("must-not-publish", 1_u32),
         Err(CordisError::StaleLifecycleView { .. })
     ));
+    assert!(view.get::<u32>("stale-read-target").is_none());
 
     release.wait().await;
     assert_eq!(
@@ -180,6 +183,47 @@ async fn stale_context_view_and_dropped_dispose_waiter_cannot_publish_after_tomb
         FiberState::Disposed
     );
     assert!(registry.get::<u32>("must-not-publish").is_none());
+}
+
+#[tokio::test]
+async fn context_view_dynamic_read_fails_after_ticket_replacement_without_tombstone() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (view_tx, view_rx) = tokio::sync::oneshot::channel();
+    let view_tx = Arc::new(Mutex::new(Some(view_tx)));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let factory = PluginFactory::new_lifecycle("stale-read-ticket", {
+        let calls = calls.clone();
+        let view_tx = view_tx.clone();
+        let release = release.clone();
+        move |_config, ctx| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                if let Some(sender) = view_tx.lock().unwrap().take() {
+                    let _ = sender.send(ctx.clone());
+                }
+                let release = release.clone();
+                LifecycleEffect::future(async move {
+                    release.wait().await;
+                    Ok(None)
+                })
+            } else {
+                LifecycleEffect::none()
+            }
+        }
+    });
+    let registry = LifecycleRegistry::new();
+    registry.provide("ticket-read-target", 13_u32).unwrap();
+    let handle = registry.mount(factory, ConfigValue::default()).unwrap();
+    let view = view_rx.await.unwrap();
+    assert_eq!(view.get::<u32>("ticket-read-target").as_deref(), Some(&13));
+
+    let mut update = Box::pin(handle.update(ConfigValue::string("new-ticket")));
+    assert!(update.as_mut().now_or_never().is_none());
+    assert!(!handle.fiber().is_disposed());
+    assert!(view.get::<u32>("ticket-read-target").is_none());
+    release.wait().await;
+
+    assert_eq!(update.await.unwrap().state(), FiberState::Active);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -722,6 +766,7 @@ async fn guard_false_and_typed_error_keep_dependency_pending_and_run_lock_free()
     let false_snapshot = consumer.await_current().await.unwrap();
     assert_eq!(false_snapshot.state(), FiberState::Pending);
     assert!(false_snapshot.diagnostics().is_empty());
+    assert!(registry.get::<u32>("guarded-dependency").is_none());
     let replacement = registry.replace_provider(&provider, 2_u32).unwrap();
     assert_eq!(replacement.generation(), 1);
 
@@ -736,6 +781,73 @@ async fn guard_false_and_typed_error_keep_dependency_pending_and_run_lock_free()
                     && source.as_ref() == &expected
         )
     }));
+}
+
+#[test]
+fn direct_provider_get_enforces_false_error_panic_and_reentrant_guards() {
+    let registry = LifecycleRegistry::new();
+    registry.provide("guard-reentrant-probe", 7_u8).unwrap();
+    registry
+        .provide_guarded("guard-false", 1_u32, {
+            let registry = registry.clone();
+            move |_value| {
+                assert_eq!(
+                    registry.get::<u8>("guard-reentrant-probe").as_deref(),
+                    Some(&7)
+                );
+                Ok(false)
+            }
+        })
+        .unwrap();
+    registry
+        .provide_guarded("guard-error", 2_u32, |_value| {
+            Err(CordisError::PayloadType {
+                name: "direct-get-guard-error".to_string(),
+            })
+        })
+        .unwrap();
+    registry
+        .provide_guarded("guard-panic", 3_u32, |_value| {
+            panic!("direct-get guard panic must be contained")
+        })
+        .unwrap();
+
+    assert!(registry.get::<u32>("guard-false").is_none());
+    assert!(registry.get::<u32>("guard-error").is_none());
+    assert!(registry.get::<u32>("guard-panic").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_provider_get_never_returns_a_stale_revision_after_guard_release() {
+    let (guard_tx, guard_rx) = tokio::sync::oneshot::channel();
+    let guard_tx = Arc::new(Mutex::new(Some(guard_tx)));
+    let guard_release = Arc::new(std::sync::Barrier::new(2));
+    let registry = LifecycleRegistry::new();
+    let provider = registry
+        .provide_guarded("guard-revision", 1_u32, {
+            let guard_tx = guard_tx.clone();
+            let guard_release = guard_release.clone();
+            move |_value| {
+                if let Some(sender) = guard_tx.lock().unwrap().take() {
+                    let _ = sender.send(());
+                    guard_release.wait();
+                }
+                Ok(true)
+            }
+        })
+        .unwrap();
+    let read = tokio::task::spawn_blocking({
+        let registry = registry.clone();
+        move || registry.get::<u32>("guard-revision")
+    });
+
+    guard_rx.await.unwrap();
+    let replacement = registry.replace_provider(&provider, 2_u32).unwrap();
+    guard_release.wait();
+
+    assert!(read.await.unwrap().is_none());
+    assert_eq!(replacement.generation(), 1);
+    assert_eq!(registry.get::<u32>("guard-revision").as_deref(), Some(&2));
 }
 
 #[tokio::test]
@@ -1307,6 +1419,24 @@ fn owned_async_begin_operations_fail_before_mutation_without_a_runtime() {
     let before = handle.snapshot();
 
     assert!(matches!(
+        handle.restart().now_or_never(),
+        Some(Err(CordisError::AsyncRuntimeUnavailable))
+    ));
+    assert!(matches!(
+        handle
+            .update(ConfigValue::string("forbidden"))
+            .now_or_never(),
+        Some(Err(CordisError::AsyncRuntimeUnavailable))
+    ));
+    assert!(matches!(
+        handle.dispose_async().now_or_never(),
+        Some(Err(CordisError::AsyncRuntimeUnavailable))
+    ));
+    assert!(matches!(
+        registry.restart_root().now_or_never(),
+        Some(Err(CordisError::AsyncRuntimeUnavailable))
+    ));
+    assert!(matches!(
         registry.begin_remove_provider(&provider),
         Err(CordisError::AsyncRuntimeUnavailable)
     ));
@@ -1321,4 +1451,54 @@ fn owned_async_begin_operations_fail_before_mutation_without_a_runtime() {
     assert_eq!(handle.snapshot(), before);
     assert_eq!(registry.runtime_count(), 1);
     assert_eq!(registry.get::<u32>("runtime-required").as_deref(), Some(&1));
+}
+
+#[test]
+fn lifecycle_commands_reject_a_replacement_runtime_without_mutation_or_waiting() {
+    let original_runtime = tokio::runtime::Runtime::new().unwrap();
+    let (registry, handle) = original_runtime.block_on(async {
+        let registry = LifecycleRegistry::new();
+        let handle = registry
+            .mount(
+                PluginFactory::new_lifecycle("runtime-identity", |_config, _ctx| {
+                    LifecycleEffect::none()
+                }),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        handle
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        (registry, handle)
+    });
+    drop(original_runtime);
+    let before = handle.snapshot();
+    let runtime_count = registry.runtime_count();
+
+    let replacement_runtime = tokio::runtime::Runtime::new().unwrap();
+    replacement_runtime.block_on(async {
+        assert!(matches!(
+            handle.restart().now_or_never(),
+            Some(Err(CordisError::AsyncRuntimeUnavailable))
+        ));
+        assert!(matches!(
+            handle
+                .update(ConfigValue::string("must-not-commit"))
+                .now_or_never(),
+            Some(Err(CordisError::AsyncRuntimeUnavailable))
+        ));
+        assert!(matches!(
+            handle.dispose_async().now_or_never(),
+            Some(Err(CordisError::AsyncRuntimeUnavailable))
+        ));
+        assert!(matches!(
+            registry.restart_root().now_or_never(),
+            Some(Err(CordisError::AsyncRuntimeUnavailable))
+        ));
+    });
+
+    assert_eq!(handle.snapshot(), before);
+    assert_eq!(registry.runtime_count(), runtime_count);
 }

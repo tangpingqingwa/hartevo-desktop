@@ -315,6 +315,8 @@ pub enum CordisError {
     NonRepeatableFactory { ids: Vec<crate::loader::PluginId> },
     #[error("lifecycle runtime is not running inside Tokio")]
     AsyncRuntimeUnavailable,
+    #[error("lifecycle runtime is shutting down")]
+    RuntimeShuttingDown,
     #[error("lifecycle transition ticket allocation overflowed")]
     TransitionTicketOverflow,
     #[error("plugin config revision overflowed")]
