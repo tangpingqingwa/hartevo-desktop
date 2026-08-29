@@ -308,9 +308,9 @@ pub enum CordisError {
     InvalidAuthorityRevision { field: &'static str },
     #[error("Cordis authority digest `{field}` must be canonical lowercase sha256")]
     InvalidAuthorityDigest { field: &'static str },
-    #[error("Cordis Runtime dispatch requires an exact bound authority scope")]
+    #[error("Cordis authority dispatch requires an exact bound authority scope")]
     AuthorityScopeUnbound,
-    #[error("Cordis Runtime dispatch scope does not match the bound Domain scope")]
+    #[error("Cordis authority dispatch scope does not match the bound Domain scope")]
     AuthorityScopeMismatch,
     #[error("Cordis Runtime dispatch scope has no durable Runtime binding")]
     RuntimeAuthorityUnbound,
@@ -332,6 +332,16 @@ pub enum CordisError {
     DomainCommandSerialOverflow,
     #[error("Cordis Domain command coordinator mutex is poisoned")]
     DomainCommandCoordinatorPoisoned,
+    #[error("Cordis Effect execution scope must not carry Runtime authority")]
+    EffectExecutionRuntimeBound,
+    #[error("Cordis Effect execution dispatch is already active")]
+    EffectExecutionDispatchBusy,
+    #[error("Cordis Effect execution permit does not match the active operation")]
+    EffectExecutionPermitMismatch,
+    #[error("Cordis Effect execution serial overflowed")]
+    EffectExecutionSerialOverflow,
+    #[error("Cordis Effect execution coordinator mutex is poisoned")]
+    EffectExecutionCoordinatorPoisoned,
     #[error("service key `{key}` is reserved to its mounted authority owner")]
     ReservedServiceKey { key: String },
     #[error("surface `{key}` cannot be mounted by authority owner `{owner}`")]

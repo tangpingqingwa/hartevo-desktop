@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 use crate::authority::{
     AuthorityScope, DomainCommandBinding, DomainCommandLease, DomainCommandPermit,
-    RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
+    EffectExecutionBinding, EffectExecutionLease, EffectExecutionPermit, RuntimeDispatchCompletion,
+    RuntimeDispatchLease, RuntimeDispatchPermit,
 };
 use crate::context::{Context, CordisError, TeardownTransaction, keys};
 use crate::invariants::{
@@ -39,6 +40,8 @@ pub struct CordisHost {
     bound_scope: Option<AuthorityScope>,
     active_domain_command: Option<ActiveDomainCommand>,
     next_domain_command_serial: u64,
+    active_effect_execution: Option<ActiveEffectExecution>,
+    next_effect_execution_serial: u64,
     active_runtime: Option<ActiveRuntimeDispatch>,
     next_runtime_serial: u64,
 }
@@ -49,6 +52,14 @@ struct ActiveDomainCommand {
     scope: AuthorityScope,
     command: DomainCommandBinding,
     lease: std::sync::Arc<DomainCommandLease>,
+}
+
+#[derive(Debug)]
+struct ActiveEffectExecution {
+    serial: u64,
+    scope: AuthorityScope,
+    binding: EffectExecutionBinding,
+    lease: std::sync::Arc<EffectExecutionLease>,
 }
 
 #[derive(Debug)]
@@ -68,6 +79,11 @@ impl std::fmt::Debug for CordisHost {
             .field(
                 "next_domain_command_serial",
                 &self.next_domain_command_serial,
+            )
+            .field("active_effect_execution", &self.active_effect_execution)
+            .field(
+                "next_effect_execution_serial",
+                &self.next_effect_execution_serial,
             )
             .field("active_runtime", &self.active_runtime)
             .field("next_runtime_serial", &self.next_runtime_serial)
@@ -91,6 +107,8 @@ impl CordisHost {
             bound_scope: None,
             active_domain_command: None,
             next_domain_command_serial: 0,
+            active_effect_execution: None,
+            next_effect_execution_serial: 0,
             active_runtime: None,
             next_runtime_serial: 0,
         })
@@ -129,6 +147,8 @@ impl CordisHost {
                 bound_scope: None,
                 active_domain_command: None,
                 next_domain_command_serial: 0,
+                active_effect_execution: None,
+                next_effect_execution_serial: 0,
                 active_runtime: None,
                 next_runtime_serial: 0,
             },
@@ -166,9 +186,13 @@ impl CordisHost {
         scope: &AuthorityScope,
     ) -> Result<RuntimeDispatchPermit, CordisError> {
         self.reap_abandoned_domain_command();
+        self.reap_abandoned_effect_execution();
         self.reap_abandoned_runtime();
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
+        }
+        if self.active_effect_execution.is_some() {
+            return Err(CordisError::EffectExecutionDispatchBusy);
         }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
@@ -258,9 +282,13 @@ impl CordisHost {
         command: DomainCommandBinding,
     ) -> Result<DomainCommandPermit, CordisError> {
         self.reap_abandoned_domain_command();
+        self.reap_abandoned_effect_execution();
         self.reap_abandoned_runtime();
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
+        }
+        if self.active_effect_execution.is_some() {
+            return Err(CordisError::EffectExecutionDispatchBusy);
         }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
@@ -313,7 +341,77 @@ impl CordisHost {
         Ok(())
     }
 
-    /// External write path. Invariants must pass; OpenInterpreter cannot write.
+    /// Issue a one-shot permit for one exact, already-approved Effect.
+    ///
+    /// Cordis validates only the bound scope, immutable digests, and host-side
+    /// invariants. Desktop must release its mutex before Application gives the
+    /// real Effect Broker an executor and independent verifier.
+    pub fn authorize_effect_execution(
+        &mut self,
+        scope: &AuthorityScope,
+        binding: EffectExecutionBinding,
+    ) -> Result<EffectExecutionPermit, CordisError> {
+        self.reap_abandoned_domain_command();
+        self.reap_abandoned_effect_execution();
+        self.reap_abandoned_runtime();
+        if self.active_domain_command.is_some() {
+            return Err(CordisError::DomainCommandDispatchBusy);
+        }
+        if self.active_runtime.is_some() {
+            return Err(CordisError::RuntimeDispatchBusy);
+        }
+        if self.active_effect_execution.is_some() {
+            return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if scope.runtime().is_some() {
+            return Err(CordisError::EffectExecutionRuntimeBound);
+        }
+        let Some(bound_scope) = self.bound_scope.as_ref() else {
+            return Err(CordisError::AuthorityScopeUnbound);
+        };
+        if bound_scope != scope {
+            return Err(CordisError::AuthorityScopeMismatch);
+        }
+        host_is_cordis_loop(self)?;
+        apply_effect(&self.ctx)?;
+
+        let serial = self
+            .next_effect_execution_serial
+            .checked_add(1)
+            .ok_or(CordisError::EffectExecutionSerialOverflow)?;
+        let (permit, lease) = EffectExecutionPermit::issue(serial, scope.clone(), binding.clone());
+        self.next_effect_execution_serial = serial;
+        self.active_effect_execution = Some(ActiveEffectExecution {
+            serial,
+            scope: scope.clone(),
+            binding,
+            lease,
+        });
+        Ok(permit)
+    }
+
+    /// Settle one exact Effect execution after Application/Broker returns.
+    pub fn finish_effect_execution(
+        &mut self,
+        permit: EffectExecutionPermit,
+    ) -> Result<(), CordisError> {
+        self.reap_abandoned_effect_execution();
+        let Some(active) = self.active_effect_execution.as_ref() else {
+            return Err(CordisError::EffectExecutionPermitMismatch);
+        };
+        if active.serial != permit.serial()
+            || active.scope != *permit.scope()
+            || active.binding != *permit.binding()
+            || !permit.owns_lease(&active.lease)
+        {
+            return Err(CordisError::EffectExecutionPermitMismatch);
+        }
+        self.active_effect_execution = None;
+        permit.complete();
+        Ok(())
+    }
+
+    /// Legacy symbolic Effect invariant probe. It never executes a provider.
     pub fn apply_effect(&self) -> Result<(), CordisError> {
         apply_effect(&self.ctx)
     }
@@ -331,12 +429,16 @@ impl CordisHost {
         now: DateTime<Utc>,
     ) -> Result<(), CordisError> {
         self.reap_abandoned_domain_command();
+        self.reap_abandoned_effect_execution();
         self.reap_abandoned_runtime();
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
+        }
+        if self.active_effect_execution.is_some() {
+            return Err(CordisError::EffectExecutionDispatchBusy);
         }
         self.bound_scope = None;
         self.bind_domain_kernel_facts(consent, record, approval, now)
@@ -352,12 +454,16 @@ impl CordisHost {
         now: DateTime<Utc>,
     ) -> Result<(), CordisError> {
         self.reap_abandoned_domain_command();
+        self.reap_abandoned_effect_execution();
         self.reap_abandoned_runtime();
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
+        }
+        if self.active_effect_execution.is_some() {
+            return Err(CordisError::EffectExecutionDispatchBusy);
         }
         self.bind_domain_kernel_facts(consent, record, approval, now)?;
         self.bound_scope = Some(scope);
@@ -402,6 +508,14 @@ impl CordisHost {
     }
 
     #[must_use]
+    pub fn active_effect_execution_scope(&self) -> Option<&AuthorityScope> {
+        self.active_effect_execution
+            .as_ref()
+            .filter(|active| active.lease.is_active())
+            .map(|active| &active.scope)
+    }
+
+    #[must_use]
     pub fn runtime_plugin(&self) -> Option<&'static str> {
         self.ctx
             .runtime::<RuntimeSurface>()
@@ -426,6 +540,9 @@ impl CordisHost {
             return;
         };
         if let Some(active) = self.active_domain_command.take() {
+            active.lease.release();
+        }
+        if let Some(active) = self.active_effect_execution.take() {
             active.lease.release();
         }
         if let Some(active) = self.active_runtime.take() {
@@ -474,6 +591,16 @@ impl CordisHost {
             .is_some_and(|active| !active.lease.is_active())
         {
             self.active_domain_command = None;
+        }
+    }
+
+    fn reap_abandoned_effect_execution(&mut self) {
+        if self
+            .active_effect_execution
+            .as_ref()
+            .is_some_and(|active| !active.lease.is_active())
+        {
+            self.active_effect_execution = None;
         }
     }
 }

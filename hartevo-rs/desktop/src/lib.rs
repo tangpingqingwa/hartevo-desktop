@@ -403,6 +403,7 @@ impl UiFailure {
             | DesktopDataError::InvalidVm11NextContractResolution
             | DesktopDataError::InvalidEffectProposal
             | DesktopDataError::InvalidWaitingApprovalGrant
+            | DesktopDataError::InvalidApprovedEffectExecution
             | DesktopDataError::InvalidBrowserWorkspaceContinue
             | DesktopDataError::InvalidCreatorDeliverableReview => Self::coded(
                 "WAITING_USER",
@@ -488,6 +489,8 @@ impl UiFailure {
                 | ApplicationError::ProposedEffectApprovalCommandMismatch
                 | ApplicationError::ProposedEffectApprovalUnavailable
                 | ApplicationError::ProposedEffectApprovalDigestMismatch
+                | ApplicationError::EffectExecutionCommandMismatch
+                | ApplicationError::EffectExecutionAuthorityMismatch
                 | ApplicationError::CreatorDeliverableReviewCommandMismatch
                 | ApplicationError::CreatorDeliverableReviewUnavailable
                 | ApplicationError::CreatorTaskRevisionMismatch { .. }

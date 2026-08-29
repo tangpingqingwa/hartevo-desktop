@@ -32,7 +32,8 @@ mod surface;
 pub use agent::{AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
-    DomainCommandBinding, DomainCommandKind, DomainCommandPermit, RuntimeAuthority, RuntimeBinding,
+    DomainCommandBinding, DomainCommandKind, DomainCommandPermit, EffectExecutionAuthority,
+    EffectExecutionBinding, EffectExecutionPermit, RuntimeAuthority, RuntimeBinding,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
 };
 pub use config::{ConfigValue, InterpolateError};

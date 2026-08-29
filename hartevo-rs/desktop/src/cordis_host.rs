@@ -1,4 +1,4 @@
-//! One-call-site Cordis mount and typed Domain/Runtime adapters for Desktop.
+//! One-call-site Cordis mount and typed Domain/Effect/Runtime adapters for Desktop.
 //!
 //! Production Runtime enters through [`dispatch_live_runtime`]: Cordis issues
 //! a short-lived scoped permit, Desktop releases the host lock, and the real
@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, DomainCommandAuthority,
-    DomainCommandBinding, DomainCommandPermit, Fiber, FiberState, FiberUid, KernelApproval,
-    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
-    RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
+    DomainCommandBinding, DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding,
+    EffectExecutionPermit, Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision,
+    KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -207,6 +208,15 @@ impl DesktopCordisCoordinator {
         self.host.authorize_domain_command(&scope, command)
     }
 
+    fn authorize_bound_effect_execution(
+        &mut self,
+        binding: DesktopCordisBindingReceipt,
+        effect: EffectExecutionBinding,
+    ) -> Result<EffectExecutionPermit, CordisError> {
+        let scope = self.consume_binding(binding)?;
+        self.host.authorize_effect_execution(&scope, effect)
+    }
+
     fn bind_and_authorize_runtime(
         &mut self,
         scope: AuthorityScope,
@@ -232,6 +242,19 @@ impl DesktopCordisCoordinator {
         self.authorize_bound_domain_command(binding, command)
     }
 
+    fn bind_and_authorize_effect_execution(
+        &mut self,
+        scope: AuthorityScope,
+        consent: KernelConsentState,
+        record: Option<KernelConsentRecord>,
+        approval: Option<KernelApproval>,
+        effect: EffectExecutionBinding,
+        now: DateTime<Utc>,
+    ) -> Result<EffectExecutionPermit, CordisError> {
+        let binding = self.bind_domain_kernel_scope(scope, consent, record, approval, now)?;
+        self.authorize_bound_effect_execution(binding, effect)
+    }
+
     fn finish_runtime(
         &mut self,
         permit: RuntimeDispatchPermit,
@@ -241,6 +264,13 @@ impl DesktopCordisCoordinator {
 
     fn finish_domain_command(&mut self, permit: DomainCommandPermit) -> Result<(), CordisError> {
         self.host.finish_domain_command(permit)
+    }
+
+    fn finish_effect_execution(
+        &mut self,
+        permit: EffectExecutionPermit,
+    ) -> Result<(), CordisError> {
+        self.host.finish_effect_execution(permit)
     }
 
     #[cfg(test)]
@@ -433,6 +463,30 @@ where
     }
 }
 
+/// Private Desktop adapter for one Cordis-authorized Effect Broker execution.
+struct DesktopEffectExecutionAuthority<Execute> {
+    execute: Execute,
+}
+
+impl<Execute> DesktopEffectExecutionAuthority<Execute> {
+    fn new(execute: Execute) -> Self {
+        Self { execute }
+    }
+}
+
+impl<Execute, Output, AdapterError> EffectExecutionAuthority
+    for DesktopEffectExecutionAuthority<Execute>
+where
+    Execute: FnOnce(&EffectExecutionPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn execute(self, permit: &EffectExecutionPermit) -> Result<Self::Output, Self::Error> {
+        (self.execute)(permit)
+    }
+}
+
 /// Exact Cordis scope plus the single Domain command admitted in that scope.
 pub(crate) struct DesktopDomainCommandAuthorization {
     scope: AuthorityScope,
@@ -442,6 +496,18 @@ pub(crate) struct DesktopDomainCommandAuthorization {
 impl DesktopDomainCommandAuthorization {
     pub(crate) fn new(scope: AuthorityScope, command: DomainCommandBinding) -> Self {
         Self { scope, command }
+    }
+}
+
+/// Exact Cordis scope plus the immutable approved Effect fence admitted in it.
+pub(crate) struct DesktopEffectExecutionAuthorization {
+    scope: AuthorityScope,
+    effect: EffectExecutionBinding,
+}
+
+impl DesktopEffectExecutionAuthorization {
+    pub(crate) fn new(scope: AuthorityScope, effect: EffectExecutionBinding) -> Self {
+        Self { scope, effect }
     }
 }
 
@@ -545,6 +611,52 @@ where
     }
 }
 
+/// Bind exact live facts, issue a one-shot Effect-execution permit, release the
+/// coordinator lock for Application/Broker/provider work, then settle under a
+/// second short lock. Cordis receives no external-write capability or result.
+pub(crate) fn dispatch_live_effect_execution<Execute, Output, AdapterError>(
+    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    authorization: DesktopEffectExecutionAuthorization,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: &Approval,
+    now: DateTime<Utc>,
+    execute: Execute,
+) -> Result<Output, AuthorityDispatchError<AdapterError>>
+where
+    Execute: FnOnce(&EffectExecutionPermit) -> Result<Output, AdapterError>,
+{
+    let DesktopEffectExecutionAuthorization { scope, effect } = authorization;
+    let permit = {
+        let mut host = cordis
+            .lock()
+            .map_err(|_| CordisError::EffectExecutionCoordinatorPoisoned)?;
+        host.bind_and_authorize_effect_execution(
+            scope,
+            kernel_consent_state(consent),
+            record.map(kernel_consent_record),
+            Some(kernel_approval(approval)),
+            effect,
+            now,
+        )?
+    };
+    let (output, authority) = match DesktopEffectExecutionAuthority::new(execute).execute(&permit) {
+        Ok(output) => (Some(output), None),
+        Err(error) => (None, Some(error)),
+    };
+    let finish = match cordis.lock() {
+        Ok(mut host) => host.finish_effect_execution(permit).err(),
+        Err(_) => Some(CordisError::EffectExecutionCoordinatorPoisoned),
+    };
+    if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
+        Err(error)
+    } else {
+        output.ok_or_else(|| {
+            AuthorityDispatchError::Cordis(Box::new(CordisError::EffectExecutionPermitMismatch))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -560,9 +672,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use hartevo_cordis::{
         AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
-        DomainCommandBinding, DomainCommandKind, DomainSurface, FiberState, OPENINTERPRETER,
-        RuntimeBinding, SurfaceOwner, enforce_invariants, events, host_is_cordis_loop,
-        invariant_missing, keys,
+        DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding, FiberState,
+        OPENINTERPRETER, RuntimeBinding, SurfaceOwner, enforce_invariants, events,
+        host_is_cordis_loop, invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -572,8 +684,9 @@ mod tests {
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
 
     use super::{
-        DesktopDomainCommandAuthorization, bind_live_domain_kernel, bind_live_domain_kernel_scope,
-        dispatch_live_domain_command, dispatch_live_runtime, mount_cordis_host,
+        DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
+        bind_live_domain_kernel, bind_live_domain_kernel_scope, dispatch_live_domain_command,
+        dispatch_live_effect_execution, dispatch_live_runtime, mount_cordis_host,
         openinterpreter_runtime_plugin,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
@@ -614,6 +727,10 @@ mod tests {
 
     fn approval_command() -> DomainCommandBinding {
         DomainCommandBinding::approve_proposed_effect("effect-a", "a".repeat(64)).unwrap()
+    }
+
+    fn effect_execution() -> EffectExecutionBinding {
+        EffectExecutionBinding::new("effect-a", "a".repeat(64), "b".repeat(64)).unwrap()
     }
 
     fn assert_emit_source(error: &CordisError, expected: &'static str) {
@@ -892,6 +1009,75 @@ mod tests {
         assert_eq!(output, "application-domain-command");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(host.lock().unwrap().active_domain_command_scope().is_none());
+    }
+
+    #[test]
+    fn desktop_effect_execution_releases_lock_and_calls_application_once() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let probe = Arc::clone(&host);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let nested_calls = Arc::new(AtomicUsize::new(0));
+        let observed_nested_calls = Arc::clone(&nested_calls);
+        let expected_scope = domain_scope();
+        let expected_binding = effect_execution();
+        let approval = approved(now() + Duration::minutes(5));
+        let nested_approval = approval.clone();
+
+        let output = dispatch_live_effect_execution(
+            &host,
+            DesktopEffectExecutionAuthorization::new(
+                expected_scope.clone(),
+                expected_binding.clone(),
+            ),
+            &ConsentState::Confirmed,
+            None,
+            &approval,
+            now(),
+            move |permit| {
+                assert_eq!(permit.scope(), &expected_scope);
+                assert_eq!(permit.binding(), &expected_binding);
+                assert!(
+                    probe.try_lock().is_ok(),
+                    "Application/Broker must run without the Cordis coordinator lock"
+                );
+                let nested = dispatch_live_effect_execution(
+                    &probe,
+                    DesktopEffectExecutionAuthorization::new(
+                        permit.scope().clone(),
+                        permit.binding().clone(),
+                    ),
+                    &ConsentState::Confirmed,
+                    None,
+                    &nested_approval,
+                    now(),
+                    move |_| {
+                        observed_nested_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, &'static str>(())
+                    },
+                );
+                assert_eq!(
+                    nested.unwrap_err(),
+                    AuthorityDispatchError::Cordis(Box::new(
+                        CordisError::EffectExecutionDispatchBusy
+                    ))
+                );
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, &'static str>("application-effect-broker")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, "application-effect-broker");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(nested_calls.load(Ordering::SeqCst), 0);
+        let host = host.lock().unwrap();
+        assert!(host.active_effect_execution_scope().is_none());
+        assert!(host.active_domain_command_scope().is_none());
+        assert!(host.active_runtime_scope().is_none());
     }
 
     #[test]
