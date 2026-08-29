@@ -22,7 +22,7 @@ use crate::service::Service;
 use crate::surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
     LlmSurface, RuntimeSurface, SurfaceOwner, ToolsSurface, events, map_surfaces,
-    rebind_hartevo_domain, trusted_surface_authority,
+    rebind_hartevo_domain,
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
@@ -66,8 +66,7 @@ impl CordisHost {
     /// [`RuntimeSurface::plugin`]. Domain and Effect stay Hartevo-owned.
     pub fn boot(openinterpreter: bool) -> Result<Self, CordisError> {
         let mut ctx = Context::new();
-        let authority = trusted_surface_authority();
-        map_surfaces(&mut ctx, authority, desktop_surfaces(openinterpreter))?;
+        map_surfaces(&mut ctx, desktop_surfaces(openinterpreter))?;
         ctx.mount(AgentLoop)?;
         ctx.mount(InvariantGate)?;
         Ok(Self {
@@ -85,10 +84,9 @@ impl CordisHost {
         openinterpreter: bool,
     ) -> Result<(Self, LoadReport), CordisError> {
         let mut ctx = Context::new();
-        let authority = trusted_surface_authority();
         let mapping_surfaces = desktop_surfaces(openinterpreter);
         let mapping = PluginSpec::new("surfaces", move |_config, ctx| {
-            map_surfaces(ctx, authority, mapping_surfaces)
+            map_surfaces(ctx, mapping_surfaces)
         });
         let loop_plugin = PluginSpec::new("agent-loop", |_config, ctx| AgentLoop.apply(ctx))
             .with_inject(AgentLoop::inject().iter().copied());
@@ -280,8 +278,7 @@ impl CordisHost {
             ]));
         };
         let bound = bind_domain_kernel_facts(*mounted, consent, record, approval, now);
-        let authority = trusted_surface_authority();
-        rebind_hartevo_domain(&mut self.ctx, authority, bound)
+        rebind_hartevo_domain(&mut self.ctx, bound)
     }
 
     #[must_use]

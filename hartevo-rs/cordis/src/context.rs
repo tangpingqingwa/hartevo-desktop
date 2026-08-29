@@ -17,7 +17,7 @@ use crate::fiber::{Fiber, FiberState, FiberUid};
 use crate::loader::{PluginFactory, PluginFactoryId};
 use crate::registry::{PendingEntry, Registry};
 use crate::service::Service;
-use crate::surface::HartevoSurfaceAuthority;
+use crate::surface::{DomainSurface, HartevoSurfaceAuthority};
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -278,6 +278,13 @@ pub enum CordisError {
     FiberContextMismatch { uid: FiberUid },
     #[error("Fiber `{uid}` is disposed")]
     FiberDisposed { uid: FiberUid },
+    #[error("Fiber `{requested}` is outside the active Fiber `{current}` scope")]
+    FiberScopeViolation {
+        current: FiberUid,
+        requested: FiberUid,
+    },
+    #[error("Fiber `{uid}` cannot be disposed while its activation callback is running")]
+    FiberBusy { uid: FiberUid },
     #[error("provider generation for `{key}` overflowed")]
     ProviderGenerationOverflow { key: String },
     #[error("provider identity allocation overflowed")]
@@ -289,6 +296,15 @@ pub enum CordisError {
         id: PluginFactoryId,
         #[source]
         source: Box<CordisError>,
+    },
+    #[error("plugin callback panicked: {message}")]
+    PluginCallbackPanicked { message: String },
+    #[error("registration cleanup panicked: {message}")]
+    CleanupPanicked { message: String },
+    #[error("cleanup also failed after `{failure}`: {cleanup}")]
+    CleanupAfterFailure {
+        failure: Box<CordisError>,
+        cleanup: Box<CordisError>,
     },
     #[error("pending factory notification failed after committing {handle:?}: {source}")]
     PendingNotification {
@@ -382,8 +398,8 @@ impl Context {
 
     /// Allocate a child Fiber with a distinct monotonic uid.
     pub fn new_fiber(&mut self) -> Result<Fiber, CordisError> {
-        let root = self.root.clone();
-        self.child_fiber(&root)
+        let parent = self.current_fiber_handle()?;
+        self.child_fiber(&parent)
     }
 
     /// Allocate a child Fiber below `parent`.
@@ -400,6 +416,12 @@ impl Context {
         if parent.is_disposed() {
             return Err(CordisError::FiberDisposed { uid: parent.uid() });
         }
+        if !self.current_scope_allows(parent) {
+            return Err(CordisError::FiberScopeViolation {
+                current: self.current_fiber,
+                requested: parent.uid(),
+            });
+        }
         let fiber = Fiber::child_with_namespace(self.id, parent, namespace);
         if parent.uid() == self.root.uid() {
             fiber.replace_metadata(self.vars.clone());
@@ -414,9 +436,7 @@ impl Context {
     /// remains fail-closed.
     pub fn with_fiber<'a>(&'a mut self, fiber: &Fiber) -> ContextView<'a> {
         let context_valid = fiber.context_id() == self.id;
-        if context_valid && fiber.uid() != self.root.uid() {
-            self.fibers.insert(fiber.uid(), fiber.clone());
-        }
+        let scope_valid = context_valid && self.current_scope_allows(fiber);
         ContextView {
             context: self,
             fiber: fiber.clone(),
@@ -424,6 +444,7 @@ impl Context {
             shared_namespaces: Vec::new(),
             metadata: fiber.metadata_snapshot(),
             context_valid,
+            scope_valid,
         }
     }
 
@@ -457,6 +478,44 @@ impl Context {
             Some(fiber) => Err(CordisError::FiberDisposed { uid: fiber.uid() }),
             None => Err(CordisError::FiberContextMismatch { uid: owner_uid }),
         }
+    }
+
+    fn current_fiber_handle(&self) -> Result<Fiber, CordisError> {
+        self.ensure_owner_active(self.current_fiber)?;
+        if self.current_fiber == self.root.uid() {
+            Ok(self.root.clone())
+        } else {
+            self.fibers
+                .get(&self.current_fiber)
+                .cloned()
+                .ok_or(CordisError::FiberDisposed {
+                    uid: self.current_fiber,
+                })
+        }
+    }
+
+    /// During a factory callback, ownership may move only to that Fiber or a
+    /// descendant. This blocks a callback from switching to root or a sibling
+    /// while retaining normal root-context behavior outside activation.
+    fn current_scope_allows(&self, fiber: &Fiber) -> bool {
+        if self.activation_depth == 0 || self.current_fiber == self.root.uid() {
+            return true;
+        }
+        if fiber.context_id() != self.id || fiber.is_disposed() {
+            return false;
+        }
+        let mut cursor = Some(fiber.uid());
+        while let Some(uid) = cursor {
+            if uid == self.current_fiber {
+                return true;
+            }
+            cursor = if uid == fiber.uid() {
+                fiber.parent_uid()
+            } else {
+                self.fibers.get(&uid).and_then(Fiber::parent_uid)
+            };
+        }
+        false
     }
 
     /// Fiber currently used by direct Context mutations. Factory callbacks
@@ -530,6 +589,37 @@ impl Context {
         config.interpolate(&fiber.metadata_snapshot())
     }
 
+    fn begin_activation(&mut self, id: PluginFactoryId) {
+        self.activating_factories.insert(id);
+        self.activation_depth = self.activation_depth.saturating_add(1);
+    }
+
+    fn end_activation(&mut self, id: PluginFactoryId) {
+        self.activation_depth = self.activation_depth.saturating_sub(1);
+        self.activating_factories.remove(&id);
+    }
+
+    fn failed_activation(
+        &mut self,
+        id: PluginFactoryId,
+        fiber: &Fiber,
+        failure: CordisError,
+    ) -> CordisError {
+        self.end_activation(id);
+        fiber.dispose();
+        let source = match self.cleanup_fiber(fiber) {
+            Ok(()) => failure,
+            Err(cleanup) => CordisError::CleanupAfterFailure {
+                failure: Box::new(failure),
+                cleanup: Box::new(cleanup),
+            },
+        };
+        CordisError::PluginActivation {
+            id,
+            source: Box::new(source),
+        }
+    }
+
     fn has_in_namespace(&self, namespace: &str, key: &str) -> bool {
         self.providers
             .contains_key(&ProviderKey::new(namespace, key))
@@ -585,16 +675,15 @@ impl Context {
             return Ok(handle);
         }
         fiber.activate();
-        self.activating_factories.insert(handle.factory_id);
-        self.activation_depth += 1;
+        self.begin_activation(handle.factory_id);
         let config = match Self::interpolate_plugin_config_for_fiber(&fiber, &config) {
             Ok(config) => config,
             Err(error) => {
-                self.activation_depth -= 1;
-                self.activating_factories.remove(&handle.factory_id);
-                fiber.dispose();
-                self.cleanup_fiber(&fiber);
-                return Err(error.into());
+                return Err(self.failed_activation(
+                    handle.factory_id,
+                    &fiber,
+                    CordisError::from(error),
+                ));
             }
         };
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -603,25 +692,22 @@ impl Context {
         let result = match result {
             Ok(result) => result,
             Err(payload) => {
-                self.activation_depth -= 1;
-                self.activating_factories.remove(&handle.factory_id);
-                fiber.dispose();
-                self.cleanup_fiber(&fiber);
-                resume_unwind(payload);
+                return Err(self.failed_activation(
+                    handle.factory_id,
+                    &fiber,
+                    CordisError::PluginCallbackPanicked {
+                        message: panic_payload_message(payload.as_ref()),
+                    },
+                ));
             }
         };
         if let Err(source) = result {
-            self.activation_depth -= 1;
-            self.activating_factories.remove(&handle.factory_id);
-            fiber.dispose();
-            self.cleanup_fiber(&fiber);
-            return Err(CordisError::PluginActivation {
-                id: handle.factory_id,
-                source: Box::new(source),
-            });
+            return Err(self.failed_activation(handle.factory_id, &fiber, source));
         }
-        self.activation_depth -= 1;
-        self.activating_factories.remove(&handle.factory_id);
+        self.end_activation(handle.factory_id);
+        if fiber.is_disposed() || !self.fibers.contains_key(&fiber.uid()) {
+            return Err(CordisError::FiberDisposed { uid: fiber.uid() });
+        }
         self.mounted_factories
             .insert(handle.factory_id, fiber.clone());
         if let Err(source) = self.notify_pending() {
@@ -635,8 +721,9 @@ impl Context {
 
     /// Mount a repeatable factory and retain it if dependencies are missing.
     pub fn mount_pending(&mut self, factory: PluginFactory) -> Result<PendingHandle, CordisError> {
-        let root = self.root.clone();
-        self.new_pending_handle(factory, &root, "root".to_string())
+        let parent = self.current_fiber_handle()?;
+        let namespace = parent.namespace();
+        self.new_pending_handle(factory, &parent, namespace)
     }
 
     fn mount_pending_in_namespace(
@@ -659,10 +746,14 @@ impl Context {
     pub fn dispose_fiber(&mut self, fiber: &Fiber) -> Result<bool, CordisError> {
         self.validate_fiber(fiber)?;
         if fiber.uid() == self.root.uid() {
+            if self.activation_depth != 0 {
+                return Err(CordisError::FiberBusy {
+                    uid: self.current_fiber,
+                });
+            }
             self.teardown();
             return Ok(true);
         }
-        let changed = fiber.dispose();
         let mut disposed = HashSet::from([fiber.uid()]);
         loop {
             let descendants: Vec<FiberUid> = self
@@ -681,24 +772,26 @@ impl Context {
             }
             disposed.extend(descendants);
         }
+        let changed = fiber.dispose();
         for candidate in self.fibers.values() {
             if disposed.contains(&candidate.uid()) {
                 candidate.dispose();
             }
         }
-        self.cleanup_fibers(&disposed);
+        let cleanup = self.cleanup_fibers(&disposed);
         self.notify_pending()?;
+        cleanup?;
         Ok(changed)
     }
 
     /// Remove all Context-owned records for a terminal child without asking
     /// the pending registry to activate another factory. Activation failures
     /// use this form so no partial callback registration can leak.
-    fn cleanup_fiber(&mut self, fiber: &Fiber) {
-        self.cleanup_fibers(&HashSet::from([fiber.uid()]));
+    fn cleanup_fiber(&mut self, fiber: &Fiber) -> Result<(), CordisError> {
+        self.cleanup_fibers(&HashSet::from([fiber.uid()]))
     }
 
-    fn cleanup_fibers(&mut self, disposed: &HashSet<FiberUid>) {
+    fn cleanup_fibers(&mut self, disposed: &HashSet<FiberUid>) -> Result<(), CordisError> {
         for uid in disposed {
             self.registry.remove_fiber(*uid);
         }
@@ -717,8 +810,18 @@ impl Context {
         }
         retained.reverse();
         self.effects = retained;
+        let mut first_panic = None;
         for registration in owned {
-            self.run_registration(registration);
+            let result = catch_unwind(AssertUnwindSafe(|| self.run_registration(registration)));
+            if let Err(payload) = result
+                && first_panic.is_none()
+            {
+                first_panic = Some(panic_payload_message(payload.as_ref()));
+            }
+        }
+        match first_panic {
+            Some(message) => Err(CordisError::CleanupPanicked { message }),
+            None => Ok(()),
         }
     }
 
@@ -736,7 +839,9 @@ impl Context {
         self.notifying_pending = false;
         match result {
             Ok(result) => result,
-            Err(payload) => resume_unwind(payload),
+            Err(payload) => Err(CordisError::PluginCallbackPanicked {
+                message: panic_payload_message(payload.as_ref()),
+            }),
         }
     }
 
@@ -788,18 +893,15 @@ impl Context {
                     continue;
                 }
                 let id = entry.factory.id();
-                self.activating_factories.insert(id);
-                self.activation_depth += 1;
+                self.begin_activation(id);
                 let config =
                     match Self::interpolate_plugin_config_for_fiber(&entry.fiber, &entry.config) {
                         Ok(config) => config,
                         Err(error) => {
-                            self.activation_depth -= 1;
-                            self.activating_factories.remove(&id);
-                            entry.fiber.dispose();
-                            self.cleanup_fiber(&entry.fiber);
+                            let failure =
+                                self.failed_activation(id, &entry.fiber, CordisError::from(error));
                             self.requeue_pending(ready);
-                            return Err(error.into());
+                            return Err(failure);
                         }
                     };
                 let result = catch_unwind(AssertUnwindSafe(|| {
@@ -810,27 +912,29 @@ impl Context {
                 let result = match result {
                     Ok(result) => result,
                     Err(payload) => {
-                        self.activation_depth -= 1;
-                        self.activating_factories.remove(&id);
-                        entry.fiber.dispose();
-                        self.cleanup_fiber(&entry.fiber);
+                        let failure = self.failed_activation(
+                            id,
+                            &entry.fiber,
+                            CordisError::PluginCallbackPanicked {
+                                message: panic_payload_message(payload.as_ref()),
+                            },
+                        );
                         self.requeue_pending(ready);
-                        resume_unwind(payload);
+                        return Err(failure);
                     }
                 };
                 if let Err(source) = result {
-                    self.activation_depth -= 1;
-                    self.activating_factories.remove(&id);
-                    entry.fiber.dispose();
-                    self.cleanup_fiber(&entry.fiber);
+                    let failure = self.failed_activation(id, &entry.fiber, source);
                     self.requeue_pending(ready);
-                    return Err(CordisError::PluginActivation {
-                        id,
-                        source: Box::new(source),
+                    return Err(failure);
+                }
+                self.end_activation(id);
+                if entry.fiber.is_disposed() || !self.fibers.contains_key(&entry.fiber.uid()) {
+                    self.requeue_pending(ready);
+                    return Err(CordisError::FiberDisposed {
+                        uid: entry.fiber.uid(),
                     });
                 }
-                self.activation_depth -= 1;
-                self.activating_factories.remove(&id);
                 self.mounted_factories.insert(id, entry.fiber);
             }
         }
@@ -1099,14 +1203,15 @@ impl Context {
         Ok(current)
     }
 
-    /// Authorized Hartevo-only replacement used by the Domain host route.
-    pub(crate) fn replace_reserved<T: Any + Send + Sync>(
+    /// Authorized Hartevo-only Domain replacement. The key and value type are
+    /// fixed so Effect Broker, Runtime, and Desktop have no replacement route.
+    pub(crate) fn replace_hartevo_domain(
         &mut self,
         authority: HartevoSurfaceAuthority,
-        key: &'static str,
-        value: T,
+        value: DomainSurface,
     ) -> Result<ProviderHandle, CordisError> {
-        if !authority.is_valid() || !authority_reserved_key(key) {
+        let key = keys::DOMAIN;
+        if !authority.is_valid() {
             return Err(CordisError::ReservedServiceKey {
                 key: key.to_string(),
             });
@@ -1142,6 +1247,9 @@ impl Context {
     /// Used after `inject` when expanding plugin `config`. Not the loader
     /// context used for `disabled`.
     pub fn set_var(&mut self, key: impl Into<String>, value: impl Into<ConfigValue>) {
+        if self.ensure_owner_active(self.current_fiber).is_err() {
+            return;
+        }
         let key = key.into();
         let value = value.into();
         let previous = match &mut self.vars {
@@ -1191,6 +1299,9 @@ impl Context {
     where
         F: FnOnce() + Send + 'static,
     {
+        if self.ensure_owner_active(self.current_fiber).is_err() {
+            return RegistrationHandle::noop();
+        }
         let dispose: Disposer = Box::new(dispose);
         let registration = Registration::disposer(self.current_fiber, dispose);
         let handle = registration.handle();
@@ -1212,6 +1323,7 @@ impl Context {
         T: Any + Send + Sync + 'static,
         F: Fn(&T) + Send + Sync + 'static,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let name = name.into();
         let callback = Arc::new(move |payload: &(dyn Any + Send + Sync)| {
             if let Some(value) = payload.downcast_ref::<T>() {
@@ -1239,6 +1351,7 @@ impl Context {
         T: Any + Send + 'static,
         F: Fn(T, WaterfallNext<T>) -> T + Send + Sync + 'static,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let name = name.into();
         let callback = Arc::new(move |payload: BoxedPayload, next: WaterfallContinuation| {
             match payload.downcast::<T>() {
@@ -1274,6 +1387,7 @@ impl Context {
         Fut: Future<Output = Result<(), E>> + Send + 'static,
         F: Fn(T) -> Fut + Send + Sync + 'static,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let name = name.into();
         let listener = Arc::new(listener);
         let callback = Arc::new(move |payload: Arc<dyn Any + Send + Sync>| {
@@ -1307,6 +1421,7 @@ impl Context {
         Fut: Future<Output = Result<T, E>> + Send + 'static,
         F: Fn(T) -> Fut + Send + Sync + 'static,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let name = name.into();
         let listener = Arc::new(listener);
         let callback = Arc::new(move |payload: Box<dyn Any + Send>| {
@@ -1334,6 +1449,7 @@ impl Context {
     where
         T: Any + Send + Sync,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         self.events
             .emit(name, payload)
             .map_err(|locked| conflict(name, locked, DispatchMode::Emit))
@@ -1349,6 +1465,7 @@ impl Context {
     where
         T: Any + Send + Sync + 'static,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let listeners = self
             .events
             .prepare_emit(name)
@@ -1361,6 +1478,7 @@ impl Context {
     where
         T: Any + Send,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let boxed = self
             .events
             .waterfall(name, Box::new(payload))
@@ -1378,6 +1496,7 @@ impl Context {
     where
         T: Any + Send + Sync,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let errors = self
             .events
             .parallel(name, Arc::new(payload))
@@ -1398,6 +1517,7 @@ impl Context {
     where
         T: Any + Send,
     {
+        self.ensure_owner_active(self.current_fiber)?;
         let boxed = self
             .events
             .serial(name, Box::new(payload))
@@ -1430,6 +1550,7 @@ impl Context {
     /// Reversed on teardown when no listeners remain for `name`. Re-locking an
     /// already-locked name is a no-op and does not stack another disposer.
     pub fn lock_event(&mut self, name: &str, mode: DispatchMode) -> Result<(), CordisError> {
+        self.ensure_owner_active(self.current_fiber)?;
         let already = self.events.mode(name) == Some(mode);
         self.events
             .lock(name, mode)
@@ -1485,6 +1606,7 @@ impl Context {
             }
             Registration::Listener { name, id, .. } => {
                 self.events.remove_listener(&name, id);
+                self.events.unlock(&name);
             }
             Registration::EventLock { name, .. } => {
                 self.events.unlock(&name);
@@ -1495,8 +1617,20 @@ impl Context {
     /// Run registrations newest-first, then drop remaining state. The root
     /// Context remains reusable and its root Fiber keeps uid zero.
     pub fn teardown(&mut self) {
+        // A callback cannot tear down the owner whose activation bookkeeping
+        // is still on the stack. N1 will model explicit async unload; N0 keeps
+        // this synchronous request fail-closed.
+        if self.activation_depth != 0 {
+            return;
+        }
+        let mut first_panic = None;
         while let Some(registration) = self.effects.pop() {
-            self.run_registration(registration);
+            let result = catch_unwind(AssertUnwindSafe(|| self.run_registration(registration)));
+            if let Err(payload) = result
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
         }
         self.services.clear();
         self.providers.clear();
@@ -1514,6 +1648,9 @@ impl Context {
         self.fibers.clear();
         self.current_fiber = self.root.uid();
         self.root.replace_metadata(self.vars.clone());
+        if let Some(payload) = first_panic {
+            resume_unwind(payload);
+        }
     }
 }
 
@@ -1529,6 +1666,7 @@ pub struct ContextView<'a> {
     shared_namespaces: Vec<String>,
     metadata: ConfigValue,
     context_valid: bool,
+    scope_valid: bool,
 }
 
 impl fmt::Debug for ContextView<'_> {
@@ -1544,16 +1682,13 @@ impl fmt::Debug for ContextView<'_> {
 
 impl Drop for ContextView<'_> {
     fn drop(&mut self) {
-        self.fiber.replace_metadata(self.metadata.clone());
+        if self.is_active() {
+            self.fiber.replace_metadata(self.metadata.clone());
+        }
     }
 }
 
 impl ContextView<'_> {
-    #[must_use]
-    pub fn context(&self) -> &Context {
-        self.context
-    }
-
     #[must_use]
     pub fn fiber(&self) -> Fiber {
         self.fiber.clone()
@@ -1571,23 +1706,31 @@ impl ContextView<'_> {
 
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.context_valid
+        self.is_active()
     }
 
     fn ownership_error(&self) -> CordisError {
-        if self.context_valid {
-            CordisError::FiberDisposed {
+        if !self.context_valid {
+            CordisError::FiberContextMismatch {
                 uid: self.fiber.uid(),
             }
+        } else if !self.scope_valid {
+            CordisError::FiberScopeViolation {
+                current: self.context.current_fiber,
+                requested: self.fiber.uid(),
+            }
         } else {
-            CordisError::FiberContextMismatch {
+            CordisError::FiberDisposed {
                 uid: self.fiber.uid(),
             }
         }
     }
 
     fn is_active(&self) -> bool {
-        self.context_valid && !self.fiber.is_disposed() && self.fiber.state() == FiberState::Active
+        self.context_valid
+            && self.scope_valid
+            && !self.fiber.is_disposed()
+            && self.fiber.state() == FiberState::Active
     }
 
     /// Switch this view to a fresh namespace derived from its current one.
@@ -1620,7 +1763,7 @@ impl ContextView<'_> {
 
     #[must_use]
     pub fn has(&self, key: &str) -> bool {
-        if !self.context_valid {
+        if !self.is_active() {
             return false;
         }
         self.lookup_namespaces()
@@ -1629,7 +1772,7 @@ impl ContextView<'_> {
 
     #[must_use]
     pub fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
-        if !self.context_valid {
+        if !self.is_active() {
             return None;
         }
         self.lookup_namespaces()
@@ -1920,11 +2063,21 @@ fn conflict(name: &str, locked: DispatchMode, requested: DispatchMode) -> Cordis
     }
 }
 
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod provider_tests {
     use super::*;
-    use crate::surface::{DomainSurface, HartevoSurfaces, map_surfaces, trusted_surface_authority};
+    use crate::surface::{DomainSurface, HartevoSurfaces, map_surfaces, rebind_hartevo_domain};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -1976,8 +2129,7 @@ mod provider_tests {
     #[test]
     fn reserved_handles_are_rejected_without_mutation() {
         let mut context = Context::new();
-        let authority = trusted_surface_authority();
-        map_surfaces(&mut context, authority, HartevoSurfaces::default()).unwrap();
+        map_surfaces(&mut context, HartevoSurfaces::default()).unwrap();
         let before_domain = context.provider_snapshot(keys::DOMAIN).unwrap();
         let before_broker = context.provider_snapshot(keys::EFFECT_BROKER).unwrap();
         let domain = context
@@ -2023,8 +2175,7 @@ mod provider_tests {
     #[test]
     fn reserved_rebind_does_not_expose_committed_handle_on_notification_error() {
         let mut context = Context::new();
-        let authority = trusted_surface_authority();
-        map_surfaces(&mut context, authority, HartevoSurfaces::default()).unwrap();
+        map_surfaces(&mut context, HartevoSurfaces::default()).unwrap();
 
         let fiber = Fiber::child_with_namespace(context.id, &context.root, "root".to_string());
         context.fibers.insert(fiber.uid(), fiber.clone());
@@ -2040,9 +2191,7 @@ mod provider_tests {
             config: ConfigValue::default(),
         });
 
-        let error = context
-            .replace_reserved(authority, keys::DOMAIN, DomainSurface::default())
-            .unwrap_err();
+        let error = rebind_hartevo_domain(&mut context, DomainSurface::default()).unwrap_err();
         assert!(matches!(
             error,
             CordisError::ReservedProviderNotification {

@@ -348,7 +348,7 @@ impl HartevoSurfaceAuthority {
     }
 }
 
-pub(crate) fn trusted_surface_authority() -> HartevoSurfaceAuthority {
+fn trusted_surface_authority() -> HartevoSurfaceAuthority {
     HartevoSurfaceAuthority {
         marker: AuthorityMarker,
     }
@@ -378,9 +378,9 @@ impl Default for HartevoSurfaces {
 /// desktop are Hartevo-owned lookups and never go through OpenInterpreter.
 pub(crate) fn map_surfaces(
     ctx: &mut Context,
-    authority: HartevoSurfaceAuthority,
     surfaces: HartevoSurfaces,
 ) -> Result<(), CordisError> {
+    let authority = trusted_surface_authority();
     if !authority.is_valid() {
         return Err(CordisError::ReservedServiceKey {
             key: keys::DOMAIN.to_string(),
@@ -432,10 +432,9 @@ fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
 /// owner stay stable while generation/notification advance exactly once.
 pub(crate) fn rebind_hartevo_domain(
     ctx: &mut Context,
-    authority: HartevoSurfaceAuthority,
     domain: DomainSurface,
 ) -> Result<(), CordisError> {
-    let _ = ctx.replace_reserved(authority, keys::DOMAIN, domain)?;
+    let _ = ctx.replace_hartevo_domain(trusted_surface_authority(), domain)?;
     Ok(())
 }
 
@@ -542,7 +541,7 @@ mod tests {
         let mut surfaces = HartevoSurfaces::default();
         surfaces.domain.owner = SurfaceOwner::OpenInterpreter;
         assert_eq!(
-            map_surfaces(&mut ctx, trusted_surface_authority(), surfaces).unwrap_err(),
+            map_surfaces(&mut ctx, surfaces).unwrap_err(),
             CordisError::InvalidSurfaceOwner {
                 key: "domain",
                 owner: "openinterpreter",
@@ -554,10 +553,9 @@ mod tests {
     #[test]
     fn duplicate_sealed_mapping_is_typed_and_keeps_original_authority() {
         let mut ctx = Context::new();
-        let authority = trusted_surface_authority();
-        map_surfaces(&mut ctx, authority, HartevoSurfaces::default()).unwrap();
+        map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap();
         assert!(matches!(
-            map_surfaces(&mut ctx, authority, HartevoSurfaces::default()),
+            map_surfaces(&mut ctx, HartevoSurfaces::default()),
             Err(CordisError::SurfaceAlreadyMapped { key }) if key == keys::TOOLS
         ));
         assert_eq!(
@@ -569,8 +567,7 @@ mod tests {
     #[test]
     fn authorized_domain_rebind_preserves_identity_and_never_touches_broker() {
         let mut ctx = Context::new();
-        let authority = trusted_surface_authority();
-        map_surfaces(&mut ctx, authority, HartevoSurfaces::default()).unwrap();
+        map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap();
         let domain_before = ctx.provider_snapshot(keys::DOMAIN).unwrap();
         let broker_before = ctx.provider_snapshot(keys::EFFECT_BROKER).unwrap();
         let bound = DomainSurface {
@@ -579,7 +576,7 @@ mod tests {
             ..DomainSurface::default()
         };
 
-        rebind_hartevo_domain(&mut ctx, authority, bound).unwrap();
+        rebind_hartevo_domain(&mut ctx, bound).unwrap();
         let domain_after = ctx.provider_snapshot(keys::DOMAIN).unwrap();
         let broker_after = ctx.provider_snapshot(keys::EFFECT_BROKER).unwrap();
         assert_eq!(domain_after.provider_id, domain_before.provider_id);

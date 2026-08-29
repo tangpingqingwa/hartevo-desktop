@@ -143,6 +143,35 @@ fn handles_and_views_are_bound_to_their_context() {
 }
 
 #[test]
+fn pending_and_disposed_views_are_read_fail_closed() {
+    let mut context = Context::new();
+    context.provide("root-only", 1_u32).unwrap();
+
+    let pending = context
+        .mount_pending(
+            PluginFactory::new("pending-view", |_config, _context| ()).with_inject(["missing"]),
+        )
+        .unwrap();
+    {
+        let pending_view = context.with_fiber(&pending.fiber());
+        assert!(!pending_view.is_valid());
+        assert!(!pending_view.has("root-only"));
+        assert!(pending_view.get::<u32>("root-only").is_none());
+    }
+
+    let child = context.new_fiber().unwrap();
+    context.dispose_fiber(&child).unwrap();
+    let mut disposed_view = context.with_fiber(&child);
+    assert!(!disposed_view.is_valid());
+    assert!(!disposed_view.has("root-only"));
+    assert!(disposed_view.get::<u32>("root-only").is_none());
+    assert!(matches!(
+        disposed_view.provide("escaped", true),
+        Err(CordisError::FiberDisposed { .. })
+    ));
+}
+
+#[test]
 fn pending_factory_is_publicly_retained_and_activates_once() {
     let mut context = Context::new();
     let starts = Arc::new(AtomicUsize::new(0));
@@ -224,4 +253,24 @@ fn isolated_views_require_explicit_shared_namespace_lookup() {
     }
     assert!(!context.has("local-only"));
     context.dispose_fiber(&child).unwrap();
+}
+
+#[test]
+fn isolated_views_require_explicit_sharing_for_hartevo_surfaces() {
+    let mut host = hartevo_cordis::CordisHost::boot(false).unwrap();
+    let child = host.context_mut().new_fiber().unwrap();
+    {
+        let isolated = host.context_mut().with_fiber(&child).isolate("tenant");
+        assert!(isolated.domain::<DomainSurface>().is_none());
+        assert!(isolated.effect_broker::<EffectBrokerSurface>().is_none());
+    }
+    {
+        let shared = host
+            .context_mut()
+            .with_fiber(&child)
+            .isolate("tenant")
+            .share_label("root");
+        assert!(shared.domain::<DomainSurface>().is_some());
+        assert!(shared.effect_broker::<EffectBrokerSurface>().is_some());
+    }
 }

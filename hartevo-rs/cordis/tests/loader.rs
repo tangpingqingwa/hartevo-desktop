@@ -589,3 +589,182 @@ fn isolated_factory_context_lookups_use_its_local_namespace() {
     assert!(ctx.has("root-only"));
     assert!(!ctx.has("local-dependency"));
 }
+
+#[test]
+fn panicking_notification_returns_committed_provider_handle_and_requeues_ready_work() {
+    let mut ctx = Context::new();
+    let panicking = PluginFactory::new("panic-first", |_config, _ctx| -> () {
+        panic!("intentional factory panic");
+    })
+    .with_inject(["dependency"]);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_factory = Arc::clone(&starts);
+    let later = PluginFactory::new("ready-after-panic", move |_config, _ctx| {
+        starts_for_factory.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["dependency"]);
+    let panicking = ctx.mount_pending(panicking).unwrap();
+    let later = ctx.mount_pending(later).unwrap();
+
+    let committed = match ctx.provide("dependency", true).unwrap_err() {
+        CordisError::ProviderNotification { handle, source } => {
+            assert!(matches!(*source, CordisError::PluginActivation { .. }));
+            handle
+        }
+        other => panic!("expected committed provider handle, got {other:?}"),
+    };
+    assert_eq!(committed.generation(), 0);
+    assert!(panicking.is_disposed());
+    assert!(later.is_pending());
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+    let current = committed.replace(&mut ctx, false).unwrap();
+    assert_eq!(current.generation(), 1);
+    assert!(later.is_active());
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn self_disposal_and_teardown_attempts_leave_activation_reusable() {
+    let mut ctx = Context::new();
+    let fiber_slot = Arc::new(Mutex::new(None));
+    let fiber_for_factory = Arc::clone(&fiber_slot);
+    let disposed_effect = Arc::new(AtomicUsize::new(0));
+    let disposed_effect_for_factory = Arc::clone(&disposed_effect);
+    let factory = PluginFactory::new("self-dispose", move |_config, ctx| {
+        let fiber = fiber_for_factory
+            .lock()
+            .expect("fiber")
+            .clone()
+            .expect("pending fiber");
+        assert!(ctx.dispose_fiber(&fiber)?);
+        assert!(matches!(
+            ctx.provide("post-dispose-provider", true),
+            Err(CordisError::FiberDisposed { .. } | CordisError::FiberContextMismatch { .. })
+        ));
+        let disposed_effect = Arc::clone(&disposed_effect_for_factory);
+        let handle = ctx.effect(move || {
+            disposed_effect.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(handle.is_disposed());
+        ctx.set_var("post-dispose-var", "forbidden");
+        assert!(ctx.on("post-dispose-event", || {}).is_err());
+        assert!(
+            ctx.lock_event("post-dispose-lock", hartevo_cordis::DispatchMode::Emit)
+                .is_err()
+        );
+        ctx.teardown();
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["dependency"]);
+    let pending = ctx.mount_pending(factory).unwrap();
+    *fiber_slot.lock().expect("fiber") = Some(pending.fiber());
+
+    let error = ctx.provide("dependency", true).unwrap_err();
+    assert!(matches!(error, CordisError::ProviderNotification { .. }));
+    assert!(pending.is_disposed());
+    assert!(!ctx.has("post-dispose-provider"));
+    assert_eq!(ctx.var("post-dispose-var"), None);
+    assert_eq!(ctx.listener_count("post-dispose-event"), 0);
+    assert_eq!(ctx.event_mode("post-dispose-lock"), None);
+    assert_eq!(disposed_effect.load(Ordering::SeqCst), 0);
+    assert!(ctx.has("dependency"));
+
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_factory = Arc::clone(&starts);
+    let clean = ctx
+        .mount_pending(PluginFactory::new(
+            "clean-after-dispose",
+            move |_config, _ctx| {
+                starts_for_factory.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), CordisError>(())
+            },
+        ))
+        .unwrap();
+    assert!(clean.is_active());
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn nested_factories_inherit_parent_and_root_switch_is_rejected() {
+    let mut ctx = Context::new();
+    ctx.provide("root-only", true).unwrap();
+    let nested_slot = Arc::new(Mutex::new(None));
+    let nested_for_factory = Arc::clone(&nested_slot);
+    let parent = PluginFactory::new("parent", move |_config, ctx| {
+        let root = ctx.root_fiber();
+        let mut root_view = ctx.with_fiber(&root);
+        assert!(!root_view.is_valid());
+        assert!(!root_view.has("root-only"));
+        assert!(matches!(
+            root_view.provide("escaped-root-provider", true),
+            Err(CordisError::FiberScopeViolation { .. })
+        ));
+        drop(root_view);
+
+        let nested = ctx.mount_pending(
+            PluginFactory::new("nested", |_config, _ctx| Ok::<(), CordisError>(()))
+                .with_inject(["nested-dependency"]),
+        )?;
+        *nested_for_factory.lock().expect("nested") = Some(nested);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["parent-dependency"]);
+    let parent = ctx.mount_pending(parent).unwrap();
+    ctx.provide("parent-dependency", true).unwrap();
+    assert!(parent.is_active());
+    let nested = nested_slot
+        .lock()
+        .expect("nested")
+        .clone()
+        .expect("nested handle");
+    assert!(nested.is_pending());
+    assert_eq!(nested.fiber().parent_uid(), Some(parent.fiber().uid()));
+    assert_eq!(ctx.pending_count(), 1);
+    assert!(!ctx.has("escaped-root-provider"));
+
+    assert!(ctx.dispose_pending(&parent).unwrap());
+    assert!(parent.is_disposed());
+    assert!(nested.is_disposed());
+    assert_eq!(ctx.pending_count(), 0);
+    assert!(!ctx.has("escaped-root-provider"));
+}
+
+#[test]
+fn panicking_disposer_cannot_orphan_partial_state_or_drop_ready_queue() {
+    let mut ctx = Context::new();
+    let failing = PluginFactory::new("cleanup-panics", |_config, ctx| {
+        ctx.provide("partial-provider", true)?;
+        ctx.on("partial-listener", || {})?;
+        ctx.effect(|| panic!("intentional disposer panic"));
+        Err::<(), _>(CordisError::MissingDependencies(vec![
+            "factory-failure".to_string(),
+        ]))
+    })
+    .with_inject(["dependency"]);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_later = Arc::clone(&starts);
+    let later = PluginFactory::new("later-ready", move |_config, _ctx| {
+        starts_for_later.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["dependency"]);
+    let failing = ctx.mount_pending(failing).unwrap();
+    let later = ctx.mount_pending(later).unwrap();
+
+    let error = ctx.provide("dependency", true).unwrap_err();
+    assert!(matches!(error, CordisError::ProviderNotification { .. }));
+    assert!(failing.is_disposed());
+    assert!(later.is_pending());
+    assert!(!ctx.has("partial-provider"));
+    assert_eq!(ctx.listener_count("partial-listener"), 0);
+    assert_eq!(ctx.event_mode("partial-listener"), None);
+    assert_eq!(ctx.pending_count(), 1);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+    ctx.provide("retry-cleanup-notification", true).unwrap();
+    assert!(later.is_active());
+    assert_eq!(ctx.pending_count(), 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+}
