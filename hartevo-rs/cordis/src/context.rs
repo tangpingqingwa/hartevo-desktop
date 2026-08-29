@@ -301,6 +301,8 @@ pub enum CordisError {
     PluginCallbackPanicked { message: String },
     #[error("registration cleanup panicked: {message}")]
     CleanupPanicked { message: String },
+    #[error("asynchronous lifecycle effects require a repeatable Fiber runtime")]
+    AsyncEffectRequiresFiber,
     #[error("cleanup also failed after `{failure}`: {cleanup}")]
     CleanupAfterFailure {
         failure: Box<CordisError>,
@@ -1279,6 +1281,19 @@ impl Context {
         }
         let key = key.into();
         let value = value.into();
+        if self.current_fiber != self.root.uid() {
+            if let Some(fiber) = self.fibers.get(&self.current_fiber) {
+                let mut metadata = fiber.metadata_snapshot();
+                match &mut metadata {
+                    ConfigValue::Object(map) => {
+                        map.insert(key, value);
+                    }
+                    current => *current = ConfigValue::object([(key, value)]),
+                }
+                fiber.replace_metadata(metadata);
+            }
+            return;
+        }
         let previous = match &mut self.vars {
             ConfigValue::Object(map) => map.insert(key.clone(), value),
             other => {
@@ -1293,14 +1308,24 @@ impl Context {
     }
 
     #[must_use]
-    pub fn var(&self, key: &str) -> Option<&ConfigValue> {
-        self.vars.lookup(key)
+    pub fn var(&self, key: &str) -> Option<ConfigValue> {
+        if self.current_fiber == self.root.uid() {
+            return self.vars.lookup(key).cloned();
+        }
+        self.fibers
+            .get(&self.current_fiber)
+            .and_then(|fiber| fiber.metadata_snapshot().lookup(key).cloned())
     }
 
     /// Interpolation source for plugin `config` (plugin context, after inject).
     #[must_use]
-    pub fn plugin_interpolation_source(&self) -> &ConfigValue {
-        &self.vars
+    pub fn plugin_interpolation_source(&self) -> ConfigValue {
+        if self.current_fiber == self.root.uid() {
+            return self.vars.clone();
+        }
+        self.fibers
+            .get(&self.current_fiber)
+            .map_or_else(ConfigValue::default, Fiber::metadata_snapshot)
     }
 
     /// Start `plugin` once every `inject` key is present. Missing deps do not start it.
@@ -1704,14 +1729,6 @@ impl fmt::Debug for ContextView<'_> {
             .field("namespace", &self.namespace)
             .field("shared_namespaces", &self.shared_namespaces)
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for ContextView<'_> {
-    fn drop(&mut self) {
-        if self.is_active() {
-            self.fiber.replace_metadata(self.metadata.clone());
-        }
     }
 }
 
@@ -2268,7 +2285,7 @@ mod provider_tests {
             });
             assert!(view.has("child-only"));
         }
-        assert_eq!(context.var("scope"), Some(&ConfigValue::string("parent")));
+        assert_eq!(context.var("scope"), Some(ConfigValue::string("parent")));
         assert!(context.get::<u32>("child-only").is_none());
         assert_eq!(
             child.metadata_snapshot().lookup("scope"),

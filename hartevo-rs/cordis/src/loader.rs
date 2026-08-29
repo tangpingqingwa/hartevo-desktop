@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{ConfigValue, InterpolateError, coerce_disabled};
 use crate::context::{Context, CordisError};
+use crate::effect::{IntoLifecycleEffect, LifecycleEffect};
 
 /// Conversion boundary for legacy unit-returning loader callbacks.
 pub trait IntoPluginResult {
@@ -30,7 +31,8 @@ impl IntoPluginResult for Result<(), CordisError> {
     }
 }
 
-type StartFn = Arc<dyn Fn(ConfigValue, &mut Context) -> Result<(), CordisError> + Send + Sync>;
+type StartFn =
+    Arc<dyn Fn(ConfigValue, &mut Context) -> Result<LifecycleEffect, CordisError> + Send + Sync>;
 
 static NEXT_FACTORY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -57,6 +59,7 @@ impl fmt::Display for PluginFactoryId {
 #[derive(Clone)]
 pub struct PluginFactory {
     id: PluginFactoryId,
+    plugin_id: PluginId,
     start: StartFn,
     inject: Vec<String>,
     config: ConfigValue,
@@ -67,6 +70,7 @@ impl fmt::Debug for PluginFactory {
         formatter
             .debug_struct("PluginFactory")
             .field("id", &self.id)
+            .field("plugin_id", &self.plugin_id)
             .field("inject", &self.inject)
             .field("config", &self.config)
             .finish_non_exhaustive()
@@ -77,12 +81,14 @@ impl PluginFactory {
     pub fn new<F, R>(id: impl Into<PluginId>, start: F) -> Self
     where
         F: Fn(ConfigValue, &mut Context) -> R + Send + Sync + 'static,
-        R: IntoPluginResult + 'static,
+        R: IntoLifecycleEffect + 'static,
     {
-        let _plugin_id: PluginId = id.into();
-        let start: StartFn = Arc::new(move |config, ctx| start(config, ctx).into_plugin_result());
+        let plugin_id: PluginId = id.into();
+        let start: StartFn =
+            Arc::new(move |config, ctx| start(config, ctx).into_lifecycle_effect());
         Self {
             id: PluginFactoryId(NEXT_FACTORY_ID.fetch_add(1, Ordering::Relaxed)),
+            plugin_id,
             start,
             inject: Vec::new(),
             config: ConfigValue::default(),
@@ -110,6 +116,13 @@ impl PluginFactory {
         self.id
     }
 
+    /// Stable loader/catalog identity. This never substitutes for opaque
+    /// callback identity when selecting a shared runtime.
+    #[must_use]
+    pub fn plugin_id(&self) -> &PluginId {
+        &self.plugin_id
+    }
+
     #[must_use]
     pub fn inject(&self) -> &[String] {
         &self.inject
@@ -121,6 +134,20 @@ impl PluginFactory {
     }
 
     pub(crate) fn start(&self, config: ConfigValue, ctx: &mut Context) -> Result<(), CordisError> {
+        match self.start_effect(config, ctx)? {
+            LifecycleEffect::None => Ok(()),
+            LifecycleEffect::Disposer(_)
+            | LifecycleEffect::DisposerCollection(_)
+            | LifecycleEffect::DisposerFuture(_)
+            | LifecycleEffect::DisposerStream(_) => Err(CordisError::AsyncEffectRequiresFiber),
+        }
+    }
+
+    pub(crate) fn start_effect(
+        &self,
+        config: ConfigValue,
+        ctx: &mut Context,
+    ) -> Result<LifecycleEffect, CordisError> {
         (self.start)(config, ctx)
     }
 }
@@ -486,7 +513,7 @@ pub fn interpolate_plugin_config(
     ctx: &Context,
     config: &ConfigValue,
 ) -> Result<ConfigValue, InterpolateError> {
-    config.interpolate(ctx.plugin_interpolation_source())
+    config.interpolate(&ctx.plugin_interpolation_source())
 }
 
 /// A selected plugin plus the function that materializes it after interpolation.
@@ -513,7 +540,7 @@ impl PluginSpec {
     pub fn new<F, R>(id: impl Into<PluginId>, start: F) -> Self
     where
         F: Fn(ConfigValue, &mut Context) -> R + Send + Sync + 'static,
-        R: IntoPluginResult + 'static,
+        R: IntoLifecycleEffect + 'static,
     {
         let id = id.into();
         Self {
