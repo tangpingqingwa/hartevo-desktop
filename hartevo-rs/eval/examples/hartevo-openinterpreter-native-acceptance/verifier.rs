@@ -1115,6 +1115,16 @@ fn string_array(value: &Value) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_native_acceptance() -> OpenInterpreterAcceptance {
+    tests::bundle(ProviderMode::Native)
+}
+
+#[cfg(test)]
+pub(crate) fn test_provider_identity_digest(provider: &ProviderIdentity) -> String {
+    expected_provider_identity_digest(provider).expect("provider identity digest")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
@@ -1128,7 +1138,7 @@ mod tests {
         current_source_commit().expect("current Git commit")
     }
 
-    fn bundle(mode: ProviderMode) -> OpenInterpreterAcceptance {
+    pub(super) fn bundle(mode: ProviderMode) -> OpenInterpreterAcceptance {
         let source_commit = source_commit();
         let project = ProjectScope {
             id: "project-oi-native".into(),
