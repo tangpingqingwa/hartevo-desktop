@@ -228,7 +228,7 @@ fn child_metadata_and_registration_are_isolated_from_parent() {
         view.set_var("scope", "child");
         view.provide("child-only", 42_u32).unwrap();
     }
-    assert_eq!(context.var("scope"), Some(&"parent".into()));
+    assert_eq!(context.var("scope"), Some("parent".into()));
     assert!(context.get::<u32>("child-only").is_some());
     context.dispose_fiber(&child).unwrap();
     assert!(context.get::<u32>("child-only").is_none());

@@ -2298,6 +2298,8 @@ name = "hartevo-cordis"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-core",
+ "futures-util",
  "thiserror 2.0.20",
  "tokio",
 ]

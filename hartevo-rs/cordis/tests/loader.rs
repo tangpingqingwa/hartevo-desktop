@@ -242,7 +242,7 @@ fn loader_disabled_flag_skips_start_without_reading_plugin_vars() {
 fn plugin_var_is_reversed_on_teardown() {
     let mut ctx = Context::new();
     ctx.set_var("env", ConfigValue::string("one"));
-    assert_eq!(ctx.var("env"), Some(&ConfigValue::string("one")));
+    assert_eq!(ctx.var("env"), Some(ConfigValue::string("one")));
     ctx.teardown();
     assert!(ctx.var("env").is_none());
 }
@@ -368,7 +368,7 @@ fn failed_pending_activation_propagates_and_cleans_partial_records() {
         ctx.effect(move || {
             disposed_for_disposer.fetch_add(1, Ordering::SeqCst);
         });
-        Err(CordisError::MissingDependencies(vec!["late".to_string()]))
+        Err::<(), _>(CordisError::MissingDependencies(vec!["late".to_string()]))
     });
 
     let error = ctx.mount_pending(factory).unwrap_err();
@@ -550,7 +550,7 @@ fn pending_config_interpolates_against_the_owning_fiber_metadata() {
         assert_eq!(view.var("scope"), Some(&ConfigValue::string("child")));
     }
 
-    assert_eq!(ctx.var("scope"), Some(&ConfigValue::string("parent")));
+    assert_eq!(ctx.var("scope"), Some(ConfigValue::string("parent")));
     assert_eq!(
         *seen.lock().expect("seen"),
         Some(ConfigValue::string("child"))
@@ -561,6 +561,7 @@ fn pending_config_interpolates_against_the_owning_fiber_metadata() {
 fn isolated_factory_context_lookups_use_its_local_namespace() {
     let mut ctx = Context::new();
     ctx.provide("root-only", Marker("root")).unwrap();
+    ctx.set_var("scope", "root");
     let child = ctx.new_fiber().unwrap();
     let seen = Arc::new(AtomicBool::new(false));
     let seen_for_factory = Arc::clone(&seen);
@@ -572,20 +573,38 @@ fn isolated_factory_context_lookups_use_its_local_namespace() {
             Some(&Marker("local"))
         );
         assert!(ctx.get::<Marker>("root-only").is_none());
+        assert_eq!(ctx.var("scope"), Some(ConfigValue::string("child")));
+        ctx.set_var("callback-only", "fiber-private");
+        assert_eq!(
+            ctx.var("callback-only"),
+            Some(ConfigValue::string("fiber-private"))
+        );
         seen_for_factory.store(true, Ordering::SeqCst);
         Ok::<(), CordisError>(())
     })
     .with_inject(["local-dependency"]);
 
     {
-        let mut view = ctx.with_fiber(&child).isolate("tenant");
+        let mut view = ctx
+            .with_fiber(&child)
+            .isolate("tenant")
+            .extend(ConfigValue::object([("scope", "child".into())]));
         let pending = view.mount_pending(factory).unwrap();
+        let callback_fiber = pending.fiber();
         assert!(pending.is_pending());
         view.provide("local-dependency", Marker("local")).unwrap();
         assert!(pending.is_active());
+        drop(view);
+        let callback_view = ctx.with_fiber(&callback_fiber);
+        assert_eq!(
+            callback_view.var("callback-only"),
+            Some(&ConfigValue::string("fiber-private"))
+        );
     }
 
     assert!(seen.load(Ordering::SeqCst));
+    assert_eq!(ctx.var("scope"), Some(ConfigValue::string("root")));
+    assert!(ctx.var("callback-only").is_none());
     assert!(ctx.has("root-only"));
     assert!(!ctx.has("local-dependency"));
 }

@@ -27,9 +27,15 @@ pub use config::{ConfigValue, InterpolateError};
 pub use context::{
     Context, ContextView, CordisError, PendingHandle, ProviderHandle, ProviderId, keys,
 };
-pub use effect::{Disposer, RegistrationHandle};
+pub use effect::{
+    Disposer, IntoLifecycleEffect, LifecycleDisposeFuture, LifecycleDisposer,
+    LifecycleDisposerFuture, LifecycleDisposerStream, LifecycleEffect, RegistrationHandle,
+};
 pub use event::{DispatchMode, WaterfallNext};
-pub use fiber::{Fiber, FiberState, FiberUid};
+pub use fiber::{
+    ActivationEpoch, Fiber, FiberSnapshot, FiberState, FiberUid, LifecycleCancellation,
+    ProviderFingerprint, TransitionTicket,
+};
 pub use host::{
     CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, host_is_cordis_loop, host_plugin_ids,
 };
@@ -45,6 +51,9 @@ pub use loader::{
     EnvironmentOverlay, IntoPluginResult, LoadReport, Loader, LoaderContext, OverlayAction,
     OverlayLayer, PluginEntry, PluginFactory, PluginFactoryId, PluginId, PluginSpec,
     ResolvedPlugin, interpolate_plugin_config, load_plugins, load_plugins_pending,
+};
+pub use registry::{
+    LifecycleContextView, LifecycleHandle, LifecycleProviderHandle, LifecycleRegistry,
 };
 pub use service::Service;
 pub use surface::{
