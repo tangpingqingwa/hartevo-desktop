@@ -295,11 +295,14 @@ struct RuntimeProviderRecord {
 /// One linearizable fact source for a provider key.  Slots survive absence so
 /// remove/reprovide cannot let an old completion compare-remove a replacement.
 /// Fresh ordinary registrations deliberately start at generation zero; slot
-/// revision/removal serial, not generation, provide the ABA fence.
+/// revision/removal serial, not generation, provide the ordinary ABA fence.
+/// Recovery adds a non-repeating Arc identity so exhausted numeric counters
+/// can still be fenced without deleting the provider before cleanup settles.
 struct RuntimeProviderSlot {
     record: Option<RuntimeProviderRecord>,
     revision: u64,
     removal_serial: u64,
+    recovery_fence: Option<Arc<()>>,
 }
 
 struct ProviderRemovalPlan {
@@ -333,6 +336,7 @@ struct ProviderRecordFact {
 struct ProviderSlotFact {
     revision: u64,
     removal_serial: u64,
+    recovery_fence: Option<Arc<()>>,
     record: Option<ProviderRecordFact>,
 }
 
@@ -380,6 +384,7 @@ impl RuntimeProviderSlot {
             record: None,
             revision: 0,
             removal_serial: 0,
+            recovery_fence: None,
         }
     }
 }
@@ -696,6 +701,9 @@ impl LifecycleRegistry {
         let Some(slot) = state.providers.get(&key) else {
             return;
         };
+        if slot.recovery_fence.is_some() {
+            return;
+        }
         let exact = slot.record.as_ref().is_some_and(|record| {
             record.provider_id == handle.provider_id
                 && record.owner.uid() == handle.owner_uid
@@ -716,6 +724,7 @@ impl LifecycleRegistry {
                 slot.revision = revision;
                 slot.removal_serial = removal_serial;
                 slot.record = None;
+                slot.recovery_fence = None;
             }
         } else {
             // Global provider ids never repeat, so dropping an exhausted exact
@@ -1089,12 +1098,14 @@ impl LifecycleRegistry {
                 if let Some(slot) = state.providers.get_mut(&provider_key) {
                     let remove = slot.removal_serial == removal_serial
                         && slot.revision == marked_revision
+                        && slot.recovery_fence.is_none()
                         && slot.record.as_ref().is_some_and(|record| {
                             record.provider_id == handle.provider_id && record.removing
                         });
                     if remove {
                         slot.record = None;
                         slot.revision = completed_revision;
+                        slot.recovery_fence = None;
                     }
                 }
             }
@@ -1144,6 +1155,7 @@ impl LifecycleRegistry {
         if let Some(slot) = state.providers.get_mut(&provider_key) {
             slot.removal_serial = removal_serial;
             slot.revision = marked_revision;
+            slot.recovery_fence = None;
             if let Some(record) = slot.record.as_mut() {
                 record.removing = true;
             }
@@ -1846,6 +1858,7 @@ fn provider_slot_fact(slot: &RuntimeProviderSlot) -> ProviderSlotFact {
     ProviderSlotFact {
         revision: slot.revision,
         removal_serial: slot.removal_serial,
+        recovery_fence: slot.recovery_fence.clone(),
         record: slot.record.as_ref().map(|record| ProviderRecordFact {
             value: record.value.clone(),
             provider_id: record.provider_id,
@@ -1867,6 +1880,11 @@ fn provider_slot_matches(
         (Some(slot), Some(fact)) => {
             slot.revision == fact.revision
                 && slot.removal_serial == fact.removal_serial
+                && match (&slot.recovery_fence, &fact.recovery_fence) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                    _ => false,
+                }
                 && match (slot.record.as_ref(), fact.record.as_ref()) {
                     (None, None) => true,
                     (Some(record), Some(expected)) => {
@@ -2330,6 +2348,7 @@ fn commit_provider_plan(state: &mut LifecycleRegistryState, plan: &ProviderMutat
         .entry(plan.key.clone())
         .or_insert_with(RuntimeProviderSlot::vacant);
     slot.revision = plan.revision;
+    slot.recovery_fence = None;
     slot.record = Some(plan.record.clone());
 }
 
@@ -2390,6 +2409,11 @@ fn provider_slot_facts_equivalent(
         (Some(left), Some(right)) => {
             left.revision == right.revision
                 && left.removal_serial == right.removal_serial
+                && match (&left.recovery_fence, &right.recovery_fence) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                    _ => false,
+                }
                 && match (left.record.as_ref(), right.record.as_ref()) {
                     (None, None) => true,
                     (Some(left), Some(right)) => {
@@ -2621,6 +2645,11 @@ fn preflight_provider_removal(
             key: handle.key.clone(),
         });
     };
+    if slot.recovery_fence.is_some() {
+        return Err(CordisError::StaleProviderHandle {
+            key: handle.key.clone(),
+        });
+    }
     let Some(record) = slot.record.as_ref() else {
         return Err(CordisError::ProviderNotFound {
             namespace: handle.namespace.clone(),
@@ -4281,6 +4310,7 @@ fn commit_provisional_providers(
             .entry(plan.key)
             .or_insert_with(RuntimeProviderSlot::vacant);
         slot.revision = plan.revision;
+        slot.recovery_fence = None;
         slot.record = Some(plan.record);
         let handle = plan.handle;
         let weak = Arc::downgrade(inner);
@@ -4825,6 +4855,7 @@ struct RecoveryPlan {
     ticket_waits: Vec<FiberTicketWait>,
     terminal_waits: Vec<Arc<FiberControl>>,
     drivers: Vec<DriverRuntimeBinding>,
+    provider_reclaims: Vec<ProviderReclaimPlan>,
 }
 
 impl RecoveryPlan {
@@ -4834,6 +4865,7 @@ impl RecoveryPlan {
         for driver in other.drivers {
             push_binding_once(&mut self.drivers, driver);
         }
+        self.provider_reclaims.extend(other.provider_reclaims);
     }
 
     fn driver_runtimes(&self) -> Vec<DriverRuntimeBinding> {
@@ -4936,8 +4968,17 @@ fn enqueue_recovery_plan(
     pending: &mut futures_util::stream::FuturesUnordered<BoxFuture<'static, RecoveryWaitOutcome>>,
     seen_tickets: &mut Vec<FiberTicketWait>,
     seen_terminals: &mut Vec<Arc<FiberControl>>,
+    provider_reclaims: &mut Vec<ProviderReclaimPlan>,
     plan: RecoveryPlan,
 ) {
+    for reclaim in plan.provider_reclaims {
+        if !provider_reclaims
+            .iter()
+            .any(|seen| same_provider_reclaim(seen, &reclaim))
+        {
+            provider_reclaims.push(reclaim);
+        }
+    }
     for (control, serial) in plan.ticket_waits {
         if seen_tickets
             .iter()
@@ -4980,7 +5021,14 @@ async fn settle_recovery_plan(
     let mut pending = futures_util::stream::FuturesUnordered::new();
     let mut seen_tickets = Vec::new();
     let mut seen_terminals = Vec::new();
-    enqueue_recovery_plan(&mut pending, &mut seen_tickets, &mut seen_terminals, plan);
+    let mut provider_reclaims = Vec::new();
+    enqueue_recovery_plan(
+        &mut pending,
+        &mut seen_tickets,
+        &mut seen_terminals,
+        &mut provider_reclaims,
+        plan,
+    );
     while let Some(outcome) = pending.next().await {
         match outcome {
             RecoveryWaitOutcome::TicketSettled(Ok(_)) => {}
@@ -4999,10 +5047,17 @@ async fn settle_recovery_plan(
                     &[],
                     &CordisError::AsyncRuntimeUnavailable,
                 );
-                enqueue_recovery_plan(&mut pending, &mut seen_tickets, &mut seen_terminals, next);
+                enqueue_recovery_plan(
+                    &mut pending,
+                    &mut seen_tickets,
+                    &mut seen_terminals,
+                    &mut provider_reclaims,
+                    next,
+                );
             }
         }
     }
+    finalize_recovery_provider_reclaims(&inner, provider_reclaims);
     first_error
 }
 
@@ -5023,8 +5078,58 @@ struct ProviderReclaimPlan {
     generation: u64,
     expected_revision: u64,
     expected_removal_serial: u64,
-    revision: Option<u64>,
-    removal_serial: Option<u64>,
+    fenced_revision: u64,
+    fenced_removal_serial: u64,
+    completed_revision: Option<u64>,
+    fence: Arc<()>,
+}
+
+fn same_provider_reclaim(left: &ProviderReclaimPlan, right: &ProviderReclaimPlan) -> bool {
+    left.key == right.key
+        && left.provider_id == right.provider_id
+        && left.owner_uid == right.owner_uid
+        && left.generation == right.generation
+        && left.fenced_revision == right.fenced_revision
+        && left.fenced_removal_serial == right.fenced_removal_serial
+        && Arc::ptr_eq(&left.fence, &right.fence)
+}
+
+fn finalize_recovery_provider_reclaims(
+    inner: &Arc<LifecycleRegistryInner>,
+    reclaims: Vec<ProviderReclaimPlan>,
+) {
+    let mut state = lock(&inner.state);
+    for plan in reclaims {
+        let exact = state.providers.get(&plan.key).is_some_and(|slot| {
+            slot.revision == plan.fenced_revision
+                && slot.removal_serial == plan.fenced_removal_serial
+                && slot
+                    .recovery_fence
+                    .as_ref()
+                    .is_some_and(|fence| Arc::ptr_eq(fence, &plan.fence))
+                && slot.record.as_ref().is_some_and(|record| {
+                    record.provider_id == plan.provider_id
+                        && record.owner.uid() == plan.owner_uid
+                        && record.generation == plan.generation
+                        && record.removing
+                })
+        });
+        if !exact {
+            continue;
+        }
+        if let Some(completed_revision) = plan.completed_revision {
+            if let Some(slot) = state.providers.get_mut(&plan.key) {
+                slot.revision = completed_revision;
+                slot.record = None;
+                slot.recovery_fence = None;
+            }
+        } else {
+            // The exact Arc fence is non-repeating even when numeric slot
+            // counters are exhausted, so removing this slot cannot let an old
+            // completion match and delete a later provider identity.
+            state.providers.remove(&plan.key);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -5035,6 +5140,7 @@ struct ExactForcedProviderFact {
     generation: u64,
     revision: u64,
     removal_serial: u64,
+    recovery_fence: Option<Arc<()>>,
 }
 
 fn exact_forced_provider_facts_locked(
@@ -5069,6 +5175,7 @@ fn exact_forced_provider_facts_locked(
             generation: record.generation,
             revision: slot.revision,
             removal_serial: slot.removal_serial,
+            recovery_fence: slot.recovery_fence.clone(),
         });
     }
     facts
@@ -5180,12 +5287,18 @@ fn quarantine_dead_bindings_transaction(
             .iter()
             .filter_map(|(key, slot)| {
                 slot.record.as_ref().and_then(|record| {
-                    provider_owner_is_one_of(&record.owner_binding, &cleanup_controls)
-                        .then_some(key.clone())
+                    (slot.recovery_fence.is_none()
+                        && provider_owner_is_one_of(&record.owner_binding, &cleanup_controls))
+                    .then_some(key.clone())
                 })
             })
             .collect::<Vec<_>>();
-        removed_keys.extend(forced_facts.iter().map(|fact| fact.key.clone()));
+        removed_keys.extend(
+            forced_facts
+                .iter()
+                .filter(|fact| fact.recovery_fence.is_none())
+                .map(|fact| fact.key.clone()),
+        );
         removed_keys.sort_by(|left, right| {
             (&left.namespace, &left.key).cmp(&(&right.namespace, &right.key))
         });
@@ -5305,8 +5418,15 @@ fn quarantine_dead_bindings_transaction(
             {
                 continue;
             }
-            let removal_serial = slot.removal_serial.checked_add(1);
-            let revision = slot.revision.checked_add(2);
+            let next_removal_serial = slot.removal_serial.checked_add(1);
+            let completed_revision = slot.revision.checked_add(2);
+            let (fenced_revision, fenced_removal_serial, completed_revision) =
+                match (next_removal_serial, completed_revision) {
+                    (Some(removal_serial), Some(completed_revision)) => {
+                        (slot.revision + 1, removal_serial, Some(completed_revision))
+                    }
+                    _ => (slot.revision, slot.removal_serial, None),
+                };
             reclaim.push(ProviderReclaimPlan {
                 key: key.clone(),
                 provider_id: record.provider_id,
@@ -5314,8 +5434,10 @@ fn quarantine_dead_bindings_transaction(
                 generation: record.generation,
                 expected_revision: slot.revision,
                 expected_removal_serial: slot.removal_serial,
-                revision,
-                removal_serial,
+                fenced_revision,
+                fenced_removal_serial,
+                completed_revision,
+                fence: Arc::new(()),
             });
         }
 
@@ -5393,10 +5515,12 @@ fn quarantine_dead_bindings_transaction(
                 notifications.push(control.clone());
             }
         }
+        let mut provider_reclaims = Vec::new();
         for plan in reclaim {
             let exact = state.providers.get(&plan.key).is_some_and(|slot| {
                 slot.revision == plan.expected_revision
                     && slot.removal_serial == plan.expected_removal_serial
+                    && slot.recovery_fence.is_none()
                     && slot.record.as_ref().is_some_and(|record| {
                         record.provider_id == plan.provider_id
                             && record.owner.uid() == plan.owner_uid
@@ -5406,18 +5530,15 @@ fn quarantine_dead_bindings_transaction(
             if !exact {
                 continue;
             }
-            if let (Some(revision), Some(removal_serial)) = (plan.revision, plan.removal_serial) {
-                if let Some(slot) = state.providers.get_mut(&plan.key) {
-                    slot.revision = revision;
-                    slot.removal_serial = removal_serial;
-                    slot.record = None;
+            if let Some(slot) = state.providers.get_mut(&plan.key) {
+                slot.revision = plan.fenced_revision;
+                slot.removal_serial = plan.fenced_removal_serial;
+                slot.recovery_fence = Some(plan.fence.clone());
+                if let Some(record) = slot.record.as_mut() {
+                    record.removing = true;
                 }
-            } else {
-                // Counter exhaustion is recoverable only by dropping the slot.
-                // Provider ids are globally monotonic, so an old completion
-                // cannot match and delete a later record created for this key.
-                state.providers.remove(&plan.key);
             }
+            provider_reclaims.push(plan);
         }
         for control in &dead_controls {
             detach_control_locked(&mut state, control);
@@ -5445,6 +5566,7 @@ fn quarantine_dead_bindings_transaction(
             ticket_waits,
             terminal_waits,
             drivers,
+            provider_reclaims,
         };
     }
 }
@@ -7515,6 +7637,15 @@ mod lifecycle_boundary_tests {
                 .recv_timeout(std::time::Duration::from_secs(1))
                 .unwrap();
             assert!(registry.get::<u32>("recovery-live-key").is_none());
+            {
+                let state = lock(&registry.inner.state);
+                let slot = state
+                    .providers
+                    .get(&RuntimeProviderKey::new("root", "recovery-live-key"))
+                    .expect("recovery keeps the fenced provider until cleanup settles");
+                assert!(slot.recovery_fence.is_some());
+                assert!(slot.record.as_ref().is_some_and(|record| record.removing));
+            }
             drop(consumer_runtime);
             let result = recovery_runtime.block_on(operation);
             assert!(matches!(result, Err(CordisError::AsyncRuntimeUnavailable)));
@@ -7526,6 +7657,12 @@ mod lifecycle_boundary_tests {
                 &lock(&registry.inner.state),
                 &consumer_control,
             ));
+            assert!(
+                lock(&registry.inner.state)
+                    .providers
+                    .get(&RuntimeProviderKey::new("root", "recovery-live-key"))
+                    .is_none_or(|slot| slot.record.is_none())
+            );
             assert!(registry.provide("recovery-live-key", 82_u32).is_ok());
             drop((consumer, owner));
         });
@@ -7679,6 +7816,12 @@ mod lifecycle_boundary_tests {
         assert_eq!(
             registry.get::<u32>("stale-forced-key").as_deref(),
             Some(&85)
+        );
+        assert!(
+            lock(&registry.inner.state).providers
+                [&RuntimeProviderKey::new("root", "stale-forced-key")]
+                .recovery_fence
+                .is_none()
         );
         assert_eq!(replacement.generation(), 1);
     }
