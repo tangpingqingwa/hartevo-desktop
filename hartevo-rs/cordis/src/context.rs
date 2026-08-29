@@ -302,6 +302,15 @@ pub enum CordisError {
         #[source]
         source: Box<CordisError>,
     },
+    #[error(
+        "reserved provider `{key}` notification failed after committing generation {generation}: {source}"
+    )]
+    ReservedProviderNotification {
+        key: String,
+        generation: u64,
+        #[source]
+        source: Box<CordisError>,
+    },
     #[error(transparent)]
     Interpolate(#[from] crate::config::InterpolateError),
 }
@@ -457,13 +466,11 @@ impl Context {
         self.current_fiber
     }
 
-    fn current_namespace(&self) -> String {
+    fn current_namespace(&self) -> Option<String> {
         if self.current_fiber == self.root.uid() {
-            "root".to_string()
+            Some("root".to_string())
         } else {
-            self.fibers
-                .get(&self.current_fiber)
-                .map_or_else(|| "root".to_string(), Fiber::namespace)
+            self.fibers.get(&self.current_fiber).map(Fiber::namespace)
         }
     }
 
@@ -831,13 +838,13 @@ impl Context {
 
     #[must_use]
     pub fn has(&self, key: &str) -> bool {
-        let namespace = self.current_namespace();
-        self.has_in_namespace(&namespace, key)
+        self.current_namespace()
+            .is_some_and(|namespace| self.has_in_namespace(&namespace, key))
     }
 
     #[must_use]
     pub fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
-        let namespace = self.current_namespace();
+        let namespace = self.current_namespace()?;
         self.get_in_namespace(&namespace, key)
     }
 
@@ -893,7 +900,10 @@ impl Context {
         value: T,
     ) -> Result<ProviderHandle, CordisError> {
         let owner_uid = self.current_fiber;
-        let namespace = self.current_namespace();
+        let namespace = self
+            .current_namespace()
+            .ok_or(CordisError::FiberDisposed { uid: owner_uid })?;
+        self.ensure_owner_active(owner_uid)?;
         self.provide_in_namespace(namespace, owner_uid, key.into(), value)
     }
 
@@ -1116,7 +1126,13 @@ impl Context {
             generation: record.generation,
         };
         match self.replace_provider_for(self.root.uid(), &handle, value, true) {
-            Err(CordisError::ProviderNotification { source, .. }) => Err(*source),
+            Err(CordisError::ProviderNotification { handle, source }) => {
+                Err(CordisError::ReservedProviderNotification {
+                    key: handle.key().to_string(),
+                    generation: handle.generation(),
+                    source,
+                })
+            }
             result => result,
         }
     }
@@ -1155,13 +1171,10 @@ impl Context {
     /// Start `plugin` once every `inject` key is present. Missing deps do not start it.
     pub fn mount<S: Service>(&mut self, plugin: S) -> Result<(), CordisError> {
         let owner_uid = self.current_fiber;
-        let namespace = if owner_uid == self.root.uid() {
-            "root".to_string()
-        } else {
-            self.fibers
-                .get(&owner_uid)
-                .map_or_else(|| "root".to_string(), Fiber::namespace)
-        };
+        let namespace = self
+            .current_namespace()
+            .ok_or(CordisError::FiberDisposed { uid: owner_uid })?;
+        self.ensure_owner_active(owner_uid)?;
         let missing: Vec<String> = S::inject()
             .iter()
             .copied()
@@ -1171,7 +1184,6 @@ impl Context {
         if !missing.is_empty() {
             return Err(CordisError::MissingDependencies(missing));
         }
-        self.ensure_owner_active(owner_uid)?;
         self.with_current_fiber(owner_uid, |ctx| plugin.apply(ctx))
     }
 
@@ -2031,8 +2043,17 @@ mod provider_tests {
         let error = context
             .replace_reserved(authority, keys::DOMAIN, DomainSurface::default())
             .unwrap_err();
-        assert!(matches!(error, CordisError::PluginActivation { .. }));
-        assert!(!matches!(error, CordisError::ProviderNotification { .. }));
+        assert!(matches!(
+            error,
+            CordisError::ReservedProviderNotification {
+                ref key,
+                generation: 1,
+                source: _,
+            } if key == keys::DOMAIN
+        ));
+        if let CordisError::ReservedProviderNotification { source, .. } = error {
+            assert!(matches!(*source, CordisError::PluginActivation { .. }));
+        }
         let snapshot = context.provider_snapshot(keys::DOMAIN).unwrap();
         assert_eq!(snapshot.generation, 1);
         assert_eq!(snapshot.notify_count, 1);
@@ -2103,6 +2124,24 @@ mod provider_tests {
         assert!(panic.is_err());
         assert_eq!(context.current_fiber_uid(), FiberUid::ROOT);
         assert!(context.provide("after-unwind", true).is_ok());
+    }
+
+    #[test]
+    fn disposed_current_fiber_cannot_fall_back_to_root_namespace() {
+        let mut context = Context::new();
+        context.provide("root-only", 1_u32).unwrap();
+        let child = context.new_fiber().unwrap();
+        context.with_current_fiber(child.uid(), |context| {
+            assert_eq!(context.get::<u32>("root-only").as_deref(), Some(&1));
+            assert!(context.dispose_fiber(&child).unwrap());
+            assert!(!context.has("root-only"));
+            assert!(context.get::<u32>("root-only").is_none());
+            assert_eq!(
+                context.provide("must-not-escape", true).unwrap_err(),
+                CordisError::FiberDisposed { uid: child.uid() }
+            );
+        });
+        assert!(context.get::<bool>("must-not-escape").is_none());
     }
 
     #[test]
