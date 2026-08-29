@@ -67,7 +67,8 @@ use zeroize::Zeroizing;
 use crate::cordis_host::{DesktopCordisCoordinator, dispatch_live_runtime, mount_cordis_host};
 #[cfg(test)]
 use crate::cordis_host::{
-    bind_live_domain_kernel, bind_live_domain_kernel_scope as bind_host_live_domain_kernel_scope,
+    bind_live_domain_kernel,
+    bind_live_domain_kernel_scope_for_test as bind_host_live_domain_kernel_scope,
 };
 use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
@@ -811,7 +812,6 @@ impl DesktopDataPlane {
             approval,
             now,
         )
-        .map(|_| ())
     }
 
     /// Test-only legacy symbolic AgentStep; never a production Runtime route.

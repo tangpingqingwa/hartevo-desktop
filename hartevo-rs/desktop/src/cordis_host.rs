@@ -5,6 +5,7 @@
 //! Application coordinator runs exactly once. OpenInterpreter may occupy the
 //! optional plugin slot; it never owns Domain, Effect, or execution authority.
 
+#[cfg(test)]
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +13,8 @@ use chrono::{DateTime, Utc};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, Fiber, FiberState, FiberUid,
     KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
-    KernelConsentStatus, RuntimeAuthority, RuntimeDispatchPermit, host_is_cordis_loop, keys,
+    KernelConsentStatus, RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit,
+    host_is_cordis_loop, keys,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -30,7 +32,7 @@ fn openinterpreter_runtime_plugin(runtime: &DesktopRuntimeProjection) -> bool {
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct DesktopCordisBindingState {
     root_fiber_uid: FiberUid,
     refresh_sequence: u64,
@@ -39,16 +41,18 @@ struct DesktopCordisBindingState {
 
 /// Typed proof that one exact scoped live binding completed before Runtime
 /// authorization. The underlying reserved Domain provider remains Cordis-owned.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DesktopCordisBindingReceipt {
+#[derive(Debug)]
+struct DesktopCordisBindingReceipt {
+    coordinator_identity: Arc<()>,
     root_fiber_uid: FiberUid,
     refresh_sequence: u64,
     scope: AuthorityScope,
 }
 
 impl DesktopCordisBindingReceipt {
+    #[cfg(test)]
     #[must_use]
-    pub(crate) const fn scope(&self) -> &AuthorityScope {
+    const fn scope(&self) -> &AuthorityScope {
         &self.scope
     }
 
@@ -73,6 +77,7 @@ impl DesktopCordisBindingReceipt {
 #[derive(Debug)]
 pub(crate) struct DesktopCordisCoordinator {
     host: CordisHost,
+    identity: Arc<()>,
     root_fiber: Fiber,
     successful_bindings: u64,
     last_binding: Option<DesktopCordisBindingState>,
@@ -83,6 +88,7 @@ impl DesktopCordisCoordinator {
         let root_fiber = host.context().root_fiber();
         let coordinator = Self {
             host,
+            identity: Arc::new(()),
             root_fiber,
             successful_bindings: 0,
             last_binding: None,
@@ -108,19 +114,13 @@ impl DesktopCordisCoordinator {
         })
     }
 
-    fn record_binding(
-        &mut self,
-        refresh_sequence: u64,
-        scope: Option<AuthorityScope>,
-    ) -> DesktopCordisBindingState {
-        let state = DesktopCordisBindingState {
+    fn record_binding(&mut self, refresh_sequence: u64, scope: Option<AuthorityScope>) {
+        self.successful_bindings = refresh_sequence;
+        self.last_binding = Some(DesktopCordisBindingState {
             root_fiber_uid: self.root_fiber.uid(),
             refresh_sequence,
             scope,
-        };
-        self.successful_bindings = refresh_sequence;
-        self.last_binding = Some(state.clone());
-        state
+        });
     }
 
     #[cfg(test)]
@@ -151,12 +151,62 @@ impl DesktopCordisCoordinator {
         let refresh_sequence = self.next_binding_sequence()?;
         self.host
             .bind_domain_kernel_scope(scope.clone(), consent, record, approval, now)?;
-        let state = self.record_binding(refresh_sequence, Some(scope.clone()));
+        self.record_binding(refresh_sequence, Some(scope.clone()));
         Ok(DesktopCordisBindingReceipt {
-            root_fiber_uid: state.root_fiber_uid,
-            refresh_sequence: state.refresh_sequence,
+            coordinator_identity: Arc::clone(&self.identity),
+            root_fiber_uid: self.root_fiber.uid(),
+            refresh_sequence,
             scope,
         })
+    }
+
+    fn authorize_bound_runtime(
+        &mut self,
+        binding: DesktopCordisBindingReceipt,
+    ) -> Result<RuntimeDispatchPermit, CordisError> {
+        let DesktopCordisBindingReceipt {
+            coordinator_identity,
+            root_fiber_uid,
+            refresh_sequence,
+            scope,
+        } = binding;
+        self.ensure_root_fiber_active()?;
+        if !Arc::ptr_eq(&self.identity, &coordinator_identity)
+            || root_fiber_uid != self.root_fiber.uid()
+        {
+            return Err(CordisError::AuthorityScopeMismatch);
+        }
+        let Some(current) = self.last_binding.as_ref() else {
+            return Err(CordisError::AuthorityScopeUnbound);
+        };
+        if current.root_fiber_uid != root_fiber_uid
+            || current.refresh_sequence != refresh_sequence
+            || current.refresh_sequence != self.successful_bindings
+            || current.scope.as_ref() != Some(&scope)
+        {
+            return Err(CordisError::AuthorityScopeMismatch);
+        }
+        self.last_binding = None;
+        self.host.authorize_runtime(&scope)
+    }
+
+    fn bind_and_authorize_runtime(
+        &mut self,
+        scope: AuthorityScope,
+        consent: KernelConsentState,
+        record: Option<KernelConsentRecord>,
+        approval: Option<KernelApproval>,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeDispatchPermit, CordisError> {
+        let binding = self.bind_domain_kernel_scope(scope, consent, record, approval, now)?;
+        self.authorize_bound_runtime(binding)
+    }
+
+    fn finish_runtime(
+        &mut self,
+        permit: RuntimeDispatchPermit,
+    ) -> Result<RuntimeDispatchCompletion, CordisError> {
+        self.host.finish_runtime(permit)
     }
 
     #[cfg(test)]
@@ -175,8 +225,15 @@ impl DesktopCordisCoordinator {
     fn last_binding(&self) -> Option<&DesktopCordisBindingState> {
         self.last_binding.as_ref()
     }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn successful_bindings(&self) -> u64 {
+        self.successful_bindings
+    }
 }
 
+#[cfg(test)]
 impl Deref for DesktopCordisCoordinator {
     type Target = CordisHost;
 
@@ -185,6 +242,7 @@ impl Deref for DesktopCordisCoordinator {
     }
 }
 
+#[cfg(test)]
 impl DerefMut for DesktopCordisCoordinator {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.host
@@ -259,11 +317,9 @@ pub(crate) fn bind_live_domain_kernel(
     )
 }
 
-/// Bind live Domain facts to one exact Project/Mission scope.
-///
-/// Production Runtime dispatch uses this path; a fact from another Mission can
-/// never authorize the scoped Cordis adapter call.
-pub(crate) fn bind_live_domain_kernel_scope(
+/// Test-only exact Project/Mission binding receipt.
+#[cfg(test)]
+fn bind_live_domain_kernel_scope(
     host: &mut DesktopCordisCoordinator,
     scope: AuthorityScope,
     consent: &ConsentState,
@@ -278,6 +334,19 @@ pub(crate) fn bind_live_domain_kernel_scope(
         approval.map(kernel_approval),
         now,
     )
+}
+
+/// Test-only compatibility seam for DataPlane invariant fixtures.
+#[cfg(test)]
+pub(crate) fn bind_live_domain_kernel_scope_for_test(
+    host: &mut DesktopCordisCoordinator,
+    scope: AuthorityScope,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+) -> Result<(), CordisError> {
+    bind_live_domain_kernel_scope(host, scope, consent, record, approval, now).map(drop)
 }
 
 /// Private Desktop adapter for the one Cordis-authorized Application call.
@@ -325,9 +394,13 @@ where
         let mut host = cordis
             .lock()
             .map_err(|_| CordisError::RuntimeCoordinatorPoisoned)?;
-        let binding =
-            bind_live_domain_kernel_scope(&mut host, scope, consent, record, approval, now)?;
-        host.authorize_runtime(binding.scope())?
+        host.bind_and_authorize_runtime(
+            scope,
+            kernel_consent_state(consent),
+            record.map(kernel_consent_record),
+            approval.map(kernel_approval),
+            now,
+        )?
     };
     let started = permit.announce_started().err();
     let (output, authority) = if started.is_none() {
@@ -685,15 +758,13 @@ mod tests {
             second.unwrap_err(),
             AuthorityDispatchError::Cordis(Box::new(CordisError::RuntimeDispatchBusy))
         );
-        assert_eq!(
-            host.lock()
-                .unwrap()
-                .last_binding()
-                .unwrap()
-                .refresh_sequence,
-            1,
-            "a rejected busy bind must not publish a successful receipt"
+        let locked = host.lock().unwrap();
+        assert_eq!(locked.successful_bindings(), 1);
+        assert!(
+            locked.last_binding().is_none(),
+            "authorization consumes the only successful binding receipt"
         );
+        drop(locked);
         release_tx.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap(), "first");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -949,6 +1020,45 @@ mod tests {
         let domain = host.context().domain::<DomainSurface>().unwrap();
         assert!(!domain.consent());
         assert!(!domain.approved());
+        assert_eq!(
+            host.authorize_bound_runtime(first).unwrap_err(),
+            CordisError::AuthorityScopeMismatch,
+            "an older receipt cannot authorize after a newer live binding"
+        );
+        assert_eq!(host.last_binding().unwrap().refresh_sequence, 2);
+        let permit = host.authorize_bound_runtime(second).unwrap();
+        assert!(host.last_binding().is_none());
+        host.finish_runtime(permit).unwrap().announce().unwrap();
+        assert_eq!(
+            host.apply_effect().unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_binding_receipt_cannot_cross_coordinators() {
+        let mut first =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        let receipt = bind_live_domain_kernel_scope(
+            &mut first,
+            runtime_scope(),
+            &ConsentState::Confirmed,
+            None,
+            Some(&approved(now() + Duration::minutes(5))),
+            now(),
+        )
+        .unwrap();
+        let mut second =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+
+        assert_eq!(
+            second.authorize_bound_runtime(receipt).unwrap_err(),
+            CordisError::AuthorityScopeMismatch
+        );
+        assert_eq!(second.successful_bindings(), 0);
+        assert!(second.last_binding().is_none());
     }
 
     #[test]
