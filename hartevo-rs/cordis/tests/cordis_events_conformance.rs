@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
+use chrono::{TimeZone, Utc};
 use futures_util::FutureExt;
 use hartevo_cordis::{
-    Accumulate, Bail, BailOutcome, Context, CordisError, DispatchMode, Emit, EventKey,
-    EventOptions, EventReentry, EventSchemaId, ListenerHandle, NonBail, Parallel, Serial,
-    Waterfall, WaterfallFailure,
+    Accumulate, AgentsSurface, AuthorityScope, Bail, BailOutcome, Context, CordisError, CordisHost,
+    DispatchMode, Emit, EventKey, EventOptions, EventReentry, EventSchemaId, KernelConsentState,
+    ListenerHandle, NonBail, Parallel, RuntimeBinding, Serial, Waterfall, WaterfallFailure,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -160,6 +161,12 @@ fn wait_for_event_gate_to_close(events: &EventReentry) {
             Err(error) => panic!("unexpected event-gate error while closing: {error}"),
         }
     }
+}
+
+fn runtime_scope() -> AuthorityScope {
+    AuthorityScope::new("tenant-a", "project-a", "mission-a", 1)
+        .unwrap()
+        .with_runtime(RuntimeBinding::new(1, None, None, "a".repeat(64)).unwrap())
 }
 
 #[derive(Debug, Clone)]
@@ -553,6 +560,156 @@ fn callback_reusable_teardown_is_a_preclose_noop_and_keeps_context_open() {
 
     assert!(teardown_listener.dispose());
     assert!(candidate.dispose());
+}
+
+#[test]
+fn callback_root_dispose_reports_busy_and_preserves_exact_context_state() {
+    let mut context = Context::new();
+    let root = context.root();
+    let provider = context
+        .provide("busy-provider", "original".to_string())
+        .unwrap();
+    let value_before = context.get::<String>("busy-provider").unwrap();
+    let registrations_before = context.registration_count();
+    let pending_before = context.pending_count();
+    let context = Arc::new(Mutex::new(context));
+    let events = context.lock().unwrap().event_reentry().unwrap();
+    let callback_context = Arc::clone(&context);
+    let callback_root = root.clone();
+    let dispose_result = std_mpsc::sync_channel(1);
+    let listener = events
+        .on_emit(SELF_TEARDOWN, move |()| {
+            let result = callback_context
+                .lock()
+                .unwrap()
+                .dispose_fiber(&callback_root);
+            dispose_result.0.send(result).unwrap();
+        })
+        .unwrap();
+    let listener_count_before = context.lock().unwrap().listener_count(SELF_TEARDOWN);
+
+    let dispatched = std_mpsc::sync_channel(1);
+    let dispatch_events = events.clone();
+    std::thread::spawn(move || {
+        let _ = dispatched.0.send(dispatch_events.emit(SELF_TEARDOWN, &()));
+    });
+    assert!(
+        !dispose_result
+            .1
+            .recv_timeout(Duration::from_secs(5))
+            .expect("root disposal must return instead of waiting for its callback permit")
+            .unwrap(),
+        "Busy root disposal must report that no teardown completed"
+    );
+    dispatched
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the root-dispose callback dispatch must settle")
+        .unwrap();
+
+    {
+        let context = context.lock().unwrap();
+        assert!(!root.is_disposed());
+        assert_eq!(context.registration_count(), registrations_before);
+        assert_eq!(context.pending_count(), pending_before);
+        assert_eq!(context.listener_count(SELF_TEARDOWN), listener_count_before);
+        let value_after = context.get::<String>("busy-provider").unwrap();
+        assert!(Arc::ptr_eq(&value_before, &value_after));
+    }
+    assert_eq!(provider.generation(), 0);
+
+    let candidate = events
+        .on_emit(FENCE_CANDIDATE, |()| {})
+        .expect("Busy root disposal must leave the exact event generation open");
+    events.emit(FENCE_CANDIDATE, &()).unwrap();
+    assert!(listener.dispose());
+    assert!(candidate.dispose());
+
+    let mut context = context.lock().unwrap();
+    assert!(context.dispose_fiber(&root).unwrap());
+    assert!(!context.has("busy-provider"));
+    assert_eq!(context.registration_count(), 0);
+    assert_eq!(context.listener_count(SELF_TEARDOWN), 0);
+}
+
+#[test]
+fn callback_host_teardown_is_atomic_busy_across_host_and_context() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope();
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        Utc.with_ymd_and_hms(2026, 8, 30, 0, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let permit = host.authorize_runtime(&scope).unwrap();
+    let agents_before = host.context().agents::<AgentsSurface>().unwrap();
+    let live_agents_before = agents_before.list();
+    let registrations_before = host.context().registration_count();
+    let pending_before = host.context().pending_count();
+    let mounted_keys = host.mounted_keys();
+    let host = Arc::new(Mutex::new(host));
+    let events = host.lock().unwrap().context().event_reentry().unwrap();
+    let callback_host = Arc::clone(&host);
+    let callback_done = std_mpsc::sync_channel(1);
+    let listener = events
+        .on_emit(SELF_TEARDOWN, move |()| {
+            callback_host.lock().unwrap().teardown();
+            callback_done.0.send(()).unwrap();
+        })
+        .unwrap();
+    let listener_count_before = host.lock().unwrap().context().listener_count(SELF_TEARDOWN);
+
+    let dispatched = std_mpsc::sync_channel(1);
+    let dispatch_events = events.clone();
+    std::thread::spawn(move || {
+        let _ = dispatched.0.send(dispatch_events.emit(SELF_TEARDOWN, &()));
+    });
+    callback_done
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Host teardown must return Busy without waiting for its callback permit");
+    dispatched
+        .1
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the Host teardown callback dispatch must settle")
+        .unwrap();
+
+    {
+        let host = host.lock().unwrap();
+        assert_eq!(host.bound_scope(), Some(&scope));
+        assert_eq!(host.active_runtime_scope(), Some(&scope));
+        assert_eq!(host.context().registration_count(), registrations_before);
+        assert_eq!(host.context().pending_count(), pending_before);
+        assert_eq!(
+            host.context().listener_count(SELF_TEARDOWN),
+            listener_count_before
+        );
+        assert!(mounted_keys.iter().all(|key| host.context().has(key)));
+        let agents_after = host.context().agents::<AgentsSurface>().unwrap();
+        assert!(Arc::ptr_eq(&agents_before, &agents_after));
+        assert_eq!(agents_after.list(), live_agents_before);
+    }
+
+    let candidate = events
+        .on_emit(FENCE_CANDIDATE, |()| {})
+        .expect("Busy Host teardown must leave the exact Context generation open");
+    events.emit(FENCE_CANDIDATE, &()).unwrap();
+    assert!(listener.dispose());
+    assert!(candidate.dispose());
+
+    let completion = host.lock().unwrap().finish_runtime(permit).unwrap();
+    completion.announce().unwrap();
+    {
+        let mut host = host.lock().unwrap();
+        host.teardown();
+        assert_eq!(host.bound_scope(), None);
+        assert_eq!(host.active_runtime_scope(), None);
+        assert!(mounted_keys.iter().all(|key| !host.context().has(key)));
+        assert_eq!(host.context().registration_count(), 0);
+    }
 }
 
 #[test]

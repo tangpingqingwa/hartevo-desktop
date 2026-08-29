@@ -445,6 +445,20 @@ struct EventOperationGate {
     drained: Condvar,
 }
 
+/// Result of atomically closing and draining one reusable Context generation.
+/// The acquired permit has no Drop behavior: an unwind before explicit
+/// completion deliberately leaves event re-entry fail-closed.
+pub(crate) enum TeardownTransaction {
+    Busy,
+    Acquired(TeardownPermit),
+}
+
+pub(crate) struct TeardownPermit {
+    context_id: u64,
+    gate: Arc<EventOperationGate>,
+    generation: Arc<EventGeneration>,
+}
+
 impl EventOperationGate {
     fn new() -> Self {
         Self {
@@ -493,17 +507,19 @@ impl EventOperationGate {
     /// Close a reusable Context generation and drain every operation. Calling
     /// this from an operation on the same thread is rejected before `open` is
     /// changed, because that operation cannot drain until the callback returns.
-    fn try_close_and_drain_reusable(&self) -> bool {
+    fn try_close_and_drain_reusable(&self) -> Option<Arc<EventGeneration>> {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if state
-            .active_by_thread
-            .contains_key(&std::thread::current().id())
+        if !state.open
+            || state
+                .active_by_thread
+                .contains_key(&std::thread::current().id())
         {
-            return false;
+            return None;
         }
+        let generation = Arc::clone(&state.generation);
         state.open = false;
         while state.active != 0 {
             state = match self.drained.wait(state) {
@@ -511,7 +527,7 @@ impl EventOperationGate {
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
-        true
+        Some(generation)
     }
 
     /// Permanently close a Context while allowing Drop to run from inside one
@@ -540,12 +556,17 @@ impl EventOperationGate {
 
     /// Publish a fresh generation only after reusable teardown completed all
     /// structural cleanup. There is deliberately no RAII reopen on unwind.
-    fn reopen_after_completed_teardown(&self) {
+    fn reopen_after_completed_teardown(&self, generation: &Arc<EventGeneration>) {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        assert!(!state.open, "a teardown permit owns one closed generation");
         debug_assert_eq!(state.active, 0);
+        assert!(
+            Arc::ptr_eq(&state.generation, generation),
+            "a teardown permit completes only its exact generation"
+        );
         state.generation = Arc::new(EventGeneration);
         state.open = true;
     }
@@ -1198,8 +1219,13 @@ impl Context {
                     uid: self.current_fiber,
                 });
             }
-            self.teardown();
-            return Ok(true);
+            return match self.try_begin_teardown() {
+                TeardownTransaction::Busy => Ok(false),
+                TeardownTransaction::Acquired(permit) => {
+                    self.complete_teardown(permit);
+                    Ok(true)
+                }
+            };
         }
         if !self.current_scope_allows(fiber) {
             return Err(CordisError::FiberScopeViolation {
@@ -2710,17 +2736,50 @@ impl Context {
     /// fail-closed no-op: it does not close the current generation or wait for
     /// itself. An external caller may retry after the callback returns.
     pub fn teardown(&mut self) {
+        let TeardownTransaction::Acquired(permit) = self.try_begin_teardown() else {
+            return;
+        };
+        self.complete_teardown(permit);
+    }
+
+    /// Atomically acquire the exact reusable event generation before any
+    /// caller mutates higher-layer teardown state.
+    pub(crate) fn try_begin_teardown(&self) -> TeardownTransaction {
         // A callback cannot tear down the owner whose activation bookkeeping
-        // is still on the stack. N1 will model explicit async unload; N0 keeps
-        // this synchronous request fail-closed.
+        // is still on the stack. N1 models explicit async unload; N0 keeps this
+        // synchronous request fail-closed.
         if self.activation_depth != 0 {
-            return;
+            return TeardownTransaction::Busy;
         }
-        if !self.event_gate.try_close_and_drain_reusable() {
-            return;
+        match self.event_gate.try_close_and_drain_reusable() {
+            Some(generation) => TeardownTransaction::Acquired(TeardownPermit {
+                context_id: self.id,
+                gate: Arc::clone(&self.event_gate),
+                generation,
+            }),
+            None => TeardownTransaction::Busy,
         }
+    }
+
+    /// Consume one exact closed generation, complete all structural cleanup,
+    /// publish a fresh generation, and only then propagate a retained callback
+    /// destructor panic. The permit never reopens itself on Drop or unwind.
+    pub(crate) fn complete_teardown(&mut self, permit: TeardownPermit) {
+        let TeardownPermit {
+            context_id,
+            gate,
+            generation,
+        } = permit;
+        assert_eq!(
+            context_id, self.id,
+            "a teardown permit belongs to one exact Context"
+        );
+        assert!(
+            Arc::ptr_eq(&gate, &self.event_gate),
+            "a teardown permit belongs to one exact event gate"
+        );
         let first_panic = self.teardown_closed();
-        self.event_gate.reopen_after_completed_teardown();
+        gate.reopen_after_completed_teardown(&generation);
         if let Some(payload) = first_panic {
             resume_unwind(payload);
         }
