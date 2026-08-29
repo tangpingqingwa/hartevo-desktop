@@ -1,10 +1,11 @@
 use std::fmt;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures_core::Stream;
-use tokio::sync::Notify;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 
 use crate::config::ConfigValue;
 use crate::context::CordisError;
@@ -18,16 +19,16 @@ pub type LifecycleDisposeFuture =
     Pin<Box<dyn Future<Output = Result<(), CordisError>> + Send + 'static>>;
 
 type LifecycleDisposeCallback = Box<dyn FnOnce() -> LifecycleDisposeFuture + Send + 'static>;
+type SharedLifecycleDispose = Shared<BoxFuture<'static, Result<(), CordisError>>>;
 
 enum LifecycleDisposerState {
     Ready(Option<LifecycleDisposeCallback>),
-    Running,
+    Running(SharedLifecycleDispose),
     Done(Result<(), CordisError>),
 }
 
 struct LifecycleDisposerInner {
     state: Mutex<LifecycleDisposerState>,
-    completed: Notify,
 }
 
 /// Idempotent async cleanup handle owned by exactly one Fiber effect.
@@ -50,7 +51,6 @@ impl LifecycleDisposer {
         Self {
             inner: Arc::new(LifecycleDisposerInner {
                 state: Mutex::new(LifecycleDisposerState::Ready(Some(callback))),
-                completed: Notify::new(),
             }),
         }
     }
@@ -75,36 +75,29 @@ impl LifecycleDisposer {
     }
 
     pub async fn dispose_async(&self) -> Result<(), CordisError> {
-        loop {
-            let notified = self.inner.completed.notified();
-            let callback = {
-                let mut state = match self.inner.state.lock() {
-                    Ok(state) => state,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                match &mut *state {
-                    LifecycleDisposerState::Ready(callback) => {
-                        let callback = callback.take();
-                        *state = LifecycleDisposerState::Running;
-                        callback
-                    }
-                    LifecycleDisposerState::Running => None,
-                    LifecycleDisposerState::Done(result) => return result.clone(),
-                }
+        let shared = {
+            let mut state = match self.inner.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
             };
-            if let Some(callback) = callback {
-                let result = callback().await;
-                let mut state = match self.inner.state.lock() {
-                    Ok(state) => state,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                *state = LifecycleDisposerState::Done(result.clone());
-                drop(state);
-                self.inner.completed.notify_waiters();
-                return result;
+            match &mut *state {
+                LifecycleDisposerState::Ready(callback) => {
+                    let callback = callback.take().expect("ready disposer has callback");
+                    let shared = shared_disposal(callback);
+                    *state = LifecycleDisposerState::Running(shared.clone());
+                    shared
+                }
+                LifecycleDisposerState::Running(shared) => shared.clone(),
+                LifecycleDisposerState::Done(result) => return result.clone(),
             }
-            notified.await;
-        }
+        };
+        let result = shared.await;
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *state = LifecycleDisposerState::Done(result.clone());
+        result
     }
 
     #[must_use]
@@ -114,6 +107,34 @@ impl LifecycleDisposer {
             Err(poisoned) => poisoned.into_inner(),
         };
         matches!(*state, LifecycleDisposerState::Done(_))
+    }
+}
+
+fn shared_disposal(callback: LifecycleDisposeCallback) -> SharedLifecycleDispose {
+    async move {
+        let future = catch_unwind(AssertUnwindSafe(callback)).map_err(|payload| {
+            CordisError::CleanupPanicked {
+                message: panic_payload_message(payload.as_ref()),
+            }
+        })?;
+        AssertUnwindSafe(future)
+            .catch_unwind()
+            .await
+            .map_err(|payload| CordisError::CleanupPanicked {
+                message: panic_payload_message(payload.as_ref()),
+            })?
+    }
+    .boxed()
+    .shared()
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
