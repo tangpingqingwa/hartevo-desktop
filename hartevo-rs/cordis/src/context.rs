@@ -1,17 +1,20 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::fmt;
-use std::fmt::Display;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
 
 use crate::config::ConfigValue;
 use crate::effect::{Disposer, Registration, RegistrationHandle};
 use crate::event::{
-    BoxedPayload, DispatchMode, EventBus, PreparedEmit, WaterfallContinuation, WaterfallNext,
+    Accumulate, Bail, BailOutcome, DispatchMode, Emit, EventBus, EventDescriptor, EventError,
+    EventErrors, EventKey, EventModeMarker, EventOptions, EventScope, ListenerHandle, Parallel,
+    PreparedEmit, Serial, TryWaterfallNext, Waterfall, WaterfallFailure, WaterfallNext,
+    into_cordis_error,
 };
 use crate::fiber::{Fiber, FiberState, FiberUid};
 use crate::loader::{PluginFactory, PluginFactoryId};
@@ -231,10 +234,52 @@ pub enum CordisError {
         locked: DispatchMode,
         requested: DispatchMode,
     },
-    #[error("event `{name}` parallel listeners failed: {}", .errors.join("; "))]
-    ParallelJoin { name: String, errors: Vec<String> },
-    #[error("event `{name}` serial listener failed: {message}")]
-    Serial { name: String, message: String },
+    #[error("event `{name}` descriptor conflict: locked {locked}, requested {requested}")]
+    SchemaConflict {
+        name: String,
+        locked: EventDescriptor,
+        requested: EventDescriptor,
+    },
+    #[error("event `{name}` requires a complete typed descriptor")]
+    EventDescriptorRequired { name: String },
+    #[error("event listener identity allocation overflowed")]
+    ListenerIdentityOverflow,
+    #[error("event `{name}` emit listener failed: {error}")]
+    Emit {
+        name: String,
+        #[source]
+        error: EventError,
+    },
+    #[error("event `{name}` parallel listeners failed: {errors}")]
+    ParallelJoin {
+        name: String,
+        #[source]
+        errors: EventErrors,
+    },
+    #[error("event `{name}` serial listener failed: {error}")]
+    Serial {
+        name: String,
+        #[source]
+        error: EventError,
+    },
+    #[error("event `{name}` bail listener failed: {error}")]
+    Bail {
+        name: String,
+        #[source]
+        error: EventError,
+    },
+    #[error("event `{name}` waterfall listener failed: {error}")]
+    Waterfall {
+        name: String,
+        #[source]
+        error: EventError,
+    },
+    #[error("event `{name}` accumulate listener failed: {error}")]
+    Accumulate {
+        name: String,
+        #[source]
+        error: EventError,
+    },
     #[error("event `{name}` payload type mismatch")]
     PayloadType { name: String },
     #[error("Cordis authority scope field `{field}` is empty or not canonical")]
@@ -367,6 +412,7 @@ pub enum CordisError {
 /// Service container and plugin host.
 pub struct Context {
     id: u64,
+    event_gate: Arc<EventOperationGate>,
     services: HashMap<String, Arc<dyn Any + Send + Sync>>,
     providers: HashMap<ProviderKey, ProviderRecord>,
     next_provider_id: u64,
@@ -385,6 +431,385 @@ pub struct Context {
     activation_depth: usize,
 }
 
+struct EventGeneration;
+
+struct EventOperationState {
+    generation: Arc<EventGeneration>,
+    open: bool,
+    active: usize,
+    active_by_thread: HashMap<ThreadId, usize>,
+}
+
+struct EventOperationGate {
+    state: Mutex<EventOperationState>,
+    drained: Condvar,
+}
+
+/// Result of atomically closing and draining one reusable Context generation.
+/// The acquired permit has no Drop behavior: an unwind before explicit
+/// completion deliberately leaves event re-entry fail-closed.
+pub(crate) enum TeardownTransaction {
+    Busy,
+    Acquired(TeardownPermit),
+}
+
+pub(crate) struct TeardownPermit {
+    context_id: u64,
+    gate: Arc<EventOperationGate>,
+    generation: Arc<EventGeneration>,
+}
+
+impl EventOperationGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(EventOperationState {
+                generation: Arc::new(EventGeneration),
+                open: true,
+                active: 0,
+                active_by_thread: HashMap::new(),
+            }),
+            drained: Condvar::new(),
+        }
+    }
+
+    fn current_generation(&self) -> Option<Arc<EventGeneration>> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.open.then(|| Arc::clone(&state.generation))
+    }
+
+    fn enter(self: &Arc<Self>, generation: &Arc<EventGeneration>) -> Option<EventOperationPermit> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.open || !Arc::ptr_eq(&state.generation, generation) {
+            return None;
+        }
+        let thread_id = std::thread::current().id();
+        let next_active = state.active.checked_add(1)?;
+        let next_thread_active = state
+            .active_by_thread
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)?;
+        state.active = next_active;
+        state.active_by_thread.insert(thread_id, next_thread_active);
+        Some(EventOperationPermit {
+            gate: Arc::clone(self),
+            thread_id,
+        })
+    }
+
+    /// Close a reusable Context generation and drain every operation. Calling
+    /// this from an operation on the same thread is rejected before `open` is
+    /// changed, because that operation cannot drain until the callback returns.
+    fn try_close_and_drain_reusable(&self) -> Option<Arc<EventGeneration>> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.open
+            || state
+                .active_by_thread
+                .contains_key(&std::thread::current().id())
+        {
+            return None;
+        }
+        let generation = Arc::clone(&state.generation);
+        state.open = false;
+        while state.active != 0 {
+            state = match self.drained.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        Some(generation)
+    }
+
+    /// Permanently close a Context while allowing Drop to run from inside one
+    /// of its own callbacks. The caller's exact outstanding permits remain
+    /// valid until their stack frames return; permits on every other thread
+    /// must drain before structural cleanup starts.
+    fn close_and_drain_for_drop(&self) {
+        let thread_id = std::thread::current().id();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.open = false;
+        let caller_active = state
+            .active_by_thread
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_default();
+        while state.active != caller_active {
+            state = match self.drained.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    /// Publish a fresh generation only after reusable teardown completed all
+    /// structural cleanup. There is deliberately no RAII reopen on unwind.
+    fn reopen_after_completed_teardown(&self, generation: &Arc<EventGeneration>) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert!(!state.open, "a teardown permit owns one closed generation");
+        debug_assert_eq!(state.active, 0);
+        assert!(
+            Arc::ptr_eq(&state.generation, generation),
+            "a teardown permit completes only its exact generation"
+        );
+        state.generation = Arc::new(EventGeneration);
+        state.open = true;
+    }
+}
+
+struct EventOperationPermit {
+    gate: Arc<EventOperationGate>,
+    thread_id: ThreadId,
+}
+
+impl Drop for EventOperationPermit {
+    fn drop(&mut self) {
+        let mut state = match self.gate.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("an event operation permit owns one active count");
+        let remove_thread = {
+            let thread_active = state
+                .active_by_thread
+                .get_mut(&self.thread_id)
+                .expect("an event operation permit owns one thread-local active count");
+            *thread_active = thread_active
+                .checked_sub(1)
+                .expect("an event operation permit owns one thread-local active count");
+            *thread_active == 0
+        };
+        if remove_thread {
+            state.active_by_thread.remove(&self.thread_id);
+        }
+        // A self-excluding Context Drop waits for `active == caller_active`,
+        // so every other-thread decrement can satisfy its predicate.
+        self.gate.drained.notify_all();
+    }
+}
+
+/// Cloneable typed-Emit capability for safe callback re-entry.
+///
+/// The capability captures one exact Context, active Fiber owner, and event
+/// scope without retaining a borrow of [`Context`] or [`ContextView`]. It may
+/// therefore be moved into a `'static` listener, where registration and
+/// recursive dispatch continue to use the normal snapshot semantics. Every
+/// listener it creates is owned by the captured Fiber and is removed when that
+/// Fiber is cleaned up.
+///
+/// This is the synchronous N2 boundary only. It deliberately does not grant
+/// provider, Fiber-lifecycle, or [`crate::LifecycleContextView`] authority.
+#[derive(Clone)]
+pub struct EventReentry {
+    context_id: u64,
+    gate: Arc<EventOperationGate>,
+    generation: Arc<EventGeneration>,
+    events: EventBus,
+    owner: Fiber,
+    listener_scope: EventScope,
+    dispatch_target: Option<EventScope>,
+}
+
+impl EventReentry {
+    fn new(
+        context_id: u64,
+        gate: Arc<EventOperationGate>,
+        generation: Arc<EventGeneration>,
+        events: EventBus,
+        owner: Fiber,
+        listener_scope: EventScope,
+        dispatch_target: Option<EventScope>,
+    ) -> Self {
+        Self {
+            context_id,
+            gate,
+            generation,
+            events,
+            owner,
+            listener_scope,
+            dispatch_target,
+        }
+    }
+
+    fn enter(&self) -> Result<EventOperationPermit, CordisError> {
+        if self.owner.context_id() != self.context_id {
+            return Err(CordisError::FiberContextMismatch {
+                uid: self.owner.uid(),
+            });
+        }
+        let permit =
+            self.gate
+                .enter(&self.generation)
+                .ok_or(CordisError::FiberContextMismatch {
+                    uid: self.owner.uid(),
+                })?;
+        if self.owner.is_disposed() || self.owner.state() != FiberState::Active {
+            return Err(CordisError::FiberDisposed {
+                uid: self.owner.uid(),
+            });
+        }
+        Ok(permit)
+    }
+
+    fn finish_listener(
+        name: &str,
+        result: Result<ListenerHandle, crate::event::EventBusError>,
+    ) -> Result<ListenerHandle, CordisError> {
+        result.map_err(|error| into_cordis_error(name, DispatchMode::Emit, error))
+    }
+
+    /// Register an infallible listener with default append/local options.
+    pub fn on_emit<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    /// Register an infallible listener with explicit ordering/scope options.
+    pub fn on_emit_with_options<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        let _permit = self.enter()?;
+        let result = self.events.register_emit(
+            key,
+            self.owner.clone(),
+            self.listener_scope.clone(),
+            options,
+            false,
+            listener,
+        );
+        Self::finish_listener(key.name(), result)
+    }
+
+    /// Register an infallible listener claimed before its first callback.
+    pub fn once_emit<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.once_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    /// Register a once listener with explicit ordering/scope options.
+    pub fn once_emit_with_options<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        let _permit = self.enter()?;
+        let result = self.events.register_emit(
+            key,
+            self.owner.clone(),
+            self.listener_scope.clone(),
+            options,
+            true,
+            listener,
+        );
+        Self::finish_listener(key.name(), result)
+    }
+
+    /// Register a fallible listener with default append/local options.
+    pub fn try_on_emit<P, E, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        self.try_on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    /// Register a fallible listener with explicit ordering/scope options.
+    pub fn try_on_emit_with_options<P, E, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        let _permit = self.enter()?;
+        let result = self.events.register_try_emit(
+            key,
+            self.owner.clone(),
+            self.listener_scope.clone(),
+            options,
+            false,
+            listener,
+        );
+        Self::finish_listener(key.name(), result)
+    }
+
+    /// Recursively dispatch an Emit event using the captured target scope.
+    pub fn emit<P>(&self, key: EventKey<Emit, P, ()>, payload: &P) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        let _permit = self.enter()?;
+        self.events
+            .emit_owned(key, payload, self.dispatch_target.as_ref(), &self.owner)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
+    }
+}
+
+impl fmt::Debug for EventReentry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventReentry")
+            .field("context_id", &self.context_id)
+            .field("owner_uid", &self.owner.uid())
+            .field("listener_scope", &self.listener_scope)
+            .field("dispatch_target", &self.dispatch_target)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Context {
     fn default() -> Self {
         Self::new()
@@ -398,6 +823,7 @@ impl Context {
         let root = Fiber::root(context_id);
         Self {
             id: context_id,
+            event_gate: Arc::new(EventOperationGate::new()),
             services: HashMap::new(),
             providers: HashMap::new(),
             next_provider_id: 1,
@@ -793,8 +1219,13 @@ impl Context {
                     uid: self.current_fiber,
                 });
             }
-            self.teardown();
-            return Ok(true);
+            return match self.try_begin_teardown() {
+                TeardownTransaction::Busy => Ok(false),
+                TeardownTransaction::Acquired(permit) => {
+                    self.complete_teardown(permit);
+                    Ok(true)
+                }
+            };
         }
         if !self.current_scope_allows(fiber) {
             return Err(CordisError::FiberScopeViolation {
@@ -852,6 +1283,10 @@ impl Context {
     }
 
     fn cleanup_fibers(&mut self, disposed: &HashSet<FiberUid>) -> Result<(), CordisError> {
+        let mut first_panic = self
+            .events
+            .remove_owners(disposed)
+            .map(|payload| panic_payload_message(payload.as_ref()));
         for uid in disposed {
             self.registry.remove_fiber(*uid);
         }
@@ -870,7 +1305,6 @@ impl Context {
         }
         retained.reverse();
         self.effects = retained;
-        let mut first_panic = None;
         for registration in owned {
             let result = catch_unwind(AssertUnwindSafe(|| self.run_registration(registration)));
             if let Err(payload) = result
@@ -1392,256 +1826,854 @@ impl Context {
         handle
     }
 
-    /// Store an emit listener. Locks this name to [`DispatchMode::Emit`].
-    pub fn on<F>(&mut self, name: impl Into<String>, listener: F) -> Result<(), CordisError>
+    fn current_event_owner(&self) -> Result<(Fiber, EventScope), CordisError> {
+        self.ensure_owner_active(self.current_fiber)?;
+        let owner = self.current_fiber_handle()?;
+        let scope = EventScope::new(owner.namespace(), &[]);
+        Ok((owner, scope))
+    }
+
+    /// Capture a cloneable typed-Emit capability for callback re-entry.
+    ///
+    /// Direct Context dispatch remains untargeted, matching [`Context::emit`].
+    /// Use [`ContextView::event_reentry`] to retain an isolated/shared target.
+    pub fn event_reentry(&self) -> Result<EventReentry, CordisError> {
+        let (owner, scope) = self.current_event_owner()?;
+        let generation = self
+            .event_gate
+            .current_generation()
+            .ok_or(CordisError::FiberContextMismatch { uid: owner.uid() })?;
+        Ok(EventReentry::new(
+            self.id,
+            Arc::clone(&self.event_gate),
+            generation,
+            self.events.clone(),
+            owner,
+            scope,
+            None,
+        ))
+    }
+
+    fn finish_listener(
+        &mut self,
+        owner_uid: FiberUid,
+        name: &str,
+        mode: DispatchMode,
+        result: Result<ListenerHandle, crate::event::EventBusError>,
+    ) -> Result<ListenerHandle, CordisError> {
+        let handle = result.map_err(|error| into_cordis_error(name, mode, error))?;
+        self.effects
+            .push(Registration::listener(owner_uid, handle.clone()));
+        Ok(handle)
+    }
+
+    /// Register a no-payload Emit listener.
+    pub fn on<F>(
+        &mut self,
+        key: EventKey<Emit, (), ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
     where
         F: Fn() + Send + Sync + 'static,
     {
-        self.on_emit(name, move |(): &()| listener())
+        self.on_emit(key, move |(): &()| listener())
     }
 
-    /// Observe-only listener. Locks `name` to [`DispatchMode::Emit`].
-    pub fn on_emit<T, F>(&mut self, name: impl Into<String>, listener: F) -> Result<(), CordisError>
-    where
-        T: Any + Send + Sync + 'static,
-        F: Fn(&T) + Send + Sync + 'static,
-    {
-        self.ensure_owner_active(self.current_fiber)?;
-        let name = name.into();
-        let callback = Arc::new(move |payload: &(dyn Any + Send + Sync)| {
-            if let Some(value) = payload.downcast_ref::<T>() {
-                listener(value);
-            }
-        });
-        let id = self
-            .events
-            .register_emit(name.clone(), callback)
-            .map_err(|locked| conflict(&name, locked, DispatchMode::Emit))?;
-        self.effects
-            .push(Registration::listener(self.current_fiber, name, id));
-        Ok(())
-    }
-
-    /// Middleware listener. Locks `name` to [`DispatchMode::Waterfall`].
-    ///
-    /// Not calling `next` short-circuits the remaining chain (policy).
-    pub fn on_waterfall<T, F>(
+    pub fn on_emit<P, F>(
         &mut self,
-        name: impl Into<String>,
+        key: EventKey<Emit, P, ()>,
         listener: F,
-    ) -> Result<(), CordisError>
+    ) -> Result<ListenerHandle, CordisError>
     where
-        T: Any + Send + 'static,
-        F: Fn(T, WaterfallNext<T>) -> T + Send + Sync + 'static,
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
     {
-        self.ensure_owner_active(self.current_fiber)?;
-        let name = name.into();
-        let callback = Arc::new(move |payload: BoxedPayload, next: WaterfallContinuation| {
-            match payload.downcast::<T>() {
-                Ok(value) => {
-                    let typed_next: WaterfallNext<T> = Box::new(move |value: T| {
-                        *next(Box::new(value))
-                            .downcast::<T>()
-                            .expect("waterfall payload type is homogeneous")
-                    });
-                    Box::new(listener(*value, typed_next)) as Box<dyn Any + Send>
-                }
-                Err(original) => original,
-            }
-        });
-        let id = self
-            .events
-            .register_waterfall(name.clone(), callback)
-            .map_err(|locked| conflict(&name, locked, DispatchMode::Waterfall))?;
-        self.effects
-            .push(Registration::listener(self.current_fiber, name, id));
-        Ok(())
+        self.on_emit_with_options(key, EventOptions::default(), listener)
     }
 
-    /// Awaited listener with no return. Locks `name` to [`DispatchMode::Parallel`].
-    pub fn on_parallel<T, E, Fut, F>(
+    pub fn on_emit_with_options<P, F>(
         &mut self,
-        name: impl Into<String>,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
         listener: F,
-    ) -> Result<(), CordisError>
+    ) -> Result<ListenerHandle, CordisError>
     where
-        T: Clone + Any + Send + Sync + 'static,
-        E: Display + Send + 'static,
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_emit_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn once_emit<P, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.once_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn once_emit_with_options<P, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_emit_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_emit_for<P, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_emit(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Emit, result)
+    }
+
+    pub fn try_on_emit<P, E, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        self.try_on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn try_on_emit_with_options<P, E, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_try_emit_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn try_once_emit_with_options<P, E, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_try_emit_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_try_emit_for<P, E, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_try_emit(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Emit, result)
+    }
+
+    pub fn on_waterfall<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        self.on_waterfall_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_waterfall_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn once_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_waterfall_for(key, owner, scope, options, true, listener)
+    }
+
+    pub fn once_waterfall<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        self.once_waterfall_with_options(key, EventOptions::default(), listener)
+    }
+
+    fn register_waterfall_for<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_waterfall(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Waterfall, result)
+    }
+
+    pub fn try_on_waterfall<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, TryWaterfallNext<P>) -> Result<P, WaterfallFailure> + Send + Sync + 'static,
+    {
+        self.try_on_waterfall_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn try_on_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, TryWaterfallNext<P>) -> Result<P, WaterfallFailure> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_try_waterfall_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn try_once_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, TryWaterfallNext<P>) -> Result<P, WaterfallFailure> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_try_waterfall_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_try_waterfall_for<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, TryWaterfallNext<P>) -> Result<P, WaterfallFailure> + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_try_waterfall(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Waterfall, result)
+    }
+
+    pub fn on_parallel<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Parallel, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Clone + Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
-        F: Fn(T) -> Fut + Send + Sync + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
     {
-        self.ensure_owner_active(self.current_fiber)?;
-        let name = name.into();
-        let listener = Arc::new(listener);
-        let callback = Arc::new(move |payload: Arc<dyn Any + Send + Sync>| {
-            let value = payload.downcast_ref::<T>().cloned();
-            let listener = Arc::clone(&listener);
-            Box::pin(async move {
-                let Some(value) = value else {
-                    return Err("payload type mismatch".to_string());
-                };
-                listener(value).await.map_err(|error| error.to_string())
-            }) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
-        });
-        let id = self
-            .events
-            .register_parallel(name.clone(), callback)
-            .map_err(|locked| conflict(&name, locked, DispatchMode::Parallel))?;
-        self.effects
-            .push(Registration::listener(self.current_fiber, name, id));
-        Ok(())
+        self.on_parallel_with_options(key, EventOptions::default(), listener)
     }
 
-    /// Awaited listener that threads a return value. Locks `name` to [`DispatchMode::Serial`].
-    pub fn on_serial<T, E, Fut, F>(
+    pub fn on_parallel_with_options<P, E, Fut, F>(
         &mut self,
-        name: impl Into<String>,
+        key: EventKey<Parallel, P, ()>,
+        options: EventOptions,
         listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Clone + Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_parallel_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn once_parallel_with_options<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Parallel, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Clone + Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_parallel_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_parallel_for<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Parallel, P, ()>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Clone + Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_parallel(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Parallel, result)
+    }
+
+    pub fn on_serial<P, R, E, Fut, F>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<BailOutcome<R>, E>> + Send + 'static,
+        F: Fn(Arc<P>) -> Fut + Send + Sync + 'static,
+    {
+        self.on_serial_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_serial_with_options<P, R, E, Fut, F>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<BailOutcome<R>, E>> + Send + 'static,
+        F: Fn(Arc<P>) -> Fut + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_serial_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn once_serial_with_options<P, R, E, Fut, F>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<BailOutcome<R>, E>> + Send + 'static,
+        F: Fn(Arc<P>) -> Fut + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_serial_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_serial_for<P, R, E, Fut, F>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<BailOutcome<R>, E>> + Send + 'static,
+        F: Fn(Arc<P>) -> Fut + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_serial(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Serial, result)
+    }
+
+    pub fn on_bail<P, R, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        F: Fn(&P) -> BailOutcome<R> + Send + Sync + 'static,
+    {
+        self.on_bail_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_bail_with_options<P, R, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        F: Fn(&P) -> BailOutcome<R> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_bail_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn once_bail_with_options<P, R, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        F: Fn(&P) -> BailOutcome<R> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_bail_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_bail_for<P, R, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        F: Fn(&P) -> BailOutcome<R> + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_bail(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Bail, result)
+    }
+
+    pub fn try_on_bail<P, R, E, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<BailOutcome<R>, E> + Send + Sync + 'static,
+    {
+        self.try_on_bail_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn try_on_bail_with_options<P, R, E, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<BailOutcome<R>, E> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_try_bail_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn try_once_bail_with_options<P, R, E, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<BailOutcome<R>, E> + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_try_bail_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_try_bail_for<P, R, E, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<BailOutcome<R>, E> + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_try_bail(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Bail, result)
+    }
+
+    pub fn on_accumulate<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        self.on_accumulate_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_accumulate_with_options<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_accumulate_for(key, owner, scope, options, false, listener)
+    }
+
+    pub fn once_accumulate_with_options<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        let (owner, scope) = self.current_event_owner()?;
+        self.register_accumulate_for(key, owner, scope, options, true, listener)
+    }
+
+    fn register_accumulate_for<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        owner: Fiber,
+        scope: EventScope,
+        options: EventOptions,
+        once: bool,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        let owner_uid = owner.uid();
+        self.ensure_owner_active(owner_uid)?;
+        let result = self
+            .events
+            .register_accumulate(key, owner, scope, options, once, listener);
+        self.finish_listener(owner_uid, key.name(), DispatchMode::Accumulate, result)
+    }
+
+    pub fn emit<P>(&mut self, key: EventKey<Emit, P, ()>, payload: &P) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        self.emit_for(key, payload, None)
+    }
+
+    fn emit_for<P>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        payload: &P,
+        target: Option<&EventScope>,
     ) -> Result<(), CordisError>
     where
-        T: Any + Send + 'static,
-        E: Display + Send + 'static,
-        Fut: Future<Output = Result<T, E>> + Send + 'static,
-        F: Fn(T) -> Fut + Send + Sync + 'static,
-    {
-        self.ensure_owner_active(self.current_fiber)?;
-        let name = name.into();
-        let listener = Arc::new(listener);
-        let callback = Arc::new(move |payload: Box<dyn Any + Send>| {
-            let listener = Arc::clone(&listener);
-            Box::pin(async move {
-                let value = payload
-                    .downcast::<T>()
-                    .map_err(|_| "payload type mismatch".to_string())?;
-                let next = listener(*value).await.map_err(|error| error.to_string())?;
-                Ok(Box::new(next) as Box<dyn Any + Send>)
-            })
-                as Pin<Box<dyn Future<Output = Result<Box<dyn Any + Send>, String>> + Send>>
-        });
-        let id = self
-            .events
-            .register_serial(name.clone(), callback)
-            .map_err(|locked| conflict(&name, locked, DispatchMode::Serial))?;
-        self.effects
-            .push(Registration::listener(self.current_fiber, name, id));
-        Ok(())
-    }
-
-    /// Observe-only dispatch. Locks `name` to [`DispatchMode::Emit`].
-    pub fn emit<T>(&mut self, name: &str, payload: &T) -> Result<(), CordisError>
-    where
-        T: Any + Send + Sync,
+        P: Any + Send + Sync + 'static,
     {
         self.ensure_owner_active(self.current_fiber)?;
         self.events
-            .emit(name, payload)
-            .map_err(|locked| conflict(name, locked, DispatchMode::Emit))
+            .emit(key, payload, target)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
     }
 
-    /// Capture an emit notification without invoking listeners. Cordis host
-    /// lifecycle code uses this to move callbacks outside its mutex.
-    pub(crate) fn prepare_emit<T>(
+    pub(crate) fn prepare_emit<P>(
         &self,
-        name: &str,
-        payload: T,
+        key: EventKey<Emit, P, ()>,
+        payload: P,
     ) -> Result<PreparedEmit, CordisError>
     where
-        T: Any + Send + Sync + 'static,
+        P: Any + Send + Sync + 'static,
     {
         self.ensure_owner_active(self.current_fiber)?;
-        let listeners = self
-            .events
-            .prepare_emit(name)
-            .map_err(|locked| conflict(name, locked, DispatchMode::Emit))?;
-        Ok(PreparedEmit::new(payload, listeners))
-    }
-
-    /// Synchronous middleware dispatch. Locks `name` to [`DispatchMode::Waterfall`].
-    pub fn waterfall<T>(&mut self, name: &str, payload: T) -> Result<T, CordisError>
-    where
-        T: Any + Send,
-    {
-        self.ensure_owner_active(self.current_fiber)?;
-        let boxed = self
-            .events
-            .waterfall(name, Box::new(payload))
-            .map_err(|locked| conflict(name, locked, DispatchMode::Waterfall))?;
-        boxed
-            .downcast::<T>()
-            .map(|value| *value)
-            .map_err(|_| CordisError::PayloadType {
-                name: name.to_string(),
-            })
-    }
-
-    /// Await every listener. Listener errors are joined; others are not dropped.
-    pub async fn parallel<T>(&mut self, name: &str, payload: T) -> Result<(), CordisError>
-    where
-        T: Any + Send + Sync,
-    {
-        self.ensure_owner_active(self.current_fiber)?;
-        let errors = self
-            .events
-            .parallel(name, Arc::new(payload))
-            .await
-            .map_err(|locked| conflict(name, locked, DispatchMode::Parallel))?;
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(CordisError::ParallelJoin {
-                name: name.to_string(),
-                errors,
-            })
-        }
-    }
-
-    /// Await listeners in registration order, threading the return value.
-    pub async fn serial<T>(&mut self, name: &str, payload: T) -> Result<T, CordisError>
-    where
-        T: Any + Send,
-    {
-        self.ensure_owner_active(self.current_fiber)?;
-        let boxed = self
-            .events
-            .serial(name, Box::new(payload))
-            .await
-            .map_err(|locked| conflict(name, locked, DispatchMode::Serial))?
-            .map_err(|message| CordisError::Serial {
-                name: name.to_string(),
-                message,
-            })?;
-        boxed
-            .downcast::<T>()
-            .map(|value| *value)
-            .map_err(|_| CordisError::PayloadType {
-                name: name.to_string(),
-            })
-    }
-
-    #[must_use]
-    pub fn listener_count(&self, name: &str) -> usize {
-        self.events.listener_count(name)
-    }
-
-    #[must_use]
-    pub fn event_mode(&self, name: &str) -> Option<DispatchMode> {
-        self.events.mode(name)
-    }
-
-    /// Lock `name` to one dispatch mode without installing a listener.
-    ///
-    /// Reversed on teardown when no listeners remain for `name`. Re-locking an
-    /// already-locked name is a no-op and does not stack another disposer.
-    pub fn lock_event(&mut self, name: &str, mode: DispatchMode) -> Result<(), CordisError> {
-        self.ensure_owner_active(self.current_fiber)?;
-        let already = self.events.mode(name) == Some(mode);
         self.events
-            .lock(name, mode)
-            .map_err(|locked| conflict(name, locked, mode))?;
-        if !already {
+            .prepare_emit(key, payload, None)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
+    }
+
+    pub fn waterfall<P>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        payload: P,
+    ) -> Result<P, CordisError>
+    where
+        P: Any + Send + 'static,
+    {
+        self.waterfall_for(key, payload, None)
+    }
+
+    fn waterfall_for<P>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        payload: P,
+        target: Option<&EventScope>,
+    ) -> Result<P, CordisError>
+    where
+        P: Any + Send + 'static,
+    {
+        self.ensure_owner_active(self.current_fiber)?;
+        self.events
+            .waterfall(key, payload, target)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Waterfall, error))
+    }
+
+    pub fn try_waterfall<P>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        payload: P,
+    ) -> Result<P, CordisError>
+    where
+        P: Any + Send + 'static,
+    {
+        self.ensure_owner_active(self.current_fiber)?;
+        self.events
+            .try_waterfall(key, payload, None)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Waterfall, error))
+    }
+
+    pub async fn parallel<P>(
+        &mut self,
+        key: EventKey<Parallel, P, ()>,
+        payload: P,
+    ) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        self.ensure_owner_active(self.current_fiber)?;
+        self.events
+            .parallel(key, payload, None)
+            .await
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Parallel, error))
+    }
+
+    pub async fn serial<P, R>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        payload: P,
+    ) -> Result<BailOutcome<R>, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+    {
+        self.ensure_owner_active(self.current_fiber)?;
+        self.events
+            .serial(key, payload, None)
+            .await
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Serial, error))
+    }
+
+    pub fn bail<P, R>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        payload: &P,
+    ) -> Result<BailOutcome<R>, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+    {
+        self.ensure_owner_active(self.current_fiber)?;
+        self.events
+            .bail(key, payload, None)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Bail, error))
+    }
+
+    pub async fn accumulate<P>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        payload: P,
+    ) -> Result<P, CordisError>
+    where
+        P: Any + Send + 'static,
+    {
+        self.ensure_owner_active(self.current_fiber)?;
+        self.events
+            .accumulate(key, payload, None)
+            .await
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Accumulate, error))
+    }
+
+    #[must_use]
+    pub fn listener_count(&self, name: impl AsRef<str>) -> usize {
+        self.events.listener_count(name.as_ref())
+    }
+
+    #[must_use]
+    pub fn event_mode(&self, name: impl AsRef<str>) -> Option<DispatchMode> {
+        self.events.mode(name.as_ref())
+    }
+
+    #[must_use]
+    pub fn event_descriptor(&self, name: impl AsRef<str>) -> Option<EventDescriptor> {
+        self.events.descriptor(name.as_ref())
+    }
+
+    /// Fail-closed source-compatible tombstone for the old mode-only lock.
+    pub fn lock_event(&mut self, name: &str, _mode: DispatchMode) -> Result<(), CordisError> {
+        self.ensure_owner_active(self.current_fiber)?;
+        Err(CordisError::EventDescriptorRequired {
+            name: name.to_string(),
+        })
+    }
+
+    pub fn lock_event_key<M, P, Output>(
+        &mut self,
+        key: EventKey<M, P, Output>,
+    ) -> Result<(), CordisError>
+    where
+        M: EventModeMarker,
+        P: 'static,
+        Output: 'static,
+    {
+        self.ensure_owner_active(self.current_fiber)?;
+        let changed = self
+            .events
+            .lock_descriptor(key.name(), key.descriptor())
+            .map_err(|error| into_cordis_error(key.name(), M::MODE, error))?;
+        if changed {
             self.effects.push(Registration::event_lock(
                 self.current_fiber,
-                name.to_string(),
+                key.name().to_string(),
             ));
         }
         Ok(())
@@ -1687,9 +2719,8 @@ impl Context {
                 }
                 self.root.replace_metadata(self.vars.clone());
             }
-            Registration::Listener { name, id, .. } => {
-                self.events.remove_listener(&name, id);
-                self.events.unlock(&name);
+            Registration::Listener { listener, .. } => {
+                let _ = listener.dispose();
             }
             Registration::EventLock { name, .. } => {
                 self.events.unlock(&name);
@@ -1699,13 +2730,64 @@ impl Context {
 
     /// Run registrations newest-first, then drop remaining state. The root
     /// Context remains reusable and its root Fiber keeps uid zero.
+    ///
+    /// A listener that calls `teardown` through shared synchronization already
+    /// owns an event-operation permit on its thread. Such a request is a
+    /// fail-closed no-op: it does not close the current generation or wait for
+    /// itself. An external caller may retry after the callback returns.
     pub fn teardown(&mut self) {
-        // A callback cannot tear down the owner whose activation bookkeeping
-        // is still on the stack. N1 will model explicit async unload; N0 keeps
-        // this synchronous request fail-closed.
-        if self.activation_depth != 0 {
+        let TeardownTransaction::Acquired(permit) = self.try_begin_teardown() else {
             return;
+        };
+        self.complete_teardown(permit);
+    }
+
+    /// Atomically acquire the exact reusable event generation before any
+    /// caller mutates higher-layer teardown state.
+    pub(crate) fn try_begin_teardown(&self) -> TeardownTransaction {
+        // A callback cannot tear down the owner whose activation bookkeeping
+        // is still on the stack. N1 models explicit async unload; N0 keeps this
+        // synchronous request fail-closed.
+        if self.activation_depth != 0 {
+            return TeardownTransaction::Busy;
         }
+        match self.event_gate.try_close_and_drain_reusable() {
+            Some(generation) => TeardownTransaction::Acquired(TeardownPermit {
+                context_id: self.id,
+                gate: Arc::clone(&self.event_gate),
+                generation,
+            }),
+            None => TeardownTransaction::Busy,
+        }
+    }
+
+    /// Consume one exact closed generation, complete all structural cleanup,
+    /// publish a fresh generation, and only then propagate a retained callback
+    /// destructor panic. The permit never reopens itself on Drop or unwind.
+    pub(crate) fn complete_teardown(&mut self, permit: TeardownPermit) {
+        let TeardownPermit {
+            context_id,
+            gate,
+            generation,
+        } = permit;
+        assert_eq!(
+            context_id, self.id,
+            "a teardown permit belongs to one exact Context"
+        );
+        assert!(
+            Arc::ptr_eq(&gate, &self.event_gate),
+            "a teardown permit belongs to one exact event gate"
+        );
+        let first_panic = self.teardown_closed();
+        gate.reopen_after_completed_teardown(&generation);
+        if let Some(payload) = first_panic {
+            resume_unwind(payload);
+        }
+    }
+
+    /// Teardown body entered only while the current public event-capability
+    /// generation is closed and every winning operation has drained.
+    fn teardown_closed(&mut self) -> Option<Box<dyn Any + Send + 'static>> {
         let mut first_panic = None;
         while let Some(registration) = self.effects.pop() {
             let result = catch_unwind(AssertUnwindSafe(|| self.run_registration(registration)));
@@ -1719,7 +2801,11 @@ impl Context {
         self.providers.clear();
         self.reserved_services.clear();
         self.vars = ConfigValue::default();
-        self.events.clear();
+        if let Some(payload) = self.events.clear()
+            && first_panic.is_none()
+        {
+            first_panic = Some(payload);
+        }
         self.registry = Registry::new();
         self.mounted_factories.clear();
         self.activating_factories.clear();
@@ -1731,9 +2817,7 @@ impl Context {
         self.fibers.clear();
         self.current_fiber = self.root.uid();
         self.root.replace_metadata(self.vars.clone());
-        if let Some(payload) = first_panic {
-            resume_unwind(payload);
-        }
+        first_panic
     }
 }
 
@@ -1742,6 +2826,10 @@ impl Context {
 /// Views intentionally do not expose the private Hartevo authority path or a
 /// raw `&mut Context`.  `isolate` switches to a fresh namespace; a caller must
 /// explicitly opt into another namespace with `share_label`.
+///
+/// This borrowed synchronous view owns the current typed-event integration.
+/// It is distinct from the repeatable registry's owned
+/// [`crate::LifecycleContextView`], whose event bridge is a later boundary.
 pub struct ContextView<'a> {
     context: &'a mut Context,
     fiber: Fiber,
@@ -2001,127 +3089,753 @@ impl ContextView<'_> {
             .mount_pending_in_namespace(factory, &self.fiber, self.namespace.clone())
     }
 
-    pub fn on<F>(&mut self, name: impl Into<String>, listener: F) -> Result<(), CordisError>
+    fn event_scope(&self) -> EventScope {
+        EventScope::new(self.namespace.clone(), &self.shared_namespaces)
+    }
+
+    /// Capture this view's exact owner and isolation labels for safe callback
+    /// registration and recursive typed-Emit dispatch.
+    pub fn event_reentry(&self) -> Result<EventReentry, CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        let scope = self.event_scope();
+        let generation = self.context.event_gate.current_generation().ok_or(
+            CordisError::FiberContextMismatch {
+                uid: self.fiber.uid(),
+            },
+        )?;
+        Ok(EventReentry::new(
+            self.context.id,
+            Arc::clone(&self.context.event_gate),
+            generation,
+            self.context.events.clone(),
+            self.fiber.clone(),
+            scope.clone(),
+            Some(scope),
+        ))
+    }
+
+    pub fn on<F>(
+        &mut self,
+        key: EventKey<Emit, (), ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
     where
         F: Fn() + Send + Sync + 'static,
     {
-        if !self.is_active() {
-            return Err(self.ownership_error());
-        }
-        self.context
-            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on(name, listener))
+        self.on_emit(key, move |(): &()| listener())
     }
 
-    pub fn on_emit<T, F>(&mut self, name: impl Into<String>, listener: F) -> Result<(), CordisError>
+    pub fn on_emit<P, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
     where
-        T: Any + Send + Sync + 'static,
-        F: Fn(&T) + Send + Sync + 'static,
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_emit_with_options<P, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
-        self.context
-            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_emit(name, listener))
+        self.context.register_emit_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
     }
 
-    pub fn on_waterfall<T, F>(
+    pub fn once_emit_with_options<P, F>(
         &mut self,
-        name: impl Into<String>,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
         listener: F,
-    ) -> Result<(), CordisError>
+    ) -> Result<ListenerHandle, CordisError>
     where
-        T: Any + Send + 'static,
-        F: Fn(T, WaterfallNext<T>) -> T + Send + Sync + 'static,
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
-        self.context
-            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_waterfall(name, listener))
+        self.context.register_emit_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
     }
 
-    pub fn on_parallel<T, E, Fut, F>(
+    pub fn try_on_emit<P, E, F>(
         &mut self,
-        name: impl Into<String>,
+        key: EventKey<Emit, P, ()>,
         listener: F,
-    ) -> Result<(), CordisError>
+    ) -> Result<ListenerHandle, CordisError>
     where
-        T: Clone + Any + Send + Sync + 'static,
-        E: Display + Send + 'static,
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        self.try_on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn try_on_emit_with_options<P, E, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_try_emit_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
+    }
+
+    pub fn try_once_emit_with_options<P, E, F>(
+        &mut self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_try_emit_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn on_waterfall<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        self.on_waterfall_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_waterfall_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
+    }
+
+    pub fn once_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, WaterfallNext<P>) -> P + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_waterfall_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn try_on_waterfall<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, TryWaterfallNext<P>) -> Result<P, WaterfallFailure> + Send + Sync + 'static,
+    {
+        self.try_on_waterfall_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn try_on_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, TryWaterfallNext<P>) -> Result<P, WaterfallFailure> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_try_waterfall_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
+    }
+
+    pub fn try_once_waterfall_with_options<P, F>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        F: Fn(P, TryWaterfallNext<P>) -> Result<P, WaterfallFailure> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_try_waterfall_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn on_parallel<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Parallel, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Clone + Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
-        F: Fn(T) -> Fut + Send + Sync + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        self.on_parallel_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_parallel_with_options<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Parallel, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Clone + Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
-        self.context
-            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_parallel(name, listener))
+        self.context.register_parallel_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
     }
 
-    pub fn on_serial<T, E, Fut, F>(
+    pub fn once_parallel_with_options<P, E, Fut, F>(
         &mut self,
-        name: impl Into<String>,
+        key: EventKey<Parallel, P, ()>,
+        options: EventOptions,
         listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Clone + Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_parallel_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn on_serial<P, R, E, Fut, F>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<BailOutcome<R>, E>> + Send + 'static,
+        F: Fn(Arc<P>) -> Fut + Send + Sync + 'static,
+    {
+        self.on_serial_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_serial_with_options<P, R, E, Fut, F>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<BailOutcome<R>, E>> + Send + 'static,
+        F: Fn(Arc<P>) -> Fut + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_serial_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
+    }
+
+    pub fn once_serial_with_options<P, R, E, Fut, F>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<BailOutcome<R>, E>> + Send + 'static,
+        F: Fn(Arc<P>) -> Fut + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_serial_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn on_bail<P, R, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        F: Fn(&P) -> BailOutcome<R> + Send + Sync + 'static,
+    {
+        self.on_bail_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_bail_with_options<P, R, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        F: Fn(&P) -> BailOutcome<R> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_bail_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
+    }
+
+    pub fn once_bail_with_options<P, R, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        F: Fn(&P) -> BailOutcome<R> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_bail_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn try_on_bail<P, R, E, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<BailOutcome<R>, E> + Send + Sync + 'static,
+    {
+        self.try_on_bail_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn try_on_bail_with_options<P, R, E, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<BailOutcome<R>, E> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_try_bail_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
+    }
+
+    pub fn try_once_bail_with_options<P, R, E, F>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<BailOutcome<R>, E> + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_try_bail_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn on_accumulate<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        self.on_accumulate_with_options(key, EventOptions::default(), listener)
+    }
+
+    pub fn on_accumulate_with_options<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_accumulate_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            false,
+            listener,
+        )
+    }
+
+    pub fn once_accumulate_with_options<P, E, Fut, F>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + 'static,
+        E: Error + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, E>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.register_accumulate_for(
+            key,
+            self.fiber.clone(),
+            self.event_scope(),
+            options,
+            true,
+            listener,
+        )
+    }
+
+    pub fn emit<P>(&mut self, key: EventKey<Emit, P, ()>, payload: &P) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        let scope = self.event_scope();
+        self.context.emit_for(key, payload, Some(&scope))
+    }
+
+    pub fn lock_event(&mut self, name: &str, _mode: DispatchMode) -> Result<(), CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        Err(CordisError::EventDescriptorRequired {
+            name: name.to_string(),
+        })
+    }
+
+    pub fn lock_event_key<M, P, Output>(
+        &mut self,
+        key: EventKey<M, P, Output>,
     ) -> Result<(), CordisError>
     where
-        T: Any + Send + 'static,
-        E: Display + Send + 'static,
-        Fut: Future<Output = Result<T, E>> + Send + 'static,
-        F: Fn(T) -> Fut + Send + Sync + 'static,
+        M: EventModeMarker,
+        P: 'static,
+        Output: 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
+        let changed = self
+            .context
+            .events
+            .lock_descriptor(key.name(), key.descriptor())
+            .map_err(|error| into_cordis_error(key.name(), M::MODE, error))?;
+        if changed {
+            self.context.effects.push(Registration::event_lock(
+                self.fiber.uid(),
+                key.name().to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn waterfall<P>(
+        &mut self,
+        key: EventKey<Waterfall, P, P>,
+        payload: P,
+    ) -> Result<P, CordisError>
+    where
+        P: Any + Send + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        let scope = self.event_scope();
+        self.context.waterfall_for(key, payload, Some(&scope))
+    }
+
+    pub fn try_waterfall<P>(
+        &mut self,
+        key: EventKey<Waterfall, P, Result<P, WaterfallFailure>>,
+        payload: P,
+    ) -> Result<P, CordisError>
+    where
+        P: Any + Send + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        let scope = self.event_scope();
         self.context
-            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_serial(name, listener))
+            .events
+            .try_waterfall(key, payload, Some(&scope))
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Waterfall, error))
     }
 
-    pub fn emit<T>(&mut self, name: &str, payload: &T) -> Result<(), CordisError>
+    pub async fn parallel<P>(
+        &mut self,
+        key: EventKey<Parallel, P, ()>,
+        payload: P,
+    ) -> Result<(), CordisError>
     where
-        T: Any + Send + Sync,
+        P: Any + Send + Sync + 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
-        self.context.emit(name, payload)
-    }
-
-    pub fn lock_event(&mut self, name: &str, mode: DispatchMode) -> Result<(), CordisError> {
-        if !self.is_active() {
-            return Err(self.ownership_error());
-        }
+        let scope = self.event_scope();
         self.context
-            .with_current_fiber(self.fiber.uid(), |ctx| ctx.lock_event(name, mode))
+            .events
+            .parallel(key, payload, Some(&scope))
+            .await
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Parallel, error))
     }
 
-    pub fn waterfall<T>(&mut self, name: &str, payload: T) -> Result<T, CordisError>
+    pub async fn serial<P, R>(
+        &mut self,
+        key: EventKey<Serial, P, BailOutcome<R>>,
+        payload: P,
+    ) -> Result<BailOutcome<R>, CordisError>
     where
-        T: Any + Send,
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
-        self.context.waterfall(name, payload)
+        let scope = self.event_scope();
+        self.context
+            .events
+            .serial(key, payload, Some(&scope))
+            .await
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Serial, error))
     }
 
-    pub async fn parallel<T>(&mut self, name: &str, payload: T) -> Result<(), CordisError>
+    pub fn bail<P, R>(
+        &mut self,
+        key: EventKey<Bail, P, BailOutcome<R>>,
+        payload: &P,
+    ) -> Result<BailOutcome<R>, CordisError>
     where
-        T: Any + Send + Sync,
+        P: Any + Send + Sync + 'static,
+        R: Any + Send + 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
-        self.context.parallel(name, payload).await
+        let scope = self.event_scope();
+        self.context
+            .events
+            .bail(key, payload, Some(&scope))
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Bail, error))
     }
 
-    pub async fn serial<T>(&mut self, name: &str, payload: T) -> Result<T, CordisError>
+    pub async fn accumulate<P>(
+        &mut self,
+        key: EventKey<Accumulate, P, P>,
+        payload: P,
+    ) -> Result<P, CordisError>
     where
-        T: Any + Send,
+        P: Any + Send + 'static,
     {
         if !self.is_active() {
             return Err(self.ownership_error());
         }
-        self.context.serial(name, payload).await
+        let scope = self.event_scope();
+        self.context
+            .events
+            .accumulate(key, payload, Some(&scope))
+            .await
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Accumulate, error))
     }
 }
 
@@ -2130,14 +3844,6 @@ fn authority_reserved_key(key: &str) -> bool {
         key,
         keys::DOMAIN | keys::EFFECT_BROKER | keys::RUNTIME | keys::DESKTOP
     )
-}
-
-fn conflict(name: &str, locked: DispatchMode, requested: DispatchMode) -> CordisError {
-    CordisError::ModeConflict {
-        name: name.to_string(),
-        locked,
-        requested,
-    }
 }
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -2395,7 +4101,10 @@ mod provider_tests {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        self.teardown();
+        self.event_gate.close_and_drain_for_drop();
+        if let Some(payload) = self.teardown_closed() {
+            resume_unwind(payload);
+        }
     }
 }
 
@@ -2403,7 +4112,7 @@ impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut services: Vec<&String> = self.services.keys().collect();
         services.sort();
-        let mut listener_events: Vec<&String> = self.events.event_names();
+        let mut listener_events = self.events.event_names();
         listener_events.sort();
         f.debug_struct("Context")
             .field("services", &services)

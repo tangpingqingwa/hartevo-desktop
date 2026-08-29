@@ -199,7 +199,8 @@ pub struct RuntimeDispatchPermit {
     lease: Arc<RuntimeDispatchLease>,
     started: Option<PreparedEmit>,
     disposed: Option<PreparedEmit>,
-    started_announced: bool,
+    started_attempted: bool,
+    started_result: Option<Result<(), CordisError>>,
     settled: bool,
 }
 
@@ -221,7 +222,8 @@ impl RuntimeDispatchPermit {
                 lease: Arc::clone(&lease),
                 started: Some(started),
                 disposed: Some(disposed),
-                started_announced: false,
+                started_attempted: false,
+                started_result: None,
                 settled: false,
             },
             lease,
@@ -230,11 +232,14 @@ impl RuntimeDispatchPermit {
 
     /// Publish the started lifecycle after the caller has released its host
     /// lock. Repeated calls are harmless and dispatch at most once.
-    pub fn announce_started(&mut self) {
-        if let Some(notification) = self.started.take() {
-            self.started_announced = true;
-            notification.dispatch();
+    pub fn announce_started(&mut self) -> Result<(), CordisError> {
+        if let Some(result) = &self.started_result {
+            return result.clone();
         }
+        self.started_attempted = true;
+        let result = self.started.take().map_or(Ok(()), PreparedEmit::dispatch);
+        self.started_result = Some(result.clone());
+        result
     }
 
     #[must_use]
@@ -259,7 +264,7 @@ impl RuntimeDispatchPermit {
         self.settled = true;
         RuntimeDispatchCompletion {
             notification: self
-                .started_announced
+                .started_attempted
                 .then(|| self.disposed.take())
                 .flatten(),
         }
@@ -273,7 +278,8 @@ impl fmt::Debug for RuntimeDispatchPermit {
             .field("serial", &self.serial)
             .field("scope", &self.scope)
             .field("agent_id", &self.agent_id)
-            .field("started_announced", &self.started_announced)
+            .field("started_attempted", &self.started_attempted)
+            .field("started_result", &self.started_result)
             .field("settled", &self.settled)
             .finish_non_exhaustive()
     }
@@ -295,9 +301,11 @@ pub struct RuntimeDispatchCompletion {
 }
 
 impl RuntimeDispatchCompletion {
-    pub fn announce(mut self) {
+    pub fn announce(mut self) -> Result<(), CordisError> {
         if let Some(notification) = self.notification.take() {
-            notification.dispatch();
+            notification.dispatch()
+        } else {
+            Ok(())
         }
     }
 }
@@ -361,16 +369,128 @@ where
     }
 }
 
+/// Multiple phase-preserving Runtime-dispatch failures.
+#[derive(Debug, Eq, PartialEq)]
+pub struct AuthorityDispatchFailures<AdapterError> {
+    started: Option<CordisError>,
+    authority: Option<AdapterError>,
+    finish: Option<CordisError>,
+    disposed: Option<CordisError>,
+}
+
+impl<AdapterError> AuthorityDispatchFailures<AdapterError> {
+    #[must_use]
+    pub const fn started(&self) -> Option<&CordisError> {
+        self.started.as_ref()
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> Option<&AdapterError> {
+        self.authority.as_ref()
+    }
+
+    #[must_use]
+    pub const fn finish(&self) -> Option<&CordisError> {
+        self.finish.as_ref()
+    }
+
+    #[must_use]
+    pub const fn disposed(&self) -> Option<&CordisError> {
+        self.disposed.as_ref()
+    }
+}
+
+impl<AdapterError: Display> Display for AuthorityDispatchFailures<AdapterError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut wrote = false;
+        macro_rules! phase {
+            ($label:literal, $value:expr) => {
+                if let Some(value) = $value {
+                    if wrote {
+                        formatter.write_str("; ")?;
+                    }
+                    write!(formatter, concat!($label, ": {}"), value)?;
+                    wrote = true;
+                }
+            };
+        }
+        phase!("started", self.started.as_ref());
+        phase!("authority", self.authority.as_ref());
+        phase!("finish", self.finish.as_ref());
+        phase!("disposed", self.disposed.as_ref());
+        debug_assert!(wrote, "combined failures are never empty");
+        Ok(())
+    }
+}
+
+impl<AdapterError> Error for AuthorityDispatchFailures<AdapterError>
+where
+    AdapterError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.started
+            .as_ref()
+            .map(|error| error as &(dyn Error + 'static))
+            .or_else(|| {
+                self.authority
+                    .as_ref()
+                    .map(|error| error as &(dyn Error + 'static))
+            })
+            .or_else(|| {
+                self.finish
+                    .as_ref()
+                    .map(|error| error as &(dyn Error + 'static))
+            })
+            .or_else(|| {
+                self.disposed
+                    .as_ref()
+                    .map(|error| error as &(dyn Error + 'static))
+            })
+    }
+}
+
 /// Distinguishes a Cordis gate/lifecycle failure from an authority failure.
 #[derive(Debug, Eq, PartialEq)]
 pub enum AuthorityDispatchError<AdapterError> {
-    Cordis(CordisError),
+    Cordis(Box<CordisError>),
     Authority(AdapterError),
+    Combined(Box<AuthorityDispatchFailures<AdapterError>>),
+}
+
+impl<AdapterError> AuthorityDispatchError<AdapterError> {
+    /// Classify zero, one, or multiple failures without discarding any phase.
+    #[must_use]
+    pub fn from_phases(
+        started: Option<CordisError>,
+        authority: Option<AdapterError>,
+        finish: Option<CordisError>,
+        disposed: Option<CordisError>,
+    ) -> Option<Self> {
+        let count = usize::from(started.is_some())
+            + usize::from(authority.is_some())
+            + usize::from(finish.is_some())
+            + usize::from(disposed.is_some());
+        match count {
+            0 => None,
+            1 => authority.map(Self::Authority).or_else(|| {
+                started
+                    .or(finish)
+                    .or(disposed)
+                    .map(|error| Self::Cordis(Box::new(error)))
+            }),
+            _ => Some(Self::Combined(Box::new(AuthorityDispatchFailures {
+                started,
+                authority,
+                finish,
+                disposed,
+            }))),
+        }
+    }
 }
 
 impl<AdapterError> From<CordisError> for AuthorityDispatchError<AdapterError> {
     fn from(error: CordisError) -> Self {
-        Self::Cordis(error)
+        Self::Cordis(Box::new(error))
     }
 }
 
@@ -379,6 +499,7 @@ impl<AdapterError: Display> Display for AuthorityDispatchError<AdapterError> {
         match self {
             Self::Cordis(error) => Display::fmt(error, formatter),
             Self::Authority(error) => Display::fmt(error, formatter),
+            Self::Combined(errors) => Display::fmt(errors, formatter),
         }
     }
 }
@@ -389,16 +510,31 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Cordis(error) => Some(error),
+            Self::Cordis(error) => Some(error.as_ref()),
             Self::Authority(error) => Some(error),
+            Self::Combined(errors) => errors.source(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorityScope, RuntimeBinding, RuntimeRecordBinding};
+    use std::error::Error;
+    use std::fmt::{self, Display};
+
+    use super::{AuthorityDispatchError, AuthorityScope, RuntimeBinding, RuntimeRecordBinding};
     use crate::CordisError;
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct AdapterError(&'static str);
+
+    impl Display for AdapterError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl Error for AdapterError {}
 
     #[test]
     fn scope_requires_exact_ids_and_positive_revision() {
@@ -456,5 +592,61 @@ mod tests {
         assert_eq!(binding.generation(), 2);
         assert_eq!(binding.recovery().unwrap().revision(), 4);
         assert_eq!(binding.turn().unwrap().id(), "turn");
+    }
+
+    #[test]
+    fn dispatch_failure_table_preserves_every_phase_and_first_source() {
+        assert_eq!(
+            AuthorityDispatchError::<AdapterError>::from_phases(None, None, None, None),
+            None
+        );
+        assert_eq!(
+            AuthorityDispatchError::from_phases(
+                None,
+                Some(AdapterError("authority-only")),
+                None,
+                None,
+            ),
+            Some(AuthorityDispatchError::Authority(AdapterError(
+                "authority-only"
+            )))
+        );
+
+        let started = CordisError::InvalidAuthorityScope { field: "started" };
+        let finish = CordisError::InvalidAuthorityRevision { field: "finish" };
+        let disposed = CordisError::InvalidAuthorityDigest { field: "disposed" };
+        let combined = AuthorityDispatchError::from_phases(
+            Some(started.clone()),
+            Some(AdapterError("authority")),
+            Some(finish.clone()),
+            Some(disposed.clone()),
+        )
+        .unwrap();
+        let AuthorityDispatchError::Combined(failures) = &combined else {
+            panic!("expected phase-preserving combined failure");
+        };
+        assert_eq!(failures.started(), Some(&started));
+        assert_eq!(failures.authority(), Some(&AdapterError("authority")));
+        assert_eq!(failures.finish(), Some(&finish));
+        assert_eq!(failures.disposed(), Some(&disposed));
+        assert_eq!(
+            combined.source().unwrap().downcast_ref::<CordisError>(),
+            Some(&started)
+        );
+
+        let authority_first = AuthorityDispatchError::from_phases(
+            None,
+            Some(AdapterError("first")),
+            Some(finish),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            authority_first
+                .source()
+                .unwrap()
+                .downcast_ref::<AdapterError>(),
+            Some(&AdapterError("first"))
+        );
     }
 }

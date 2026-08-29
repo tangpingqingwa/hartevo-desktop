@@ -8,7 +8,7 @@ use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 use crate::authority::{
     AuthorityScope, RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
 };
-use crate::context::{Context, CordisError, keys};
+use crate::context::{Context, CordisError, TeardownTransaction, keys};
 use crate::invariants::{
     InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, enforce_runtime_invariants,
 };
@@ -315,11 +315,14 @@ impl CordisHost {
     }
 
     pub fn teardown(&mut self) {
+        let TeardownTransaction::Acquired(permit) = self.ctx.try_begin_teardown() else {
+            return;
+        };
         if let Some(active) = self.active_runtime.take() {
             active.lease.release();
         }
         self.bound_scope = None;
-        self.ctx.teardown();
+        self.ctx.complete_teardown(permit);
     }
 
     /// Register a Runtime-start observer. Notifications prepared while the
@@ -328,7 +331,9 @@ impl CordisHost {
     where
         F: Fn(&AgentRef) + Send + Sync + 'static,
     {
-        self.ctx.on_emit(events::AGENT_CREATED, observer)
+        self.ctx
+            .on_emit(events::AGENT_CREATED, observer)
+            .map(|_| ())
     }
 
     /// Register a Runtime-finished observer. The completion notification is
@@ -337,7 +342,9 @@ impl CordisHost {
     where
         F: Fn(&AgentRef) + Send + Sync + 'static,
     {
-        self.ctx.on_emit(events::AGENT_DISPOSED, observer)
+        self.ctx
+            .on_emit(events::AGENT_DISPOSED, observer)
+            .map(|_| ())
     }
 
     fn reap_abandoned_runtime(&mut self) {

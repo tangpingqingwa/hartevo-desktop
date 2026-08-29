@@ -2,6 +2,11 @@
 //! effects, typed events, loader/overlay interpolation, Hartevo surface mapping,
 //! a Cordis-hosted agent loop, a fail-closed Domain Kernel invariant gate, and
 //! the desktop host that mounts those three services.
+//!
+//! Typed events currently integrate with synchronous [`Context`], its borrowed
+//! [`ContextView`], and the Desktop prepared lifecycle notifications. The owned
+//! repeatable-plugin [`LifecycleContextView`] event bridge is deliberately not
+//! part of this slice; it remains the follow-up N2B boundary.
 
 mod agent;
 mod authority;
@@ -20,18 +25,24 @@ mod surface;
 
 pub use agent::{AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 pub use authority::{
-    AuthorityDispatchError, AuthorityScope, RuntimeAuthority, RuntimeBinding,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
+    AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, RuntimeAuthority,
+    RuntimeBinding, RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
 };
 pub use config::{ConfigValue, InterpolateError};
 pub use context::{
-    Context, ContextView, CordisError, PendingHandle, ProviderHandle, ProviderId, keys,
+    Context, ContextView, CordisError, EventReentry, PendingHandle, ProviderHandle, ProviderId,
+    keys,
 };
 pub use effect::{
     Disposer, IntoLifecycleEffect, LifecycleDisposeFuture, LifecycleDisposer,
     LifecycleDisposerFuture, LifecycleDisposerStream, LifecycleEffect, RegistrationHandle,
 };
-pub use event::{DispatchMode, WaterfallNext};
+pub use event::{
+    Accumulate, Bail, BailOutcome, DispatchMode, Emit, EventDescriptor, EventError, EventErrors,
+    EventKey, EventModeMarker, EventOptions, EventSchemaId, EventSourceFingerprint, ListenerHandle,
+    NonBail, Parallel, Serial, SharedEventSource, TryWaterfallNext, Waterfall, WaterfallFailure,
+    WaterfallNext,
+};
 pub use fiber::{
     ActivationEpoch, Fiber, FiberSnapshot, FiberState, FiberUid, LifecycleCancellation,
     ProviderFingerprint, TransitionTicket,

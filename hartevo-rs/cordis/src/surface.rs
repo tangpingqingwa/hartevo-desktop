@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::context::{Context, CordisError, keys};
-use crate::event::DispatchMode;
+use crate::event::{DispatchMode, EventKey, EventModeMarker};
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
@@ -24,20 +24,43 @@ pub const MAPPED_KEYS: &[&str] = &[
 
 /// Primer event names owned by the mapped surfaces.
 pub mod events {
+    use crate::event::{Emit, EventKey, EventSchemaId, Waterfall};
+
+    use super::{AgentRef, LlmStream, ToolCall};
+
     /// Allow / deny / ask waterfall before a tool body runs.
-    pub const TOOLS_PRE_EXECUTE: &str = "tools/pre-execute";
+    pub const TOOLS_PRE_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
+        EventSchemaId::new("hartevo.tools.pre-execute.v1"),
+        "tools/pre-execute",
+    );
     /// Around-dispatch waterfall wrapping the tool body.
-    pub const TOOLS_EXECUTE: &str = "tools/execute";
+    pub const TOOLS_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
+        EventSchemaId::new("hartevo.tools.execute.v1"),
+        "tools/execute",
+    );
     /// Inspect / replace waterfall after a tool body.
-    pub const TOOLS_POST_EXECUTE: &str = "tools/post-execute";
+    pub const TOOLS_POST_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
+        EventSchemaId::new("hartevo.tools.post-execute.v1"),
+        "tools/post-execute",
+    );
     /// Observe-only notification of the frozen tool outcome.
-    pub const TOOLS_RESULT: &str = "tools/result";
+    pub const TOOLS_RESULT: EventKey<Emit, ToolCall, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.tools.result.v1"),
+        "tools/result",
+    );
     /// Intercept / wrap every streaming model call.
-    pub const LLM_STREAM: &str = "llm/stream";
+    pub const LLM_STREAM: EventKey<Waterfall, LlmStream, LlmStream> =
+        EventKey::new(EventSchemaId::new("hartevo.llm.stream.v1"), "llm/stream");
     /// Live agent published after scoped setup.
-    pub const AGENT_CREATED: &str = "agent/created";
+    pub const AGENT_CREATED: EventKey<Emit, AgentRef, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.agent.created.v1"),
+        "agent/created",
+    );
     /// Live agent left the registry.
-    pub const AGENT_DISPOSED: &str = "agent/disposed";
+    pub const AGENT_DISPOSED: EventKey<Emit, AgentRef, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.agent.disposed.v1"),
+        "agent/disposed",
+    );
 }
 
 /// Who currently owns a mapped surface. OpenInterpreter never owns Mission,
@@ -406,24 +429,34 @@ pub(crate) fn map_surfaces(
 }
 
 fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
-    for (name, mode) in [
-        (events::TOOLS_PRE_EXECUTE, DispatchMode::Waterfall),
-        (events::TOOLS_EXECUTE, DispatchMode::Waterfall),
-        (events::TOOLS_POST_EXECUTE, DispatchMode::Waterfall),
-        (events::TOOLS_RESULT, DispatchMode::Emit),
-        (events::LLM_STREAM, DispatchMode::Waterfall),
-        (events::AGENT_CREATED, DispatchMode::Emit),
-        (events::AGENT_DISPOSED, DispatchMode::Emit),
-    ] {
-        if let Some(locked) = ctx.event_mode(name)
-            && locked != mode
-        {
-            return Err(CordisError::ModeConflict {
-                name: name.to_string(),
-                locked,
-                requested: mode,
-            });
-        }
+    validate_mapped_event(ctx, events::TOOLS_PRE_EXECUTE)?;
+    validate_mapped_event(ctx, events::TOOLS_EXECUTE)?;
+    validate_mapped_event(ctx, events::TOOLS_POST_EXECUTE)?;
+    validate_mapped_event(ctx, events::TOOLS_RESULT)?;
+    validate_mapped_event(ctx, events::LLM_STREAM)?;
+    validate_mapped_event(ctx, events::AGENT_CREATED)?;
+    validate_mapped_event(ctx, events::AGENT_DISPOSED)?;
+    Ok(())
+}
+
+fn validate_mapped_event<M, P, Output>(
+    ctx: &Context,
+    key: EventKey<M, P, Output>,
+) -> Result<(), CordisError>
+where
+    M: EventModeMarker,
+    P: 'static,
+    Output: 'static,
+{
+    let requested = key.descriptor();
+    if let Some(locked) = ctx.event_descriptor(key)
+        && locked != requested
+    {
+        return Err(CordisError::SchemaConflict {
+            name: key.name().to_string(),
+            locked,
+            requested,
+        });
     }
     Ok(())
 }
@@ -439,13 +472,13 @@ pub(crate) fn rebind_hartevo_domain(
 }
 
 fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
-    ctx.lock_event(events::TOOLS_PRE_EXECUTE, DispatchMode::Waterfall)?;
-    ctx.lock_event(events::TOOLS_EXECUTE, DispatchMode::Waterfall)?;
-    ctx.lock_event(events::TOOLS_POST_EXECUTE, DispatchMode::Waterfall)?;
-    ctx.lock_event(events::TOOLS_RESULT, DispatchMode::Emit)?;
-    ctx.lock_event(events::LLM_STREAM, DispatchMode::Waterfall)?;
-    ctx.lock_event(events::AGENT_CREATED, DispatchMode::Emit)?;
-    ctx.lock_event(events::AGENT_DISPOSED, DispatchMode::Emit)?;
+    ctx.lock_event_key(events::TOOLS_PRE_EXECUTE)?;
+    ctx.lock_event_key(events::TOOLS_EXECUTE)?;
+    ctx.lock_event_key(events::TOOLS_POST_EXECUTE)?;
+    ctx.lock_event_key(events::TOOLS_RESULT)?;
+    ctx.lock_event_key(events::LLM_STREAM)?;
+    ctx.lock_event_key(events::AGENT_CREATED)?;
+    ctx.lock_event_key(events::AGENT_DISPOSED)?;
     Ok(())
 }
 
@@ -518,15 +551,12 @@ pub fn stream_llm(ctx: &mut Context, request: LlmStream) -> Result<LlmStream, Co
 
 /// Primer dispatch mode for each mapped event name.
 #[must_use]
-pub fn expected_mode(name: &str) -> Option<DispatchMode> {
-    match name {
-        events::TOOLS_PRE_EXECUTE
-        | events::TOOLS_EXECUTE
-        | events::TOOLS_POST_EXECUTE
-        | events::LLM_STREAM => Some(DispatchMode::Waterfall),
-        events::TOOLS_RESULT | events::AGENT_CREATED | events::AGENT_DISPOSED => {
-            Some(DispatchMode::Emit)
+pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
+    match name.as_ref() {
+        "tools/pre-execute" | "tools/execute" | "tools/post-execute" | "llm/stream" => {
+            Some(DispatchMode::Waterfall)
         }
+        "tools/result" | "agent/created" | "agent/disposed" => Some(DispatchMode::Emit),
         _ => None,
     }
 }
@@ -534,6 +564,7 @@ pub fn expected_mode(name: &str) -> Option<DispatchMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Waterfall;
 
     #[test]
     fn sealed_mapping_rejects_forged_owner_with_typed_error_before_mount() {
@@ -562,6 +593,46 @@ mod tests {
             ctx.domain::<DomainSurface>().unwrap().owner(),
             SurfaceOwner::Hartevo
         );
+    }
+
+    #[test]
+    fn all_seven_event_descriptors_preflight_before_any_surface_provider_mutation() {
+        let mut ctx = Context::new();
+        let incompatible_last_key = EventKey::<Waterfall, AgentRef, AgentRef>::new(
+            events::AGENT_DISPOSED.schema_id(),
+            events::AGENT_DISPOSED.name(),
+        );
+        ctx.lock_event_key(incompatible_last_key).unwrap();
+        let descriptor_before = ctx.event_descriptor(events::AGENT_DISPOSED).unwrap();
+
+        let error = map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CordisError::SchemaConflict { ref name, ref locked, ref requested }
+                if name == events::AGENT_DISPOSED.name()
+                    && locked == &descriptor_before
+                    && requested == &events::AGENT_DISPOSED.descriptor()
+        ));
+        assert!(MAPPED_KEYS.iter().all(|key| !ctx.has(key)));
+        assert_eq!(
+            ctx.event_descriptor(events::AGENT_DISPOSED),
+            Some(descriptor_before)
+        );
+        for name in [
+            events::TOOLS_PRE_EXECUTE.name(),
+            events::TOOLS_EXECUTE.name(),
+            events::TOOLS_POST_EXECUTE.name(),
+            events::TOOLS_RESULT.name(),
+            events::LLM_STREAM.name(),
+            events::AGENT_CREATED.name(),
+        ] {
+            assert_eq!(
+                ctx.event_descriptor(name),
+                None,
+                "{name} must stay untouched"
+            );
+        }
     }
 
     #[test]

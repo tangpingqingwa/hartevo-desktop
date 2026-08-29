@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use hartevo_cordis::{Context, CordisError, Service, keys};
+use hartevo_cordis::{Context, CordisError, Emit, EventKey, EventSchemaId, Service, keys};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Marker(&'static str);
@@ -56,7 +56,10 @@ impl Service for RecordEffect {
         let order = Arc::clone(&self.order);
         let tag = self.tag;
         ctx.effect(move || order.lock().expect("order").push(tag));
-        ctx.on(tag, || {})?;
+        ctx.on(
+            EventKey::<Emit, (), ()>::new(EventSchemaId::new(tag), tag),
+            || {},
+        )?;
         Ok(())
     }
 }
@@ -182,9 +185,11 @@ fn effect_disposers_run_newest_first_on_teardown() {
 #[test]
 fn on_stores_listeners_and_unregisters_on_teardown() {
     let mut ctx = Context::new();
-    ctx.on("ready", || {}).unwrap();
-    ctx.on("ready", || {}).unwrap();
-    ctx.on("stop", || {}).unwrap();
+    let ready = EventKey::<Emit, (), ()>::new(EventSchemaId::new("test.ready"), "ready");
+    let stop = EventKey::<Emit, (), ()>::new(EventSchemaId::new("test.stop"), "stop");
+    ctx.on(ready, || {}).unwrap();
+    ctx.on(ready, || {}).unwrap();
+    ctx.on(stop, || {}).unwrap();
     assert_eq!(ctx.listener_count("ready"), 2);
     assert_eq!(ctx.listener_count("stop"), 1);
     ctx.teardown();
@@ -201,7 +206,11 @@ fn on_and_effect_share_one_reverse_disposer_stack() {
         let order = Arc::clone(&order);
         ctx.effect(move || order.lock().expect("order").push("effect-1"));
     }
-    ctx.on("tick", || {}).unwrap();
+    ctx.on(
+        EventKey::<Emit, (), ()>::new(EventSchemaId::new("test.tick"), "tick"),
+        || {},
+    )
+    .unwrap();
     assert_eq!(ctx.listener_count("tick"), 1);
     {
         let order = Arc::clone(&order);
@@ -254,7 +263,11 @@ fn teardown_then_second_mount_can_reregister() {
     })
     .unwrap();
     ctx.provide(keys::TOOLS, Marker("v2")).unwrap();
-    ctx.on("second", || {}).unwrap();
+    ctx.on(
+        EventKey::<Emit, (), ()>::new(EventSchemaId::new("second"), "second"),
+        || {},
+    )
+    .unwrap();
     assert_eq!(ctx.tools::<Marker>().as_deref(), Some(&Marker("v2")));
     assert_eq!(ctx.listener_count("second"), 2);
     ctx.teardown();
