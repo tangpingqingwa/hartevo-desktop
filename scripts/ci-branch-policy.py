@@ -32,13 +32,7 @@ GITHUB_ACTIONS_INTEGRATION_ID = 15368
 EXPECTED_STATUS_CHECKS = (
     "PR / Workflow policy",
     "Governance / PR admission",
-    "Governance / Train-only merge",
     "PR / Scope plan",
-    "PR / Fast Rust matrix / PR / Fast Rust / fmt",
-    "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
-    "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
-    "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
-    "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
     "PR / Result taxonomy",
 )
 REPOSITORY_LIFECYCLE_FIELDS = {
@@ -253,7 +247,7 @@ def verify(path: Path = POLICY) -> dict[str, object]:
         "ready",
         "root-bootstrap-base",
         "exact-current-head",
-        "candidate-checks-success-excluding-intentional-train-only-block",
+        "stable-required-checks-and-admission-success",
     }:
         raise ValueError("repository merge-train candidate requirements drifted")
     if not isinstance(composite_requirements, list) or set(composite_requirements) != {
@@ -421,7 +415,7 @@ def hosted_repository(repo: str) -> dict[str, object]:
 
 
 def require_trusted_admission_on_protected(repo: str) -> None:
-    """Refuse to require train-only checks before their trusted workflow exists."""
+    """Refuse to apply admission checks before trusted verifier code exists."""
     if not TRUSTED_ADMISSION_WORKFLOW.is_file():
         raise ValueError("trusted governance admission workflow is missing locally")
     local_blob = subprocess.run(

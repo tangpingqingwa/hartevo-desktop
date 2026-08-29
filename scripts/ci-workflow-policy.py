@@ -239,8 +239,75 @@ def reusable_rust_scope_plan(
     return result
 
 
+def validate_reusable_scope_contract_v2(path: Path, text: str) -> None:
+    """Validate split common-Rust/desktop lanes while retaining old fixtures."""
+    required = (
+        "run_rust:\n",
+        "run_common_rust:\n",
+        "run_desktop:\n",
+        "common_rust_packages:\n",
+        "desktop_packages:\n",
+        "name: ${{ inputs.check_prefix }} / fmt",
+        "name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})",
+        "os: [ubuntu-24.04, macos-15]",
+        "matrix.os == 'ubuntu-24.04' && inputs.run_common_rust",
+        "matrix.os == 'macos-15' && inputs.run_desktop",
+        "test-ubuntu-shards:",
+        "shard: [0, 1]",
+        "test-ubuntu-result:",
+        "if: ${{ always() }}",
+        "test-macos:",
+        "runs-on: ${{ !inputs.run_desktop && 'ubuntu-24.04' || 'macos-15' }}",
+        "Desktop scope is empty",
+        "Common Rust scope is empty",
+    )
+    if any(item not in text for item in required):
+        raise PolicyError(f"{path} is missing the split-lane Rust scope contract")
+    if re.search(r"\$\{\{[^}\n]*\+[^}\n]*\}\}", text):
+        raise PolicyError(f"{path} contains unsupported arithmetic in a GitHub Actions expression")
+    if re.search(r"(?m)^  (?:fmt|clippy|test-ubuntu-shards|test-ubuntu-result|test-macos):\n    if:", text):
+        raise PolicyError(f"{path} reusable Rust jobs must expose planned skips as steps, not job conditions")
+    shard_match = re.search(r"(?ms)^  test-ubuntu-shards:.*?(?=^  [A-Za-z0-9_.-]+:\s*$|\Z)", text)
+    if not shard_match:
+        raise PolicyError(f"{path} is missing the common-Rust Ubuntu shard lane")
+    if "hartevo-desktop" in shard_match.group(0):
+        raise PolicyError(f"{path} Ubuntu test lane must not select hartevo-desktop")
+    shard_text = shard_match.group(0)
+    if "--full-workspace false" not in shard_text or "--packages \"$COMMON_PACKAGES\"" not in shard_text:
+        raise PolicyError(f"{path} Ubuntu shards must use the common-Rust package selector")
+    if "if: ${{ !inputs.run_common_rust }}" not in shard_text:
+        raise PolicyError(f"{path} Ubuntu shards must expose a common-Rust planned skip")
+    if "strategy:\n      fail-fast: false\n      max-parallel: 2\n      matrix:\n        shard: [0, 1]" not in shard_text:
+        raise PolicyError(f"{path} Ubuntu shards must use the fixed two-way fail-closed layout")
+    if any(token in shard_text for token in ("fromJSON", "include:", "exclude:", "continue-on-error", "nextest", "--ignored", "fail-fast: true")):
+        raise PolicyError(f"{path} Ubuntu shards contain a dynamic or non-fail-closed execution path")
+    result_match = re.search(r"(?ms)^  test-ubuntu-result:\s*\n.*?(?=^  [A-Za-z0-9_.-]+:\s*$|\Z)", text)
+    if not result_match:
+        raise PolicyError(f"{path} is missing the Ubuntu aggregate")
+    result_text = result_match.group(0)
+    if "needs: test-ubuntu-shards" not in result_text or "if: ${{ always() }}" not in result_text:
+        raise PolicyError(f"{path} Ubuntu aggregate must always inspect shard results")
+    if "needs.test-ubuntu-shards.result" not in result_text or "!= success" not in result_text or "exit 1" not in result_text:
+        raise PolicyError(f"{path} Ubuntu aggregate must fail closed on shard failure")
+    if "if: inputs.run_common_rust" not in result_text:
+        raise PolicyError(f"{path} Ubuntu aggregate gate must be scoped to common Rust")
+    if "name: Planned scope skip marker" not in result_text or "if: ${{ !inputs.run_common_rust }}" not in result_text:
+        raise PolicyError(f"{path} Ubuntu aggregate must expose a planned common-Rust marker")
+    macos_block = re.search(r"(?ms)^  test-macos:\s*\n.*?(?=^  [A-Za-z0-9_.-]+:\s*$|\Z)", text)
+    if not macos_block:
+        raise PolicyError(f"{path} is missing the macOS desktop lane")
+    macos_text = macos_block.group(0)
+    if "if: inputs.run_desktop" not in macos_text or "--packages \"$DESKTOP_PACKAGES\"" not in macos_text:
+        raise PolicyError(f"{path} macOS lane must execute only the desktop package selector")
+    if "if: ${{ !inputs.run_desktop }}" not in macos_text:
+        raise PolicyError(f"{path} macOS lane must expose a desktop planned skip")
+
+
 def validate_reusable_scope_contract(path: Path, text: str) -> None:
     if path.name != "rust-reusable.yml":
+        return
+    if "run_common_rust:\n" in text:
+        validate_reusable_scope_contract_v2(path, text)
         return
     if re.search(r"\$\{\{[^}\n]*\+[^}\n]*\}\}", text):
         raise PolicyError(f"{path} contains unsupported arithmetic in a GitHub Actions expression")
@@ -560,8 +627,77 @@ def reusable_shard_cache_restore_block() -> str:
     )
 
 
+def validate_reusable_cache_contract_v2(path: Path, text: str) -> None:
+    """Ensure split lanes retain isolated, run-unique Cargo caches."""
+    if len(re.findall(r"^\s+uses:\s*actions/cache@", text, re.MULTILINE)) != 4:
+        raise PolicyError(f"{path} must contain exactly one cache step per Rust execution lane")
+    if re.search(r"cache-hit", text, re.IGNORECASE):
+        raise PolicyError(f"{path} must not use cache-hit to control required gates")
+    if text.count("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9") != 4:
+        raise PolicyError(f"{path} cache actions must use the verified SHA")
+    for cache in re.finditer(r"(?ms)^      - name: Cache Cargo and Rust toolchain\s*\n.*?(?=^      - name:|\Z)", text):
+        block = cache.group(0)
+        if "enableCrossOsArchive: false" not in block:
+            raise PolicyError(f"{path} cache must disable cross-OS archives")
+        if "${{ runner.os }}" not in block or "${{ runner.arch }}" not in block:
+            raise PolicyError(f"{path} cache must be runner-scoped")
+        if "${{ github.sha }}" not in block or "${{ github.run_id }}" not in block or "${{ github.run_attempt }}" not in block:
+            raise PolicyError(f"{path} primary cache key must include run identity")
+        if "restore-keys: |" not in block:
+            raise PolicyError(f"{path} cache must provide restore prefixes")
+        if "fmt-deps" in block:
+            if "target/ci-cargo" in block:
+                raise PolicyError(f"{path} format cache must not contain build targets")
+        elif "target/ci-cargo" not in block:
+            raise PolicyError(f"{path} executable build cache must contain target/ci-cargo")
+    cache_keys = re.findall(r"^          key: (.+)$", text, re.MULTILINE)
+    if len(cache_keys) != 4 or len(cache_keys) != len(set(cache_keys)):
+        raise PolicyError(f"{path} cache primary keys must be unique")
+    if sum("fmt-deps" in key for key in cache_keys) != 1:
+        raise PolicyError(f"{path} must keep one format cache namespace")
+    if sum("clippy-target" in key for key in cache_keys) != 1:
+        raise PolicyError(f"{path} must keep one common/desktop clippy cache namespace")
+    if sum("test-shard" in key for key in cache_keys) != 1:
+        raise PolicyError(f"{path} must keep one Ubuntu shard cache namespace")
+    if sum("test-target" in key for key in cache_keys) != 1:
+        raise PolicyError(f"{path} must keep one desktop test cache namespace")
+    for restore in re.findall(r"(?ms)^          restore-keys: \|\n.*?(?=^      - name:|\Z)", text):
+        if "${{ runner.os }}" not in restore or "${{ runner.arch }}" not in restore:
+            raise PolicyError(f"{path} cache restore prefixes must be runner-scoped")
+        if any(identity in restore for identity in ("${{ github.sha }}", "${{ github.run_id }}", "${{ github.run_attempt }}")):
+            raise PolicyError(f"{path} cache restore prefixes must not contain run identity")
+    for gate in ("fmt-deps", "clippy-target", "test-target"):
+        cache = next((block for block in re.finditer(r"(?ms)^      - name: Cache Cargo and Rust toolchain\s*\n.*?(?=^      - name:|\Z)", text) if gate in block.group(0)), None)
+        if cache is None:
+            raise PolicyError(f"{path} is missing the {gate} cache")
+        restore_lines = re.search(r"(?ms)^          restore-keys: \|\n(.*?)(?=^      - name:|\Z)", cache.group(0))
+        if restore_lines is None:
+            raise PolicyError(f"{path} {gate} cache has no restore prefixes")
+        actual = [line.strip() for line in restore_lines.group(1).splitlines() if line.strip()]
+        if actual != reusable_cache_restore_prefixes(gate):
+            raise PolicyError(f"{path} {gate} cache restore prefixes are missing, unsafe, or out of order")
+    shard_cache = next((block for block in re.finditer(r"(?ms)^      - name: Cache Cargo and Rust toolchain\s*\n.*?(?=^      - name:|\Z)", text) if "test-shard" in block.group(0)), None)
+    if shard_cache is None:
+        raise PolicyError(f"{path} is missing the Ubuntu shard cache")
+    shard_text = shard_cache.group(0)
+    shard_key = re.search(r"^          key: (.+)$", shard_text, re.MULTILINE)
+    if shard_key is None or reusable_shard_cache_primary_key() != shard_key.group(1).strip():
+        raise PolicyError(f"{path} Ubuntu shard cache key is missing shard/layout/lock/run identity")
+    shard_restore = re.search(r"(?ms)^          restore-keys: \|\n(.*?)(?=^      - name:|\Z)", shard_text)
+    if shard_restore is None or [line.strip() for line in shard_restore.group(1).splitlines() if line.strip()] != reusable_shard_cache_restore_prefixes():
+        raise PolicyError(f"{path} Ubuntu shard restore prefixes are missing, unsafe, or out of order")
+    if "if: inputs.run_common_rust && steps.shard-plan.outputs.has_packages == 'true'" not in shard_text:
+        raise PolicyError(f"{path} empty Ubuntu shards must not restore or save a cache")
+    shard_match = re.search(r"(?ms)^  test-ubuntu-shards:\s*\n.*?(?=^  [A-Za-z0-9_.-]+:\s*$|\Z)", text)
+    if not shard_match or "${{ matrix.shard }}" not in shard_match.group(0):
+        raise PolicyError(f"{path} Ubuntu cache must be shard-scoped")
+
+
 def validate_reusable_cache_contract(path: Path, text: str) -> None:
     if path.name != "rust-reusable.yml":
+        return
+    if "run_common_rust:\n" in text:
+        validate_reusable_cache_contract_v2(path, text)
         return
 
     if len(re.findall(r"^\s+uses:\s*actions/cache@", text, re.MULTILINE)) != 4:
@@ -706,10 +842,10 @@ def validate_pr_secrets(path: Path, text: str) -> None:
             "persist-credentials: false",
             "git fetch --no-tags --no-write-fetch-head origin \"$HEAD_SHA\"",
             "--trusted-base",
-            "Require one repository-owned merge-train branch",
-            "git worktree add --detach",
-            "trusted_verifier=\"$GITHUB_WORKSPACE/scripts/ci-merge-train.py\"",
-            "verify-hosted",
+            "pull_request_review:",
+            "Capture read-only exact-head GitHub review evidence",
+            "pulls/$PR_NUMBER/reviews",
+            "--github-reviews",
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the non-executing trusted-base admission contract")
@@ -756,14 +892,21 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "startsWith(github.head_ref, 'merge-train/')",
             "ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}",
             "scripts/ci-scope.py",
-            "scripts/ci-merge-train.py verify-hosted",
-            "scripts/ci-merge-train.py discover-manifest",
-            "repository_merge_train_full",
             "rust-reusable.yml",
             "run_rust: ${{ needs.scope.outputs.rust == 'true' }}",
-            "run_macos: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') }}",
-            "--planned-scope rust",
-            "--planned-scope macos",
+            "run_common_rust: ${{ needs.scope.outputs.common_rust == 'true' }}",
+            "run_desktop: ${{ needs.scope.outputs.desktop == 'true' }}",
+            "common_rust_packages",
+            "desktop_packages",
+            "dependency_only",
+            "dependency-cordis-smoke",
+            "dependency-desktop-smoke",
+            "needs.scope.outputs.dependency_only != 'true' && 'ubuntu-24.04' || 'macos-15'",
+            "cargo test -p hartevo-cordis --locked --lib",
+            "cargo test -p hartevo-desktop --locked --lib",
+            "--planned-scope common-rust",
+            "--planned-scope desktop",
+            "--planned-scope dependency",
             "--planned-job-name",
             "scripts/ci-workflow-policy.py",
             "scripts/repository_governance.py verify-repository",
@@ -780,7 +923,7 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         if "branches: [main]" in text or "branches: [bootstrap/macos-r0]" in text:
             raise PolicyError(f"{path} must not run the integration push tier")
     elif path.name == "integration.yml":
-        required = ("bootstrap/macos-r0", "workflow_dispatch:", "ci-merge-train.py verify-bootstrap-push", "run_rust: true", "run_macos: true", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
+        required = ("bootstrap/macos-r0", "workflow_dispatch:", "schedule:", "Verify recoverable direct PR or exact train merge", "ci-merge-train.py verify-bootstrap-push", "run_rust: true", "run_common_rust: true", "run_desktop: true", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a required integration contract")
         if "pull_request_review:" in text:
@@ -809,15 +952,16 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
     elif path.name == "governance-admission.yml":
         required = (
             "pull_request_target:",
+            "pull_request_review:",
             "Governance / PR admission",
-            "Governance / Train-only merge",
             "github.event.pull_request.base.sha",
             "github.event.pull_request.head.sha",
+            "github.token",
+            "pulls/$PR_NUMBER/reviews",
+            "github-reviews.json",
             "repository_governance.py verify-pr-event",
             "--trusted-base",
-            "ci-merge-train.py",
-            "discover-manifest",
-            "verify-hosted",
+            "--github-reviews",
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the trusted governance admission contract")
@@ -835,6 +979,10 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "workflow_call:",
             "inputs:",
             "check_prefix",
+            "run_common_rust",
+            "run_desktop",
+            "common_rust_packages",
+            "desktop_packages",
             "ci-rust-gate.sh",
             "ci-rust-test-shards.py",
             "test-ubuntu-shards",
@@ -844,6 +992,10 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "all-targets",
             "all-features",
             "--locked",
+            "Desktop scope is empty",
+            "Common Rust scope is empty",
+            "matrix.os == 'ubuntu-24.04' && inputs.run_common_rust",
+            "matrix.os == 'macos-15' && inputs.run_desktop",
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the reusable Rust gate contract")
@@ -1073,11 +1225,11 @@ jobs:
     expect_scope_rejection("an aggregate accepting failure", scope_fixture.replace("!= success", "== failure", 1))
     expect_scope_rejection(
         "an aggregate without its planned Rust-scope marker",
-        scope_fixture.replace("      - name: Planned scope skip marker\n        if: ${{ !inputs.run_rust }}\n        run: echo \"Rust scope is empty; the Ubuntu aggregate confirms the planned shard markers only.\"\n", "", 1),
+        scope_fixture.replace("      - name: Planned scope skip marker\n        if: ${{ !inputs.run_common_rust }}\n        run: echo \"Common Rust scope is empty; the Ubuntu aggregate confirms planned markers only.\"\n", "", 1),
     )
     expect_scope_rejection(
         "an aggregate shard gate that runs for empty Rust scope",
-        scope_fixture.replace("      - name: Require successful Ubuntu shards\n        if: inputs.run_rust\n", "      - name: Require successful Ubuntu shards\n", 1),
+        scope_fixture.replace("      - name: Require successful Ubuntu common-Rust shards\n        if: inputs.run_common_rust\n", "      - name: Require successful Ubuntu common-Rust shards\n", 1),
     )
 
     scope_skip_plan = reusable_rust_scope_plan("PR / Fast Rust", False)
@@ -1200,9 +1352,9 @@ jobs:
         "a cache on a planned-empty shard",
         cache_fixture.replace(
             "      - name: Cache Cargo and Rust toolchain\n"
-            "        if: inputs.run_rust && steps.shard-plan.outputs.has_packages == 'true'",
+            "        if: inputs.run_common_rust && steps.shard-plan.outputs.has_packages == 'true'",
             "      - name: Cache Cargo and Rust toolchain\n"
-            "        if: inputs.run_rust",
+            "        if: inputs.run_common_rust",
             1,
         ),
     )

@@ -40,13 +40,7 @@
       "requiredStatusChecks": [
         "PR / Workflow policy",
         "Governance / PR admission",
-        "Governance / Train-only merge",
         "PR / Scope plan",
-        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
-        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
-        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
-        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
-        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
         "PR / Result taxonomy"
       ]
     },
@@ -62,13 +56,7 @@
       "requiredStatusChecks": [
         "PR / Workflow policy",
         "Governance / PR admission",
-        "Governance / Train-only merge",
         "PR / Scope plan",
-        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
-        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
-        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
-        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
-        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
         "PR / Result taxonomy"
       ]
     }
@@ -138,7 +126,7 @@
       "ready",
       "root-bootstrap-base",
       "exact-current-head",
-      "candidate-checks-success-excluding-intentional-train-only-block"
+      "stable-required-checks-and-admission-success"
     ],
     "compositeRequirements": [
       "exact-first-parent-history",
@@ -193,31 +181,7 @@
               "integration_id": 15368
             },
             {
-              "context": "Governance / Train-only merge",
-              "integration_id": 15368
-            },
-            {
               "context": "PR / Scope plan",
-              "integration_id": 15368
-            },
-            {
-              "context": "PR / Fast Rust matrix / PR / Fast Rust / fmt",
-              "integration_id": 15368
-            },
-            {
-              "context": "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
-              "integration_id": 15368
-            },
-            {
-              "context": "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
-              "integration_id": 15368
-            },
-            {
-              "context": "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
-              "integration_id": 15368
-            },
-            {
-              "context": "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
               "integration_id": 15368
             },
             {
