@@ -437,12 +437,21 @@ impl Context {
     pub fn with_fiber<'a>(&'a mut self, fiber: &Fiber) -> ContextView<'a> {
         let context_valid = fiber.context_id() == self.id;
         let scope_valid = context_valid && self.current_scope_allows(fiber);
+        let view_active = context_valid
+            && scope_valid
+            && !fiber.is_disposed()
+            && fiber.state() == FiberState::Active;
+        let metadata = if view_active {
+            fiber.metadata_snapshot()
+        } else {
+            ConfigValue::default()
+        };
         ContextView {
             context: self,
             fiber: fiber.clone(),
             namespace: fiber.namespace(),
             shared_namespaces: Vec::new(),
-            metadata: fiber.metadata_snapshot(),
+            metadata,
             context_valid,
             scope_valid,
         }
@@ -754,7 +763,23 @@ impl Context {
             self.teardown();
             return Ok(true);
         }
-        let mut disposed = HashSet::from([fiber.uid()]);
+        if !self.current_scope_allows(fiber) {
+            return Err(CordisError::FiberScopeViolation {
+                current: self.current_fiber,
+                requested: fiber.uid(),
+            });
+        }
+        let disposed = self.fiber_subtree(fiber.uid());
+        let changed = fiber.dispose();
+        self.tombstone_fibers(&disposed);
+        let cleanup = self.cleanup_fibers(&disposed);
+        self.notify_pending()?;
+        cleanup?;
+        Ok(changed)
+    }
+
+    fn fiber_subtree(&self, root_uid: FiberUid) -> HashSet<FiberUid> {
+        let mut disposed = HashSet::from([root_uid]);
         loop {
             let descendants: Vec<FiberUid> = self
                 .fibers
@@ -772,23 +797,25 @@ impl Context {
             }
             disposed.extend(descendants);
         }
-        let changed = fiber.dispose();
+        disposed
+    }
+
+    fn tombstone_fibers(&self, disposed: &HashSet<FiberUid>) {
         for candidate in self.fibers.values() {
             if disposed.contains(&candidate.uid()) {
                 candidate.dispose();
             }
         }
-        let cleanup = self.cleanup_fibers(&disposed);
-        self.notify_pending()?;
-        cleanup?;
-        Ok(changed)
     }
 
     /// Remove all Context-owned records for a terminal child without asking
     /// the pending registry to activate another factory. Activation failures
     /// use this form so no partial callback registration can leak.
     fn cleanup_fiber(&mut self, fiber: &Fiber) -> Result<(), CordisError> {
-        self.cleanup_fibers(&HashSet::from([fiber.uid()]))
+        let disposed = self.fiber_subtree(fiber.uid());
+        fiber.dispose();
+        self.tombstone_fibers(&disposed);
+        self.cleanup_fibers(&disposed)
     }
 
     fn cleanup_fibers(&mut self, disposed: &HashSet<FiberUid>) -> Result<(), CordisError> {
@@ -1880,12 +1907,14 @@ impl ContextView<'_> {
 
     #[must_use]
     pub fn var(&self, key: &str) -> Option<&ConfigValue> {
-        self.metadata.lookup(key)
+        self.is_active()
+            .then(|| self.metadata.lookup(key))
+            .flatten()
     }
 
     #[must_use]
-    pub fn plugin_interpolation_source(&self) -> &ConfigValue {
-        &self.metadata
+    pub fn plugin_interpolation_source(&self) -> Option<&ConfigValue> {
+        self.is_active().then_some(&self.metadata)
     }
 
     /// Extend this view's private metadata without mutating its parent.

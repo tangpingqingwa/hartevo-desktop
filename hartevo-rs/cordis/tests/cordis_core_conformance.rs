@@ -118,6 +118,7 @@ fn public_handles_require_their_owner_and_current_generation() {
 #[test]
 fn handles_and_views_are_bound_to_their_context() {
     let mut left = Context::new();
+    left.set_var("left-secret", "private");
     let handle = left.provide("ordinary", 1_u32).unwrap();
     let mut right = Context::new();
     right.provide("ordinary", 10_u32).unwrap();
@@ -134,6 +135,8 @@ fn handles_and_views_are_bound_to_their_context() {
     let mut foreign_view = right.with_fiber(&foreign_root);
     assert!(!foreign_view.is_valid());
     assert!(!foreign_view.has("ordinary"));
+    assert!(foreign_view.var("left-secret").is_none());
+    assert!(foreign_view.plugin_interpolation_source().is_none());
     assert_eq!(
         foreign_view.provide("other", true).unwrap_err(),
         CordisError::FiberContextMismatch {
@@ -145,6 +148,7 @@ fn handles_and_views_are_bound_to_their_context() {
 #[test]
 fn pending_and_disposed_views_are_read_fail_closed() {
     let mut context = Context::new();
+    context.set_var("root-secret", "private");
     context.provide("root-only", 1_u32).unwrap();
 
     let pending = context
@@ -157,6 +161,8 @@ fn pending_and_disposed_views_are_read_fail_closed() {
         assert!(!pending_view.is_valid());
         assert!(!pending_view.has("root-only"));
         assert!(pending_view.get::<u32>("root-only").is_none());
+        assert!(pending_view.var("root-secret").is_none());
+        assert!(pending_view.plugin_interpolation_source().is_none());
     }
 
     let child = context.new_fiber().unwrap();
@@ -165,6 +171,8 @@ fn pending_and_disposed_views_are_read_fail_closed() {
     assert!(!disposed_view.is_valid());
     assert!(!disposed_view.has("root-only"));
     assert!(disposed_view.get::<u32>("root-only").is_none());
+    assert!(disposed_view.var("root-secret").is_none());
+    assert!(disposed_view.plugin_interpolation_source().is_none());
     assert!(matches!(
         disposed_view.provide("escaped", true),
         Err(CordisError::FiberDisposed { .. })

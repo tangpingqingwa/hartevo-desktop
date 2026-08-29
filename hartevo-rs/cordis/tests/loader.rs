@@ -773,3 +773,115 @@ fn panicking_disposer_cannot_orphan_partial_state_or_drop_ready_queue() {
     assert_eq!(ctx.pending_count(), 0);
     assert_eq!(starts.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn parent_failure_recursively_disposes_active_and_pending_children() {
+    let mut ctx = Context::new();
+    let active_slot = Arc::new(Mutex::new(None));
+    let grandchild_slot = Arc::new(Mutex::new(None));
+    let pending_slot = Arc::new(Mutex::new(None));
+    let active_for_parent = Arc::clone(&active_slot);
+    let grandchild_for_parent = Arc::clone(&grandchild_slot);
+    let pending_for_parent = Arc::clone(&pending_slot);
+    let parent = PluginFactory::new("failing-parent", move |_config, ctx| {
+        let grandchild_for_active = Arc::clone(&grandchild_for_parent);
+        let active = ctx.mount_pending(PluginFactory::new(
+            "nested-active-before-parent-failure",
+            move |_config, ctx| {
+                let grandchild = ctx.mount_pending(PluginFactory::new(
+                    "active-grandchild-before-parent-failure",
+                    |_config, ctx| ctx.provide("grandchild-provider", true).map(|_| ()),
+                ))?;
+                *grandchild_for_active.lock().expect("grandchild") = Some(grandchild);
+                ctx.provide("nested-active-provider", true).map(|_| ())
+            },
+        ))?;
+        let pending = ctx.mount_pending(
+            PluginFactory::new("nested-pending-before-parent-failure", |_config, _ctx| ())
+                .with_inject(["never-ready"]),
+        )?;
+        *active_for_parent.lock().expect("active") = Some(active);
+        *pending_for_parent.lock().expect("pending") = Some(pending);
+        Err::<(), _>(CordisError::MissingDependencies(vec![
+            "parent-failure".to_string(),
+        ]))
+    });
+
+    assert!(matches!(
+        ctx.mount_pending(parent),
+        Err(CordisError::PluginActivation { .. })
+    ));
+    let active = active_slot
+        .lock()
+        .expect("active")
+        .clone()
+        .expect("active child");
+    let pending = pending_slot
+        .lock()
+        .expect("pending")
+        .clone()
+        .expect("pending child");
+    let grandchild = grandchild_slot
+        .lock()
+        .expect("grandchild")
+        .clone()
+        .expect("active grandchild");
+    assert!(active.is_disposed());
+    assert!(grandchild.is_disposed());
+    assert!(pending.is_disposed());
+    assert!(!ctx.has("nested-active-provider"));
+    assert!(!ctx.has("grandchild-provider"));
+    assert_eq!(ctx.pending_count(), 0);
+    assert_eq!(ctx.registration_count(), 0);
+}
+
+#[test]
+fn activation_scope_cannot_dispose_a_sibling_or_ancestor_fiber() {
+    let mut ctx = Context::new();
+    let sibling = ctx
+        .mount_pending(PluginFactory::new("sibling", |_config, ctx| {
+            ctx.provide("sibling-provider", true).map(|_| ())
+        }))
+        .unwrap();
+    assert!(sibling.is_active());
+    let sibling_for_attacker = sibling.clone();
+    let attacker = ctx
+        .mount_pending(PluginFactory::new(
+            "sibling-disposal-attacker",
+            move |_config, ctx| {
+                assert!(matches!(
+                    ctx.dispose_pending(&sibling_for_attacker),
+                    Err(CordisError::FiberScopeViolation { .. })
+                ));
+                Ok::<(), CordisError>(())
+            },
+        ))
+        .unwrap();
+
+    assert!(attacker.is_active());
+    assert!(sibling.is_active());
+    assert!(ctx.has("sibling-provider"));
+    assert!(ctx.dispose_pending(&attacker).unwrap());
+    assert!(ctx.dispose_pending(&sibling).unwrap());
+    assert!(!ctx.has("sibling-provider"));
+
+    let ancestor = ctx.new_fiber().unwrap();
+    let ancestor_for_attacker = ancestor.clone();
+    let descendant = ctx
+        .with_fiber(&ancestor)
+        .mount_pending(PluginFactory::new(
+            "ancestor-disposal-attacker",
+            move |_config, ctx| {
+                assert!(matches!(
+                    ctx.dispose_fiber(&ancestor_for_attacker),
+                    Err(CordisError::FiberScopeViolation { .. })
+                ));
+                Ok::<(), CordisError>(())
+            },
+        ))
+        .unwrap();
+    assert!(descendant.is_active());
+    assert_eq!(ancestor.state(), hartevo_cordis::FiberState::Active);
+    assert!(ctx.dispose_pending(&descendant).unwrap());
+    assert!(ctx.dispose_fiber(&ancestor).unwrap());
+}
