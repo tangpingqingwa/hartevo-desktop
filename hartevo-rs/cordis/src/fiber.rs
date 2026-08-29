@@ -356,6 +356,11 @@ impl Fiber {
     }
 
     /// Current minimal lifecycle state.
+    ///
+    /// N1-managed Fibers read the single runtime control snapshot. Legacy N0
+    /// Context Fibers retain their last Active/Pending compatibility snapshot
+    /// after teardown; callers must use [`Self::is_disposed`] as the terminal
+    /// authority for those unmanaged handles.
     #[must_use]
     pub fn state(&self) -> FiberState {
         if let Some(lifecycle) = self.lifecycle() {
@@ -392,8 +397,9 @@ impl Fiber {
             .is_ok()
     }
 
-    /// Publish the terminal tombstone. Repeated disposal is a no-op; the root
-    /// Fiber is retained as the reusable Context owner and cannot be disposed.
+    /// Publish the legacy N0 terminal tombstone. Repeated disposal is a no-op;
+    /// the compatibility state snapshot intentionally remains Active/Pending.
+    /// The root Fiber is retained as the reusable Context owner.
     pub(crate) fn dispose(&self) -> bool {
         if self.uid() == FiberUid::ROOT {
             return false;
