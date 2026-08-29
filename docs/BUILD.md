@@ -16,6 +16,17 @@ Cordis primer semantics are authoritative concepts, not TypeScript to vendor:
 - [Cordis primer](https://deepseek-harness.github.io/deepseek-harness/reference/cordis-primer)
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (everything is a plugin; powered by Cordis)
 
+Pinned source provenance for this target contract:
+
+- Cordis: cordiverse/cordis@8cc9e33fab69e2d0476d126baaf2acb24e6a6ab4
+  (MIT).
+- DeepSeek Harness: deepseek-ai/deepseek-harness@cd5ef8148158c3a752a658978873241fdf8e2bbc
+  (MIT).
+
+Hartevo reimplements the pinned primer behavior in Rust. It does not vendor or
+run the TypeScript/Node cores, and it does not add a Node/Electron/React/Python
+agent core.
+
 The bounded train fallback is [`scripts/ci-merge-train.py`](../scripts/ci-merge-train.py)
 and [`.github/policies/branch-ruleset-policy.json`](../.github/policies/branch-ruleset-policy.json).
 
@@ -40,29 +51,63 @@ this PR because repository-root files fail-closed into the full Rust matrix.
 
 ### PR 2: Rust Cordis kernel (Context, Service, inject, reversible effect/on)
 
-Reimplement primer plugin-host semantics in Rust:
+Reimplement the pinned primer plugin-host and Fiber/runtime semantics in Rust.
+This heading is a target contract for later implementation; this docs-only
+change does not implement PR 2, N0, or N1.
 
-1. Plugin = Service object (`fn` with `inject` + `apply(ctx)`, or Service
-   subclass). Lifecycle is mounted on the current context.
-2. Context is the service container: stable `ctx.<key>` lookups
-   (`ctx.tools`, `ctx.llm`, `ctx.sessions`, plus Hartevo `ctx.domain`,
-   `ctx.effect_broker`, `ctx.runtime`, `ctx.desktop`). Plugins look up by key,
-   not concrete imports.
-3. `inject` declares deps; start waits until those services are ready. Load
-   order is dependency, not a hardcoded boot sequence.
-4. Registrations are reversible side effects via `effect()` / `on()` with
-   disposers. Reload and teardown must undo.
+1. Plugin = a Service object or an opaque repeatable PluginFactory. inject
+   declares dependencies, and activation waits until those services are ready.
+   The consuming Service.apply(self, ctx) form is an explicit strict one-shot
+   compatibility adapter; it cannot claim reload or update parity.
+2. Context is the service container: stable ctx.<key> lookups (ctx.tools,
+   ctx.llm, ctx.sessions, plus Hartevo ctx.domain, ctx.effect_broker,
+   ctx.runtime, ctx.desktop). Plugins look up by key, not concrete imports.
+   Provider records keep namespace/key, authorization provider_id, owning Fiber
+   uid, and mutable provider generation as separate fields. Ordinary
+   registration starts at generation zero; authorized in-place rebind
+   increments generation exactly once.
+3. The complete target Fiber/runtime has root uid 0, monotonic distinct child
+   uids, and states PENDING, LOADING, ACTIVE, FAILED, UNLOADING, and terminal
+   DISPOSED. It permits one current transition at a time, retains start
+   errors, and prevents work or callbacks after disposal.
+4. Missing inject dependencies create a pending Fiber. A repeatable opaque
+   PluginFactory is retained and can be invoked once per committed load epoch;
+   cloning a factory preserves its opaque identity. Provider-generation refresh
+   uses the active owner Fiber uid plus provider generation, not authorization
+   provider_id, as its activation fingerprint.
+5. Reload/unload, update/restart, terminal child disposal, and reversible
+   synchronous/asynchronous lifecycle registrations are part of the complete
+   target. Effects have one Fiber teardown owner and idempotent disposal;
+   asynchronous cleanup is awaited by the lifecycle transition. The N0 slice
+   establishes only the provider/ownership boundary and minimal PENDING/ACTIVE
+   activation; N1 owns the remaining lifecycle/effect implementation and its
+   race oracles.
+6. Load order is dependency-driven, not a hardcoded crate boot sequence.
+   Context parent/child ownership and isolated namespaces must not leak
+   Hartevo-owned services across an isolate boundary.
 
 ### PR 3: typed events with exactly one dispatch mode each
 
-Lock four dispatch modes. Each event has exactly one:
+Lock five upstream core dispatch modes. Each event has exactly one mode:
 
 | Mode | Await | Return | Contract |
 | --- | --- | --- | --- |
-| `emit` | no | no | observe only |
-| `waterfall` | no | yes | wrap middleware with `next()`; short-circuit is intentional for policy |
-| `parallel` | yes | no | await all listeners |
-| `serial` | yes | yes | await in order |
+| Emit | no | no | Synchronous observe-only listeners in registration order. |
+| Parallel | yes | no | Start all matching listeners, await all, and aggregate every typed cause in registration order. |
+| Serial | yes | yes | Give every listener the same original payload, await in registration order, and stop at the first BailOutcome<T>::Bail(_). Never thread a prior return as input. |
+| Bail | no | yes | Synchronous first-bailed dispatch over the same original payload; never await a listener. |
+| Waterfall | no | yes | Synchronous around-middleware; next delegates and omitting next intentionally short-circuits. |
+
+Serial and Bail use an explicit BailOutcome<T> decision wrapper. The non-bailing
+set is exactly Undefined, Null, and False; 0, -0, NaN, the empty string,
+true, empty arrays/objects, and opaque object values bail. Do not infer this
+rule from Rust bool, Option, emptiness, Default, or general truthiness. A
+no-bail/no-listener result is Continue(Undefined).
+
+The current Hartevo transform, where each listener consumes the preceding
+listener's result, is not upstream Serial. Rename it to the explicit
+Accumulate extension (on_accumulate/accumulate, DispatchMode::Accumulate) and
+never count it as one of the five core modes.
 
 Interception and policy use events. Capability calls use service methods.
 
