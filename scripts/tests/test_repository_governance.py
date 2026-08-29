@@ -89,9 +89,23 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def test_checked_in_policy_and_ledger_are_valid_resumed_and_normal(self) -> None:
         self.assertEqual(governance.verify_policy_value(self.policy)["status"], "PASS")
         self.assertEqual(self.policy["admissionModeWhenUnpaused"], "normal")
-        self.assertEqual(self.events[-2]["kind"], "GLOBAL_RESUMED")
+        latest_transition = next(
+            event for event in reversed(self.events) if event["kind"] in {"GLOBAL_PAUSED", "GLOBAL_RESUMED"}
+        )
+        self.assertEqual(latest_transition["kind"], "GLOBAL_RESUMED")
         self.assertFalse(governance.global_paused(self.events))
         self.assertTrue(governance.global_paused(self.paused_events))
+        self.assertEqual(
+            self.policy["admissionStatus"],
+            {
+                "context": "Governance / PR admission",
+                "controllerJob": "Governance / Admission controller",
+                "mutation": "exact-head-commit-status-only",
+                "beforeExactReview": "pending",
+                "validExactReview": "success",
+                "invalidAdmission": "failure",
+            },
+        )
 
     def test_repository_lifecycle_settings_prefer_complete_rest_truth(self) -> None:
         repository = {
@@ -286,6 +300,39 @@ class RepositoryGovernanceTests(unittest.TestCase):
         )
         self.assertEqual(restored["reviewerTaskId"], "reviewer")
 
+        with self.assertRaises(governance.AwaitingIndependentReview):
+            governance.validate_github_review_records([], head_sha=head, owner="author")
+
+    def test_admission_classification_is_pending_before_review_and_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            event_path = Path(directory) / "event.json"
+            event_path.write_text(json.dumps({"action": "opened"}), encoding="utf-8")
+            waiting = governance.AwaitingIndependentReview("no current exact-head review")
+            with mock.patch.object(governance, "verify_pr_event", side_effect=waiting):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request")
+            self.assertEqual(result["status"], "WAITING_REVIEW")
+            self.assertEqual(result["commitStatus"], "pending")
+
+            event_path.write_text(json.dumps({"action": "submitted"}), encoding="utf-8")
+            with mock.patch.object(governance, "verify_pr_event", side_effect=waiting):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request_review")
+            self.assertEqual(result["status"], "INVALID")
+            self.assertEqual(result["commitStatus"], "failure")
+
+            with mock.patch.object(governance, "verify_pr_event", return_value={"status": "PASS"}):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request_review")
+            self.assertEqual(result["status"], "READY")
+            self.assertEqual(result["commitStatus"], "success")
+
+            with mock.patch.object(
+                governance,
+                "verify_pr_event",
+                side_effect=governance.GovernanceError("invalid admission metadata"),
+            ):
+                result = governance.classify_pr_event(ROOT, event_path, "pull_request")
+            self.assertEqual(result["status"], "INVALID")
+            self.assertEqual(result["commitStatus"], "failure")
+
     def test_exact_path_lease_rejects_outside_change(self) -> None:
         value = self.admission()
         value["ownedPaths"] = ["scripts"]
@@ -444,6 +491,7 @@ class RepositoryGovernanceTests(unittest.TestCase):
             head = command(root, "git", "rev-parse", "HEAD")
             command(root, "git", "switch", "--quiet", "--detach", base)
             event = {
+                "action": "opened",
                 "pull_request": {
                     "number": 7,
                     "body": (
@@ -463,6 +511,16 @@ class RepositoryGovernanceTests(unittest.TestCase):
             }
             event_path = root / "event.json"
             event_path.write_text(json.dumps(event), encoding="utf-8")
+            waiting = governance.classify_pr_event(
+                root,
+                event_path,
+                "pull_request",
+                trusted_base=True,
+                github_reviews=[],
+            )
+            self.assertEqual(waiting["status"], "WAITING_REVIEW")
+            self.assertEqual(waiting["commitStatus"], "pending")
+            self.assertEqual(command(root, "git", "rev-parse", "HEAD"), base)
             result = governance.verify_pr_event(
                 root,
                 event_path,

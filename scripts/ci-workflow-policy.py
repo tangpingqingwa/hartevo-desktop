@@ -843,12 +843,23 @@ def validate_pr_secrets(path: Path, text: str) -> None:
             "git fetch --no-tags --no-write-fetch-head origin \"$HEAD_SHA\"",
             "--trusted-base",
             "pull_request_review:",
+            "statuses: write",
+            "Mark exact head admission pending",
+            "Governance / Admission controller",
+            "STATUS_CONTEXT: Governance / PR admission",
+            "statuses/$HEAD_SHA",
+            "classify-pr-event",
             "Capture read-only exact-head GitHub review evidence",
             "pulls/$PR_NUMBER/reviews",
             "--github-reviews",
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the non-executing trusted-base admission contract")
+        if text.index("Mark exact head admission pending") > text.index("Checkout trusted protected governance policy"):
+            raise PolicyError(f"{path} must publish pending before checkout or verification")
+        write_permissions = set(re.findall(r"^\s+([a-z-]+):\s*write\s*$", text, re.MULTILINE))
+        if write_permissions != {"statuses"}:
+            raise PolicyError(f"{path} may write only exact-head commit statuses")
         if re.search(r"\bsecrets\b|secrets\.", text):
             raise PolicyError(f"{path} exposes secrets to a privileged PR event")
     if "pull_request:" in text or "pull_request_review:" in text:
@@ -954,19 +965,24 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "pull_request_target:",
             "pull_request_review:",
             "Governance / PR admission",
+            "Governance / Admission controller",
+            "Mark exact head admission pending",
+            "WAITING_REVIEW",
+            "statuses: write",
+            "statuses/$HEAD_SHA",
             "github.event.pull_request.base.sha",
             "github.event.pull_request.head.sha",
             "github.token",
             "pulls/$PR_NUMBER/reviews",
             "github-reviews.json",
-            "repository_governance.py verify-pr-event",
+            "repository_governance.py classify-pr-event",
             "--trusted-base",
             "--github-reviews",
         )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the trusted governance admission contract")
         if re.search(r"\b(contents|issues|pull-requests):\s*write\b", text):
-            raise PolicyError(f"{path} trusted admission workflow must remain read-only")
+            raise PolicyError(f"{path} trusted admission may not mutate repository or pull-request content")
     elif path.name == "release-promotion.yml":
         required = ("workflow_dispatch:", "environment: release-promotion", "id-token: write", "source_commit", "refs/heads/main", "release-baseline", "releaseCommit", "passed", "sha256", "rollback", "release: false", "ci-distribution-hook.sh", "ci-oidc-interface")
         if any(item not in text for item in required):

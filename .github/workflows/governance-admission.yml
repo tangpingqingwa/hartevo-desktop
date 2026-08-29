@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  statuses: write
+
+env:
+  STATUS_CONTEXT: Governance / PR admission
 
 concurrency:
   group: hartevo-governance-admission-${{ github.event.pull_request.number }}
@@ -20,13 +24,29 @@ concurrency:
 
 jobs:
   admission:
-    name: Governance / PR admission
+    name: Governance / Admission controller
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read
+      statuses: write
     steps:
+      - name: Mark exact head admission pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 -c 'import json, os; print(json.dumps({"state": "pending", "context": os.environ["STATUS_CONTEXT"], "description": "Awaiting trusted exact-head admission", "target_url": os.environ["TARGET_URL"]}))' \
+            > "$RUNNER_TEMP/admission-status.json"
+          curl --fail --silent --show-error \
+            --request POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --data @"$RUNNER_TEMP/admission-status.json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA"
       - name: Checkout trusted protected governance policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,10 +68,54 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews?per_page=100" \
             > "$RUNNER_TEMP/github-reviews.json"
-      - name: Verify exact trusted-base admission
+      - name: Classify exact trusted-base admission
+        id: classify
         run: |
-          python3 scripts/repository_governance.py verify-pr-event \
+          python3 scripts/repository_governance.py classify-pr-event \
             --event "$GITHUB_EVENT_PATH" \
             --event-name "${{ github.event_name == 'pull_request_review' && 'pull_request_review' || 'pull_request' }}" \
             --trusted-base \
-            --github-reviews "$RUNNER_TEMP/github-reviews.json"
+            --github-reviews "$RUNNER_TEMP/github-reviews.json" \
+            > "$RUNNER_TEMP/admission-classification.json"
+          classification="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["status"])' "$RUNNER_TEMP/admission-classification.json")"
+          case "$classification" in
+            READY|WAITING_REVIEW|INVALID) ;;
+            *) exit 1 ;;
+          esac
+          printf 'status=%s\n' "$classification" >> "$GITHUB_OUTPUT"
+          python3 -m json.tool "$RUNNER_TEMP/admission-classification.json"
+      - name: Publish exact head admission decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLASSIFICATION: ${{ steps.classify.outputs.status }}
+        run: |
+          case "$CLASSIFICATION" in
+            READY)
+              state=success
+              description="Exact-head admission and review passed"
+              ;;
+            WAITING_REVIEW)
+              state=pending
+              description="Awaiting independent exact-head review"
+              ;;
+            INVALID)
+              state=failure
+              description="Trusted exact-head admission failed"
+              ;;
+            *)
+              state=failure
+              description="Admission controller returned an invalid state"
+              ;;
+          esac
+          STATE="$state" DESCRIPTION="$description" python3 -c 'import json, os; print(json.dumps({"state": os.environ["STATE"], "context": os.environ["STATUS_CONTEXT"], "description": os.environ["DESCRIPTION"], "target_url": os.environ["TARGET_URL"]}))' \
+            > "$RUNNER_TEMP/admission-status.json"
+          curl --fail --silent --show-error \
+            --request POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --data @"$RUNNER_TEMP/admission-status.json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA"
+          test "$CLASSIFICATION" != INVALID

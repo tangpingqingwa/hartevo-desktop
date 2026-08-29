@@ -21,7 +21,13 @@ multi-PR integration, release, or an explicitly high-risk combination.
 
 The trusted `pull_request_target` admission workflow checks out only the
 protected base, fetches the event head as an object, and reads review records
-with a read-only token. A code push changes the exact head and therefore
+without executing PR code. It controls one exact-head commit status named
+`Governance / PR admission`: pending before review, success only after a valid
+exact-head review, and failure for invalid governance facts. The pending status
+is published before checkout, so a workflow or API failure remains blocked.
+Later events update the same context instead of leaving sticky failed required
+CheckRuns. The token may write statuses only; repository contents and pull
+requests remain read-only. A code push changes the exact head and therefore
 invalidates older GitHub review records. `requiredApprovingReviews` is zero on
 both protected branches because this repository has one GitHub collaborator;
 the admission verifier enforces task-independent exact-head review without a

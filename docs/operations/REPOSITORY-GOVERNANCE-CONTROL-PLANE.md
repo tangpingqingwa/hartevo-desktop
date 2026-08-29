@@ -32,13 +32,24 @@ matrix runs through `workflow_dispatch` or the weekday schedule.
 ## Trusted admission and review freshness
 
 `governance-admission.yml` runs from the protected base for both PR updates and
-`pull_request_review` events. It fetches the untrusted head as a Git object,
-never checks out or executes PR code with privileged authority, and reads
-GitHub reviews with a read-only token. A review is accepted only when its
-state is `COMMENTED` or `APPROVED`, its API commit ID equals the current head,
-its body is exactly one machine-readable marker with `APPROVE`, and its
-reviewer task ID differs from the admission owner. Any code push changes the
-head and invalidates old records.
+`pull_request_review` events. It fetches the untrusted head as a Git object and
+never checks out or executes PR code with privileged authority. The workflow
+publishes pending before review to the exact-head commit status
+`Governance / PR admission`, and does so before checkout or verification. A
+valid ordinary PR therefore stays blocked without showing an expected red
+failure. A review is accepted only when its state is `COMMENTED` or
+`APPROVED`, its API commit ID equals the current head, its body is exactly one
+machine-readable marker with `APPROVE`, and its reviewer task ID differs from
+the admission owner. Acceptance updates the same status to success; invalid
+facts update it to failure. A later correction can update that same context,
+so Rust checks are not rerun merely to clear an old admission failure. Any code
+push changes the head and invalidates old records.
+
+The trusted token has `statuses: write` solely for this exact-head commit
+status. Contents and pull requests remain read-only. Because pending is posted
+first, checkout, review-API, verifier, or final-status failures leave the PR
+blocked. The protected ruleset still requires the same four contexts; neither
+approval count nor bypass policy changes.
 
 ## High-risk changes
 
