@@ -487,6 +487,8 @@ struct LifecycleRegistryInner {
     driver_bindings: Mutex<HashMap<TokioRuntimeId, Weak<DriverRuntimeState>>>,
     supervisor: Mutex<Option<RegistrySupervisor>>,
     shutdown_operation: Mutex<Option<SharedUnitOperation>>,
+    #[cfg(test)]
+    supervisor_reservation_failures: AtomicU64,
 }
 
 /// Cloneable asynchronous Cordis runtime.
@@ -626,6 +628,8 @@ impl LifecycleRegistry {
                 driver_bindings: Mutex::new(HashMap::new()),
                 supervisor: Mutex::new(None),
                 shutdown_operation: Mutex::new(None),
+                #[cfg(test)]
+                supervisor_reservation_failures: AtomicU64::new(0),
             }),
         }
     }
@@ -659,6 +663,17 @@ impl LifecycleRegistry {
     }
 
     fn ensure_supervisor(&self) -> Result<SupervisorReservation, CordisError> {
+        #[cfg(test)]
+        if self
+            .inner
+            .supervisor_reservation_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(CordisError::AsyncRuntimeUnavailable);
+        }
         let mut supervisor = lock(&self.inner.supervisor);
         if supervisor
             .as_ref()
@@ -673,6 +688,40 @@ impl LifecycleRegistry {
             .as_ref()
             .ok_or(CordisError::AsyncRuntimeUnavailable)?
             .reserve()
+    }
+
+    fn fence_owner_provider_without_supervisor(&self, handle: &LifecycleProviderHandle) {
+        let mut state = lock(&self.inner.state);
+        let key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
+        let Some(slot) = state.providers.get(&key) else {
+            return;
+        };
+        let exact = slot.record.as_ref().is_some_and(|record| {
+            record.provider_id == handle.provider_id
+                && record.owner.uid() == handle.owner_uid
+                && record.generation == handle.generation
+        });
+        if !exact {
+            return;
+        }
+        let next_revision = slot.revision.checked_add(2);
+        let next_removal = slot.removal_serial.checked_add(1);
+        if let (Some(revision), Some(removal_serial)) = (next_revision, next_removal) {
+            if let Some(slot) = state.providers.get_mut(&key) {
+                // Exact provider identity plus the slot counters fence this
+                // synchronous owner-teardown fallback from any delayed older
+                // completion. Consumers are intentionally left untouched:
+                // without a reserved supervisor there is no durable waiter,
+                // while a later provide/reconcile can safely recover them.
+                slot.revision = revision;
+                slot.removal_serial = removal_serial;
+                slot.record = None;
+            }
+        } else {
+            // Global provider ids never repeat, so dropping an exhausted exact
+            // slot cannot let an old completion delete a later replacement.
+            state.providers.remove(&key);
+        }
     }
 
     pub fn mount(
@@ -913,25 +962,44 @@ impl LifecycleRegistry {
         self.begin_provider_removal_with_mode(handle, ProviderRemovalMode::Strict)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep owner-teardown reservation, recovery, and exact compare-delete in one path"
+    )]
     fn begin_provider_removal_with_mode(
         &self,
         handle: &LifecycleProviderHandle,
         mode: ProviderRemovalMode,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         self.validate_provider_handle(handle)?;
-        let supervisor = self.ensure_supervisor()?;
         let owner_teardown = matches!(&mode, ProviderRemovalMode::OwnerTeardown { .. });
-        let mut teardown_diagnostic = None;
+        let supervisor = match self.ensure_supervisor() {
+            Ok(supervisor) => supervisor,
+            Err(error) if owner_teardown => {
+                self.fence_owner_provider_without_supervisor(handle);
+                return Ok(async move { Err(error) }.boxed());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut recovery = RecoveryPlan::default();
         if let ProviderRemovalMode::OwnerTeardown { driver_runtime } = &mode {
             if let Err(error) = driver_runtime.require_alive() {
-                quarantine_dead_bindings_transaction(
+                recovery.extend(quarantine_dead_bindings_transaction(
                     &self.inner,
                     vec![driver_runtime.clone()],
                     Vec::new(),
                     std::slice::from_ref(handle),
                     &error,
-                );
-                return Ok(async move { Err(error) }.boxed());
+                ));
+                let drivers = recovery.driver_runtimes();
+                let inner = self.inner.clone();
+                let operation = async move {
+                    let first_error = settle_recovery_plan(inner, recovery, Some(error)).await;
+                    first_error.map_or(Ok(()), Err)
+                }
+                .boxed()
+                .shared();
+                return Ok(spawn_unit_operation_on(supervisor, operation, drivers));
             }
             let dead_bindings = {
                 let state = lock(&self.inner.state);
@@ -939,27 +1007,44 @@ impl LifecycleRegistry {
                 dead_driver_bindings_for_controls(&affected_controls_locked(&state, &key))
             };
             if !dead_bindings.is_empty() {
-                quarantine_dead_bindings_transaction(
+                recovery.extend(quarantine_dead_bindings_transaction(
                     &self.inner,
                     dead_bindings,
                     Vec::new(),
-                    &[],
+                    std::slice::from_ref(handle),
                     &CordisError::AsyncRuntimeUnavailable,
-                );
-                teardown_diagnostic = Some(CordisError::AsyncRuntimeUnavailable);
+                ));
+                let error = CordisError::AsyncRuntimeUnavailable;
+                let drivers = recovery.driver_runtimes();
+                let inner = self.inner.clone();
+                let operation = async move {
+                    let first_error = settle_recovery_plan(inner, recovery, Some(error)).await;
+                    first_error.map_or(Ok(()), Err)
+                }
+                .boxed()
+                .shared();
+                return Ok(spawn_unit_operation_on(supervisor, operation, drivers));
             }
         }
         let plan = match self.prepare_provider_removal(handle, mode) {
             Ok(plan) => plan,
             Err(error) if owner_teardown => {
-                quarantine_dead_bindings_transaction(
+                recovery.extend(quarantine_dead_bindings_transaction(
                     &self.inner,
                     Vec::new(),
                     Vec::new(),
                     std::slice::from_ref(handle),
                     &error,
-                );
-                return Ok(async move { Err(error) }.boxed());
+                ));
+                let drivers = recovery.driver_runtimes();
+                let inner = self.inner.clone();
+                let operation = async move {
+                    let first_error = settle_recovery_plan(inner, recovery, Some(error)).await;
+                    first_error.map_or(Ok(()), Err)
+                }
+                .boxed()
+                .shared();
+                return Ok(spawn_unit_operation_on(supervisor, operation, drivers));
             }
             Err(error) => return Err(error),
         };
@@ -975,26 +1060,29 @@ impl LifecycleRegistry {
                 },
             drivers,
         } = plan;
+        let mut drivers = drivers;
+        for driver in recovery.driver_runtimes() {
+            push_binding_once(&mut drivers, driver);
+        }
         publish_deferred_batch(publications, notifications);
         let weak = Arc::downgrade(&self.inner);
         let handle = handle.clone();
         let operation = async move {
             let mut summary = await_ticket_batch_or_driver_death(waits).await;
-            if summary.first_error.is_none() {
-                summary.first_error = teardown_diagnostic;
-            }
             let Some(inner) = weak.upgrade() else {
                 return Ok(());
             };
             if !summary.dead_bindings.is_empty() {
-                quarantine_dead_bindings_transaction(
+                recovery.extend(quarantine_dead_bindings_transaction(
                     &inner,
                     summary.dead_bindings,
                     Vec::new(),
                     &[],
                     &CordisError::AsyncRuntimeUnavailable,
-                );
+                ));
             }
+            summary.first_error =
+                settle_recovery_plan(inner.clone(), recovery, summary.first_error).await;
             {
                 let mut state = lock(&inner.state);
                 let provider_key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
@@ -1115,37 +1203,61 @@ impl LifecycleRegistry {
         observation.value.downcast::<T>().ok()
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep delete preflight, durable recovery, and exact runtime removal together"
+    )]
     pub fn begin_delete_factory(
         &self,
         factory: &PluginFactory,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         require_async_runtime()?;
         let supervisor = self.ensure_supervisor()?;
-        let dead_bindings = {
+        let (dead_bindings, recovery_controls) = {
             let state = lock(&self.inner.state);
             state
                 .runtimes
                 .get(&factory.id())
                 .map(|runtime| {
-                    dead_driver_bindings_for_controls(
-                        &runtime.fibers.values().cloned().collect::<Vec<_>>(),
-                    )
+                    let controls = runtime.fibers.values().cloned().collect::<Vec<_>>();
+                    (dead_driver_bindings_for_controls(&controls), controls)
                 })
                 .unwrap_or_default()
         };
+        let mut recovery = RecoveryPlan::default();
         if !dead_bindings.is_empty() {
-            quarantine_dead_bindings_transaction(
+            recovery.extend(quarantine_dead_bindings_transaction(
                 &self.inner,
                 dead_bindings,
-                Vec::new(),
+                recovery_controls,
                 &[],
                 &CordisError::AsyncRuntimeUnavailable,
-            );
+            ));
+        }
+        if !lock(&self.inner.state).runtimes.contains_key(&factory.id()) {
+            let drivers = recovery.driver_runtimes();
+            let inner = self.inner.clone();
+            let operation = async move {
+                let first_error = settle_recovery_plan(inner, recovery, None).await;
+                first_error.map_or(Ok(()), Err)
+            }
+            .boxed()
+            .shared();
+            return Ok(spawn_unit_operation_on(supervisor, operation, drivers));
         }
         let (generation, batch, drivers) = {
             let mut state = lock(&self.inner.state);
             let Some(runtime) = state.runtimes.get(&factory.id()) else {
-                return Ok(async { Ok(()) }.boxed());
+                drop(state);
+                let drivers = recovery.driver_runtimes();
+                let inner = self.inner.clone();
+                let operation = async move {
+                    let first_error = settle_recovery_plan(inner, recovery, None).await;
+                    first_error.map_or(Ok(()), Err)
+                }
+                .boxed()
+                .shared();
+                return Ok(spawn_unit_operation_on(supervisor, operation, drivers));
             };
             let generation = runtime.generation;
             let mut controls = runtime.fibers.values().cloned().collect::<Vec<_>>();
@@ -1172,21 +1284,27 @@ impl LifecycleRegistry {
             publications,
             notifications,
         } = batch;
+        let mut drivers = drivers;
+        for driver in recovery.driver_runtimes() {
+            push_binding_once(&mut drivers, driver);
+        }
         publish_deferred_batch(publications, notifications);
         let weak = Arc::downgrade(&self.inner);
         let factory = factory.clone();
         let operation = async move {
-            let summary = await_ticket_batch_or_driver_death(waits).await;
+            let mut summary = await_ticket_batch_or_driver_death(waits).await;
             if let Some(inner) = weak.upgrade() {
                 if !summary.dead_bindings.is_empty() {
-                    quarantine_dead_bindings_transaction(
+                    recovery.extend(quarantine_dead_bindings_transaction(
                         &inner,
                         summary.dead_bindings,
                         Vec::new(),
                         &[],
                         &CordisError::AsyncRuntimeUnavailable,
-                    );
+                    ));
                 }
+                summary.first_error =
+                    settle_recovery_plan(inner.clone(), recovery, summary.first_error).await;
                 let mut state = lock(&inner.state);
                 let remove = state.runtimes.get(&factory.id()).is_some_and(|runtime| {
                     runtime.generation == generation && runtime.status == RuntimeStatus::Deleting
@@ -1296,18 +1414,20 @@ impl LifecycleRegistry {
             return Ok(operation.boxed());
         }
         let supervisor = self.ensure_supervisor()?;
-        let dead_bindings = {
+        let (dead_bindings, recovery_controls) = {
             let state = lock(&self.inner.state);
-            dead_driver_bindings_for_controls(&controls_locked(&state))
+            let controls = controls_locked(&state);
+            (dead_driver_bindings_for_controls(&controls), controls)
         };
+        let mut recovery = RecoveryPlan::default();
         if !dead_bindings.is_empty() {
-            quarantine_dead_bindings_transaction(
+            recovery.extend(quarantine_dead_bindings_transaction(
                 &self.inner,
                 dead_bindings,
-                Vec::new(),
+                recovery_controls,
                 &[],
                 &CordisError::AsyncRuntimeUnavailable,
-            );
+            ));
         }
         let (batch, drivers) = {
             let mut state = lock(&self.inner.state);
@@ -1340,19 +1460,25 @@ impl LifecycleRegistry {
             publications,
             notifications,
         } = batch;
+        let mut drivers = drivers;
+        for driver in recovery.driver_runtimes() {
+            push_binding_once(&mut drivers, driver);
+        }
         let weak = Arc::downgrade(&self.inner);
         let operation = async move {
-            let summary = await_ticket_batch_or_driver_death(waits).await;
+            let mut summary = await_ticket_batch_or_driver_death(waits).await;
             if let Some(inner) = weak.upgrade() {
                 if !summary.dead_bindings.is_empty() {
-                    quarantine_dead_bindings_transaction(
+                    recovery.extend(quarantine_dead_bindings_transaction(
                         &inner,
                         summary.dead_bindings,
                         Vec::new(),
                         &[],
                         &CordisError::AsyncRuntimeUnavailable,
-                    );
+                    ));
                 }
+                summary.first_error =
+                    settle_recovery_plan(inner.clone(), recovery, summary.first_error).await;
                 let mut state = lock(&inner.state);
                 state.runtimes.clear();
                 state.catalog.clear();
@@ -3216,6 +3342,20 @@ impl FiberControl {
         self.snapshots.send_replace(terminal);
     }
 
+    fn publish_recovery_state(&self, snapshot: FiberSnapshot) {
+        debug_assert!(matches!(
+            snapshot.state(),
+            FiberState::Unloading | FiberState::Disposed
+        ));
+        // Recovery has already set the exact machine tombstone while holding
+        // registry + uid-ordered machine guards. That permanently closes the
+        // command side of this control, so publishing an in-place terminal
+        // transition at the current ticket cannot be overtaken by a newer
+        // ticket. `publish_deferred` intentionally rejects this same-ticket
+        // shape, hence the dedicated monotonic terminal-recovery channel.
+        self.snapshots.send_replace(snapshot);
+    }
+
     fn request_restart(&self) -> Result<u64, CordisError> {
         if !self.factory.is_repeatable() {
             return Err(CordisError::NonRepeatableFactory {
@@ -4674,6 +4814,33 @@ struct FiberTicketSummary {
     first_error: Option<CordisError>,
 }
 
+enum RecoveryWaitOutcome {
+    TicketSettled(Result<FiberSnapshot, CordisError>),
+    TerminalSettled(Arc<FiberControl>),
+    DriverDied(DriverRuntimeBinding),
+}
+
+#[derive(Default)]
+struct RecoveryPlan {
+    ticket_waits: Vec<FiberTicketWait>,
+    terminal_waits: Vec<Arc<FiberControl>>,
+    drivers: Vec<DriverRuntimeBinding>,
+}
+
+impl RecoveryPlan {
+    fn extend(&mut self, other: Self) {
+        self.ticket_waits.extend(other.ticket_waits);
+        self.terminal_waits.extend(other.terminal_waits);
+        for driver in other.drivers {
+            push_binding_once(&mut self.drivers, driver);
+        }
+    }
+
+    fn driver_runtimes(&self) -> Vec<DriverRuntimeBinding> {
+        self.drivers.clone()
+    }
+}
+
 async fn await_ticket_or_driver_death(
     control: Arc<FiberControl>,
     serial: u64,
@@ -4726,6 +4893,119 @@ async fn await_ticket_batch_or_driver_death(waits: Vec<FiberTicketWait>) -> Fibe
     summary
 }
 
+async fn await_terminal_or_driver_death(control: Arc<FiberControl>) -> RecoveryWaitOutcome {
+    let binding = control.driver_runtime.clone();
+    let mut death = binding.death_receiver();
+    let mut snapshots = control.snapshots.subscribe();
+    loop {
+        if lock(&control.machine).state == FiberState::Disposed {
+            return RecoveryWaitOutcome::TerminalSettled(control);
+        }
+        if !*death.borrow() {
+            return RecoveryWaitOutcome::DriverDied(binding);
+        }
+        tokio::select! {
+            biased;
+            changed = death.changed() => {
+                if changed.is_err() || !*death.borrow() {
+                    return RecoveryWaitOutcome::DriverDied(binding);
+                }
+            }
+            changed = snapshots.changed() => {
+                if changed.is_err() && lock(&control.machine).state != FiberState::Disposed {
+                    return RecoveryWaitOutcome::DriverDied(binding);
+                }
+            }
+        }
+    }
+}
+
+fn finalize_recovered_terminal(inner: &Arc<LifecycleRegistryInner>, control: &Arc<FiberControl>) {
+    let mut state = lock(&inner.state);
+    if !control_is_registered_locked(&state, control) {
+        return;
+    }
+    let machine = lock(&control.machine);
+    if machine.tombstone && machine.state == FiberState::Disposed {
+        drop(machine);
+        detach_control_locked(&mut state, control);
+    }
+}
+
+fn enqueue_recovery_plan(
+    pending: &mut futures_util::stream::FuturesUnordered<BoxFuture<'static, RecoveryWaitOutcome>>,
+    seen_tickets: &mut Vec<FiberTicketWait>,
+    seen_terminals: &mut Vec<Arc<FiberControl>>,
+    plan: RecoveryPlan,
+) {
+    for (control, serial) in plan.ticket_waits {
+        if seen_tickets
+            .iter()
+            .any(|(seen, seen_serial)| Arc::ptr_eq(seen, &control) && *seen_serial == serial)
+        {
+            continue;
+        }
+        seen_tickets.push((control.clone(), serial));
+        pending.push(
+            async move {
+                match await_ticket_or_driver_death(control, serial).await {
+                    FiberTicketOutcome::Settled(result) => {
+                        RecoveryWaitOutcome::TicketSettled(result)
+                    }
+                    FiberTicketOutcome::DriverDied(binding) => {
+                        RecoveryWaitOutcome::DriverDied(binding)
+                    }
+                }
+            }
+            .boxed(),
+        );
+    }
+    for control in plan.terminal_waits {
+        if seen_terminals
+            .iter()
+            .any(|seen| Arc::ptr_eq(seen, &control))
+        {
+            continue;
+        }
+        seen_terminals.push(control.clone());
+        pending.push(await_terminal_or_driver_death(control).boxed());
+    }
+}
+
+async fn settle_recovery_plan(
+    inner: Arc<LifecycleRegistryInner>,
+    plan: RecoveryPlan,
+    mut first_error: Option<CordisError>,
+) -> Option<CordisError> {
+    let mut pending = futures_util::stream::FuturesUnordered::new();
+    let mut seen_tickets = Vec::new();
+    let mut seen_terminals = Vec::new();
+    enqueue_recovery_plan(&mut pending, &mut seen_tickets, &mut seen_terminals, plan);
+    while let Some(outcome) = pending.next().await {
+        match outcome {
+            RecoveryWaitOutcome::TicketSettled(Ok(_)) => {}
+            RecoveryWaitOutcome::TicketSettled(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            RecoveryWaitOutcome::TerminalSettled(control) => {
+                finalize_recovered_terminal(&inner, &control);
+            }
+            RecoveryWaitOutcome::DriverDied(binding) => {
+                first_error.get_or_insert(CordisError::AsyncRuntimeUnavailable);
+                let next = quarantine_dead_bindings_transaction(
+                    &inner,
+                    vec![binding],
+                    Vec::new(),
+                    &[],
+                    &CordisError::AsyncRuntimeUnavailable,
+                );
+                enqueue_recovery_plan(&mut pending, &mut seen_tickets, &mut seen_terminals, next);
+            }
+        }
+    }
+    first_error
+}
+
 fn binding_is_one_of(binding: &DriverRuntimeBinding, candidates: &[DriverRuntimeBinding]) -> bool {
     candidates.iter().any(|candidate| binding.ptr_eq(candidate))
 }
@@ -4739,16 +5019,69 @@ fn push_binding_once(bindings: &mut Vec<DriverRuntimeBinding>, binding: DriverRu
 struct ProviderReclaimPlan {
     key: RuntimeProviderKey,
     provider_id: u64,
+    owner_uid: FiberUid,
+    generation: u64,
     expected_revision: u64,
     expected_removal_serial: u64,
     revision: Option<u64>,
     removal_serial: Option<u64>,
 }
 
-/// Fail-closed recovery for controls whose executor can no longer make
-/// progress. User effects on those controls are deliberately abandoned: no
-/// executor remains on which their async cleanup can be run safely, so the
-/// terminal snapshot records `AsyncRuntimeUnavailable` explicitly.
+#[derive(Clone)]
+struct ExactForcedProviderFact {
+    key: RuntimeProviderKey,
+    provider_id: u64,
+    owner_uid: FiberUid,
+    generation: u64,
+    revision: u64,
+    removal_serial: u64,
+}
+
+fn exact_forced_provider_facts_locked(
+    state: &LifecycleRegistryState,
+    handles: &[LifecycleProviderHandle],
+) -> Vec<ExactForcedProviderFact> {
+    let mut facts = Vec::new();
+    for handle in handles {
+        let key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
+        let Some(slot) = state.providers.get(&key) else {
+            continue;
+        };
+        let Some(record) = slot.record.as_ref() else {
+            continue;
+        };
+        if record.provider_id != handle.provider_id
+            || record.owner.uid() != handle.owner_uid
+            || record.generation != handle.generation
+        {
+            continue;
+        }
+        if facts
+            .iter()
+            .any(|fact: &ExactForcedProviderFact| fact.key == key)
+        {
+            continue;
+        }
+        facts.push(ExactForcedProviderFact {
+            key,
+            provider_id: record.provider_id,
+            owner_uid: record.owner.uid(),
+            generation: record.generation,
+            revision: slot.revision,
+            removal_serial: slot.removal_serial,
+        });
+    }
+    facts
+}
+
+/// Fail-closed recovery for an exact dead executor plus any live controls that
+/// must be terminalized because the ordinary ticket path is exhausted.
+///
+/// Effects are abandoned only for controls whose exact driver binding is
+/// confirmed dead. Live controls retain their effects and are woken into the
+/// no-new-ticket tombstone path; the returned plan keeps the supervisor from
+/// completing the enclosing registry operation until their real cleanup has
+/// settled (or their exact binding subsequently dies and is quarantined).
 #[expect(
     clippy::too_many_lines,
     reason = "keep the bounded registry + uid-ordered quarantine transaction visibly atomic"
@@ -4759,46 +5092,87 @@ fn quarantine_dead_bindings_transaction(
     forced_controls: Vec<Arc<FiberControl>>,
     forced_providers: &[LifecycleProviderHandle],
     diagnostic: &CordisError,
-) {
+) -> RecoveryPlan {
     let mut state = lock(&inner.state);
-    let mut dead_bindings = initial_bindings
+    let mut dead_bindings = Vec::new();
+    for binding in initial_bindings {
+        if binding.require_alive().is_err() {
+            push_binding_once(&mut dead_bindings, binding);
+        }
+    }
+    let mut forced_cleanup = forced_controls
         .into_iter()
-        .filter(|binding| binding.require_alive().is_err())
+        .map(|control| (control, diagnostic.clone()))
         .collect::<Vec<_>>();
-    let mut forced_controls = forced_controls;
 
     'rebuild: loop {
         let all_controls = controls_locked(&state);
-        let mut quarantined = all_controls
+        let mut cleanup = all_controls
             .iter()
             .filter(|control| binding_is_one_of(&control.driver_runtime, &dead_bindings))
             .cloned()
+            .map(|control| (control, CordisError::AsyncRuntimeUnavailable))
             .collect::<Vec<_>>();
-        quarantined.extend(
-            forced_controls
+        cleanup.extend(
+            forced_cleanup
                 .iter()
-                .filter(|control| control_is_registered_locked(&state, control))
+                .filter(|(control, _)| control_is_registered_locked(&state, control))
                 .cloned(),
         );
-        quarantined.sort_by_key(|control| control.fiber.uid());
-        quarantined.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        cleanup.sort_by_key(|(control, _)| control.fiber.uid());
+        cleanup.dedup_by(|(left, _), (right, _)| Arc::ptr_eq(left, right));
         loop {
-            let before = quarantined.len();
-            let parent_uids = quarantined
-                .iter()
-                .map(|control| control.fiber.uid())
-                .collect::<Vec<_>>();
-            quarantined.extend(
-                all_controls
+            let before = cleanup.len();
+            for child in &all_controls {
+                let Some((_, cause)) = cleanup
                     .iter()
-                    .filter(|control| parent_uids.contains(&control.parent_uid))
-                    .cloned(),
-            );
-            quarantined.sort_by_key(|control| control.fiber.uid());
-            quarantined.dedup_by(|left, right| Arc::ptr_eq(left, right));
-            if quarantined.len() == before {
+                    .find(|(parent, _)| parent.fiber.uid() == child.parent_uid)
+                else {
+                    continue;
+                };
+                if !cleanup
+                    .iter()
+                    .any(|(candidate, _)| Arc::ptr_eq(candidate, child))
+                {
+                    cleanup.push((child.clone(), cause.clone()));
+                }
+            }
+            cleanup.sort_by_key(|(control, _)| control.fiber.uid());
+            if cleanup.len() == before {
                 break;
             }
+        }
+
+        let newly_dead = cleanup
+            .iter()
+            .filter(|(control, _)| control.driver_runtime.require_alive().is_err())
+            .map(|(control, _)| control.driver_runtime.clone())
+            .collect::<Vec<_>>();
+        let before = dead_bindings.len();
+        for binding in newly_dead {
+            push_binding_once(&mut dead_bindings, binding);
+        }
+        if dead_bindings.len() != before {
+            continue;
+        }
+
+        let cleanup_controls = cleanup
+            .iter()
+            .map(|(control, _)| control.clone())
+            .collect::<Vec<_>>();
+        let forced_facts = exact_forced_provider_facts_locked(&state, forced_providers);
+        if forced_providers.iter().any(|handle| {
+            !forced_facts.iter().any(|fact| {
+                fact.key == RuntimeProviderKey::new(&handle.namespace, &handle.key)
+                    && fact.provider_id == handle.provider_id
+                    && fact.owner_uid == handle.owner_uid
+                    && fact.generation == handle.generation
+            })
+        }) {
+            // A forced owner-teardown handle fences the entire transaction,
+            // including dead-binding closure discovery. A stale completion
+            // must not perturb a replacement provider or any of its consumers.
+            return RecoveryPlan::default();
         }
 
         let mut removed_keys = state
@@ -4806,16 +5180,12 @@ fn quarantine_dead_bindings_transaction(
             .iter()
             .filter_map(|(key, slot)| {
                 slot.record.as_ref().and_then(|record| {
-                    provider_owner_is_one_of(&record.owner_binding, &quarantined)
+                    provider_owner_is_one_of(&record.owner_binding, &cleanup_controls)
                         .then_some(key.clone())
                 })
             })
             .collect::<Vec<_>>();
-        removed_keys.extend(
-            forced_providers
-                .iter()
-                .map(|handle| RuntimeProviderKey::new(&handle.namespace, &handle.key)),
-        );
+        removed_keys.extend(forced_facts.iter().map(|fact| fact.key.clone()));
         removed_keys.sort_by(|left, right| {
             (&left.namespace, &left.key).cmp(&(&right.namespace, &right.key))
         });
@@ -4840,7 +5210,7 @@ fn quarantine_dead_bindings_transaction(
             continue;
         }
 
-        let mut locked_controls = quarantined.clone();
+        let mut locked_controls = cleanup_controls.clone();
         locked_controls.extend(affected.iter().cloned());
         locked_controls.sort_by_key(|control| control.fiber.uid());
         locked_controls.dedup_by(|left, right| Arc::ptr_eq(left, right));
@@ -4852,17 +5222,36 @@ fn quarantine_dead_bindings_transaction(
         if dead_bindings
             .iter()
             .any(|binding| binding.require_alive().is_ok())
-            || quarantined
+            || cleanup_controls
                 .iter()
                 .any(|control| !control_is_registered_locked(&state, control))
         {
-            return;
+            return RecoveryPlan::default();
+        }
+
+        let dead_controls = cleanup_controls
+            .iter()
+            .filter(|control| binding_is_one_of(&control.driver_runtime, &dead_bindings))
+            .cloned()
+            .collect::<Vec<_>>();
+        let live_cleanup = cleanup_controls
+            .iter()
+            .filter(|control| !binding_is_one_of(&control.driver_runtime, &dead_bindings))
+            .cloned()
+            .collect::<Vec<_>>();
+        let newly_dead = dead_driver_bindings_for_controls(&live_cleanup);
+        if !newly_dead.is_empty() {
+            for binding in newly_dead {
+                push_binding_once(&mut dead_bindings, binding);
+            }
+            drop(machines);
+            continue;
         }
 
         let live_affected = affected
             .iter()
             .filter(|control| {
-                !quarantined
+                !cleanup_controls
                     .iter()
                     .any(|candidate| Arc::ptr_eq(candidate, control))
             })
@@ -4879,12 +5268,19 @@ fn quarantine_dead_bindings_transaction(
         let mut next_tickets = Vec::with_capacity(live_affected.len());
         for control in &live_affected {
             let index = control_index(&locked_controls, control).expect("affected control locked");
-            let Ok(ticket) = FiberControl::preflight_desired_locked(&machines[index], None) else {
-                forced_controls.push(control.clone());
+            if machines[index].tombstone {
+                forced_cleanup.push((control.clone(), diagnostic.clone()));
                 drop(machines);
                 continue 'rebuild;
-            };
-            next_tickets.push(ticket);
+            }
+            match FiberControl::preflight_desired_locked(&machines[index], None) {
+                Ok(ticket) => next_tickets.push(ticket),
+                Err(error) => {
+                    forced_cleanup.push((control.clone(), error));
+                    drop(machines);
+                    continue 'rebuild;
+                }
+            }
         }
 
         let mut reclaim = Vec::new();
@@ -4895,12 +5291,17 @@ fn quarantine_dead_bindings_transaction(
             let Some(record) = slot.record.as_ref() else {
                 continue;
             };
-            if let Some(handle) = forced_providers
+            let exact_forced = forced_facts
                 .iter()
-                .find(|handle| handle.namespace == key.namespace && handle.key == key.key)
-                && (record.provider_id != handle.provider_id
-                    || record.owner.uid() != handle.owner_uid
-                    || record.generation != handle.generation)
+                .find(|fact| fact.key == *key)
+                .is_some_and(|fact| {
+                    fact.provider_id == record.provider_id
+                        && fact.owner_uid == record.owner.uid()
+                        && fact.generation == record.generation
+                        && fact.revision == slot.revision
+                        && fact.removal_serial == slot.removal_serial
+                });
+            if !exact_forced && !provider_owner_is_one_of(&record.owner_binding, &cleanup_controls)
             {
                 continue;
             }
@@ -4909,6 +5310,8 @@ fn quarantine_dead_bindings_transaction(
             reclaim.push(ProviderReclaimPlan {
                 key: key.clone(),
                 provider_id: record.provider_id,
+                owner_uid: record.owner.uid(),
+                generation: record.generation,
                 expected_revision: slot.revision,
                 expected_removal_serial: slot.removal_serial,
                 revision,
@@ -4919,16 +5322,19 @@ fn quarantine_dead_bindings_transaction(
         let mut publications = Vec::new();
         let mut notifications = Vec::new();
         let mut terminals = Vec::new();
-        for control in &quarantined {
-            let index =
-                control_index(&locked_controls, control).expect("quarantined control locked");
+        for control in &dead_controls {
+            let index = control_index(&locked_controls, control).expect("dead control locked");
             let machine = &mut machines[index];
-            if !machine.diagnostics.contains(diagnostic) {
-                machine.diagnostics.push(diagnostic.clone());
+            let error = CordisError::AsyncRuntimeUnavailable;
+            if !machine.diagnostics.contains(&error) {
+                machine.diagnostics.push(error);
             }
             machine.tombstone = true;
             machine.desired = None;
             machine.committed = None;
+            // The exact driver is dead, so no executor exists on which async
+            // user cleanup can run. Preserve that fact as a typed diagnostic
+            // and abandon only this irrecoverable control's effects.
             machine.effects.clear();
             machine.effects_epoch = None;
             machine.force_restart = false;
@@ -4949,11 +5355,37 @@ fn quarantine_dead_bindings_transaction(
                 machine.history.clone(),
             ));
         }
+        let mut recovery_publications = Vec::new();
+        let mut terminal_waits = Vec::new();
+        for control in &live_cleanup {
+            let index = control_index(&locked_controls, control).expect("live cleanup locked");
+            let machine = &mut machines[index];
+            let cause = cleanup
+                .iter()
+                .find(|(candidate, _)| Arc::ptr_eq(candidate, control))
+                .map_or_else(|| diagnostic.clone(), |(_, cause)| cause.clone());
+            if !machine.diagnostics.contains(&cause) {
+                machine.diagnostics.push(cause);
+            }
+            machine.tombstone = true;
+            machine.desired = None;
+            machine.force_restart = false;
+            control.fiber.publish_tombstone();
+            if machine.state != FiberState::Disposed {
+                FiberControl::apply_transition_state_locked(machine, FiberState::Unloading);
+            }
+            recovery_publications.push((control.clone(), machine.snapshot()));
+            terminal_waits.push(control.clone());
+            notifications.push(control.clone());
+        }
+        let mut ticket_waits = Vec::with_capacity(live_affected.len());
         for (control, next_ticket) in live_affected.iter().zip(next_tickets) {
             let index = control_index(&locked_controls, control).expect("affected control locked");
             let machine = &mut machines[index];
             let before = machine.snapshot();
-            let (changed, _) = FiberControl::apply_desired_locked(machine, None, None, next_ticket);
+            let (changed, serial) =
+                FiberControl::apply_desired_locked(machine, None, None, next_ticket);
+            ticket_waits.push((control.clone(), serial));
             if machine.snapshot() != before {
                 publications.push((control.clone(), machine.snapshot()));
             }
@@ -4965,10 +5397,11 @@ fn quarantine_dead_bindings_transaction(
             let exact = state.providers.get(&plan.key).is_some_and(|slot| {
                 slot.revision == plan.expected_revision
                     && slot.removal_serial == plan.expected_removal_serial
-                    && slot
-                        .record
-                        .as_ref()
-                        .is_some_and(|record| record.provider_id == plan.provider_id)
+                    && slot.record.as_ref().is_some_and(|record| {
+                        record.provider_id == plan.provider_id
+                            && record.owner.uid() == plan.owner_uid
+                            && record.generation == plan.generation
+                    })
             });
             if !exact {
                 continue;
@@ -4986,17 +5419,33 @@ fn quarantine_dead_bindings_transaction(
                 state.providers.remove(&plan.key);
             }
         }
-        for control in &quarantined {
+        for control in &dead_controls {
             detach_control_locked(&mut state, control);
+        }
+        let mut drivers = driver_runtimes_for_controls(&live_affected);
+        for control in &live_cleanup {
+            push_binding_once(&mut drivers, control.driver_runtime.clone());
         }
         drop(machines);
         drop(state);
-        publish_deferred_batch(publications, notifications);
+        for (control, snapshot) in publications {
+            control.publish_deferred(snapshot);
+        }
+        for (control, snapshot) in recovery_publications {
+            control.publish_recovery_state(snapshot);
+        }
         for (control, fiber, snapshot, history) in terminals {
             control.publish_terminal(snapshot.clone());
             fiber.freeze_terminal(snapshot, history);
         }
-        return;
+        for control in notifications {
+            control.wake.notify_one();
+        }
+        return RecoveryPlan {
+            ticket_waits,
+            terminal_waits,
+            drivers,
+        };
     }
 }
 
@@ -7008,5 +7457,297 @@ mod lifecycle_boundary_tests {
             );
         }
         assert_eq!(machine.state, FiberState::Pending);
+    }
+
+    #[test]
+    fn dead_owner_recovery_waits_until_a_live_consumer_settles_or_dies() {
+        production_result_with_timeout(|| {
+            let owner_runtime = tokio::runtime::Runtime::new().unwrap();
+            let consumer_runtime = tokio::runtime::Runtime::new().unwrap();
+            let recovery_runtime = tokio::runtime::Runtime::new().unwrap();
+            let registry = LifecycleRegistry::new();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let entered = Arc::new(Mutex::new(Some(entered_tx)));
+            let consumer = consumer_runtime.block_on(async {
+                registry
+                    .mount(
+                        PluginFactory::new_lifecycle("recovery-live-consumer", {
+                            let entered = entered.clone();
+                            move |_, _| {
+                                LifecycleEffect::disposer(permanently_gated_disposer(
+                                    entered.clone(),
+                                ))
+                            }
+                        })
+                        .with_inject(["recovery-live-key"]),
+                        ConfigValue::default(),
+                    )
+                    .unwrap()
+            });
+            let consumer_control = consumer.control().unwrap();
+            let owner_factory = PluginFactory::new_lifecycle("recovery-dead-owner", |_, view| {
+                view.provide("recovery-live-key", 81_u32)?;
+                Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+            });
+            let owner = owner_runtime.block_on(async {
+                let owner = registry
+                    .mount(owner_factory.clone(), ConfigValue::default())
+                    .unwrap();
+                owner
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                consumer
+                    .fiber()
+                    .wait_until_active(LifecycleCancellation::default())
+                    .await
+                    .unwrap();
+                owner
+            });
+            drop(owner_runtime);
+
+            let operation = {
+                let _entered = recovery_runtime.enter();
+                registry.begin_delete_factory(&owner_factory).unwrap()
+            };
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert!(registry.get::<u32>("recovery-live-key").is_none());
+            drop(consumer_runtime);
+            let result = recovery_runtime.block_on(operation);
+            assert!(matches!(result, Err(CordisError::AsyncRuntimeUnavailable)));
+            assert_eq!(
+                machine_boundary_snapshot(&consumer_control).state,
+                FiberState::Disposed
+            );
+            assert!(!control_is_registered_locked(
+                &lock(&registry.inner.state),
+                &consumer_control,
+            ));
+            assert!(registry.provide("recovery-live-key", 82_u32).is_ok());
+            drop((consumer, owner));
+        });
+    }
+
+    #[tokio::test]
+    async fn ticket_exhausted_live_parent_and_child_run_real_cleanup() {
+        let registry = LifecycleRegistry::new();
+        let cleanup_count = Arc::new(AtomicU64::new(0));
+        let child_slot = Arc::new(Mutex::new(None::<Fiber>));
+        let child_factory = PluginFactory::new_lifecycle("overflow-live-child", {
+            let cleanup_count = cleanup_count.clone();
+            move |_, _| {
+                LifecycleEffect::disposer(LifecycleDisposer::new({
+                    let cleanup_count = cleanup_count.clone();
+                    move || {
+                        let cleanup_count = cleanup_count.clone();
+                        async move {
+                            cleanup_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }
+                }))
+            }
+        });
+        let owner = registry
+            .mount(
+                PluginFactory::new_lifecycle("overflow-live-owner", |_, view| {
+                    view.provide("overflow-live-key", 83_u32)?;
+                    Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                }),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        owner
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let parent = registry
+            .mount(
+                PluginFactory::new_lifecycle("overflow-live-parent", {
+                    let child_factory = child_factory.clone();
+                    let child_slot = child_slot.clone();
+                    let cleanup_count = cleanup_count.clone();
+                    move |_, view| {
+                        let child = view.mount(child_factory.clone(), ConfigValue::default())?;
+                        *lock(&child_slot) = Some(child);
+                        Ok::<LifecycleEffect, CordisError>(LifecycleEffect::disposer(
+                            LifecycleDisposer::new({
+                                let cleanup_count = cleanup_count.clone();
+                                move || {
+                                    let cleanup_count = cleanup_count.clone();
+                                    async move {
+                                        cleanup_count.fetch_add(1, Ordering::SeqCst);
+                                        Ok(())
+                                    }
+                                }
+                            }),
+                        ))
+                    }
+                })
+                .with_inject(["overflow-live-key"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        parent
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let child = lock(&child_slot).clone().unwrap();
+        child
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let parent_control = parent.control().unwrap();
+        let child_control = {
+            let state = lock(&registry.inner.state);
+            state.runtimes[&child_factory.id()]
+                .fibers
+                .values()
+                .next()
+                .unwrap()
+                .clone()
+        };
+        lock(&parent_control.machine).next_ticket = u64::MAX;
+
+        let restarted = owner.restart().await.unwrap();
+        assert_eq!(restarted.state(), FiberState::Active);
+        assert_eq!(cleanup_count.load(Ordering::SeqCst), 2);
+        assert_eq!(parent.snapshot().state(), FiberState::Disposed);
+        assert_eq!(child.state(), FiberState::Disposed);
+        let state = lock(&registry.inner.state);
+        assert!(!control_is_registered_locked(&state, &parent_control));
+        assert!(!control_is_registered_locked(&state, &child_control));
+    }
+
+    #[tokio::test]
+    async fn stale_owner_teardown_handle_cannot_touch_replacement_or_consumers() {
+        let registry = LifecycleRegistry::new();
+        let original = registry.provide("stale-forced-key", 84_u32).unwrap();
+        let consumer = registry
+            .mount(
+                PluginFactory::new_lifecycle("stale-forced-consumer", |_, _| {
+                    LifecycleEffect::none()
+                })
+                .with_inject(["stale-forced-key"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        consumer
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let consumer_control = consumer.control().unwrap();
+        let replacement = registry.replace_provider(&original, 85_u32).unwrap();
+        consumer.await_current().await.unwrap();
+        let provider_before = provider_boundary_snapshot(&registry, "root", "stale-forced-key");
+        let consumer_before = machine_boundary_snapshot(&consumer_control);
+        consumer_control
+            .driver_runtime
+            .state
+            .alive
+            .store(false, Ordering::Release);
+        consumer_control
+            .driver_runtime
+            .state
+            .death
+            .send_replace(false);
+
+        let result = registry
+            .begin_provider_removal_with_mode(
+                &original,
+                ProviderRemovalMode::OwnerTeardown {
+                    driver_runtime: consumer_control.driver_runtime.clone(),
+                },
+            )
+            .unwrap()
+            .await;
+        assert!(matches!(result, Err(CordisError::AsyncRuntimeUnavailable)));
+        assert_eq!(
+            provider_boundary_snapshot(&registry, "root", "stale-forced-key"),
+            provider_before
+        );
+        assert_eq!(
+            machine_boundary_snapshot(&consumer_control),
+            consumer_before
+        );
+        assert_eq!(
+            registry.get::<u32>("stale-forced-key").as_deref(),
+            Some(&85)
+        );
+        assert_eq!(replacement.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_reservation_failure_fences_owner_but_not_public_strict_removal() {
+        let registry = LifecycleRegistry::new();
+        let owner = registry
+            .mount(
+                PluginFactory::new_lifecycle("reservation-failure-owner", |_, view| {
+                    view.provide("reservation-failure-key", 86_u32)?;
+                    Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                }),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        owner
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        let first_provider_id =
+            provider_boundary_snapshot(&registry, "root", "reservation-failure-key")
+                .slot
+                .unwrap()
+                .provider_id
+                .unwrap();
+        registry
+            .inner
+            .supervisor_reservation_failures
+            .store(1, Ordering::Release);
+        let restarted = owner.restart().await.unwrap();
+        assert_eq!(restarted.state(), FiberState::Active);
+        assert!(
+            restarted
+                .diagnostics()
+                .contains(&CordisError::AsyncRuntimeUnavailable)
+        );
+        let second_provider_id =
+            provider_boundary_snapshot(&registry, "root", "reservation-failure-key")
+                .slot
+                .unwrap()
+                .provider_id
+                .unwrap();
+        assert_ne!(first_provider_id, second_provider_id);
+
+        let strict_registry = LifecycleRegistry::new();
+        let strict = strict_registry
+            .provide("reservation-strict-key", 87_u32)
+            .unwrap();
+        let strict_before =
+            provider_boundary_snapshot(&strict_registry, "root", "reservation-strict-key");
+        strict_registry
+            .inner
+            .supervisor_reservation_failures
+            .store(1, Ordering::Release);
+        assert!(matches!(
+            strict_registry.begin_remove_provider(&strict),
+            Err(CordisError::AsyncRuntimeUnavailable)
+        ));
+        assert_eq!(
+            provider_boundary_snapshot(&strict_registry, "root", "reservation-strict-key"),
+            strict_before
+        );
+        assert_eq!(
+            strict_registry
+                .get::<u32>("reservation-strict-key")
+                .as_deref(),
+            Some(&87)
+        );
     }
 }
