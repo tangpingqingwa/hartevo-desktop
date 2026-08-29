@@ -9,10 +9,12 @@ mod config;
 mod context;
 mod effect;
 mod event;
+mod fiber;
 mod host;
 mod invariants;
 mod kernel;
 mod loader;
+mod registry;
 mod service;
 mod surface;
 
@@ -22,9 +24,12 @@ pub use authority::{
     RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
 };
 pub use config::{ConfigValue, InterpolateError};
-pub use context::{Context, CordisError, keys};
-pub use effect::Disposer;
+pub use context::{
+    Context, ContextView, CordisError, PendingHandle, ProviderHandle, ProviderId, keys,
+};
+pub use effect::{Disposer, RegistrationHandle};
 pub use event::{DispatchMode, WaterfallNext};
+pub use fiber::{Fiber, FiberState, FiberUid};
 pub use host::{
     CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, host_is_cordis_loop, host_plugin_ids,
 };
@@ -37,8 +42,9 @@ pub use kernel::{
     KernelConsentStatus, bind_domain_kernel_facts,
 };
 pub use loader::{
-    EnvironmentOverlay, LoadReport, Loader, LoaderContext, OverlayAction, OverlayLayer,
-    PluginEntry, PluginId, PluginSpec, ResolvedPlugin, interpolate_plugin_config, load_plugins,
+    EnvironmentOverlay, IntoPluginResult, LoadReport, Loader, LoaderContext, OverlayAction,
+    OverlayLayer, PluginEntry, PluginFactory, PluginFactoryId, PluginId, PluginSpec,
+    ResolvedPlugin, interpolate_plugin_config, load_plugins, load_plugins_pending,
 };
 pub use service::Service;
 pub use surface::{

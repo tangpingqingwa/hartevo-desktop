@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use hartevo_cordis::{
     ConfigValue, Context, CordisError, EnvironmentOverlay, Loader, LoaderContext, OverlayLayer,
-    PluginEntry, PluginId, PluginSpec, Service, keys, load_plugins,
+    PluginEntry, PluginFactory, PluginId, PluginSpec, Service, keys, load_plugins,
+    load_plugins_pending,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,12 +13,13 @@ struct Marker(&'static str);
 struct ProvideTools;
 
 impl Service for ProvideTools {
-    fn apply(self, ctx: &mut Context) {
-        ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
+        ctx.provide(keys::TOOLS, Marker("tools"))?;
         ctx.set_var(
             "tools",
             ConfigValue::object([("endpoint", "ctx://tools".into())]),
         );
+        Ok(())
     }
 }
 
@@ -105,9 +107,7 @@ fn plugin_config_interpolates_after_inject_on_the_plugin_context() {
     // Loader context has a colliding key; plugin config must not read it.
     let overlay = EnvironmentOverlay::new("test");
 
-    let provider = PluginSpec::new("tools", |_config, ctx| {
-        ProvideTools.apply(ctx);
-    });
+    let provider = PluginSpec::new("tools", |_config, ctx| ProvideTools.apply(ctx));
     let consumer_started = Arc::clone(&started);
     let consumer_seen = Arc::clone(&seen);
     let consumer = PluginSpec::new("agent", move |config, _ctx| {
@@ -179,7 +179,7 @@ fn load_order_follows_inject_not_catalog_order() {
     let order_tools = Arc::clone(&order);
     let tools = PluginSpec::new("tools", move |_config, ctx| {
         order_tools.lock().expect("order").push("tools");
-        ProvideTools.apply(ctx);
+        ProvideTools.apply(ctx)
     });
 
     // Catalog lists the dependent plugin first. Overlay does not sort by crate.
@@ -281,4 +281,97 @@ fn overlay_replace_overrides_catalog_disabled_and_config() {
     assert_eq!(resolved.len(), 1);
     assert!(resolved[0].disabled);
     assert_eq!(resolved[0].config, ConfigValue::string("prod"));
+}
+
+#[test]
+fn pending_factory_is_retained_and_activates_once_after_provider_arrives() {
+    let mut ctx = Context::new();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let factory = PluginFactory::new("identity", |_config, _ctx| Ok::<(), CordisError>(()));
+    let cloned = factory.clone();
+    assert_eq!(factory.id(), cloned.id());
+
+    ctx.set_var(
+        "dependency",
+        ConfigValue::object([("value", "ready".into())]),
+    );
+    let starts_for_plugin = Arc::clone(&starts);
+    let seen_for_plugin = Arc::clone(&seen);
+    let plugin = PluginSpec::new("consumer", move |config, ctx| {
+        starts_for_plugin.fetch_add(1, Ordering::SeqCst);
+        seen_for_plugin.lock().expect("seen").push(config);
+        ctx.provide("consumer-output", Marker("active")).map(|_| ())
+    })
+    .with_inject(["dependency"])
+    .with_config(ConfigValue::string("{dependency.value}"));
+    let report = load_plugins_pending(
+        &mut ctx,
+        &LoaderContext::new(),
+        &EnvironmentOverlay::new("test"),
+        &[plugin],
+    )
+    .unwrap();
+    assert_eq!(report.pending, [PluginId::new("consumer")]);
+    assert_eq!(ctx.pending_count(), 1);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+    ctx.provide(
+        "dependency",
+        ConfigValue::object([("value", "ready".into())]),
+    )
+    .unwrap();
+    assert_eq!(ctx.pending_count(), 0);
+
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.lock().expect("seen").len(), 1);
+    assert_eq!(ctx.pending_count(), 0);
+    assert!(ctx.has("consumer-output"));
+}
+
+#[test]
+fn disposed_pending_factory_never_receives_late_activation() {
+    let mut ctx = Context::new();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starts_for_factory = Arc::clone(&starts);
+    let factory = PluginFactory::new("late", move |_config, _ctx| {
+        starts_for_factory.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), CordisError>(())
+    })
+    .with_inject(["dependency"]);
+    let handle = ctx.mount_pending(factory).unwrap();
+    assert!(handle.is_pending());
+    assert!(handle.dispose());
+    assert_eq!(ctx.pending_count(), 0);
+    ctx.dispose_pending(&handle).unwrap();
+    ctx.provide("dependency", Marker("ready")).unwrap();
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert_eq!(handle.state(), hartevo_cordis::FiberState::Disposed);
+}
+
+#[test]
+fn failed_pending_activation_propagates_and_cleans_partial_records() {
+    let mut ctx = Context::new();
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let disposed_for_factory = Arc::clone(&disposed);
+    let factory = PluginFactory::new("failing", move |_config, ctx| {
+        ctx.provide("partial", true)?;
+        let disposed_for_disposer = Arc::clone(&disposed_for_factory);
+        ctx.effect(move || {
+            disposed_for_disposer.fetch_add(1, Ordering::SeqCst);
+        });
+        Err(CordisError::MissingDependencies(vec!["late".to_string()]))
+    });
+
+    let error = ctx.mount_pending(factory).unwrap_err();
+    match error {
+        CordisError::PluginActivation { source, .. } => assert_eq!(
+            *source,
+            CordisError::MissingDependencies(vec!["late".to_string()])
+        ),
+        other => panic!("expected activation error, got {other:?}"),
+    }
+    assert!(!ctx.has("partial"));
+    assert_eq!(ctx.registration_count(), 0);
+    assert_eq!(disposed.load(Ordering::SeqCst), 1);
 }

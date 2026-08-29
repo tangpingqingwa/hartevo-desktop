@@ -5,13 +5,195 @@ use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::ConfigValue;
-use crate::effect::{Disposer, Registration};
+use crate::effect::{Disposer, Registration, RegistrationHandle};
 use crate::event::{
     BoxedPayload, DispatchMode, EventBus, PreparedEmit, WaterfallContinuation, WaterfallNext,
 };
+use crate::fiber::{Fiber, FiberState, FiberUid};
+use crate::loader::{PluginFactory, PluginFactoryId, interpolate_plugin_config};
+use crate::registry::{PendingEntry, Registry};
 use crate::service::Service;
+use crate::surface::HartevoSurfaceAuthority;
+
+static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderKey {
+    namespace: String,
+    key: String,
+}
+
+impl ProviderKey {
+    fn new(namespace: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            key: key.into(),
+        }
+    }
+}
+
+/// Opaque provider authorization identity. It is distinct from the owning
+/// Fiber and from the mutable provider generation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProviderId(u64);
+
+impl fmt::Debug for ProviderId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("ProviderId").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for ProviderId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Capability for owner-checked ordinary provider replacement.
+///
+/// Handles are minted only by successful ordinary registration. Their fields
+/// are private, so a caller cannot forge an owner, namespace, provider id, or
+/// generation. Reserved Hartevo providers never return a public handle.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderHandle {
+    context_id: u64,
+    namespace: String,
+    key: String,
+    provider_id: ProviderId,
+    owner_uid: FiberUid,
+    generation: u64,
+}
+
+impl ProviderHandle {
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn provider_id(&self) -> ProviderId {
+        self.provider_id
+    }
+
+    #[must_use]
+    pub const fn owner_uid(&self) -> FiberUid {
+        self.owner_uid
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Owner-checked replacement convenience method.
+    pub fn replace<T: Any + Send + Sync>(
+        &self,
+        ctx: &mut Context,
+        value: T,
+    ) -> Result<Self, CordisError> {
+        ctx.replace_provider(self, value)
+    }
+}
+
+impl fmt::Debug for ProviderHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderHandle")
+            .field("context_id", &self.context_id)
+            .field("namespace", &self.namespace)
+            .field("key", &self.key)
+            .field("provider_id", &self.provider_id)
+            .field("owner_uid", &self.owner_uid)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+struct ProviderRecord {
+    value: Arc<dyn Any + Send + Sync>,
+    provider_id: ProviderId,
+    owner_uid: FiberUid,
+    generation: u64,
+    notify_count: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderSnapshot {
+    pub(crate) namespace: String,
+    pub(crate) key: String,
+    pub(crate) provider_id: ProviderId,
+    pub(crate) owner_uid: FiberUid,
+    pub(crate) generation: u64,
+    pub(crate) notify_count: u64,
+    pub(crate) value_identity: usize,
+    pub(crate) disposer_count: usize,
+}
+
+/// Handle for a pending or activated repeatable plugin factory.
+#[derive(Clone)]
+pub struct PendingHandle {
+    id: u64,
+    factory_id: PluginFactoryId,
+    fiber: Fiber,
+}
+
+impl PendingHandle {
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn factory_id(&self) -> PluginFactoryId {
+        self.factory_id
+    }
+
+    #[must_use]
+    pub fn fiber(&self) -> Fiber {
+        self.fiber.clone()
+    }
+
+    #[must_use]
+    pub fn state(&self) -> FiberState {
+        self.fiber.state()
+    }
+
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.state() == FiberState::Pending
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.state() == FiberState::Active
+    }
+
+    /// Publish the child tombstone. Context-owned registrations are cleaned
+    /// when the owning Context observes this handle through `dispose_fiber`.
+    pub fn dispose(&self) -> bool {
+        self.fiber.dispose()
+    }
+}
+
+impl fmt::Debug for PendingHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingHandle")
+            .field("id", &self.id)
+            .field("factory_id", &self.factory_id)
+            .field("fiber", &self.fiber)
+            .finish()
+    }
+}
 
 /// Conventional Cordis / Hartevo service keys. Plugins look up by these names.
 pub mod keys {
@@ -71,18 +253,52 @@ pub enum CordisError {
     },
     #[error("Cordis surface key `{key}` is already mapped")]
     SurfaceAlreadyMapped { key: &'static str },
+    #[error("provider `{namespace}/{key}` is already registered")]
+    DuplicateProvider { namespace: String, key: String },
+    #[error("provider `{key}` is owned by another Fiber")]
+    ProviderOwnerMismatch { key: String },
+    #[error("provider handle `{key}` is stale")]
+    StaleProviderHandle { key: String },
+    #[error("provider `{namespace}/{key}` is not registered")]
+    ProviderNotFound { namespace: String, key: String },
+    #[error("Fiber `{uid}` does not belong to this Context")]
+    FiberContextMismatch { uid: FiberUid },
+    #[error("Fiber `{uid}` is disposed")]
+    FiberDisposed { uid: FiberUid },
+    #[error("provider generation for `{key}` overflowed")]
+    ProviderGenerationOverflow { key: String },
+    #[error("provider identity allocation overflowed")]
+    ProviderIdentityOverflow,
+    #[error("pending plugin factory `{id}` is already mounted")]
+    DuplicatePluginFactory { id: PluginFactoryId },
+    #[error("plugin factory `{id}` activation failed: {source}")]
+    PluginActivation {
+        id: PluginFactoryId,
+        #[source]
+        source: Box<CordisError>,
+    },
     #[error(transparent)]
     Interpolate(#[from] crate::config::InterpolateError),
 }
 
 /// Service container and plugin host.
 pub struct Context {
+    id: u64,
     services: HashMap<String, Arc<dyn Any + Send + Sync>>,
+    providers: HashMap<ProviderKey, ProviderRecord>,
+    next_provider_id: u64,
     /// Plugin-context interpolation source. Distinct from the loader context.
     vars: ConfigValue,
     effects: Vec<Registration>,
     events: EventBus,
     reserved_services: HashSet<String>,
+    root: Fiber,
+    current_fiber: FiberUid,
+    fibers: HashMap<FiberUid, Fiber>,
+    registry: Registry,
+    mounted_factories: HashMap<PluginFactoryId, Fiber>,
+    activating_factories: HashSet<PluginFactoryId>,
+    notifying_pending: bool,
 }
 
 impl Default for Context {
@@ -94,12 +310,410 @@ impl Default for Context {
 impl Context {
     #[must_use]
     pub fn new() -> Self {
+        let context_id = NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let root = Fiber::root(context_id);
         Self {
+            id: context_id,
             services: HashMap::new(),
+            providers: HashMap::new(),
+            next_provider_id: 1,
             vars: ConfigValue::default(),
             effects: Vec::new(),
             events: EventBus::new(),
             reserved_services: HashSet::new(),
+            current_fiber: root.uid(),
+            fibers: HashMap::new(),
+            root,
+            registry: Registry::new(),
+            mounted_factories: HashMap::new(),
+            activating_factories: HashSet::new(),
+            notifying_pending: false,
+        }
+    }
+
+    /// The active root Fiber. Its uid is always zero and it is never created
+    /// from a public constructor.
+    #[must_use]
+    pub fn root_fiber(&self) -> Fiber {
+        self.root.clone()
+    }
+
+    /// Alias for [`Context::root_fiber`].
+    #[must_use]
+    pub fn root(&self) -> Fiber {
+        self.root_fiber()
+    }
+
+    /// Allocate a child Fiber with a distinct monotonic uid.
+    pub fn new_fiber(&mut self) -> Result<Fiber, CordisError> {
+        let root = self.root.clone();
+        self.child_fiber(&root)
+    }
+
+    /// Allocate a child Fiber below `parent`.
+    pub fn child_fiber(&mut self, parent: &Fiber) -> Result<Fiber, CordisError> {
+        self.child_fiber_in_namespace(parent, parent.namespace())
+    }
+
+    fn child_fiber_in_namespace(
+        &mut self,
+        parent: &Fiber,
+        namespace: String,
+    ) -> Result<Fiber, CordisError> {
+        self.validate_fiber(parent)?;
+        if parent.is_disposed() {
+            return Err(CordisError::FiberDisposed { uid: parent.uid() });
+        }
+        let fiber = Fiber::child_with_namespace(self.id, parent, namespace);
+        if parent.uid() == self.root.uid() {
+            fiber.replace_metadata(self.vars.clone());
+        }
+        let _ = fiber.activate();
+        self.fibers.insert(fiber.uid(), fiber.clone());
+        Ok(fiber)
+    }
+
+    /// Create an ownership view for `fiber`. A pending Fiber remains pending
+    /// until its retained factory is notified; a disposed or foreign Fiber
+    /// remains fail-closed.
+    pub fn with_fiber<'a>(&'a mut self, fiber: &Fiber) -> ContextView<'a> {
+        let context_valid = fiber.context_id() == self.id;
+        if context_valid && fiber.uid() != self.root.uid() {
+            self.fibers.insert(fiber.uid(), fiber.clone());
+        }
+        ContextView {
+            context: self,
+            fiber: fiber.clone(),
+            namespace: fiber.namespace(),
+            shared_namespaces: Vec::new(),
+            metadata: fiber.metadata_snapshot(),
+            context_valid,
+        }
+    }
+
+    /// Closure-shaped counterpart to [`Context::with_fiber`] for callers that
+    /// do not need to retain a view.
+    pub fn in_fiber<R>(&mut self, fiber: &Fiber, f: impl FnOnce(&mut ContextView<'_>) -> R) -> R {
+        let mut view = self.with_fiber(fiber);
+        f(&mut view)
+    }
+
+    fn validate_fiber(&self, fiber: &Fiber) -> Result<(), CordisError> {
+        if fiber.context_id() == self.id {
+            Ok(())
+        } else {
+            Err(CordisError::FiberContextMismatch { uid: fiber.uid() })
+        }
+    }
+
+    fn ensure_owner_active(&self, owner_uid: FiberUid) -> Result<(), CordisError> {
+        if owner_uid == self.root.uid() {
+            if self.root.is_disposed() {
+                return Err(CordisError::FiberDisposed { uid: owner_uid });
+            }
+            return Ok(());
+        }
+        match self.fibers.get(&owner_uid) {
+            Some(fiber) if fiber.state() == FiberState::Active => Ok(()),
+            Some(fiber) if fiber.is_disposed() => {
+                Err(CordisError::FiberDisposed { uid: fiber.uid() })
+            }
+            Some(fiber) => Err(CordisError::FiberDisposed { uid: fiber.uid() }),
+            None => Err(CordisError::FiberContextMismatch { uid: owner_uid }),
+        }
+    }
+
+    /// Fiber currently used by direct Context mutations. Factory callbacks
+    /// temporarily switch this owner to their child Fiber.
+    #[must_use]
+    pub fn current_fiber_uid(&self) -> FiberUid {
+        self.current_fiber
+    }
+
+    /// Number of live registration records, useful for lifecycle diagnostics.
+    #[must_use]
+    pub fn registration_count(&self) -> usize {
+        self.effects.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_snapshot(&self, key: &str) -> Option<ProviderSnapshot> {
+        let provider_key = ProviderKey::new("root", key);
+        let record = self.providers.get(&provider_key)?;
+        Some(ProviderSnapshot {
+            namespace: "root".to_string(),
+            key: key.to_string(),
+            provider_id: record.provider_id,
+            owner_uid: record.owner_uid,
+            generation: record.generation,
+            notify_count: record.notify_count,
+            value_identity: Arc::as_ptr(&record.value).cast::<()>() as usize,
+            disposer_count: usize::from(
+                self.effects.iter().any(|registration| {
+                    matches!(
+                        registration,
+                        Registration::Provider {
+                            namespace,
+                            key: registered_key,
+                            provider_id,
+                            ..
+                        } if namespace == "root" && registered_key == key && *provider_id == record.provider_id.0
+                    )
+                }),
+            ),
+        })
+    }
+
+    fn with_current_fiber<R>(
+        &mut self,
+        owner_uid: FiberUid,
+        callback: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.current_fiber;
+        self.current_fiber = owner_uid;
+        let result = callback(self);
+        self.current_fiber = previous;
+        result
+    }
+
+    fn has_in_namespace(&self, namespace: &str, key: &str) -> bool {
+        self.providers
+            .contains_key(&ProviderKey::new(namespace, key))
+    }
+
+    fn get_in_namespace<T: Any + Send + Sync>(&self, namespace: &str, key: &str) -> Option<Arc<T>> {
+        self.providers
+            .get(&ProviderKey::new(namespace, key))?
+            .value
+            .clone()
+            .downcast::<T>()
+            .ok()
+    }
+
+    fn new_pending_handle(
+        &mut self,
+        factory: PluginFactory,
+        parent: &Fiber,
+        namespace: String,
+    ) -> Result<PendingHandle, CordisError> {
+        self.validate_fiber(parent)?;
+        if parent.is_disposed() {
+            return Err(CordisError::FiberDisposed { uid: parent.uid() });
+        }
+        if self.mounted_factories.contains_key(&factory.id())
+            || self.activating_factories.contains(&factory.id())
+            || self.registry.contains_factory(factory.id())
+        {
+            return Err(CordisError::DuplicatePluginFactory { id: factory.id() });
+        }
+        let fiber = Fiber::child_with_namespace(self.id, parent, namespace.clone());
+        self.fibers.insert(fiber.uid(), fiber.clone());
+        let handle = PendingHandle {
+            id: self.registry.allocate_id(),
+            factory_id: factory.id(),
+            fiber: fiber.clone(),
+        };
+        let missing = factory
+            .inject()
+            .iter()
+            .filter(|key| !self.has_in_namespace(&namespace, key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let config = factory.config();
+        if !missing.is_empty() {
+            self.registry.push(PendingEntry {
+                factory,
+                fiber,
+                namespace,
+                inject: missing,
+                config,
+            });
+            return Ok(handle);
+        }
+        fiber.activate();
+        self.activating_factories.insert(handle.factory_id);
+        let config = match interpolate_plugin_config(self, &config) {
+            Ok(config) => config,
+            Err(error) => {
+                self.activating_factories.remove(&handle.factory_id);
+                fiber.dispose();
+                self.cleanup_fiber(&fiber);
+                return Err(error.into());
+            }
+        };
+        let result = self.with_current_fiber(fiber.uid(), |ctx| factory.start(config, ctx));
+        if let Err(source) = result {
+            self.activating_factories.remove(&handle.factory_id);
+            fiber.dispose();
+            self.cleanup_fiber(&fiber);
+            return Err(CordisError::PluginActivation {
+                id: handle.factory_id,
+                source: Box::new(source),
+            });
+        }
+        self.activating_factories.remove(&handle.factory_id);
+        self.mounted_factories.insert(handle.factory_id, fiber);
+        Ok(handle)
+    }
+
+    /// Mount a repeatable factory and retain it if dependencies are missing.
+    pub fn mount_pending(&mut self, factory: PluginFactory) -> Result<PendingHandle, CordisError> {
+        let root = self.root.clone();
+        self.new_pending_handle(factory, &root, "root".to_string())
+    }
+
+    fn mount_pending_in_namespace(
+        &mut self,
+        factory: PluginFactory,
+        parent: &Fiber,
+        namespace: String,
+    ) -> Result<PendingHandle, CordisError> {
+        self.new_pending_handle(factory, parent, namespace)
+    }
+
+    /// Number of retained unresolved factories.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.registry.len()
+    }
+
+    /// Publish a child Fiber tombstone and synchronously clean its owned
+    /// registrations. Parent-owned registrations are left untouched.
+    pub fn dispose_fiber(&mut self, fiber: &Fiber) -> Result<bool, CordisError> {
+        self.validate_fiber(fiber)?;
+        if fiber.uid() == self.root.uid() {
+            self.teardown();
+            return Ok(true);
+        }
+        let changed = fiber.dispose();
+        let mut disposed = HashSet::from([fiber.uid()]);
+        loop {
+            let descendants: Vec<FiberUid> = self
+                .fibers
+                .values()
+                .filter(|candidate| {
+                    candidate
+                        .parent_uid()
+                        .is_some_and(|parent| disposed.contains(&parent))
+                        && !disposed.contains(&candidate.uid())
+                })
+                .map(Fiber::uid)
+                .collect();
+            if descendants.is_empty() {
+                break;
+            }
+            disposed.extend(descendants);
+        }
+        for candidate in self.fibers.values() {
+            if disposed.contains(&candidate.uid()) {
+                candidate.dispose();
+            }
+        }
+        self.cleanup_fibers(&disposed);
+        self.notify_pending()?;
+        Ok(changed)
+    }
+
+    /// Remove all Context-owned records for a terminal child without asking
+    /// the pending registry to activate another factory. Activation failures
+    /// use this form so no partial callback registration can leak.
+    fn cleanup_fiber(&mut self, fiber: &Fiber) {
+        self.cleanup_fibers(&HashSet::from([fiber.uid()]));
+    }
+
+    fn cleanup_fibers(&mut self, disposed: &HashSet<FiberUid>) {
+        for uid in disposed {
+            self.registry.remove_fiber(*uid);
+        }
+        self.mounted_factories
+            .retain(|_, candidate| !disposed.contains(&candidate.uid()));
+        self.fibers.retain(|uid, _| !disposed.contains(uid));
+
+        let mut retained = Vec::with_capacity(self.effects.len());
+        let mut owned = Vec::new();
+        while let Some(registration) = self.effects.pop() {
+            if disposed.contains(&registration.owner_uid()) {
+                owned.push(registration);
+            } else {
+                retained.push(registration);
+            }
+        }
+        retained.reverse();
+        self.effects = retained;
+        for registration in owned {
+            self.run_registration(registration);
+        }
+    }
+
+    /// Dispose a pending/active plugin handle and its Context-owned records.
+    pub fn dispose_pending(&mut self, handle: &PendingHandle) -> Result<bool, CordisError> {
+        self.dispose_fiber(&handle.fiber)
+    }
+
+    fn notify_pending(&mut self) -> Result<(), CordisError> {
+        if self.notifying_pending {
+            return Ok(());
+        }
+        self.notifying_pending = true;
+        let result = self.notify_pending_inner();
+        self.notifying_pending = false;
+        result
+    }
+
+    fn notify_pending_inner(&mut self) -> Result<(), CordisError> {
+        loop {
+            let mut ready = Vec::new();
+            let mut waiting = Vec::new();
+            for entry in self.registry.take_pending() {
+                if entry.fiber.is_disposed() {
+                    continue;
+                }
+                let is_ready = entry
+                    .inject
+                    .iter()
+                    .all(|key| self.has_in_namespace(&entry.namespace, key));
+                if is_ready {
+                    ready.push(entry);
+                } else {
+                    waiting.push(entry);
+                }
+            }
+            self.registry.replace_pending(waiting);
+            if ready.is_empty() {
+                return Ok(());
+            }
+            for entry in ready {
+                if entry.fiber.is_disposed() {
+                    continue;
+                }
+                if !entry.fiber.activate() {
+                    continue;
+                }
+                let id = entry.factory.id();
+                self.activating_factories.insert(id);
+                let config = match interpolate_plugin_config(self, &entry.config) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        self.activating_factories.remove(&id);
+                        entry.fiber.dispose();
+                        self.cleanup_fiber(&entry.fiber);
+                        return Err(error.into());
+                    }
+                };
+                if let Err(source) = self
+                    .with_current_fiber(entry.fiber.uid(), |ctx| entry.factory.start(config, ctx))
+                {
+                    self.activating_factories.remove(&id);
+                    entry.fiber.dispose();
+                    self.cleanup_fiber(&entry.fiber);
+                    return Err(CordisError::PluginActivation {
+                        id,
+                        source: Box::new(source),
+                    });
+                }
+                self.activating_factories.remove(&id);
+                self.mounted_factories.insert(id, entry.fiber);
+            }
         }
     }
 
@@ -153,65 +767,236 @@ impl Context {
         self.get(keys::DESKTOP)
     }
 
-    /// Provide a named non-authority service. Reversed on teardown.
+    /// Provide a named ordinary service in the current Fiber namespace.
     ///
-    /// Domain, Effect Broker, Runtime, and Desktop are reserved by
-    /// `SurfaceMapping`; ordinary plugins cannot replace those owners.
+    /// Registration is unique by `(namespace, key)` and starts at generation
+    /// zero. The returned opaque handle is the only ordinary replacement
+    /// capability. Domain, Effect Broker, Runtime, and Desktop are reserved
+    /// to the private Hartevo surface authority.
     pub fn provide<T: Any + Send + Sync>(
         &mut self,
         key: impl Into<String>,
         value: T,
-    ) -> Result<(), CordisError> {
-        let key = key.into();
+    ) -> Result<ProviderHandle, CordisError> {
+        let owner_uid = self.current_fiber;
+        let namespace = if owner_uid == self.root.uid() {
+            "root".to_string()
+        } else {
+            self.fibers
+                .get(&owner_uid)
+                .map_or_else(|| "root".to_string(), Fiber::namespace)
+        };
+        self.provide_in_namespace(namespace, owner_uid, key.into(), value)
+    }
+
+    fn provide_in_namespace<T: Any + Send + Sync>(
+        &mut self,
+        namespace: impl Into<String>,
+        owner_uid: FiberUid,
+        key: String,
+        value: T,
+    ) -> Result<ProviderHandle, CordisError> {
         if authority_reserved_key(&key) || self.reserved_services.contains(&key) {
             return Err(CordisError::ReservedServiceKey { key });
         }
-        let previous = self.services.insert(key.clone(), Arc::new(value));
-        self.effects.push(Registration::Service {
+        self.ensure_owner_active(owner_uid)?;
+        let namespace = namespace.into();
+        let provider_key = ProviderKey::new(namespace.clone(), key.clone());
+        if self.providers.contains_key(&provider_key) {
+            return Err(CordisError::DuplicateProvider { namespace, key });
+        }
+        let provider_id = ProviderId(self.next_provider_id);
+        self.next_provider_id = self
+            .next_provider_id
+            .checked_add(1)
+            .ok_or(CordisError::ProviderIdentityOverflow)?;
+        let handle = ProviderHandle {
+            context_id: self.id,
+            namespace: namespace.clone(),
+            key: key.clone(),
+            provider_id,
+            owner_uid,
+            generation: 0,
+        };
+        let value: Arc<dyn Any + Send + Sync> = Arc::new(value);
+        if namespace == "root" {
+            self.services.insert(key.clone(), Arc::clone(&value));
+        }
+        self.providers.insert(
+            provider_key,
+            ProviderRecord {
+                value,
+                provider_id,
+                owner_uid,
+                generation: 0,
+                notify_count: 0,
+            },
+        );
+        self.effects.push(Registration::provider(
+            owner_uid,
+            namespace,
             key,
-            previous,
-            reserved: false,
-        });
-        Ok(())
+            provider_id.0,
+        ));
+        self.notify_pending()?;
+        Ok(handle)
     }
 
-    /// Mount one owner-bound authority service exactly once.
+    /// Mount one owner-bound authority service exactly once. The authority is
+    /// deliberately crate-private and cannot be forged by integration users.
     pub(crate) fn provide_reserved<T: Any + Send + Sync>(
         &mut self,
+        authority: HartevoSurfaceAuthority,
         key: &'static str,
         value: T,
-    ) -> Result<(), CordisError> {
-        if !authority_reserved_key(key)
-            || self.services.contains_key(key)
-            || !self.reserved_services.insert(key.to_string())
-        {
+    ) -> Result<ProviderHandle, CordisError> {
+        if !authority.is_valid() {
             return Err(CordisError::ReservedServiceKey {
                 key: key.to_string(),
             });
         }
-        self.services.insert(key.to_string(), Arc::new(value));
-        self.effects.push(Registration::Service {
+        self.ensure_owner_active(self.root.uid())?;
+        if !authority_reserved_key(key) || self.services.contains_key(key) {
+            return Err(CordisError::ReservedServiceKey {
+                key: key.to_string(),
+            });
+        }
+        let namespace = "root".to_string();
+        let provider_id = ProviderId(self.next_provider_id);
+        self.next_provider_id = self
+            .next_provider_id
+            .checked_add(1)
+            .ok_or(CordisError::ProviderIdentityOverflow)?;
+        self.reserved_services.insert(key.to_string());
+        let value: Arc<dyn Any + Send + Sync> = Arc::new(value);
+        self.services.insert(key.to_string(), Arc::clone(&value));
+        self.providers.insert(
+            ProviderKey::new(namespace.clone(), key),
+            ProviderRecord {
+                value,
+                provider_id,
+                owner_uid: self.root.uid(),
+                generation: 0,
+                notify_count: 0,
+            },
+        );
+        self.effects.push(Registration::provider(
+            self.root.uid(),
+            namespace.clone(),
+            key.to_string(),
+            provider_id.0,
+        ));
+        self.notify_pending()?;
+        Ok(ProviderHandle {
+            context_id: self.id,
+            namespace,
             key: key.to_string(),
-            previous: None,
-            reserved: true,
-        });
-        Ok(())
+            provider_id,
+            owner_uid: self.root.uid(),
+            generation: 0,
+        })
     }
 
-    /// Replace the value behind an already-reserved authority owner. This is
-    /// crate-private so ordinary plugins cannot mint or swap that owner.
+    /// Replace an ordinary provider through its opaque owner-checked handle.
+    /// Reserved handles are rejected before any value or generation changes.
+    pub fn replace_provider<T: Any + Send + Sync>(
+        &mut self,
+        handle: &ProviderHandle,
+        value: T,
+    ) -> Result<ProviderHandle, CordisError> {
+        self.replace_provider_for(self.current_fiber, handle, value, false)
+    }
+
+    fn replace_provider_for<T: Any + Send + Sync>(
+        &mut self,
+        owner_uid: FiberUid,
+        handle: &ProviderHandle,
+        value: T,
+        authorized_reserved: bool,
+    ) -> Result<ProviderHandle, CordisError> {
+        if authority_reserved_key(&handle.key) && !authorized_reserved {
+            return Err(CordisError::ReservedServiceKey {
+                key: handle.key.clone(),
+            });
+        }
+        if handle.context_id != self.id {
+            return Err(CordisError::FiberContextMismatch {
+                uid: handle.owner_uid,
+            });
+        }
+        self.ensure_owner_active(owner_uid)?;
+        if handle.owner_uid != owner_uid {
+            return Err(CordisError::ProviderOwnerMismatch {
+                key: handle.key.clone(),
+            });
+        }
+        let provider_key = ProviderKey::new(handle.namespace.clone(), handle.key.clone());
+        let Some(record) = self.providers.get_mut(&provider_key) else {
+            return Err(CordisError::ProviderNotFound {
+                namespace: handle.namespace.clone(),
+                key: handle.key.clone(),
+            });
+        };
+        if record.provider_id != handle.provider_id || record.owner_uid != handle.owner_uid {
+            return Err(CordisError::ProviderOwnerMismatch {
+                key: handle.key.clone(),
+            });
+        }
+        if record.generation != handle.generation {
+            return Err(CordisError::StaleProviderHandle {
+                key: handle.key.clone(),
+            });
+        }
+        let generation = record.generation.checked_add(1).ok_or_else(|| {
+            CordisError::ProviderGenerationOverflow {
+                key: handle.key.clone(),
+            }
+        })?;
+        let value: Arc<dyn Any + Send + Sync> = Arc::new(value);
+        record.value = Arc::clone(&value);
+        record.generation = generation;
+        record.notify_count = record.notify_count.saturating_add(1);
+        if handle.namespace == "root" {
+            self.services.insert(handle.key.clone(), value);
+        }
+        self.notify_pending()?;
+        Ok(ProviderHandle {
+            context_id: self.id,
+            namespace: handle.namespace.clone(),
+            key: handle.key.clone(),
+            provider_id: handle.provider_id,
+            owner_uid: handle.owner_uid,
+            generation,
+        })
+    }
+
+    /// Authorized Hartevo-only replacement used by the Domain host route.
     pub(crate) fn replace_reserved<T: Any + Send + Sync>(
         &mut self,
-        key: &str,
+        authority: HartevoSurfaceAuthority,
+        key: &'static str,
         value: T,
-    ) -> Result<Option<Arc<T>>, CordisError> {
-        if !self.reserved_services.contains(key) || !self.services.contains_key(key) {
+    ) -> Result<ProviderHandle, CordisError> {
+        if !authority.is_valid() || !authority_reserved_key(key) {
             return Err(CordisError::ReservedServiceKey {
                 key: key.to_string(),
             });
         }
-        let previous = self.services.insert(key.to_string(), Arc::new(value));
-        Ok(previous.and_then(|value| value.downcast::<T>().ok()))
+        let Some(record) = self.providers.get(&ProviderKey::new("root", key)) else {
+            return Err(CordisError::ProviderNotFound {
+                namespace: "root".to_string(),
+                key: key.to_string(),
+            });
+        };
+        let handle = ProviderHandle {
+            context_id: self.id,
+            namespace: "root".to_string(),
+            key: key.to_string(),
+            provider_id: record.provider_id,
+            owner_uid: record.owner_uid,
+            generation: record.generation,
+        };
+        self.replace_provider_for(self.root.uid(), &handle, value, true)
     }
 
     /// Set a plugin-context interpolation variable. Reversed on teardown.
@@ -229,7 +1014,9 @@ impl Context {
                 previous
             }
         };
-        self.effects.push(Registration::Var { key, previous });
+        self.effects
+            .push(Registration::var(self.current_fiber, key, previous));
+        self.root.replace_metadata(self.vars.clone());
     }
 
     #[must_use]
@@ -254,16 +1041,18 @@ impl Context {
         if !missing.is_empty() {
             return Err(CordisError::MissingDependencies(missing));
         }
-        plugin.apply(self);
-        Ok(())
+        self.with_current_fiber(self.root.uid(), |ctx| plugin.apply(ctx))
     }
 
-    pub fn effect<F>(&mut self, dispose: F)
+    pub fn effect<F>(&mut self, dispose: F) -> RegistrationHandle
     where
         F: FnOnce() + Send + 'static,
     {
         let dispose: Disposer = Box::new(dispose);
-        self.effects.push(Registration::Disposer(dispose));
+        let registration = Registration::disposer(self.current_fiber, dispose);
+        let handle = registration.handle();
+        self.effects.push(registration);
+        handle
     }
 
     /// Store an emit listener. Locks this name to [`DispatchMode::Emit`].
@@ -290,7 +1079,8 @@ impl Context {
             .events
             .register_emit(name.clone(), callback)
             .map_err(|locked| conflict(&name, locked, DispatchMode::Emit))?;
-        self.effects.push(Registration::Listener { name, id });
+        self.effects
+            .push(Registration::listener(self.current_fiber, name, id));
         Ok(())
     }
 
@@ -324,7 +1114,8 @@ impl Context {
             .events
             .register_waterfall(name.clone(), callback)
             .map_err(|locked| conflict(&name, locked, DispatchMode::Waterfall))?;
-        self.effects.push(Registration::Listener { name, id });
+        self.effects
+            .push(Registration::listener(self.current_fiber, name, id));
         Ok(())
     }
 
@@ -356,7 +1147,8 @@ impl Context {
             .events
             .register_parallel(name.clone(), callback)
             .map_err(|locked| conflict(&name, locked, DispatchMode::Parallel))?;
-        self.effects.push(Registration::Listener { name, id });
+        self.effects
+            .push(Registration::listener(self.current_fiber, name, id));
         Ok(())
     }
 
@@ -389,7 +1181,8 @@ impl Context {
             .events
             .register_serial(name.clone(), callback)
             .map_err(|locked| conflict(&name, locked, DispatchMode::Serial))?;
-        self.effects.push(Registration::Listener { name, id });
+        self.effects
+            .push(Registration::listener(self.current_fiber, name, id));
         Ok(())
     }
 
@@ -499,36 +1292,39 @@ impl Context {
             .lock(name, mode)
             .map_err(|locked| conflict(name, locked, mode))?;
         if !already {
-            self.effects.push(Registration::EventLock {
-                name: name.to_string(),
-            });
+            self.effects.push(Registration::event_lock(
+                self.current_fiber,
+                name.to_string(),
+            ));
         }
         Ok(())
     }
 
-    /// Run disposers newest-first, then drop remaining registrations. The context is reusable.
-    pub fn teardown(&mut self) {
-        while let Some(registration) = self.effects.pop() {
-            match registration {
-                Registration::Disposer(dispose) => dispose(),
-                Registration::Service {
-                    key,
-                    previous,
-                    reserved,
-                } => {
-                    match previous {
-                        Some(value) => {
-                            self.services.insert(key.clone(), value);
-                        }
-                        None => {
-                            self.services.remove(&key);
-                        }
+    fn run_registration(&mut self, registration: Registration) {
+        registration.dispose_callback();
+        match registration {
+            Registration::Disposer { .. } => {}
+            Registration::Provider {
+                namespace,
+                key,
+                provider_id,
+                ..
+            } => {
+                let provider_key = ProviderKey::new(namespace.clone(), key.clone());
+                let remove = self
+                    .providers
+                    .get(&provider_key)
+                    .is_some_and(|record| record.provider_id.0 == provider_id);
+                if remove {
+                    self.providers.remove(&provider_key);
+                    if namespace == "root" {
+                        self.services.remove(&key);
                     }
-                    if reserved {
-                        self.reserved_services.remove(&key);
-                    }
+                    self.reserved_services.remove(&key);
                 }
-                Registration::Var { key, previous } => match &mut self.vars {
+            }
+            Registration::Var { key, previous, .. } => {
+                match &mut self.vars {
                     ConfigValue::Object(map) => match previous {
                         Some(value) => {
                             map.insert(key, value);
@@ -541,19 +1337,426 @@ impl Context {
                         Some(value) => *other = value,
                         None => *other = ConfigValue::default(),
                     },
-                },
-                Registration::Listener { name, id } => {
-                    self.events.remove_listener(&name, id);
                 }
-                Registration::EventLock { name } => {
-                    self.events.unlock(&name);
-                }
+                self.root.replace_metadata(self.vars.clone());
+            }
+            Registration::Listener { name, id, .. } => {
+                self.events.remove_listener(&name, id);
+            }
+            Registration::EventLock { name, .. } => {
+                self.events.unlock(&name);
             }
         }
+    }
+
+    /// Run registrations newest-first, then drop remaining state. The root
+    /// Context remains reusable and its root Fiber keeps uid zero.
+    pub fn teardown(&mut self) {
+        while let Some(registration) = self.effects.pop() {
+            self.run_registration(registration);
+        }
         self.services.clear();
+        self.providers.clear();
         self.reserved_services.clear();
         self.vars = ConfigValue::default();
         self.events.clear();
+        self.registry = Registry::new();
+        self.mounted_factories.clear();
+        self.activating_factories.clear();
+        for fiber in self.fibers.values() {
+            fiber.dispose();
+        }
+        self.fibers.clear();
+        self.current_fiber = self.root.uid();
+        self.root.replace_metadata(self.vars.clone());
+    }
+}
+
+/// A mutable Context view carrying one Fiber owner and one service namespace.
+///
+/// Views intentionally do not expose the private Hartevo authority path or a
+/// raw `&mut Context`.  `isolate` switches to a fresh namespace; a caller must
+/// explicitly opt into another namespace with `share_label`.
+pub struct ContextView<'a> {
+    context: &'a mut Context,
+    fiber: Fiber,
+    namespace: String,
+    shared_namespaces: Vec<String>,
+    metadata: ConfigValue,
+    context_valid: bool,
+}
+
+impl fmt::Debug for ContextView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContextView")
+            .field("fiber", &self.fiber)
+            .field("namespace", &self.namespace)
+            .field("shared_namespaces", &self.shared_namespaces)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ContextView<'_> {
+    fn drop(&mut self) {
+        self.fiber.replace_metadata(self.metadata.clone());
+    }
+}
+
+impl ContextView<'_> {
+    #[must_use]
+    pub fn context(&self) -> &Context {
+        self.context
+    }
+
+    #[must_use]
+    pub fn fiber(&self) -> Fiber {
+        self.fiber.clone()
+    }
+
+    #[must_use]
+    pub fn fiber_uid(&self) -> FiberUid {
+        self.fiber.uid()
+    }
+
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.context_valid
+    }
+
+    fn ownership_error(&self) -> CordisError {
+        if self.context_valid {
+            CordisError::FiberDisposed {
+                uid: self.fiber.uid(),
+            }
+        } else {
+            CordisError::FiberContextMismatch {
+                uid: self.fiber.uid(),
+            }
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.context_valid && self.fiber.state() == FiberState::Active
+    }
+
+    /// Switch this view to a fresh namespace derived from its current one.
+    /// Existing providers are not copied and no parent fallback is implicit.
+    #[must_use]
+    pub fn isolate(mut self, label: impl Into<String>) -> Self {
+        let label = label.into();
+        self.namespace = format!("{}::{label}", self.namespace);
+        self.shared_namespaces.clear();
+        self
+    }
+
+    /// Explicitly share a namespace label with this view.
+    #[must_use]
+    pub fn share_label(mut self, label: impl Into<String>) -> Self {
+        self.shared_namespaces.push(label.into());
+        self
+    }
+
+    /// Alias for callers that prefer the upstream terminology.
+    #[must_use]
+    pub fn shared_label(self, label: impl Into<String>) -> Self {
+        self.share_label(label)
+    }
+
+    fn lookup_namespaces(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.namespace.as_str())
+            .chain(self.shared_namespaces.iter().map(String::as_str))
+    }
+
+    #[must_use]
+    pub fn has(&self, key: &str) -> bool {
+        if !self.context_valid {
+            return false;
+        }
+        self.lookup_namespaces()
+            .any(|namespace| self.context.has_in_namespace(namespace, key))
+    }
+
+    #[must_use]
+    pub fn get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
+        if !self.context_valid {
+            return None;
+        }
+        self.lookup_namespaces()
+            .find_map(|namespace| self.context.get_in_namespace(namespace, key))
+    }
+
+    #[must_use]
+    pub fn tools<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::TOOLS)
+    }
+
+    #[must_use]
+    pub fn llm<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::LLM)
+    }
+
+    #[must_use]
+    pub fn sessions<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::SESSIONS)
+    }
+
+    #[must_use]
+    pub fn agents<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::AGENTS)
+    }
+
+    #[must_use]
+    pub fn domain<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::DOMAIN)
+    }
+
+    #[must_use]
+    pub fn effect_broker<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::EFFECT_BROKER)
+    }
+
+    #[must_use]
+    pub fn runtime<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::RUNTIME)
+    }
+
+    #[must_use]
+    pub fn desktop<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::DESKTOP)
+    }
+
+    pub fn provide<T: Any + Send + Sync>(
+        &mut self,
+        key: impl Into<String>,
+        value: T,
+    ) -> Result<ProviderHandle, CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.provide_in_namespace(
+            self.namespace.clone(),
+            self.fiber.uid(),
+            key.into(),
+            value,
+        )
+    }
+
+    pub fn replace_provider<T: Any + Send + Sync>(
+        &mut self,
+        handle: &ProviderHandle,
+        value: T,
+    ) -> Result<ProviderHandle, CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        if handle.namespace != self.namespace {
+            return Err(CordisError::ProviderOwnerMismatch {
+                key: handle.key.clone(),
+            });
+        }
+        self.context
+            .replace_provider_for(self.fiber.uid(), handle, value, false)
+    }
+
+    pub fn effect<F>(&mut self, dispose: F) -> RegistrationHandle
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if !self.is_active() {
+            return RegistrationHandle::noop();
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.effect(dispose))
+    }
+
+    pub fn set_var(&mut self, key: impl Into<String>, value: impl Into<ConfigValue>) {
+        if !self.is_active() {
+            return;
+        }
+        let key = key.into();
+        let value = value.into();
+        match &mut self.metadata {
+            ConfigValue::Object(map) => {
+                map.insert(key, value);
+            }
+            other => *other = ConfigValue::object([(key, value)]),
+        }
+        self.fiber.replace_metadata(self.metadata.clone());
+    }
+
+    #[must_use]
+    pub fn var(&self, key: &str) -> Option<&ConfigValue> {
+        self.metadata.lookup(key)
+    }
+
+    #[must_use]
+    pub fn plugin_interpolation_source(&self) -> &ConfigValue {
+        &self.metadata
+    }
+
+    /// Extend this view's private metadata without mutating its parent.
+    #[must_use]
+    pub fn extend(mut self, metadata: ConfigValue) -> Self {
+        if !self.is_active() {
+            return self;
+        }
+        if let ConfigValue::Object(extra) = metadata {
+            match &mut self.metadata {
+                ConfigValue::Object(current) => {
+                    current.extend(extra);
+                }
+                current => {
+                    *current = ConfigValue::Object(extra);
+                }
+            }
+        }
+        self.fiber.replace_metadata(self.metadata.clone());
+        self
+    }
+
+    pub fn new_fiber(&mut self) -> Result<Fiber, CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .child_fiber_in_namespace(&self.fiber, self.namespace.clone())
+    }
+
+    pub fn mount_pending(&mut self, factory: PluginFactory) -> Result<PendingHandle, CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .mount_pending_in_namespace(factory, &self.fiber, self.namespace.clone())
+    }
+
+    pub fn on<F>(&mut self, name: impl Into<String>, listener: F) -> Result<(), CordisError>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on(name, listener))
+    }
+
+    pub fn on_emit<T, F>(&mut self, name: impl Into<String>, listener: F) -> Result<(), CordisError>
+    where
+        T: Any + Send + Sync + 'static,
+        F: Fn(&T) + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_emit(name, listener))
+    }
+
+    pub fn on_waterfall<T, F>(
+        &mut self,
+        name: impl Into<String>,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        T: Any + Send + 'static,
+        F: Fn(T, WaterfallNext<T>) -> T + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_waterfall(name, listener))
+    }
+
+    pub fn on_parallel<T, E, Fut, F>(
+        &mut self,
+        name: impl Into<String>,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        T: Clone + Any + Send + Sync + 'static,
+        E: Display + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: Fn(T) -> Fut + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_parallel(name, listener))
+    }
+
+    pub fn on_serial<T, E, Fut, F>(
+        &mut self,
+        name: impl Into<String>,
+        listener: F,
+    ) -> Result<(), CordisError>
+    where
+        T: Any + Send + 'static,
+        E: Display + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        F: Fn(T) -> Fut + Send + Sync + 'static,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.on_serial(name, listener))
+    }
+
+    pub fn emit<T>(&mut self, name: &str, payload: &T) -> Result<(), CordisError>
+    where
+        T: Any + Send + Sync,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.emit(name, payload)
+    }
+
+    pub fn lock_event(&mut self, name: &str, mode: DispatchMode) -> Result<(), CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.lock_event(name, mode))
+    }
+
+    pub fn waterfall<T>(&mut self, name: &str, payload: T) -> Result<T, CordisError>
+    where
+        T: Any + Send,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.waterfall(name, payload)
+    }
+
+    pub async fn parallel<T>(&mut self, name: &str, payload: T) -> Result<(), CordisError>
+    where
+        T: Any + Send + Sync,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.parallel(name, payload).await
+    }
+
+    pub async fn serial<T>(&mut self, name: &str, payload: T) -> Result<T, CordisError>
+    where
+        T: Any + Send,
+    {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        self.context.serial(name, payload).await
     }
 }
 
@@ -569,6 +1772,180 @@ fn conflict(name: &str, locked: DispatchMode, requested: DispatchMode) -> Cordis
         name: name.to_string(),
         locked,
         requested,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod provider_tests {
+    use super::*;
+    use crate::surface::{HartevoSurfaces, map_surfaces, trusted_surface_authority};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ordinary_duplicate_is_rejected_before_mutation() {
+        let mut context = Context::new();
+        let handle = context.provide("ordinary", 7_u32).unwrap();
+        let before = context.provider_snapshot("ordinary").unwrap();
+        assert_eq!(handle.generation(), 0);
+        assert_eq!(
+            context.provide("ordinary", 9_u32).unwrap_err(),
+            CordisError::DuplicateProvider {
+                namespace: "root".to_string(),
+                key: "ordinary".to_string(),
+            }
+        );
+        assert_eq!(context.get::<u32>("ordinary").as_deref(), Some(&7));
+        assert_eq!(context.provider_snapshot("ordinary").unwrap(), before);
+    }
+
+    #[test]
+    fn owner_and_stale_handles_cannot_change_provider() {
+        let mut context = Context::new();
+        let handle = context.provide("ordinary", 7_u32).unwrap();
+        let child = context.new_fiber().unwrap();
+        let before = context.provider_snapshot("ordinary").unwrap();
+        {
+            let mut view = context.with_fiber(&child);
+            assert_eq!(
+                view.replace_provider(&handle, 8_u32).unwrap_err(),
+                CordisError::ProviderOwnerMismatch {
+                    key: "ordinary".to_string()
+                }
+            );
+        }
+        assert_eq!(context.get::<u32>("ordinary").as_deref(), Some(&7));
+        assert_eq!(context.provider_snapshot("ordinary").unwrap(), before);
+
+        let current = context.replace_provider(&handle, 8_u32).unwrap();
+        assert_eq!(current.generation(), 1);
+        assert_eq!(
+            context.replace_provider(&handle, 9_u32).unwrap_err(),
+            CordisError::StaleProviderHandle {
+                key: "ordinary".to_string()
+            }
+        );
+        assert_eq!(context.get::<u32>("ordinary").as_deref(), Some(&8));
+    }
+
+    #[test]
+    fn reserved_handles_are_rejected_without_mutation() {
+        let mut context = Context::new();
+        let authority = trusted_surface_authority();
+        map_surfaces(&mut context, authority, HartevoSurfaces::default()).unwrap();
+        let before_domain = context.provider_snapshot(keys::DOMAIN).unwrap();
+        let before_broker = context.provider_snapshot(keys::EFFECT_BROKER).unwrap();
+        let domain = context
+            .providers
+            .get(&ProviderKey::new("root", keys::DOMAIN))
+            .map(|record| ProviderHandle {
+                context_id: context.id,
+                namespace: "root".to_string(),
+                key: keys::DOMAIN.to_string(),
+                provider_id: record.provider_id,
+                owner_uid: record.owner_uid,
+                generation: record.generation,
+            })
+            .expect("domain provider");
+        let broker = context
+            .providers
+            .get(&ProviderKey::new("root", keys::EFFECT_BROKER))
+            .map(|record| ProviderHandle {
+                context_id: context.id,
+                namespace: "root".to_string(),
+                key: keys::EFFECT_BROKER.to_string(),
+                provider_id: record.provider_id,
+                owner_uid: record.owner_uid,
+                generation: record.generation,
+            })
+            .expect("broker provider");
+        for handle in [&domain, &broker] {
+            assert!(matches!(
+                context.replace_provider(handle, "forged"),
+                Err(CordisError::ReservedServiceKey { .. })
+            ));
+        }
+        assert_eq!(
+            context.provider_snapshot(keys::DOMAIN).unwrap(),
+            before_domain
+        );
+        assert_eq!(
+            context.provider_snapshot(keys::EFFECT_BROKER).unwrap(),
+            before_broker
+        );
+    }
+
+    #[test]
+    fn fibers_are_monotonic_isolated_and_dispose_owned_records_once() {
+        let mut context = Context::new();
+        let root = context.root_fiber();
+        assert_eq!(root.uid(), FiberUid::ROOT);
+        context.set_var("scope", "parent");
+        let parent_disposals = Arc::new(AtomicUsize::new(0));
+        let parent_disposals_for_effect = Arc::clone(&parent_disposals);
+        let parent_handle = context.effect(move || {
+            parent_disposals_for_effect.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let child = context.new_fiber().unwrap();
+        let grandchild = context.child_fiber(&child).unwrap();
+        assert!(child.uid() > root.uid());
+        assert!(grandchild.uid() > child.uid());
+        assert_eq!(child.parent_uid(), Some(root.uid()));
+        assert_eq!(grandchild.parent_uid(), Some(child.uid()));
+
+        let child_disposals = Arc::new(AtomicUsize::new(0));
+        let child_disposals_for_effect = Arc::clone(&child_disposals);
+        {
+            let mut view = context.with_fiber(&child).isolate("tenant");
+            assert_eq!(view.var("scope"), Some(&ConfigValue::string("parent")));
+            view.set_var("scope", "child");
+            view.provide("child-only", 42_u32).unwrap();
+            view.effect(move || {
+                child_disposals_for_effect.fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(view.has("child-only"));
+        }
+        assert_eq!(context.var("scope"), Some(&ConfigValue::string("parent")));
+        assert!(context.get::<u32>("child-only").is_none());
+        assert_eq!(
+            child.metadata_snapshot().lookup("scope"),
+            Some(&ConfigValue::string("child"))
+        );
+
+        assert!(context.dispose_fiber(&child).unwrap());
+        assert!(!context.dispose_fiber(&child).unwrap());
+        assert_eq!(child_disposals.load(Ordering::SeqCst), 1);
+        assert!(context.get::<u32>("child-only").is_none());
+        assert!(!parent_handle.is_disposed());
+        assert_eq!(parent_disposals.load(Ordering::SeqCst), 0);
+        context.teardown();
+        assert_eq!(parent_disposals.load(Ordering::SeqCst), 1);
+        assert!(parent_handle.is_disposed());
+        assert_eq!(child.state(), FiberState::Disposed);
+        assert_eq!(grandchild.state(), FiberState::Disposed);
+    }
+
+    #[test]
+    fn registration_handles_are_idempotent_and_reentrant() {
+        let mut context = Context::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let first = context.effect(move || {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+        });
+        let first_for_second = first.clone();
+        let second_calls = Arc::clone(&calls);
+        let second = context.effect(move || {
+            assert!(first_for_second.dispose());
+            second_calls.fetch_add(1, Ordering::SeqCst);
+        });
+        context.teardown();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(first.is_disposed());
+        assert!(second.is_disposed());
+        assert!(!first.dispose());
+        assert!(!second.dispose());
     }
 }
 

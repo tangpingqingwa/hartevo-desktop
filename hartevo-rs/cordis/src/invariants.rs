@@ -29,9 +29,10 @@ impl Service for InvariantGate {
         &[keys::DOMAIN, keys::EFFECT_BROKER]
     }
 
-    fn apply(self, ctx: &mut Context) {
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
         let _ = ctx.domain::<DomainSurface>();
         let _ = ctx.effect_broker::<EffectBrokerSurface>();
+        Ok(())
     }
 }
 

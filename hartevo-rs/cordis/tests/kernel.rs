@@ -9,8 +9,9 @@ struct Marker(&'static str);
 struct ProvideTools;
 
 impl Service for ProvideTools {
-    fn apply(self, ctx: &mut Context) {
-        ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
+        ctx.provide(keys::TOOLS, Marker("tools"))?;
+        Ok(())
     }
 }
 
@@ -23,9 +24,10 @@ impl Service for NeedsTools {
         &[keys::TOOLS]
     }
 
-    fn apply(self, ctx: &mut Context) {
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
         assert!(ctx.get::<Marker>(keys::TOOLS).is_some());
         self.started.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -38,8 +40,9 @@ impl Service for NeedsToolsAndLlm {
         &[keys::TOOLS, keys::LLM]
     }
 
-    fn apply(self, _ctx: &mut Context) {
+    fn apply(self, _ctx: &mut Context) -> Result<(), CordisError> {
         self.started.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -49,11 +52,12 @@ struct RecordEffect {
 }
 
 impl Service for RecordEffect {
-    fn apply(self, ctx: &mut Context) {
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
         let order = Arc::clone(&self.order);
         let tag = self.tag;
         ctx.effect(move || order.lock().expect("order").push(tag));
-        ctx.on(tag, || {}).unwrap();
+        ctx.on(tag, || {})?;
+        Ok(())
     }
 }
 

@@ -27,11 +27,10 @@ impl Service for AgentLoop {
         AGENT_LOOP_KEYS
     }
 
-    fn apply(self, ctx: &mut Context) {
-        ctx.on_emit(events::AGENT_CREATED, |_: &AgentRef| {})
-            .expect("agent/created observer");
-        ctx.on_emit(events::AGENT_DISPOSED, |_: &AgentRef| {})
-            .expect("agent/disposed observer");
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
+        ctx.on_emit(events::AGENT_CREATED, |_: &AgentRef| {})?;
+        ctx.on_emit(events::AGENT_DISPOSED, |_: &AgentRef| {})?;
+        Ok(())
     }
 }
 

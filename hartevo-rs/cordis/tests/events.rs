@@ -9,8 +9,9 @@ struct Marker(&'static str);
 struct ProvideTools;
 
 impl Service for ProvideTools {
-    fn apply(self, ctx: &mut Context) {
-        ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
+        ctx.provide(keys::TOOLS, Marker("tools"))?;
+        Ok(())
     }
 }
 
