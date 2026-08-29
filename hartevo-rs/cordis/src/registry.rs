@@ -187,6 +187,28 @@ impl SupervisorReservation {
     }
 }
 
+/// A provider obtains its cleanup slot before it can become observable.  The
+/// reservation is deliberately single-use: the provider's exactly-once
+/// disposer transfers it to the removal coordinator without a second
+/// fallible supervisor handshake during owner teardown.
+struct ProviderTeardownAuthority {
+    reservation: Mutex<Option<SupervisorReservation>>,
+}
+
+impl ProviderTeardownAuthority {
+    fn new(reservation: SupervisorReservation) -> Self {
+        Self {
+            reservation: Mutex::new(Some(reservation)),
+        }
+    }
+
+    fn take(&self) -> Result<SupervisorReservation, CordisError> {
+        lock(&self.reservation)
+            .take()
+            .ok_or(CordisError::AsyncRuntimeUnavailable)
+    }
+}
+
 pub(crate) type PendingId = u64;
 
 pub(crate) struct PendingEntry {
@@ -695,44 +717,6 @@ impl LifecycleRegistry {
             .reserve()
     }
 
-    fn fence_owner_provider_without_supervisor(&self, handle: &LifecycleProviderHandle) {
-        let mut state = lock(&self.inner.state);
-        let key = RuntimeProviderKey::new(&handle.namespace, &handle.key);
-        let Some(slot) = state.providers.get(&key) else {
-            return;
-        };
-        if slot.recovery_fence.is_some() {
-            return;
-        }
-        let exact = slot.record.as_ref().is_some_and(|record| {
-            record.provider_id == handle.provider_id
-                && record.owner.uid() == handle.owner_uid
-                && record.generation == handle.generation
-        });
-        if !exact {
-            return;
-        }
-        let next_revision = slot.revision.checked_add(2);
-        let next_removal = slot.removal_serial.checked_add(1);
-        if let (Some(revision), Some(removal_serial)) = (next_revision, next_removal) {
-            if let Some(slot) = state.providers.get_mut(&key) {
-                // Exact provider identity plus the slot counters fence this
-                // synchronous owner-teardown fallback from any delayed older
-                // completion. Consumers are intentionally left untouched:
-                // without a reserved supervisor there is no durable waiter,
-                // while a later provide/reconcile can safely recover them.
-                slot.revision = revision;
-                slot.removal_serial = removal_serial;
-                slot.record = None;
-                slot.recovery_fence = None;
-            }
-        } else {
-            // Global provider ids never repeat, so dropping an exhausted exact
-            // slot cannot let an old completion delete a later replacement.
-            state.providers.remove(&key);
-        }
-    }
-
     pub fn mount(
         &self,
         factory: PluginFactory,
@@ -968,28 +952,26 @@ impl LifecycleRegistry {
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         require_async_runtime()?;
         self.validate_provider_handle(handle)?;
-        self.begin_provider_removal_with_mode(handle, ProviderRemovalMode::Strict)
+        let supervisor = self.ensure_supervisor()?;
+        self.begin_provider_removal_with_reservation(
+            handle,
+            ProviderRemovalMode::Strict,
+            supervisor,
+        )
     }
 
     #[expect(
         clippy::too_many_lines,
-        reason = "keep owner-teardown reservation, recovery, and exact compare-delete in one path"
+        reason = "keep owner-teardown recovery and exact compare-delete in one path"
     )]
-    fn begin_provider_removal_with_mode(
+    fn begin_provider_removal_with_reservation(
         &self,
         handle: &LifecycleProviderHandle,
         mode: ProviderRemovalMode,
+        supervisor: SupervisorReservation,
     ) -> Result<BoxFuture<'static, Result<(), CordisError>>, CordisError> {
         self.validate_provider_handle(handle)?;
         let owner_teardown = matches!(&mode, ProviderRemovalMode::OwnerTeardown { .. });
-        let supervisor = match self.ensure_supervisor() {
-            Ok(supervisor) => supervisor,
-            Err(error) if owner_teardown => {
-                self.fence_owner_provider_without_supervisor(handle);
-                return Ok(async move { Err(error) }.boxed());
-            }
-            Err(error) => return Err(error),
-        };
         let mut recovery = RecoveryPlan::default();
         if let ProviderRemovalMode::OwnerTeardown { driver_runtime } = &mode {
             if let Err(error) = driver_runtime.require_alive() {
@@ -2380,6 +2362,7 @@ fn prepared_activations_equivalent(left: &PreparedActivation, right: &PreparedAc
                     && left.revision == right.revision
                     && left.removal_serial == right.removal_serial
                     && left.handle == right.handle
+                    && Arc::ptr_eq(&left.teardown, &right.teardown)
                     && provider_slot_facts_equivalent(
                         left.expected_slot.as_ref(),
                         right.expected_slot.as_ref(),
@@ -2844,6 +2827,7 @@ struct ProvisionalProvider {
     key: String,
     value: ProviderValue,
     guard: Option<ProviderGuard>,
+    teardown: Arc<ProviderTeardownAuthority>,
 }
 
 #[derive(Clone)]
@@ -2991,6 +2975,18 @@ impl LifecycleContextView {
         let key = key.into();
         let namespace = self.namespace.clone();
         let value: ProviderValue = Arc::new(value);
+        // Reserve the durable removal coordinator before the provider enters
+        // the provisional ledger.  A stale activation simply drops this
+        // token; a committed provider transfers it to its exactly-once
+        // disposer.  Owner teardown therefore has no late fallible handshake
+        // that could tempt a consumer-bypassing store delete.
+        let (inner, _) = self.authority()?;
+        let teardown = Arc::new(ProviderTeardownAuthority::new(
+            LifecycleRegistry {
+                inner: inner.clone(),
+            }
+            .ensure_supervisor()?,
+        ));
         self.with_activation_write(move |registry, _, state| {
             let provider_key = RuntimeProviderKey::new(&namespace, &key);
             if state
@@ -3010,6 +3006,7 @@ impl LifecycleContextView {
                 key,
                 value,
                 guard: None,
+                teardown,
             });
             Ok(())
         })
@@ -4305,6 +4302,7 @@ fn commit_provisional_providers(
     for plan in provider_plans {
         let owner_driver = runtime_provider_owner_control(&plan.record.owner_binding)
             .map(|control| control.driver_runtime.clone());
+        let teardown = plan.teardown;
         let slot = registry
             .providers
             .entry(plan.key)
@@ -4321,10 +4319,12 @@ fn commit_provisional_providers(
             let Some(driver_runtime) = owner_driver else {
                 return Err(CordisError::AsyncRuntimeUnavailable);
             };
+            let supervisor = teardown.take()?;
             LifecycleRegistry { inner }
-                .begin_provider_removal_with_mode(
+                .begin_provider_removal_with_reservation(
                     &handle,
                     ProviderRemovalMode::OwnerTeardown { driver_runtime },
+                    supervisor,
                 )?
                 .await
         })]);
@@ -4415,6 +4415,7 @@ struct ProvisionalProviderPlan {
     removal_serial: u64,
     record: RuntimeProviderRecord,
     handle: LifecycleProviderHandle,
+    teardown: Arc<ProviderTeardownAuthority>,
 }
 
 fn prepare_activation_commit(
@@ -4523,6 +4524,7 @@ fn provisional_provider_plan(
             owner_uid: control.fiber.uid(),
             generation,
         },
+        teardown: provider.teardown.clone(),
     }
 }
 
@@ -7142,13 +7144,11 @@ mod lifecycle_boundary_tests {
                     .wait_until_active(LifecycleCancellation::default())
                     .await
                     .unwrap();
-                for _ in 0..128 {
-                    if registry.get::<u32>("dead-binding-child-key").is_some() {
-                        return (parent, sibling);
-                    }
-                    tokio::task::yield_now().await;
-                }
-                panic!("provisional child did not publish its provider");
+                wait_for_registry_condition("provisional child provider publication", || {
+                    registry.get::<u32>("dead-binding-child-key").is_some()
+                })
+                .await;
+                (parent, sibling)
             });
             assert_eq!(
                 registry.get::<u32>("dead-binding-parent-key").as_deref(),
@@ -7813,12 +7813,14 @@ mod lifecycle_boundary_tests {
             .death
             .send_replace(false);
 
+        let supervisor = registry.ensure_supervisor().unwrap();
         let result = registry
-            .begin_provider_removal_with_mode(
+            .begin_provider_removal_with_reservation(
                 &original,
                 ProviderRemovalMode::OwnerTeardown {
                     driver_runtime: consumer_control.driver_runtime.clone(),
                 },
+                supervisor,
             )
             .unwrap()
             .await;
@@ -7845,12 +7847,34 @@ mod lifecycle_boundary_tests {
     }
 
     #[tokio::test]
-    async fn supervisor_reservation_failure_fences_owner_but_not_public_strict_removal() {
+    async fn durable_provider_teardown_cleans_consumer_before_failed_restart_republish() {
         let registry = LifecycleRegistry::new();
+        let consumer_starts = Arc::new(AtomicU64::new(0));
+        let consumer_cleanups = Arc::new(AtomicU64::new(0));
+        let consumer = registry
+            .mount(
+                PluginFactory::new_lifecycle("reservation-restart-consumer", {
+                    let consumer_starts = consumer_starts.clone();
+                    let consumer_cleanups = consumer_cleanups.clone();
+                    move |_, _| {
+                        consumer_starts.fetch_add(1, Ordering::SeqCst);
+                        LifecycleEffect::disposer(LifecycleDisposer::new({
+                            let consumer_cleanups = consumer_cleanups.clone();
+                            move || async move {
+                                consumer_cleanups.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            }
+                        }))
+                    }
+                })
+                .with_inject(["reservation-restart-key"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
         let owner = registry
             .mount(
-                PluginFactory::new_lifecycle("reservation-failure-owner", |_, view| {
-                    view.provide("reservation-failure-key", 86_u32)?;
+                PluginFactory::new_lifecycle("reservation-restart-owner", |_, view| {
+                    view.provide("reservation-restart-key", 86_u32)?;
                     Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
                 }),
                 ConfigValue::default(),
@@ -7861,34 +7885,189 @@ mod lifecycle_boundary_tests {
             .wait_until_active(LifecycleCancellation::default())
             .await
             .unwrap();
-        let first_provider_id =
-            provider_boundary_snapshot(&registry, "root", "reservation-failure-key")
-                .slot
-                .unwrap()
-                .provider_id
-                .unwrap();
+        consumer
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(consumer_starts.load(Ordering::SeqCst), 1);
         registry
             .inner
             .supervisor_reservation_failures
             .store(1, Ordering::Release);
-        let restarted = owner.restart().await.unwrap();
-        assert_eq!(restarted.state(), FiberState::Active);
-        assert!(
-            restarted
-                .diagnostics()
-                .contains(&CordisError::AsyncRuntimeUnavailable)
-        );
-        let second_provider_id =
-            provider_boundary_snapshot(&registry, "root", "reservation-failure-key")
-                .slot
-                .unwrap()
-                .provider_id
-                .unwrap();
-        assert_ne!(first_provider_id, second_provider_id);
+        assert!(matches!(
+            owner.restart().await,
+            Err(CordisError::AsyncRuntimeUnavailable)
+        ));
+        assert_eq!(consumer_cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(consumer.snapshot().state(), FiberState::Pending);
+        assert!(registry.get::<u32>("reservation-restart-key").is_none());
 
+        let recovered = owner.update(ConfigValue::default()).await.unwrap();
+        assert_eq!(recovered.state(), FiberState::Active);
+        consumer
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(consumer_starts.load(Ordering::SeqCst), 2);
+        assert_eq!(consumer_cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.get::<u32>("reservation-restart-key").as_deref(),
+            Some(&86)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_provider_teardown_dispose_waits_for_consumer_without_late_reserve() {
+        let registry = LifecycleRegistry::new();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let consumer = registry
+            .mount(
+                PluginFactory::new_lifecycle("reservation-dispose-consumer", {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    move |_, _| {
+                        LifecycleEffect::disposer(LifecycleDisposer::new({
+                            let entered = entered.clone();
+                            let release = release.clone();
+                            move || async move {
+                                if let Some(sender) = lock(&entered).take() {
+                                    let _ = sender.send(());
+                                }
+                                release.wait().await;
+                                Ok(())
+                            }
+                        }))
+                    }
+                })
+                .with_inject(["reservation-dispose-key"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        let owner = registry
+            .mount(
+                PluginFactory::new_lifecycle("reservation-dispose-owner", |_, view| {
+                    view.provide("reservation-dispose-key", 87_u32)?;
+                    Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                }),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        owner
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        consumer
+            .fiber()
+            .wait_until_active(LifecycleCancellation::default())
+            .await
+            .unwrap();
+        registry
+            .inner
+            .supervisor_reservation_failures
+            .store(1, Ordering::Release);
+
+        let disposal = tokio::spawn({
+            let owner = owner.clone();
+            async move { owner.dispose_async().await }
+        });
+        entered_rx.await.unwrap();
+        let during_cleanup =
+            provider_boundary_snapshot(&registry, "root", "reservation-dispose-key");
+        assert!(
+            during_cleanup
+                .slot
+                .as_ref()
+                .is_some_and(|slot| slot.removing)
+        );
+        assert_eq!(
+            registry
+                .inner
+                .supervisor_reservation_failures
+                .load(Ordering::Acquire),
+            1
+        );
+
+        release.wait().await;
+        assert_eq!(
+            disposal.await.unwrap().unwrap().state(),
+            FiberState::Disposed
+        );
+        assert!(registry.get::<u32>("reservation-dispose-key").is_none());
+        assert_eq!(
+            consumer.await_current().await.unwrap().state(),
+            FiberState::Pending
+        );
+        assert_eq!(
+            registry
+                .inner
+                .supervisor_reservation_failures
+                .load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_publication_reservation_failure_is_atomic() {
+        let registry = LifecycleRegistry::new();
+        let consumer_starts = Arc::new(AtomicU64::new(0));
+        let consumer = registry
+            .mount(
+                PluginFactory::new_lifecycle("reservation-publish-consumer", {
+                    let consumer_starts = consumer_starts.clone();
+                    move |_, _| {
+                        consumer_starts.fetch_add(1, Ordering::SeqCst);
+                        LifecycleEffect::none()
+                    }
+                })
+                .with_inject(["reservation-publish-key"]),
+                ConfigValue::default(),
+            )
+            .unwrap();
+        consumer.await_current().await.unwrap();
+        let provider_before =
+            provider_boundary_snapshot(&registry, "root", "reservation-publish-key");
+        let consumer_before = machine_boundary_snapshot(&consumer.control().unwrap());
+        registry
+            .inner
+            .supervisor_reservation_failures
+            .store(1, Ordering::Release);
+        let owner = registry
+            .mount(
+                PluginFactory::new_lifecycle("reservation-publish-owner", |_, view| {
+                    view.provide("reservation-publish-key", 88_u32)?;
+                    Ok::<LifecycleEffect, CordisError>(LifecycleEffect::none())
+                }),
+                ConfigValue::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            owner.await_current().await,
+            Err(CordisError::AsyncRuntimeUnavailable)
+        ));
+        assert_eq!(owner.snapshot().state(), FiberState::Failed);
+        assert_eq!(
+            provider_boundary_snapshot(&registry, "root", "reservation-publish-key"),
+            provider_before
+        );
+        assert_eq!(
+            machine_boundary_snapshot(&consumer.control().unwrap()),
+            consumer_before
+        );
+        assert_eq!(consumer_starts.load(Ordering::SeqCst), 0);
+        assert!(registry.get::<u32>("reservation-publish-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_reservation_failure_leaves_public_strict_removal_unchanged() {
         let strict_registry = LifecycleRegistry::new();
         let strict = strict_registry
-            .provide("reservation-strict-key", 87_u32)
+            .provide("reservation-strict-key", 89_u32)
             .unwrap();
         let strict_before =
             provider_boundary_snapshot(&strict_registry, "root", "reservation-strict-key");
@@ -7908,7 +8087,7 @@ mod lifecycle_boundary_tests {
             strict_registry
                 .get::<u32>("reservation-strict-key")
                 .as_deref(),
-            Some(&87)
+            Some(&89)
         );
     }
 }
