@@ -18,12 +18,12 @@ use hartevo_application::{
     CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
     DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
-    FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
-    MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
-    PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProposePreviewEffect, ProvisionProjectEncryption, RecoverContextWorkerRuntime,
-    RecoverPersonalProjectDevice, RelationshipConversationProjection, ResearchPacket,
-    ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
+    ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
+    KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
+    ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession,
+    ProjectEncryptionReadiness, ProposePreviewEffect, ProvisionProjectEncryption,
+    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
+    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
     RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
     RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
     StartCatalogMission, StartMission, Vm11NextContractOrValidTerminalResult,
@@ -39,22 +39,25 @@ use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblySta
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, DomainCommandBinding, DomainCommandKind,
-    RuntimeBinding, RuntimeRecordBinding,
+    EffectExecutionBinding, RuntimeBinding, RuntimeRecordBinding,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
     BrowserWorkspaceId, CompanyId, ConnectionId, ConsentRecord, ConsentState, ConsentStatus,
     ContactChannel, Conversation, ConversationId, CreatorTaskId, CurrencyCode, DeliverableId,
-    DeviceId, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
+    DeviceId, Effect, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
     MessagingGateway, Mission, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
     MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
     MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, PersonId,
-    ProjectEncryptionMode, ProjectId, ProjectKeyring, ReviewDecision, ReviewId,
+    ProjectEncryptionMode, ProjectId, ProjectKeyring, ReceiptId, ReviewDecision, ReviewId,
     RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
-    RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId,
-    WorkerHandleStatus,
+    RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId, VerificationId,
+    VerificationStatus, WorkProductId, WorkerHandleStatus,
 };
-use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
+use hartevo_effect_broker::{
+    BrokerResult, EffectBroker, EffectExecutor, EffectPolicy, EffectRateLimit, EffectVerifier,
+    ExecutionDisposition,
+};
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
 use hartevo_storage::{
     ContextMaterialStoreError, DatabaseKey, KeyMaterial, OsSecretStore, ProjectStore,
@@ -66,8 +69,9 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::cordis_host::{
-    DesktopCordisCoordinator, DesktopDomainCommandAuthorization, dispatch_live_domain_command,
-    dispatch_live_runtime, mount_cordis_host,
+    DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
+    DesktopEffectExecutionAuthorization, dispatch_live_domain_command,
+    dispatch_live_effect_execution, dispatch_live_runtime, mount_cordis_host,
 };
 #[cfg(test)]
 use crate::cordis_host::{
@@ -564,6 +568,46 @@ pub struct DesktopWaitingApprovalGrantRequest {
     pub effect_id: EffectId,
     pub expected_scope_digest: String,
     pub expected_mission_revision: u64,
+}
+
+/// Exact Desktop-to-Cordis fence for one first execution of an Approved
+/// Effect. Both digests and the Mission revision must come from the durable
+/// SQLCipher projection; no provider payload or credential crosses Cordis.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopApprovedEffectExecutionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_broker_authorization_digest: String,
+    pub expected_mission_revision: u64,
+}
+
+impl fmt::Debug for DesktopApprovedEffectExecutionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopApprovedEffectExecutionRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("effect_id", &self.effect_id)
+            .field("expected_scope_digest", &"[DIGEST]")
+            .field("expected_broker_authorization_digest", &"[DIGEST]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .finish()
+    }
+}
+
+/// Desktop projection keeps provider Receipt and independent Verification as
+/// separate typed facts. It deliberately excludes provider external ids,
+/// response bodies, credentials, and Effect payload content.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesktopApprovedEffectExecution {
+    pub snapshot: DesktopSnapshot,
+    pub disposition: ExecutionDisposition,
+    pub receipt_id: ReceiptId,
+    pub verification_id: VerificationId,
+    pub verification_status: VerificationStatus,
+    pub verification_independent: bool,
 }
 
 /// Exact Desktop-to-Cordis proposal fence for one preview Effect. The complete
@@ -2387,6 +2431,123 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Execute one exact Approved Effect through
+    /// Cordis → Desktop → Application → Effect Broker.
+    ///
+    /// The caller supplies a Broker-owned executor and independent verifier;
+    /// neither capability enters Cordis. There is intentionally no default OS
+    /// provider here until a real connector is selected by a later slice.
+    pub fn execute_approved_effect_with<Executor, Verifier>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopApprovedEffectExecutionRequest,
+        broker: &mut EffectBroker,
+        executor: &mut Executor,
+        verifier: &mut Verifier,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopApprovedEffectExecution, DesktopDataError>
+    where
+        Executor: EffectExecutor,
+        Verifier: EffectVerifier,
+    {
+        let DesktopApprovedEffectExecutionRequest {
+            project_id,
+            mission_id,
+            effect_id,
+            expected_scope_digest,
+            expected_broker_authorization_digest,
+            expected_mission_revision,
+        } = request;
+        if expected_mission_revision == 0
+            || effect_id.as_str().trim().is_empty()
+            || !is_canonical_sha256(&expected_scope_digest)
+            || !is_canonical_sha256(&expected_broker_authorization_digest)
+        {
+            return Err(DesktopDataError::InvalidApprovedEffectExecution);
+        }
+
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.revision != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: mission.revision,
+            }
+            .into());
+        }
+        let scope = authority_scope_for_mission(&mission, &project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+        let approval = effect
+            .approval
+            .clone()
+            .ok_or(ApplicationError::EffectExecutionAuthorityMismatch)?;
+        let (consent, record) = live_effect_consent_facts(&service, &effect, now)?;
+        let binding = EffectExecutionBinding::new(
+            effect_id.as_str(),
+            expected_scope_digest.clone(),
+            expected_broker_authorization_digest.clone(),
+        )?;
+
+        let (_, result): (_, BrokerResult) =
+            map_effect_execution_dispatch_result(dispatch_live_effect_execution(
+                &self.cordis,
+                DesktopEffectExecutionAuthorization::new(scope, binding),
+                &consent,
+                record.as_ref(),
+                &approval,
+                now,
+                |permit| {
+                    let current_scope =
+                        mission_authority_scope(&service, &project_id, &mission_id)?;
+                    if &current_scope != permit.scope()
+                        || permit.binding().effect_id() != effect_id.as_str()
+                        || permit.binding().approval_scope_digest()
+                            != expected_scope_digest.as_str()
+                        || permit.binding().broker_authorization_digest()
+                            != expected_broker_authorization_digest.as_str()
+                    {
+                        return Err(CordisError::EffectExecutionPermitMismatch.into());
+                    }
+                    service
+                        .execute_approved_effect_at_revision(
+                            broker,
+                            &ExecuteApprovedEffect {
+                                project_id: project_id.clone(),
+                                mission_id: mission_id.clone(),
+                                effect_id: effect_id.clone(),
+                                expected_scope_digest: expected_scope_digest.clone(),
+                                expected_broker_authorization_digest:
+                                    expected_broker_authorization_digest.clone(),
+                                expected_mission_revision,
+                            },
+                            executor,
+                            verifier,
+                            now,
+                        )
+                        .map_err(DesktopDataError::from)
+                },
+            ))?;
+        let snapshot = self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
+            now,
+        )?;
+        Ok(DesktopApprovedEffectExecution {
+            snapshot,
+            disposition: result.disposition,
+            receipt_id: result.receipt.id,
+            verification_id: result.verification.id,
+            verification_status: result.verification.status,
+            verification_independent: result.verification.independent,
+        })
+    }
+
     fn continue_mission_and_run_with(
         &self,
         secret_store: &impl SecretStore,
@@ -4131,6 +4292,13 @@ fn effect_proposal_authority_field(hasher: &mut Sha256, name: &str, value: &[u8]
     hasher.update(value);
 }
 
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 /// Bind the complete typed proposal to one exact Mission revision and proposal
 /// time without exposing proposal content to Cordis. `ProposePreviewEffect`
 /// contains only ordered fields and `BTreeSet`s, so its JSON encoding is
@@ -4612,6 +4780,67 @@ struct LiveDomainKernelFacts {
     approval: Option<Approval>,
 }
 
+/// Re-read the exact Consent record bound by one Effect. This is only the
+/// coarse Cordis host gate; Effect Broker still owns the transactional
+/// permission-evidence and policy revalidation immediately before claim.
+fn live_effect_consent_facts(
+    service: &ApplicationService,
+    effect: &Effect,
+    now: DateTime<Utc>,
+) -> Result<(ConsentState, Option<ConsentRecord>), DesktopDataError> {
+    if effect.consent == ConsentState::NotRequired {
+        // The generic Cordis gate intentionally does not trust an unscoped
+        // `NotRequired` assertion. Here the value was re-read from this exact
+        // durable Effect and is therefore translated into a satisfied gate;
+        // Broker still revalidates the full Effect transactionally.
+        return Ok((ConsentState::Confirmed, None));
+    }
+    let Some(consent_record_id) = effect.consent_record_id.as_ref() else {
+        return Ok((ConsentState::Missing, None));
+    };
+    let record = service
+        .list_consent_records(&effect.project_id)?
+        .into_iter()
+        .find(|record| {
+            record.id == *consent_record_id
+                && record.tenant_id == effect.tenant_id
+                && record.project_id == effect.project_id
+        });
+    let Some(record) = record else {
+        return Ok((ConsentState::Missing, None));
+    };
+    let permitted = effect.consent_requirement.as_ref().map_or_else(
+        || {
+            record.permits(
+                &record.person_id,
+                &record.purpose,
+                &record.channel,
+                &record.market,
+                now,
+            )
+        },
+        |requirement| {
+            record.permits(
+                &requirement.person_id,
+                &requirement.purpose,
+                &requirement.channel,
+                &requirement.market,
+                now,
+            )
+        },
+    );
+    let consent = match record.status {
+        ConsentStatus::Granted if effect.consent == ConsentState::Confirmed && permitted => {
+            ConsentState::Confirmed
+        }
+        ConsentStatus::Withdrawn => ConsentState::Withdrawn,
+        ConsentStatus::Granted | ConsentStatus::Denied | ConsentStatus::Expired => {
+            ConsentState::Missing
+        }
+    };
+    Ok((consent, Some(record)))
+}
+
 fn live_domain_kernel_facts(
     service: &ApplicationService,
     project_id: &ProjectId,
@@ -5039,6 +5268,19 @@ fn map_domain_command_dispatch_result<T>(
     }
 }
 
+fn map_effect_execution_dispatch_result<T>(
+    result: Result<T, AuthorityDispatchError<DesktopDataError>>,
+) -> Result<T, DesktopDataError> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(AuthorityDispatchError::Cordis(error)) => Err((*error).into()),
+        Err(AuthorityDispatchError::Authority(error)) => Err(error),
+        Err(error @ AuthorityDispatchError::Combined(_)) => {
+            Err(DesktopDataError::EffectExecutionDispatch(Box::new(error)))
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DesktopDataError {
     #[error("Desktop data root must be an absolute non-symlink directory: {0}")]
@@ -5071,6 +5313,10 @@ pub enum DesktopDataError {
         "WaitingApproval grant requires an exact Proposed Effect digest and Mission CAS revision"
     )]
     InvalidWaitingApprovalGrant,
+    #[error(
+        "Approved Effect execution requires exact scope/Broker authorization digests and a Mission CAS revision"
+    )]
+    InvalidApprovedEffectExecution,
     #[error(
         "Effect proposal requires a typed payload, canonical digest, stable idempotency key, positive expiry, and exact Mission CAS revision"
     )]
@@ -5137,6 +5383,8 @@ pub enum DesktopDataError {
     RuntimeDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error("Cordis Domain command dispatch failed across phases: {0}")]
     DomainCommandDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
+    #[error("Cordis Effect execution failed across phases: {0}")]
+    EffectExecutionDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -5173,10 +5421,11 @@ mod tests {
         KeyRecipient, KpiDirection, LegalBasis, MessagingGateway, MissionCheckpointExecutor,
         MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision, OutcomeEvent,
         OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
-        PartnerId, Person, PersonId, ProbeOutcome, ProjectEncryptionMode, RightsAttestation,
-        StorageMode, TaskId, TaskStatus, UsageRights, WorkProductId, WorkerLeaseStatus,
+        PartnerId, Person, PersonId, ProbeOutcome, ProjectEncryptionMode, Receipt, ReceiptId,
+        RightsAttestation, StorageMode, TaskId, TaskStatus, UsageRights, Verification,
+        VerificationId, VerificationStatus, WorkProductId, WorkerLeaseStatus,
     };
-    use hartevo_effect_broker::EffectBroker;
+    use hartevo_effect_broker::{EffectBroker, EffectExecutor, EffectVerifier, ProviderFailure};
     use hartevo_storage::MemorySecretStore;
     use rust_decimal::Decimal;
 
@@ -11204,6 +11453,111 @@ sleep 30"#;
         )
     }
 
+    fn approved_preview_execution_request(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        suffix: &str,
+        now: DateTime<Utc>,
+    ) -> DesktopApprovedEffectExecutionRequest {
+        let (mission_id, effect_id, scope_digest, revision) =
+            propose_waiting_approval_preview(plane, secrets, project_id, suffix, now);
+        plane
+            .grant_waiting_approval_with(
+                secrets,
+                DesktopWaitingApprovalGrantRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: effect_id.clone(),
+                    expected_scope_digest: scope_digest,
+                    expected_mission_revision: revision,
+                },
+                now + Duration::seconds(3),
+            )
+            .expect("approved preview Effect");
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("application after approval");
+        let mission = service
+            .load_mission(project_id, &mission_id)
+            .expect("approved Mission");
+        let approval = mission
+            .effect(&effect_id)
+            .expect("approved Effect")
+            .approval
+            .as_ref()
+            .expect("approval");
+        DesktopApprovedEffectExecutionRequest {
+            project_id: project_id.clone(),
+            mission_id,
+            effect_id,
+            expected_scope_digest: approval.scope_digest.clone(),
+            expected_broker_authorization_digest: approval.permission_digest.clone(),
+            expected_mission_revision: mission.revision,
+        }
+    }
+
+    struct DesktopPreviewExecutor {
+        calls: usize,
+        accepted_at: DateTime<Utc>,
+        uncertain: bool,
+    }
+
+    impl EffectExecutor for DesktopPreviewExecutor {
+        fn execute(
+            &mut self,
+            effect: &hartevo_domain_kernel::Effect,
+        ) -> Result<Receipt, ProviderFailure> {
+            self.calls += 1;
+            if self.uncertain {
+                return Err(ProviderFailure::Uncertain(
+                    "fixture provider outcome is unknown".into(),
+                ));
+            }
+            Ok(Receipt {
+                id: ReceiptId::from_stable(format!(
+                    "desktop-cordis-receipt:{}",
+                    effect.id.as_str()
+                )),
+                provider: effect.provider.clone(),
+                external_id: format!("preview-{}", effect.id.as_str()),
+                accepted_at: self.accepted_at,
+                request_digest: effect.approval_digest(),
+                response_digest: "8".repeat(64),
+            })
+        }
+    }
+
+    struct DesktopPreviewVerifier {
+        calls: usize,
+        observed_at: DateTime<Utc>,
+    }
+
+    impl EffectVerifier for DesktopPreviewVerifier {
+        fn verify(
+            &mut self,
+            _effect: &hartevo_domain_kernel::Effect,
+            receipt: &Receipt,
+        ) -> Verification {
+            self.calls += 1;
+            Verification {
+                id: VerificationId::from_stable(format!(
+                    "desktop-cordis-verification:{}",
+                    receipt.id.as_str()
+                )),
+                status: VerificationStatus::Confirmed,
+                verifier: "independent-preview-readback".into(),
+                independent: true,
+                observed_at: self.observed_at,
+                evidence_digest: "9".repeat(64),
+                receipt_id: receipt.id.clone(),
+            }
+        }
+    }
+
     #[test]
     fn effect_proposal_routes_through_cordis_and_stops_at_waiting_approval() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -11711,6 +12065,296 @@ sleep 30"#;
                 .expect("unchanged events"),
             events_before
         );
+    }
+
+    #[test]
+    fn approved_effect_executes_once_through_cordis_and_real_broker_path() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(4);
+        let request =
+            approved_preview_execution_request(&plane, &secrets, &project_id, "execute", now);
+        let entry_at = now + Duration::seconds(5);
+        let mut broker = production_preview_broker();
+        let mut executor = DesktopPreviewExecutor {
+            calls: 0,
+            accepted_at: entry_at + Duration::milliseconds(1),
+            uncertain: false,
+        };
+        let mut verifier = DesktopPreviewVerifier {
+            calls: 0,
+            observed_at: entry_at + Duration::milliseconds(2),
+        };
+
+        let executed = plane
+            .execute_approved_effect_with(
+                &secrets,
+                request.clone(),
+                &mut broker,
+                &mut executor,
+                &mut verifier,
+                entry_at,
+            )
+            .expect("Cordis-authorized Broker execution");
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
+        assert_eq!(executed.disposition, ExecutionDisposition::Executed);
+        assert_eq!(executed.verification_status, VerificationStatus::Confirmed);
+        assert!(executed.verification_independent);
+        assert_ne!(
+            executed.receipt_id.as_str(),
+            executed.verification_id.as_str()
+        );
+        let projected = executed.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == request.mission_id)
+            .expect("executed Mission projection");
+        assert_eq!(projected.verified_effect_count, 1);
+        assert_ne!(projected.stage, MissionStage::Completed);
+
+        {
+            let cordis = plane.lock_cordis();
+            let bound = cordis.bound_scope().expect("exact execution scope");
+            assert_eq!(bound.project_id(), request.project_id.as_str());
+            assert_eq!(bound.mission_id(), request.mission_id.as_str());
+            assert_eq!(bound.mission_revision(), request.expected_mission_revision);
+            assert!(bound.runtime().is_none());
+            assert!(cordis.active_effect_execution_scope().is_none());
+            assert!(cordis.active_domain_command_scope().is_none());
+            assert!(cordis.active_runtime_scope().is_none());
+        }
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, entry_at)
+            .expect("reopen after execution");
+        let mission = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("durable executed Mission");
+        let effect = mission.effect(&request.effect_id).expect("durable Effect");
+        assert_eq!(effect.status, EffectStatus::Verified);
+        assert_eq!(effect.receipt.as_ref().unwrap().id, executed.receipt_id);
+        assert_eq!(
+            effect.verification.as_ref().unwrap().id,
+            executed.verification_id
+        );
+        assert!(effect.verification.as_ref().unwrap().independent);
+        let events = service
+            .mission_events(&request.project_id, &request.mission_id)
+            .expect("execution events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.executed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.verified")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_or_swapped_effect_execution_never_calls_provider_or_mutates_state() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(5);
+        let request =
+            approved_preview_execution_request(&plane, &secrets, &project_id, "refuse", now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("baseline application");
+        let before = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("approved baseline");
+        let events_before = service
+            .mission_events(&request.project_id, &request.mission_id)
+            .expect("baseline events");
+        drop(service);
+        let mut broker = production_preview_broker();
+        let mut executor = DesktopPreviewExecutor {
+            calls: 0,
+            accepted_at: now + Duration::seconds(6),
+            uncertain: false,
+        };
+        let mut verifier = DesktopPreviewVerifier {
+            calls: 0,
+            observed_at: now + Duration::seconds(7),
+        };
+
+        let mut stale = request.clone();
+        stale.expected_mission_revision = stale.expected_mission_revision.saturating_add(1);
+        assert!(matches!(
+            plane.execute_approved_effect_with(
+                &secrets,
+                stale,
+                &mut broker,
+                &mut executor,
+                &mut verifier,
+                now + Duration::seconds(5),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::MissionRevisionMismatch { .. }
+            ))
+        ));
+        let mut swapped_scope = request.clone();
+        swapped_scope.expected_scope_digest = "a".repeat(64);
+        if swapped_scope.expected_scope_digest == request.expected_scope_digest {
+            swapped_scope.expected_scope_digest = "b".repeat(64);
+        }
+        assert!(matches!(
+            plane.execute_approved_effect_with(
+                &secrets,
+                swapped_scope,
+                &mut broker,
+                &mut executor,
+                &mut verifier,
+                now + Duration::seconds(5),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::EffectExecutionAuthorityMismatch
+            ))
+        ));
+        let mut swapped_authorization = request.clone();
+        swapped_authorization.expected_broker_authorization_digest = "c".repeat(64);
+        assert!(matches!(
+            plane.execute_approved_effect_with(
+                &secrets,
+                swapped_authorization,
+                &mut broker,
+                &mut executor,
+                &mut verifier,
+                now + Duration::seconds(5),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::EffectExecutionAuthorityMismatch
+            ))
+        ));
+        assert_eq!(executor.calls, 0);
+        assert_eq!(verifier.calls, 0);
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("reopen after refusals");
+        assert_eq!(
+            service
+                .load_mission(&request.project_id, &request.mission_id)
+                .expect("unchanged Mission"),
+            before
+        );
+        assert_eq!(
+            service
+                .mission_events(&request.project_id, &request.mission_id)
+                .expect("unchanged events"),
+            events_before
+        );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_execution_scope().is_none());
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn uncertain_effect_execution_is_not_replayed_by_the_same_desktop_request() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(6);
+        let request =
+            approved_preview_execution_request(&plane, &secrets, &project_id, "uncertain", now);
+        let mut broker = production_preview_broker();
+        let mut executor = DesktopPreviewExecutor {
+            calls: 0,
+            accepted_at: now + Duration::seconds(5),
+            uncertain: true,
+        };
+        let mut verifier = DesktopPreviewVerifier {
+            calls: 0,
+            observed_at: now + Duration::seconds(6),
+        };
+        let first = plane.execute_approved_effect_with(
+            &secrets,
+            request.clone(),
+            &mut broker,
+            &mut executor,
+            &mut verifier,
+            now + Duration::seconds(5),
+        );
+        assert!(matches!(
+            first,
+            Err(DesktopDataError::Application(ApplicationError::Broker(
+                hartevo_effect_broker::BrokerError::ProviderUncertain(_)
+            )))
+        ));
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 0);
+
+        let second = plane.execute_approved_effect_with(
+            &secrets,
+            request.clone(),
+            &mut broker,
+            &mut executor,
+            &mut verifier,
+            now + Duration::seconds(6),
+        );
+        assert!(matches!(
+            second,
+            Err(DesktopDataError::Application(
+                ApplicationError::MissionRevisionMismatch { .. }
+            ))
+        ));
+        assert_eq!(executor.calls, 1, "uncertain Provider call must not replay");
+        assert_eq!(verifier.calls, 0);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(7))
+            .expect("reopen uncertain Mission");
+        let mission = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("uncertain Mission");
+        assert!(mission.revision > request.expected_mission_revision);
+        let effect = mission
+            .effect(&request.effect_id)
+            .expect("uncertain Effect");
+        assert!(effect.receipt.is_none());
+        assert!(effect.verification.is_none());
+        assert_eq!(
+            service
+                .mission_events(&request.project_id, &request.mission_id)
+                .expect("uncertain events")
+                .iter()
+                .filter(|event| event.event_type == "effect.execution_interrupted")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn approved_effect_execution_request_debug_redacts_both_authority_digests() {
+        let request = DesktopApprovedEffectExecutionRequest {
+            project_id: ProjectId::from_stable("desktop-effect-debug-project"),
+            mission_id: MissionId::from_stable("desktop-effect-debug-mission"),
+            effect_id: EffectId::from_stable("desktop-effect-debug-effect"),
+            expected_scope_digest: "a".repeat(64),
+            expected_broker_authorization_digest: "b".repeat(64),
+            expected_mission_revision: 7,
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("[DIGEST]"));
+        assert!(!debug.contains(&"a".repeat(64)));
+        assert!(!debug.contains(&"b".repeat(64)));
+        assert!(!debug.contains("provider"));
+        assert!(!debug.contains("idempotency"));
+        assert!(!debug.contains("payload"));
     }
 
     fn persist_user_held_browser_workspace(

@@ -576,6 +576,21 @@ pub struct ProposedEffectApprovalGrant {
     pub replayed: bool,
 }
 
+/// Exact CAS and approval-time Broker authority for one first execution.
+///
+/// The Broker authorization digest is the frozen permission-plus-policy
+/// digest persisted on Domain Approval. Application re-reads all fields before
+/// any provider executor can be called.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecuteApprovedEffect {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_broker_authorization_digest: String,
+    pub expected_mission_revision: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingEffectApprovalProjection {
@@ -13191,7 +13206,63 @@ impl ApplicationService {
         verifier: &mut impl EffectVerifier,
         now: DateTime<Utc>,
     ) -> Result<(Mission, BrokerResult), ApplicationError> {
-        let mut mission = self.store.load_mission(project_id, mission_id)?;
+        let mission = self.store.load_mission(project_id, mission_id)?;
+        self.execute_loaded_effect(broker, mission, effect_id, executor, verifier, now)
+    }
+
+    /// Executes one exact, currently Approved Effect after re-reading the
+    /// Mission CAS and approval-time Broker authorization from durable state.
+    /// A stale/swapped command fails before the Broker can call its executor.
+    pub fn execute_approved_effect_at_revision(
+        &mut self,
+        broker: &mut EffectBroker,
+        command: &ExecuteApprovedEffect,
+        executor: &mut impl EffectExecutor,
+        verifier: &mut impl EffectVerifier,
+        now: DateTime<Utc>,
+    ) -> Result<(Mission, BrokerResult), ApplicationError> {
+        if command.expected_mission_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || !is_sha256_text(&command.expected_scope_digest)
+            || !is_sha256_text(&command.expected_broker_authorization_digest)
+        {
+            return Err(ApplicationError::EffectExecutionCommandMismatch);
+        }
+        let mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        let effect = mission.effect(&command.effect_id)?;
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ApplicationError::EffectExecutionAuthorityMismatch)?;
+        if effect.status != EffectStatus::Approved
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || approval.scope_digest != command.expected_scope_digest
+            || approval.permission_digest != command.expected_broker_authorization_digest
+        {
+            return Err(ApplicationError::EffectExecutionAuthorityMismatch);
+        }
+        self.execute_loaded_effect(broker, mission, &command.effect_id, executor, verifier, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_loaded_effect(
+        &mut self,
+        broker: &mut EffectBroker,
+        mut mission: Mission,
+        effect_id: &EffectId,
+        executor: &mut impl EffectExecutor,
+        verifier: &mut impl EffectVerifier,
+        now: DateTime<Utc>,
+    ) -> Result<(Mission, BrokerResult), ApplicationError> {
         let mission_before = mission.clone();
         let expected_revision = mission.revision;
         let effect_before_execution = mission.effect(effect_id)?.clone();
@@ -22596,6 +22667,14 @@ pub enum ApplicationError {
     ProposedEffectApprovalUnavailable,
     #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
     ProposedEffectApprovalDigestMismatch,
+    #[error(
+        "Effect execution requires an exact approved Effect digest, Broker authorization digest, and Mission CAS revision"
+    )]
+    EffectExecutionCommandMismatch,
+    #[error(
+        "the approved Effect or its Broker authorization no longer matches the execution command"
+    )]
+    EffectExecutionAuthorityMismatch,
     #[error("preview Effect id already exists in this Mission: {0}")]
     DuplicatePreviewEffectId(EffectId),
     #[error(
@@ -31959,6 +32038,139 @@ sleep 30"#
             mission_id,
             effect_id,
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exact_approved_effect_execution_refuses_swaps_before_provider_then_persists_both_facts() {
+        let mut fixture = approved_preview_fixture("cordis-exact-execution");
+        let approved = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("approved Mission");
+        let effect = approved
+            .effect(&fixture.effect_id)
+            .expect("approved Effect");
+        let approval = effect.approval.as_ref().expect("approval");
+        let command = ExecuteApprovedEffect {
+            project_id: fixture.project_id.clone(),
+            mission_id: fixture.mission_id.clone(),
+            effect_id: fixture.effect_id.clone(),
+            expected_scope_digest: approval.scope_digest.clone(),
+            expected_broker_authorization_digest: approval.permission_digest.clone(),
+            expected_mission_revision: approved.revision,
+        };
+        let mut executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: now() + Duration::seconds(4),
+        };
+        let mut verifier = RelationshipVerifier {
+            observed_at: now() + Duration::seconds(5),
+        };
+
+        let mut stale = command.clone();
+        stale.expected_mission_revision = stale.expected_mission_revision.saturating_add(1);
+        assert!(matches!(
+            fixture.service.execute_approved_effect_at_revision(
+                &mut fixture.broker,
+                &stale,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(3),
+            ),
+            Err(ApplicationError::MissionRevisionMismatch { .. })
+        ));
+        let mut swapped_scope = command.clone();
+        swapped_scope.expected_scope_digest = "a".repeat(64);
+        if swapped_scope.expected_scope_digest == command.expected_scope_digest {
+            swapped_scope.expected_scope_digest = "b".repeat(64);
+        }
+        assert!(matches!(
+            fixture.service.execute_approved_effect_at_revision(
+                &mut fixture.broker,
+                &swapped_scope,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(3),
+            ),
+            Err(ApplicationError::EffectExecutionAuthorityMismatch)
+        ));
+        let mut swapped_authorization = command.clone();
+        swapped_authorization.expected_broker_authorization_digest = "c".repeat(64);
+        assert!(matches!(
+            fixture.service.execute_approved_effect_at_revision(
+                &mut fixture.broker,
+                &swapped_authorization,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(3),
+            ),
+            Err(ApplicationError::EffectExecutionAuthorityMismatch)
+        ));
+        assert_eq!(executor.calls, 0);
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("unchanged approved Mission"),
+            approved
+        );
+
+        let (mission, result) = fixture
+            .service
+            .execute_approved_effect_at_revision(
+                &mut fixture.broker,
+                &command,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(3),
+            )
+            .expect("exact execution");
+        assert_eq!(executor.calls, 1);
+        assert_eq!(
+            result.receipt.id,
+            mission
+                .effect(&fixture.effect_id)
+                .unwrap()
+                .receipt
+                .as_ref()
+                .unwrap()
+                .id
+        );
+        assert_eq!(
+            result.verification.id,
+            mission
+                .effect(&fixture.effect_id)
+                .unwrap()
+                .verification
+                .as_ref()
+                .unwrap()
+                .id
+        );
+        assert!(result.verification.independent);
+        assert_ne!(
+            result.receipt.id.as_str(),
+            result.verification.id.as_str(),
+            "Receipt and Verification remain distinct typed facts"
+        );
+        let events = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("execution events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.executed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "effect.verified")
+                .count(),
+            1
+        );
     }
 
     fn uncertain_preview_fixture(suffix: &str) -> UncertainPreviewFixture {
