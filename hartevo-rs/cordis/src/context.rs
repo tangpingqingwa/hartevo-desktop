@@ -322,6 +322,16 @@ pub enum CordisError {
     RuntimeDispatchSerialOverflow,
     #[error("Cordis Runtime coordinator mutex is poisoned")]
     RuntimeCoordinatorPoisoned,
+    #[error("Cordis Domain command scope must not carry Runtime authority")]
+    DomainCommandRuntimeBound,
+    #[error("Cordis Domain command dispatch is already active")]
+    DomainCommandDispatchBusy,
+    #[error("Cordis Domain command permit does not match the active operation")]
+    DomainCommandPermitMismatch,
+    #[error("Cordis Domain command serial overflowed")]
+    DomainCommandSerialOverflow,
+    #[error("Cordis Domain command coordinator mutex is poisoned")]
+    DomainCommandCoordinatorPoisoned,
     #[error("service key `{key}` is reserved to its mounted authority owner")]
     ReservedServiceKey { key: String },
     #[error("surface `{key}` cannot be mounted by authority owner `{owner}`")]

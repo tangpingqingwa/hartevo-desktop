@@ -38,7 +38,8 @@ use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblySta
 #[cfg(test)]
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
-    AuthorityDispatchError, AuthorityScope, CordisError, RuntimeBinding, RuntimeRecordBinding,
+    AuthorityDispatchError, AuthorityScope, CordisError, DomainCommandBinding, DomainCommandKind,
+    RuntimeBinding, RuntimeRecordBinding,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -64,7 +65,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::cordis_host::{DesktopCordisCoordinator, dispatch_live_runtime, mount_cordis_host};
+use crate::cordis_host::{
+    DesktopCordisCoordinator, DesktopDomainCommandAuthorization, dispatch_live_domain_command,
+    dispatch_live_runtime, mount_cordis_host,
+};
 #[cfg(test)]
 use crate::cordis_host::{
     bind_live_domain_kernel,
@@ -2197,32 +2201,63 @@ impl DesktopDataPlane {
         request: DesktopWaitingApprovalGrantRequest,
         now: DateTime<Utc>,
     ) -> Result<DesktopSnapshot, DesktopDataError> {
-        if request.expected_mission_revision == 0
-            || request.effect_id.as_str().trim().is_empty()
-            || request.expected_scope_digest.len() != 64
-            || !request
-                .expected_scope_digest
+        let DesktopWaitingApprovalGrantRequest {
+            project_id,
+            mission_id,
+            effect_id,
+            expected_scope_digest,
+            expected_mission_revision,
+        } = request;
+        if expected_mission_revision == 0
+            || effect_id.as_str().trim().is_empty()
+            || expected_scope_digest.len() != 64
+            || !expected_scope_digest
                 .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
             return Err(DesktopDataError::InvalidWaitingApprovalGrant);
         }
-        let project_id = request.project_id.clone();
         let (mut service, runtime_reconciliation, _context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
-        let broker = Self::waiting_approval_broker();
-        service.approve_proposed_effect(
-            &broker,
-            ApproveProposedEffect {
-                project_id,
-                mission_id: request.mission_id,
-                effect_id: request.effect_id,
-                expected_scope_digest: request.expected_scope_digest,
-                expected_mission_revision: request.expected_mission_revision,
-            },
-            ActorId::from_stable(format!("desktop-local-operator:{}", self.device_id)),
-            now,
+        let scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+        let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+        let command = DomainCommandBinding::approve_proposed_effect(
+            effect_id.as_str(),
+            expected_scope_digest.clone(),
         )?;
+        let broker = Self::waiting_approval_broker();
+        let actor = ActorId::from_stable(format!("desktop-local-operator:{}", self.device_id));
+        map_domain_command_dispatch_result(dispatch_live_domain_command(
+            &self.cordis,
+            DesktopDomainCommandAuthorization::new(scope, command),
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+                if &current_scope != permit.scope()
+                    || permit.command().kind() != DomainCommandKind::ApproveProposedEffect
+                    || permit.command().effect_id() != effect_id.as_str()
+                    || permit.command().approval_scope_digest() != expected_scope_digest
+                {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                service.approve_proposed_effect(
+                    &broker,
+                    ApproveProposedEffect {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        effect_id: effect_id.clone(),
+                        expected_scope_digest: expected_scope_digest.clone(),
+                        expected_mission_revision,
+                    },
+                    actor,
+                    now,
+                )?;
+                Ok(())
+            },
+        ))?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -3945,15 +3980,38 @@ impl DesktopDataPlane {
     }
 }
 
+fn mission_authority_scope(
+    service: &ApplicationService,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+) -> Result<AuthorityScope, DesktopDataError> {
+    let mission = service.load_mission(project_id, mission_id)?;
+    authority_scope_for_mission(&mission, project_id, mission_id)
+}
+
+fn authority_scope_for_mission(
+    mission: &Mission,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+) -> Result<AuthorityScope, DesktopDataError> {
+    if mission.project_id != *project_id || mission.id != *mission_id {
+        return Err(CordisError::AuthorityScopeMismatch.into());
+    }
+    Ok(AuthorityScope::new(
+        mission.tenant_id.as_str(),
+        project_id.as_str(),
+        mission_id.as_str(),
+        mission.revision,
+    )?)
+}
+
 fn runtime_authority_scope(
     service: &ApplicationService,
     project_id: &ProjectId,
     mission_id: &MissionId,
 ) -> Result<AuthorityScope, DesktopDataError> {
     let mission = service.load_mission(project_id, mission_id)?;
-    if mission.project_id != *project_id || mission.id != *mission_id {
-        return Err(CordisError::AuthorityScopeMismatch.into());
-    }
+    let scope = authority_scope_for_mission(&mission, project_id, mission_id)?;
     let latest_recovery = service.latest_runtime_recovery_for_mission(project_id, mission_id)?;
     let latest_turn = service.latest_runtime_turn_for_mission(project_id, mission_id)?;
     let generation = runtime_entry_generation(
@@ -3991,13 +4049,7 @@ fn runtime_authority_scope(
             mission_handle_digest.as_deref(),
         ),
     )?;
-    Ok(AuthorityScope::new(
-        mission.tenant_id.as_str(),
-        project_id.as_str(),
-        mission_id.as_str(),
-        mission.revision,
-    )?
-    .with_runtime(runtime))
+    Ok(scope.with_runtime(runtime))
 }
 
 fn runtime_entry_generation(
@@ -4813,6 +4865,19 @@ fn map_runtime_dispatch_result<T>(
     }
 }
 
+fn map_domain_command_dispatch_result<T>(
+    result: Result<T, AuthorityDispatchError<DesktopDataError>>,
+) -> Result<T, DesktopDataError> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(AuthorityDispatchError::Cordis(error)) => Err((*error).into()),
+        Err(AuthorityDispatchError::Authority(error)) => Err(error),
+        Err(error @ AuthorityDispatchError::Combined(_)) => {
+            Err(DesktopDataError::DomainCommandDispatch(Box::new(error)))
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DesktopDataError {
     #[error("Desktop data root must be an absolute non-symlink directory: {0}")]
@@ -4905,6 +4970,8 @@ pub enum DesktopDataError {
     Cordis(#[from] CordisError),
     #[error("Cordis Runtime dispatch failed across phases: {0}")]
     RuntimeDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
+    #[error("Cordis Domain command dispatch failed across phases: {0}")]
+    DomainCommandDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -10948,6 +11015,17 @@ sleep 30"#;
         assert_eq!(projected.pending_approval_count, 0);
         assert!(projected.pending_effects.is_empty());
         assert_eq!(projected.verified_effect_count, 0);
+        {
+            let cordis = plane.lock_cordis();
+            let bound = cordis
+                .bound_scope()
+                .expect("WaitingApproval grant must cross a Cordis scope");
+            assert_eq!(bound.project_id(), project_id.as_str());
+            assert_eq!(bound.mission_id(), mission_id.as_str());
+            assert_eq!(bound.mission_revision(), revision);
+            assert!(bound.runtime().is_none());
+            assert!(cordis.active_domain_command_scope().is_none());
+        }
 
         let database_secret = secrets
             .get(plane.database_key_reference())

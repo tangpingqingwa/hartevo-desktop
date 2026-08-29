@@ -161,6 +161,67 @@ impl AuthorityScope {
     }
 }
 
+/// Exact Domain command kind currently admitted through the Desktop host.
+///
+/// Approval records remain Application/Domain Kernel state. This enum only
+/// names the command crossing Cordis; it grants no Effect execution authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DomainCommandKind {
+    ApproveProposedEffect,
+}
+
+impl DomainCommandKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApproveProposedEffect => "approve_proposed_effect",
+        }
+    }
+}
+
+/// Content-minimized binding for one exact Domain command.
+///
+/// Mission identity and revision stay in [`AuthorityScope`]. The approval
+/// digest is the existing Application/Effect Broker scope digest, not a
+/// Receipt, Verification, provider lease, or execution capability.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct DomainCommandBinding {
+    kind: DomainCommandKind,
+    effect_id: String,
+    approval_scope_digest: String,
+}
+
+impl DomainCommandBinding {
+    pub fn approve_proposed_effect(
+        effect_id: impl Into<String>,
+        approval_scope_digest: impl Into<String>,
+    ) -> Result<Self, CordisError> {
+        Ok(Self {
+            kind: DomainCommandKind::ApproveProposedEffect,
+            effect_id: normalized_id(effect_id.into(), "domain_command_effect_id")?,
+            approval_scope_digest: canonical_digest(
+                approval_scope_digest.into(),
+                "domain_command_approval_scope_digest",
+            )?,
+        })
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> DomainCommandKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+
+    #[must_use]
+    pub fn approval_scope_digest(&self) -> &str {
+        &self.approval_scope_digest
+    }
+}
+
 fn normalized_id(value: String, field: &'static str) -> Result<String, CordisError> {
     let normalized = value.trim();
     if normalized.is_empty() || normalized != value {
@@ -185,6 +246,110 @@ fn canonical_digest(value: String, field: &'static str) -> Result<String, Cordis
         return Err(CordisError::InvalidAuthorityDigest { field });
     }
     Ok(value)
+}
+
+/// Unforgeable, one-shot proof that Cordis admitted one exact Domain command.
+///
+/// Only [`crate::CordisHost`] can issue it. Desktop releases the coordinator
+/// lock before invoking Application, then returns the permit for settlement.
+pub struct DomainCommandPermit {
+    serial: u64,
+    scope: AuthorityScope,
+    command: DomainCommandBinding,
+    lease: Arc<DomainCommandLease>,
+    settled: bool,
+}
+
+impl DomainCommandPermit {
+    pub(crate) fn issue(
+        serial: u64,
+        scope: AuthorityScope,
+        command: DomainCommandBinding,
+    ) -> (Self, Arc<DomainCommandLease>) {
+        let lease = Arc::new(DomainCommandLease::new());
+        (
+            Self {
+                serial,
+                scope,
+                command,
+                lease: Arc::clone(&lease),
+                settled: false,
+            },
+            lease,
+        )
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &AuthorityScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> &DomainCommandBinding {
+        &self.command
+    }
+
+    pub(crate) const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    pub(crate) fn owns_lease(&self, lease: &Arc<DomainCommandLease>) -> bool {
+        Arc::ptr_eq(&self.lease, lease)
+    }
+
+    pub(crate) fn complete(mut self) {
+        self.lease.release();
+        self.settled = true;
+    }
+}
+
+impl fmt::Debug for DomainCommandPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DomainCommandPermit")
+            .field("serial", &self.serial)
+            .field("scope", &self.scope)
+            .field("command", &self.command)
+            .field("settled", &self.settled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DomainCommandPermit {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.lease.release();
+        }
+    }
+}
+
+pub(crate) struct DomainCommandLease {
+    active: AtomicBool,
+}
+
+impl DomainCommandLease {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn release(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for DomainCommandLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DomainCommandLease")
+            .field("active", &self.is_active())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Unforgeable, one-shot proof that Cordis authorized a Runtime dispatch.
@@ -369,7 +534,30 @@ where
     }
 }
 
-/// Multiple phase-preserving Runtime-dispatch failures.
+/// One-shot typed adapter for an Application-owned Domain command.
+///
+/// The permit proves Cordis scope admission only. The concrete Application
+/// adapter still owns command validation, CAS, persistence, and replay rules.
+pub trait DomainCommandAuthority {
+    type Output;
+    type Error;
+
+    fn execute(self, permit: &DomainCommandPermit) -> Result<Self::Output, Self::Error>;
+}
+
+impl<F, Output, AdapterError> DomainCommandAuthority for F
+where
+    F: FnOnce(&DomainCommandPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn execute(self, permit: &DomainCommandPermit) -> Result<Self::Output, Self::Error> {
+        self(permit)
+    }
+}
+
+/// Multiple phase-preserving authority-dispatch failures.
 #[derive(Debug, Eq, PartialEq)]
 pub struct AuthorityDispatchFailures<AdapterError> {
     started: Option<CordisError>,
@@ -522,7 +710,10 @@ mod tests {
     use std::error::Error;
     use std::fmt::{self, Display};
 
-    use super::{AuthorityDispatchError, AuthorityScope, RuntimeBinding, RuntimeRecordBinding};
+    use super::{
+        AuthorityDispatchError, AuthorityScope, DomainCommandBinding, DomainCommandKind,
+        RuntimeBinding, RuntimeRecordBinding,
+    };
     use crate::CordisError;
 
     #[derive(Debug, Eq, PartialEq)]
@@ -592,6 +783,36 @@ mod tests {
         assert_eq!(binding.generation(), 2);
         assert_eq!(binding.recovery().unwrap().revision(), 4);
         assert_eq!(binding.turn().unwrap().id(), "turn");
+    }
+
+    #[test]
+    fn domain_command_binding_is_exact_and_canonical() {
+        assert_eq!(
+            DomainCommandBinding::approve_proposed_effect("", "a".repeat(64)).unwrap_err(),
+            CordisError::InvalidAuthorityScope {
+                field: "domain_command_effect_id"
+            }
+        );
+        assert_eq!(
+            DomainCommandBinding::approve_proposed_effect(" effect-a ", "a".repeat(64))
+                .unwrap_err(),
+            CordisError::InvalidAuthorityScope {
+                field: "domain_command_effect_id"
+            }
+        );
+        assert_eq!(
+            DomainCommandBinding::approve_proposed_effect("effect-a", "A".repeat(64)).unwrap_err(),
+            CordisError::InvalidAuthorityDigest {
+                field: "domain_command_approval_scope_digest"
+            }
+        );
+
+        let command =
+            DomainCommandBinding::approve_proposed_effect("effect-a", "b".repeat(64)).unwrap();
+        assert_eq!(command.kind(), DomainCommandKind::ApproveProposedEffect);
+        assert_eq!(command.kind().as_str(), "approve_proposed_effect");
+        assert_eq!(command.effect_id(), "effect-a");
+        assert_eq!(command.approval_scope_digest(), "b".repeat(64));
     }
 
     #[test]

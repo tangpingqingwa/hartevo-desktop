@@ -1,4 +1,4 @@
-//! One-call-site Cordis mount and typed Runtime adapter for the desktop shell.
+//! One-call-site Cordis mount and typed Domain/Runtime adapters for Desktop.
 //!
 //! Production Runtime enters through [`dispatch_live_runtime`]: Cordis issues
 //! a short-lived scoped permit, Desktop releases the host lock, and the real
@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use hartevo_cordis::{
-    AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, Fiber, FiberState, FiberUid,
-    KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
-    KernelConsentStatus, RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit,
-    host_is_cordis_loop, keys,
+    AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, DomainCommandAuthority,
+    DomainCommandBinding, DomainCommandPermit, Fiber, FiberState, FiberUid, KernelApproval,
+    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
+    RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -160,10 +160,10 @@ impl DesktopCordisCoordinator {
         })
     }
 
-    fn authorize_bound_runtime(
+    fn consume_binding(
         &mut self,
         binding: DesktopCordisBindingReceipt,
-    ) -> Result<RuntimeDispatchPermit, CordisError> {
+    ) -> Result<AuthorityScope, CordisError> {
         let DesktopCordisBindingReceipt {
             coordinator_identity,
             root_fiber_uid,
@@ -187,7 +187,24 @@ impl DesktopCordisCoordinator {
             return Err(CordisError::AuthorityScopeMismatch);
         }
         self.last_binding = None;
+        Ok(scope)
+    }
+
+    fn authorize_bound_runtime(
+        &mut self,
+        binding: DesktopCordisBindingReceipt,
+    ) -> Result<RuntimeDispatchPermit, CordisError> {
+        let scope = self.consume_binding(binding)?;
         self.host.authorize_runtime(&scope)
+    }
+
+    fn authorize_bound_domain_command(
+        &mut self,
+        binding: DesktopCordisBindingReceipt,
+        command: DomainCommandBinding,
+    ) -> Result<DomainCommandPermit, CordisError> {
+        let scope = self.consume_binding(binding)?;
+        self.host.authorize_domain_command(&scope, command)
     }
 
     fn bind_and_authorize_runtime(
@@ -202,11 +219,28 @@ impl DesktopCordisCoordinator {
         self.authorize_bound_runtime(binding)
     }
 
+    fn bind_and_authorize_domain_command(
+        &mut self,
+        scope: AuthorityScope,
+        consent: KernelConsentState,
+        record: Option<KernelConsentRecord>,
+        approval: Option<KernelApproval>,
+        command: DomainCommandBinding,
+        now: DateTime<Utc>,
+    ) -> Result<DomainCommandPermit, CordisError> {
+        let binding = self.bind_domain_kernel_scope(scope, consent, record, approval, now)?;
+        self.authorize_bound_domain_command(binding, command)
+    }
+
     fn finish_runtime(
         &mut self,
         permit: RuntimeDispatchPermit,
     ) -> Result<RuntimeDispatchCompletion, CordisError> {
         self.host.finish_runtime(permit)
+    }
+
+    fn finish_domain_command(&mut self, permit: DomainCommandPermit) -> Result<(), CordisError> {
+        self.host.finish_domain_command(permit)
     }
 
     #[cfg(test)]
@@ -375,6 +409,42 @@ where
     }
 }
 
+/// Private Desktop adapter for one Cordis-authorized Domain command.
+struct DesktopDomainCommandAuthority<Execute> {
+    execute: Execute,
+}
+
+impl<Execute> DesktopDomainCommandAuthority<Execute> {
+    fn new(execute: Execute) -> Self {
+        Self { execute }
+    }
+}
+
+impl<Execute, Output, AdapterError> DomainCommandAuthority
+    for DesktopDomainCommandAuthority<Execute>
+where
+    Execute: FnOnce(&DomainCommandPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn execute(self, permit: &DomainCommandPermit) -> Result<Self::Output, Self::Error> {
+        (self.execute)(permit)
+    }
+}
+
+/// Exact Cordis scope plus the single Domain command admitted in that scope.
+pub(crate) struct DesktopDomainCommandAuthorization {
+    scope: AuthorityScope,
+    command: DomainCommandBinding,
+}
+
+impl DesktopDomainCommandAuthorization {
+    pub(crate) fn new(scope: AuthorityScope, command: DomainCommandBinding) -> Self {
+        Self { scope, command }
+    }
+}
+
 /// Bind exact live facts, obtain an unforgeable Cordis permit, release the
 /// host lock, execute the real Desktop/Application adapter exactly once, and
 /// settle the lifecycle under a second short lock.
@@ -429,6 +499,52 @@ where
     }
 }
 
+/// Bind exact live facts, issue a one-shot Domain-command permit, release the
+/// coordinator lock for Application, then settle the permit under a second
+/// short lock. This path grants no Effect execution capability.
+pub(crate) fn dispatch_live_domain_command<Execute, Output, AdapterError>(
+    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    authorization: DesktopDomainCommandAuthorization,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+    execute: Execute,
+) -> Result<Output, AuthorityDispatchError<AdapterError>>
+where
+    Execute: FnOnce(&DomainCommandPermit) -> Result<Output, AdapterError>,
+{
+    let DesktopDomainCommandAuthorization { scope, command } = authorization;
+    let permit = {
+        let mut host = cordis
+            .lock()
+            .map_err(|_| CordisError::DomainCommandCoordinatorPoisoned)?;
+        host.bind_and_authorize_domain_command(
+            scope,
+            kernel_consent_state(consent),
+            record.map(kernel_consent_record),
+            approval.map(kernel_approval),
+            command,
+            now,
+        )?
+    };
+    let (output, authority) = match DesktopDomainCommandAuthority::new(execute).execute(&permit) {
+        Ok(output) => (Some(output), None),
+        Err(error) => (None, Some(error)),
+    };
+    let finish = match cordis.lock() {
+        Ok(mut host) => host.finish_domain_command(permit).err(),
+        Err(_) => Some(CordisError::DomainCommandCoordinatorPoisoned),
+    };
+    if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
+        Err(error)
+    } else {
+        output.ok_or_else(|| {
+            AuthorityDispatchError::Cordis(Box::new(CordisError::DomainCommandPermitMismatch))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -444,8 +560,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use hartevo_cordis::{
         AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
-        DomainSurface, FiberState, OPENINTERPRETER, RuntimeBinding, SurfaceOwner,
-        enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys,
+        DomainCommandBinding, DomainCommandKind, DomainSurface, FiberState, OPENINTERPRETER,
+        RuntimeBinding, SurfaceOwner, enforce_invariants, events, host_is_cordis_loop,
+        invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -455,8 +572,9 @@ mod tests {
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
 
     use super::{
-        bind_live_domain_kernel, bind_live_domain_kernel_scope, dispatch_live_runtime,
-        mount_cordis_host, openinterpreter_runtime_plugin,
+        DesktopDomainCommandAuthorization, bind_live_domain_kernel, bind_live_domain_kernel_scope,
+        dispatch_live_domain_command, dispatch_live_runtime, mount_cordis_host,
+        openinterpreter_runtime_plugin,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -488,6 +606,14 @@ mod tests {
         AuthorityScope::new("tenant-a", "project-a", "mission-a", 4)
             .unwrap()
             .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap())
+    }
+
+    fn domain_scope() -> AuthorityScope {
+        AuthorityScope::new("tenant-a", "project-a", "mission-a", 4).unwrap()
+    }
+
+    fn approval_command() -> DomainCommandBinding {
+        DomainCommandBinding::approve_proposed_effect("effect-a", "a".repeat(64)).unwrap()
     }
 
     fn assert_emit_source(error: &CordisError, expected: &'static str) {
@@ -704,6 +830,101 @@ mod tests {
                 .list()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn desktop_domain_command_releases_lock_and_calls_application_once() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let probe = Arc::clone(&host);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let expected_scope = domain_scope();
+        let expected_command = approval_command();
+
+        let output = dispatch_live_domain_command(
+            &host,
+            DesktopDomainCommandAuthorization::new(
+                expected_scope.clone(),
+                expected_command.clone(),
+            ),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                assert_eq!(permit.scope(), &expected_scope);
+                assert_eq!(permit.command(), &expected_command);
+                assert_eq!(
+                    permit.command().kind(),
+                    DomainCommandKind::ApproveProposedEffect
+                );
+                assert!(
+                    probe.try_lock().is_ok(),
+                    "Application must run without the Cordis coordinator lock"
+                );
+                let nested = dispatch_live_domain_command(
+                    &probe,
+                    DesktopDomainCommandAuthorization::new(
+                        permit.scope().clone(),
+                        permit.command().clone(),
+                    ),
+                    &ConsentState::NotRequired,
+                    None,
+                    None,
+                    now(),
+                    |_| Ok::<_, &'static str>(()),
+                );
+                assert_eq!(
+                    nested.unwrap_err(),
+                    AuthorityDispatchError::Cordis(Box::new(
+                        CordisError::DomainCommandDispatchBusy
+                    ))
+                );
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, &'static str>("application-domain-command")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, "application-domain-command");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(host.lock().unwrap().active_domain_command_scope().is_none());
+    }
+
+    #[test]
+    fn abandoned_desktop_domain_command_recovers_on_next_dispatch() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let panic_host = Arc::clone(&host);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = dispatch_live_domain_command(
+                &panic_host,
+                DesktopDomainCommandAuthorization::new(domain_scope(), approval_command()),
+                &ConsentState::NotRequired,
+                None,
+                None,
+                now(),
+                |_| -> Result<(), &'static str> { panic!("Domain command adapter panic") },
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(host.lock().unwrap().active_domain_command_scope().is_none());
+
+        dispatch_live_domain_command(
+            &host,
+            DesktopDomainCommandAuthorization::new(domain_scope(), approval_command()),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            |_| Ok::<_, &'static str>(()),
+        )
+        .unwrap();
     }
 
     #[test]

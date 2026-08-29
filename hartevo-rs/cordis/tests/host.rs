@@ -1,11 +1,11 @@
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost, DomainSurface,
-    EffectBrokerSurface, EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate, KernelApproval,
-    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
-    LoaderContext, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding,
-    RuntimeSurface, SurfaceOwner, ToolCall, enforce_invariants, host_is_cordis_loop,
-    host_plugin_ids, invariant_missing, keys,
+    AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost, DomainCommandBinding,
+    DomainCommandKind, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, HOST_PLUGIN_IDS,
+    InvariantGate, KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
+    KernelConsentStatus, LoaderContext, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId,
+    RuntimeBinding, RuntimeSurface, SurfaceOwner, ToolCall, enforce_invariants,
+    host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -51,6 +51,132 @@ fn runtime_scope(
             RuntimeBinding::new(generation, None, None, digest_byte.to_string().repeat(64))
                 .unwrap(),
         )
+}
+
+fn domain_scope(project: &str, mission: &str, mission_revision: u64) -> AuthorityScope {
+    AuthorityScope::new("tenant-a", project, mission, mission_revision).unwrap()
+}
+
+fn approval_command(effect: &str, digest_byte: char) -> DomainCommandBinding {
+    DomainCommandBinding::approve_proposed_effect(effect, digest_byte.to_string().repeat(64))
+        .unwrap()
+}
+
+#[test]
+fn domain_command_requires_and_preserves_exact_bound_scope() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 3);
+    let command = approval_command("effect-a", 'a');
+    assert_eq!(
+        host.authorize_domain_command(&scope, command.clone())
+            .unwrap_err(),
+        CordisError::AuthorityScopeUnbound
+    );
+
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::Missing,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let other = domain_scope("project-a", "mission-b", 3);
+    assert_eq!(
+        host.authorize_domain_command(&other, command.clone())
+            .unwrap_err(),
+        CordisError::AuthorityScopeMismatch
+    );
+
+    let permit = host
+        .authorize_domain_command(&scope, command.clone())
+        .unwrap();
+    assert_eq!(permit.scope(), &scope);
+    assert_eq!(permit.command(), &command);
+    assert_eq!(
+        permit.command().kind(),
+        DomainCommandKind::ApproveProposedEffect
+    );
+    assert_eq!(host.active_domain_command_scope(), Some(&scope));
+    assert_eq!(
+        host.authorize_domain_command(&scope, command.clone())
+            .unwrap_err(),
+        CordisError::DomainCommandDispatchBusy
+    );
+    assert_eq!(
+        host.bind_domain_kernel_scope(
+            scope.clone(),
+            KernelConsentState::Missing,
+            None,
+            None,
+            now(),
+        )
+        .unwrap_err(),
+        CordisError::DomainCommandDispatchBusy
+    );
+    host.finish_domain_command(permit).unwrap();
+    assert_eq!(host.bound_scope(), Some(&scope));
+    assert_eq!(host.active_domain_command_scope(), None);
+}
+
+#[test]
+fn domain_command_excludes_runtime_authority_and_runtime_bound_scopes() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    assert_eq!(
+        host.authorize_domain_command(&scope, approval_command("effect-a", 'a'))
+            .unwrap_err(),
+        CordisError::DomainCommandRuntimeBound
+    );
+
+    let permit = host.authorize_runtime(&scope).unwrap();
+    assert_eq!(
+        host.authorize_domain_command(&scope, approval_command("effect-a", 'a'))
+            .unwrap_err(),
+        CordisError::RuntimeDispatchBusy
+    );
+    host.finish_runtime(permit).unwrap();
+}
+
+#[test]
+fn abandoned_domain_command_permit_releases_active_slot() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 3);
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let permit = host
+        .authorize_domain_command(&scope, approval_command("effect-a", 'a'))
+        .unwrap();
+    assert_eq!(host.active_domain_command_scope(), Some(&scope));
+    drop(permit);
+    assert_eq!(host.active_domain_command_scope(), None);
+
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let permit = host
+        .authorize_domain_command(&scope, approval_command("effect-a", 'a'))
+        .unwrap();
+    host.finish_domain_command(permit).unwrap();
 }
 
 #[test]
