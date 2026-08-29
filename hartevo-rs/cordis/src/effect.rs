@@ -12,6 +12,7 @@ pub(crate) enum Registration {
     Service {
         key: String,
         previous: Option<Arc<dyn Any + Send + Sync>>,
+        reserved: bool,
     },
     Var {
         key: String,

@@ -1,33 +1,35 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentLoop, AgentRef, AgentStep, Context, CordisError, DomainSurface, EffectBrokerSurface,
-    EnvironmentOverlay, HartevoSurfaces, LlmStream, LoaderContext, PluginSpec, RuntimeSurface,
-    Service, SurfaceMapping, SurfaceOwner, ToolCall, events, keys, load_plugins, map_surfaces,
-    run_agent_step,
+    AgentLoop, AgentRef, AgentStep, Context, CordisError, CordisHost, DomainSurface,
+    EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
+    KernelConsentState, LlmStream, LoaderContext, RuntimeSurface, SurfaceOwner, ToolCall, events,
+    keys, run_agent_step,
 };
 
-fn consented_domain() -> DomainSurface {
-    DomainSurface {
-        consent: true,
-        approved: true,
-        ..DomainSurface::default()
-    }
+fn now() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 8, 25, 13, 34, 33).unwrap()
 }
 
-fn consented_surfaces() -> HartevoSurfaces {
-    HartevoSurfaces {
-        domain: consented_domain(),
-        ..HartevoSurfaces::default()
-    }
+fn mapped_with_openinterpreter(openinterpreter: bool) -> Context {
+    let mut host = CordisHost::boot(openinterpreter).unwrap();
+    host.bind_domain_kernel(
+        KernelConsentState::Confirmed,
+        None,
+        Some(KernelApproval {
+            decision: KernelApprovalDecision::Approved,
+            valid_until: now() + Duration::minutes(5),
+        }),
+        now(),
+    )
+    .unwrap();
+    std::mem::take(host.context_mut())
 }
 
 fn mapped() -> Context {
-    let mut ctx = Context::new();
-    map_surfaces(&mut ctx, consented_surfaces()).unwrap();
-    ctx.mount(AgentLoop).unwrap();
-    ctx
+    mapped_with_openinterpreter(false)
 }
 
 #[test]
@@ -79,11 +81,11 @@ fn full_step_streams_llm_runs_tool_and_registers_agent() {
     );
     assert_eq!(*created.lock().expect("created"), ["mission-1".to_string()]);
     assert_eq!(
-        ctx.domain::<DomainSurface>().unwrap().owner,
+        ctx.domain::<DomainSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner,
+        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert!(ctx.get::<String>("openinterpreter").is_none());
@@ -104,8 +106,8 @@ fn missing_inject_keys_are_missing_dependencies() {
     );
     assert_eq!(ctx.listener_count(events::AGENT_CREATED), 0);
 
-    ctx.provide(keys::AGENTS, "agents");
-    ctx.provide(keys::TOOLS, "tools");
+    ctx.provide(keys::AGENTS, "agents").unwrap();
+    ctx.provide(keys::TOOLS, "tools").unwrap();
     assert_eq!(
         ctx.mount(AgentLoop).unwrap_err(),
         CordisError::MissingDependencies(vec![
@@ -128,35 +130,22 @@ fn missing_inject_keys_are_missing_dependencies() {
 
 #[test]
 fn openinterpreter_runtime_plugin_does_not_own_domain_or_effect() {
-    let mut ctx = Context::new();
-    map_surfaces(
-        &mut ctx,
-        HartevoSurfaces {
-            domain: consented_domain(),
-            runtime: RuntimeSurface {
-                owner: SurfaceOwner::Hartevo,
-                plugin: Some("openinterpreter"),
-            },
-            ..HartevoSurfaces::default()
-        },
-    )
-    .unwrap();
-    ctx.mount(AgentLoop).unwrap();
+    let mut ctx = mapped_with_openinterpreter(true);
 
     assert_eq!(
-        ctx.runtime::<RuntimeSurface>().unwrap().plugin,
+        ctx.runtime::<RuntimeSurface>().unwrap().plugin(),
         Some("openinterpreter")
     );
     assert_eq!(
-        ctx.runtime::<RuntimeSurface>().unwrap().owner,
+        ctx.runtime::<RuntimeSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        ctx.domain::<DomainSurface>().unwrap().owner,
+        ctx.domain::<DomainSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner,
+        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
 
@@ -168,10 +157,9 @@ fn openinterpreter_runtime_plugin_does_not_own_domain_or_effect() {
             .list(),
         [AgentRef::new("mission-oi")]
     );
-    assert_eq!(
-        ctx.domain::<DomainSurface>().as_deref(),
-        Some(&consented_domain())
-    );
+    let domain = ctx.domain::<DomainSurface>().unwrap();
+    assert!(domain.consent());
+    assert!(domain.approved());
     assert_eq!(
         ctx.effect_broker::<EffectBrokerSurface>().as_deref(),
         Some(&EffectBrokerSurface::default())
@@ -209,14 +197,11 @@ fn teardown_undoes_agents_and_loop_listeners() {
     assert_eq!(ctx.event_mode(events::AGENT_CREATED), None);
     assert_eq!(ctx.event_mode(events::AGENT_DISPOSED), None);
 
-    ctx.mount(SurfaceMapping {
-        surfaces: consented_surfaces(),
-    })
-    .unwrap();
-    ctx.mount(AgentLoop).unwrap();
-    run_agent_step(&mut ctx, AgentStep::new("mission-2", "retry")).unwrap();
+    let mut reloaded = mapped();
+    run_agent_step(&mut reloaded, AgentStep::new("mission-2", "retry")).unwrap();
     assert_eq!(
-        ctx.agents::<hartevo_cordis::AgentsSurface>()
+        reloaded
+            .agents::<hartevo_cordis::AgentsSurface>()
             .unwrap()
             .list(),
         [AgentRef::new("mission-2")]
@@ -225,36 +210,26 @@ fn teardown_undoes_agents_and_loop_listeners() {
 
 #[test]
 fn overlay_still_selects_surface_mapping_then_agent_loop() {
-    let mut ctx = Context::new();
     let overlay = EnvironmentOverlay::new("macos-dev");
     let loader = LoaderContext::new();
-    let mapping = PluginSpec::new("surfaces", |_config, ctx| {
-        SurfaceMapping {
-            surfaces: consented_surfaces(),
-        }
-        .apply(ctx);
-    });
-    let loop_plugin = PluginSpec::new("agent-loop", |_config, ctx| {
-        AgentLoop.apply(ctx);
-    })
-    .with_inject(AgentLoop::inject().iter().copied());
-    let openinterpreter = PluginSpec::new("openinterpreter", |_config, ctx| {
-        ctx.provide("openinterpreter", "loop");
-    })
-    .with_disabled(true);
-
-    let report = load_plugins(
-        &mut ctx,
-        &loader,
-        &overlay,
-        &[mapping, loop_plugin, openinterpreter],
+    let (mut host, report) = CordisHost::boot_overlay(&overlay, &loader, false).unwrap();
+    host.bind_domain_kernel(
+        KernelConsentState::Confirmed,
+        None,
+        Some(KernelApproval {
+            decision: KernelApprovalDecision::Approved,
+            valid_until: now() + Duration::minutes(5),
+        }),
+        now(),
     )
     .unwrap();
+    let ctx = host.context_mut();
     assert_eq!(
         report.started,
         [
             hartevo_cordis::PluginId::new("surfaces"),
-            hartevo_cordis::PluginId::new("agent-loop")
+            hartevo_cordis::PluginId::new("agent-loop"),
+            hartevo_cordis::PluginId::new("invariants"),
         ]
     );
     assert_eq!(
@@ -266,6 +241,6 @@ fn overlay_still_selects_surface_mapping_then_agent_loop() {
     assert_eq!(ctx.listener_count(events::AGENT_CREATED), 1);
     assert!(ctx.get::<&str>("openinterpreter").is_none());
 
-    let out = run_agent_step(&mut ctx, AgentStep::new("mission-overlay", "plan")).unwrap();
+    let out = run_agent_step(ctx, AgentStep::new("mission-overlay", "plan")).unwrap();
     assert_eq!(out.id, "mission-overlay");
 }

@@ -3,7 +3,7 @@
     reason = "UI-SUB-02B1 wires the durable Desktop consumer before the Dioxus subscription owns these crate-private types"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -84,6 +84,10 @@ impl DesktopRuntimeSubscriptionScope {
 
     pub(crate) fn mission_id(&self) -> &MissionId {
         &self.mission_id
+    }
+
+    pub(crate) fn handle_digest(&self) -> &str {
+        self.mission_handle_digest.as_str()
     }
 
     pub(crate) fn from_handle(
@@ -1603,6 +1607,7 @@ impl DesktopRuntimePaintCommit {
 /// coordinator endpoint carried by this token.
 pub(crate) struct DesktopRuntimeExecutionLaunch {
     selection: DesktopRuntimeSelection,
+    handle: CatalogMissionExecutionHandle,
     identity: DesktopRuntimeCommandIdentity,
     coordinator: DesktopRuntimeCoordinatorControl,
     prepared_sequence: u64,
@@ -1618,6 +1623,10 @@ impl DesktopRuntimeExecutionLaunch {
         &self.identity
     }
 
+    pub(crate) fn handle(&self) -> &CatalogMissionExecutionHandle {
+        &self.handle
+    }
+
     pub(crate) const fn prepared_sequence(&self) -> u64 {
         self.prepared_sequence
     }
@@ -1630,6 +1639,7 @@ impl DesktopRuntimeExecutionLaunch {
         self,
     ) -> (
         DesktopRuntimeSelection,
+        CatalogMissionExecutionHandle,
         DesktopRuntimeCommandIdentity,
         DesktopRuntimeCoordinatorControl,
         u64,
@@ -1637,6 +1647,7 @@ impl DesktopRuntimeExecutionLaunch {
     ) {
         (
             self.selection,
+            self.handle,
             self.identity,
             self.coordinator,
             self.prepared_sequence,
@@ -1650,6 +1661,7 @@ impl fmt::Debug for DesktopRuntimeExecutionLaunch {
         formatter
             .debug_struct("DesktopRuntimeExecutionLaunch")
             .field("selection", &self.selection)
+            .field("handle", &self.handle)
             .field("identity", &self.identity)
             .field("prepared_sequence", &self.prepared_sequence)
             .field("render_ack_sequence", &self.render_ack_sequence)
@@ -1708,6 +1720,7 @@ struct DesktopRuntimeActivePaint {
 pub(crate) struct DesktopRuntimeExecutionPaintState {
     reducer: DesktopRuntimeSubscriptionReducer,
     handles: BTreeMap<DesktopRuntimeSubscriptionScope, CatalogMissionExecutionHandle>,
+    acknowledged_handles: BTreeSet<DesktopRuntimeSubscriptionScope>,
     command_slot: DesktopRuntimeCommandSlot,
     active_paint: Option<DesktopRuntimeActivePaint>,
     visible_scope: Option<DesktopRuntimeSubscriptionScope>,
@@ -1743,6 +1756,7 @@ impl DesktopRuntimeExecutionPaintState {
             DesktopRuntimeCommandHandle::pair(scope.clone(), command_digest)?;
         let identity = command.identity();
         self.command_slot.install(command)?;
+        self.acknowledged_handles.remove(&scope);
         self.handles.insert(scope.clone(), handle);
         self.visible_scope = Some(scope);
         self.active_paint = Some(DesktopRuntimeActivePaint {
@@ -1821,6 +1835,14 @@ impl DesktopRuntimeExecutionPaintState {
             self.active_paint = None;
             return Err(RuntimeSubscriptionError::PaintStoppedBeforeRuntime);
         }
+        let handle = self
+            .handles
+            .get(&commit.selection.scope)
+            .cloned()
+            .ok_or(RuntimeSubscriptionError::ScopeHandleMismatch)?;
+        if handle.handle_digest() != commit.selection.scope.handle_digest() {
+            return Err(RuntimeSubscriptionError::ScopeHandleMismatch);
+        }
         let active = self
             .active_paint
             .as_mut()
@@ -1830,9 +1852,12 @@ impl DesktopRuntimeExecutionPaintState {
             .take()
             .ok_or(RuntimeSubscriptionError::PaintAlreadyAcknowledged)?;
         active.render_ack_sequence = Some(render_ack_sequence);
+        self.acknowledged_handles
+            .insert(commit.selection.scope.clone());
         self.transition_sequence = render_ack_sequence;
         Ok(DesktopRuntimeExecutionLaunch {
             selection: commit.selection.clone(),
+            handle,
             identity: commit.identity.clone(),
             coordinator,
             prepared_sequence: commit.prepared_sequence,
@@ -1953,6 +1978,21 @@ impl DesktopRuntimeExecutionPaintState {
             handle,
             cursor,
         })
+    }
+
+    /// Return only a handle that crossed this process's post-render
+    /// acknowledgement fence for the exact selected Catalog Mission.
+    pub(crate) fn acknowledged_handle_for_selection(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Option<CatalogMissionExecutionHandle> {
+        let scope = self.selected_scope_for(project_id, mission_id)?;
+        if !self.acknowledged_handles.contains(scope) {
+            return None;
+        }
+        let handle = self.handles.get(scope)?;
+        (handle.handle_digest() == scope.handle_digest()).then(|| handle.clone())
     }
 
     pub(crate) fn apply_delivery(
@@ -2279,6 +2319,10 @@ impl fmt::Debug for DesktopRuntimeExecutionPaintState {
         formatter
             .debug_struct("DesktopRuntimeExecutionPaintState")
             .field("retained_handle_count", &self.handles.len())
+            .field(
+                "acknowledged_handle_count",
+                &self.acknowledged_handles.len(),
+            )
             .field("reducer", &self.reducer)
             .field("command_active", &self.command_slot.has_active_command())
             .field("has_visible_scope", &self.visible_scope.is_some())
@@ -3630,6 +3674,35 @@ mod tests {
         );
         assert!(state.pull_request(&selection).is_some());
         assert!(!state.stop_available_for_selection(Some((&project_id, &mission_id))));
+    }
+
+    #[test]
+    fn continuation_handle_exists_only_after_exact_render_ack() {
+        let project_id = ProjectId::from("project-continuation-paint");
+        let mission_id = MissionId::from("mission-continuation-paint");
+        let handle = catalog_handle(project_id.as_str(), mission_id.as_str(), 'a');
+        let mut state = DesktopRuntimeExecutionPaintState::default();
+        let commit = state
+            .commit_catalog_start(handle.clone())
+            .expect("prepare first paint");
+        assert!(
+            state
+                .acknowledged_handle_for_selection(&project_id, &mission_id)
+                .is_none()
+        );
+
+        state
+            .acknowledge_rendered_paint(&commit)
+            .expect("exact post-render acknowledgement");
+        assert_eq!(
+            state.acknowledged_handle_for_selection(&project_id, &mission_id),
+            Some(handle)
+        );
+        assert!(
+            state
+                .acknowledged_handle_for_selection(&ProjectId::from("other-project"), &mission_id,)
+                .is_none()
+        );
     }
 
     #[test]

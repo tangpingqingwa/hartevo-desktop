@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::context::{Context, CordisError, keys};
 use crate::event::DispatchMode;
-use crate::service::Service;
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
@@ -215,12 +214,44 @@ impl AgentsSurface {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DomainSurface {
-    pub owner: SurfaceOwner,
-    pub consent: bool,
-    pub approved: bool,
-    pub local_first: bool,
-    pub sqlcipher: bool,
-    pub eval_gate: bool,
+    pub(crate) owner: SurfaceOwner,
+    pub(crate) consent: bool,
+    pub(crate) approved: bool,
+    pub(crate) local_first: bool,
+    pub(crate) sqlcipher: bool,
+    pub(crate) eval_gate: bool,
+}
+
+impl DomainSurface {
+    #[must_use]
+    pub const fn owner(&self) -> SurfaceOwner {
+        self.owner
+    }
+
+    #[must_use]
+    pub const fn consent(&self) -> bool {
+        self.consent
+    }
+
+    #[must_use]
+    pub const fn approved(&self) -> bool {
+        self.approved
+    }
+
+    #[must_use]
+    pub const fn local_first(&self) -> bool {
+        self.local_first
+    }
+
+    #[must_use]
+    pub const fn sqlcipher(&self) -> bool {
+        self.sqlcipher
+    }
+
+    #[must_use]
+    pub const fn eval_gate(&self) -> bool {
+        self.eval_gate
+    }
 }
 
 impl Default for DomainSurface {
@@ -241,31 +272,62 @@ impl Default for DomainSurface {
 /// `receipt_is_verification` stays false: Receipt ≠ Verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EffectBrokerSurface {
-    pub owner: SurfaceOwner,
-    pub receipt_is_verification: bool,
+    pub(crate) owner: SurfaceOwner,
+    pub(crate) receipt_is_verification: bool,
+}
+
+impl EffectBrokerSurface {
+    #[must_use]
+    pub const fn owner(&self) -> SurfaceOwner {
+        self.owner
+    }
+
+    #[must_use]
+    pub const fn receipt_is_verification(&self) -> bool {
+        self.receipt_is_verification
+    }
 }
 
 /// Optional runtime plugin slot. OpenInterpreter may sit here as an adapter
 /// plugin; it still does not own Mission, Truth, or Effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeSurface {
-    pub owner: SurfaceOwner,
-    pub plugin: Option<&'static str>,
+    pub(crate) owner: SurfaceOwner,
+    pub(crate) plugin: Option<&'static str>,
+}
+
+impl RuntimeSurface {
+    #[must_use]
+    pub const fn owner(&self) -> SurfaceOwner {
+        self.owner
+    }
+
+    #[must_use]
+    pub const fn plugin(&self) -> Option<&'static str> {
+        self.plugin
+    }
 }
 
 /// Desktop shell handle. Hartevo-owned; not an OpenInterpreter surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopSurface {
-    pub owner: SurfaceOwner,
+    pub(crate) owner: SurfaceOwner,
+}
+
+impl DesktopSurface {
+    #[must_use]
+    pub const fn owner(&self) -> SurfaceOwner {
+        self.owner
+    }
 }
 
 /// Bundle of Hartevo-owned surfaces. Mapping, not a second host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HartevoSurfaces {
-    pub domain: DomainSurface,
-    pub effect_broker: EffectBrokerSurface,
-    pub runtime: RuntimeSurface,
-    pub desktop: DesktopSurface,
+pub(crate) struct HartevoSurfaces {
+    pub(crate) domain: DomainSurface,
+    pub(crate) effect_broker: EffectBrokerSurface,
+    pub(crate) runtime: RuntimeSurface,
+    pub(crate) desktop: DesktopSurface,
 }
 
 impl Default for HartevoSurfaces {
@@ -284,37 +346,31 @@ impl Default for HartevoSurfaces {
     }
 }
 
-/// Plugin that provides the seven mapped keys and locks pipeline event modes.
-#[derive(Debug, Default)]
-pub struct SurfaceMapping {
-    pub surfaces: HartevoSurfaces,
-}
-
-impl Service for SurfaceMapping {
-    fn apply(self, ctx: &mut Context) {
-        map_surfaces(ctx, self.surfaces).expect("surface mapping registrations");
-    }
-}
-
 /// Provide mapped services and lock primer event names to one dispatch mode.
 ///
 /// Tools pipeline: three waterfalls plus observe-only `tools/result`.
 /// LLM streams: `llm/stream` waterfall. Agent coordination: emit-only
 /// `agent/created` / `agent/disposed`. Domain / effect_broker / runtime /
 /// desktop are Hartevo-owned lookups and never go through OpenInterpreter.
-pub fn map_surfaces(ctx: &mut Context, surfaces: HartevoSurfaces) -> Result<(), CordisError> {
-    assert_hartevo_owned("domain", surfaces.domain.owner);
-    assert_hartevo_owned("effect_broker", surfaces.effect_broker.owner);
-    assert_hartevo_owned("runtime", surfaces.runtime.owner);
-    assert_hartevo_owned("desktop", surfaces.desktop.owner);
+pub(crate) fn map_surfaces(
+    ctx: &mut Context,
+    surfaces: HartevoSurfaces,
+) -> Result<(), CordisError> {
+    require_hartevo_owned("domain", surfaces.domain.owner)?;
+    require_hartevo_owned("effect_broker", surfaces.effect_broker.owner)?;
+    require_hartevo_owned("runtime", surfaces.runtime.owner)?;
+    require_hartevo_owned("desktop", surfaces.desktop.owner)?;
+    if let Some(key) = MAPPED_KEYS.iter().copied().find(|key| ctx.has(key)) {
+        return Err(CordisError::SurfaceAlreadyMapped { key });
+    }
 
-    ctx.provide(keys::TOOLS, ToolsSurface::new());
-    ctx.provide(keys::LLM, LlmSurface::new());
-    ctx.provide(keys::AGENTS, AgentsSurface::new());
-    ctx.provide(keys::DOMAIN, surfaces.domain);
-    ctx.provide(keys::EFFECT_BROKER, surfaces.effect_broker);
-    ctx.provide(keys::RUNTIME, surfaces.runtime);
-    ctx.provide(keys::DESKTOP, surfaces.desktop);
+    ctx.provide(keys::TOOLS, ToolsSurface::new())?;
+    ctx.provide(keys::LLM, LlmSurface::new())?;
+    ctx.provide(keys::AGENTS, AgentsSurface::new())?;
+    ctx.provide_reserved(keys::DOMAIN, surfaces.domain)?;
+    ctx.provide_reserved(keys::EFFECT_BROKER, surfaces.effect_broker)?;
+    ctx.provide_reserved(keys::RUNTIME, surfaces.runtime)?;
+    ctx.provide_reserved(keys::DESKTOP, surfaces.desktop)?;
     lock_mapped_events(ctx)
 }
 
@@ -329,13 +385,14 @@ fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
     Ok(())
 }
 
-fn assert_hartevo_owned(key: &str, owner: SurfaceOwner) {
-    assert_eq!(
-        owner,
-        SurfaceOwner::Hartevo,
-        "{key} is Hartevo-owned; OpenInterpreter never owns Mission, Truth, or Effect (got {})",
-        owner.as_str()
-    );
+fn require_hartevo_owned(key: &'static str, owner: SurfaceOwner) -> Result<(), CordisError> {
+    if owner != SurfaceOwner::Hartevo {
+        return Err(CordisError::InvalidSurfaceOwner {
+            key,
+            owner: owner.as_str(),
+        });
+    }
+    Ok(())
 }
 
 /// Register a tool name on `ctx.tools` and reverse it on teardown.
@@ -407,5 +464,39 @@ pub fn expected_mode(name: &str) -> Option<DispatchMode> {
             Some(DispatchMode::Emit)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sealed_mapping_rejects_forged_owner_with_typed_error_before_mount() {
+        let mut ctx = Context::new();
+        let mut surfaces = HartevoSurfaces::default();
+        surfaces.domain.owner = SurfaceOwner::OpenInterpreter;
+        assert_eq!(
+            map_surfaces(&mut ctx, surfaces).unwrap_err(),
+            CordisError::InvalidSurfaceOwner {
+                key: "domain",
+                owner: "openinterpreter",
+            }
+        );
+        assert!(MAPPED_KEYS.iter().all(|key| !ctx.has(key)));
+    }
+
+    #[test]
+    fn duplicate_sealed_mapping_is_typed_and_keeps_original_authority() {
+        let mut ctx = Context::new();
+        map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap();
+        assert!(matches!(
+            map_surfaces(&mut ctx, HartevoSurfaces::default()),
+            Err(CordisError::SurfaceAlreadyMapped { key }) if key == keys::TOOLS
+        ));
+        assert_eq!(
+            ctx.domain::<DomainSurface>().unwrap().owner(),
+            SurfaceOwner::Hartevo
+        );
     }
 }

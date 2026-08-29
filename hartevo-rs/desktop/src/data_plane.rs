@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration as StdDuration;
@@ -24,8 +24,9 @@ use hartevo_application::{
     ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
     RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
     RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission, Vm11NextContractOrValidTerminalResult,
+    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
+    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
+    Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -34,18 +35,24 @@ use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
-use hartevo_cordis::{AgentStep, AgentStepResult, CordisError, CordisHost};
+#[cfg(test)]
+use hartevo_cordis::{AgentStep, AgentStepResult};
+use hartevo_cordis::{
+    AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, RuntimeBinding,
+    RuntimeRecordBinding,
+};
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
     BrowserWorkspaceId, CompanyId, ConnectionId, ConsentRecord, ConsentState, ConsentStatus,
     ContactChannel, Conversation, ConversationId, CreatorTaskId, CurrencyCode, DeliverableId,
     DeviceId, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
-    MessagingGateway, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+    MessagingGateway, Mission, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
     MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
     MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, PersonId,
     ProjectEncryptionMode, ProjectId, ProjectKeyring, ReviewDecision, ReviewId,
-    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus,
-    StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
+    RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
+    RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId,
+    WorkerHandleStatus,
 };
 use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
@@ -58,7 +65,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::cordis_host::{bind_live_domain_kernel, mount_cordis_host};
+#[cfg(test)]
+use crate::cordis_host::{
+    bind_live_domain_kernel, bind_live_domain_kernel_scope as bind_host_live_domain_kernel_scope,
+};
+use crate::cordis_host::{dispatch_live_runtime, mount_cordis_host};
 use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
     discover_runtime, ensure_project_runtime_home,
@@ -67,6 +78,9 @@ use crate::runtime_plane::{
 const DATA_DIRECTORY_ENV: &str = "HARTEVO_DESKTOP_DATA_DIR";
 const DATABASE_FILE_NAME: &str = "hartevo.sqlite3";
 const OS_SECRET_SERVICE: &str = "com.hartevo.desktop";
+
+/// One process-wide Cordis/DataPlane coordinator for all production UI paths.
+static DESKTOP_DATA_PLANE: OnceLock<DesktopDataPlane> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionContractEvidenceProjection {
@@ -418,6 +432,9 @@ impl fmt::Debug for DesktopCatalogMissionExecutionStart {
 pub struct DesktopMissionContinuationRequest {
     pub project_id: ProjectId,
     pub mission_id: MissionId,
+    /// Exact durable Catalog handle that crossed the Desktop paint/ack fence.
+    /// Legacy non-Catalog Missions leave this empty.
+    pub catalog_execution_handle: Option<CatalogMissionExecutionHandle>,
     pub message_id: MissionConversationMessageId,
     pub kind: MissionConversationMessageKind,
     pub body: String,
@@ -715,6 +732,7 @@ impl fmt::Debug for RecoveryKitDraft {
 #[derive(Clone)]
 pub struct DesktopDataPlane {
     data_root: PathBuf,
+    data_root_identity: DataRootIdentity,
     database_path: PathBuf,
     database_key_reference: SecretReference,
     device_id: DeviceId,
@@ -722,19 +740,47 @@ pub struct DesktopDataPlane {
 }
 
 impl DesktopDataPlane {
-    pub fn discover() -> Result<Self, DesktopDataError> {
+    fn discover() -> Result<Self, DesktopDataError> {
         Self::at_data_root(default_data_root()?)
     }
 
-    /// Cordis-hosted live loop. OpenInterpreter is never this loop.
+    /// Return the single process-wide production DataPlane/Cordis coordinator.
+    ///
+    /// Tests and native fixtures may still construct isolated planes with
+    /// [`Self::at_data_root`]; Dioxus entry points must use this accessor. The
+    /// Desktop data root/profile is immutable for the lifetime of the process;
+    /// changing it requires an application restart.
+    pub fn persistent() -> Result<Self, DesktopDataError> {
+        if let Some(plane) = DESKTOP_DATA_PLANE.get() {
+            return Ok(plane.clone());
+        }
+        let candidate = Self::discover()?;
+        Ok(Self::install_persistent(&DESKTOP_DATA_PLANE, candidate))
+    }
+
+    fn install_persistent(cell: &OnceLock<Self>, candidate: Self) -> Self {
+        if cell.set(candidate.clone()).is_ok() {
+            return candidate;
+        }
+        cell.get().cloned().unwrap_or(candidate)
+    }
+
+    #[cfg(test)]
+    fn shares_cordis_coordinator(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cordis, &other.cordis)
+    }
+
+    /// Test-only inspection seam for the isolated Cordis host.
+    #[cfg(test)]
     pub fn with_cordis_host<T>(&self, f: impl FnOnce(&mut CordisHost) -> T) -> T {
         f(&mut self.lock_cordis())
     }
 
-    /// Bind live Domain Kernel consent/approval onto the mounted host.
+    /// Test-only unscoped Domain Kernel fact binding.
     ///
     /// Production `desktop_surfaces()` stays fail-closed. `step` / `apply_effect`
     /// still require these facts; this never stamps `true` at boot.
+    #[cfg(test)]
     pub fn bind_live_domain_kernel(
         &self,
         consent: &ConsentState,
@@ -745,30 +791,54 @@ impl DesktopDataPlane {
         bind_live_domain_kernel(&mut self.lock_cordis(), consent, record, approval, now)
     }
 
-    /// Production Cordis step. Live Domain Kernel facts are rebound from
-    /// ApplicationService before the host may plan; missing facts stay fail-closed.
+    /// Test-only exact Domain Kernel fact binding.
+    #[cfg(test)]
+    pub fn bind_live_domain_kernel_scope(
+        &self,
+        scope: AuthorityScope,
+        consent: &ConsentState,
+        record: Option<&ConsentRecord>,
+        approval: Option<&Approval>,
+        now: DateTime<Utc>,
+    ) -> Result<(), CordisError> {
+        bind_host_live_domain_kernel_scope(
+            &mut self.lock_cordis(),
+            scope,
+            consent,
+            record,
+            approval,
+            now,
+        )
+    }
+
+    /// Test-only legacy symbolic AgentStep; never a production Runtime route.
+    #[cfg(test)]
     pub fn step(
         &self,
         secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
         step: AgentStep,
         now: DateTime<Utc>,
     ) -> Result<AgentStepResult, DesktopDataError> {
-        self.bind_live_domain_kernel_from_store(secret_store, now)?;
+        self.bind_live_domain_kernel_from_store(secret_store, project_id, mission_id, now)?;
         Ok(self.lock_cordis().step(step)?)
     }
 
-    /// Production Effect write path. Live Domain Kernel facts are rebound
-    /// first; OpenInterpreter still cannot own Domain or Effect.
+    /// Test-only Effect invariant probe; it never executes an external Effect.
+    #[cfg(test)]
     pub fn apply_effect(
         &self,
         secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
         now: DateTime<Utc>,
     ) -> Result<(), DesktopDataError> {
-        self.bind_live_domain_kernel_from_store(secret_store, now)?;
+        self.bind_live_domain_kernel_from_store(secret_store, project_id, mission_id, now)?;
         Ok(self.lock_cordis().apply_effect()?)
     }
 
-    pub fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
+    pub(crate) fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
         let root = root.as_ref();
         if !root.is_absolute() {
             return Err(DesktopDataError::InvalidDataRoot(root.to_path_buf()));
@@ -781,6 +851,7 @@ impl DesktopDataPlane {
             fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
         }
         let data_root = root.canonicalize()?;
+        let data_root_identity = DataRootIdentity::capture(&data_root)?;
         let database_path = data_root.join(DATABASE_FILE_NAME);
         reject_symlink(&database_path)?;
         let root_digest = format!(
@@ -796,12 +867,12 @@ impl DesktopDataPlane {
             version: 1,
         };
         let device_id = DeviceId::from_stable(format!("desktop-device:{root_digest}"));
-        let cordis = Arc::new(Mutex::new(
-            mount_cordis_host(&discover_runtime().projection)
-                .expect("Cordis host mounts SurfaceMapping, AgentLoop, and InvariantGate"),
-        ));
+        let cordis = Arc::new(Mutex::new(mount_cordis_host(
+            &discover_runtime().projection,
+        )?));
         Ok(Self {
             data_root,
+            data_root_identity,
             database_path,
             database_key_reference,
             device_id,
@@ -830,7 +901,6 @@ impl DesktopDataPlane {
             Ok(secret) => {
                 let (service, runtime_reconciliation) =
                     self.open_application_from_secret(&secret, now)?;
-                self.bind_live_domain_kernel_from_service(&service, now)?;
                 Ok(DesktopLoadState::Ready(Box::new(self.build_snapshot(
                     &service,
                     secret_store,
@@ -947,7 +1017,6 @@ impl DesktopDataPlane {
             Err(error) => return Err(error.into()),
         };
         let (service, runtime_reconciliation) = self.open_application_from_secret(&secret, now)?;
-        self.bind_live_domain_kernel_from_service(&service, now)?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -1073,6 +1142,49 @@ impl DesktopDataPlane {
         let command = Self::catalog_mission_start_command(&service, request)?;
         let started = service.start_catalog_mission_execution(command, now)?;
         let handle = started.handle().clone();
+        let snapshot = self.build_snapshot(
+            &service,
+            secret_store,
+            no_runtime_turn_startup_reconciliation(),
+            load_product_evidence(now)?,
+            now,
+        )?;
+        Ok(DesktopCatalogMissionExecutionStart { snapshot, handle })
+    }
+
+    /// Prepare an existing Catalog Mission for a new paint-authorized Runtime
+    /// attempt. This read-only phase returns the exact current durable handle;
+    /// it never starts a process, reconciles Runtime state, or mints authority.
+    pub fn prepare_catalog_mission_runtime_resume_os(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopCatalogMissionExecutionStart, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.prepare_catalog_mission_runtime_resume_with(&secret_store, project_id, mission_id, now)
+    }
+
+    fn prepare_catalog_mission_runtime_resume_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopCatalogMissionExecutionStart, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        self.require_project_context_access(&service, secret_store, project_id, now)?;
+        let mission = service.load_mission(project_id, mission_id)?;
+        if mission.project_id != *project_id
+            || mission.id != *mission_id
+            || mission.definition.is_none()
+            || mission.stage.is_terminal()
+        {
+            return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
+        }
+        let handle = service.mission_execution_handle(project_id, mission_id)?;
         let snapshot = self.build_snapshot(
             &service,
             secret_store,
@@ -1210,48 +1322,9 @@ impl DesktopDataPlane {
         )
     }
 
-    /// Starts an explicitly confirmed VM-00..VM-11 Mission from the machine
-    /// Catalog and then runs at most one bounded local Runtime turn. The
-    /// Catalog binding and first Checkpoint are committed before Runtime
-    /// discovery can fail; Runtime output still cannot complete the Mission.
-    pub fn start_catalog_mission_and_run_os(
-        &self,
-        request: DesktopCatalogMissionRequest,
-        now: DateTime<Utc>,
-    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
-        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
-        self.start_catalog_mission_and_run_with(
-            &secret_store,
-            request,
-            runtime
-                .configuration
-                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
-            runtime.projection.status,
-            now,
-        )
-    }
-
-    pub fn start_catalog_mission_and_run_cancellable_os(
-        &self,
-        request: DesktopCatalogMissionRequest,
-        cancellation: &DesktopRuntimeCancellation,
-        now: DateTime<Utc>,
-    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
-        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
-        self.start_catalog_mission_and_run_with_cancellation(
-            &secret_store,
-            request,
-            runtime
-                .configuration
-                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
-            runtime.projection.status,
-            Some(cancellation),
-            now,
-        )
-    }
-
+    /// Test-only direct Catalog runner. Production Catalog execution must use
+    /// start-only -> paint -> acknowledge -> exact-handle resume.
+    #[cfg(test)]
     fn start_catalog_mission_and_run_with(
         &self,
         secret_store: &impl SecretStore,
@@ -1270,6 +1343,7 @@ impl DesktopDataPlane {
         )
     }
 
+    #[cfg(test)]
     fn start_catalog_mission_and_run_with_cancellation(
         &self,
         secret_store: &impl SecretStore,
@@ -1414,6 +1488,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.require_id_only_runtime_resume(&secret_store, project_id, mission_id)?;
         let runtime = discover_runtime();
         self.resume_mission_runtime_with(
             &secret_store,
@@ -1435,6 +1510,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.require_id_only_runtime_resume(&secret_store, project_id, mission_id)?;
         let runtime = discover_runtime();
         self.resume_mission_runtime_with_cancellation(
             &secret_store,
@@ -1449,20 +1525,40 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Resume one Catalog Mission only when the UI supplies the exact durable
+    /// execution handle that was painted and acknowledged before dispatch.
+    pub fn resume_catalog_mission_runtime_cancellable_os(
+        &self,
+        handle: &CatalogMissionExecutionHandle,
+        cancellation: &DesktopRuntimeCancellation,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let runtime = discover_runtime();
+        self.resume_catalog_mission_runtime_with_cancellation(
+            &secret_store,
+            handle,
+            runtime
+                .configuration
+                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
+            runtime.projection.status,
+            Some(cancellation),
+            now,
+        )
+    }
+
     #[cfg(feature = "native-journey")]
     pub(crate) fn resume_mission_runtime_native(
         &self,
         secret_store: &impl SecretStore,
-        scope: (&ProjectId, &MissionId),
+        handle: &CatalogMissionExecutionHandle,
         runtime: DesktopRuntimeSource,
         cancellation: &DesktopRuntimeCancellation,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
-        let (project_id, mission_id) = scope;
-        self.resume_mission_runtime_with_cancellation(
+        self.resume_catalog_mission_runtime_with_cancellation(
             secret_store,
-            project_id,
-            mission_id,
+            handle,
             Some(runtime),
             DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
             Some(cancellation),
@@ -1481,12 +1577,40 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        self.resume_mission_runtime_with(
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(&secret_store, project_id, now)?;
+        let mission = service.load_mission(project_id, mission_id)?;
+        if mission.project_id != *project_id
+            || mission.id != *mission_id
+            || mission.definition.is_none()
+            || mission.stage.is_terminal()
+        {
+            return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
+        }
+        if let Some(submission) = self.advance_application_checkpoint_before_runtime(
+            &mut service,
             &secret_store,
+            &runtime_reconciliation,
             project_id,
             mission_id,
-            None,
-            DesktopRuntimeAvailabilityStatus::NotConfigured,
+            now,
+        )? {
+            return Ok(submission);
+        }
+        let dispatch = service.dispatch_current_mission_checkpoint(project_id, mission_id, now)?;
+        self.finish_mission_submission(
+            &service,
+            &secret_store,
+            runtime_reconciliation,
+            mission_id.clone(),
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: dispatch.checkpoint_id,
+                capability_id: dispatch.capability_id,
+                executor: dispatch.executor,
+                oracle_ids: dispatch.oracle_ids,
+                completion_policy: dispatch.completion_policy,
+                state: dispatch.state,
+            },
             now,
         )
     }
@@ -2116,10 +2240,12 @@ impl DesktopDataPlane {
         if request.body.trim().is_empty() || request.idempotency_key.trim().is_empty() {
             return Err(DesktopDataError::InvalidMissionContinuation);
         }
+        self.require_exact_catalog_continuation_handle(secret_store, &request)?;
         let project_id = request.project_id.clone();
         let mission_id = request.mission_id.clone();
         let (mut service, runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        validate_catalog_continuation_handle(&service, &request)?;
         service.append_mission_conversation_message(
             AppendMissionConversationMessage {
                 project_id: project_id.clone(),
@@ -2200,6 +2326,49 @@ impl DesktopDataPlane {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resume_catalog_mission_runtime_with_cancellation(
+        &self,
+        secret_store: &impl SecretStore,
+        handle: &CatalogMissionExecutionHandle,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        cancellation: Option<&DesktopRuntimeCancellation>,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let project_id = handle.project_id();
+        let mission_id = handle.mission_id();
+        let (mut service, runtime_reconciliation, context_session) =
+            self.open_ready_runtime_project(secret_store, project_id, now)?;
+        let durable_handle = service.mission_execution_handle(project_id, mission_id)?;
+        if durable_handle != *handle {
+            return Err(ApplicationError::from(
+                RuntimeTextSubscriptionError::MissionHandleMismatch,
+            )
+            .into());
+        }
+        let mission = service.load_mission(project_id, mission_id)?;
+        if mission.project_id != *project_id
+            || mission.id != *mission_id
+            || mission.stage.is_terminal()
+            || mission.definition.is_none()
+        {
+            return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
+        }
+        self.run_existing_mission_runtime_with_cancellation(
+            &mut service,
+            secret_store,
+            runtime_reconciliation,
+            &context_session,
+            project_id,
+            mission.id,
+            runtime,
+            availability,
+            cancellation,
+            now,
+        )
+    }
+
     fn open_ready_runtime_project(
         &self,
         secret_store: &impl SecretStore,
@@ -2237,6 +2406,40 @@ impl DesktopDataPlane {
         let context_session =
             self.project_context_material_session(&service, secret_store, project_id, now)?;
         Ok((service, runtime_reconciliation, context_session))
+    }
+
+    /// Public Project/Mission-id retry is retained only for legacy local
+    /// Missions. Catalog Runtime requires a durable painted execution handle.
+    fn require_id_only_runtime_resume(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<(), DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        let mission = service.load_mission(project_id, mission_id)?;
+        if mission.project_id != *project_id
+            || mission.id != *mission_id
+            || mission.definition.is_some()
+        {
+            return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
+        }
+        Ok(())
+    }
+
+    /// Reject a missing, stale, substituted, or cross-scope Catalog handle
+    /// before startup reconciliation, Conversation append, or Runtime dispatch.
+    fn require_exact_catalog_continuation_handle(
+        &self,
+        secret_store: &impl SecretStore,
+        request: &DesktopMissionContinuationRequest,
+    ) -> Result<(), DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        validate_catalog_continuation_handle(&service, request)
     }
 
     #[allow(
@@ -2288,96 +2491,188 @@ impl DesktopDataPlane {
         cancellation: Option<&DesktopRuntimeCancellation>,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
-        if let Some(control) = cancellation {
-            control.record_progress(DesktopRuntimeProgressPhase::Preparing);
+        if let Some(submission) = self.advance_application_checkpoint_before_runtime(
+            service,
+            secret_store,
+            &runtime_reconciliation,
+            project_id,
+            &mission_id,
+            now,
+        )? {
+            return Ok(submission);
         }
-        let mut mission = service.load_mission(project_id, &mission_id)?;
-        if mission.project_id != *project_id {
+        let scope = runtime_authority_scope(service, project_id, &mission_id)?;
+        let facts = live_domain_kernel_facts(service, project_id, &mission_id, now)?;
+        match dispatch_live_runtime(
+            &self.cordis,
+            scope,
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = runtime_authority_scope(service, project_id, &mission_id)?;
+                if &current_scope != permit.scope() {
+                    return Err(CordisError::AuthorityScopeMismatch.into());
+                }
+                self.run_existing_mission_runtime_authorized(
+                    service,
+                    secret_store,
+                    runtime_reconciliation,
+                    context_session,
+                    project_id,
+                    mission_id,
+                    runtime,
+                    availability,
+                    cancellation,
+                    now,
+                )
+            },
+        ) {
+            Ok(submission) => Ok(submission),
+            Err(AuthorityDispatchError::Cordis(error)) => Err(error.into()),
+            Err(AuthorityDispatchError::Authority(error)) => Err(error),
+        }
+    }
+
+    /// Advance a deterministic Application-owned checkpoint before Cordis
+    /// computes or issues any Runtime permit. A successful CAS therefore
+    /// becomes part of the exact post-checkpoint Runtime scope rather than
+    /// silently aging a previously issued permit.
+    fn advance_application_checkpoint_before_runtime(
+        &self,
+        service: &mut ApplicationService,
+        secret_store: &impl SecretStore,
+        runtime_reconciliation: &RuntimeTurnStartupReconciliation,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DesktopMissionSubmission>, DesktopDataError> {
+        let mission = service.load_mission(project_id, mission_id)?;
+        if mission.project_id != *project_id || mission.id != *mission_id {
             return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
         }
-        if mission.definition.is_some() {
-            let mut dispatch =
-                service.dispatch_current_mission_checkpoint(project_id, &mission_id, now)?;
-            if dispatch.executor == MissionCheckpointExecutor::Application {
-                if dispatch.checkpoint_id == "next_contract_or_valid_terminal" {
-                    return Err(
-                        ApplicationError::Vm11NextContractRouteSpecificCommandRequired.into(),
-                    );
-                }
-                match service.execute_application_mission_checkpoint(
-                    ExecuteApplicationMissionCheckpoint {
-                        project_id: project_id.clone(),
-                        mission_id: mission_id.clone(),
-                        checkpoint_id: dispatch.checkpoint_id.clone(),
-                        expected_mission_revision: dispatch.mission_revision,
-                        expected_checkpoint_revision: dispatch.checkpoint_revision,
-                    },
-                    now,
-                )? {
-                    ApplicationMissionCheckpointExecution::Completed {
-                        next_dispatch: Some(next_dispatch),
-                        ..
-                    } => dispatch = next_dispatch,
-                    ApplicationMissionCheckpointExecution::Completed {
-                        completed_checkpoint_id,
-                        completion_evidence_digest,
-                        next_dispatch: None,
-                        ..
-                    } => {
-                        return self.finish_mission_submission(
+        if mission.definition.is_none() {
+            return Ok(None);
+        }
+
+        let mut dispatch =
+            service.dispatch_current_mission_checkpoint(project_id, mission_id, now)?;
+        if dispatch.executor == MissionCheckpointExecutor::Application {
+            if dispatch.checkpoint_id == "next_contract_or_valid_terminal" {
+                return Err(ApplicationError::Vm11NextContractRouteSpecificCommandRequired.into());
+            }
+            match service.execute_application_mission_checkpoint(
+                ExecuteApplicationMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    checkpoint_id: dispatch.checkpoint_id.clone(),
+                    expected_mission_revision: dispatch.mission_revision,
+                    expected_checkpoint_revision: dispatch.checkpoint_revision,
+                },
+                now,
+            )? {
+                ApplicationMissionCheckpointExecution::Completed {
+                    next_dispatch: Some(next_dispatch),
+                    ..
+                } => dispatch = next_dispatch,
+                ApplicationMissionCheckpointExecution::Completed {
+                    completed_checkpoint_id,
+                    completion_evidence_digest,
+                    next_dispatch: None,
+                    ..
+                } => {
+                    return self
+                        .finish_mission_submission(
                             service,
                             secret_store,
-                            runtime_reconciliation,
-                            mission_id,
+                            runtime_reconciliation.clone(),
+                            mission_id.clone(),
                             DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
                                 checkpoint_id: completed_checkpoint_id,
                                 evidence_digest: completion_evidence_digest,
                             },
                             now,
-                        );
-                    }
-                    ApplicationMissionCheckpointExecution::Blocked { .. } => {
-                        dispatch = service.dispatch_current_mission_checkpoint(
-                            project_id,
-                            &mission_id,
-                            now,
-                        )?;
-                    }
-                    ApplicationMissionCheckpointExecution::NotImplemented { dispatch: current } => {
-                        return self.finish_mission_submission(
+                        )
+                        .map(Some);
+                }
+                ApplicationMissionCheckpointExecution::Blocked { .. } => {
+                    dispatch =
+                        service.dispatch_current_mission_checkpoint(project_id, mission_id, now)?;
+                }
+                ApplicationMissionCheckpointExecution::NotImplemented { dispatch: current } => {
+                    return self
+                        .finish_mission_submission(
                             service,
                             secret_store,
-                            runtime_reconciliation,
-                            mission_id,
+                            runtime_reconciliation.clone(),
+                            mission_id.clone(),
                             DesktopMissionRuntimeOutcome::ApplicationCheckpointNotImplemented {
                                 checkpoint_id: current.checkpoint_id,
                                 capability_id: current.capability_id,
                             },
                             now,
-                        );
-                    }
+                        )
+                        .map(Some);
                 }
             }
+        }
+        if dispatch.executor == MissionCheckpointExecutor::Runtime
+            && dispatch.state == MissionCheckpointDispatchState::Ready
+        {
+            return Ok(None);
+        }
+        self.finish_mission_submission(
+            service,
+            secret_store,
+            runtime_reconciliation.clone(),
+            mission_id.clone(),
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: dispatch.checkpoint_id,
+                capability_id: dispatch.capability_id,
+                executor: dispatch.executor,
+                oracle_ids: dispatch.oracle_ids,
+                completion_policy: dispatch.completion_policy,
+                state: dispatch.state,
+            },
+            now,
+        )
+        .map(Some)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the authorized Desktop Runtime coordinator remains the single implementation behind Cordis dispatch; it preserves encrypted Context, recovery, bounded cancellation, and draft adoption"
+    )]
+    fn run_existing_mission_runtime_authorized(
+        &self,
+        service: &mut ApplicationService,
+        secret_store: &impl SecretStore,
+        runtime_reconciliation: RuntimeTurnStartupReconciliation,
+        context_session: &ProjectContextMaterialSession,
+        project_id: &ProjectId,
+        mission_id: MissionId,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        cancellation: Option<&DesktopRuntimeCancellation>,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        if let Some(control) = cancellation {
+            control.record_progress(DesktopRuntimeProgressPhase::Preparing);
+        }
+        let mission = service.load_mission(project_id, &mission_id)?;
+        if mission.project_id != *project_id || mission.id != mission_id {
+            return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
+        }
+        if mission.definition.is_some() {
+            let dispatch =
+                service.dispatch_current_mission_checkpoint(project_id, &mission_id, now)?;
             if dispatch.executor != MissionCheckpointExecutor::Runtime
                 || dispatch.state != MissionCheckpointDispatchState::Ready
             {
-                return self.finish_mission_submission(
-                    service,
-                    secret_store,
-                    runtime_reconciliation,
-                    mission_id,
-                    DesktopMissionRuntimeOutcome::CheckpointRouted {
-                        checkpoint_id: dispatch.checkpoint_id,
-                        capability_id: dispatch.capability_id,
-                        executor: dispatch.executor,
-                        oracle_ids: dispatch.oracle_ids,
-                        completion_policy: dispatch.completion_policy,
-                        state: dispatch.state,
-                    },
-                    now,
-                );
+                return Err(CordisError::AuthorityScopeMismatch.into());
             }
-            mission = service.load_mission(project_id, &mission_id)?;
         }
         if mission.stage != MissionStage::Running {
             return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
@@ -2385,48 +2680,14 @@ impl DesktopDataPlane {
         let latest_recovery =
             service.latest_runtime_recovery_for_mission(project_id, &mission_id)?;
         let latest_turn = service.latest_runtime_turn_for_mission(project_id, &mission_id)?;
-        let runtime_generation = match service.mission_conversation(project_id, &mission_id) {
-            Ok(conversation) => conversation
-                .messages
-                .iter()
-                .rev()
-                .find(|message| message.role == MissionConversationRole::User)
-                .map(|message| message.sequence)
-                .ok_or(ApplicationError::LocalRuntimeContextScopeMismatch)?,
-            Err(ApplicationError::Storage(StorageError::ScopedRecordNotFound {
-                kind: "mission conversation",
-                ..
-            })) if mission.definition.is_none() => latest_recovery
-                .as_ref()
-                .map(|recovery| recovery.worker_generation)
-                .into_iter()
-                .chain(
-                    latest_turn
-                        .as_ref()
-                        .map(|turn| turn.scope.worker_generation),
-                )
-                .max()
-                .unwrap_or(1),
-            Err(error) => return Err(error.into()),
-        };
-        if mission.definition.is_none()
-            && latest_turn.as_ref().is_some_and(|turn| {
-                latest_recovery.as_ref().is_none_or(|recovery| {
-                    turn.scope.worker_generation > recovery.worker_generation
-                })
-            })
-        {
-            return Err(ApplicationError::LocalRuntimeContextScopeMismatch.into());
-        }
-        if latest_recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.worker_generation > runtime_generation)
-            || latest_turn
-                .as_ref()
-                .is_some_and(|turn| turn.scope.worker_generation > runtime_generation)
-        {
-            return Err(ApplicationError::LocalRuntimeContextScopeMismatch.into());
-        }
+        let runtime_generation = runtime_entry_generation(
+            service,
+            &mission,
+            project_id,
+            &mission_id,
+            latest_recovery.as_ref(),
+            latest_turn.as_ref(),
+        )?;
         let current_recovery = latest_recovery
             .as_ref()
             .filter(|recovery| recovery.worker_generation == runtime_generation);
@@ -3509,6 +3770,7 @@ impl DesktopDataPlane {
         secret: &hartevo_storage::SecretBytes,
         now: DateTime<Utc>,
     ) -> Result<(ApplicationService, RuntimeTurnStartupReconciliation), DesktopDataError> {
+        self.revalidate_database_entry()?;
         let database_key = DatabaseKey::from_secret(secret)?;
         let store = ProjectStore::open(&self.database_path, &database_key)?;
         let mut service = ApplicationService::new(store);
@@ -3521,21 +3783,25 @@ impl DesktopDataPlane {
         &self,
         secret: &hartevo_storage::SecretBytes,
     ) -> Result<ApplicationService, DesktopDataError> {
+        self.revalidate_database_entry()?;
         let database_key = DatabaseKey::from_secret(secret)?;
         let store = ProjectStore::open(&self.database_path, &database_key)?;
         Ok(ApplicationService::new(store))
     }
 
+    #[cfg(test)]
     fn bind_live_domain_kernel_from_store(
         &self,
         secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
         now: DateTime<Utc>,
     ) -> Result<(), DesktopDataError> {
         self.revalidate_database_entry()?;
         match secret_store.get(&self.database_key_reference) {
             Ok(secret) => {
                 let service = self.open_read_application_from_secret(&secret)?;
-                self.bind_live_domain_kernel_from_service(&service, now)
+                self.bind_live_domain_kernel_from_service(&service, project_id, mission_id, now)
             }
             Err(SecretStoreError::SecretNotFound) => {
                 // Uninitialized / missing key: host stays mounted and fail-closed.
@@ -3545,21 +3811,31 @@ impl DesktopDataPlane {
         }
     }
 
+    #[cfg(test)]
     fn lock_cordis(&self) -> std::sync::MutexGuard<'_, CordisHost> {
         self.cordis
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     fn bind_live_domain_kernel_from_service(
         &self,
         service: &ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
         now: DateTime<Utc>,
     ) -> Result<(), DesktopDataError> {
-        let Some(facts) = live_domain_kernel_facts(service, now)? else {
-            return Ok(());
-        };
-        self.bind_live_domain_kernel(
+        let mission = service.load_mission(project_id, mission_id)?;
+        let scope = AuthorityScope::new(
+            mission.tenant_id.as_str(),
+            project_id.as_str(),
+            mission_id.as_str(),
+            mission.revision,
+        )?;
+        let facts = live_domain_kernel_facts(service, project_id, mission_id, now)?;
+        self.bind_live_domain_kernel_scope(
+            scope,
             &facts.consent,
             facts.record.as_ref(),
             facts.approval.as_ref(),
@@ -3570,10 +3846,21 @@ impl DesktopDataPlane {
 
     fn revalidate_database_entry(&self) -> Result<(), DesktopDataError> {
         reject_symlink(&self.data_root)?;
+        if !self.data_root_identity.matches(&self.data_root)
+            || self.database_path.parent() != Some(self.data_root.as_path())
+            || !self.data_root_identity.matches(
+                self.database_path
+                    .parent()
+                    .ok_or_else(|| DesktopDataError::InvalidDataRoot(self.database_path.clone()))?,
+            )
+        {
+            return Err(DesktopDataError::InvalidDataRoot(self.data_root.clone()));
+        }
         reject_symlink(&self.database_path)
     }
 
     fn create_project_root(&self, project_id: &ProjectId) -> Result<PathBuf, DesktopDataError> {
+        self.revalidate_database_entry()?;
         let projects_directory = self.data_root.join("projects");
         reject_symlink(&projects_directory)?;
         fs::create_dir_all(&projects_directory)?;
@@ -3594,6 +3881,454 @@ impl DesktopDataPlane {
     }
 }
 
+fn runtime_authority_scope(
+    service: &ApplicationService,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+) -> Result<AuthorityScope, DesktopDataError> {
+    let mission = service.load_mission(project_id, mission_id)?;
+    if mission.project_id != *project_id || mission.id != *mission_id {
+        return Err(CordisError::AuthorityScopeMismatch.into());
+    }
+    let latest_recovery = service.latest_runtime_recovery_for_mission(project_id, mission_id)?;
+    let latest_turn = service.latest_runtime_turn_for_mission(project_id, mission_id)?;
+    let generation = runtime_entry_generation(
+        service,
+        &mission,
+        project_id,
+        mission_id,
+        latest_recovery.as_ref(),
+        latest_turn.as_ref(),
+    )?;
+    let mission_handle_digest = if mission.definition.is_some() {
+        Some(
+            service
+                .mission_execution_handle(project_id, mission_id)?
+                .handle_digest()
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let runtime = RuntimeBinding::new(
+        generation,
+        latest_recovery
+            .as_ref()
+            .map(|recovery| RuntimeRecordBinding::new(recovery.id.as_str(), recovery.revision))
+            .transpose()?,
+        latest_turn
+            .as_ref()
+            .map(|turn| RuntimeRecordBinding::new(turn.id.as_str(), turn.revision))
+            .transpose()?,
+        runtime_authority_fence_digest(
+            &mission,
+            latest_recovery.as_ref(),
+            latest_turn.as_ref(),
+            mission_handle_digest.as_deref(),
+        ),
+    )?;
+    Ok(AuthorityScope::new(
+        mission.tenant_id.as_str(),
+        project_id.as_str(),
+        mission_id.as_str(),
+        mission.revision,
+    )?
+    .with_runtime(runtime))
+}
+
+fn runtime_entry_generation(
+    service: &ApplicationService,
+    mission: &Mission,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+    latest_recovery: Option<&RuntimeRecoveryAttempt>,
+    latest_turn: Option<&RuntimeTurnAttempt>,
+) -> Result<u64, DesktopDataError> {
+    if mission.project_id != *project_id
+        || mission.id != *mission_id
+        || latest_recovery.is_some_and(|recovery| {
+            recovery.tenant_id != mission.tenant_id
+                || recovery.project_id != *project_id
+                || recovery.mission_id != *mission_id
+        })
+        || latest_turn.is_some_and(|turn| {
+            turn.scope.tenant_id != mission.tenant_id
+                || turn.scope.project_id != *project_id
+                || turn.scope.mission_id != *mission_id
+        })
+    {
+        return Err(CordisError::AuthorityScopeMismatch.into());
+    }
+
+    let runtime_generation = match service.mission_conversation(project_id, mission_id) {
+        Ok(conversation) => {
+            if conversation.tenant_id != mission.tenant_id
+                || conversation.project_id != *project_id
+                || conversation.mission_id != *mission_id
+            {
+                return Err(CordisError::AuthorityScopeMismatch.into());
+            }
+            conversation
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MissionConversationRole::User)
+                .map(|message| message.sequence)
+                .ok_or(ApplicationError::LocalRuntimeContextScopeMismatch)?
+        }
+        Err(ApplicationError::Storage(StorageError::ScopedRecordNotFound {
+            kind: "mission conversation",
+            ..
+        })) if mission.definition.is_none() => latest_recovery
+            .map(|recovery| recovery.worker_generation)
+            .into_iter()
+            .chain(latest_turn.map(|turn| turn.scope.worker_generation))
+            .max()
+            .unwrap_or(1),
+        Err(error) => return Err(error.into()),
+    };
+    if runtime_generation == 0
+        || (mission.definition.is_none()
+            && latest_turn.is_some_and(|turn| {
+                latest_recovery.is_none_or(|recovery| {
+                    turn.scope.worker_generation > recovery.worker_generation
+                })
+            }))
+        || latest_recovery.is_some_and(|recovery| recovery.worker_generation > runtime_generation)
+        || latest_turn.is_some_and(|turn| turn.scope.worker_generation > runtime_generation)
+    {
+        return Err(ApplicationError::LocalRuntimeContextScopeMismatch.into());
+    }
+    Ok(runtime_generation)
+}
+
+fn runtime_authority_field(hasher: &mut Sha256, name: &str, value: &[u8]) {
+    hasher.update((name.len() as u128).to_be_bytes());
+    hasher.update(name.as_bytes());
+    hasher.update((value.len() as u128).to_be_bytes());
+    hasher.update(value);
+}
+
+fn runtime_authority_optional_field(hasher: &mut Sha256, name: &str, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            runtime_authority_field(hasher, name, b"some");
+            runtime_authority_field(hasher, "value", value.as_bytes());
+        }
+        None => runtime_authority_field(hasher, name, b"none"),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the content-free authority digest explicitly frames every durable Mission, recovery, turn, workspace, attachment, assembly, and handle fence so omitted authority fields remain review-visible"
+)]
+fn runtime_authority_fence_digest(
+    mission: &Mission,
+    recovery: Option<&RuntimeRecoveryAttempt>,
+    turn: Option<&RuntimeTurnAttempt>,
+    mission_handle_digest: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    runtime_authority_field(
+        &mut hasher,
+        "domain",
+        b"hartevo.cordis.runtime-authority/v1",
+    );
+    runtime_authority_field(&mut hasher, "tenant", mission.tenant_id.as_str().as_bytes());
+    runtime_authority_field(
+        &mut hasher,
+        "project",
+        mission.project_id.as_str().as_bytes(),
+    );
+    runtime_authority_field(&mut hasher, "mission", mission.id.as_str().as_bytes());
+    runtime_authority_field(
+        &mut hasher,
+        "mission_revision",
+        &mission.revision.to_be_bytes(),
+    );
+    runtime_authority_field(
+        &mut hasher,
+        "mission_stage",
+        format!("{:?}", mission.stage).as_bytes(),
+    );
+    runtime_authority_optional_field(&mut hasher, "mission_handle_digest", mission_handle_digest);
+
+    match recovery {
+        None => runtime_authority_field(&mut hasher, "recovery", b"none"),
+        Some(recovery) => {
+            runtime_authority_field(&mut hasher, "recovery", b"some");
+            runtime_authority_field(&mut hasher, "recovery_id", recovery.id.as_str().as_bytes());
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_tenant",
+                recovery.tenant_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_project",
+                recovery.project_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_mission",
+                recovery.mission_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_workspace",
+                recovery.workspace_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_worker",
+                recovery.worker_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_generation",
+                &recovery.worker_generation.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_source_attachment_epoch",
+                &recovery.source_attachment_epoch.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_target_attachment_epoch",
+                &recovery.target_attachment_epoch.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_source_mapping_digest",
+                recovery.source_mapping_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_checkpoint_id",
+                recovery.checkpoint_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_checkpoint_digest",
+                recovery.checkpoint_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_runtime_config_digest",
+                recovery.runtime_config_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_initial_strategy",
+                format!("{:?}", recovery.initial_strategy).as_bytes(),
+            );
+            runtime_authority_optional_field(
+                &mut hasher,
+                "recovery_requested_thread_digest",
+                recovery.requested_thread_id_digest.as_deref(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_max_process_attempts",
+                &recovery.max_process_attempts.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_process_attempt",
+                &recovery.process_attempt.to_be_bytes(),
+            );
+            runtime_authority_optional_field(
+                &mut hasher,
+                "recovery_health_digest",
+                recovery.health_digest.as_deref(),
+            );
+            runtime_authority_optional_field(
+                &mut hasher,
+                "recovery_runtime_instance_digest",
+                recovery.runtime_instance_digest.as_deref(),
+            );
+            runtime_authority_optional_field(
+                &mut hasher,
+                "recovery_runtime_thread_id",
+                recovery.runtime_thread_id.as_deref(),
+            );
+            runtime_authority_optional_field(
+                &mut hasher,
+                "recovery_runtime_mapping_digest",
+                recovery.runtime_mapping_digest.as_deref(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_status",
+                format!("{:?}", recovery.status).as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_revision",
+                &recovery.revision.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "recovery_updated_at",
+                recovery.updated_at.to_rfc3339().as_bytes(),
+            );
+        }
+    }
+
+    match turn {
+        None => runtime_authority_field(&mut hasher, "turn", b"none"),
+        Some(turn) => {
+            let scope = &turn.scope;
+            runtime_authority_field(&mut hasher, "turn", b"some");
+            runtime_authority_field(&mut hasher, "turn_id", turn.id.as_str().as_bytes());
+            runtime_authority_field(
+                &mut hasher,
+                "turn_tenant",
+                scope.tenant_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_project",
+                scope.project_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_mission",
+                scope.mission_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_workspace",
+                scope.workspace_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_capsule_id",
+                scope.capsule_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_capsule_revision",
+                &scope.capsule_revision.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_capsule_authority_digest",
+                scope.capsule_authority_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_branch_id",
+                scope.branch_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_branch_revision",
+                &scope.branch_revision.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_worker",
+                scope.worker_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_generation",
+                &scope.worker_generation.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_worker_lease_id",
+                scope.worker_lease_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_worker_lease_revision",
+                &scope.worker_lease_revision.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_attachment_epoch",
+                &scope.attachment_epoch.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_assembly_id",
+                scope.assembly_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_assembly_revision",
+                &scope.assembly_revision.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_assembly_manifest_digest",
+                scope.assembly_manifest_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_assembly_input_digest",
+                scope.assembly_input_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_prompt_digest",
+                scope.prompt_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_checkpoint_id",
+                scope.checkpoint_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_checkpoint_digest",
+                scope.checkpoint_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_recovery_id",
+                scope.recovery_id.as_str().as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_recovery_revision",
+                &scope.recovery_revision.to_be_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_runtime_instance_digest",
+                scope.runtime_instance_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_runtime_mapping_digest",
+                scope.runtime_mapping_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_runtime_thread_digest",
+                scope.runtime_thread_id_digest.as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
+                "turn_status",
+                format!("{:?}", turn.status).as_bytes(),
+            );
+            runtime_authority_field(&mut hasher, "turn_revision", &turn.revision.to_be_bytes());
+            runtime_authority_field(
+                &mut hasher,
+                "turn_updated_at",
+                turn.updated_at.to_rfc3339().as_bytes(),
+            );
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 struct LiveDomainKernelFacts {
     consent: ConsentState,
     record: Option<ConsentRecord>,
@@ -3602,20 +4337,25 @@ struct LiveDomainKernelFacts {
 
 fn live_domain_kernel_facts(
     service: &ApplicationService,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
     now: DateTime<Utc>,
-) -> Result<Option<LiveDomainKernelFacts>, DesktopDataError> {
-    let projects = service.list_projects()?;
-    let Some(project) = projects.first() else {
-        return Ok(None);
-    };
-    let records = service.list_consent_records(&project.id)?;
-    let record = records.into_iter().max_by_key(|record| {
-        (
-            record.revision,
-            record.granted_at.unwrap_or(DateTime::<Utc>::MIN_UTC),
-            record.id.as_str().to_owned(),
-        )
-    });
+) -> Result<LiveDomainKernelFacts, DesktopDataError> {
+    let mission = service.load_mission(project_id, mission_id)?;
+    if mission.project_id != *project_id || mission.id != *mission_id {
+        return Err(CordisError::AuthorityScopeMismatch.into());
+    }
+    let records = service.list_consent_records(project_id)?;
+    let record = records
+        .into_iter()
+        .filter(|record| record.tenant_id == mission.tenant_id && record.project_id == *project_id)
+        .max_by_key(|record| {
+            (
+                record.revision,
+                record.granted_at.unwrap_or(DateTime::<Utc>::MIN_UTC),
+                record.id.as_str().to_owned(),
+            )
+        });
     let consent = record
         .as_ref()
         .map_or(ConsentState::Missing, |record| match record.status {
@@ -3635,29 +4375,45 @@ fn live_domain_kernel_facts(
                 ConsentState::Missing
             }
         });
-    let missions = service.list_missions(&project.id)?;
-    let approval = missions
+    let approval = mission
+        .effects
         .iter()
-        .flat_map(|mission| mission.effects.iter())
         .filter_map(|effect| effect.approval.as_ref())
         .filter(|candidate| {
             candidate.decision == ApprovalDecision::Approved && now < candidate.valid_until
         })
         .max_by_key(|candidate| (candidate.valid_until, candidate.decided_at))
-        .cloned()
-        .or_else(|| {
-            missions
-                .iter()
-                .flat_map(|mission| mission.effects.iter())
-                .filter_map(|effect| effect.approval.as_ref())
-                .max_by_key(|candidate| (candidate.valid_until, candidate.decided_at))
-                .cloned()
-        });
-    Ok(Some(LiveDomainKernelFacts {
+        .cloned();
+    Ok(LiveDomainKernelFacts {
         consent,
         record,
         approval,
-    }))
+    })
+}
+
+fn validate_catalog_continuation_handle(
+    service: &ApplicationService,
+    request: &DesktopMissionContinuationRequest,
+) -> Result<(), DesktopDataError> {
+    let mission = service.load_mission(&request.project_id, &request.mission_id)?;
+    if mission.project_id != request.project_id || mission.id != request.mission_id {
+        return Err(CordisError::AuthorityScopeMismatch.into());
+    }
+    match (&mission.definition, &request.catalog_execution_handle) {
+        (Some(_), Some(handle))
+            if handle.project_id() == &request.project_id
+                && handle.mission_id() == &request.mission_id
+                && service
+                    .mission_execution_handle(&request.project_id, &request.mission_id)?
+                    == *handle =>
+        {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => {
+            Err(ApplicationError::from(RuntimeTextSubscriptionError::MissionHandleMismatch).into())
+        }
+    }
 }
 
 fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation {
@@ -3817,6 +4573,42 @@ fn reject_symlink(path: &Path) -> Result<(), DesktopDataError> {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DataRootIdentity {
+    canonical_path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl DataRootIdentity {
+    fn capture(path: &Path) -> Result<Self, DesktopDataError> {
+        let canonical_path = path.canonicalize()?;
+        let metadata = fs::metadata(&canonical_path)?;
+        if !metadata.is_dir() {
+            return Err(DesktopDataError::InvalidDataRoot(path.to_path_buf()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                canonical_path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self { canonical_path })
+        }
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        Self::capture(path).is_ok_and(|current| current == *self)
     }
 }
 
@@ -4089,6 +4881,35 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn current_catalog_handle(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> CatalogMissionExecutionHandle {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("read Application")
+            .mission_execution_handle(project_id, mission_id)
+            .expect("exact Catalog execution handle")
+    }
+
+    #[test]
+    fn persistent_installer_reuses_the_first_cordis_coordinator() {
+        let directory = tempfile::tempdir().expect("directory");
+        let first = DesktopDataPlane::at_data_root(directory.path().join("first")).unwrap();
+        let second = DesktopDataPlane::at_data_root(directory.path().join("second")).unwrap();
+        assert!(!first.shares_cordis_coordinator(&second));
+
+        let cell = OnceLock::new();
+        let installed = DesktopDataPlane::install_persistent(&cell, first);
+        let raced = DesktopDataPlane::install_persistent(&cell, second);
+        assert!(installed.shares_cordis_coordinator(&raced));
+    }
+
     fn production_preview_broker() -> EffectBroker {
         DesktopDataPlane::waiting_approval_broker()
     }
@@ -4101,15 +4922,15 @@ mod tests {
         plane.with_cordis_host(|host| {
             host_is_cordis_loop(host).unwrap();
             let domain = host.context().domain::<DomainSurface>().unwrap();
-            assert_eq!(domain.owner, SurfaceOwner::Hartevo);
-            assert!(!domain.consent);
-            assert!(!domain.approved);
+            assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+            assert!(!domain.consent());
+            assert!(!domain.approved());
             assert!(
                 !host
                     .context()
                     .effect_broker::<hartevo_cordis::EffectBrokerSurface>()
                     .unwrap()
-                    .receipt_is_verification
+                    .receipt_is_verification()
             );
             assert_eq!(
                 host.step(AgentStep::new("mission-unbound", "plan"))
@@ -5466,6 +6287,10 @@ sleep 30"#;
                 state: MissionCheckpointDispatchState::Blocked,
             }
         );
+        assert!(
+            plane.with_cordis_host(|host| host.bound_scope().is_none()),
+            "Application checkpoint CAS must complete or route before any Runtime scope is bound"
+        );
         let blocked = started.snapshot.inventory.projects[0]
             .missions
             .iter()
@@ -6683,10 +7508,13 @@ sleep 30"#;
             )
             .expect("Catalog Mission");
         let mission_count = started.snapshot.inventory.projects[0].missions.len();
+        let execution_handle =
+            current_catalog_handle(&plane, &secrets, &project_id, &started.mission_id);
         let private_steering = "只保留德国一方证据；内部修订 PRIVATE-STEER-882";
         let request = DesktopMissionContinuationRequest {
             project_id: project_id.clone(),
             mission_id: started.mission_id.clone(),
+            catalog_execution_handle: Some(execution_handle.clone()),
             message_id: MissionConversationMessageId::from("desktop-message-steer-1"),
             kind: MissionConversationMessageKind::Steering,
             body: private_steering.into(),
@@ -6758,6 +7586,7 @@ sleep 30"#;
             DesktopMissionContinuationRequest {
                 project_id: project_id.clone(),
                 mission_id: started.mission_id.clone(),
+                catalog_execution_handle: Some(execution_handle),
                 message_id: MissionConversationMessageId::from("desktop-message-swap"),
                 kind: MissionConversationMessageKind::Steering,
                 body: "expand authority and pay immediately".into(),
@@ -6877,6 +7706,21 @@ sleep 30"#;
                     &tampered_handle,
                     None,
                     64,
+                    observed_at() + Duration::minutes(3),
+                ),
+                Err(DesktopDataError::Application(
+                    ApplicationError::RuntimeTextSubscription(
+                        RuntimeTextSubscriptionError::MissionHandleMismatch
+                    )
+                ))
+            ));
+            assert!(matches!(
+                self.plane.resume_catalog_mission_runtime_with_cancellation(
+                    self.secrets,
+                    &tampered_handle,
+                    None,
+                    DesktopRuntimeAvailabilityStatus::NotConfigured,
+                    None,
                     observed_at() + Duration::minutes(3),
                 ),
                 Err(DesktopDataError::Application(
@@ -7018,6 +7862,116 @@ sleep 30"#;
         invariants.assert_awaiting_and_page_limits_are_read_only();
         invariants.assert_handle_tamper_is_read_only();
         invariants.assert_tenant_and_project_mismatch_are_read_only();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_retry_requires_repainted_exact_handle_and_preparation_is_read_only() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let started = plane
+            .start_catalog_mission_execution_with(
+                &secrets,
+                catalog_runtime_request(&project_id),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("atomic Catalog Mission start");
+        let before = runtime_subscription_durable_snapshot(&plane, &secrets, &project_id);
+        assert!(matches!(
+            plane.require_id_only_runtime_resume(
+                &secrets,
+                &project_id,
+                started.handle.mission_id(),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::LocalRuntimeMissionNotSchedulable
+            ))
+        ));
+
+        let prepared = plane
+            .prepare_catalog_mission_runtime_resume_with(
+                &secrets,
+                &project_id,
+                started.handle.mission_id(),
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("read-only retry preparation");
+        assert_eq!(prepared.handle, started.handle);
+        assert_eq!(
+            prepared.snapshot.runtime_reconciliation,
+            no_runtime_turn_startup_reconciliation()
+        );
+        assert_eq!(
+            runtime_subscription_durable_snapshot(&plane, &secrets, &project_id),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_continuation_rejects_missing_or_tampered_handle_before_write_or_dispatch() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let started = plane
+            .start_catalog_mission_execution_with(
+                &secrets,
+                catalog_runtime_request(&project_id),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("atomic Catalog Mission start");
+        let before = runtime_subscription_durable_snapshot(&plane, &secrets, &project_id);
+        let base = DesktopMissionContinuationRequest {
+            project_id: project_id.clone(),
+            mission_id: started.handle.mission_id().clone(),
+            catalog_execution_handle: None,
+            message_id: MissionConversationMessageId::from("catalog-continuation-handle-gate"),
+            kind: MissionConversationMessageKind::Steering,
+            body: "private continuation that must stay unwritten".into(),
+            idempotency_key: "catalog-continuation-handle-gate:1".into(),
+            expected_conversation_revision: 1,
+        };
+        assert!(matches!(
+            plane.continue_mission_and_run_with(
+                &secrets,
+                base.clone(),
+                None,
+                DesktopRuntimeAvailabilityStatus::NotConfigured,
+                observed_at() + Duration::minutes(3),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::RuntimeTextSubscription(
+                    RuntimeTextSubscriptionError::MissionHandleMismatch
+                )
+            ))
+        ));
+
+        let mut tampered_json =
+            serde_json::to_value(&started.handle).expect("serialized execution handle");
+        tampered_json["contractDigest"] = serde_json::json!("0".repeat(64));
+        let tampered = serde_json::from_value(tampered_json).expect("tampered handle envelope");
+        assert!(matches!(
+            plane.continue_mission_and_run_with(
+                &secrets,
+                DesktopMissionContinuationRequest {
+                    catalog_execution_handle: Some(tampered),
+                    ..base
+                },
+                None,
+                DesktopRuntimeAvailabilityStatus::NotConfigured,
+                observed_at() + Duration::minutes(4),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::RuntimeTextSubscription(
+                    RuntimeTextSubscriptionError::MissionHandleMismatch
+                )
+            ))
+        ));
+        assert_eq!(
+            runtime_subscription_durable_snapshot(&plane, &secrets, &project_id),
+            before
+        );
+        plane.with_cordis_host(|host| {
+            assert!(host.bound_scope().is_none());
+            assert!(host.active_runtime_scope().is_none());
+        });
     }
 
     #[cfg(unix)]
@@ -7945,12 +8899,15 @@ sleep 30"#;
         );
 
         let private_steering = "Use only confirmed first-party evidence in the replacement turn";
+        let execution_handle =
+            current_catalog_handle(&plane, &secrets, &project_id, &failed.mission_id);
         let continued = plane
             .continue_mission_and_run_with(
                 &secrets,
                 DesktopMissionContinuationRequest {
                     project_id: project_id.clone(),
                     mission_id: failed.mission_id.clone(),
+                    catalog_execution_handle: Some(execution_handle),
                     message_id: MissionConversationMessageId::from(
                         "message-retire-failed-generation",
                     ),
@@ -8084,9 +9041,12 @@ sleep 30"#;
 
         let private_steering =
             "Supersede the startup generation before any model turn; keep this private";
+        let execution_handle =
+            current_catalog_handle(&plane, &secrets, &project_id, &failed_start.mission_id);
         let request = DesktopMissionContinuationRequest {
             project_id: project_id.clone(),
             mission_id: failed_start.mission_id.clone(),
+            catalog_execution_handle: Some(execution_handle),
             message_id: MissionConversationMessageId::from("message-retire-pre-turn-recovery"),
             kind: MissionConversationMessageKind::Correction,
             body: private_steering.into(),
@@ -8228,6 +9188,21 @@ sleep 30"#;
             .expect("content-free Runtime projection");
         assert_eq!(runtime.recovery_status, None);
         assert_eq!(runtime.turn_status, None);
+        let bound_scope = plane
+            .with_cordis_host(|host| host.bound_scope().cloned())
+            .expect("Runtime coordinator must enter through exact Cordis scope");
+        assert_eq!(bound_scope.project_id(), project_id.as_str());
+        assert_eq!(bound_scope.mission_id(), submission.mission_id.as_str());
+        plane.with_cordis_host(|host| {
+            assert!(
+                host.context()
+                    .agents::<hartevo_cordis::AgentsSurface>()
+                    .unwrap()
+                    .list()
+                    .is_empty(),
+                "Cordis must dispose the exact scoped agent after Runtime returns"
+            );
+        });
 
         let database_secret = secrets
             .get(plane.database_key_reference())
@@ -8749,7 +9724,7 @@ sleep 30"#;
     }
 
     #[test]
-    fn data_plane_mounts_cordis_host_as_the_live_loop() {
+    fn data_plane_mounts_cordis_host_with_hartevo_owned_surfaces() {
         use chrono::{Duration, TimeZone, Utc};
         use hartevo_cordis::{
             AgentStep, CordisError, DomainSurface, OPENINTERPRETER, SurfaceOwner,
@@ -8765,9 +9740,9 @@ sleep 30"#;
         plane.with_cordis_host(|host| {
             host_is_cordis_loop(host).unwrap();
             let domain = host.context().domain::<DomainSurface>().unwrap();
-            assert_eq!(domain.owner, SurfaceOwner::Hartevo);
-            assert!(!domain.consent);
-            assert!(!domain.approved);
+            assert_eq!(domain.owner(), SurfaceOwner::Hartevo);
+            assert!(!domain.consent());
+            assert!(!domain.approved());
             assert_eq!(
                 host.step(AgentStep::new("mission-plane", "plan"))
                     .unwrap_err(),
@@ -8813,6 +9788,8 @@ sleep 30"#;
         let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
+        let missing_project = ProjectId::from("missing-project");
+        let missing_mission = MissionId::from("missing-mission");
         let DesktopLoadState::Uninitialized { .. } = plane
             .load_with(&secrets, observed_at())
             .expect("honest first-run state")
@@ -8824,6 +9801,8 @@ sleep 30"#;
             plane
                 .step(
                     &secrets,
+                    &missing_project,
+                    &missing_mission,
                     AgentStep::new("mission-uninitialized", "plan"),
                     observed_at(),
                 )
@@ -8836,7 +9815,7 @@ sleep 30"#;
         );
         assert_eq!(
             plane
-                .apply_effect(&secrets, observed_at())
+                .apply_effect(&secrets, &missing_project, &missing_mission, observed_at(),)
                 .unwrap_err()
                 .to_string(),
             DesktopDataError::Cordis(CordisError::MissingDependencies(vec![
@@ -8849,24 +9828,44 @@ sleep 30"#;
             .initialize_with(&secrets, observed_at())
             .expect("explicit initialization");
         assert_host_fail_closed_on_consent(&plane);
-        assert!(matches!(
-            plane.step(
-                &secrets,
-                AgentStep::new("mission-initialized", "plan"),
-                observed_at(),
-            ),
-            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
-                if missing == [hartevo_cordis::invariant_missing::CONSENT]
-        ));
-        assert!(matches!(
-            plane.apply_effect(&secrets, observed_at()),
-            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
-                if missing == [hartevo_cordis::invariant_missing::CONSENT]
-        ));
+        for error in [
+            plane
+                .step(
+                    &secrets,
+                    &missing_project,
+                    &missing_mission,
+                    AgentStep::new("mission-initialized", "plan"),
+                    observed_at(),
+                )
+                .unwrap_err(),
+            plane
+                .apply_effect(&secrets, &missing_project, &missing_mission, observed_at())
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    &error,
+                    DesktopDataError::Application(ApplicationError::Storage(
+                        StorageError::MissionNotFound { .. }
+                    ))
+                ),
+                "unexpected exact-scope error: {error:?}"
+            );
+        }
+        assert!(
+            plane
+                .with_cordis_host(|host| host.bound_scope().cloned())
+                .is_none(),
+            "a missing Mission must not bind fallback authority"
+        );
     }
 
     #[test]
-    fn production_load_binds_live_grant_and_in_window_approval() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the scoped Domain fact test covers an approved exact Mission plus a consent-only planning/effect gate fixture"
+    )]
+    fn exact_mission_step_binds_live_grant_and_in_window_approval() {
         use hartevo_cordis::{DomainSurface, host_is_cordis_loop, invariant_missing};
 
         let directory = tempfile::tempdir().expect("directory");
@@ -8914,19 +9913,26 @@ sleep 30"#;
         plane.with_cordis_host(|host| {
             host_is_cordis_loop(host).unwrap();
             let domain = host.context().domain::<DomainSurface>().unwrap();
-            assert!(domain.consent);
-            assert!(domain.approved);
+            assert!(!domain.consent());
+            assert!(!domain.approved());
         });
         let out = plane
             .step(
                 &secrets,
+                &project_id,
+                &mission_id,
                 AgentStep::new("mission-live", "plan"),
                 observed_at() + Duration::minutes(3),
             )
             .expect("production step after live bind");
         assert_eq!(out.id, "mission-live");
         plane
-            .apply_effect(&secrets, observed_at() + Duration::minutes(3))
+            .apply_effect(
+                &secrets,
+                &project_id,
+                &mission_id,
+                observed_at() + Duration::minutes(3),
+            )
             .expect("production apply_effect after live bind");
 
         let consent_only = DesktopDataPlane::at_data_root(directory.path().join("consent-only"))
@@ -8944,7 +9950,7 @@ sleep 30"#;
             "consent-only",
             observed_at() + Duration::minutes(1),
         );
-        grant_live_consent(&LiveConsentGrant {
+        let (_, _, consent_mission) = grant_live_consent(&LiveConsentGrant {
             plane: &consent_only,
             secrets: &consent_secrets,
             project_id: &consent_project,
@@ -8959,12 +9965,88 @@ sleep 30"#;
         assert!(matches!(
             consent_only.step(
                 &consent_secrets,
+                &consent_project,
+                &consent_mission,
                 AgentStep::new("mission-consent-only", "plan"),
                 observed_at() + Duration::minutes(3),
             ),
             Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
                 if missing == [invariant_missing::APPROVAL]
         ));
+    }
+
+    #[test]
+    fn approval_from_another_mission_cannot_bind_runtime_authority() {
+        use hartevo_cordis::{DomainSurface, invariant_missing};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let project_root = directory.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data")).unwrap();
+        let secrets = MemorySecretStore::default();
+        plane.initialize_with(&secrets, observed_at()).unwrap();
+        let (project_id, tenant_id) = create_kernel_bind_project(
+            &plane,
+            &secrets,
+            &project_root,
+            "cross-mission",
+            observed_at() + Duration::minutes(1),
+        );
+        let (person_id, consent_id, approved_mission) = grant_live_consent(&LiveConsentGrant {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            tenant_id: &tenant_id,
+            suffix: "cross-mission",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::days(30)),
+        });
+        approve_live_preview(&LivePreviewApproval {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            person_id,
+            consent_id: &consent_id,
+            mission_id: &approved_mission,
+            suffix: "cross-mission",
+            now: observed_at() + Duration::minutes(2),
+        });
+
+        let other_mission = MissionId::from("desktop-kernel-mission-without-approval");
+        let database_secret = secrets.get(plane.database_key_reference()).unwrap();
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .unwrap();
+        service
+            .start_mission(
+                StartMission {
+                    id: other_mission.clone(),
+                    research_task_id: TaskId::from("desktop-kernel-task-without-approval"),
+                    project_id: project_id.clone(),
+                    title: Some("Unapproved Mission".into()),
+                    prompt: "plan only; do not execute an external effect".into(),
+                },
+                observed_at() + Duration::minutes(3),
+            )
+            .unwrap();
+        drop(service);
+
+        assert!(matches!(
+            plane.step(
+                &secrets,
+                &project_id,
+                &other_mission,
+                AgentStep::new("cross-mission-attack", "plan"),
+                observed_at() + Duration::minutes(4),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [invariant_missing::APPROVAL]
+        ));
+        plane.with_cordis_host(|host| {
+            let bound = host.bound_scope().expect("exact Mission scope");
+            assert_eq!(bound.mission_id(), other_mission.as_str());
+            assert!(!host.context().domain::<DomainSurface>().unwrap().approved());
+        });
     }
 
     #[test]
@@ -9026,6 +10108,8 @@ sleep 30"#;
         assert!(matches!(
             plane.step(
                 &secrets,
+                &project_id,
+                &mission_id,
                 AgentStep::new("mission-withdrawn", "plan"),
                 observed_at() + Duration::minutes(5),
             ),
@@ -9079,6 +10163,8 @@ sleep 30"#;
         assert!(matches!(
             expired.step(
                 &expired_secrets,
+                &expired_project,
+                &mission_id,
                 AgentStep::new("mission-expired", "plan"),
                 observed_at() + Duration::minutes(4),
             ),
@@ -9613,6 +10699,38 @@ sleep 30"#;
             DesktopDataPlane::at_data_root(&link_root),
             Err(DesktopDataError::InvalidDataRoot(path)) if path == link_root
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_and_recreated_regular_data_root_fails_installed_identity_before_access() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let installed_root = plane.data_root().to_path_buf();
+        let displaced_root = installed_root.with_extension("displaced");
+        fs::rename(&installed_root, &displaced_root).expect("displace installed root");
+        fs::create_dir(&installed_root).expect("recreate regular lexical root");
+
+        assert!(matches!(
+            plane.load_with(&secrets, observed_at() + Duration::minutes(2)),
+            Err(DesktopDataError::InvalidDataRoot(path)) if path == installed_root
+        ));
+        assert!(matches!(
+            plane.start_mission_with(
+                &secrets,
+                &project_id,
+                "must not write through a replaced root",
+                observed_at() + Duration::minutes(3),
+            ),
+            Err(DesktopDataError::InvalidDataRoot(path)) if path == installed_root
+        ));
+        assert!(
+            fs::read_dir(&installed_root)
+                .expect("replacement root")
+                .next()
+                .is_none(),
+            "replacement root must remain untouched"
+        );
+        assert!(displaced_root.join(DATABASE_FILE_NAME).is_file());
     }
 
     fn propose_waiting_approval_preview(

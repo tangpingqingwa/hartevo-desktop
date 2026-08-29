@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Display;
 use std::future::Future;
@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use crate::config::ConfigValue;
 use crate::effect::{Disposer, Registration};
-use crate::event::{BoxedPayload, DispatchMode, EventBus, WaterfallContinuation, WaterfallNext};
+use crate::event::{
+    BoxedPayload, DispatchMode, EventBus, PreparedEmit, WaterfallContinuation, WaterfallNext,
+};
 use crate::service::Service;
 
 /// Conventional Cordis / Hartevo service keys. Plugins look up by these names.
@@ -40,6 +42,35 @@ pub enum CordisError {
     Serial { name: String, message: String },
     #[error("event `{name}` payload type mismatch")]
     PayloadType { name: String },
+    #[error("Cordis authority scope field `{field}` is empty or not canonical")]
+    InvalidAuthorityScope { field: &'static str },
+    #[error("Cordis authority revision `{field}` must be positive")]
+    InvalidAuthorityRevision { field: &'static str },
+    #[error("Cordis authority digest `{field}` must be canonical lowercase sha256")]
+    InvalidAuthorityDigest { field: &'static str },
+    #[error("Cordis Runtime dispatch requires an exact bound authority scope")]
+    AuthorityScopeUnbound,
+    #[error("Cordis Runtime dispatch scope does not match the bound Domain scope")]
+    AuthorityScopeMismatch,
+    #[error("Cordis Runtime dispatch scope has no durable Runtime binding")]
+    RuntimeAuthorityUnbound,
+    #[error("Cordis Runtime dispatch is already active")]
+    RuntimeDispatchBusy,
+    #[error("Cordis Runtime dispatch permit does not match the active operation")]
+    RuntimePermitMismatch,
+    #[error("Cordis Runtime dispatch serial overflowed")]
+    RuntimeDispatchSerialOverflow,
+    #[error("Cordis Runtime coordinator mutex is poisoned")]
+    RuntimeCoordinatorPoisoned,
+    #[error("service key `{key}` is reserved to its mounted authority owner")]
+    ReservedServiceKey { key: String },
+    #[error("surface `{key}` cannot be mounted by authority owner `{owner}`")]
+    InvalidSurfaceOwner {
+        key: &'static str,
+        owner: &'static str,
+    },
+    #[error("Cordis surface key `{key}` is already mapped")]
+    SurfaceAlreadyMapped { key: &'static str },
     #[error(transparent)]
     Interpolate(#[from] crate::config::InterpolateError),
 }
@@ -51,6 +82,7 @@ pub struct Context {
     vars: ConfigValue,
     effects: Vec<Registration>,
     events: EventBus,
+    reserved_services: HashSet<String>,
 }
 
 impl Default for Context {
@@ -67,6 +99,7 @@ impl Context {
             vars: ConfigValue::default(),
             effects: Vec::new(),
             events: EventBus::new(),
+            reserved_services: HashSet::new(),
         }
     }
 
@@ -120,18 +153,65 @@ impl Context {
         self.get(keys::DESKTOP)
     }
 
-    /// Provide a named service. Reversed on teardown (restores the previous value).
-    pub fn provide<T: Any + Send + Sync>(&mut self, key: impl Into<String>, value: T) {
+    /// Provide a named non-authority service. Reversed on teardown.
+    ///
+    /// Domain, Effect Broker, Runtime, and Desktop are reserved by
+    /// `SurfaceMapping`; ordinary plugins cannot replace those owners.
+    pub fn provide<T: Any + Send + Sync>(
+        &mut self,
+        key: impl Into<String>,
+        value: T,
+    ) -> Result<(), CordisError> {
         let key = key.into();
+        if authority_reserved_key(&key) || self.reserved_services.contains(&key) {
+            return Err(CordisError::ReservedServiceKey { key });
+        }
         let previous = self.services.insert(key.clone(), Arc::new(value));
-        self.effects.push(Registration::Service { key, previous });
+        self.effects.push(Registration::Service {
+            key,
+            previous,
+            reserved: false,
+        });
+        Ok(())
     }
 
-    /// Replace a mounted service in place. Does not push a disposer, so host
-    /// teardown still reverses the original mount rather than this live bind.
-    pub(crate) fn replace<T: Any + Send + Sync>(&mut self, key: &str, value: T) -> Option<Arc<T>> {
+    /// Mount one owner-bound authority service exactly once.
+    pub(crate) fn provide_reserved<T: Any + Send + Sync>(
+        &mut self,
+        key: &'static str,
+        value: T,
+    ) -> Result<(), CordisError> {
+        if !authority_reserved_key(key)
+            || self.services.contains_key(key)
+            || !self.reserved_services.insert(key.to_string())
+        {
+            return Err(CordisError::ReservedServiceKey {
+                key: key.to_string(),
+            });
+        }
+        self.services.insert(key.to_string(), Arc::new(value));
+        self.effects.push(Registration::Service {
+            key: key.to_string(),
+            previous: None,
+            reserved: true,
+        });
+        Ok(())
+    }
+
+    /// Replace the value behind an already-reserved authority owner. This is
+    /// crate-private so ordinary plugins cannot mint or swap that owner.
+    pub(crate) fn replace_reserved<T: Any + Send + Sync>(
+        &mut self,
+        key: &str,
+        value: T,
+    ) -> Result<Option<Arc<T>>, CordisError> {
+        if !self.reserved_services.contains(key) || !self.services.contains_key(key) {
+            return Err(CordisError::ReservedServiceKey {
+                key: key.to_string(),
+            });
+        }
         let previous = self.services.insert(key.to_string(), Arc::new(value));
-        previous.and_then(|value| value.downcast::<T>().ok())
+        Ok(previous.and_then(|value| value.downcast::<T>().ok()))
     }
 
     /// Set a plugin-context interpolation variable. Reversed on teardown.
@@ -323,6 +403,23 @@ impl Context {
             .map_err(|locked| conflict(name, locked, DispatchMode::Emit))
     }
 
+    /// Capture an emit notification without invoking listeners. Cordis host
+    /// lifecycle code uses this to move callbacks outside its mutex.
+    pub(crate) fn prepare_emit<T>(
+        &self,
+        name: &str,
+        payload: T,
+    ) -> Result<PreparedEmit, CordisError>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let listeners = self
+            .events
+            .prepare_emit(name)
+            .map_err(|locked| conflict(name, locked, DispatchMode::Emit))?;
+        Ok(PreparedEmit::new(payload, listeners))
+    }
+
     /// Synchronous middleware dispatch. Locks `name` to [`DispatchMode::Waterfall`].
     pub fn waterfall<T>(&mut self, name: &str, payload: T) -> Result<T, CordisError>
     where
@@ -414,14 +511,23 @@ impl Context {
         while let Some(registration) = self.effects.pop() {
             match registration {
                 Registration::Disposer(dispose) => dispose(),
-                Registration::Service { key, previous } => match previous {
-                    Some(value) => {
-                        self.services.insert(key, value);
+                Registration::Service {
+                    key,
+                    previous,
+                    reserved,
+                } => {
+                    match previous {
+                        Some(value) => {
+                            self.services.insert(key.clone(), value);
+                        }
+                        None => {
+                            self.services.remove(&key);
+                        }
                     }
-                    None => {
-                        self.services.remove(&key);
+                    if reserved {
+                        self.reserved_services.remove(&key);
                     }
-                },
+                }
                 Registration::Var { key, previous } => match &mut self.vars {
                     ConfigValue::Object(map) => match previous {
                         Some(value) => {
@@ -445,9 +551,17 @@ impl Context {
             }
         }
         self.services.clear();
+        self.reserved_services.clear();
         self.vars = ConfigValue::default();
         self.events.clear();
     }
+}
+
+fn authority_reserved_key(key: &str) -> bool {
+    matches!(
+        key,
+        keys::DOMAIN | keys::EFFECT_BROKER | keys::RUNTIME | keys::DESKTOP
+    )
 }
 
 fn conflict(name: &str, locked: DispatchMode, requested: DispatchMode) -> CordisError {

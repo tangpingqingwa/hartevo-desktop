@@ -2,17 +2,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hartevo_cordis::{
-    AgentRef, Context, CordisError, DispatchMode, DomainSurface, EffectBrokerSurface,
-    EnvironmentOverlay, HartevoSurfaces, LlmStream, LoaderContext, MAPPED_KEYS, PluginId,
-    PluginSpec, RuntimeSurface, Service, SurfaceMapping, SurfaceOwner, ToolCall, ToolsSurface,
-    events, expected_mode, keys, load_plugins, map_surfaces, register_agent, register_llm_stream,
-    register_tool, run_tools_pipeline, stream_llm,
+    AgentRef, Context, CordisError, CordisHost, DispatchMode, DomainSurface, EffectBrokerSurface,
+    EnvironmentOverlay, LlmStream, LoaderContext, MAPPED_KEYS, PluginId, RuntimeSurface,
+    SurfaceOwner, ToolCall, ToolsSurface, events, expected_mode, keys, register_agent,
+    register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
 };
 
 fn mapped() -> Context {
-    let mut ctx = Context::new();
-    ctx.mount(SurfaceMapping::default()).unwrap();
-    ctx
+    let mut host = CordisHost::boot(false).unwrap();
+    std::mem::take(host.context_mut())
 }
 
 #[test]
@@ -46,18 +44,14 @@ fn mapped_keys_are_provided_and_looked_up() {
         ctx.effect_broker::<EffectBrokerSurface>().as_deref(),
         Some(&EffectBrokerSurface::default())
     );
+    let runtime = ctx.runtime::<RuntimeSurface>().unwrap();
+    assert_eq!(runtime.owner(), SurfaceOwner::Hartevo);
+    assert_eq!(runtime.plugin(), None);
     assert_eq!(
-        ctx.runtime::<RuntimeSurface>().as_deref(),
-        Some(&RuntimeSurface {
-            owner: SurfaceOwner::Hartevo,
-            plugin: None,
-        })
-    );
-    assert_eq!(
-        ctx.desktop::<hartevo_cordis::DesktopSurface>().as_deref(),
-        Some(&hartevo_cordis::DesktopSurface {
-            owner: SurfaceOwner::Hartevo
-        })
+        ctx.desktop::<hartevo_cordis::DesktopSurface>()
+            .unwrap()
+            .owner(),
+        SurfaceOwner::Hartevo
     );
     assert!(ctx.get::<u32>(keys::TOOLS).is_none());
     assert!(ctx.get::<u32>(keys::AGENTS).is_none());
@@ -240,7 +234,7 @@ fn agent_coordination_registers_on_ctx_agents_and_reverse() {
 #[test]
 fn hartevo_owned_lookups_do_not_go_through_openinterpreter() {
     let mut ctx = mapped();
-    ctx.provide("openinterpreter", "runtime-plugin");
+    ctx.provide("openinterpreter", "runtime-plugin").unwrap();
     assert_eq!(
         ctx.get::<&str>("openinterpreter").as_deref(),
         Some(&"runtime-plugin")
@@ -250,21 +244,21 @@ fn hartevo_owned_lookups_do_not_go_through_openinterpreter() {
     assert_ne!(keys::RUNTIME, "openinterpreter");
     assert_ne!(keys::DESKTOP, "openinterpreter");
     assert_eq!(
-        ctx.domain::<DomainSurface>().unwrap().owner,
+        ctx.domain::<DomainSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner,
+        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        ctx.runtime::<RuntimeSurface>().unwrap().owner,
+        ctx.runtime::<RuntimeSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
         ctx.desktop::<hartevo_cordis::DesktopSurface>()
             .unwrap()
-            .owner,
+            .owner(),
         SurfaceOwner::Hartevo
     );
     assert!(ctx.domain::<&str>().is_none());
@@ -274,7 +268,43 @@ fn hartevo_owned_lookups_do_not_go_through_openinterpreter() {
 }
 
 #[test]
-fn teardown_and_reload_undo_every_registration() {
+fn mounted_authority_surfaces_reject_ordinary_provider_replacement() {
+    let mut ctx = mapped();
+    for key in [
+        keys::DOMAIN,
+        keys::EFFECT_BROKER,
+        keys::RUNTIME,
+        keys::DESKTOP,
+    ] {
+        assert_eq!(
+            ctx.provide(key, "forged-owner").unwrap_err(),
+            CordisError::ReservedServiceKey {
+                key: key.to_string(),
+            }
+        );
+    }
+    assert_eq!(
+        ctx.domain::<DomainSurface>().unwrap().owner(),
+        SurfaceOwner::Hartevo
+    );
+    assert_eq!(
+        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner(),
+        SurfaceOwner::Hartevo
+    );
+    assert_eq!(
+        ctx.runtime::<RuntimeSurface>().unwrap().owner(),
+        SurfaceOwner::Hartevo
+    );
+    assert_eq!(
+        ctx.desktop::<hartevo_cordis::DesktopSurface>()
+            .unwrap()
+            .owner(),
+        SurfaceOwner::Hartevo
+    );
+}
+
+#[test]
+fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
     let mut ctx = mapped();
     register_tool(&mut ctx, "search").unwrap();
     register_llm_stream(&mut ctx, "hartevo-local").unwrap();
@@ -303,7 +333,7 @@ fn teardown_and_reload_undo_every_registration() {
     );
     assert_eq!(ctx.listener_count(events::TOOLS_EXECUTE), 1);
     assert_eq!(ctx.listener_count(events::LLM_STREAM), 1);
-    assert_eq!(ctx.listener_count(events::AGENT_CREATED), 1);
+    assert!(ctx.listener_count(events::AGENT_CREATED) >= 2);
 
     ctx.teardown();
     for key in [
@@ -330,14 +360,14 @@ fn teardown_and_reload_undo_every_registration() {
         assert_eq!(ctx.event_mode(name), None, "{name} lock must reverse");
     }
 
-    ctx.mount(SurfaceMapping::default()).unwrap();
-    register_tool(&mut ctx, "search-2").unwrap();
+    let mut reloaded = mapped();
+    register_tool(&mut reloaded, "search-2").unwrap();
     assert_eq!(
-        ctx.tools::<ToolsSurface>().unwrap().names(),
+        reloaded.tools::<ToolsSurface>().unwrap().names(),
         ["search-2".to_string()]
     );
     assert_eq!(
-        ctx.event_mode(events::TOOLS_PRE_EXECUTE),
+        reloaded.event_mode(events::TOOLS_PRE_EXECUTE),
         Some(DispatchMode::Waterfall)
     );
 }
@@ -361,68 +391,56 @@ fn tool_and_llm_and_agent_register_require_mapped_keys() {
 
 #[test]
 fn overlay_still_selects_plugins_instead_of_a_crate_boot_list() {
-    let mut ctx = Context::new();
     let overlay = EnvironmentOverlay::new("macos-dev");
     let loader = LoaderContext::new();
-    let mapping = PluginSpec::new("surfaces", |_config, ctx| {
-        SurfaceMapping::default().apply(ctx);
-    });
-    let openinterpreter = PluginSpec::new("openinterpreter", |_config, ctx| {
-        ctx.provide("openinterpreter", "loop");
-    })
-    .with_disabled(true);
-
-    let report = load_plugins(&mut ctx, &loader, &overlay, &[mapping, openinterpreter]).unwrap();
-    assert_eq!(report.started, [PluginId::new("surfaces")]);
+    let (host, report) = CordisHost::boot_overlay(&overlay, &loader, false).unwrap();
+    assert_eq!(
+        report.started,
+        [
+            PluginId::new("surfaces"),
+            PluginId::new("agent-loop"),
+            PluginId::new("invariants"),
+        ]
+    );
     assert_eq!(report.disabled, [PluginId::new("openinterpreter")]);
-    assert!(ctx.has(keys::DOMAIN));
-    assert!(ctx.get::<&str>("openinterpreter").is_none());
+    assert!(host.context().has(keys::DOMAIN));
+    assert!(host.context().get::<&str>("openinterpreter").is_none());
 }
 
 #[test]
 fn runtime_plugin_slot_may_name_openinterpreter_without_owning_domain() {
-    let mut ctx = Context::new();
-    map_surfaces(
-        &mut ctx,
-        HartevoSurfaces {
-            runtime: RuntimeSurface {
-                owner: SurfaceOwner::Hartevo,
-                plugin: Some("openinterpreter"),
-            },
-            ..HartevoSurfaces::default()
-        },
-    )
-    .unwrap();
+    let mut host = CordisHost::boot(true).unwrap();
+    let ctx = host.context_mut();
     assert_eq!(
-        ctx.runtime::<RuntimeSurface>().unwrap().plugin,
+        ctx.runtime::<RuntimeSurface>().unwrap().plugin(),
         Some("openinterpreter")
     );
     assert_eq!(
-        ctx.runtime::<RuntimeSurface>().unwrap().owner,
+        ctx.runtime::<RuntimeSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        ctx.domain::<DomainSurface>().unwrap().owner,
+        ctx.domain::<DomainSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
     assert_eq!(
-        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner,
+        ctx.effect_broker::<EffectBrokerSurface>().unwrap().owner(),
         SurfaceOwner::Hartevo
     );
 }
 
 #[test]
-#[should_panic(expected = "domain is Hartevo-owned")]
 fn openinterpreter_cannot_own_domain() {
-    let mut ctx = Context::new();
-    let _ = map_surfaces(
-        &mut ctx,
-        HartevoSurfaces {
-            domain: DomainSurface {
-                owner: SurfaceOwner::OpenInterpreter,
-                ..DomainSurface::default()
-            },
-            ..HartevoSurfaces::default()
-        },
+    let mut host = CordisHost::boot(false).unwrap();
+    let ctx = host.context_mut();
+    assert_eq!(
+        ctx.provide(keys::DOMAIN, "openinterpreter").unwrap_err(),
+        CordisError::ReservedServiceKey {
+            key: keys::DOMAIN.to_owned(),
+        }
+    );
+    assert_eq!(
+        ctx.domain::<DomainSurface>().unwrap().owner(),
+        SurfaceOwner::Hartevo
     );
 }

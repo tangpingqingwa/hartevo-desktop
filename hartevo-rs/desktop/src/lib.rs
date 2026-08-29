@@ -31,7 +31,6 @@ use zeroize::Zeroizing;
 
 mod agent_operations;
 mod cordis_host;
-pub use cordis_host::{bind_live_domain_kernel, mount_cordis_host};
 pub mod data_plane;
 #[cfg(feature = "native-journey")]
 pub mod native_runtime_journey;
@@ -531,7 +530,7 @@ impl DesktopUiModel {
         if let Some(model) = visual_fixture::load_from_environment() {
             return model;
         }
-        match DesktopDataPlane::discover().and_then(|plane| plane.load_os(Utc::now())) {
+        match DesktopDataPlane::persistent().and_then(|plane| plane.load_os(Utc::now())) {
             Ok(DesktopLoadState::Uninitialized { product_evidence }) => Self {
                 backend: DesktopBackendState::Uninitialized(product_evidence),
                 selected_project_id: None,
@@ -1091,7 +1090,7 @@ pub fn App() -> Element {
             let query_project_id = project_id.clone();
             let query_mission_id = mission_id.clone();
             let result = tokio::task::spawn_blocking(move || {
-                DesktopDataPlane::discover().and_then(|plane| {
+                DesktopDataPlane::persistent().and_then(|plane| {
                     plane.runtime_text_stream_os(&query_project_id, &query_mission_id, Utc::now())
                 })
             })
@@ -1561,9 +1560,21 @@ pub fn App() -> Element {
         && waiting_approval_grant_active
         && pending_effect_grant.is_some()
         && !runtime_busy;
+    let catalog_continuation_handle_ready =
+        project
+            .as_ref()
+            .zip(mission.as_ref())
+            .is_some_and(|(project, mission)| {
+                mission.manifest_id.is_none()
+                    || runtime_execution_paint
+                        .read()
+                        .acknowledged_handle_for_selection(&project.project_id, &mission.mission_id)
+                        .is_some()
+            });
     let can_edit_continuation = project_can_start_mission
         && !human_route_active
         && !waiting_approval_grant_active
+        && catalog_continuation_handle_ready
         && mission.as_ref().is_some_and(|mission| {
             mission.conversation_revision.is_some()
                 && matches!(
@@ -1708,7 +1719,7 @@ pub fn App() -> Element {
         };
         spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                DesktopDataPlane::discover()
+                DesktopDataPlane::persistent()
                     .and_then(|plane| plane.continue_browser_workspace_os(request, Utc::now()))
             })
             .await;
@@ -1787,7 +1798,7 @@ pub fn App() -> Element {
         };
         spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                DesktopDataPlane::discover()
+                DesktopDataPlane::persistent()
                     .and_then(|plane| plane.review_creator_deliverable_os(request, Utc::now()))
             })
             .await;
@@ -1849,7 +1860,7 @@ pub fn App() -> Element {
         };
         spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                DesktopDataPlane::discover()
+                DesktopDataPlane::persistent()
                     .and_then(|plane| plane.open_conversation_os(request, Utc::now()))
             })
             .await;
@@ -1912,7 +1923,7 @@ pub fn App() -> Element {
                         expected_manifest_version: binding.manifest_version,
                     };
                     let result = tokio::task::spawn_blocking(move || {
-                        DesktopDataPlane::discover()
+                        DesktopDataPlane::persistent()
                             .and_then(|plane| plane.adopt_work_product_os(request, Utc::now()))
                     })
                     .await;
@@ -2522,7 +2533,7 @@ pub fn App() -> Element {
                                 interrupt_available: operations_interrupt_available,
                                 interrupt_requested: operations_interrupt_requested,
                                 on_initialize: move |_| {
-                                    match DesktopDataPlane::discover().and_then(|plane| plane.initialize_os(Utc::now())) {
+                                    match DesktopDataPlane::persistent().and_then(|plane| plane.initialize_os(Utc::now())) {
                                         Ok(snapshot) => model.write().set_ready(snapshot, false),
                                         Err(error) => model.write().set_notice(&error),
                                     }
@@ -3239,7 +3250,7 @@ pub fn App() -> Element {
                                                     mission_submitting.set(true);
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
-                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
                                                                 plane.grant_waiting_approval_os(request, Utc::now())
                                                             })
                                                         })
@@ -3310,7 +3321,7 @@ pub fn App() -> Element {
                                                     mission_submitting.set(true);
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
-                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
                                                                 plane.resolve_vm11_next_contract_or_valid_terminal_os(
                                                                     request,
                                                                     Utc::now(),
@@ -3360,7 +3371,7 @@ pub fn App() -> Element {
                                                     mission_submitting.set(true);
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
-                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
                                                                 plane.execute_application_mission_checkpoint_os(
                                                                     &project_id,
                                                                     &mission_id,
@@ -3406,9 +3417,78 @@ pub fn App() -> Element {
                                                         let model = model.read();
                                                         model.selected_project_id.clone().zip(
                                                             model.selected_mission_id.clone(),
-                                                        )
+                                                        ).map(|(project_id, mission_id)| {
+                                                            let catalog = model.current_mission().is_some_and(|mission| {
+                                                                mission.mission_id == mission_id
+                                                                    && mission.manifest_id.is_some()
+                                                            });
+                                                            (project_id, mission_id, catalog)
+                                                        })
                                                     };
-                                                    let Some((project_id, mission_id)) = selection else { return; };
+                                                    let Some((project_id, mission_id, catalog)) = selection else { return; };
+                                                    if catalog {
+                                                        runtime_cancellation.set(None);
+                                                        runtime_stop_requested.set(false);
+                                                        runtime_progress.set(Vec::new());
+                                                        runtime_retrying.set(true);
+                                                        mission_submitting.set(true);
+                                                        spawn(async move {
+                                                            let prepared_project_id = project_id.clone();
+                                                            let prepared_mission_id = mission_id.clone();
+                                                            let result = tokio::task::spawn_blocking(move || {
+                                                                DesktopDataPlane::persistent().and_then(|plane| {
+                                                                    plane.prepare_catalog_mission_runtime_resume_os(
+                                                                        &prepared_project_id,
+                                                                        &prepared_mission_id,
+                                                                        Utc::now(),
+                                                                    )
+                                                                })
+                                                            })
+                                                            .await;
+                                                            match result {
+                                                                Ok(Ok(prepared)) => {
+                                                                    model.write().set_ready(prepared.snapshot, false);
+                                                                    match runtime_execution_paint
+                                                                        .write()
+                                                                        .commit_catalog_start(prepared.handle)
+                                                                    {
+                                                                        Ok(commit) => {
+                                                                            let scope = &commit.selection().scope;
+                                                                            runtime_text_scope.set(Some((
+                                                                                scope.project_id().clone(),
+                                                                                scope.mission_id().clone(),
+                                                                            )));
+                                                                            runtime_text_stream.set(None);
+                                                                            runtime_text_error.set(None);
+                                                                            runtime_follow_latest.set(true);
+                                                                            runtime_has_unseen.set(false);
+                                                                            // The post-render effect owns the exact
+                                                                            // handle and all Runtime authority.
+                                                                        }
+                                                                        Err(error) => {
+                                                                            runtime_text_error.set(Some(
+                                                                                UiFailure::from_runtime_subscription_error(error),
+                                                                            ));
+                                                                            mission_submitting.set(false);
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(Err(error)) => {
+                                                                    model.write().set_notice(&error);
+                                                                    mission_submitting.set(false);
+                                                                }
+                                                                Err(_) => {
+                                                                    model.write().notice = Some(UiFailure {
+                                                                        code: "CATALOG_RUNTIME_RETRY_PREPARE_FAILED".into(),
+                                                                        message: "Catalog Runtime 恢复准备异常结束；未获得新的精确句柄，也未启动 Runtime 或 Effect。".into(),
+                                                                    });
+                                                                    mission_submitting.set(false);
+                                                                }
+                                                            }
+                                                            runtime_retrying.set(false);
+                                                        });
+                                                        return;
+                                                    }
                                                     let cancellation = DesktopRuntimeCancellation::default();
                                                     runtime_cancellation.set(Some(cancellation.clone()));
                                                     runtime_stop_requested.set(false);
@@ -3433,7 +3513,7 @@ pub fn App() -> Element {
                                                     );
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
-                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
                                                                 plane.resume_mission_runtime_cancellable_os(
                                                                     &project_id,
                                                                     &mission_id,
@@ -3525,7 +3605,7 @@ pub fn App() -> Element {
                                                             mission_submitting.set(true);
                                                             spawn(async move {
                                                                 let result = tokio::task::spawn_blocking(move || {
-                                                                    DesktopDataPlane::discover().and_then(|plane| {
+                                                                    DesktopDataPlane::persistent().and_then(|plane| {
                                                                         plane.decide_vm11_outcome_review_os(request, Utc::now())
                                                                     })
                                                                 })
@@ -3601,7 +3681,7 @@ pub fn App() -> Element {
                                                             mission_submitting.set(true);
                                                             spawn(async move {
                                                                 let result = tokio::task::spawn_blocking(move || {
-                                                                    DesktopDataPlane::discover().and_then(|plane| {
+                                                                    DesktopDataPlane::persistent().and_then(|plane| {
                                                                         plane.confirm_human_mission_checkpoint_os(request, Utc::now())
                                                                     })
                                                                 })
@@ -3642,22 +3722,45 @@ pub fn App() -> Element {
                                                         model.selected_project_id.clone().zip(
                                                             model.current_mission().and_then(|mission| {
                                                                 mission.conversation_revision.map(|revision| {
-                                                                    (mission.mission_id.clone(), revision)
+                                                                    (
+                                                                        mission.mission_id.clone(),
+                                                                        revision,
+                                                                        mission.manifest_id.is_some(),
+                                                                    )
                                                                 })
                                                             }),
                                                         )
                                                     };
-                                                    let Some((project_id, (mission_id, expected_revision))) = selection else {
+                                                    let Some((project_id, (mission_id, expected_revision, is_catalog))) = selection else {
                                                         model.write().notice = Some(UiFailure {
                                                             code: "NOT_IMPLEMENTED".into(),
                                                             message: "该 Mission 没有持久 Conversation；legacy bootstrap 不会伪装成可续写会话。".into(),
                                                         });
                                                         return;
                                                     };
+                                                    let catalog_execution_handle = if is_catalog {
+                                                        let handle = runtime_execution_paint
+                                                            .read()
+                                                            .acknowledged_handle_for_selection(
+                                                                &project_id,
+                                                                &mission_id,
+                                                            );
+                                                        let Some(handle) = handle else {
+                                                            model.write().notice = Some(UiFailure {
+                                                                code: "RUNTIME_PAINT_REQUIRED".into(),
+                                                                message: "该 Catalog Mission 尚无已渲染确认的执行句柄；未写入续写内容，也未启动 Runtime。请先恢复当前执行视图。".into(),
+                                                            });
+                                                            return;
+                                                        };
+                                                        Some(handle)
+                                                    } else {
+                                                        None
+                                                    };
                                                     let message_id = MissionConversationMessageId::new();
                                                     let request = DesktopMissionContinuationRequest {
                                                         project_id,
                                                         mission_id,
+                                                        catalog_execution_handle,
                                                         idempotency_key: format!("desktop-message:{}", message_id.as_str()),
                                                         message_id,
                                                         kind: MissionConversationMessageKind::Steering,
@@ -3688,7 +3791,7 @@ pub fn App() -> Element {
                                                     );
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
-                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
                                                                 plane.continue_mission_and_run_cancellable_os(
                                                                     request,
                                                                     &cancellation,
@@ -3778,7 +3881,7 @@ pub fn App() -> Element {
                                                     mission_submitting.set(true);
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
-                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
                                                                 plane.start_catalog_mission_execution_os(
                                                                     request,
                                                                     Utc::now(),
@@ -6711,7 +6814,7 @@ fn PersonalProjectOnboarding(
                             let result = {
                                 let kit = recovery_kit.read();
                                 let Some(kit) = kit.as_ref() else { return; };
-                                DesktopDataPlane::discover().and_then(|plane| {
+                                DesktopDataPlane::persistent().and_then(|plane| {
                                     plane.create_personal_project_os(
                                         project_name.read().as_str(),
                                         initial_goal.read().as_str(),
@@ -6766,7 +6869,7 @@ fn RecoveryCompletionCard(
                 onclick: move |_| {
                     let result = {
                         let input = recovery_input.read();
-                        DesktopDataPlane::discover().and_then(|plane| {
+                        DesktopDataPlane::persistent().and_then(|plane| {
                             plane.complete_personal_encryption_os(
                                 &project_id,
                                 input.expose_for_submission(),
@@ -6817,7 +6920,7 @@ fn DeviceRecoveryCard(
                 onclick: move |_| {
                     let result = {
                         let input = recovery_input.read();
-                        DesktopDataPlane::discover().and_then(|plane| {
+                        DesktopDataPlane::persistent().and_then(|plane| {
                             plane.recover_personal_project_device_os(
                                 &project_id,
                                 input.expose_for_submission(),
@@ -8514,17 +8617,20 @@ fn begin_catalog_runtime_execution_after_paint(
     let identity = launch.identity().clone();
     begin_runtime_execution_progress_monitor(ui, identity.clone());
     spawn(async move {
-        let (prepared_selection, identity, coordinator, prepared_sequence, render_ack_sequence) =
-            launch.into_parts();
+        let (
+            prepared_selection,
+            handle,
+            identity,
+            coordinator,
+            prepared_sequence,
+            render_ack_sequence,
+        ) = launch.into_parts();
         debug_assert_eq!(prepared_selection, selection);
         debug_assert!(render_ack_sequence > prepared_sequence);
-        let runtime_project_id = selection.scope.project_id().clone();
-        let runtime_mission_id = selection.scope.mission_id().clone();
         let runtime_task = tokio::task::spawn_blocking(move || {
-            DesktopDataPlane::discover().and_then(|plane| {
-                plane.resume_mission_runtime_cancellable_os(
-                    &runtime_project_id,
-                    &runtime_mission_id,
+            DesktopDataPlane::persistent().and_then(|plane| {
+                plane.resume_catalog_mission_runtime_cancellable_os(
+                    &handle,
                     coordinator.cancellation(),
                     Utc::now(),
                 )
@@ -8703,7 +8809,7 @@ async fn pull_runtime_subscription_page(
     };
     let producer_request = request.clone();
     let result = tokio::task::spawn_blocking(move || {
-        DesktopDataPlane::discover().and_then(|plane| {
+        DesktopDataPlane::persistent().and_then(|plane| {
             plane.runtime_text_subscription_os(
                 producer_request.handle(),
                 producer_request.producer_cursor(),
@@ -8951,7 +9057,7 @@ fn begin_runtime_text_stream_monitor(
             let query_project_id = project_id.clone();
             let query_mission_id = mission_id.clone();
             let result = tokio::task::spawn_blocking(move || {
-                DesktopDataPlane::discover().and_then(|plane| {
+                DesktopDataPlane::persistent().and_then(|plane| {
                     plane.runtime_text_stream_os(&query_project_id, &query_mission_id, Utc::now())
                 })
             })

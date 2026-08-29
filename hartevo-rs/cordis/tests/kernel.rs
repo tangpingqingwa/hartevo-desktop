@@ -10,7 +10,7 @@ struct ProvideTools;
 
 impl Service for ProvideTools {
     fn apply(self, ctx: &mut Context) {
-        ctx.provide(keys::TOOLS, Marker("tools"));
+        ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
     }
 }
 
@@ -60,14 +60,23 @@ impl Service for RecordEffect {
 #[test]
 fn typed_slots_round_trip_well_known_keys() {
     let mut ctx = Context::new();
-    ctx.provide(keys::TOOLS, Marker("tools"));
-    ctx.provide(keys::LLM, Marker("llm"));
-    ctx.provide(keys::SESSIONS, Marker("sessions"));
-    ctx.provide(keys::AGENTS, Marker("agents"));
-    ctx.provide(keys::DOMAIN, Marker("domain"));
-    ctx.provide(keys::EFFECT_BROKER, Marker("effect_broker"));
-    ctx.provide(keys::RUNTIME, Marker("runtime"));
-    ctx.provide(keys::DESKTOP, Marker("desktop"));
+    ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
+    ctx.provide(keys::LLM, Marker("llm")).unwrap();
+    ctx.provide(keys::SESSIONS, Marker("sessions")).unwrap();
+    ctx.provide(keys::AGENTS, Marker("agents")).unwrap();
+    for key in [
+        keys::DOMAIN,
+        keys::EFFECT_BROKER,
+        keys::RUNTIME,
+        keys::DESKTOP,
+    ] {
+        assert_eq!(
+            ctx.provide(key, Marker("forged-authority")).unwrap_err(),
+            CordisError::ReservedServiceKey {
+                key: key.to_string(),
+            }
+        );
+    }
 
     assert_eq!(
         ctx.get::<Marker>(keys::TOOLS).as_deref(),
@@ -80,13 +89,10 @@ fn typed_slots_round_trip_well_known_keys() {
         Some(&Marker("sessions"))
     );
     assert_eq!(ctx.agents::<Marker>().as_deref(), Some(&Marker("agents")));
-    assert_eq!(ctx.domain::<Marker>().as_deref(), Some(&Marker("domain")));
-    assert_eq!(
-        ctx.effect_broker::<Marker>().as_deref(),
-        Some(&Marker("effect_broker"))
-    );
-    assert_eq!(ctx.runtime::<Marker>().as_deref(), Some(&Marker("runtime")));
-    assert_eq!(ctx.desktop::<Marker>().as_deref(), Some(&Marker("desktop")));
+    assert!(ctx.domain::<Marker>().is_none());
+    assert!(ctx.effect_broker::<Marker>().is_none());
+    assert!(ctx.runtime::<Marker>().is_none());
+    assert!(ctx.desktop::<Marker>().is_none());
     assert!(ctx.get::<u32>(keys::TOOLS).is_none());
 }
 
@@ -124,7 +130,7 @@ fn inject_reports_every_missing_dependency() {
     );
     assert!(!started.load(Ordering::SeqCst));
 
-    ctx.provide(keys::TOOLS, Marker("tools"));
+    ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
     let err = ctx
         .mount(NeedsToolsAndLlm {
             started: Arc::clone(&started),
@@ -229,7 +235,7 @@ fn teardown_then_second_mount_can_reregister() {
         tag: "first",
     })
     .unwrap();
-    ctx.provide(keys::TOOLS, Marker("v1"));
+    ctx.provide(keys::TOOLS, Marker("v1")).unwrap();
     assert!(ctx.has(keys::TOOLS));
     assert_eq!(ctx.listener_count("first"), 1);
     ctx.teardown();
@@ -243,7 +249,7 @@ fn teardown_then_second_mount_can_reregister() {
         tag: "second",
     })
     .unwrap();
-    ctx.provide(keys::TOOLS, Marker("v2"));
+    ctx.provide(keys::TOOLS, Marker("v2")).unwrap();
     ctx.on("second", || {}).unwrap();
     assert_eq!(ctx.tools::<Marker>().as_deref(), Some(&Marker("v2")));
     assert_eq!(ctx.listener_count("second"), 2);

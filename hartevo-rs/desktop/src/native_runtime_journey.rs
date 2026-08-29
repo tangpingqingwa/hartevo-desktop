@@ -981,15 +981,13 @@ async fn run_complete_runtime_journey_inner(
     launch: DesktopRuntimeExecutionLaunch,
 ) -> Result<(), NativeJourneyError> {
     let context = journey.read().context.clone();
-    let (selection, identity, coordinator, prepared_sequence, render_ack_sequence) =
+    let (selection, handle, identity, coordinator, prepared_sequence, render_ack_sequence) =
         launch.into_parts();
     if render_ack_sequence <= prepared_sequence || coordinator.identity() != &identity {
         return Err(NativeJourneyError::new("NATIVE_RUNTIME_AUTHORITY_INVALID"));
     }
     let plane = context.plane.clone();
     let secrets = context.secrets.clone();
-    let project_id = context.project_id.clone();
-    let mission_id = context.main_mission_id.clone();
     let control_root = context.config.control_root.clone();
     let runtime_program = env::current_exe()
         .map_err(|_| NativeJourneyError::new("NATIVE_RUNTIME_PROGRAM_UNAVAILABLE"))?;
@@ -997,7 +995,7 @@ async fn run_complete_runtime_journey_inner(
         let runtime = controlled_runtime_source(runtime_program, control_root);
         plane.resume_mission_runtime_native(
             secrets.as_ref(),
-            (&project_id, &mission_id),
+            &handle,
             runtime,
             coordinator.cancellation(),
             Utc::now(),

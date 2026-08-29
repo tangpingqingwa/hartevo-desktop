@@ -13,7 +13,7 @@ struct ProvideTools;
 
 impl Service for ProvideTools {
     fn apply(self, ctx: &mut Context) {
-        ctx.provide(keys::TOOLS, Marker("tools"));
+        ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
         ctx.set_var(
             "tools",
             ConfigValue::object([("endpoint", "ctx://tools".into())]),
@@ -194,7 +194,7 @@ fn load_order_follows_inject_not_catalog_order() {
 #[test]
 fn overlay_disabled_plugin_never_starts_even_when_inject_is_ready() {
     let mut ctx = Context::new();
-    ctx.provide(keys::TOOLS, Marker("tools"));
+    ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
     let started = Arc::new(AtomicBool::new(false));
     let overlay =
         EnvironmentOverlay::new("test").with_layer(OverlayLayer::new("env").disable("agent"));
@@ -242,7 +242,7 @@ fn plugin_var_is_reversed_on_teardown() {
 #[test]
 fn plugin_config_does_not_fall_back_to_loader_context() {
     let mut ctx = Context::new();
-    ctx.provide(keys::TOOLS, Marker("tools"));
+    ctx.provide(keys::TOOLS, Marker("tools")).unwrap();
     let overlay = EnvironmentOverlay::new("test");
     let loader = LoaderContext::new().with(
         "tools",
