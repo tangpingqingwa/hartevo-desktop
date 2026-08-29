@@ -21,12 +21,12 @@ use hartevo_application::{
     FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
     MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
     PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
-    RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
-    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
-    Vm11NextContractOrValidTerminalResult,
+    ProposePreviewEffect, ProvisionProjectEncryption, RecoverContextWorkerRuntime,
+    RecoverPersonalProjectDevice, RelationshipConversationProjection, ResearchPacket,
+    ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
+    RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
+    RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
+    StartCatalogMission, StartMission, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -564,6 +564,30 @@ pub struct DesktopWaitingApprovalGrantRequest {
     pub effect_id: EffectId,
     pub expected_scope_digest: String,
     pub expected_mission_revision: u64,
+}
+
+/// Exact Desktop-to-Cordis proposal fence for one preview Effect. The complete
+/// proposal remains Application-owned content; Cordis sees only its Effect id
+/// and a versioned digest bound to this Mission revision and proposal time.
+#[derive(Clone)]
+pub struct DesktopPreviewEffectProposalRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub proposal: ProposePreviewEffect,
+}
+
+impl fmt::Debug for DesktopPreviewEffectProposalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopPreviewEffectProposalRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("effect_id", &self.proposal.effect_id)
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field("proposal", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Window Continue for one Mission-bound Browser Workspace. The ids, revision
@@ -2183,6 +2207,99 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Propose one preview Effect through the exact Cordis Domain-command
+    /// seam. Success stops at Domain Kernel `Proposed` plus the durable
+    /// `approval.requested` event; it grants no execution or provider access.
+    pub fn propose_preview_effect_os(
+        &self,
+        request: DesktopPreviewEffectProposalRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.propose_preview_effect_with(&secret_store, request, now)
+    }
+
+    pub fn propose_preview_effect_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopPreviewEffectProposalRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let DesktopPreviewEffectProposalRequest {
+            project_id,
+            mission_id,
+            expected_mission_revision,
+            proposal,
+        } = request;
+        if expected_mission_revision == 0
+            || proposal.effect_id.as_str().trim().is_empty()
+            || proposal.payload_digest.len() != 64
+            || !proposal
+                .payload_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || proposal.idempotency_key.trim().is_empty()
+            || proposal.expires_in <= Duration::zero()
+        {
+            return Err(DesktopDataError::InvalidEffectProposal);
+        }
+
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+        if scope.mission_revision() != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: scope.mission_revision(),
+            }
+            .into());
+        }
+        let proposal_digest = effect_proposal_authority_digest(&scope, &proposal, now)?;
+        let effect_id = proposal.effect_id.clone();
+        let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+        let command =
+            DomainCommandBinding::propose_effect(effect_id.as_str(), proposal_digest.clone())?;
+
+        map_domain_command_dispatch_result(dispatch_live_domain_command(
+            &self.cordis,
+            DesktopDomainCommandAuthorization::new(scope, command),
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+                if &current_scope != permit.scope()
+                    || permit.command().kind() != DomainCommandKind::ProposeEffect
+                    || permit.command().effect_id() != effect_id.as_str()
+                    || permit.command().proposal_digest() != Some(proposal_digest.as_str())
+                    || permit.command().approval_scope_digest().is_some()
+                {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                let proposed = service.propose_preview_effect_at_revision(
+                    &project_id,
+                    &mission_id,
+                    expected_mission_revision,
+                    proposal,
+                    now,
+                )?;
+                if proposed != effect_id {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                Ok(())
+            },
+        ))?;
+
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
+            now,
+        )
+    }
+
     /// Grants Domain Kernel Approval for one Proposed Effect without executing
     /// it. The frozen digest and Mission revision must match SQLCipher; a
     /// fixture SAMPLE digest is refused.
@@ -2239,7 +2356,9 @@ impl DesktopDataPlane {
                 if &current_scope != permit.scope()
                     || permit.command().kind() != DomainCommandKind::ApproveProposedEffect
                     || permit.command().effect_id() != effect_id.as_str()
-                    || permit.command().approval_scope_digest() != expected_scope_digest
+                    || permit.command().approval_scope_digest()
+                        != Some(expected_scope_digest.as_str())
+                    || permit.command().proposal_digest().is_some()
                 {
                     return Err(CordisError::DomainCommandPermitMismatch.into());
                 }
@@ -4005,6 +4124,48 @@ fn authority_scope_for_mission(
     )?)
 }
 
+fn effect_proposal_authority_field(hasher: &mut Sha256, name: &str, value: &[u8]) {
+    hasher.update((name.len() as u128).to_be_bytes());
+    hasher.update(name.as_bytes());
+    hasher.update((value.len() as u128).to_be_bytes());
+    hasher.update(value);
+}
+
+/// Bind the complete typed proposal to one exact Mission revision and proposal
+/// time without exposing proposal content to Cordis. `ProposePreviewEffect`
+/// contains only ordered fields and `BTreeSet`s, so its JSON encoding is
+/// deterministic for this versioned digest schema.
+fn effect_proposal_authority_digest(
+    scope: &AuthorityScope,
+    proposal: &ProposePreviewEffect,
+    proposed_at: DateTime<Utc>,
+) -> Result<String, DesktopDataError> {
+    let encoded = proposal
+        .authority_payload_bytes()
+        .map_err(|_| DesktopDataError::InvalidEffectProposal)?;
+    let mut hasher = Sha256::new();
+    effect_proposal_authority_field(
+        &mut hasher,
+        "domain",
+        b"hartevo.cordis.effect-proposal-authority/v1",
+    );
+    effect_proposal_authority_field(&mut hasher, "tenant", scope.tenant_id().as_bytes());
+    effect_proposal_authority_field(&mut hasher, "project", scope.project_id().as_bytes());
+    effect_proposal_authority_field(&mut hasher, "mission", scope.mission_id().as_bytes());
+    effect_proposal_authority_field(
+        &mut hasher,
+        "mission_revision",
+        &scope.mission_revision().to_be_bytes(),
+    );
+    effect_proposal_authority_field(
+        &mut hasher,
+        "proposed_at",
+        proposed_at.to_rfc3339().as_bytes(),
+    );
+    effect_proposal_authority_field(&mut hasher, "proposal", &encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn runtime_authority_scope(
     service: &ApplicationService,
     project_id: &ProjectId,
@@ -4911,6 +5072,10 @@ pub enum DesktopDataError {
     )]
     InvalidWaitingApprovalGrant,
     #[error(
+        "Effect proposal requires a typed payload, canonical digest, stable idempotency key, positive expiry, and exact Mission CAS revision"
+    )]
+    InvalidEffectProposal,
+    #[error(
         "Browser Workspace Continue requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
     )]
     InvalidBrowserWorkspaceContinue,
@@ -5168,6 +5333,18 @@ mod tests {
                 now,
             )
             .expect("project");
+        service
+            .provision_project_encryption(
+                secrets,
+                ProvisionProjectEncryption {
+                    project_id: project_id.clone(),
+                    mode: ProjectEncryptionMode::TeamEnvelope,
+                    primary_recipient: KeyRecipient::Device(plane.device_id.clone()),
+                    recovery_recipient_id: None,
+                },
+                now,
+            )
+            .expect("project encryption");
         (project_id, tenant_id)
     }
 
@@ -5262,46 +5439,60 @@ mod tests {
             .secrets
             .get(input.plane.database_key_reference())
             .expect("database secret");
-        let (mut service, _) = input
+        let (service, _) = input
             .plane
             .open_application_from_secret(&database_secret, input.now)
             .expect("application");
+        let expected_mission_revision = service
+            .load_mission(input.project_id, input.mission_id)
+            .expect("Mission before proposal")
+            .revision;
+        drop(service);
         let effect_id = EffectId::from_stable(format!("desktop-kernel-effect-{}", input.suffix));
-        service
-            .propose_preview_effect(
-                input.project_id,
-                input.mission_id,
-                ProposePreviewEffect {
-                    effect_id: effect_id.clone(),
-                    actor_id: ActorId::from("desktop-kernel-actor"),
-                    capability: "channel.preview".into(),
-                    provider: "fixture-provider".into(),
-                    connection_id: None,
-                    account_id: None,
-                    required_scopes: BTreeSet::new(),
-                    description: "Bind live Domain Kernel approval".into(),
-                    target_resource: "preview://desktop-kernel".into(),
-                    audience_digest: None,
-                    payload_digest: "1".repeat(64),
-                    asset_digests: BTreeSet::new(),
-                    scheduled_for: None,
-                    timezone: "UTC".into(),
-                    consent: ConsentState::Confirmed,
-                    consent_record_id: Some(input.consent_id.clone()),
-                    consent_requirement: Some(ConsentRequirement {
-                        person_id: input.person_id.clone(),
-                        purpose: ConsentPurpose::DirectOutreach,
-                        channel: ContactChannel::Email,
-                        market: "US".into(),
-                    }),
-                    policy_version: "policy-v1".into(),
-                    amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
-                    idempotency_key: format!("desktop-kernel-{}", input.suffix),
-                    expires_in: Duration::hours(1),
+        input
+            .plane
+            .propose_preview_effect_with(
+                input.secrets,
+                DesktopPreviewEffectProposalRequest {
+                    project_id: input.project_id.clone(),
+                    mission_id: input.mission_id.clone(),
+                    expected_mission_revision,
+                    proposal: ProposePreviewEffect {
+                        effect_id: effect_id.clone(),
+                        actor_id: ActorId::from("desktop-kernel-actor"),
+                        capability: "channel.preview".into(),
+                        provider: "fixture-provider".into(),
+                        connection_id: None,
+                        account_id: None,
+                        required_scopes: BTreeSet::new(),
+                        description: "Bind live Domain Kernel approval".into(),
+                        target_resource: "preview://desktop-kernel".into(),
+                        audience_digest: None,
+                        payload_digest: "1".repeat(64),
+                        asset_digests: BTreeSet::new(),
+                        scheduled_for: None,
+                        timezone: "UTC".into(),
+                        consent: ConsentState::Confirmed,
+                        consent_record_id: Some(input.consent_id.clone()),
+                        consent_requirement: Some(ConsentRequirement {
+                            person_id: input.person_id.clone(),
+                            purpose: ConsentPurpose::DirectOutreach,
+                            channel: ContactChannel::Email,
+                            market: "US".into(),
+                        }),
+                        policy_version: "policy-v1".into(),
+                        amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
+                        idempotency_key: format!("desktop-kernel-{}", input.suffix),
+                        expires_in: Duration::hours(1),
+                    },
                 },
                 input.now + Duration::seconds(1),
             )
             .expect("effect");
+        let (mut service, _) = input
+            .plane
+            .open_application_from_secret(&database_secret, input.now + Duration::seconds(2))
+            .expect("application after Cordis proposal");
         let broker = production_preview_broker();
         service
             .approve_effect(
@@ -10103,7 +10294,11 @@ sleep 30"#;
         plane.with_cordis_host(|host| {
             host_is_cordis_loop(host).unwrap();
             let domain = host.context().domain::<DomainSurface>().unwrap();
-            assert!(!domain.consent());
+            // `load_with` is read-only and does not refresh authority. The
+            // preceding production proposal leaves Cordis bound to the
+            // proposal's pre-write facts; `step` below must rebind the newly
+            // durable Approval before it can succeed.
+            assert!(domain.consent());
             assert!(!domain.approved());
         });
         let out = plane
@@ -10923,6 +11118,35 @@ sleep 30"#;
         assert!(displaced_root.join(DATABASE_FILE_NAME).is_file());
     }
 
+    fn waiting_approval_preview_proposal(
+        effect_id: EffectId,
+        suffix: &str,
+    ) -> ProposePreviewEffect {
+        ProposePreviewEffect {
+            effect_id,
+            actor_id: ActorId::from("desktop-waiting-approval-actor"),
+            capability: "channel.preview".into(),
+            provider: "fixture-provider".into(),
+            connection_id: None,
+            account_id: None,
+            required_scopes: BTreeSet::new(),
+            description: "Publish exact preview after window grant".into(),
+            target_resource: "preview://desktop-waiting-approval".into(),
+            audience_digest: None,
+            payload_digest: "1".repeat(64),
+            asset_digests: BTreeSet::new(),
+            scheduled_for: None,
+            timezone: "UTC".into(),
+            consent: ConsentState::NotRequired,
+            consent_record_id: None,
+            consent_requirement: None,
+            policy_version: "policy-v1".into(),
+            amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
+            idempotency_key: format!("desktop-waiting-approval-{suffix}"),
+            expires_in: Duration::hours(1),
+        }
+    }
+
     fn propose_waiting_approval_preview(
         plane: &DesktopDataPlane,
         secrets: &MemorySecretStore,
@@ -10942,40 +11166,30 @@ sleep 30"#;
         let database_secret = secrets
             .get(plane.database_key_reference())
             .expect("database secret");
-        let (mut service, _) = plane
+        let (service, _) = plane
             .open_application_from_secret(&database_secret, now + Duration::seconds(1))
             .expect("application");
+        let expected_mission_revision = service
+            .load_mission(project_id, &mission_id)
+            .expect("Mission before proposal")
+            .revision;
+        drop(service);
         let effect_id = EffectId::from_stable(format!("desktop-waiting-approval-{suffix}"));
-        service
-            .propose_preview_effect(
-                project_id,
-                &mission_id,
-                ProposePreviewEffect {
-                    effect_id: effect_id.clone(),
-                    actor_id: ActorId::from("desktop-waiting-approval-actor"),
-                    capability: "channel.preview".into(),
-                    provider: "fixture-provider".into(),
-                    connection_id: None,
-                    account_id: None,
-                    required_scopes: BTreeSet::new(),
-                    description: "Publish exact preview after window grant".into(),
-                    target_resource: "preview://desktop-waiting-approval".into(),
-                    audience_digest: None,
-                    payload_digest: "1".repeat(64),
-                    asset_digests: BTreeSet::new(),
-                    scheduled_for: None,
-                    timezone: "UTC".into(),
-                    consent: ConsentState::NotRequired,
-                    consent_record_id: None,
-                    consent_requirement: None,
-                    policy_version: "policy-v1".into(),
-                    amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
-                    idempotency_key: format!("desktop-waiting-approval-{suffix}"),
-                    expires_in: Duration::hours(1),
+        plane
+            .propose_preview_effect_with(
+                secrets,
+                DesktopPreviewEffectProposalRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    expected_mission_revision,
+                    proposal: waiting_approval_preview_proposal(effect_id.clone(), suffix),
                 },
                 now + Duration::seconds(2),
             )
             .expect("proposed Effect");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(2))
+            .expect("application after Cordis proposal");
         let mission = service
             .load_mission(project_id, &mission_id)
             .expect("WaitingApproval Mission after propose");
@@ -10988,6 +11202,229 @@ sleep 30"#;
             effect.approval_digest(),
             mission.revision,
         )
+    }
+
+    #[test]
+    fn effect_proposal_routes_through_cordis_and_stops_at_waiting_approval() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(1);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "准备一个受控预览提案；不得执行外部动作",
+                now,
+            )
+            .expect("proposal Mission");
+        let projected = &started.inventory.projects[0].missions[0];
+        let mission_id = projected.mission_id.clone();
+        let expected_mission_revision = projected.revision;
+        let effect_id = EffectId::from_stable("desktop-cordis-effect-proposal-success");
+
+        let snapshot = plane
+            .propose_preview_effect_with(
+                &secrets,
+                DesktopPreviewEffectProposalRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    expected_mission_revision,
+                    proposal: waiting_approval_preview_proposal(effect_id.clone(), "success"),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("Cordis proposal");
+        let proposed = snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("proposed Mission projection");
+        assert_eq!(proposed.stage, MissionStage::WaitingApproval);
+        assert_eq!(proposed.pending_approval_count, 1);
+        assert_eq!(proposed.verified_effect_count, 0);
+
+        {
+            let cordis = plane.lock_cordis();
+            let bound = cordis
+                .bound_scope()
+                .expect("Effect proposal must cross one Cordis scope");
+            assert_eq!(bound.project_id(), project_id.as_str());
+            assert_eq!(bound.mission_id(), mission_id.as_str());
+            assert_eq!(bound.mission_revision(), expected_mission_revision);
+            assert!(bound.runtime().is_none());
+            assert!(cordis.active_domain_command_scope().is_none());
+            assert!(cordis.active_runtime_scope().is_none());
+        }
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(2))
+            .expect("application after proposal");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("durable proposed Mission");
+        let effect = mission.effect(&effect_id).expect("durable proposed Effect");
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        assert!(effect.approval.is_none());
+        assert!(effect.receipt.is_none());
+        assert!(effect.verification.is_none());
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("proposal events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "approval.requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "approval.decided")
+                .count(),
+            0
+        );
+        let event_json = serde_json::to_string(&events).expect("event JSON");
+        assert!(!event_json.contains("Receipt"));
+        assert!(!event_json.contains("Verification"));
+    }
+
+    #[test]
+    fn stale_or_invalid_effect_proposal_refuses_without_mutation() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(2);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "验证 Effect 提案的 revision 与摘要拒绝路径",
+                now,
+            )
+            .expect("proposal Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application before refusals");
+        let before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before refusals");
+        let events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before refusals");
+        drop(service);
+        let effect_id = EffectId::from_stable("desktop-cordis-effect-proposal-refusal");
+        let proposal = waiting_approval_preview_proposal(effect_id, "refusal");
+
+        let stale_expected = before.revision.saturating_add(1);
+        let stale = plane.propose_preview_effect_with(
+            &secrets,
+            DesktopPreviewEffectProposalRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                expected_mission_revision: stale_expected,
+                proposal: proposal.clone(),
+            },
+            now + Duration::seconds(1),
+        );
+        assert!(matches!(
+            stale,
+            Err(DesktopDataError::Application(
+                ApplicationError::MissionRevisionMismatch { expected, actual }
+            )) if expected == stale_expected && actual == before.revision
+        ));
+
+        let mut invalid_proposal = proposal;
+        invalid_proposal.payload_digest = "A".repeat(64);
+        assert!(matches!(
+            plane.propose_preview_effect_with(
+                &secrets,
+                DesktopPreviewEffectProposalRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    expected_mission_revision: before.revision,
+                    proposal: invalid_proposal,
+                },
+                now + Duration::seconds(2),
+            ),
+            Err(DesktopDataError::InvalidEffectProposal)
+        ));
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(3))
+            .expect("application after refusals");
+        let after = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission after refusals");
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.stage, before.stage);
+        assert_eq!(after.effects, before.effects);
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged events"),
+            events_before
+        );
+    }
+
+    #[test]
+    fn effect_proposal_request_debug_redacts_private_content() {
+        let effect_id = EffectId::from_stable("desktop-cordis-effect-proposal-debug");
+        let mut proposal = waiting_approval_preview_proposal(effect_id, "debug-secret");
+        proposal.provider = "private-provider-token".into();
+        proposal.description = "private proposal body".into();
+        proposal.target_resource = "preview://private-target".into();
+        proposal.idempotency_key = "private-idempotency-key".into();
+        let request = DesktopPreviewEffectProposalRequest {
+            project_id: ProjectId::from_stable("desktop-cordis-proposal-debug-project"),
+            mission_id: MissionId::from_stable("desktop-cordis-proposal-debug-mission"),
+            expected_mission_revision: 7,
+            proposal,
+        };
+
+        let debug = format!("{request:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("private-provider-token"));
+        assert!(!debug.contains("private proposal body"));
+        assert!(!debug.contains("preview://private-target"));
+        assert!(!debug.contains("private-idempotency-key"));
+        assert!(!debug.contains("debug-secret"));
+    }
+
+    #[test]
+    fn effect_proposal_digest_binds_scope_time_and_typed_content() {
+        let now = observed_at();
+        let scope = AuthorityScope::new("tenant-a", "project-a", "mission-a", 7).unwrap();
+        let proposal = waiting_approval_preview_proposal(
+            EffectId::from_stable("desktop-cordis-effect-proposal-digest"),
+            "digest",
+        );
+        let digest = effect_proposal_authority_digest(&scope, &proposal, now).unwrap();
+        assert_eq!(
+            effect_proposal_authority_digest(&scope, &proposal, now).unwrap(),
+            digest
+        );
+
+        let next_revision = AuthorityScope::new("tenant-a", "project-a", "mission-a", 8).unwrap();
+        assert_ne!(
+            effect_proposal_authority_digest(&next_revision, &proposal, now).unwrap(),
+            digest
+        );
+        assert_ne!(
+            effect_proposal_authority_digest(&scope, &proposal, now + Duration::seconds(1))
+                .unwrap(),
+            digest
+        );
+        let mut changed = proposal;
+        changed.description = "a different private proposal body".into();
+        assert_ne!(
+            effect_proposal_authority_digest(&scope, &changed, now).unwrap(),
+            digest
+        );
     }
 
     #[test]

@@ -1358,6 +1358,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidHumanCheckpointConfirmation
         | DesktopDataError::InvalidVm11OutcomeDecision
         | DesktopDataError::InvalidVm11NextContractResolution
+        | DesktopDataError::InvalidEffectProposal
         | DesktopDataError::InvalidWaitingApprovalGrant
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::BrowserWorkspaceUnavailable
