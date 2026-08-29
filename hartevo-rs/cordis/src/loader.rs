@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::{ConfigValue, InterpolateError, coerce_disabled};
 use crate::context::{Context, CordisError};
 use crate::effect::{IntoLifecycleEffect, LifecycleEffect};
+use crate::registry::LifecycleContextView;
 
 /// Conversion boundary for legacy unit-returning loader callbacks.
 pub trait IntoPluginResult {
@@ -33,6 +34,9 @@ impl IntoPluginResult for Result<(), CordisError> {
 
 type StartFn =
     Arc<dyn Fn(ConfigValue, &mut Context) -> Result<LifecycleEffect, CordisError> + Send + Sync>;
+type LifecycleStartFn = Arc<
+    dyn Fn(ConfigValue, LifecycleContextView) -> Result<LifecycleEffect, CordisError> + Send + Sync,
+>;
 
 static NEXT_FACTORY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -60,7 +64,9 @@ impl fmt::Display for PluginFactoryId {
 pub struct PluginFactory {
     id: PluginFactoryId,
     plugin_id: PluginId,
-    start: StartFn,
+    start: Option<StartFn>,
+    lifecycle_start: Option<LifecycleStartFn>,
+    repeatable: bool,
     inject: Vec<String>,
     config: ConfigValue,
 }
@@ -71,6 +77,7 @@ impl fmt::Debug for PluginFactory {
             .debug_struct("PluginFactory")
             .field("id", &self.id)
             .field("plugin_id", &self.plugin_id)
+            .field("repeatable", &self.repeatable)
             .field("inject", &self.inject)
             .field("config", &self.config)
             .finish_non_exhaustive()
@@ -89,7 +96,51 @@ impl PluginFactory {
         Self {
             id: PluginFactoryId(NEXT_FACTORY_ID.fetch_add(1, Ordering::Relaxed)),
             plugin_id,
-            start,
+            start: Some(start),
+            lifecycle_start: None,
+            // The `&mut Context` compatibility callback is synchronous and
+            // cannot be replayed by the owned async runtime without retaining
+            // an illegal borrow. It is therefore a strict one-shot entry.
+            repeatable: false,
+            inject: Vec::new(),
+            config: ConfigValue::default(),
+        }
+    }
+
+    /// Build a repeatable factory whose callback receives an owned,
+    /// generation-checked lifecycle ContextView. This is the async N1 path;
+    /// no `&mut Context` borrow survives callback return.
+    pub fn new_lifecycle<F, R>(id: impl Into<PluginId>, start: F) -> Self
+    where
+        F: Fn(ConfigValue, LifecycleContextView) -> R + Send + Sync + 'static,
+        R: IntoLifecycleEffect + 'static,
+    {
+        Self::lifecycle_factory(id.into(), start, true)
+    }
+
+    /// Strict one-shot lifecycle adapter used to prove restart/update
+    /// preflight. Its callback can run for the initial activation only.
+    pub fn one_shot_lifecycle<F, R>(id: impl Into<PluginId>, start: F) -> Self
+    where
+        F: Fn(ConfigValue, LifecycleContextView) -> R + Send + Sync + 'static,
+        R: IntoLifecycleEffect + 'static,
+    {
+        Self::lifecycle_factory(id.into(), start, false)
+    }
+
+    fn lifecycle_factory<F, R>(plugin_id: PluginId, start: F, repeatable: bool) -> Self
+    where
+        F: Fn(ConfigValue, LifecycleContextView) -> R + Send + Sync + 'static,
+        R: IntoLifecycleEffect + 'static,
+    {
+        let lifecycle_start: LifecycleStartFn =
+            Arc::new(move |config, ctx| start(config, ctx).into_lifecycle_effect());
+        Self {
+            id: PluginFactoryId(NEXT_FACTORY_ID.fetch_add(1, Ordering::Relaxed)),
+            plugin_id,
+            start: None,
+            lifecycle_start: Some(lifecycle_start),
+            repeatable,
             inject: Vec::new(),
             config: ConfigValue::default(),
         }
@@ -124,6 +175,16 @@ impl PluginFactory {
     }
 
     #[must_use]
+    pub const fn is_repeatable(&self) -> bool {
+        self.repeatable
+    }
+
+    #[must_use]
+    pub const fn supports_lifecycle(&self) -> bool {
+        self.lifecycle_start.is_some()
+    }
+
+    #[must_use]
     pub fn inject(&self) -> &[String] {
         &self.inject
     }
@@ -136,10 +197,32 @@ impl PluginFactory {
     pub(crate) fn start(&self, config: ConfigValue, ctx: &mut Context) -> Result<(), CordisError> {
         match self.start_effect(config, ctx)? {
             LifecycleEffect::None => Ok(()),
-            LifecycleEffect::Disposer(_)
-            | LifecycleEffect::DisposerCollection(_)
-            | LifecycleEffect::DisposerFuture(_)
-            | LifecycleEffect::DisposerStream(_) => Err(CordisError::AsyncEffectRequiresFiber),
+            LifecycleEffect::Disposer(disposer) => {
+                if !disposer.supports_sync_disposal() {
+                    return Err(CordisError::AsyncEffectRequiresFiber);
+                }
+                ctx.effect(move || {
+                    let _ = disposer.dispose_sync();
+                });
+                Ok(())
+            }
+            LifecycleEffect::DisposerCollection(disposers) => {
+                if disposers
+                    .iter()
+                    .any(|disposer| !disposer.supports_sync_disposal())
+                {
+                    return Err(CordisError::AsyncEffectRequiresFiber);
+                }
+                for disposer in disposers {
+                    ctx.effect(move || {
+                        let _ = disposer.dispose_sync();
+                    });
+                }
+                Ok(())
+            }
+            LifecycleEffect::DisposerFuture(_) | LifecycleEffect::DisposerStream(_) => {
+                Err(CordisError::AsyncEffectRequiresFiber)
+            }
         }
     }
 
@@ -148,7 +231,25 @@ impl PluginFactory {
         config: ConfigValue,
         ctx: &mut Context,
     ) -> Result<LifecycleEffect, CordisError> {
-        (self.start)(config, ctx)
+        let Some(start) = &self.start else {
+            return Err(CordisError::LifecycleFactoryRequired {
+                id: self.plugin_id.clone(),
+            });
+        };
+        start(config, ctx)
+    }
+
+    pub(crate) fn start_lifecycle(
+        &self,
+        config: ConfigValue,
+        ctx: LifecycleContextView,
+    ) -> Result<LifecycleEffect, CordisError> {
+        let Some(start) = &self.lifecycle_start else {
+            return Err(CordisError::LifecycleFactoryRequired {
+                id: self.plugin_id.clone(),
+            });
+        };
+        start(config, ctx)
     }
 }
 
@@ -549,6 +650,21 @@ impl PluginSpec {
             disabled: None,
             config: ConfigValue::default(),
             factory: PluginFactory::new(id, start),
+        }
+    }
+
+    pub fn new_lifecycle<F, R>(id: impl Into<PluginId>, start: F) -> Self
+    where
+        F: Fn(ConfigValue, LifecycleContextView) -> R + Send + Sync + 'static,
+        R: IntoLifecycleEffect + 'static,
+    {
+        let id = id.into();
+        Self {
+            id: id.clone(),
+            inject: Vec::new(),
+            disabled: None,
+            config: ConfigValue::default(),
+            factory: PluginFactory::new_lifecycle(id, start),
         }
     }
 

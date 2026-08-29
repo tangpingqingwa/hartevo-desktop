@@ -303,6 +303,35 @@ pub enum CordisError {
     CleanupPanicked { message: String },
     #[error("asynchronous lifecycle effects require a repeatable Fiber runtime")]
     AsyncEffectRequiresFiber,
+    #[error("Fiber `{uid}` is not managed by the asynchronous lifecycle runtime")]
+    FiberRuntimeUnavailable { uid: FiberUid },
+    #[error("plugin `{id}` requires an owned lifecycle callback")]
+    LifecycleFactoryRequired { id: crate::loader::PluginId },
+    #[error("plugin catalog id `{id}` is already bound to a different factory")]
+    PluginCatalogConflict { id: crate::loader::PluginId },
+    #[error("plugin runtime `{id}` is being deleted")]
+    RuntimeDeleting { id: crate::loader::PluginId },
+    #[error("plugin factory is one-shot and cannot transition again: {}", .ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))]
+    NonRepeatableFactory { ids: Vec<crate::loader::PluginId> },
+    #[error("lifecycle runtime is not running inside Tokio")]
+    AsyncRuntimeUnavailable,
+    #[error("lifecycle transition ticket allocation overflowed")]
+    TransitionTicketOverflow,
+    #[error("plugin config revision overflowed")]
+    ConfigRevisionOverflow,
+    #[error("plugin runtime generation allocation overflowed")]
+    RuntimeGenerationOverflow,
+    #[error("lifecycle ContextView for Fiber `{uid}` is stale")]
+    StaleLifecycleView { uid: FiberUid },
+    #[error("wait for Fiber `{uid}` activation was cancelled")]
+    WaitCancelled { uid: FiberUid },
+    #[error("provider guard for `{namespace}/{key}` failed: {source}")]
+    ProviderGuard {
+        namespace: String,
+        key: String,
+        #[source]
+        source: Box<CordisError>,
+    },
     #[error("cleanup also failed after `{failure}`: {cleanup}")]
     CleanupAfterFailure {
         failure: Box<CordisError>,

@@ -1,10 +1,26 @@
 //! Fiber identity and lifecycle value types.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::config::ConfigValue;
+use crate::context::CordisError;
+
+pub(crate) type FiberFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+pub(crate) trait FiberLifecycle: Send + Sync {
+    fn snapshot(&self) -> FiberSnapshot;
+    fn is_tombstoned(&self) -> bool;
+    fn state_history(&self) -> Vec<FiberState>;
+    fn await_current(&self) -> FiberFuture<Result<FiberSnapshot, CordisError>>;
+    fn wait_until_active(
+        &self,
+        cancellation: LifecycleCancellation,
+    ) -> FiberFuture<Result<FiberSnapshot, CordisError>>;
+}
 
 /// Opaque monotonically allocated Fiber identity.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -162,6 +178,95 @@ pub struct TransitionTicket {
     target: Option<ActivationEpoch>,
 }
 
+/// Observable immutable lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiberSnapshot {
+    state: FiberState,
+    ticket: Option<TransitionTicket>,
+    committed_epoch: Option<ActivationEpoch>,
+    error: Option<CordisError>,
+    diagnostics: Vec<CordisError>,
+}
+
+impl FiberSnapshot {
+    #[must_use]
+    pub fn new(
+        state: FiberState,
+        ticket: Option<TransitionTicket>,
+        committed_epoch: Option<ActivationEpoch>,
+        error: Option<CordisError>,
+        diagnostics: Vec<CordisError>,
+    ) -> Self {
+        Self {
+            state,
+            ticket,
+            committed_epoch,
+            error,
+            diagnostics,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> FiberState {
+        self.state
+    }
+
+    #[must_use]
+    pub fn ticket(&self) -> Option<&TransitionTicket> {
+        self.ticket.as_ref()
+    }
+
+    #[must_use]
+    pub fn committed_epoch(&self) -> Option<&ActivationEpoch> {
+        self.committed_epoch.as_ref()
+    }
+
+    #[must_use]
+    pub fn error(&self) -> Option<&CordisError> {
+        self.error.as_ref()
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> &[CordisError] {
+        &self.diagnostics
+    }
+}
+
+/// Explicit cancellation handle for [`Fiber::wait_until_active`].
+#[derive(Debug, Clone)]
+pub struct LifecycleCancellation {
+    cancelled: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl LifecycleCancellation {
+    pub fn cancel(&self) {
+        self.cancelled.send_replace(true);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut cancelled = self.cancelled.subscribe();
+        while !*cancelled.borrow_and_update() {
+            if cancelled.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for LifecycleCancellation {
+    fn default() -> Self {
+        let (cancelled, _) = tokio::sync::watch::channel(false);
+        Self {
+            cancelled: Arc::new(cancelled),
+        }
+    }
+}
+
 impl TransitionTicket {
     #[must_use]
     pub fn new(serial: u64, target: Option<ActivationEpoch>) -> Self {
@@ -185,10 +290,12 @@ struct FiberInner {
     context_id: u64,
     uid: FiberUid,
     parent: Option<FiberUid>,
-    state: AtomicU8,
+    legacy_state: AtomicU8,
     disposed: AtomicBool,
     metadata: Mutex<ConfigValue>,
     namespace: String,
+    lifecycle: Mutex<Option<Weak<dyn FiberLifecycle>>>,
+    terminal: Mutex<Option<(FiberSnapshot, Vec<FiberState>)>>,
 }
 
 /// Cloneable, opaque handle to a Fiber.
@@ -208,10 +315,12 @@ impl Fiber {
                 context_id,
                 uid: FiberUid::ROOT,
                 parent: None,
-                state: AtomicU8::new(FiberState::Active.as_byte()),
+                legacy_state: AtomicU8::new(FiberState::Active.as_byte()),
                 disposed: AtomicBool::new(false),
                 metadata: Mutex::new(ConfigValue::default()),
                 namespace: "root".to_string(),
+                lifecycle: Mutex::new(None),
+                terminal: Mutex::new(None),
             }),
         }
     }
@@ -224,10 +333,12 @@ impl Fiber {
                 context_id,
                 uid,
                 parent: Some(parent.uid()),
-                state: AtomicU8::new(FiberState::Pending.as_byte()),
+                legacy_state: AtomicU8::new(FiberState::Pending.as_byte()),
                 disposed: AtomicBool::new(false),
                 metadata: Mutex::new(metadata),
                 namespace,
+                lifecycle: Mutex::new(None),
+                terminal: Mutex::new(None),
             }),
         }
     }
@@ -247,13 +358,22 @@ impl Fiber {
     /// Current minimal lifecycle state.
     #[must_use]
     pub fn state(&self) -> FiberState {
-        FiberState::from_byte(self.inner.state.load(Ordering::Acquire))
+        if let Some(lifecycle) = self.lifecycle() {
+            return lifecycle.snapshot().state();
+        }
+        self.terminal_snapshot().map_or_else(
+            || FiberState::from_byte(self.inner.legacy_state.load(Ordering::Acquire)),
+            |(snapshot, _)| snapshot.state(),
+        )
     }
 
     /// Whether this Fiber has reached its terminal state.
     #[must_use]
     pub fn is_disposed(&self) -> bool {
-        self.inner.disposed.load(Ordering::Acquire)
+        self.lifecycle().map_or_else(
+            || self.inner.disposed.load(Ordering::Acquire),
+            |lifecycle| lifecycle.is_tombstoned(),
+        )
     }
 
     /// Mark a pending Fiber active exactly once.
@@ -262,7 +382,7 @@ impl Fiber {
             return false;
         }
         self.inner
-            .state
+            .legacy_state
             .compare_exchange(
                 FiberState::Pending.as_byte(),
                 FiberState::Active.as_byte(),
@@ -275,6 +395,13 @@ impl Fiber {
     /// Publish the terminal tombstone. Repeated disposal is a no-op; the root
     /// Fiber is retained as the reusable Context owner and cannot be disposed.
     pub(crate) fn dispose(&self) -> bool {
+        if self.uid() == FiberUid::ROOT {
+            return false;
+        }
+        !self.inner.disposed.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn publish_tombstone(&self) -> bool {
         if self.uid() == FiberUid::ROOT {
             return false;
         }
@@ -299,6 +426,83 @@ impl Fiber {
     pub(crate) fn replace_metadata(&self, metadata: ConfigValue) {
         if let Ok(mut current) = self.inner.metadata.lock() {
             *current = metadata;
+        }
+    }
+
+    pub(crate) fn attach_lifecycle(&self, lifecycle: Weak<dyn FiberLifecycle>) {
+        let mut current = match self.inner.lifecycle.lock() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *current = Some(lifecycle);
+    }
+
+    /// Freeze the final managed snapshot before the registry releases its last
+    /// strong control reference. This is a terminal handoff, not a second
+    /// concurrently mutable state source.
+    pub(crate) fn freeze_terminal(&self, snapshot: FiberSnapshot, history: Vec<FiberState>) {
+        let mut terminal = match self.inner.terminal.lock() {
+            Ok(terminal) => terminal,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if terminal.is_none() {
+            *terminal = Some((snapshot, history));
+        }
+    }
+
+    fn lifecycle(&self) -> Option<Arc<dyn FiberLifecycle>> {
+        let current = match self.inner.lifecycle.lock() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        current.as_ref()?.upgrade()
+    }
+
+    fn terminal_snapshot(&self) -> Option<(FiberSnapshot, Vec<FiberState>)> {
+        let terminal = match self.inner.terminal.lock() {
+            Ok(terminal) => terminal,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        terminal.clone()
+    }
+
+    /// Immutable lifecycle snapshot. Unmanaged N0 Fibers expose only their
+    /// current synchronous state.
+    #[must_use]
+    pub fn snapshot(&self) -> FiberSnapshot {
+        if let Some(lifecycle) = self.lifecycle() {
+            return lifecycle.snapshot();
+        }
+        self.terminal_snapshot().map_or_else(
+            || FiberSnapshot::new(self.state(), None, None, None, Vec::new()),
+            |(snapshot, _)| snapshot,
+        )
+    }
+
+    #[must_use]
+    pub fn state_history(&self) -> Vec<FiberState> {
+        if let Some(lifecycle) = self.lifecycle() {
+            return lifecycle.state_history();
+        }
+        self.terminal_snapshot()
+            .map_or_else(|| vec![self.state()], |(_, history)| history)
+    }
+
+    pub async fn await_current(&self) -> Result<FiberSnapshot, CordisError> {
+        match self.lifecycle() {
+            Some(lifecycle) => lifecycle.await_current().await,
+            None => Ok(self.snapshot()),
+        }
+    }
+
+    pub async fn wait_until_active(
+        &self,
+        cancellation: LifecycleCancellation,
+    ) -> Result<FiberSnapshot, CordisError> {
+        match self.lifecycle() {
+            Some(lifecycle) => lifecycle.wait_until_active(cancellation).await,
+            None if self.state() == FiberState::Active => Ok(self.snapshot()),
+            None => Err(CordisError::FiberRuntimeUnavailable { uid: self.uid() }),
         }
     }
 }

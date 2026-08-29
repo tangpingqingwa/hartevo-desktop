@@ -18,7 +18,10 @@ pub type Disposer = Box<dyn FnOnce() + Send + 'static>;
 pub type LifecycleDisposeFuture =
     Pin<Box<dyn Future<Output = Result<(), CordisError>> + Send + 'static>>;
 
-type LifecycleDisposeCallback = Box<dyn FnOnce() -> LifecycleDisposeFuture + Send + 'static>;
+enum LifecycleDisposeCallback {
+    Sync(Box<dyn FnOnce() -> Result<(), CordisError> + Send + 'static>),
+    Async(Box<dyn FnOnce() -> LifecycleDisposeFuture + Send + 'static>),
+}
 type SharedLifecycleDispose = Shared<BoxFuture<'static, Result<(), CordisError>>>;
 
 enum LifecycleDisposerState {
@@ -47,7 +50,7 @@ impl LifecycleDisposer {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), CordisError>> + Send + 'static,
     {
-        let callback: LifecycleDisposeCallback = Box::new(move || Box::pin(dispose()));
+        let callback = LifecycleDisposeCallback::Async(Box::new(move || Box::pin(dispose())));
         Self {
             inner: Arc::new(LifecycleDisposerInner {
                 state: Mutex::new(LifecycleDisposerState::Ready(Some(callback))),
@@ -60,7 +63,7 @@ impl LifecycleDisposer {
     where
         F: FnOnce() + Send + 'static,
     {
-        Self::new(move || async move {
+        Self::fallible_sync(move || {
             dispose();
             Ok(())
         })
@@ -71,7 +74,13 @@ impl LifecycleDisposer {
     where
         F: FnOnce() -> Result<(), CordisError> + Send + 'static,
     {
-        Self::new(move || async move { dispose() })
+        Self {
+            inner: Arc::new(LifecycleDisposerInner {
+                state: Mutex::new(LifecycleDisposerState::Ready(Some(
+                    LifecycleDisposeCallback::Sync(Box::new(dispose)),
+                ))),
+            }),
+        }
     }
 
     pub async fn dispose_async(&self) -> Result<(), CordisError> {
@@ -82,7 +91,11 @@ impl LifecycleDisposer {
             };
             match &mut *state {
                 LifecycleDisposerState::Ready(callback) => {
-                    let callback = callback.take().expect("ready disposer has callback");
+                    let Some(callback) = callback.take() else {
+                        return Err(CordisError::CleanupPanicked {
+                            message: "lifecycle disposer callback was already consumed".to_string(),
+                        });
+                    };
                     let shared = shared_disposal(callback);
                     *state = LifecycleDisposerState::Running(shared.clone());
                     shared
@@ -92,6 +105,77 @@ impl LifecycleDisposer {
             }
         };
         let result = shared.await;
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *state = LifecycleDisposerState::Done(result.clone());
+        result
+    }
+
+    /// Whether this callback can be transferred into the synchronous legacy
+    /// Context without introducing an async ownership boundary.
+    #[must_use]
+    pub(crate) fn supports_sync_disposal(&self) -> bool {
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        matches!(
+            &*state,
+            LifecycleDisposerState::Ready(Some(LifecycleDisposeCallback::Sync(_)))
+                | LifecycleDisposerState::Done(_)
+        )
+    }
+
+    /// Consume a synchronous callback without holding the state mutex. Async
+    /// callbacks are rejected before ownership changes.
+    pub(crate) fn dispose_sync(&self) -> Result<(), CordisError> {
+        let callback = {
+            let mut state = match self.inner.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match &mut *state {
+                LifecycleDisposerState::Ready(callback) => {
+                    match callback.as_ref() {
+                        Some(LifecycleDisposeCallback::Sync(_)) => {}
+                        Some(LifecycleDisposeCallback::Async(_)) | None => {
+                            return Err(CordisError::AsyncEffectRequiresFiber);
+                        }
+                    }
+                    let Some(LifecycleDisposeCallback::Sync(callback)) = callback.take() else {
+                        return Err(CordisError::AsyncEffectRequiresFiber);
+                    };
+                    // A completion future lets a concurrent async caller wait
+                    // without polling or owning this synchronous invocation.
+                    let (complete, completed) = tokio::sync::oneshot::channel();
+                    let shared = async move {
+                        completed.await.unwrap_or_else(|_| {
+                            Err(CordisError::CleanupPanicked {
+                                message: "synchronous lifecycle disposer was cancelled".to_string(),
+                            })
+                        })
+                    }
+                    .boxed()
+                    .shared();
+                    *state = LifecycleDisposerState::Running(shared);
+                    (callback, complete)
+                }
+                LifecycleDisposerState::Running(_) => {
+                    return Err(CordisError::AsyncEffectRequiresFiber);
+                }
+                LifecycleDisposerState::Done(result) => return result.clone(),
+            }
+        };
+        let (callback, complete) = callback;
+        let result = match catch_unwind(AssertUnwindSafe(callback)) {
+            Ok(result) => result,
+            Err(payload) => Err(CordisError::CleanupPanicked {
+                message: panic_payload_message(payload.as_ref()),
+            }),
+        };
+        let _ = complete.send(result.clone());
         let mut state = match self.inner.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
@@ -112,17 +196,25 @@ impl LifecycleDisposer {
 
 fn shared_disposal(callback: LifecycleDisposeCallback) -> SharedLifecycleDispose {
     async move {
-        let future = catch_unwind(AssertUnwindSafe(callback)).map_err(|payload| {
-            CordisError::CleanupPanicked {
-                message: panic_payload_message(payload.as_ref()),
+        match callback {
+            LifecycleDisposeCallback::Sync(callback) => catch_unwind(AssertUnwindSafe(callback))
+                .map_err(|payload| CordisError::CleanupPanicked {
+                    message: panic_payload_message(payload.as_ref()),
+                })?,
+            LifecycleDisposeCallback::Async(callback) => {
+                let future = catch_unwind(AssertUnwindSafe(callback)).map_err(|payload| {
+                    CordisError::CleanupPanicked {
+                        message: panic_payload_message(payload.as_ref()),
+                    }
+                })?;
+                AssertUnwindSafe(future)
+                    .catch_unwind()
+                    .await
+                    .map_err(|payload| CordisError::CleanupPanicked {
+                        message: panic_payload_message(payload.as_ref()),
+                    })?
             }
-        })?;
-        AssertUnwindSafe(future)
-            .catch_unwind()
-            .await
-            .map_err(|payload| CordisError::CleanupPanicked {
-                message: panic_payload_message(payload.as_ref()),
-            })?
+        }
     }
     .boxed()
     .shared()
