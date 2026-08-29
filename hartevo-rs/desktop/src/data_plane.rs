@@ -4805,7 +4805,7 @@ fn map_runtime_dispatch_result<T>(
 ) -> Result<T, DesktopDataError> {
     match result {
         Ok(output) => Ok(output),
-        Err(AuthorityDispatchError::Cordis(error)) => Err(error.into()),
+        Err(AuthorityDispatchError::Cordis(error)) => Err((*error).into()),
         Err(AuthorityDispatchError::Authority(error)) => Err(error),
         Err(error @ AuthorityDispatchError::Combined(_)) => {
             Err(DesktopDataError::RuntimeDispatch(Box::new(error)))

@@ -450,7 +450,7 @@ mod tests {
                 );
                 assert_eq!(
                     nested.unwrap_err(),
-                    AuthorityDispatchError::Cordis(CordisError::RuntimeDispatchBusy)
+                    AuthorityDispatchError::Cordis(Box::new(CordisError::RuntimeDispatchBusy))
                 );
                 observed_calls.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, &'static str>("application-runtime")
@@ -522,7 +522,7 @@ mod tests {
         );
         assert_eq!(
             second.unwrap_err(),
-            AuthorityDispatchError::Cordis(CordisError::RuntimeDispatchBusy)
+            AuthorityDispatchError::Cordis(Box::new(CordisError::RuntimeDispatchBusy))
         );
         release_tx.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap(), "first");
@@ -560,7 +560,7 @@ mod tests {
                     );
                     assert_eq!(
                         nested.unwrap_err(),
-                        AuthorityDispatchError::Cordis(CordisError::RuntimeDispatchBusy)
+                        AuthorityDispatchError::Cordis(Box::new(CordisError::RuntimeDispatchBusy))
                     );
                     started_count.fetch_add(1, Ordering::SeqCst);
                 })
@@ -621,7 +621,7 @@ mod tests {
         );
         assert_eq!(
             result.unwrap_err(),
-            AuthorityDispatchError::Cordis(CordisError::RuntimeCoordinatorPoisoned)
+            AuthorityDispatchError::Cordis(Box::new(CordisError::RuntimeCoordinatorPoisoned))
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }

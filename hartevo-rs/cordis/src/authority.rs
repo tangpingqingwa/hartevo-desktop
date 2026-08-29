@@ -452,9 +452,9 @@ where
 /// Distinguishes a Cordis gate/lifecycle failure from an authority failure.
 #[derive(Debug, Eq, PartialEq)]
 pub enum AuthorityDispatchError<AdapterError> {
-    Cordis(CordisError),
+    Cordis(Box<CordisError>),
     Authority(AdapterError),
-    Combined(AuthorityDispatchFailures<AdapterError>),
+    Combined(Box<AuthorityDispatchFailures<AdapterError>>),
 }
 
 impl<AdapterError> AuthorityDispatchError<AdapterError> {
@@ -472,22 +472,25 @@ impl<AdapterError> AuthorityDispatchError<AdapterError> {
             + usize::from(disposed.is_some());
         match count {
             0 => None,
-            1 => authority
-                .map(Self::Authority)
-                .or_else(|| started.or(finish).or(disposed).map(Self::Cordis)),
-            _ => Some(Self::Combined(AuthorityDispatchFailures {
+            1 => authority.map(Self::Authority).or_else(|| {
+                started
+                    .or(finish)
+                    .or(disposed)
+                    .map(|error| Self::Cordis(Box::new(error)))
+            }),
+            _ => Some(Self::Combined(Box::new(AuthorityDispatchFailures {
                 started,
                 authority,
                 finish,
                 disposed,
-            })),
+            }))),
         }
     }
 }
 
 impl<AdapterError> From<CordisError> for AuthorityDispatchError<AdapterError> {
     fn from(error: CordisError) -> Self {
-        Self::Cordis(error)
+        Self::Cordis(Box::new(error))
     }
 }
 
@@ -507,7 +510,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Cordis(error) => Some(error),
+            Self::Cordis(error) => Some(error.as_ref()),
             Self::Authority(error) => Some(error),
             Self::Combined(errors) => errors.source(),
         }
