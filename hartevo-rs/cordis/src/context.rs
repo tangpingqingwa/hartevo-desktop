@@ -4,8 +4,8 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use crate::config::ConfigValue;
 use crate::effect::{Disposer, Registration, RegistrationHandle};
@@ -411,6 +411,7 @@ pub enum CordisError {
 /// Service container and plugin host.
 pub struct Context {
     id: u64,
+    event_authority: Arc<()>,
     services: HashMap<String, Arc<dyn Any + Send + Sync>>,
     providers: HashMap<ProviderKey, ProviderRecord>,
     next_provider_id: u64,
@@ -429,6 +430,202 @@ pub struct Context {
     activation_depth: usize,
 }
 
+/// Cloneable typed-Emit capability for safe callback re-entry.
+///
+/// The capability captures one exact Context, active Fiber owner, and event
+/// scope without retaining a borrow of [`Context`] or [`ContextView`]. It may
+/// therefore be moved into a `'static` listener, where registration and
+/// recursive dispatch continue to use the normal snapshot semantics. Every
+/// listener it creates is owned by the captured Fiber and is removed when that
+/// Fiber is cleaned up.
+///
+/// This is the synchronous N2 boundary only. It deliberately does not grant
+/// provider, Fiber-lifecycle, or [`crate::LifecycleContextView`] authority.
+#[derive(Clone)]
+pub struct EventReentry {
+    context_id: u64,
+    context_authority: Weak<()>,
+    events: EventBus,
+    owner: Fiber,
+    listener_scope: EventScope,
+    dispatch_target: Option<EventScope>,
+}
+
+impl EventReentry {
+    fn new(
+        context_id: u64,
+        context_authority: Weak<()>,
+        events: EventBus,
+        owner: Fiber,
+        listener_scope: EventScope,
+        dispatch_target: Option<EventScope>,
+    ) -> Self {
+        Self {
+            context_id,
+            context_authority,
+            events,
+            owner,
+            listener_scope,
+            dispatch_target,
+        }
+    }
+
+    fn ensure_active(&self) -> Result<(), CordisError> {
+        if self.context_authority.upgrade().is_none() || self.owner.context_id() != self.context_id
+        {
+            return Err(CordisError::FiberContextMismatch {
+                uid: self.owner.uid(),
+            });
+        }
+        if self.owner.is_disposed() || self.owner.state() != FiberState::Active {
+            return Err(CordisError::FiberDisposed {
+                uid: self.owner.uid(),
+            });
+        }
+        Ok(())
+    }
+
+    fn finish_listener(
+        name: &str,
+        result: Result<ListenerHandle, crate::event::EventBusError>,
+    ) -> Result<ListenerHandle, CordisError> {
+        result.map_err(|error| into_cordis_error(name, DispatchMode::Emit, error))
+    }
+
+    /// Register an infallible listener with default append/local options.
+    pub fn on_emit<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    /// Register an infallible listener with explicit ordering/scope options.
+    pub fn on_emit_with_options<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.ensure_active()?;
+        let result = self.events.register_emit(
+            key,
+            self.owner.clone(),
+            self.listener_scope.clone(),
+            options,
+            false,
+            listener,
+        );
+        Self::finish_listener(key.name(), result)
+    }
+
+    /// Register an infallible listener claimed before its first callback.
+    pub fn once_emit<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.once_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    /// Register a once listener with explicit ordering/scope options.
+    pub fn once_emit_with_options<P, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        F: Fn(&P) + Send + Sync + 'static,
+    {
+        self.ensure_active()?;
+        let result = self.events.register_emit(
+            key,
+            self.owner.clone(),
+            self.listener_scope.clone(),
+            options,
+            true,
+            listener,
+        );
+        Self::finish_listener(key.name(), result)
+    }
+
+    /// Register a fallible listener with default append/local options.
+    pub fn try_on_emit<P, E, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        self.try_on_emit_with_options(key, EventOptions::default(), listener)
+    }
+
+    /// Register a fallible listener with explicit ordering/scope options.
+    pub fn try_on_emit_with_options<P, E, F>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        options: EventOptions,
+        listener: F,
+    ) -> Result<ListenerHandle, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+        F: Fn(&P) -> Result<(), E> + Send + Sync + 'static,
+    {
+        self.ensure_active()?;
+        let result = self.events.register_try_emit(
+            key,
+            self.owner.clone(),
+            self.listener_scope.clone(),
+            options,
+            false,
+            listener,
+        );
+        Self::finish_listener(key.name(), result)
+    }
+
+    /// Recursively dispatch an Emit event using the captured target scope.
+    pub fn emit<P>(&self, key: EventKey<Emit, P, ()>, payload: &P) -> Result<(), CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        self.ensure_active()?;
+        self.events
+            .emit(key, payload, self.dispatch_target.as_ref())
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
+    }
+}
+
+impl fmt::Debug for EventReentry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventReentry")
+            .field("context_id", &self.context_id)
+            .field("owner_uid", &self.owner.uid())
+            .field("listener_scope", &self.listener_scope)
+            .field("dispatch_target", &self.dispatch_target)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Context {
     fn default() -> Self {
         Self::new()
@@ -442,6 +639,7 @@ impl Context {
         let root = Fiber::root(context_id);
         Self {
             id: context_id,
+            event_authority: Arc::new(()),
             services: HashMap::new(),
             providers: HashMap::new(),
             next_provider_id: 1,
@@ -896,6 +1094,7 @@ impl Context {
     }
 
     fn cleanup_fibers(&mut self, disposed: &HashSet<FiberUid>) -> Result<(), CordisError> {
+        self.events.remove_owners(disposed);
         for uid in disposed {
             self.registry.remove_fiber(*uid);
         }
@@ -1441,6 +1640,22 @@ impl Context {
         let owner = self.current_fiber_handle()?;
         let scope = EventScope::new(owner.namespace(), &[]);
         Ok((owner, scope))
+    }
+
+    /// Capture a cloneable typed-Emit capability for callback re-entry.
+    ///
+    /// Direct Context dispatch remains untargeted, matching [`Context::emit`].
+    /// Use [`ContextView::event_reentry`] to retain an isolated/shared target.
+    pub fn event_reentry(&self) -> Result<EventReentry, CordisError> {
+        let (owner, scope) = self.current_event_owner()?;
+        Ok(EventReentry::new(
+            self.id,
+            Arc::downgrade(&self.event_authority),
+            self.events.clone(),
+            owner,
+            scope,
+            None,
+        ))
     }
 
     fn finish_listener(
@@ -2627,6 +2842,23 @@ impl ContextView<'_> {
 
     fn event_scope(&self) -> EventScope {
         EventScope::new(self.namespace.clone(), &self.shared_namespaces)
+    }
+
+    /// Capture this view's exact owner and isolation labels for safe callback
+    /// registration and recursive typed-Emit dispatch.
+    pub fn event_reentry(&self) -> Result<EventReentry, CordisError> {
+        if !self.is_active() {
+            return Err(self.ownership_error());
+        }
+        let scope = self.event_scope();
+        Ok(EventReentry::new(
+            self.context.id,
+            Arc::downgrade(&self.context.event_authority),
+            self.context.events.clone(),
+            self.fiber.clone(),
+            scope.clone(),
+            Some(scope),
+        ))
     }
 
     pub fn on<F>(

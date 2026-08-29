@@ -1,7 +1,7 @@
 //! Typed Cordis events with complete runtime descriptor locks.
 
 use std::any::{Any, TypeId, type_name};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -678,6 +678,9 @@ pub(crate) enum EventBusError {
         requested: EventDescriptor,
     },
     ListenerIdentityOverflow,
+    OwnerInactive {
+        uid: FiberUid,
+    },
     Payload,
     Listener(EventError),
     Parallel(EventErrors),
@@ -944,6 +947,29 @@ impl EventBus {
 
     pub(crate) fn clear(&self) {
         lock_recover(&self.inner).slots.clear();
+    }
+
+    /// Remove every listener owned by a terminal Fiber. The owner tombstone is
+    /// published before this sweep, while registration rechecks that same
+    /// tombstone under the event-table lock. Consequently a cloneable event
+    /// capability cannot race cleanup and leave an inactive listener behind.
+    pub(crate) fn remove_owners(&self, owners: &HashSet<FiberUid>) {
+        let mut state = lock_recover(&self.inner);
+        for slot in state.slots.values_mut() {
+            slot.listeners
+                .retain(|listener| !owners.contains(&listener.owner.uid()));
+        }
+        let empty = state
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.listeners.is_empty() && !slot.explicit_lock && !slot.dispatch_lock
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in empty {
+            state.slots.remove(&name);
+        }
     }
 
     pub(crate) fn register_emit<P, F>(
@@ -1249,6 +1275,11 @@ impl EventBus {
 
     fn register(&self, spec: RegistrationSpec) -> Result<ListenerHandle, EventBusError> {
         let mut state = lock_recover(&self.inner);
+        if spec.owner.is_disposed() || spec.owner.state() != FiberState::Active {
+            return Err(EventBusError::OwnerInactive {
+                uid: spec.owner.uid(),
+            });
+        }
         if let Some(slot) = state.slots.get(spec.name)
             && slot.descriptor != spec.descriptor
         {
@@ -1282,12 +1313,7 @@ impl EventBus {
                 dispatch_lock: false,
             });
         if spec.options.prepend {
-            let index = slot
-                .listeners
-                .iter()
-                .position(|listener| !listener.options.prepend)
-                .unwrap_or(slot.listeners.len());
-            slot.listeners.insert(index, listener);
+            slot.listeners.insert(0, listener);
         } else {
             slot.listeners.push(listener);
         }
@@ -1712,6 +1738,7 @@ pub(crate) fn into_cordis_error(
             requested,
         },
         EventBusError::ListenerIdentityOverflow => CordisError::ListenerIdentityOverflow,
+        EventBusError::OwnerInactive { uid } => CordisError::FiberDisposed { uid },
         EventBusError::Payload => CordisError::PayloadType {
             name: name.to_string(),
         },

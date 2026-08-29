@@ -30,7 +30,8 @@ pub use authority::{
 };
 pub use config::{ConfigValue, InterpolateError};
 pub use context::{
-    Context, ContextView, CordisError, PendingHandle, ProviderHandle, ProviderId, keys,
+    Context, ContextView, CordisError, EventReentry, PendingHandle, ProviderHandle, ProviderId,
+    keys,
 };
 pub use effect::{
     Disposer, IntoLifecycleEffect, LifecycleDisposeFuture, LifecycleDisposer,

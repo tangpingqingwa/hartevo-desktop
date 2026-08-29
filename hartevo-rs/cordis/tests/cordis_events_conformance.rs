@@ -15,6 +15,14 @@ const EMIT_I32: EventKey<Emit, i32, ()> =
     EventKey::new(EventSchemaId::new("conformance.emit-i32.v1"), "same-name");
 const ORDER: EventKey<Emit, (), ()> =
     EventKey::new(EventSchemaId::new("conformance.order.v1"), "order");
+const DIRECT_REENTRY: EventKey<Emit, (), ()> = EventKey::new(
+    EventSchemaId::new("conformance.direct-reentry.v1"),
+    "direct-reentry",
+);
+const VIEW_REENTRY: EventKey<Emit, u8, ()> = EventKey::new(
+    EventSchemaId::new("conformance.view-reentry.v1"),
+    "view-reentry",
+);
 const SCOPED: EventKey<Emit, (), ()> =
     EventKey::new(EventSchemaId::new("conformance.scope.v1"), "scope");
 const FALLIBLE_EMIT: EventKey<Emit, (), ()> = EventKey::new(
@@ -150,7 +158,7 @@ fn mode_only_lock_is_an_active_zero_mutation_tombstone() {
 }
 
 #[test]
-fn prepend_is_stable_ahead_of_append_and_handle_drop_does_not_unregister() {
+fn prepend_is_lifo_front_ahead_of_append_and_handle_drop_does_not_unregister() {
     let mut context = Context::new();
     let order = Arc::new(Mutex::new(Vec::new()));
     for tag in ["append-a", "append-b"] {
@@ -176,7 +184,7 @@ fn prepend_is_stable_ahead_of_append_and_handle_drop_does_not_unregister() {
     context.emit(ORDER, &()).unwrap();
     assert_eq!(
         *order.lock().unwrap(),
-        ["prepend-a", "prepend-b", "append-a", "append-b"]
+        ["prepend-b", "prepend-a", "append-a", "append-b"]
     );
 }
 
@@ -248,6 +256,107 @@ fn borrowed_context_view_applies_non_emit_options_and_once_before_reentry() {
 
     assert_eq!(view.waterfall(VIEW_WATERFALL, 1).unwrap(), 20);
     assert_eq!(view.waterfall(VIEW_WATERFALL, 1).unwrap(), 10);
+}
+
+#[test]
+fn public_context_reentry_claims_once_before_recursive_dispatch() {
+    let context = Context::new();
+    let events = context.event_reentry().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_listener = Arc::clone(&calls);
+    let nested = events.clone();
+    let once = events
+        .once_emit(DIRECT_REENTRY, move |()| {
+            calls_for_listener.fetch_add(1, Ordering::SeqCst);
+            nested.emit(DIRECT_REENTRY, &()).unwrap();
+        })
+        .unwrap();
+
+    events.emit(DIRECT_REENTRY, &()).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(once.is_disposed());
+}
+
+#[test]
+fn public_context_reentry_fails_closed_after_its_context_drops() {
+    let events = {
+        let context = Context::new();
+        context.event_reentry().unwrap()
+    };
+    assert!(matches!(
+        events.on_emit(DIRECT_REENTRY, |()| {}),
+        Err(CordisError::FiberContextMismatch { .. })
+    ));
+    assert!(matches!(
+        events.emit(DIRECT_REENTRY, &()),
+        Err(CordisError::FiberContextMismatch { .. })
+    ));
+}
+
+#[test]
+fn borrowed_view_reentry_registers_into_next_snapshot_and_stays_owner_bound() {
+    let mut context = Context::new();
+    let fiber = context.new_fiber().unwrap();
+    let events = {
+        let view = context.with_fiber(&fiber).isolate("callback");
+        view.event_reentry().unwrap()
+    };
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let nested_handle = Arc::new(Mutex::new(None));
+    let order_for_outer = Arc::clone(&order);
+    let nested_handle_for_outer = Arc::clone(&nested_handle);
+    let nested_events = events.clone();
+    let once = events
+        .once_emit(VIEW_REENTRY, move |depth| {
+            order_for_outer.lock().unwrap().push(("outer", *depth));
+            let order_for_nested = Arc::clone(&order_for_outer);
+            let handle = nested_events
+                .on_emit(VIEW_REENTRY, move |nested_depth| {
+                    order_for_nested
+                        .lock()
+                        .unwrap()
+                        .push(("nested", *nested_depth));
+                })
+                .unwrap();
+            *nested_handle_for_outer.lock().unwrap() = Some(handle);
+            nested_events.emit(VIEW_REENTRY, &1).unwrap();
+        })
+        .unwrap();
+
+    events.emit(VIEW_REENTRY, &0).unwrap();
+    assert_eq!(*order.lock().unwrap(), [("outer", 0), ("nested", 1)]);
+    assert!(once.is_disposed());
+    let handle = nested_handle.lock().unwrap().clone().unwrap();
+    assert_eq!(handle.owner_uid(), fiber.uid());
+    assert_eq!(context.listener_count(VIEW_REENTRY), 1);
+
+    events.emit(VIEW_REENTRY, &2).unwrap();
+    assert_eq!(
+        *order.lock().unwrap(),
+        [("outer", 0), ("nested", 1), ("nested", 2)]
+    );
+
+    let mut foreign = Context::new();
+    let foreign_error = foreign
+        .with_fiber(&fiber)
+        .event_reentry()
+        .expect_err("a foreign Context must not mint an event capability");
+    assert_eq!(
+        foreign_error,
+        CordisError::FiberContextMismatch { uid: fiber.uid() }
+    );
+
+    assert!(context.dispose_fiber(&fiber).unwrap());
+    assert!(handle.is_disposed());
+    assert_eq!(context.listener_count(VIEW_REENTRY), 0);
+    assert_eq!(
+        events.on_emit(VIEW_REENTRY, |_| {}).unwrap_err(),
+        CordisError::FiberDisposed { uid: fiber.uid() }
+    );
+    assert_eq!(
+        events.emit(VIEW_REENTRY, &3).unwrap_err(),
+        CordisError::FiberDisposed { uid: fiber.uid() }
+    );
 }
 
 #[test]
