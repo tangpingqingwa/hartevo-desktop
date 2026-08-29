@@ -94,7 +94,9 @@
   },
   "admissionStatus": {
     "context": "Governance / PR admission",
-    "controllerJob": "Governance / Admission controller",
+    "controllerJob": "Governance / PR admission",
+    "gate": "required-check-and-commit-status",
+    "latestRunFence": "maximum-observed-target-run-id",
     "mutation": "exact-head-commit-status-only",
     "beforeExactReview": "pending",
     "validExactReview": "success",

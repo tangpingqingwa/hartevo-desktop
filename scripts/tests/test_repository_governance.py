@@ -99,7 +99,9 @@ class RepositoryGovernanceTests(unittest.TestCase):
             self.policy["admissionStatus"],
             {
                 "context": "Governance / PR admission",
-                "controllerJob": "Governance / Admission controller",
+                "controllerJob": "Governance / PR admission",
+                "gate": "required-check-and-commit-status",
+                "latestRunFence": "maximum-observed-target-run-id",
                 "mutation": "exact-head-commit-status-only",
                 "beforeExactReview": "pending",
                 "validExactReview": "success",
@@ -332,6 +334,41 @@ class RepositoryGovernanceTests(unittest.TestCase):
                 result = governance.classify_pr_event(ROOT, event_path, "pull_request")
             self.assertEqual(result["status"], "INVALID")
             self.assertEqual(result["commitStatus"], "failure")
+
+    def test_same_name_check_and_status_gate_fails_closed_on_status_api_failure(self) -> None:
+        # Production-equivalent regression: this SHA was READY, a review/body
+        # event invalidated it, and the new pending status write failed.  The
+        # old commit status is still green, but the required controller
+        # CheckRun is failed, so the same-name dual gate cannot merge.
+        self.assertEqual(governance.admission_merge_gate("failure", "success"), "BLOCKED")
+        self.assertEqual(governance.admission_merge_gate("success", "pending"), "BLOCKED")
+        self.assertEqual(governance.admission_merge_gate("success", "failure"), "BLOCKED")
+        self.assertEqual(governance.admission_merge_gate("success", "success"), "READY")
+
+    def test_older_ready_run_cannot_overwrite_newer_invalid_run(self) -> None:
+        context = "Governance / PR admission"
+        statuses = [
+            {
+                "context": context,
+                "state": "pending",
+                "target_url": "https://github.com/tangpingqingwa/hartevo-desktop/actions/runs/12",
+            },
+            {
+                "context": context,
+                "state": "success",
+                "target_url": "https://github.com/tangpingqingwa/hartevo-desktop/actions/runs/10",
+            },
+            {
+                "context": "PR / Scope plan",
+                "state": "success",
+                "target_url": "https://github.com/tangpingqingwa/hartevo-desktop/actions/runs/99",
+            },
+        ]
+        older = governance.admission_run_fence(statuses, context=context, run_id=10)
+        newer = governance.admission_run_fence(statuses, context=context, run_id=12)
+        self.assertFalse(older["current"])
+        self.assertEqual(older["maxObservedRunId"], 12)
+        self.assertTrue(newer["current"])
 
     def test_exact_path_lease_rejects_outside_change(self) -> None:
         value = self.admission()

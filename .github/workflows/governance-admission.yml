@@ -18,13 +18,12 @@ permissions:
 env:
   STATUS_CONTEXT: Governance / PR admission
 
-concurrency:
-  group: hartevo-governance-admission-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   admission:
-    name: Governance / Admission controller
+    # This CheckRun deliberately has the same name as the mutable commit
+    # status below. GitHub requires both to pass. Infrastructure/API failure
+    # therefore fails closed even if an older status on the SHA was green.
+    name: Governance / PR admission
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -32,7 +31,43 @@ jobs:
       pull-requests: read
       statuses: write
     steps:
+      - name: Fence stale exact-head controller run
+        id: initial-fence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" \
+            > "$RUNNER_TEMP/exact-head-statuses.json"
+          max_run_id="$(python3 - "$RUNNER_TEMP/exact-head-statuses.json" "$STATUS_CONTEXT" <<'PY'
+          import json
+          import re
+          import sys
+
+          statuses = json.load(open(sys.argv[1], encoding="utf-8"))
+          context = sys.argv[2]
+          run_ids = []
+          for status in statuses:
+              if status.get("context") != context:
+                  continue
+              match = re.search(r"/actions/runs/([0-9]+)(?:$|[/?#])", status.get("target_url") or "")
+              if match:
+                  run_ids.append(int(match.group(1)))
+          print(max(run_ids, default=0))
+          PY
+          )"
+          if [ "$max_run_id" -gt "$GITHUB_RUN_ID" ]; then
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Run $GITHUB_RUN_ID is stale; newer controller run $max_run_id owns this exact head."
+          else
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Mark exact head admission pending
+        if: steps.initial-fence.outputs.current == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -48,16 +83,19 @@ jobs:
             --data @"$RUNNER_TEMP/admission-status.json" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA"
       - name: Checkout trusted protected governance policy
+        if: steps.initial-fence.outputs.current == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.event.pull_request.base.sha }}
       - name: Fetch the exact untrusted head without checking it out
+        if: steps.initial-fence.outputs.current == 'true'
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: git fetch --no-tags --no-write-fetch-head origin "$HEAD_SHA"
       - name: Capture read-only exact-head GitHub review evidence
+        if: steps.initial-fence.outputs.current == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -69,6 +107,7 @@ jobs:
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews?per_page=100" \
             > "$RUNNER_TEMP/github-reviews.json"
       - name: Classify exact trusted-base admission
+        if: steps.initial-fence.outputs.current == 'true'
         id: classify
         run: |
           python3 scripts/repository_governance.py classify-pr-event \
@@ -84,7 +123,33 @@ jobs:
           esac
           printf 'status=%s\n' "$classification" >> "$GITHUB_OUTPUT"
           python3 -m json.tool "$RUNNER_TEMP/admission-classification.json"
+      - name: Recheck exact-head controller freshness
+        if: steps.initial-fence.outputs.current == 'true'
+        id: final-fence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses?per_page=100" \
+            > "$RUNNER_TEMP/exact-head-statuses.json"
+          python3 scripts/repository_governance.py admission-run-fence \
+            --statuses "$RUNNER_TEMP/exact-head-statuses.json" \
+            --context "$STATUS_CONTEXT" \
+            --run-id "$GITHUB_RUN_ID" \
+            > "$RUNNER_TEMP/admission-run-fence.json"
+          current="$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["current"]).lower())' "$RUNNER_TEMP/admission-run-fence.json")"
+          if [ "$current" != true ]; then
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Run $GITHUB_RUN_ID will not overwrite the newer exact-head controller."
+          else
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish exact head admission decision
+        if: steps.final-fence.outputs.current == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -118,4 +183,3 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             --data @"$RUNNER_TEMP/admission-status.json" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA"
-          test "$CLASSIFICATION" != INVALID

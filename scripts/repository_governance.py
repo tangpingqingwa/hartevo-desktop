@@ -44,9 +44,11 @@ REVIEW_SCHEMA = "hartevo-independent-review-receipt/v1"
 ADMISSION_SCHEMA = "hartevo-pr-admission/v1"
 GITHUB_REVIEW_SCHEMA = "hartevo-github-review/v1"
 ADMISSION_CLASSIFICATION_SCHEMA = "hartevo-pr-admission-classification/v1"
+ADMISSION_RUN_FENCE_SCHEMA = "hartevo-admission-run-fence/v1"
 ZERO_DIGEST = "0" * 64
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+ACTION_RUN_TARGET = re.compile(r"/actions/runs/([0-9]+)(?:$|[/?#])")
 ADMISSION_BLOCK = re.compile(r"<!--\s*hartevo-governance\s*(\{.*?\})\s*-->", re.DOTALL)
 GITHUB_REVIEW_BLOCK = re.compile(r"<!--\s*hartevo-github-review\s*(\{.*?\})\s*-->", re.DOTALL)
 REPOSITORY_LIFECYCLE_FIELDS = {
@@ -379,7 +381,9 @@ def verify_policy_value(policy: dict[str, object]) -> dict[str, object]:
     admission_status = policy.get("admissionStatus")
     if admission_status != {
         "context": "Governance / PR admission",
-        "controllerJob": "Governance / Admission controller",
+        "controllerJob": "Governance / PR admission",
+        "gate": "required-check-and-commit-status",
+        "latestRunFence": "maximum-observed-target-run-id",
         "mutation": "exact-head-commit-status-only",
         "beforeExactReview": "pending",
         "validExactReview": "success",
@@ -970,6 +974,39 @@ def classify_pr_event(
         "status": "READY",
         "commitStatus": "success",
         "admission": result,
+    }
+
+
+def admission_merge_gate(controller_check: object, commit_status: object) -> str:
+    """Model the same-name required CheckRun and commit-status merge gate."""
+
+    return "READY" if controller_check == "success" and commit_status == "success" else "BLOCKED"
+
+
+def admission_run_fence(statuses: object, *, context: str, run_id: int) -> dict[str, object]:
+    """Prevent an older same-head event from overwriting a newer decision."""
+
+    if not isinstance(statuses, list):
+        raise GovernanceError("exact-head commit statuses must be a list")
+    if not context or run_id <= 0:
+        raise GovernanceError("admission run fence requires a context and positive run id")
+    observed: list[int] = []
+    for status in statuses:
+        if not isinstance(status, dict):
+            raise GovernanceError("exact-head commit status entry must be an object")
+        if status.get("context") != context:
+            continue
+        target_url = status.get("target_url")
+        match = ACTION_RUN_TARGET.search(target_url) if isinstance(target_url, str) else None
+        if match:
+            observed.append(int(match.group(1)))
+    maximum = max(observed, default=0)
+    return {
+        "schema": ADMISSION_RUN_FENCE_SCHEMA,
+        "status": "PASS",
+        "current": maximum <= run_id,
+        "runId": run_id,
+        "maxObservedRunId": maximum,
     }
 
 
@@ -1754,6 +1791,8 @@ def verify_repository(root: Path) -> dict[str, object]:
         isinstance(event.get("payload"), dict)
         and event["payload"].get("ordinaryPreReview") == "pending"
         and event["payload"].get("requiredContext") == "Governance / PR admission"
+        and event["payload"].get("requiredCheckAndStatus") == "both"
+        and event["payload"].get("latestRunFence") == "maximum-observed-target-run-id"
         and event["payload"].get("statusMutation") == "exact-head-commit-status-only"
         and event["payload"].get("mainline") == "Cordis"
         and event["payload"].get("historicalPrWaves") == "frozen"
@@ -1971,6 +2010,11 @@ def main(argv: Iterable[str]) -> int:
             help="read-only GitHub API review JSON captured by trusted admission",
         )
 
+    run_fence_parser = subparsers.add_parser("admission-run-fence")
+    run_fence_parser.add_argument("--statuses", type=Path, required=True)
+    run_fence_parser.add_argument("--context", required=True)
+    run_fence_parser.add_argument("--run-id", type=int, required=True)
+
     append_parser = subparsers.add_parser("append-event")
     append_parser.add_argument("--ledger", type=Path, default=LEDGER_PATH)
     append_parser.add_argument("--event", type=Path, required=True)
@@ -2049,6 +2093,15 @@ def main(argv: Iterable[str]) -> int:
                     args.event_name,
                     trusted_base=args.trusted_base,
                     github_reviews=read_json(args.github_reviews) if args.github_reviews else None,
+                ),
+                None,
+            )
+        elif args.command == "admission-run-fence":
+            write_json(
+                admission_run_fence(
+                    read_json(args.statuses),
+                    context=args.context,
+                    run_id=args.run_id,
                 ),
                 None,
             )

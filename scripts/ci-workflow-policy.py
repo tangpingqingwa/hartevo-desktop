@@ -171,6 +171,10 @@ def validate_permissions(path: Path, text: str) -> None:
 
 
 def validate_concurrency(path: Path, text: str) -> None:
+    if path.name == "governance-admission.yml":
+        if re.search(r"^concurrency:\s*$", text, re.MULTILINE):
+            raise PolicyError(f"{path} must let every required admission CheckRun finish")
+        return
     if not re.search(r"^concurrency:\s*$", text, re.MULTILINE):
         raise PolicyError(f"{path} lacks workflow concurrency")
     if not re.search(r"^\s+group:\s*\S+", text, re.MULTILINE):
@@ -845,9 +849,12 @@ def validate_pr_secrets(path: Path, text: str) -> None:
             "pull_request_review:",
             "statuses: write",
             "Mark exact head admission pending",
-            "Governance / Admission controller",
+            "name: Governance / PR admission",
             "STATUS_CONTEXT: Governance / PR admission",
             "statuses/$HEAD_SHA",
+            "Fence stale exact-head controller run",
+            "Recheck exact-head controller freshness",
+            "admission-run-fence",
             "classify-pr-event",
             "Capture read-only exact-head GitHub review evidence",
             "pulls/$PR_NUMBER/reviews",
@@ -857,6 +864,10 @@ def validate_pr_secrets(path: Path, text: str) -> None:
             raise PolicyError(f"{path} is missing the non-executing trusted-base admission contract")
         if text.index("Mark exact head admission pending") > text.index("Checkout trusted protected governance policy"):
             raise PolicyError(f"{path} must publish pending before checkout or verification")
+        if "cancel-in-progress" in text:
+            raise PolicyError(f"{path} must not cancel same-head required controller CheckRuns")
+        if 'test "$CLASSIFICATION" != INVALID' in text:
+            raise PolicyError(f"{path} invalid facts must use the replaceable status, not a sticky failed CheckRun")
         write_permissions = set(re.findall(r"^\s+([a-z-]+):\s*write\s*$", text, re.MULTILINE))
         if write_permissions != {"statuses"}:
             raise PolicyError(f"{path} may write only exact-head commit statuses")
@@ -964,9 +975,13 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         required = (
             "pull_request_target:",
             "pull_request_review:",
-            "Governance / PR admission",
-            "Governance / Admission controller",
+            "name: Governance / PR admission",
             "Mark exact head admission pending",
+            "Fence stale exact-head controller run",
+            "Recheck exact-head controller freshness",
+            "commits/$HEAD_SHA/statuses?per_page=100",
+            "steps.final-fence.outputs.current == 'true'",
+            "repository_governance.py admission-run-fence",
             "WAITING_REVIEW",
             "statuses: write",
             "statuses/$HEAD_SHA",
@@ -1092,6 +1107,17 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted a PR workflow without cancellation")
+
+    validate_concurrency(Path("governance-admission.yml"), "name: trusted admission\n")
+    try:
+        validate_concurrency(
+            Path("governance-admission.yml"),
+            "concurrency:\n  group: admission\n  cancel-in-progress: false\n",
+        )
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted cancellation-prone admission concurrency")
 
     ci_fixture = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
     validate_required_workflow_contract(Path("ci.yml"), ci_fixture)

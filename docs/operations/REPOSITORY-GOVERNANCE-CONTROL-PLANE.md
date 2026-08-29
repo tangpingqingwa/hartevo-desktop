@@ -33,23 +33,28 @@ matrix runs through `workflow_dispatch` or the weekday schedule.
 
 `governance-admission.yml` runs from the protected base for both PR updates and
 `pull_request_review` events. It fetches the untrusted head as a Git object and
-never checks out or executes PR code with privileged authority. The workflow
-publishes pending before review to the exact-head commit status
-`Governance / PR admission`, and does so before checkout or verification. A
-valid ordinary PR therefore stays blocked without showing an expected red
-failure. A review is accepted only when its state is `COMMENTED` or
-`APPROVED`, its API commit ID equals the current head, its body is exactly one
-machine-readable marker with `APPROVE`, and its reviewer task ID differs from
-the admission owner. Acceptance updates the same status to success; invalid
-facts update it to failure. A later correction can update that same context,
-so Rust checks are not rerun merely to clear an old admission failure. Any code
-push changes the head and invalidates old records.
+never checks out or executes PR code with privileged authority. The workflow's
+required CheckRun and its replaceable exact-head commit status use the same
+name, `Governance / PR admission`; GitHub requires both to pass. The workflow
+publishes pending before review and before checkout. A valid ordinary PR
+therefore stays blocked without showing an expected red failure. A review is
+accepted only when its state is `COMMENTED` or `APPROVED`, its API commit ID
+equals the current head, its body is exactly one machine-readable marker with
+`APPROVE`, and its reviewer task ID differs from the admission owner.
+Acceptance updates the status to success; invalid facts update it to failure
+while the controller CheckRun succeeds. A later correction can replace that
+status, so Rust checks are not rerun merely to clear an old admission failure.
+Any code push changes the head and invalidates old records.
 
 The trusted token has `statuses: write` solely for this exact-head commit
-status. Contents and pull requests remain read-only. Because pending is posted
-first, checkout, review-API, verifier, or final-status failures leave the PR
-blocked. The protected ruleset still requires the same four contexts; neither
-approval count nor bypass policy changes.
+status. Contents and pull requests remain read-only. Checkout, review-API,
+verifier, or status-API failures fail the same-name required CheckRun, so an
+older green status cannot fail open. A maximum observed workflow-run-id fence,
+checked before pending and again before the final decision, prevents an older
+READY event from overwriting a newer WAITING or INVALID event on the same SHA.
+Same-head runs are not cancelled, avoiding cancelled required CheckRuns. The
+protected ruleset still requires the same four contexts; neither approval
+count nor bypass policy changes.
 
 ## High-risk changes
 

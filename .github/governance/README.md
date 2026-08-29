@@ -21,17 +21,20 @@ multi-PR integration, release, or an explicitly high-risk combination.
 
 The trusted `pull_request_target` admission workflow checks out only the
 protected base, fetches the event head as an object, and reads review records
-without executing PR code. It controls one exact-head commit status named
-`Governance / PR admission`: pending before review, success only after a valid
-exact-head review, and failure for invalid governance facts. The pending status
-is published before checkout, so a workflow or API failure remains blocked.
-Later events update the same context instead of leaving sticky failed required
-CheckRuns. The token may write statuses only; repository contents and pull
-requests remain read-only. A code push changes the exact head and therefore
-invalidates older GitHub review records. `requiredApprovingReviews` is zero on
-both protected branches because this repository has one GitHub collaborator;
-the admission verifier enforces task-independent exact-head review without a
-ruleset deadlock.
+without executing PR code. Its required CheckRun and replaceable exact-head
+commit status deliberately share the name `Governance / PR admission`; both
+must pass. The status is pending before review, success only after a valid
+exact-head review, and failure for invalid governance facts. Waiting and
+correctable invalid facts therefore do not create a sticky failed CheckRun,
+while a checkout, verifier, or status-API failure still fails the required
+CheckRun and cannot reuse an older green status. A maximum-run-id fence stops
+an older READY event from overwriting a newer WAITING or INVALID decision.
+The token may write statuses only; repository contents and pull requests remain
+read-only. A code push changes the exact head and therefore invalidates older
+GitHub review records. `requiredApprovingReviews` is zero on both protected
+branches because this repository has one GitHub collaborator; the admission
+verifier enforces task-independent exact-head review without a ruleset
+deadlock.
 
 ## High-risk governance
 
