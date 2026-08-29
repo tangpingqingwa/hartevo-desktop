@@ -654,6 +654,11 @@ fn self_disposal_and_teardown_attempts_leave_activation_reusable() {
             ctx.lock_event("post-dispose-lock", hartevo_cordis::DispatchMode::Emit)
                 .is_err()
         );
+        let root = ctx.root_fiber();
+        assert!(matches!(
+            ctx.dispose_fiber(&root),
+            Err(CordisError::FiberBusy { .. })
+        ));
         ctx.teardown();
         Ok::<(), CordisError>(())
     })
