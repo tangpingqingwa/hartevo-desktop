@@ -1,5 +1,7 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+pub mod connectors;
+
 mod observation_evidence_pack;
 mod plugin_invocation_timeline;
 mod runtime_text_subscription;

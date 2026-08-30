@@ -35,7 +35,10 @@ use crate::shopify_effect::{
 };
 
 pub const SHOPIFY_FULFILLMENT_EFFECT_OPERATION: &str = "fulfillmentCreate";
-pub const SHOPIFY_FULFILLMENT_RECONCILIATION_MAX_EXECUTE_ATTEMPTS: u32 = 2;
+/// The approved Effect owns exactly one Provider execution permit. A
+/// reconciliation observation can never create another permit, including when
+/// Shopify proves that the original call was not executed.
+pub const SHOPIFY_FULFILLMENT_RECONCILIATION_MAX_EXECUTE_ATTEMPTS: u32 = 1;
 
 /// A plugin revision is separate from the SDK credential and worker
 /// generations.  It binds the provider implementation that interpreted the
@@ -342,6 +345,7 @@ pub enum ShopifyFulfillmentReconciliationState {
     Prepared,
     InFlight,
     Uncertain,
+    NotExecuted,
     ReceiptObserved,
     Reconciled,
     Verified,
@@ -748,6 +752,16 @@ where
                 ShopifyFulfillmentReconciliationState::FailedClosed => {
                     return Err(ShopifyReceiptReadbackError::PreviouslyFailedClosed);
                 }
+                ShopifyFulfillmentReconciliationState::NotExecuted => {
+                    let evidence_digest = record
+                        .reconciliation
+                        .as_ref()
+                        .map(|reconciliation| reconciliation.provider_state_digest.clone())
+                        .ok_or(ShopifyReceiptReadbackError::MissingReconciliationEvidence)?;
+                    return Err(ShopifyReceiptReadbackError::NotExecutedTerminal {
+                        evidence_digest,
+                    });
+                }
                 ShopifyFulfillmentReconciliationState::Prepared => {
                     return self.execute_once(approved, now);
                 }
@@ -900,18 +914,18 @@ where
                 if prior_provider_receipt.is_some() {
                     return self.fail_closed(&key, ShopifyReceiptReadbackError::ReadbackMismatch);
                 }
-                let attempts = self
-                    .store
-                    .record(&key)
-                    .map_or(0, |record| record.execute_attempts);
-                if attempts < SHOPIFY_FULFILLMENT_RECONCILIATION_MAX_EXECUTE_ATTEMPTS {
-                    if let Some(record) = self.store.record_mut(&key) {
-                        record.state = ShopifyFulfillmentReconciliationState::Prepared;
-                    }
-                    self.execute_once(approved, now)
-                } else {
-                    Err(ShopifyReceiptReadbackError::ExecutionUncertain)
+                let evidence_digest = boundary_readback
+                    .reconciliation
+                    .provider_state_digest()
+                    .to_owned();
+                if let Some(record) = self.store.record_mut(&key) {
+                    record.reconciliation =
+                        Some(ShopifyReconciliationEvidenceSnapshot::from_observation(
+                            &boundary_readback.reconciliation,
+                        ));
+                    record.state = ShopifyFulfillmentReconciliationState::NotExecuted;
                 }
+                Err(ShopifyReceiptReadbackError::NotExecutedTerminal { evidence_digest })
             }
             ReconciliationStatus::ReceiptFound => {
                 self.finish_reconciliation(approved, &boundary_readback, now, replayed)
@@ -1351,6 +1365,10 @@ pub enum ShopifyReceiptReadbackError {
     ProviderRejected,
     #[error("Shopify provider operation remains uncertain; retry only by exact readback")]
     ExecutionUncertain,
+    #[error(
+        "Shopify reconciliation proved this approved Effect was not executed ({evidence_digest}); a new approval is required"
+    )]
+    NotExecutedTerminal { evidence_digest: String },
     #[error("Shopify provider readback is pending")]
     ReadbackPending,
     #[error("Shopify Verification evidence is pending")]

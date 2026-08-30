@@ -2157,6 +2157,8 @@ dependencies = [
  "hartevo-browser-adapter",
  "hartevo-catalog",
  "hartevo-cloud-storage",
+ "hartevo-commerce-connector",
+ "hartevo-connector-sdk",
  "hartevo-context-fabric",
  "hartevo-domain-kernel",
  "hartevo-effect-broker",

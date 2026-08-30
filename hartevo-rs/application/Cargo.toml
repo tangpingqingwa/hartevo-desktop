@@ -13,6 +13,8 @@ hartevo-catalog = { path = "../catalog" }
 hartevo-domain-kernel = { path = "../domain-kernel" }
 hartevo-context-fabric = { path = "../context-fabric" }
 hartevo-cloud-storage = { path = "../cloud-storage" }
+hartevo-commerce-connector = { path = "../commerce-connector" }
+hartevo-connector-sdk = { path = "../connector-sdk" }
 hartevo-effect-broker = { path = "../effect-broker" }
 hartevo-runtime-adapter = { path = "../runtime-adapter" }
 hartevo-storage = { path = "../storage" }
