@@ -10,11 +10,13 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use hartevo_commerce_connector::shopify::SHOPIFY_PROVIDER_ID;
-use hartevo_commerce_connector::shopify_effect::SHOPIFY_FULFILLMENT_CAPABILITY;
+pub use hartevo_commerce_connector::shopify::SHOPIFY_PROVIDER_ID;
+pub use hartevo_commerce_connector::shopify::ShopifyApiVersion;
+pub use hartevo_commerce_connector::shopify_effect::SHOPIFY_FULFILLMENT_CAPABILITY;
 pub use hartevo_commerce_connector::shopify_transport::{
-    ShopifyAdminReadbackTransport, ShopifyFulfillmentReadback, ShopifyFulfillmentReadbackRequest,
-    ShopifyNativeReadbackError, ShopifyReadbackCancellation, UreqShopifyAdminReadbackTransport,
+    ShopifyAdminReadbackTransport, ShopifyFulfillmentGid, ShopifyFulfillmentReadback,
+    ShopifyFulfillmentReadbackRequest, ShopifyFulfillmentStatus, ShopifyNativeReadbackError,
+    ShopifyReadbackCancellation, UreqShopifyAdminReadbackTransport,
 };
 use hartevo_connector_sdk::ProviderProvenanceClass;
 use hartevo_effect_broker::secret_broker::SECRET_BROKER_DISPATCH_LEASE_TTL_SECONDS;
@@ -367,6 +369,24 @@ pub struct ShopifyBrokeredReadback {
     credential_use: SecretUseReceipt,
 }
 
+/// Redacted metadata that may leave the Application/provider boundary. It is
+/// an observation only: no provider Receipt, Verification, or Mission result
+/// can be reconstructed from this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShopifyReadbackMetadata {
+    pub fulfillment_id: ShopifyFulfillmentGid,
+    pub status: ShopifyFulfillmentStatus,
+    pub api_version: ShopifyApiVersion,
+    pub request_id_digest: Option<String>,
+    pub evidence_digest: String,
+    pub credential_use_digest: String,
+    pub lease_reclaimed: bool,
+    pub provenance_class: ProviderProvenanceClass,
+}
+
+/// Naming alias for callers that describe the value as a projection.
+pub type ShopifyReadbackMetadataProjection = ShopifyReadbackMetadata;
+
 impl ShopifyBrokeredReadback {
     pub fn readback(&self) -> &ShopifyFulfillmentReadback {
         &self.readback
@@ -374,6 +394,21 @@ impl ShopifyBrokeredReadback {
 
     pub fn credential_use(&self) -> &SecretUseReceipt {
         &self.credential_use
+    }
+
+    /// Returns only typed provider metadata and content-free lease evidence.
+    /// The full brokered value remains below the Desktop projection boundary.
+    pub fn metadata(&self) -> ShopifyReadbackMetadata {
+        ShopifyReadbackMetadata {
+            fulfillment_id: self.readback.fulfillment_id().clone(),
+            status: self.readback.status().clone(),
+            api_version: self.readback.api_version().clone(),
+            request_id_digest: self.readback.request_id_digest().map(str::to_owned),
+            evidence_digest: self.readback.evidence_digest().to_owned(),
+            credential_use_digest: self.credential_use.use_digest().to_owned(),
+            lease_reclaimed: self.credential_use.lease_reclaimed(),
+            provenance_class: self.readback.provenance_class(),
+        }
     }
 }
 
@@ -535,6 +570,16 @@ mod tests {
             ProviderProvenanceClass::Fixture
         );
         assert!(outcome.credential_use().lease_reclaimed());
+        let metadata = outcome.metadata();
+        assert_eq!(
+            metadata.fulfillment_id.as_str(),
+            "gid://shopify/Fulfillment/3001"
+        );
+        assert_eq!(metadata.status.as_str(), "SUCCESS");
+        assert_eq!(metadata.provenance_class, ProviderProvenanceClass::Fixture);
+        assert!(metadata.lease_reclaimed);
+        assert_eq!(metadata.evidence_digest.len(), 64);
+        assert_eq!(metadata.credential_use_digest.len(), 64);
         assert_eq!(service.active_lease_count(), 0);
         let debug = format!("{provider:?} {outcome:?} {binding:?}");
         assert!(!debug.contains("shpat_test"));
