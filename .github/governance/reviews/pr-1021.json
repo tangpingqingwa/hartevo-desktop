@@ -1,0 +1,19 @@
+{
+  "authorTaskId": "cordis-g2-ci-scope-author-20260830",
+  "baseSha": "254245bb651daeb9f70b66dcb92254b68f3f7e0d",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    ".github/workflows/ci.yml",
+    "scripts/ci-result.py",
+    "scripts/ci-scope.py",
+    "scripts/ci-workflow-policy.py"
+  ],
+  "pr": 1021,
+  "receiptDigest": "baf178cc54abf5fb5a7ac2bb7e1a5cc38769b3a73fceb34153ef5993b8f76e2a",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-30T06:28:45Z",
+  "reviewedHeadSha": "ddead3b478c4cbe65f909cb7ea90b34f72de0bd6",
+  "reviewerTaskId": "g2-ci-scope-exact-review-ddead3b4-20260830",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

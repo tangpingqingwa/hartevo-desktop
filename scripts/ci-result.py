@@ -174,7 +174,14 @@ def run_aggregate(args: argparse.Namespace) -> int:
     names = parse_mapping(args.job_name, "--job-name")
     allowed = set(args.allow_skipped)
     planned_scopes = set(args.planned_scope)
-    supported_planned_scopes = {"rust", "macos", "common-rust", "desktop", "dependency"}
+    supported_planned_scopes = {
+        "rust",
+        "macos",
+        "common-rust",
+        "desktop",
+        "dependency",
+        "dependency-smoke",
+    }
     if planned_scopes - supported_planned_scopes:
         raise ValueError(f"unsupported planned scope: {sorted(planned_scopes - supported_planned_scopes)}")
     if set(results) != set(kinds):
@@ -234,16 +241,21 @@ def run_aggregate(args: argparse.Namespace) -> int:
         planned_evidence["common-rust"] = validate_planned_scope_markers(
             records, common_names, scope="common-rust"
         )
-    if "dependency" in planned_scopes:
-        dependency_names = {
-            "PR / Dependency only",
+    if "dependency" in planned_scopes or "dependency-smoke" in planned_scopes:
+        smoke_names = {
             "PR / Dependency Cordis smoke",
             "PR / Dependency desktop smoke",
         }
+        dependency_names = (
+            {"PR / Dependency audit"} | smoke_names
+            if "dependency" in planned_scopes
+            else smoke_names
+        )
         if not dependency_names.issubset(args.planned_job_name):
-            raise ValueError("planned dependency scope requires metadata and Cordis/desktop smoke names")
-        planned_evidence["dependency"] = validate_planned_scope_markers(
-            records, sorted(dependency_names), scope="dependency"
+            raise ValueError("planned dependency scope is missing an audit or smoke job name")
+        scope = "dependency" if "dependency" in planned_scopes else "dependency-smoke"
+        planned_evidence[scope] = validate_planned_scope_markers(
+            records, sorted(dependency_names), scope=scope
         )
     jobs = []
     planned_job_names = set(args.planned_job_name)
@@ -318,7 +330,7 @@ def self_test() -> None:
     macos_evidence = validate_planned_scope_markers(macos_records, macos_names, scope="macos")
     assert macos_evidence["status"] == "PASS" and macos_evidence["jobCount"] == 2
     dependency_names = [
-        "PR / Dependency only",
+        "PR / Dependency audit",
         "PR / Dependency Cordis smoke",
         "PR / Dependency desktop smoke",
     ]
@@ -339,6 +351,13 @@ def self_test() -> None:
         dependency_records, dependency_names, scope="dependency"
     )
     assert dependency_evidence["status"] == "PASS" and dependency_evidence["jobCount"] == 3
+    dependency_smoke_evidence = validate_planned_scope_markers(
+        dependency_records[1:], dependency_names[1:], scope="dependency-smoke"
+    )
+    assert (
+        dependency_smoke_evidence["status"] == "PASS"
+        and dependency_smoke_evidence["jobCount"] == 2
+    )
     try:
         validate_planned_scope_markers(
             marker_records[:-1]

@@ -923,7 +923,17 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "run_desktop: ${{ needs.scope.outputs.desktop == 'true' }}",
             "common_rust_packages",
             "desktop_packages",
+            "dependency_changed: ${{ steps.plan.outputs.dependency_changed }}",
             "dependency_only",
+            "--pr-number \"$PR_NUMBER\"",
+            "--parent-check-runs target/ci/parent-check-runs.json",
+            "checks: read",
+            "/commits/$parent_sha/check-runs?per_page=100",
+            "name: PR / Dependency audit",
+            "needs.scope.outputs.dependency_changed == 'true'",
+            "cargo metadata --format-version 1 --locked",
+            "cargo audit --json",
+            "--planned-scope dependency-smoke",
             "dependency-cordis-smoke",
             "dependency-desktop-smoke",
             "needs.scope.outputs.dependency_only != 'true' && 'ubuntu-24.04' || 'macos-15'",
@@ -1131,6 +1141,23 @@ def self_test() -> None:
 
     ci_fixture = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
     validate_required_workflow_contract(Path("ci.yml"), ci_fixture)
+    for missing_contract in (
+        '--pr-number "$PR_NUMBER"',
+        "--parent-check-runs target/ci/parent-check-runs.json",
+        "/commits/$parent_sha/check-runs?per_page=100",
+        "dependency_changed: ${{ steps.plan.outputs.dependency_changed }}",
+        "--planned-scope dependency-smoke",
+    ):
+        try:
+            validate_required_workflow_contract(
+                Path("ci.yml"), ci_fixture.replace(missing_contract, "", 1)
+            )
+        except PolicyError:
+            pass
+        else:
+            raise AssertionError(
+                f"self-test accepted a PR workflow without {missing_contract}"
+            )
     try:
         validate_required_workflow_contract(
             Path("ci.yml"), ci_fixture.replace("types: [opened, synchronize, reopened]", "types: [opened, synchronize, reopened, ready_for_review]")
