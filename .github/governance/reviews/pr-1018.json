@@ -1,0 +1,20 @@
+{
+  "authorTaskId": "cordis-n12b-secure-shopify-recovery-author-20260830",
+  "baseSha": "36618bf3e71a3cb1b2a5178cb9249bc90c72763b",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/application/src/connectors/mod.rs",
+    "hartevo-rs/application/src/connectors/shopify.rs",
+    "hartevo-rs/application/src/connectors/shopify_recovery.rs",
+    "hartevo-rs/storage/src/lib.rs",
+    "hartevo-rs/storage/src/provider_recovery_store.rs"
+  ],
+  "pr": 1018,
+  "receiptDigest": "f1c8a902a2cc14aab808deaca6a25532c4c76d4f2c8c4a8419ce3abb7f6df333",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-30T04:50:42Z",
+  "reviewedHeadSha": "8733c56a5f19be215174723e0714c02061210928",
+  "reviewerTaskId": "n12b-fast-exact-review-8733c56a5-20260830",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
