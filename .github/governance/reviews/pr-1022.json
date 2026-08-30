@@ -1,0 +1,24 @@
+{
+  "authorTaskId": "cordis-n12c-shopify-readback-author-20260830",
+  "baseSha": "8602f4bb1dea16a55230db44ecdf8f87cf802cc6",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "hartevo-rs/application/src/connectors/mod.rs",
+    "hartevo-rs/application/src/connectors/shopify_readback.rs",
+    "hartevo-rs/commerce-connector/Cargo.toml",
+    "hartevo-rs/commerce-connector/src/lib.rs",
+    "hartevo-rs/commerce-connector/src/shopify_transport.rs",
+    "hartevo-rs/desktop/src/lib.rs",
+    "hartevo-rs/desktop/src/shopify_readback.rs"
+  ],
+  "pr": 1022,
+  "receiptDigest": "dea70fb05bf4df83fd1be7aad8f4ddefaf03f04a335d1bd40eb184745587fec5",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-30T06:53:34Z",
+  "reviewedHeadSha": "5cdfd4fb98cbbada52106aa67119fe800edb5794",
+  "reviewerTaskId": "n12c-shopify-readback-exact-review-5cdfd4fb-20260830",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
