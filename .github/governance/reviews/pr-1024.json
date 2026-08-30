@@ -1,0 +1,18 @@
+{
+  "authorTaskId": "cordis-n13-shopify-readback-admission-20260830",
+  "baseSha": "000ebd92fad55c0a2fe13492de5a6fe7cfb1e0c0",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/application/src/connectors/shopify_readback.rs",
+    "hartevo-rs/desktop/src/data_plane.rs",
+    "hartevo-rs/desktop/src/shopify_readback.rs"
+  ],
+  "pr": 1024,
+  "receiptDigest": "d51449575441a16f90331947f6e1a8ecd92e935d1d66431bfe8addd65f3b108c",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-30T08:30:23Z",
+  "reviewedHeadSha": "4e36b6b8b60f9de8f66cb32214d7a7a1e52794cd",
+  "reviewerTaskId": "n13-shopify-readback-admission-exact-review-4e36b6b8-20260830",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
