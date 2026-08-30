@@ -14,7 +14,10 @@ use chrono::{DateTime, Duration, Utc};
 use hartevo_application::connectors::shopify_readback::{
     SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopifyFulfillmentReadbackRequest,
     ShopifyNativeReadbackError, ShopifyReadbackBridgeError, ShopifyReadbackCancellation,
-    ShopifyReadbackCredentialBinding, ShopifyReadbackMetadata,
+    ShopifyReadbackCredentialBinding, ShopifyReadbackIdentityMetadata, ShopifyReadbackMetadata,
+};
+use hartevo_application::connectors::shopify_recovery::{
+    ShopifyRecoveryCapsuleRef, ShopifyRecoveryError,
 };
 use hartevo_application::{
     AcceptWorkProduct, AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
@@ -92,6 +95,7 @@ use crate::runtime_plane::{
 };
 use crate::runtime_subscription::DesktopCatalogRuntimeDispatchAuthority;
 use crate::shopify_readback::{
+    dispatch_os_keyring_shopify_readback_identity_metadata,
     dispatch_os_keyring_shopify_readback_metadata, prepare_shopify_readback_broker,
 };
 
@@ -685,6 +689,29 @@ impl fmt::Debug for DesktopShopifyReadbackRequest {
 /// redacted metadata projection. It is not a Receipt, Verification, E4 fact,
 /// or Mission completion result.
 pub type DesktopShopifyReadbackProjection = ShopifyReadbackMetadata;
+
+/// Exact read-only identity admission for one N12B recovery capsule. The
+/// capsule reference is redacted at the Desktop boundary and is reopened only
+/// inside the existing Cordis reconciliation permit.
+#[derive(Clone)]
+pub struct DesktopShopifyReceiptIdentityRequest {
+    pub readback: DesktopShopifyReadbackRequest,
+    pub recovery: ShopifyRecoveryCapsuleRef,
+}
+
+impl fmt::Debug for DesktopShopifyReceiptIdentityRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopShopifyReceiptIdentityRequest")
+            .field("readback", &self.readback)
+            .field("recovery", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Stable, redacted identity observation only. This is not a Broker Receipt,
+/// Verification, E4 fact, or Mission completion result.
+pub type DesktopShopifyReceiptIdentityProjection = ShopifyReadbackIdentityMetadata;
 
 /// Read-only reconciliation projection. The Receipt was recovered/reused,
 /// never produced by a provider execution in this call, and remains distinct
@@ -2829,7 +2856,37 @@ impl DesktopDataPlane {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Reopens the exact encrypted N12B capsule inside the existing Cordis
+    /// permit, binds its approved order/fulfillment-order/line items to one
+    /// native readback, and returns observation metadata only.
+    pub fn dispatch_shopify_receipt_identity_os(
+        &self,
+        request: DesktopShopifyReceiptIdentityRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopShopifyReceiptIdentityProjection, DesktopShopifyReadbackError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)
+            .map_err(DesktopDataError::from)
+            .map_err(DesktopShopifyReadbackError::Desktop)?;
+        let DesktopShopifyReceiptIdentityRequest { readback, recovery } = request;
+        self.dispatch_shopify_readback_reconciliation_admission(
+            &secret_store,
+            readback,
+            Some(&recovery),
+            now,
+            |_, binding, readback, cancellation, consumer, service, at| {
+                dispatch_os_keyring_shopify_readback_identity_metadata(
+                    binding,
+                    readback,
+                    cancellation,
+                    consumer,
+                    service,
+                    at,
+                )
+                .map_err(DesktopShopifyReadbackError::Bridge)
+            },
+        )
+    }
+
     fn dispatch_shopify_readback_admission<S, Observe>(
         &self,
         secret_store: &S,
@@ -2850,6 +2907,36 @@ impl DesktopDataPlane {
         )
             -> Result<DesktopShopifyReadbackProjection, DesktopShopifyReadbackError>,
     {
+        self.dispatch_shopify_readback_reconciliation_admission(
+            secret_store,
+            request,
+            None,
+            now,
+            observe,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_shopify_readback_reconciliation_admission<S, Projection, Observe>(
+        &self,
+        secret_store: &S,
+        request: DesktopShopifyReadbackRequest,
+        recovery: Option<&ShopifyRecoveryCapsuleRef>,
+        now: DateTime<Utc>,
+        observe: Observe,
+    ) -> Result<Projection, DesktopShopifyReadbackError>
+    where
+        S: SecretStore,
+        Observe: FnOnce(
+            &S,
+            ShopifyReadbackCredentialBinding,
+            ShopifyFulfillmentReadbackRequest,
+            ShopifyReadbackCancellation,
+            &SecretBrokerConsumer,
+            &mut SecretBrokerService,
+            DateTime<Utc>,
+        ) -> Result<Projection, DesktopShopifyReadbackError>,
+    {
         let DesktopShopifyReadbackRequest {
             project_id,
             mission_id,
@@ -2861,6 +2948,11 @@ impl DesktopDataPlane {
             readback,
             cancellation,
         } = request;
+        let observation_authority_digest = recovery
+            .map(|reference| reference.readback_authority_digest(&readback))
+            .transpose()
+            .map_err(ShopifyReadbackBridgeError::Transport)
+            .map_err(DesktopShopifyReadbackError::Bridge)?;
         if expected_mission_revision == 0
             || effect_id.as_str().trim().is_empty()
             || !is_canonical_sha256(&expected_scope_digest)
@@ -2870,6 +2962,10 @@ impl DesktopDataPlane {
             || binding.scope().provider_id() != SHOPIFY_PROVIDER_ID
             || binding.scope().capability_id() != SHOPIFY_FULFILLMENT_CAPABILITY
             || binding.shop() != readback.shop()
+            || readback.expected_identity().is_some()
+            || recovery.is_some_and(|reference| {
+                reference.project_id != project_id || reference.effect_id != effect_id
+            })
         {
             return Err(DesktopShopifyReadbackError::InvalidRequest);
         }
@@ -2881,7 +2977,7 @@ impl DesktopDataPlane {
             ));
         }
 
-        let (service, _runtime_reconciliation, _context_session) =
+        let (mut service, _runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
         let mission = service.load_mission(&project_id, &mission_id)?;
         if mission.revision != expected_mission_revision {
@@ -2917,7 +3013,7 @@ impl DesktopDataPlane {
             || effect.capability != SHOPIFY_FULFILLMENT_CAPABILITY
             || effect.effect_class != EffectClass::ExternalWrite
             || effect.status != hartevo_domain_kernel::EffectStatus::VerificationRequired
-            || effect.target_resource != expected_target_resource
+            || (recovery.is_none() && effect.target_resource != expected_target_resource)
         {
             return Err(DesktopShopifyReadbackError::BindingMismatch);
         }
@@ -2947,11 +3043,19 @@ impl DesktopDataPlane {
         }
         let (consumer, mut broker_service) = prepare_shopify_readback_broker(&binding, now)
             .map_err(DesktopShopifyReadbackError::Bridge)?;
-        let reconciliation_binding = EffectReconciliationBinding::new(
-            effect_id.as_str(),
-            expected_scope_digest.clone(),
-            expected_broker_authorization_digest.clone(),
-        )
+        let reconciliation_binding = match observation_authority_digest.as_deref() {
+            Some(digest) => EffectReconciliationBinding::new_observation_bound(
+                effect_id.as_str(),
+                expected_scope_digest.clone(),
+                expected_broker_authorization_digest.clone(),
+                digest,
+            ),
+            None => EffectReconciliationBinding::new(
+                effect_id.as_str(),
+                expected_scope_digest.clone(),
+                expected_broker_authorization_digest.clone(),
+            ),
+        }
         .map_err(DesktopDataError::from)?;
         let (consent, record) = live_effect_consent_facts(&service, &effect, now)?;
         map_shopify_readback_dispatch_result(dispatch_live_effect_reconciliation(
@@ -2968,6 +3072,8 @@ impl DesktopDataPlane {
                     || permit.binding().approval_scope_digest() != expected_scope_digest.as_str()
                     || permit.binding().broker_authorization_digest()
                         != expected_broker_authorization_digest.as_str()
+                    || permit.binding().observation_authority_digest()
+                        != observation_authority_digest.as_deref()
                 {
                     return Err(CordisError::EffectReconciliationPermitMismatch.into());
                 }
@@ -2993,15 +3099,94 @@ impl DesktopDataPlane {
                         ),
                     ));
                 }
-                observe(
+                let selector_readback = readback.clone();
+                let bound_readback = if let Some(reference) = recovery {
+                    let reopened = service
+                        .reopen_shopify_reconciliation(&context_session, reference)
+                        .map_err(DesktopShopifyReadbackError::Recovery)?;
+                    if !reopened.matches_current_fence(
+                        &effect,
+                        expected_mission_revision,
+                        binding.credential_revision(),
+                    ) {
+                        return Err(DesktopShopifyReadbackError::BindingMismatch);
+                    }
+                    reopened
+                        .bind_exact_readback(
+                            &readback,
+                            observation_authority_digest
+                                .as_deref()
+                                .ok_or(DesktopShopifyReadbackError::BindingMismatch)?,
+                        )
+                        .map_err(ShopifyReadbackBridgeError::Transport)
+                        .map_err(DesktopShopifyReadbackError::Bridge)?
+                } else {
+                    readback
+                };
+                let projection = observe(
                     secret_store,
-                    binding,
-                    readback,
-                    cancellation,
+                    binding.clone(),
+                    bound_readback,
+                    cancellation.clone(),
                     &consumer,
                     &mut broker_service,
                     now,
-                )
+                )?;
+
+                if cancellation.is_cancelled() {
+                    return Err(DesktopShopifyReadbackError::Bridge(
+                        ShopifyReadbackBridgeError::Transport(
+                            ShopifyNativeReadbackError::CancelledAfterDispatch,
+                        ),
+                    ));
+                }
+                let current_mission = service.load_mission(&project_id, &mission_id)?;
+                let current_effect = current_mission
+                    .effect(&effect_id)
+                    .map_err(ApplicationError::from)?;
+                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+                if current_mission.revision != expected_mission_revision
+                    || current_effect != &effect
+                    || &current_scope != permit.scope()
+                {
+                    return Err(DesktopShopifyReadbackError::BindingMismatch);
+                }
+                let current_connection = service.load_connection(&project_id, &connection_id)?;
+                if current_connection.snapshot() != connection_snapshot
+                    || current_connection.revision() != binding.credential_revision()
+                    || !current_connection.permits_scopes(&effect.required_scopes, now)
+                    || current_connection.snapshot().expected_external_account_id
+                        != binding.shop().as_str()
+                    || current_connection
+                        .snapshot()
+                        .last_probe
+                        .as_ref()
+                        .is_none_or(|probe| {
+                            probe.observed_external_account_id != binding.shop().as_str()
+                        })
+                {
+                    return Err(DesktopShopifyReadbackError::BindingMismatch);
+                }
+                if let Some(reference) = recovery {
+                    let authority_digest = observation_authority_digest
+                        .as_deref()
+                        .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+                    let reopened = service
+                        .reopen_shopify_reconciliation(&context_session, reference)
+                        .map_err(DesktopShopifyReadbackError::Recovery)?;
+                    if !reopened.matches_current_fence(
+                        current_effect,
+                        expected_mission_revision,
+                        binding.credential_revision(),
+                    ) {
+                        return Err(DesktopShopifyReadbackError::BindingMismatch);
+                    }
+                    reopened
+                        .bind_exact_readback(&selector_readback, authority_digest)
+                        .map_err(ShopifyReadbackBridgeError::Transport)
+                        .map_err(DesktopShopifyReadbackError::Bridge)?;
+                }
+                Ok(projection)
             },
         ))
     }
@@ -5779,6 +5964,8 @@ pub enum DesktopShopifyReadbackError {
     #[error(transparent)]
     Bridge(#[from] ShopifyReadbackBridgeError),
     #[error(transparent)]
+    Recovery(#[from] ShopifyRecoveryError),
+    #[error(transparent)]
     Desktop(#[from] DesktopDataError),
     #[error("Cordis Shopify readback admission failed across phases: {0}")]
     Dispatch(#[source] Box<AuthorityDispatchError<DesktopShopifyReadbackError>>),
@@ -5928,10 +6115,16 @@ mod tests {
 
     use chrono::Duration;
     use hartevo_application::connectors::shopify_readback::{
-        SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopifyApiVersion,
-        ShopifyFulfillmentGid, ShopifyFulfillmentReadback, ShopifyFulfillmentReadbackRequest,
-        ShopifyReadbackBridgeError, ShopifyReadbackCancellation, ShopifyReadbackCredentialBinding,
+        SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopDomain, ShopifyApiVersion,
+        ShopifyFulfillmentGid, ShopifyFulfillmentOrderGid, ShopifyFulfillmentReadback,
+        ShopifyFulfillmentReadbackRequest, ShopifyOrderGid, ShopifyReadbackBridgeError,
+        ShopifyReadbackCancellation, ShopifyReadbackCredentialBinding,
         shopify_readback_adapter_identity, shopify_readback_registry,
+    };
+    use hartevo_application::connectors::shopify_recovery::{
+        ConnectorScope, DraftFulfillmentRequest, ShopifyApprovalRevision,
+        ShopifyEffectIdempotencyKey, ShopifyFulfillmentLineItem,
+        ShopifyFulfillmentOrderLineItemGid, ShopifyFulfillmentScope,
     };
     use hartevo_application::{
         AcceptCreatorTask, CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject,
@@ -5957,10 +6150,11 @@ mod tests {
         VerificationId, VerificationStatus, WorkProductId, WorkerLeaseStatus,
     };
     use hartevo_effect_broker::{
-        EffectBroker, EffectExecutor, EffectVerifier, ProviderAdapterIdentity, ProviderFailure,
-        SecretBrokerProvider, SecretProviderError, SecretUseHandle,
+        EffectBroker, EffectExecutor, EffectPermissionResolver, EffectVerifier,
+        ProviderAdapterIdentity, ProviderFailure, SecretBrokerProvider, SecretProviderError,
+        SecretUseHandle,
     };
-    use hartevo_storage::MemorySecretStore;
+    use hartevo_storage::{MemorySecretStore, ProviderRecoveryState};
     use rust_decimal::Decimal;
 
     use crate::runtime_subscription::{
@@ -6054,21 +6248,25 @@ mod tests {
         DesktopDataPlane::waiting_approval_broker()
     }
 
+    fn shopify_readback_policy() -> EffectPolicy {
+        EffectPolicy {
+            version: "policy-v1".into(),
+            allowed_capabilities: BTreeSet::from([SHOPIFY_FULFILLMENT_CAPABILITY.into()]),
+            allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
+            max_amounts_minor: BTreeMap::from([(CurrencyCode::parse("USD").expect("USD"), 0)]),
+            rate_limits: vec![EffectRateLimit {
+                rule_id: "desktop-shopify-readback-test".into(),
+                provider: SHOPIFY_PROVIDER_ID.into(),
+                capability: SHOPIFY_FULFILLMENT_CAPABILITY.into(),
+                max_executions: 1,
+                window_seconds: 60,
+            }],
+        }
+    }
+
     fn shopify_readback_broker() -> EffectBroker {
         EffectBroker::new(
-            EffectPolicy {
-                version: "policy-v1".into(),
-                allowed_capabilities: BTreeSet::from([SHOPIFY_FULFILLMENT_CAPABILITY.into()]),
-                allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
-                max_amounts_minor: BTreeMap::from([(CurrencyCode::parse("USD").expect("USD"), 0)]),
-                rate_limits: vec![EffectRateLimit {
-                    rule_id: "desktop-shopify-readback-test".into(),
-                    provider: SHOPIFY_PROVIDER_ID.into(),
-                    capability: SHOPIFY_FULFILLMENT_CAPABILITY.into(),
-                    max_executions: 1,
-                    window_seconds: 60,
-                }],
-            },
+            shopify_readback_policy(),
             "desktop-shopify-readback-test-worker",
         )
         .with_lease_for(Duration::days(36_500))
@@ -12060,23 +12258,49 @@ sleep 30"#;
         project_id: &ProjectId,
         now: DateTime<Utc>,
     ) -> DesktopShopifyReadbackRequest {
-        uncertain_shopify_readback_request_with_connection_shop(
+        uncertain_shopify_readback_fixture_with_connection_shop(
             plane,
             secrets,
             project_id,
             now,
             "n13.myshopify.com",
+            false,
         )
+        .0
+    }
+
+    fn uncertain_shopify_recovery_identity_request(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        now: DateTime<Utc>,
+    ) -> DesktopShopifyReceiptIdentityRequest {
+        let (readback, recovery) = uncertain_shopify_readback_fixture_with_connection_shop(
+            plane,
+            secrets,
+            project_id,
+            now,
+            "n13.myshopify.com",
+            true,
+        );
+        DesktopShopifyReceiptIdentityRequest {
+            readback,
+            recovery: recovery.expect("real N12B recovery capsule"),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
-    fn uncertain_shopify_readback_request_with_connection_shop(
+    fn uncertain_shopify_readback_fixture_with_connection_shop(
         plane: &DesktopDataPlane,
         secrets: &MemorySecretStore,
         project_id: &ProjectId,
         now: DateTime<Utc>,
         connection_shop: &str,
-    ) -> DesktopShopifyReadbackRequest {
+        prepare_recovery: bool,
+    ) -> (
+        DesktopShopifyReadbackRequest,
+        Option<ShopifyRecoveryCapsuleRef>,
+    ) {
         let started = plane
             .start_mission_with(
                 secrets,
@@ -12118,6 +12342,56 @@ sleep 30"#;
         let effect_id = EffectId::from_stable("desktop-shopify-readback-effect");
         let account_id = AccountId::from_stable("desktop-shopify-readback-account");
         let connection_id = ConnectionId::from_stable("desktop-shopify-readback-connection");
+        let required_scopes = BTreeSet::from([
+            "read_merchant_managed_fulfillment_orders".into(),
+            "write_merchant_managed_fulfillment_orders".into(),
+        ]);
+        let recovery_draft = prepare_recovery.then(|| {
+            DraftFulfillmentRequest::new(
+                "shopify-draft-fulfillment-desktop-recovery",
+                mission_id.as_str(),
+                ShopifyFulfillmentScope::new(
+                    ConnectorScope::new(
+                        tenant_id.as_str(),
+                        project_id.as_str(),
+                        SHOPIFY_PROVIDER_ID,
+                        account_id.as_str(),
+                        required_scopes.clone(),
+                    )
+                    .expect("Shopify connector scope"),
+                    ShopDomain::parse(connection_shop).expect("Shopify recovery shop"),
+                )
+                .expect("Shopify fulfillment scope"),
+                ShopifyApiVersion::latest(),
+                ShopifyOrderGid::parse("gid://shopify/Order/1001").expect("Order GID"),
+                ShopifyFulfillmentOrderGid::parse("gid://shopify/FulfillmentOrder/2001")
+                    .expect("FulfillmentOrder GID"),
+                vec![
+                    ShopifyFulfillmentLineItem::new(
+                        ShopifyFulfillmentOrderLineItemGid::parse(
+                            "gid://shopify/FulfillmentOrderLineItem/4001",
+                        )
+                        .expect("line item GID"),
+                        2,
+                    )
+                    .expect("line item"),
+                ],
+                5,
+                ShopifyApprovalRevision::new(2).expect("approval revision"),
+                ShopifyEffectIdempotencyKey::parse("shopify-effect-idem-desktop-recovery")
+                    .expect("idempotency key"),
+                now + Duration::seconds(2),
+                now + Duration::minutes(10) + Duration::seconds(2),
+            )
+            .expect("Shopify recovery draft")
+        });
+        let payload_digest = recovery_draft
+            .as_ref()
+            .map_or_else(|| "1".repeat(64), |draft| draft.request_digest().to_owned());
+        let idempotency_key = recovery_draft.as_ref().map_or_else(
+            || "desktop-shopify-readback-effect".to_owned(),
+            |draft| draft.idempotency_key().as_str().to_owned(),
+        );
         plane
             .propose_preview_effect_with(
                 secrets,
@@ -12132,14 +12406,15 @@ sleep 30"#;
                         provider: SHOPIFY_PROVIDER_ID.into(),
                         connection_id: Some(connection_id.clone()),
                         account_id: Some(account_id.clone()),
-                        required_scopes: BTreeSet::from([
-                            "read_merchant_managed_fulfillment_orders".into(),
-                            "write_merchant_managed_fulfillment_orders".into(),
-                        ]),
+                        required_scopes: required_scopes.clone(),
                         description: "Read one exact Shopify fulfillment state".into(),
-                        target_resource: "shopify://n13.myshopify.com/fulfillment/3001".into(),
+                        target_resource: if prepare_recovery {
+                            format!("shopify://{connection_shop}/fulfillment")
+                        } else {
+                            "shopify://n13.myshopify.com/fulfillment/3001".into()
+                        },
                         audience_digest: None,
-                        payload_digest: "1".repeat(64),
+                        payload_digest,
                         asset_digests: BTreeSet::new(),
                         scheduled_for: None,
                         timezone: "UTC".into(),
@@ -12148,8 +12423,12 @@ sleep 30"#;
                         consent_requirement: None,
                         policy_version: "policy-v1".into(),
                         amount: Money::zero(CurrencyCode::parse("USD").expect("USD")),
-                        idempotency_key: "desktop-shopify-readback-effect".into(),
-                        expires_in: Duration::hours(1),
+                        idempotency_key,
+                        expires_in: if prepare_recovery {
+                            Duration::minutes(10)
+                        } else {
+                            Duration::hours(1)
+                        },
                     },
                 },
                 now + Duration::seconds(2),
@@ -12158,10 +12437,7 @@ sleep 30"#;
         let (mut service, _) = plane
             .open_application_from_secret(&database_secret, now + Duration::seconds(3))
             .expect("application after Shopify proposal");
-        let granted_scopes = BTreeSet::from([
-            "read_merchant_managed_fulfillment_orders".into(),
-            "write_merchant_managed_fulfillment_orders".into(),
-        ]);
+        let granted_scopes = required_scopes;
         service
             .register_connection(
                 Connection::register(
@@ -12219,18 +12495,17 @@ sleep 30"#;
             )
             .expect("approved Shopify readback Effect");
         drop(service);
-        let (service, _) = plane
-            .open_application_from_secret(&database_secret, now + Duration::seconds(5))
-            .expect("application after Shopify approval");
+        let (mut service, _runtime, context_session) = plane
+            .open_ready_runtime_project(secrets, project_id, now + Duration::seconds(5))
+            .expect("ready application after Shopify approval");
         let approved = service
             .load_mission(project_id, &mission_id)
             .expect("approved Shopify Mission");
-        let approval = approved
+        let approved_effect = approved
             .effect(&effect_id)
             .expect("approved Shopify Effect")
-            .approval
-            .clone()
-            .expect("Shopify approval");
+            .clone();
+        let approval = approved_effect.approval.clone().expect("Shopify approval");
         let execution_request = DesktopApprovedEffectExecutionRequest {
             project_id: project_id.clone(),
             mission_id: mission_id.clone(),
@@ -12239,7 +12514,49 @@ sleep 30"#;
             expected_broker_authorization_digest: approval.permission_digest.clone(),
             expected_mission_revision: approved.revision,
         };
+        let prepared_capsule_ref = recovery_draft.map(|draft| {
+            service
+                .prepare_shopify_controlled_recovery_draft(
+                    &context_session,
+                    &approved_effect,
+                    draft,
+                    4,
+                    &shopify_readback_policy(),
+                    now + Duration::seconds(5),
+                )
+                .expect("prepare real encrypted N12B capsule")
+        });
         drop(service);
+
+        let claimed_capsule_ref = prepared_capsule_ref.map(|reference| {
+            let mut store = ProjectStore::open(&plane.database_path, &database_key)
+                .expect("project store for N12B claim");
+            let current_effect = store
+                .load_mission(project_id, &mission_id)
+                .expect("approved Mission before N12B claim")
+                .effect(&effect_id)
+                .expect("approved Effect before N12B claim")
+                .clone();
+            let permission = store
+                .authorize(&current_effect, now + Duration::seconds(5))
+                .expect("fresh N12B permission evidence");
+            let head = store
+                .load_provider_recovery(project_id, &effect_id)
+                .expect("prepared N12B head");
+            let claimed = store
+                .claim_provider_recovery_execution_authorized(
+                    project_id,
+                    &effect_id,
+                    head.revision,
+                    &head.binding.binding_digest,
+                    &current_effect,
+                    &permission,
+                    now + Duration::seconds(5),
+                )
+                .expect("durable N12B InFlight claim");
+            assert_eq!(reference.state, ProviderRecoveryState::Prepared);
+            ShopifyRecoveryCapsuleRef::from_head(&claimed)
+        });
 
         let mut broker = broker;
         let mut executor = DesktopPreviewExecutor {
@@ -12265,6 +12582,21 @@ sleep 30"#;
             )))
         ));
         assert_eq!((executor.calls, verifier.calls), (1, 0));
+
+        let uncertain_capsule_ref = claimed_capsule_ref.map(|reference| {
+            let mut store = ProjectStore::open(&plane.database_path, &database_key)
+                .expect("project store for N12B uncertain transition");
+            let uncertain = store
+                .mark_provider_recovery_uncertain(
+                    project_id,
+                    &effect_id,
+                    reference.head_revision,
+                    &reference.binding_digest,
+                    now + Duration::seconds(7),
+                )
+                .expect("durable N12B Uncertain transition");
+            ShopifyRecoveryCapsuleRef::from_head(&uncertain)
+        });
 
         let (service, _) = plane
             .open_application_from_secret(&database_secret, now + Duration::seconds(7))
@@ -12300,17 +12632,20 @@ sleep 30"#;
             ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").expect("GID"),
         )
         .expect("Shopify readback request");
-        DesktopShopifyReadbackRequest {
-            project_id: project_id.clone(),
-            mission_id,
-            effect_id,
-            expected_scope_digest: approval.scope_digest,
-            expected_broker_authorization_digest: approval.permission_digest,
-            expected_mission_revision: uncertain.revision,
-            binding,
-            readback,
-            cancellation: ShopifyReadbackCancellation::default(),
-        }
+        (
+            DesktopShopifyReadbackRequest {
+                project_id: project_id.clone(),
+                mission_id,
+                effect_id,
+                expected_scope_digest: approval.scope_digest,
+                expected_broker_authorization_digest: approval.permission_digest,
+                expected_mission_revision: uncertain.revision,
+                binding,
+                readback,
+                cancellation: ShopifyReadbackCancellation::default(),
+            },
+            uncertain_capsule_ref,
+        )
     }
 
     struct DesktopPreviewExecutor {
@@ -12401,6 +12736,57 @@ sleep 30"#;
         _now: DateTime<Utc>,
     ) -> Result<DesktopShopifyReadbackProjection, DesktopShopifyReadbackError> {
         panic!("Shopify provider callback must not be reached");
+    }
+
+    fn fixture_shopify_projection(
+        readback: &ShopifyFulfillmentReadbackRequest,
+    ) -> Result<DesktopShopifyReadbackProjection, DesktopShopifyReadbackError> {
+        let observed = ShopifyFulfillmentReadback::fixture(readback, "SUCCESS")
+            .map_err(ShopifyReadbackBridgeError::Transport)
+            .map_err(DesktopShopifyReadbackError::Bridge)?;
+        Ok(ShopifyReadbackMetadata {
+            fulfillment_id: observed.fulfillment_id().clone(),
+            status: observed.status().clone(),
+            api_version: observed.api_version().clone(),
+            request_id_digest: None,
+            evidence_digest: observed.evidence_digest().to_owned(),
+            credential_use_digest: "f".repeat(64),
+            lease_reclaimed: true,
+            provenance_class: observed.provenance_class(),
+        })
+    }
+
+    fn fixture_shopify_identity_projection(
+        readback: &ShopifyFulfillmentReadbackRequest,
+        at: DateTime<Utc>,
+    ) -> Result<DesktopShopifyReceiptIdentityProjection, DesktopShopifyReadbackError> {
+        let observed = ShopifyFulfillmentReadback::fixture_exact(
+            readback,
+            "SUCCESS",
+            at - Duration::seconds(1),
+            at,
+        )
+        .map_err(ShopifyReadbackBridgeError::Transport)
+        .map_err(DesktopShopifyReadbackError::Bridge)?;
+        let identity = observed
+            .receipt_identity()
+            .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+        Ok(ShopifyReadbackIdentityMetadata {
+            fulfillment_id: observed.fulfillment_id().clone(),
+            status: observed.status().clone(),
+            api_version: observed.api_version().clone(),
+            order_id: identity.order_id().clone(),
+            fulfillment_order_id: identity.fulfillment_order_id().clone(),
+            line_item_binding_digest: "a".repeat(64),
+            provider_created_at: identity.provider_created_at(),
+            provider_updated_at: identity.provider_updated_at(),
+            request_id_digest: None,
+            response_digest: identity.response_digest().to_owned(),
+            evidence_digest: observed.evidence_digest().to_owned(),
+            credential_use_digest: "f".repeat(64),
+            lease_reclaimed: true,
+            provenance_class: observed.provenance_class(),
+        })
     }
 
     #[derive(Debug)]
@@ -12585,6 +12971,234 @@ sleep 30"#;
     }
 
     #[test]
+    fn shopify_receipt_identity_requires_the_exact_recovery_head_before_observe() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(25);
+        let request = uncertain_shopify_readback_request(&plane, &secrets, &project_id, now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("uncertain Shopify Application");
+        let before = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("uncertain Shopify Mission");
+        let events_before = service
+            .mission_events(&request.project_id, &request.mission_id)
+            .expect("Mission events before identity rejection");
+        drop(service);
+
+        let missing = ShopifyRecoveryCapsuleRef {
+            project_id: request.project_id.clone(),
+            effect_id: request.effect_id.clone(),
+            binding_digest: "c".repeat(64),
+            storage_ref: "context-material://must-not-leave-application".into(),
+            content_digest: "d".repeat(64),
+            key_version: 1,
+            object_revision: 1,
+            head_revision: 2,
+            state: ProviderRecoveryState::InFlight,
+        };
+        let result: Result<DesktopShopifyReceiptIdentityProjection, _> = plane
+            .dispatch_shopify_readback_reconciliation_admission(
+                &secrets,
+                request.clone(),
+                Some(&missing),
+                now + Duration::seconds(9),
+                |_, _, _, _, _, _, _| panic!("provider callback must not be reached"),
+            );
+        assert!(matches!(
+            result,
+            Err(DesktopShopifyReadbackError::Recovery(
+                ShopifyRecoveryError::Storage(StorageError::ScopedRecordNotFound {
+                    kind: "provider recovery",
+                    ..
+                })
+            ))
+        ));
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(10))
+            .expect("reopen Shopify Application");
+        let after = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("Mission after identity rejection");
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(
+            service
+                .mission_events(&request.project_id, &request.mission_id)
+                .expect("Mission events after identity rejection"),
+            events_before
+        );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+        assert!(cordis.active_effect_execution_scope().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn n12b_capsule_crosses_n14_cordis_identity_admission_without_business_mutation() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(26);
+        let request =
+            uncertain_shopify_recovery_identity_request(&plane, &secrets, &project_id, now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let database_key =
+            DatabaseKey::from_secret(&database_secret).expect("database key for N14 oracle");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("Application before N14 readback");
+        let mission_before = service
+            .load_mission(&request.readback.project_id, &request.readback.mission_id)
+            .expect("Mission before N14 readback");
+        let events_before = service
+            .mission_events(&request.readback.project_id, &request.readback.mission_id)
+            .expect("Mission events before N14 readback");
+        assert_eq!(
+            mission_before
+                .effect(&request.readback.effect_id)
+                .expect("original recovery Effect")
+                .target_resource,
+            "shopify://n13.myshopify.com/fulfillment"
+        );
+        drop(service);
+        let head_before = ProjectStore::open(&plane.database_path, &database_key)
+            .expect("N14 store before")
+            .load_provider_recovery(&request.recovery.project_id, &request.recovery.effect_id)
+            .expect("real N12B head before N14");
+        assert_eq!(head_before.state, ProviderRecoveryState::Uncertain);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let projection = plane
+            .dispatch_shopify_readback_reconciliation_admission(
+                &secrets,
+                request.readback.clone(),
+                Some(&request.recovery),
+                now + Duration::seconds(9),
+                move |_, _, readback, _, _, _, at| {
+                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                    assert!(readback.expected_identity().is_some());
+                    fixture_shopify_identity_projection(&readback, at)
+                },
+            )
+            .expect("real N12B capsule crosses N14 Cordis admission");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(projection.order_id.as_str(), "gid://shopify/Order/1001");
+        assert_eq!(
+            projection.fulfillment_order_id.as_str(),
+            "gid://shopify/FulfillmentOrder/2001"
+        );
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(10))
+            .expect("Application after N14 readback");
+        let mission_after = service
+            .load_mission(&request.readback.project_id, &request.readback.mission_id)
+            .expect("Mission after N14 readback");
+        assert_eq!(mission_after, mission_before);
+        assert_eq!(
+            service
+                .mission_events(&request.readback.project_id, &request.readback.mission_id)
+                .expect("Mission events after N14 readback"),
+            events_before
+        );
+        drop(service);
+        let head_after = ProjectStore::open(&plane.database_path, &database_key)
+            .expect("N14 store after")
+            .load_provider_recovery(&request.recovery.project_id, &request.recovery.effect_id)
+            .expect("real N12B head after N14");
+        assert_eq!(head_after, head_before);
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+        assert!(cordis.active_effect_execution_scope().is_none());
+    }
+
+    #[test]
+    fn n14_discards_projection_when_recovery_turns_terminal_during_observe() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(27);
+        let request =
+            uncertain_shopify_recovery_identity_request(&plane, &secrets, &project_id, now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("Application before terminal race");
+        let mission_before = service
+            .load_mission(&request.readback.project_id, &request.readback.mission_id)
+            .expect("Mission before terminal race");
+        let events_before = service
+            .mission_events(&request.readback.project_id, &request.readback.mission_id)
+            .expect("events before terminal race");
+        drop(service);
+        let concurrent_recovery = request.recovery.clone();
+        let result = plane.dispatch_shopify_readback_reconciliation_admission(
+            &secrets,
+            request.readback.clone(),
+            Some(&request.recovery),
+            now + Duration::seconds(9),
+            |_, _, readback, _, _, _, at| {
+                let projection = fixture_shopify_identity_projection(&readback, at)?;
+                let database_key = DatabaseKey::from_secret(&database_secret)
+                    .expect("database key for terminal race");
+                let mut store = ProjectStore::open(&plane.database_path, &database_key)
+                    .expect("concurrent recovery store");
+                let digest = "e".repeat(64);
+                store
+                    .record_provider_recovery_not_executed(
+                        &concurrent_recovery.project_id,
+                        &concurrent_recovery.effect_id,
+                        concurrent_recovery.head_revision,
+                        &concurrent_recovery.binding_digest,
+                        format!("cas://{digest}"),
+                        digest,
+                        at + Duration::seconds(1),
+                    )
+                    .expect("concurrent terminal recovery transition");
+                Ok(projection)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DesktopShopifyReadbackError::Recovery(
+                ShopifyRecoveryError::ReconciliationOnly
+            ))
+        ));
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(11))
+            .expect("Application after terminal race");
+        assert_eq!(
+            service
+                .load_mission(&request.readback.project_id, &request.readback.mission_id)
+                .expect("Mission after terminal race"),
+            mission_before
+        );
+        assert_eq!(
+            service
+                .mission_events(&request.readback.project_id, &request.readback.mission_id)
+                .expect("events after terminal race"),
+            events_before
+        );
+        drop(service);
+        let database_key =
+            DatabaseKey::from_secret(&database_secret).expect("database key after terminal race");
+        let head = ProjectStore::open(&plane.database_path, &database_key)
+            .expect("store after terminal race")
+            .load_provider_recovery(&request.recovery.project_id, &request.recovery.effect_id)
+            .expect("terminal recovery head");
+        assert_eq!(head.state, ProviderRecoveryState::NotExecuted);
+        assert_eq!(head.revision, request.recovery.head_revision + 1);
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn shopify_readback_admission_rejects_stale_scope_and_cancel_before_observe() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -12755,13 +13369,15 @@ sleep 30"#;
     fn shopify_readback_admission_rejects_a_connection_for_another_shop() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let now = observed_at() + Duration::minutes(40);
-        let request = uncertain_shopify_readback_request_with_connection_shop(
+        let request = uncertain_shopify_readback_fixture_with_connection_shop(
             &plane,
             &secrets,
             &project_id,
             now,
             "other.myshopify.com",
-        );
+            false,
+        )
+        .0;
         assert!(matches!(
             plane.dispatch_shopify_readback_admission(
                 &secrets,
@@ -12800,6 +13416,121 @@ sleep 30"#;
         let cordis = plane.lock_cordis();
         assert!(cordis.active_effect_reconciliation_scope().is_none());
         assert!(cordis.active_effect_execution_scope().is_none());
+    }
+
+    #[test]
+    fn shopify_readback_discards_projection_when_cancelled_after_observe() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(51);
+        let request = uncertain_shopify_readback_request(&plane, &secrets, &project_id, now);
+        let cancellation = request.cancellation.clone();
+        let result = plane.dispatch_shopify_readback_admission(
+            &secrets,
+            request,
+            now + Duration::seconds(9),
+            move |_, _, readback, _, _, _, _| {
+                let projection = fixture_shopify_projection(&readback)?;
+                cancellation.cancel();
+                Ok(projection)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DesktopShopifyReadbackError::Bridge(
+                ShopifyReadbackBridgeError::Transport(
+                    ShopifyNativeReadbackError::CancelledAfterDispatch
+                )
+            ))
+        ));
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+    }
+
+    #[test]
+    fn shopify_readback_discards_projection_after_connection_rotation() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(52);
+        let request = uncertain_shopify_readback_request(&plane, &secrets, &project_id, now);
+        let mission_connection_id = {
+            let database_secret = secrets
+                .get(plane.database_key_reference())
+                .expect("database secret");
+            let (service, _) = plane
+                .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+                .expect("application before concurrent revocation");
+            service
+                .load_mission(&request.project_id, &request.mission_id)
+                .expect("Shopify Mission")
+                .effect(&request.effect_id)
+                .expect("Shopify Effect")
+                .connection_id
+                .clone()
+                .expect("Shopify Connection")
+        };
+        let result = plane.dispatch_shopify_readback_admission(
+            &secrets,
+            request,
+            now + Duration::seconds(9),
+            |_, _, readback, _, _, _, _| {
+                let database_secret = secrets
+                    .get(plane.database_key_reference())
+                    .expect("database secret");
+                let (mut service, _) = plane
+                    .open_application_from_secret(&database_secret, now + Duration::seconds(9))
+                    .expect("concurrent Application");
+                service
+                    .revoke_connection(
+                        &project_id,
+                        &mission_connection_id,
+                        now + Duration::seconds(10),
+                    )
+                    .expect("concurrent connection revocation");
+                fixture_shopify_projection(&readback)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DesktopShopifyReadbackError::BindingMismatch)
+        ));
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+    }
+
+    #[test]
+    fn shopify_readback_discards_projection_after_mission_revision_change() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(53);
+        let request = uncertain_shopify_readback_request(&plane, &secrets, &project_id, now);
+        let changed_project_id = request.project_id.clone();
+        let changed_mission_id = request.mission_id.clone();
+        let result = plane.dispatch_shopify_readback_admission(
+            &secrets,
+            request,
+            now + Duration::seconds(9),
+            |_, _, readback, _, _, _, _| {
+                let database_secret = secrets
+                    .get(plane.database_key_reference())
+                    .expect("database secret");
+                let database_key = DatabaseKey::from_secret(&database_secret)
+                    .expect("database key for concurrent Mission change");
+                let mut store = ProjectStore::open(&plane.database_path, &database_key)
+                    .expect("concurrent project store");
+                let mut mission = store
+                    .load_mission(&changed_project_id, &changed_mission_id)
+                    .expect("current Mission");
+                mission.revision = mission.revision.saturating_add(1);
+                store
+                    .save_mission(&mission)
+                    .expect("concurrent Mission revision change");
+                fixture_shopify_projection(&readback)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DesktopShopifyReadbackError::BindingMismatch)
+        ));
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
     }
 
     #[test]
@@ -12847,6 +13578,26 @@ sleep 30"#;
         assert!(!debug.contains("storage_reference"));
         assert!(!debug.contains("gid://shopify/Fulfillment/3001"));
         assert!(!debug.contains("n13.myshopify.com"));
+
+        let identity_request = DesktopShopifyReceiptIdentityRequest {
+            recovery: ShopifyRecoveryCapsuleRef {
+                project_id: request.project_id.clone(),
+                effect_id: request.effect_id.clone(),
+                binding_digest: "c".repeat(64),
+                storage_ref: "context-material://private-shopify-capsule".into(),
+                content_digest: "d".repeat(64),
+                key_version: 1,
+                object_revision: 1,
+                head_revision: 2,
+                state: ProviderRecoveryState::InFlight,
+            },
+            readback: request,
+        };
+        let identity_debug = format!("{identity_request:?}");
+        assert!(identity_debug.contains("[REDACTED]"));
+        assert!(!identity_debug.contains("private-shopify-capsule"));
+        assert!(!identity_debug.contains(&"c".repeat(64)));
+        assert!(!identity_debug.contains(&"d".repeat(64)));
     }
 
     #[test]
