@@ -342,6 +342,16 @@ pub enum CordisError {
     EffectExecutionSerialOverflow,
     #[error("Cordis Effect execution coordinator mutex is poisoned")]
     EffectExecutionCoordinatorPoisoned,
+    #[error("Cordis Effect reconciliation scope must not carry Runtime authority")]
+    EffectReconciliationRuntimeBound,
+    #[error("Cordis Effect reconciliation dispatch is already active")]
+    EffectReconciliationDispatchBusy,
+    #[error("Cordis Effect reconciliation permit does not match the active operation")]
+    EffectReconciliationPermitMismatch,
+    #[error("Cordis Effect reconciliation serial overflowed")]
+    EffectReconciliationSerialOverflow,
+    #[error("Cordis Effect reconciliation coordinator mutex is poisoned")]
+    EffectReconciliationCoordinatorPoisoned,
     #[error("service key `{key}` is reserved to its mounted authority owner")]
     ReservedServiceKey { key: String },
     #[error("surface `{key}` cannot be mounted by authority owner `{owner}`")]

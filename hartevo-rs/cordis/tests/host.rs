@@ -2,10 +2,11 @@ use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost, DomainCommandBinding,
     DomainCommandKind, DomainSurface, EffectBrokerSurface, EffectExecutionBinding,
-    EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate, KernelApproval, KernelApprovalDecision,
-    KernelConsentRecord, KernelConsentState, KernelConsentStatus, LoaderContext, OPENINTERPRETER,
-    OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding, RuntimeSurface, SurfaceOwner, ToolCall,
-    enforce_invariants, host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
+    EffectReconciliationBinding, EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate,
+    KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
+    KernelConsentStatus, LoaderContext, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId,
+    RuntimeBinding, RuntimeSurface, SurfaceOwner, ToolCall, enforce_invariants,
+    host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -72,6 +73,19 @@ fn effect_execution(
     authorization_byte: char,
 ) -> EffectExecutionBinding {
     EffectExecutionBinding::new(
+        effect,
+        scope_byte.to_string().repeat(64),
+        authorization_byte.to_string().repeat(64),
+    )
+    .unwrap()
+}
+
+fn effect_reconciliation(
+    effect: &str,
+    scope_byte: char,
+    authorization_byte: char,
+) -> EffectReconciliationBinding {
+    EffectReconciliationBinding::new(
         effect,
         scope_byte.to_string().repeat(64),
         authorization_byte.to_string().repeat(64),
@@ -156,6 +170,11 @@ fn domain_command_requires_and_preserves_exact_bound_scope() {
         CordisError::DomainCommandDispatchBusy
     );
     assert_eq!(
+        host.authorize_effect_reconciliation(&scope, effect_reconciliation("effect-a", 'a', 'b'),)
+            .unwrap_err(),
+        CordisError::DomainCommandDispatchBusy
+    );
+    assert_eq!(
         host.bind_domain_kernel_scope(
             scope.clone(),
             KernelConsentState::Missing,
@@ -192,6 +211,11 @@ fn domain_command_excludes_runtime_authority_and_runtime_bound_scopes() {
     let permit = host.authorize_runtime(&scope).unwrap();
     assert_eq!(
         host.authorize_domain_command(&scope, approval_command("effect-a", 'a'))
+            .unwrap_err(),
+        CordisError::RuntimeDispatchBusy
+    );
+    assert_eq!(
+        host.authorize_effect_reconciliation(&scope, effect_reconciliation("effect-a", 'a', 'b'),)
             .unwrap_err(),
         CordisError::RuntimeDispatchBusy
     );
@@ -290,6 +314,11 @@ fn effect_execution_requires_exact_approved_domain_scope() {
     );
     assert_eq!(
         host.authorize_domain_command(&scope, approval_command("effect-a", 'a'))
+            .unwrap_err(),
+        CordisError::EffectExecutionDispatchBusy
+    );
+    assert_eq!(
+        host.authorize_effect_reconciliation(&scope, effect_reconciliation("effect-a", 'a', 'b'),)
             .unwrap_err(),
         CordisError::EffectExecutionDispatchBusy
     );
@@ -411,6 +440,136 @@ fn effect_execution_binding_rejects_noncanonical_or_content_like_inputs() {
         EffectExecutionBinding::new("effect-a", "a".repeat(64), "provider-token").unwrap_err(),
         CordisError::InvalidAuthorityDigest {
             field: "effect_execution_broker_authorization_digest"
+        }
+    );
+}
+
+#[test]
+fn effect_reconciliation_is_exact_read_only_and_does_not_require_live_approval() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 7);
+    let binding = effect_reconciliation("effect-a", 'a', 'b');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::Missing,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+
+    let permit = host
+        .authorize_effect_reconciliation(&scope, binding.clone())
+        .unwrap();
+    assert_eq!(permit.scope(), &scope);
+    assert_eq!(permit.binding(), &binding);
+    assert_eq!(permit.binding().effect_id(), "effect-a");
+    assert_eq!(permit.binding().approval_scope_digest(), "a".repeat(64));
+    assert_eq!(
+        permit.binding().broker_authorization_digest(),
+        "b".repeat(64)
+    );
+    assert_eq!(host.active_effect_reconciliation_scope(), Some(&scope));
+    assert!(host.active_effect_execution_scope().is_none());
+    assert!(host.active_domain_command_scope().is_none());
+    assert!(host.active_runtime_scope().is_none());
+
+    host.finish_effect_reconciliation(permit).unwrap();
+    assert!(host.active_effect_reconciliation_scope().is_none());
+}
+
+#[test]
+fn effect_reconciliation_is_mutually_exclusive_drop_safe_and_teardown_revoked() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 7);
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::Confirmed,
+        None,
+        Some(live_approval()),
+        now(),
+    )
+    .unwrap();
+    let permit = host
+        .authorize_effect_reconciliation(&scope, effect_reconciliation("effect-a", 'a', 'b'))
+        .unwrap();
+    assert_eq!(
+        host.authorize_effect_execution(&scope, effect_execution("effect-a", 'a', 'b'))
+            .unwrap_err(),
+        CordisError::EffectReconciliationDispatchBusy
+    );
+    assert_eq!(
+        host.authorize_domain_command(&scope, approval_command("effect-a", 'a'))
+            .unwrap_err(),
+        CordisError::EffectReconciliationDispatchBusy
+    );
+    assert_eq!(
+        host.authorize_runtime(&scope).unwrap_err(),
+        CordisError::EffectReconciliationDispatchBusy
+    );
+    drop(permit);
+    assert!(host.active_effect_reconciliation_scope().is_none());
+
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::Missing,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let permit = host
+        .authorize_effect_reconciliation(&scope, effect_reconciliation("effect-a", 'a', 'b'))
+        .unwrap();
+    host.teardown();
+    assert!(host.active_effect_reconciliation_scope().is_none());
+    assert_eq!(
+        host.finish_effect_reconciliation(permit).unwrap_err(),
+        CordisError::EffectReconciliationPermitMismatch
+    );
+
+    let runtime = runtime_scope("project-a", "mission-a", 8, 2, 'c');
+    let mut runtime_host = CordisHost::boot(false).unwrap();
+    runtime_host
+        .bind_domain_kernel_scope(
+            runtime.clone(),
+            KernelConsentState::Missing,
+            None,
+            None,
+            now(),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime_host
+            .authorize_effect_reconciliation(&runtime, effect_reconciliation("effect-a", 'a', 'b'),)
+            .unwrap_err(),
+        CordisError::EffectReconciliationRuntimeBound
+    );
+}
+
+#[test]
+fn effect_reconciliation_binding_is_distinct_redacted_and_canonical() {
+    let binding = effect_reconciliation("effect-a", 'a', 'b');
+    let debug = format!("{binding:?}");
+    assert!(debug.contains("effect-a"));
+    assert!(!debug.contains(&"a".repeat(64)));
+    assert!(!debug.contains(&"b".repeat(64)));
+    assert_eq!(
+        EffectReconciliationBinding::new(" effect-a", "a".repeat(64), "b".repeat(64)).unwrap_err(),
+        CordisError::InvalidAuthorityScope {
+            field: "effect_reconciliation_effect_id"
+        }
+    );
+    assert_eq!(
+        EffectReconciliationBinding::new("effect-a", "A".repeat(64), "b".repeat(64)).unwrap_err(),
+        CordisError::InvalidAuthorityDigest {
+            field: "effect_reconciliation_approval_scope_digest"
+        }
+    );
+    assert_eq!(
+        EffectReconciliationBinding::new("effect-a", "a".repeat(64), "provider-token").unwrap_err(),
+        CordisError::InvalidAuthorityDigest {
+            field: "effect_reconciliation_broker_authorization_digest"
         }
     );
 }

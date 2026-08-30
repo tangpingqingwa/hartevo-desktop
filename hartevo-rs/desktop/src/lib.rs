@@ -404,6 +404,7 @@ impl UiFailure {
             | DesktopDataError::InvalidEffectProposal
             | DesktopDataError::InvalidWaitingApprovalGrant
             | DesktopDataError::InvalidApprovedEffectExecution
+            | DesktopDataError::InvalidEffectReconciliation
             | DesktopDataError::InvalidBrowserWorkspaceContinue
             | DesktopDataError::InvalidCreatorDeliverableReview => Self::coded(
                 "WAITING_USER",
@@ -491,6 +492,8 @@ impl UiFailure {
                 | ApplicationError::ProposedEffectApprovalDigestMismatch
                 | ApplicationError::EffectExecutionCommandMismatch
                 | ApplicationError::EffectExecutionAuthorityMismatch
+                | ApplicationError::EffectReconciliationCommandMismatch
+                | ApplicationError::EffectReconciliationAuthorityMismatch
                 | ApplicationError::CreatorDeliverableReviewCommandMismatch
                 | ApplicationError::CreatorDeliverableReviewUnavailable
                 | ApplicationError::CreatorTaskRevisionMismatch { .. }

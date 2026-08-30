@@ -591,6 +591,23 @@ pub struct ExecuteApprovedEffect {
     pub expected_mission_revision: u64,
 }
 
+/// Exact CAS and original-approval fence for one read-only reconciliation of
+/// an already-uncertain Effect.
+///
+/// This command is deliberately separate from [`ExecuteApprovedEffect`]. It
+/// carries no executor or provider-write capability and remains valid after
+/// the original Approval window closes, provided the durable Effect is still
+/// in its reconciliation-required state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconcileUncertainEffect {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_broker_authorization_digest: String,
+    pub expected_mission_revision: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingEffectApprovalProjection {
@@ -13322,7 +13339,73 @@ impl ApplicationService {
         verifier: &mut impl EffectVerifier,
         now: DateTime<Utc>,
     ) -> Result<(Mission, BrokerResult), ApplicationError> {
-        let mut mission = self.store.load_mission(project_id, mission_id)?;
+        let mission = self.store.load_mission(project_id, mission_id)?;
+        self.reconcile_loaded_effect(broker, mission, effect_id, reconciler, verifier, now)
+    }
+
+    /// Reconcile one exact durable uncertain Effect after re-reading its
+    /// Mission revision and original Approval/Broker authorization.
+    ///
+    /// The method accepts no executor and enters only the Broker's existing
+    /// read-reconciliation path. A stale or swapped command fails before the
+    /// reconciler or verifier can be called.
+    pub fn reconcile_uncertain_effect_at_revision(
+        &mut self,
+        broker: &mut EffectBroker,
+        command: &ReconcileUncertainEffect,
+        reconciler: &mut impl EffectReconciler,
+        verifier: &mut impl EffectVerifier,
+        now: DateTime<Utc>,
+    ) -> Result<(Mission, BrokerResult), ApplicationError> {
+        if command.expected_mission_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || !is_canonical_sha256_text(&command.expected_scope_digest)
+            || !is_canonical_sha256_text(&command.expected_broker_authorization_digest)
+        {
+            return Err(ApplicationError::EffectReconciliationCommandMismatch);
+        }
+        let mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        let effect = mission.effect(&command.effect_id)?;
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ApplicationError::EffectReconciliationAuthorityMismatch)?;
+        if effect.status != EffectStatus::VerificationRequired
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || approval.scope_digest != command.expected_scope_digest
+            || approval.permission_digest != command.expected_broker_authorization_digest
+        {
+            return Err(ApplicationError::EffectReconciliationAuthorityMismatch);
+        }
+        self.reconcile_loaded_effect(
+            broker,
+            mission,
+            &command.effect_id,
+            reconciler,
+            verifier,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_loaded_effect(
+        &mut self,
+        broker: &mut EffectBroker,
+        mut mission: Mission,
+        effect_id: &EffectId,
+        reconciler: &mut impl EffectReconciler,
+        verifier: &mut impl EffectVerifier,
+        now: DateTime<Utc>,
+    ) -> Result<(Mission, BrokerResult), ApplicationError> {
         let mission_before = mission.clone();
         let expected_revision = mission.revision;
         let conversation_guard = mission.effect(effect_id)?.conversation_guard.clone();
@@ -19498,6 +19581,13 @@ fn is_sha256_text(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn is_canonical_sha256_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn validate_key_reference(
     tenant_id: &TenantId,
     project_id: &ProjectId,
@@ -22675,6 +22765,14 @@ pub enum ApplicationError {
         "the approved Effect or its Broker authorization no longer matches the execution command"
     )]
     EffectExecutionAuthorityMismatch,
+    #[error(
+        "Effect reconciliation requires an exact uncertain Effect digest, Broker authorization digest, and Mission CAS revision"
+    )]
+    EffectReconciliationCommandMismatch,
+    #[error(
+        "the uncertain Effect or its original Broker authorization no longer matches the reconciliation command"
+    )]
+    EffectReconciliationAuthorityMismatch,
     #[error("preview Effect id already exists in this Mission: {0}")]
     DuplicatePreviewEffectId(EffectId),
     #[error(
@@ -32193,6 +32291,146 @@ sleep 30"#
         ));
         assert_eq!(executor.calls, 1);
         fixture
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exact_uncertain_effect_reconciliation_rejects_stale_or_swapped_before_observer() {
+        let mut fixture = uncertain_preview_fixture("cordis-exact-reconciliation");
+        let uncertain = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("uncertain Mission");
+        let effect = uncertain
+            .effect(&fixture.effect_id)
+            .expect("uncertain Effect")
+            .clone();
+        let approval = effect.approval.as_ref().expect("original Approval");
+        let command = ReconcileUncertainEffect {
+            project_id: fixture.project_id.clone(),
+            mission_id: fixture.mission_id.clone(),
+            effect_id: fixture.effect_id.clone(),
+            expected_scope_digest: approval.scope_digest.clone(),
+            expected_broker_authorization_digest: approval.permission_digest.clone(),
+            expected_mission_revision: uncertain.revision,
+        };
+        let events_before = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("uncertain events");
+        let receipt = Receipt {
+            id: ReceiptId::from("exact-reconciliation-receipt"),
+            provider: effect.provider.clone(),
+            external_id: "exact-reconciliation-external".into(),
+            accepted_at: now() + Duration::seconds(3),
+            request_digest: effect.approval_digest(),
+            response_digest: "7".repeat(64),
+        };
+        let mut reconciler = RelationshipReconciler {
+            calls: 0,
+            receipt,
+            observed_at: now() + Duration::seconds(4),
+        };
+        let mut verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: now() + Duration::seconds(5),
+        };
+
+        let mut malformed = command.clone();
+        malformed.expected_scope_digest = "A".repeat(64);
+        assert!(matches!(
+            fixture.service.reconcile_uncertain_effect_at_revision(
+                &mut fixture.broker,
+                &malformed,
+                &mut reconciler,
+                &mut verifier,
+                now() + Duration::seconds(4),
+            ),
+            Err(ApplicationError::EffectReconciliationCommandMismatch)
+        ));
+        let mut stale = command.clone();
+        stale.expected_mission_revision = stale.expected_mission_revision.saturating_add(1);
+        assert!(matches!(
+            fixture.service.reconcile_uncertain_effect_at_revision(
+                &mut fixture.broker,
+                &stale,
+                &mut reconciler,
+                &mut verifier,
+                now() + Duration::seconds(4),
+            ),
+            Err(ApplicationError::MissionRevisionMismatch { .. })
+        ));
+        let mut swapped_scope = command.clone();
+        swapped_scope.expected_scope_digest = "a".repeat(64);
+        if swapped_scope.expected_scope_digest == command.expected_scope_digest {
+            swapped_scope.expected_scope_digest = "b".repeat(64);
+        }
+        assert!(matches!(
+            fixture.service.reconcile_uncertain_effect_at_revision(
+                &mut fixture.broker,
+                &swapped_scope,
+                &mut reconciler,
+                &mut verifier,
+                now() + Duration::seconds(4),
+            ),
+            Err(ApplicationError::EffectReconciliationAuthorityMismatch)
+        ));
+        let mut swapped_authorization = command.clone();
+        swapped_authorization.expected_broker_authorization_digest = "c".repeat(64);
+        assert!(matches!(
+            fixture.service.reconcile_uncertain_effect_at_revision(
+                &mut fixture.broker,
+                &swapped_authorization,
+                &mut reconciler,
+                &mut verifier,
+                now() + Duration::seconds(4),
+            ),
+            Err(ApplicationError::EffectReconciliationAuthorityMismatch)
+        ));
+        assert_eq!((reconciler.calls, verifier.calls), (0, 0));
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("unchanged uncertain Mission"),
+            uncertain
+        );
+        assert_eq!(
+            fixture
+                .service
+                .mission_events(&fixture.project_id, &fixture.mission_id)
+                .expect("unchanged events"),
+            events_before
+        );
+
+        let (mission, result) = fixture
+            .service
+            .reconcile_uncertain_effect_at_revision(
+                &mut fixture.broker,
+                &command,
+                &mut reconciler,
+                &mut verifier,
+                now() + Duration::seconds(4),
+            )
+            .expect("exact read reconciliation");
+        assert_eq!((reconciler.calls, verifier.calls), (1, 1));
+        assert_eq!(
+            mission.effect(&fixture.effect_id).unwrap().status,
+            EffectStatus::Verified
+        );
+        assert_ne!(result.receipt.id.as_str(), result.verification.id.as_str());
+        assert!(result.verification.independent);
+        let events = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("reconciliation events");
+        let receipt_event = events
+            .iter()
+            .find(|event| event.event_type == "effect.reconciliation_receipt_found")
+            .expect("receipt reconciliation event");
+        assert_eq!(receipt_event.payload["readOnlyReconciliation"], true);
+        assert_eq!(receipt_event.payload["providerExecutionReplayed"], false);
     }
 
     struct ConversationRecoveryIds {

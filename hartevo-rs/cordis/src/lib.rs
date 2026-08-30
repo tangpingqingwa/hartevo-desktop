@@ -33,7 +33,8 @@ pub use agent::{AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, run_agen
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
     DomainCommandBinding, DomainCommandKind, DomainCommandPermit, EffectExecutionAuthority,
-    EffectExecutionBinding, EffectExecutionPermit, RuntimeAuthority, RuntimeBinding,
+    EffectExecutionBinding, EffectExecutionPermit, EffectReconciliationAuthority,
+    EffectReconciliationBinding, EffectReconciliationPermit, RuntimeAuthority, RuntimeBinding,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
 };
 pub use config::{ConfigValue, InterpolateError};
