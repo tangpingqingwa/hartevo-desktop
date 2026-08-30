@@ -3,10 +3,10 @@
 
 The desktop crate is intentionally a macOS-only lane.  Common Rust crates
 (including Cordis) run on Ubuntu, while a desktop-only change never silently
-falls into an Ubuntu desktop test.  A lock/dependency-only change gets the
-locked metadata/audit/SBOM lane and a narrowly scoped smoke lane.  Unknown or
-missing scope remains fail-closed through explicit planned skips rather than a
-false claim of full workspace coverage.
+falls into an Ubuntu desktop test.  Every dependency input change gets the
+locked metadata/audit/SBOM lane; dependency-only changes additionally get two
+narrow smoke lanes.  Unknown or missing scope remains fail-closed through
+explicit planned skips rather than a false claim of full workspace coverage.
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ DEPENDENCY_PATHS = {
     ".cargo/config",
 }
 DEPENDENCY_SUFFIXES = ("/Cargo.toml", "/Cargo.lock")
+REVIEW_DIRECTORY = Path(".github/governance/reviews")
 
 
 def changed_files(base: str, head: str, repo: Path) -> list[str]:
@@ -66,6 +67,94 @@ def changed_files(base: str, head: str, repo: Path) -> list[str]:
         message = process.stderr.strip() or "git diff failed"
         raise RuntimeError(message)
     return sorted(path for path in process.stdout.splitlines() if path)
+
+
+def git_lines(repo: Path, *args: str) -> list[str]:
+    process = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if process.returncode != 0:
+        message = process.stderr.strip() or f"git {' '.join(args)} failed"
+        raise RuntimeError(message)
+    return [line for line in process.stdout.splitlines() if line]
+
+
+def receipt_candidate_parent(
+    pr_number: int,
+    parents: Sequence[str],
+    parent_delta: Sequence[str],
+) -> str | None:
+    """Return the reviewed parent for an exact receipt-only child.
+
+    Mentioning the current PR's receipt path opts into the high-risk receipt
+    contract.  A mixed or merge commit is therefore an error, not an
+    opportunity to hide product changes behind a narrow CI comparison.
+    """
+    expected = (REVIEW_DIRECTORY / f"pr-{pr_number}.json").as_posix()
+    if expected not in parent_delta:
+        return None
+    if len(parents) != 2:
+        raise RuntimeError("review receipt candidate must be a single-parent commit")
+    if list(parent_delta) != [expected]:
+        raise RuntimeError("review receipt candidate must change only its exact receipt path")
+    return parents[1]
+
+
+def resolve_scope_base(base: str, head: str, repo: Path, pr_number: int | None) -> tuple[str, bool]:
+    """Narrow only a repository-verified high-risk receipt child to its parent."""
+    if pr_number is None:
+        return base, False
+    parents = git_lines(repo, "rev-list", "--parents", "-n", "1", head)
+    if len(parents) != 1:
+        raise RuntimeError("unable to resolve exact head parents")
+    parent_tokens = parents[0].split()
+    if len(parent_tokens) < 2:
+        return base, False
+    parent = parent_tokens[1]
+    parent_delta = sorted(git_lines(repo, "diff", "--name-only", parent, head, "--"))
+    reviewed_parent = receipt_candidate_parent(pr_number, parent_tokens, parent_delta)
+    if reviewed_parent is None:
+        return base, False
+    verifier = repo / "scripts/repository_governance.py"
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(verifier),
+            "verify-review-receipt",
+            "--root",
+            str(repo),
+            "--pr",
+            str(pr_number),
+            "--base",
+            base,
+            "--head",
+            head,
+        ],
+        cwd=repo,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if process.returncode != 0:
+        message = process.stderr.strip() or "review receipt verification failed"
+        raise RuntimeError(message)
+    try:
+        verification = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("review receipt verifier returned invalid JSON") from error
+    if (
+        not isinstance(verification, dict)
+        or verification.get("status") != "PASS"
+        or verification.get("reviewedHeadSha") != reviewed_parent
+    ):
+        raise RuntimeError("review receipt verifier did not bind the exact reviewed parent")
+    return reviewed_parent, True
 
 
 def is_schema_path(path: str) -> bool:
@@ -101,6 +190,7 @@ def empty_plan(files: Sequence[str], *, reason: str) -> dict[str, object]:
         "commonRustPackages": [],
         "desktopPackages": [],
         "packages": [],
+        "dependencyChanged": any(is_dependency_path(path) for path in files),
         "dependencyOnly": False,
         "catalog": False,
         "evidence": False,
@@ -122,6 +212,7 @@ def plan_for_files(files: Sequence[str]) -> dict[str, object]:
             "commonRustPackages": list(COMMON_RUST_PACKAGES),
             "desktopPackages": list(DESKTOP_PACKAGES),
             "packages": sorted(PACKAGES.values()),
+            "dependencyChanged": False,
             "dependencyOnly": False,
             "catalog": True,
             "evidence": True,
@@ -137,10 +228,12 @@ def plan_for_files(files: Sequence[str]) -> dict[str, object]:
     evidence = False
     docs = False
     dependency_paths = True
+    dependency_changed = False
 
     for path in files:
         parts = Path(path).parts
         lower = path.lower()
+        dependency_changed = dependency_changed or is_dependency_path(path)
         dependency_paths = dependency_paths and is_dependency_path(path)
         if path.startswith("hartevo-rs/"):
             package = package_for_path(path)
@@ -190,6 +283,7 @@ def plan_for_files(files: Sequence[str]) -> dict[str, object]:
             "commonRustPackages": sorted(packages - desktop_packages),
             "desktopPackages": sorted(desktop_packages),
             "packages": sorted(packages),
+            "dependencyChanged": dependency_changed,
             "dependencyOnly": False,
             "catalog": True,
             "evidence": True,
@@ -221,6 +315,7 @@ def plan_for_files(files: Sequence[str]) -> dict[str, object]:
         "commonRustPackages": common_packages,
         "desktopPackages": desktop_changed,
         "packages": sorted(packages),
+        "dependencyChanged": dependency_changed,
         "dependencyOnly": dependency_only,
         "catalog": catalog,
         "evidence": evidence,
@@ -246,7 +341,9 @@ def write_outputs(plan: dict[str, object], output: Path | None) -> None:
         "desktop": str(plan["desktop"]).lower(),
         "desktop_packages": json.dumps(plan["desktopPackages"], separators=(",", ":")),
         "run_desktop": str(plan["desktop"]).lower(),
+        "dependency_changed": str(plan["dependencyChanged"]).lower(),
         "dependency_only": str(plan["dependencyOnly"]).lower(),
+        "receipt_only": str(plan.get("receiptOnly", False)).lower(),
         "catalog": str(plan["catalog"]).lower(),
         "evidence": str(plan["evidence"]).lower(),
         "docs": str(plan["docs"]).lower(),
@@ -260,6 +357,7 @@ def self_test() -> None:
     full = plan_for_files(["Cargo.lock"])
     assert full["full"] is False and full["rust"] is False
     assert full["dependencyOnly"] is True
+    assert full["dependencyChanged"] is True
     assert full["commonRustPackages"] == [] and full["desktopPackages"] == []
 
     scoped = plan_for_files(["hartevo-rs/catalog/src/lib.rs"])
@@ -267,6 +365,19 @@ def self_test() -> None:
     assert scoped["packages"] == ["hartevo-catalog"]
     assert scoped["rust"] is True
     assert scoped["commonRust"] is True and scoped["desktop"] is False
+    assert scoped["dependencyChanged"] is False
+
+    mixed_dependency = plan_for_files(
+        [
+            "Cargo.lock",
+            "Cargo.toml",
+            "hartevo-rs/commerce-connector/Cargo.toml",
+            "hartevo-rs/commerce-connector/src/lib.rs",
+        ]
+    )
+    assert mixed_dependency["dependencyOnly"] is False
+    assert mixed_dependency["dependencyChanged"] is True
+    assert mixed_dependency["packages"] == ["hartevo-commerce-connector"]
 
     mission_scheduler = plan_for_files(["hartevo-rs/mission-scheduler/src/lib.rs"])
     assert mission_scheduler["full"] is False
@@ -303,6 +414,22 @@ def self_test() -> None:
     schema = plan_for_files(["hartevo-rs/application/schema/foo.json"])
     assert schema["full"] is True and schema["rust"] is True
 
+    receipt = ".github/governance/reviews/pr-1020.json"
+    parent = "a" * 40
+    head = "b" * 40
+    assert receipt_candidate_parent(1020, [head, parent], [receipt]) == parent
+    assert receipt_candidate_parent(1020, [head, parent], ["scripts/ci-scope.py"]) is None
+    for invalid_parents, invalid_delta in (
+        ([head, parent], [receipt, "scripts/ci-scope.py"]),
+        ([head, parent, "c" * 40], [receipt]),
+    ):
+        try:
+            receipt_candidate_parent(1020, invalid_parents, invalid_delta)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("invalid receipt-looking commit did not fail closed")
+
     print(json.dumps({"schema": "hartevo-ci-scope-self-test/v1", "status": "PASS"}, sort_keys=True))
 
 
@@ -310,6 +437,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base")
     parser.add_argument("--head")
+    parser.add_argument("--pr-number", type=int)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--self-test", action="store_true")
@@ -325,8 +453,13 @@ def main(argv: Iterable[str]) -> int:
         print("--base and --head are required", file=sys.stderr)
         return 2
     try:
-        files = changed_files(args.base, args.head, args.repo)
+        effective_base, receipt_only = resolve_scope_base(
+            args.base, args.head, args.repo, args.pr_number
+        )
+        files = changed_files(effective_base, args.head, args.repo)
         plan = plan_for_files(files)
+        plan["receiptOnly"] = receipt_only
+        plan["comparisonBaseSha"] = effective_base
         write_outputs(plan, args.github_output)
     except (OSError, RuntimeError) as error:
         print(f"ci scope planning failed: {error}", file=sys.stderr)

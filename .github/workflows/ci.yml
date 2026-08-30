@@ -58,7 +58,9 @@ jobs:
       common_rust_packages: ${{ steps.plan.outputs.common_rust_packages }}
       desktop: ${{ steps.plan.outputs.desktop }}
       desktop_packages: ${{ steps.plan.outputs.desktop_packages }}
+      dependency_changed: ${{ steps.plan.outputs.dependency_changed }}
       dependency_only: ${{ steps.plan.outputs.dependency_only }}
+      receipt_only: ${{ steps.plan.outputs.receipt_only }}
       packages: ${{ steps.plan.outputs.packages }}
       plan: ${{ steps.plan.outputs.plan }}
     steps:
@@ -73,6 +75,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REF: ${{ github.head_ref }}
           IS_MERGE_TRAIN: ${{ startsWith(github.head_ref, 'merge-train/') }}
         run: |
@@ -86,14 +89,17 @@ jobs:
             echo "common_rust_packages=$common" >> "$GITHUB_OUTPUT"
             echo 'desktop=true' >> "$GITHUB_OUTPUT"
             echo "desktop_packages=$desktop" >> "$GITHUB_OUTPUT"
+            echo 'dependency_changed=true' >> "$GITHUB_OUTPUT"
             echo 'dependency_only=false' >> "$GITHUB_OUTPUT"
+            echo 'receipt_only=false' >> "$GITHUB_OUTPUT"
             echo "packages=[$(printf '%s' "$common" | sed 's/^\[//;s/\]$//'),\"hartevo-desktop\"]" >> "$GITHUB_OUTPUT"
-            echo 'plan={"schema":"hartevo-ci-scope/v2","mode":"full_integration","full":true,"rust":true,"commonRust":true,"desktop":true,"dependencyOnly":false}' >> "$GITHUB_OUTPUT"
-            printf '%s\n' '{"schema":"hartevo-ci-scope/v2","mode":"full_integration","full":true,"rust":true,"commonRust":true,"desktop":true,"dependencyOnly":false}' | tee target/ci/scope.json
+            echo 'plan={"schema":"hartevo-ci-scope/v2","mode":"full_integration","full":true,"rust":true,"commonRust":true,"desktop":true,"dependencyChanged":true,"dependencyOnly":false,"receiptOnly":false}' >> "$GITHUB_OUTPUT"
+            printf '%s\n' '{"schema":"hartevo-ci-scope/v2","mode":"full_integration","full":true,"rust":true,"commonRust":true,"desktop":true,"dependencyChanged":true,"dependencyOnly":false,"receiptOnly":false}' | tee target/ci/scope.json
           else
             python3 scripts/ci-scope.py \
               --base "$BASE_SHA" \
               --head "$HEAD_SHA" \
+              --pr-number "$PR_NUMBER" \
               --github-output "$GITHUB_OUTPUT" \
               | tee target/ci/scope.json
           fi
@@ -124,7 +130,7 @@ jobs:
       contents: read
 
   dependency:
-    name: PR / Dependency only
+    name: PR / Dependency audit
     needs: scope
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -132,19 +138,19 @@ jobs:
       contents: read
     steps:
       - name: Planned scope skip marker
-        if: ${{ needs.scope.outputs.dependency_only != 'true' }}
-        run: echo "Dependency-only scope is not planned for this change."
+        if: ${{ needs.scope.outputs.dependency_changed != 'true' }}
+        run: echo "No Cargo dependency input changed."
       - name: Checkout locked dependency source
-        if: needs.scope.outputs.dependency_only == 'true'
+        if: needs.scope.outputs.dependency_changed == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
       - name: Install pinned cargo-audit
-        if: needs.scope.outputs.dependency_only == 'true'
+        if: needs.scope.outputs.dependency_changed == 'true'
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Verify locked metadata, dependency tree, audit and SBOM
-        if: needs.scope.outputs.dependency_only == 'true'
+        if: needs.scope.outputs.dependency_changed == 'true'
         run: |
           mkdir -p target/ci/dependencies
           test -s Cargo.lock
@@ -158,10 +164,10 @@ jobs:
             --cargo-audit-json target/ci/dependencies/cargo-audit.json \
             --output target/ci/dependencies/sbom.json
       - name: Narrow dependency smoke check
-        if: needs.scope.outputs.dependency_only == 'true'
+        if: needs.scope.outputs.dependency_changed == 'true'
         run: cargo metadata --format-version 1 --locked >/dev/null
       - name: Upload dependency evidence
-        if: always() && needs.scope.outputs.dependency_only == 'true'
+        if: always() && needs.scope.outputs.dependency_changed == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pr-dependency-evidence-${{ github.run_id }}
@@ -241,6 +247,7 @@ jobs:
         env:
           COMMON_RUST: ${{ needs.scope.outputs.common_rust }}
           DESKTOP: ${{ needs.scope.outputs.desktop }}
+          DEPENDENCY_CHANGED: ${{ needs.scope.outputs.dependency_changed }}
           DEPENDENCY_ONLY: ${{ needs.scope.outputs.dependency_only }}
         run: |
           mkdir -p target/ci
@@ -266,9 +273,13 @@ jobs:
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)")
           fi
-          if [[ "$DEPENDENCY_ONLY" != true ]]; then
+          if [[ "$DEPENDENCY_CHANGED" != true ]]; then
             planned+=(--planned-scope dependency)
-            planned+=(--planned-job-name "PR / Dependency only")
+            planned+=(--planned-job-name "PR / Dependency audit")
+            planned+=(--planned-job-name "PR / Dependency Cordis smoke")
+            planned+=(--planned-job-name "PR / Dependency desktop smoke")
+          elif [[ "$DEPENDENCY_ONLY" != true ]]; then
+            planned+=(--planned-scope dependency-smoke)
             planned+=(--planned-job-name "PR / Dependency Cordis smoke")
             planned+=(--planned-job-name "PR / Dependency desktop smoke")
           fi
@@ -289,7 +300,7 @@ jobs:
             --job-name "policy=PR / Workflow policy" \
             --job-name "scope=PR / Scope plan" \
             --job-name "rust=PR / Fast Rust matrix" \
-            --job-name "dependency=PR / Dependency only" \
+            --job-name "dependency=PR / Dependency audit" \
             --job-name "dependency-cordis-smoke=PR / Dependency Cordis smoke" \
             --job-name "dependency-desktop-smoke=PR / Dependency desktop smoke" \
             --kind policy=code \
