@@ -375,16 +375,26 @@ fn classify_provider_error(error: &ShopifyReadbackProviderError) -> SecretProvid
 
 /// Readback plus the broker's content-free proof that the credential-use lease
 /// was reclaimed before this value left Application.
-#[derive(Debug)]
 pub struct ShopifyBrokeredReadback {
     readback: ShopifyFulfillmentReadback,
     credential_use: SecretUseReceipt,
 }
 
+impl fmt::Debug for ShopifyBrokeredReadback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyBrokeredReadback")
+            .field("readback", &self.readback)
+            .field("credential_use_digest", &"[DIGEST]")
+            .field("lease_reclaimed", &self.credential_use.lease_reclaimed())
+            .finish()
+    }
+}
+
 /// Redacted metadata that may leave the Application/provider boundary. It is
 /// an observation only: no provider Receipt, Verification, or Mission result
 /// can be reconstructed from this value.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ShopifyReadbackMetadata {
     pub fulfillment_id: ShopifyFulfillmentGid,
     pub status: ShopifyFulfillmentStatus,
@@ -394,6 +404,25 @@ pub struct ShopifyReadbackMetadata {
     pub credential_use_digest: String,
     pub lease_reclaimed: bool,
     pub provenance_class: ProviderProvenanceClass,
+}
+
+impl fmt::Debug for ShopifyReadbackMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyReadbackMetadata")
+            .field("fulfillment_id", &"[REDACTED]")
+            .field("status", &self.status)
+            .field("api_version", &self.api_version)
+            .field(
+                "request_id_digest",
+                &self.request_id_digest.as_ref().map(|_| "[DIGEST]"),
+            )
+            .field("evidence_digest", &"[DIGEST]")
+            .field("credential_use_digest", &"[DIGEST]")
+            .field("lease_reclaimed", &self.lease_reclaimed)
+            .field("provenance_class", &self.provenance_class)
+            .finish()
+    }
 }
 
 /// Redacted, exact provider identity observation. This is sufficient for a
@@ -768,6 +797,7 @@ mod tests {
         let metadata = outcome
             .identity_metadata(now() + Duration::seconds(1))
             .unwrap();
+        let generic_metadata = outcome.metadata();
         assert_eq!(metadata.order_id.as_str(), "gid://shopify/Order/1001");
         assert_eq!(
             metadata.fulfillment_order_id.as_str(),
@@ -783,19 +813,24 @@ mod tests {
             outcome.identity_metadata(now() - Duration::seconds(1)),
             Err(ShopifyReadbackBridgeError::InvalidReceiptIdentity)
         ));
-        let debug = format!("{metadata:?} {provider:?} {outcome:?}");
+        let debug =
+            format!("{metadata:?} {generic_metadata:?} {provider:?} {outcome:?} {binding:?}");
         assert!(!debug.contains("shpat_exact"));
         assert!(!debug.contains("never-logged"));
         for private in [
             "n12c.myshopify.com",
+            "gid://shopify/Fulfillment/3001",
             "gid://shopify/Order/1001",
             "gid://shopify/FulfillmentOrder/2001",
             "gid://shopify/FulfillmentOrderLineItem/4001",
             "line_items",
             "quantity",
+            hartevo_commerce_connector::shopify_transport::SHOPIFY_RECEIPT_IDENTITY_QUERY,
+            binding.broker_reference_id(),
         ] {
             assert!(!debug.contains(private), "Debug leaked {private}");
         }
+        assert!(!debug.contains(&format!("{:?}", binding.storage_reference())));
     }
 
     #[test]

@@ -391,7 +391,7 @@ impl fmt::Debug for ShopifyFulfillmentReceiptIdentity {
 
 /// Minimal provider metadata returned across the native transport boundary.
 /// No response body, header value, token, or GraphQL error text is retained.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ShopifyFulfillmentReadback {
     fulfillment_id: ShopifyFulfillmentGid,
     status: ShopifyFulfillmentStatus,
@@ -400,6 +400,24 @@ pub struct ShopifyFulfillmentReadback {
     evidence_digest: String,
     provenance_class: ProviderProvenanceClass,
     receipt_identity: Option<ShopifyFulfillmentReceiptIdentity>,
+}
+
+impl fmt::Debug for ShopifyFulfillmentReadback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyFulfillmentReadback")
+            .field("fulfillment_id", &"[REDACTED]")
+            .field("status", &self.status)
+            .field("api_version", &self.api_version)
+            .field(
+                "request_id_digest",
+                &self.request_id_digest.as_ref().map(|_| "[DIGEST]"),
+            )
+            .field("evidence_digest", &"[DIGEST]")
+            .field("provenance_class", &self.provenance_class)
+            .field("has_receipt_identity", &self.receipt_identity.is_some())
+            .finish()
+    }
 }
 
 impl ShopifyFulfillmentReadback {
@@ -692,12 +710,13 @@ fn decode_readback(
     body: &Value,
     request_id_digest: Option<String>,
 ) -> Result<ShopifyFulfillmentReadback, ShopifyNativeReadbackError> {
-    if body
-        .get("errors")
-        .and_then(Value::as_array)
-        .is_some_and(|errors| !errors.is_empty())
-    {
-        return Err(ShopifyNativeReadbackError::GraphqlRejected);
+    if let Some(errors) = body.get("errors") {
+        let errors = errors
+            .as_array()
+            .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+        if !errors.is_empty() {
+            return Err(ShopifyNativeReadbackError::GraphqlRejected);
+        }
     }
     if request.expected_identity().is_some() {
         return decode_receipt_identity(request, body, request_id_digest);
@@ -1225,7 +1244,7 @@ mod tests {
             "2026-08-30T07:00:00+00:00"
         );
         let debug = format!(
-            "{request:?} {:?} {identity:?}",
+            "{request:?} {:?} {readback:?} {identity:?}",
             request.expected_identity().unwrap()
         );
         for private in [
@@ -1245,6 +1264,19 @@ mod tests {
     #[test]
     fn exact_identity_rejects_partial_ambiguous_or_mismatched_provider_state() {
         let request = exact_request();
+        let mut malformed_errors = exact_body();
+        malformed_errors["errors"] = json!("private provider detail");
+        assert_eq!(
+            decode_readback(&request, &malformed_errors, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+        let mut rejected = exact_body();
+        rejected["errors"] = json!([{"message": "private provider detail"}]);
+        assert_eq!(
+            decode_readback(&request, &rejected, None),
+            Err(ShopifyNativeReadbackError::GraphqlRejected)
+        );
+
         let mut partial = exact_body();
         partial["data"]["fulfillment"]["fulfillmentLineItems"]["pageInfo"]["hasNextPage"] =
             json!(true);

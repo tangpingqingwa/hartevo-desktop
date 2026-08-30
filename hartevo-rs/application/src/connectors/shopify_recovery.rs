@@ -65,11 +65,11 @@ impl fmt::Debug for ShopifyRecoveryCapsuleRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ShopifyRecoveryCapsuleRef")
-            .field("project_id", &self.project_id)
-            .field("effect_id", &self.effect_id)
-            .field("binding_digest", &self.binding_digest)
-            .field("storage_ref", &self.storage_ref)
-            .field("content_digest", &self.content_digest)
+            .field("project_id", &"[REDACTED]")
+            .field("effect_id", &"[REDACTED]")
+            .field("binding_digest", &"[DIGEST]")
+            .field("storage_ref", &"[REDACTED]")
+            .field("content_digest", &"[DIGEST]")
             .field("key_version", &self.key_version)
             .field("object_revision", &self.object_revision)
             .field("head_revision", &self.head_revision)
@@ -971,6 +971,19 @@ mod tests {
         effect: &Effect,
         head_before: &ProviderRecoveryHead,
     ) {
+        let reference_debug = format!("{reference:?}");
+        for private in [
+            reference.project_id.to_string(),
+            reference.effect_id.to_string(),
+            reference.binding_digest.clone(),
+            reference.storage_ref.clone(),
+            reference.content_digest.clone(),
+        ] {
+            assert!(
+                !reference_debug.contains(&private),
+                "recovery Debug leaked private identity or locator"
+            );
+        }
         let selector = ShopifyFulfillmentReadbackRequest::new(
             approved.draft().tenant_scope().shop().clone(),
             approved.draft().api_version().clone(),
