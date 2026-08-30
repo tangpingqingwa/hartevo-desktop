@@ -37,6 +37,7 @@ pub mod native_runtime_journey;
 mod result_adoption_surface;
 mod runtime_plane;
 mod runtime_subscription;
+pub mod shopify_readback;
 #[cfg(feature = "visual-fixtures")]
 mod visual_fixture;
 
