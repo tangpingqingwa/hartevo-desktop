@@ -52,6 +52,11 @@ DEPENDENCY_PATHS = {
 }
 DEPENDENCY_SUFFIXES = ("/Cargo.toml", "/Cargo.lock")
 REVIEW_DIRECTORY = Path(".github/governance/reviews")
+REQUIRED_PARENT_CHECKS = (
+    "PR / Workflow policy",
+    "PR / Scope plan",
+    "PR / Result taxonomy",
+)
 
 
 def changed_files(base: str, head: str, repo: Path) -> list[str]:
@@ -105,7 +110,56 @@ def receipt_candidate_parent(
     return parents[1]
 
 
-def resolve_scope_base(base: str, head: str, repo: Path, pr_number: int | None) -> tuple[str, bool]:
+def verify_parent_check_runs(value: object, parent: str) -> None:
+    """Require the latest GitHub Actions result for each parent code-head gate."""
+    if not isinstance(value, dict):
+        raise RuntimeError("parent check evidence must be a GitHub check-runs object")
+    records = value.get("check_runs")
+    total = value.get("total_count")
+    if (
+        not isinstance(records, list)
+        or not isinstance(total, int)
+        or total != len(records)
+    ):
+        raise RuntimeError("parent check evidence is incomplete or malformed")
+    latest: dict[str, dict[str, object]] = {}
+    for record in records:
+        if not isinstance(record, dict) or record.get("name") not in REQUIRED_PARENT_CHECKS:
+            continue
+        if record.get("head_sha") != parent:
+            continue
+        identifier = record.get("id")
+        app = record.get("app")
+        if (
+            not isinstance(identifier, int)
+            or identifier <= 0
+            or not isinstance(app, dict)
+            or app.get("slug") != "github-actions"
+        ):
+            continue
+        name = str(record["name"])
+        previous = latest.get(name)
+        if previous is None or identifier > int(previous["id"]):
+            latest[name] = record
+    missing = sorted(set(REQUIRED_PARENT_CHECKS) - set(latest))
+    if missing:
+        raise RuntimeError(f"reviewed parent is missing trusted check runs: {missing}")
+    failed = sorted(
+        name
+        for name, record in latest.items()
+        if record.get("status") != "completed" or record.get("conclusion") != "success"
+    )
+    if failed:
+        raise RuntimeError(f"reviewed parent checks are not successful: {failed}")
+
+
+def resolve_scope_base(
+    base: str,
+    head: str,
+    repo: Path,
+    pr_number: int | None,
+    parent_check_runs: Path | None,
+) -> tuple[str, bool]:
     """Narrow only a repository-verified high-risk receipt child to its parent."""
     if pr_number is None:
         return base, False
@@ -154,6 +208,13 @@ def resolve_scope_base(base: str, head: str, repo: Path, pr_number: int | None) 
         or verification.get("reviewedHeadSha") != reviewed_parent
     ):
         raise RuntimeError("review receipt verifier did not bind the exact reviewed parent")
+    if parent_check_runs is None:
+        raise RuntimeError("review receipt narrowing requires hosted parent check evidence")
+    try:
+        check_evidence = json.loads(parent_check_runs.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("unable to read hosted parent check evidence") from error
+    verify_parent_check_runs(check_evidence, reviewed_parent)
     return reviewed_parent, True
 
 
@@ -430,6 +491,63 @@ def self_test() -> None:
         else:
             raise AssertionError("invalid receipt-looking commit did not fail closed")
 
+    parent_checks = {
+        "total_count": 4,
+        "check_runs": [
+            {
+                "id": 1,
+                "name": "PR / Result taxonomy",
+                "head_sha": parent,
+                "status": "completed",
+                "conclusion": "failure",
+                "app": {"slug": "github-actions"},
+            },
+            *[
+                {
+                    "id": index + 10,
+                    "name": name,
+                    "head_sha": parent,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "app": {"slug": "github-actions"},
+                }
+                for index, name in enumerate(REQUIRED_PARENT_CHECKS)
+            ],
+        ],
+    }
+    verify_parent_check_runs(parent_checks, parent)
+    for invalid_checks in (
+        {
+            **parent_checks,
+            "total_count": 3,
+        },
+        {
+            "total_count": 2,
+            "check_runs": parent_checks["check_runs"][1:3],
+        },
+        {
+            **parent_checks,
+            "check_runs": [
+                {
+                    **record,
+                    "conclusion": (
+                        "failure"
+                        if record["name"] == "PR / Result taxonomy"
+                        and record["id"] > 1
+                        else record["conclusion"]
+                    ),
+                }
+                for record in parent_checks["check_runs"]
+            ],
+        },
+    ):
+        try:
+            verify_parent_check_runs(invalid_checks, parent)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("invalid hosted parent check evidence did not fail closed")
+
     print(json.dumps({"schema": "hartevo-ci-scope-self-test/v1", "status": "PASS"}, sort_keys=True))
 
 
@@ -438,6 +556,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--pr-number", type=int)
+    parser.add_argument("--parent-check-runs", type=Path)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--self-test", action="store_true")
@@ -454,7 +573,11 @@ def main(argv: Iterable[str]) -> int:
         return 2
     try:
         effective_base, receipt_only = resolve_scope_base(
-            args.base, args.head, args.repo, args.pr_number
+            args.base,
+            args.head,
+            args.repo,
+            args.pr_number,
+            args.parent_check_runs,
         )
         files = changed_files(effective_base, args.head, args.repo)
         plan = plan_for_files(files)

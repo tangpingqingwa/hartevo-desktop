@@ -926,6 +926,9 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "dependency_changed: ${{ steps.plan.outputs.dependency_changed }}",
             "dependency_only",
             "--pr-number \"$PR_NUMBER\"",
+            "--parent-check-runs target/ci/parent-check-runs.json",
+            "checks: read",
+            "/commits/$parent_sha/check-runs?per_page=100",
             "name: PR / Dependency audit",
             "needs.scope.outputs.dependency_changed == 'true'",
             "cargo metadata --format-version 1 --locked",
@@ -1140,6 +1143,8 @@ def self_test() -> None:
     validate_required_workflow_contract(Path("ci.yml"), ci_fixture)
     for missing_contract in (
         '--pr-number "$PR_NUMBER"',
+        "--parent-check-runs target/ci/parent-check-runs.json",
+        "/commits/$parent_sha/check-runs?per_page=100",
         "dependency_changed: ${{ steps.plan.outputs.dependency_changed }}",
         "--planned-scope dependency-smoke",
     ):
