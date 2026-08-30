@@ -496,7 +496,7 @@ fn timeout_after_commit_restarts_by_exact_readback_without_duplicate_execute() {
 }
 
 #[test]
-fn retry_after_not_executed_can_dispatch_same_typed_effect_once_without_duplicate_state() {
+fn not_executed_is_terminal_and_never_replays_same_typed_effect() {
     let state = Arc::new(Mutex::new(FakeBoundaryState {
         timeout_before_commit: true,
         ..FakeBoundaryState::default()
@@ -514,15 +514,27 @@ fn retry_after_not_executed_can_dispatch_same_typed_effect_once_without_duplicat
         retry_service.submit_approved(&approved, now()),
         Err(ShopifyReceiptReadbackError::ExecutionUncertain)
     );
-    let result = retry_service
-        .submit_approved(&approved, now())
-        .expect("safe retry after exact NotExecuted readback");
-    assert!(!result.replayed);
+    assert_eq!(
+        retry_service.submit_approved(&approved, now()),
+        Err(ShopifyReceiptReadbackError::NotExecutedTerminal {
+            evidence_digest: digest("not-executed"),
+        })
+    );
+    assert_eq!(
+        retry_service.store().records()[approved.draft().idempotency_key().as_str()].state,
+        ShopifyFulfillmentReconciliationState::NotExecuted
+    );
+    assert_eq!(
+        retry_service.submit_approved(&approved, now()),
+        Err(ShopifyReceiptReadbackError::NotExecutedTerminal {
+            evidence_digest: digest("not-executed"),
+        })
+    );
     let state = state.lock().expect("fake boundary state");
-    assert_eq!(state.execute_calls, 2);
-    assert_eq!(state.operations.len(), 1);
-    assert_eq!(state.reconcile_calls, 2);
-    assert_eq!(state.verify_calls, 1);
+    assert_eq!(state.execute_calls, 1);
+    assert_eq!(state.operations.len(), 0);
+    assert_eq!(state.reconcile_calls, 1);
+    assert_eq!(state.verify_calls, 0);
 }
 
 #[test]
