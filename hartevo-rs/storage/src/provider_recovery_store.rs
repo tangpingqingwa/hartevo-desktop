@@ -77,9 +77,8 @@ fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
-        .replace("create table if not exists", "create table")
-        .replace("create index if not exists", "create index")
+        .replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
+        .replace("CREATE INDEX IF NOT EXISTS", "CREATE INDEX")
 }
 
 /// Durable state for one provider write. Only `Prepared` may be claimed for
@@ -1058,6 +1057,23 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn schema_verifier_preserves_check_literal_case() {
+        let store = ProjectStore::in_memory().unwrap();
+        store
+            .connection
+            .execute_batch("DROP TABLE provider_recovery_heads;")
+            .unwrap();
+        let drifted = PROVIDER_RECOVERY_TABLE_SQL.replace("'prepared'", "'PREPARED'");
+        store.connection.execute_batch(&drifted).unwrap();
+        store
+            .connection
+            .execute_batch(PROVIDER_RECOVERY_INDEX_SQL)
+            .unwrap();
+
+        assert!(verify_provider_recovery_schema(&store.connection).is_err());
     }
 
     #[test]
