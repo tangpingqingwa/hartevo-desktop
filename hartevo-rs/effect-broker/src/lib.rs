@@ -1569,10 +1569,7 @@ impl StagedReceiptFound {
             return Err(LedgerError::ScopeConflict);
         }
         let receipt = Receipt {
-            id: ReceiptId::from_stable(format!(
-                "reconciled-receipt:{}:{}",
-                effect.id, evidence_digest
-            )),
+            id: opaque_reconciled_receipt_id(effect, &evidence_digest),
             provider: effect.provider.clone(),
             external_id,
             accepted_at,
@@ -1664,6 +1661,16 @@ pub enum ReceiptReconciliationFailure {
 /// A provider adapter for the staged receipt-only path. The Broker invokes it
 /// only after a durable reconciliation lease has been acquired.
 pub trait EffectReceiptReconciler {
+    /// Authenticates one already-committed receipt before the Broker projects
+    /// it after a restart. Implementations may read local durable evidence,
+    /// but must not contact the provider, obtain credentials, or issue a new
+    /// observation.
+    fn validate_recovered_receipt(
+        &mut self,
+        effect: &Effect,
+        durable: &DurableReceiptReconciliation,
+    ) -> Result<(), ReceiptReconciliationFailure>;
+
     fn reconcile_receipt(
         &mut self,
         effect: &Effect,
@@ -3194,6 +3201,7 @@ impl EffectBroker {
 
             if let Some(durable) = infrastructure.recover_staged_receipt(&effect)? {
                 Self::validate_durable_receipt_reconciliation(&effect, &durable)?;
+                reconciler.validate_recovered_receipt(&effect, &durable)?;
                 Self::validate_persisted_completion(
                     &clock,
                     durable.completion,
@@ -3918,6 +3926,14 @@ pub enum BrokerError {
     MissingReceipt,
     #[error("verified effect has no verification")]
     MissingVerification,
+}
+
+fn opaque_reconciled_receipt_id(effect: &Effect, evidence_digest: &str) -> ReceiptId {
+    let mut digest = Sha256::new();
+    hash_field(&mut digest, "hartevo-reconciled-receipt-id/v1");
+    hash_field(&mut digest, effect.id.as_str());
+    hash_field(&mut digest, evidence_digest);
+    ReceiptId::from_stable(format!("reconciled-receipt-v1:{:x}", digest.finalize()))
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -4801,10 +4817,20 @@ mod tests {
 
     struct CountingReceiptReconciler {
         calls: usize,
+        recovery_validations: usize,
         staged: Option<StagedReceiptFound>,
     }
 
     impl EffectReceiptReconciler for CountingReceiptReconciler {
+        fn validate_recovered_receipt(
+            &mut self,
+            _effect: &Effect,
+            _durable: &DurableReceiptReconciliation,
+        ) -> Result<(), ReceiptReconciliationFailure> {
+            self.recovery_validations += 1;
+            Ok(())
+        }
+
         fn reconcile_receipt(
             &mut self,
             _effect: &Effect,
@@ -6386,6 +6412,7 @@ mod tests {
         let expected_receipt = staged.receipt().clone();
         let mut reconciler = CountingReceiptReconciler {
             calls: 0,
+            recovery_validations: 0,
             staged: Some(staged),
         };
         let first = broker
@@ -6402,7 +6429,14 @@ mod tests {
         let recovery_debug = format!("{first:?} {:?}", first.result());
         assert!(!recovery_debug.contains("provider-existing-object"));
         assert!(!recovery_debug.contains(&expected_receipt.response_digest));
+        assert!(
+            !expected_receipt
+                .id
+                .as_str()
+                .contains(&expected_receipt.response_digest)
+        );
         assert_eq!(reconciler.calls, 1);
+        assert_eq!(reconciler.recovery_validations, 0);
         assert_eq!(unused_verifier.calls, 0);
         let recovered_effect = mission.effect(&effect_id).expect("receipt projection");
         assert_eq!(recovered_effect.status, EffectStatus::ReceiptRecorded);
@@ -6413,6 +6447,7 @@ mod tests {
         let mission_after_first = mission.clone();
         let mut forbidden_reconciler = CountingReceiptReconciler {
             calls: 0,
+            recovery_validations: 0,
             staged: None,
         };
         let duplicate = broker
@@ -6427,6 +6462,7 @@ mod tests {
         assert!(!duplicate.projection_committed());
         assert_eq!(duplicate.result().receipt, expected_receipt);
         assert_eq!(forbidden_reconciler.calls, 0);
+        assert_eq!(forbidden_reconciler.recovery_validations, 1);
         assert_eq!(mission, mission_after_first);
         assert_eq!(executor.calls, 1);
     }

@@ -10623,6 +10623,30 @@ mod tests {
             before_recovery_read,
             "durable recovery read must be side-effect free"
         );
+
+        store
+            .connection
+            .execute(
+                "UPDATE effect_idempotency SET verification_json = ?3
+                 WHERE project_id = ?1 AND effect_id = ?2",
+                params![
+                    effect.project_id.as_str(),
+                    effect.id.as_str(),
+                    "{\"tampered\":true}",
+                ],
+            )
+            .expect("simulate an invalid receipt plus verification durable shape");
+        let before_tampered_recovery = effect_recovery_snapshot(&store, &effect);
+        assert_eq!(
+            store.recover_staged_receipt(&effect),
+            Err(LedgerError::ScopeConflict),
+            "receipt-only recovery must reject any durable verification payload"
+        );
+        assert_eq!(
+            effect_recovery_snapshot(&store, &effect),
+            before_tampered_recovery,
+            "a malformed durable shape must fail without mutation"
+        );
     }
 
     #[test]

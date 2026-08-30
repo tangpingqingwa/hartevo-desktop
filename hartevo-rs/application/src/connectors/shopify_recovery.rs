@@ -32,8 +32,8 @@ use hartevo_domain_kernel::{
     ApprovalDecision, Connection, ConnectionSnapshot, Effect, EffectStatus,
 };
 use hartevo_effect_broker::{
-    EffectPermissionResolver, EffectPolicy, PermissionEvidence, ReceiptRecoveryFence,
-    StagedReceiptFound,
+    DurableReceiptReconciliation, EffectPermissionResolver, EffectPolicy, PermissionEvidence,
+    ReceiptRecoveryFence, StagedReceiptFound,
 };
 use hartevo_storage::{
     ContextMaterialStoreError, ProjectStore, ProviderRecoveryBinding, ProviderRecoveryCapsule,
@@ -346,31 +346,31 @@ impl ReopenedShopifyReconciliation {
         }
 
         let evidence = StoredShopifyReceiptFoundEvidence {
-            schema: SHOPIFY_RECEIPT_FOUND_EVIDENCE_SCHEMA,
-            effect_id: self.effect.id.as_str(),
-            effect_approval_digest: &approval.scope_digest,
-            broker_authorization_digest: &approval.permission_digest,
+            schema: SHOPIFY_RECEIPT_FOUND_EVIDENCE_SCHEMA.to_owned(),
+            effect_id: self.effect.id.as_str().to_owned(),
+            effect_approval_digest: approval.scope_digest.clone(),
+            broker_authorization_digest: approval.permission_digest.clone(),
             original_execution_started_at: execution_started_at,
-            recovery_binding_digest: &self.head.binding.binding_digest,
-            recovery_capsule_content_digest: &self.head.capsule.content_digest,
+            recovery_binding_digest: self.head.binding.binding_digest.clone(),
+            recovery_capsule_content_digest: self.head.capsule.content_digest.clone(),
             recovery_capsule_key_version: self.head.capsule.key_version,
             recovery_capsule_object_revision: self.head.capsule.object_revision,
             recovery_head_revision: self.head.revision,
             recovery_head_state: self.head.state,
             credential_revision: self.head.binding.credential_revision,
-            secret_broker_use_digest: brokered.credential_use().use_digest(),
+            secret_broker_use_digest: brokered.credential_use().use_digest().to_owned(),
             selector_digest: selector.selector_digest(),
-            observation_authority_digest,
-            shop: draft.tenant_scope().shop().as_str(),
-            api_version: draft.api_version().as_str(),
-            fulfillment_id: metadata.fulfillment_id.as_str(),
-            fulfillment_status: metadata.status.as_str(),
-            order_id: metadata.order_id.as_str(),
-            fulfillment_order_id: metadata.fulfillment_order_id.as_str(),
-            line_item_binding_digest: &metadata.line_item_binding_digest,
-            native_response_digest: &metadata.response_digest,
-            native_evidence_digest: &metadata.evidence_digest,
-            native_request_id_digest: metadata.request_id_digest.as_deref(),
+            observation_authority_digest: observation_authority_digest.to_owned(),
+            shop: draft.tenant_scope().shop().as_str().to_owned(),
+            api_version: draft.api_version().as_str().to_owned(),
+            fulfillment_id: metadata.fulfillment_id.as_str().to_owned(),
+            fulfillment_status: metadata.status.as_str().to_owned(),
+            order_id: metadata.order_id.as_str().to_owned(),
+            fulfillment_order_id: metadata.fulfillment_order_id.as_str().to_owned(),
+            line_item_binding_digest: metadata.line_item_binding_digest,
+            native_response_digest: metadata.response_digest,
+            native_evidence_digest: metadata.evidence_digest,
+            native_request_id_digest: metadata.request_id_digest,
             provider_created_at: metadata.provider_created_at,
             provider_updated_at: metadata.provider_updated_at,
             observed_at,
@@ -398,10 +398,7 @@ impl ReopenedShopifyReconciliation {
         .map_err(|_| ShopifyRecoveryError::InvalidReceiptEvidence)?;
         StagedReceiptFound::new(
             &self.effect,
-            format!(
-                "shopify-fulfillment:{}",
-                sha256(metadata.fulfillment_id.as_str().as_bytes())
-            ),
+            recovered_shopify_external_id(metadata.fulfillment_id.as_str()),
             metadata.provider_created_at,
             descriptor.content_digest,
             observed_at,
@@ -411,34 +408,34 @@ impl ReopenedShopifyReconciliation {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredShopifyReceiptFoundEvidence<'a> {
-    schema: &'static str,
-    effect_id: &'a str,
-    effect_approval_digest: &'a str,
-    broker_authorization_digest: &'a str,
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredShopifyReceiptFoundEvidence {
+    schema: String,
+    effect_id: String,
+    effect_approval_digest: String,
+    broker_authorization_digest: String,
     original_execution_started_at: DateTime<Utc>,
-    recovery_binding_digest: &'a str,
-    recovery_capsule_content_digest: &'a str,
+    recovery_binding_digest: String,
+    recovery_capsule_content_digest: String,
     recovery_capsule_key_version: u64,
     recovery_capsule_object_revision: u64,
     recovery_head_revision: u64,
     recovery_head_state: ProviderRecoveryState,
     credential_revision: u64,
-    secret_broker_use_digest: &'a str,
+    secret_broker_use_digest: String,
     selector_digest: String,
-    observation_authority_digest: &'a str,
-    shop: &'a str,
-    api_version: &'a str,
-    fulfillment_id: &'a str,
-    fulfillment_status: &'a str,
-    order_id: &'a str,
-    fulfillment_order_id: &'a str,
-    line_item_binding_digest: &'a str,
-    native_response_digest: &'a str,
-    native_evidence_digest: &'a str,
-    native_request_id_digest: Option<&'a str>,
+    observation_authority_digest: String,
+    shop: String,
+    api_version: String,
+    fulfillment_id: String,
+    fulfillment_status: String,
+    order_id: String,
+    fulfillment_order_id: String,
+    line_item_binding_digest: String,
+    native_response_digest: String,
+    native_evidence_digest: String,
+    native_request_id_digest: Option<String>,
     provider_created_at: DateTime<Utc>,
     provider_updated_at: DateTime<Utc>,
     observed_at: DateTime<Utc>,
@@ -796,6 +793,191 @@ impl<'a> ShopifySecureRecovery<'a> {
         })
     }
 
+    /// Authenticates the exact encrypted evidence behind a receipt already
+    /// committed by Phase A. This is a local restart check only: it obtains no
+    /// credential and performs no provider readback.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    pub fn authenticate_receipt_found(
+        &mut self,
+        reference: &ShopifyRecoveryCapsuleRef,
+        selector: &ShopifyFulfillmentReadbackRequest,
+        observation_authority_digest: &str,
+        effect: &Effect,
+        durable: &DurableReceiptReconciliation,
+    ) -> Result<(), ShopifyRecoveryError> {
+        if selector.expected_identity().is_some()
+            || self.material.project_id() != &effect.project_id
+            || reference.project_id != effect.project_id
+            || reference.effect_id != effect.id
+            || reference
+                .readback_authority_digest(selector)
+                .map_err(|_| ShopifyRecoveryError::BindingMismatch)?
+                != observation_authority_digest
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let effect_shape_is_valid = match effect.status {
+            EffectStatus::VerificationRequired => {
+                effect.receipt.is_none() && effect.verification.is_none()
+            }
+            EffectStatus::ReceiptRecorded => {
+                effect.receipt.as_ref() == Some(&durable.receipt) && effect.verification.is_none()
+            }
+            _ => false,
+        };
+        if !effect_shape_is_valid
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || durable.receipt.provider != effect.provider
+            || durable.receipt.request_digest != approval.scope_digest
+            || durable.receipt.accepted_at < durable.execution_started_at
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+
+        let head = self
+            .store
+            .load_provider_recovery(&reference.project_id, &reference.effect_id)?;
+        let expected_committed_revision = reference
+            .head_revision
+            .checked_add(1)
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let readback_storage_ref = head
+            .readback_storage_ref
+            .as_deref()
+            .ok_or(ShopifyRecoveryError::InvalidReceiptEvidence)?;
+        let readback_content_digest = head
+            .readback_content_digest
+            .as_deref()
+            .ok_or(ShopifyRecoveryError::InvalidReceiptEvidence)?;
+        if head.state != ProviderRecoveryState::ReceiptObserved
+            || head.revision != expected_committed_revision
+            || head.binding.project_id != reference.project_id
+            || head.binding.effect_id != reference.effect_id
+            || head.binding.binding_digest != reference.binding_digest
+            || head.capsule.storage_ref != reference.storage_ref
+            || head.capsule.content_digest != reference.content_digest
+            || head.capsule.key_version != reference.key_version
+            || head.capsule.object_revision != reference.object_revision
+            || !matches!(
+                reference.state,
+                ProviderRecoveryState::InFlight | ProviderRecoveryState::Uncertain
+            )
+            || readback_storage_ref != format!("cas://{readback_content_digest}")
+            || head.receipt_evidence_digest.as_deref() != Some(readback_content_digest)
+            || head.verification_evidence_digest.is_some()
+            || durable.receipt.response_digest != readback_content_digest
+            || durable.completion.operation_at() != head.updated_at
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+
+        if !self
+            .material
+            .readable_key_versions()
+            .contains(&head.capsule.key_version)
+        {
+            return Err(ShopifyRecoveryError::InvalidCapsule);
+        }
+        let capsule = self
+            .material
+            .load_text(&head.capsule.storage_ref)?
+            .ok_or(ShopifyRecoveryError::InvalidCapsule)?;
+        if sha256(capsule.as_str().as_bytes()) != head.capsule.content_digest
+            || u64::try_from(capsule.as_str().len()).ok() != Some(head.capsule.byte_len)
+        {
+            return Err(ShopifyRecoveryError::InvalidCapsule);
+        }
+        let private: StoredShopifyRecoveryCapsule = serde_json::from_str(capsule.as_str())
+            .map_err(|_| ShopifyRecoveryError::InvalidCapsule)?;
+        if private.schema != SHOPIFY_RECOVERY_CAPSULE_SCHEMA
+            || private.binding_digest != head.binding.binding_digest
+        {
+            return Err(ShopifyRecoveryError::InvalidCapsule);
+        }
+        let approved = rebuild_approved(
+            private.draft,
+            ShopifyPluginRevision::new(head.binding.plugin_revision)
+                .map_err(|_| ShopifyRecoveryError::BindingMismatch)?,
+            &approval.permission_digest,
+            effect.expires_at,
+        )?;
+        validate_controlled_recovery_effect(effect, &approved)?;
+        let expected_binding = recovery_binding(
+            effect,
+            head.binding.mission_revision,
+            head.binding.credential_revision,
+            &approved,
+            head.binding.keyring_revision,
+            head.capsule.key_version,
+        )?;
+        if expected_binding != head.binding {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+
+        let resolved = self
+            .material
+            .load_text(readback_storage_ref)?
+            .ok_or(ShopifyRecoveryError::InvalidReceiptEvidence)?;
+        if sha256(resolved.as_str().as_bytes()) != readback_content_digest {
+            return Err(ShopifyRecoveryError::InvalidReceiptEvidence);
+        }
+        let evidence: StoredShopifyReceiptFoundEvidence =
+            serde_json::from_str(resolved.as_str())
+                .map_err(|_| ShopifyRecoveryError::InvalidReceiptEvidence)?;
+        let draft = approved.draft();
+        let optional_digests_are_valid = evidence
+            .native_request_id_digest
+            .as_deref()
+            .is_none_or(is_sha256);
+        if evidence.schema != SHOPIFY_RECEIPT_FOUND_EVIDENCE_SCHEMA
+            || evidence.effect_id != effect.id.as_str()
+            || evidence.effect_approval_digest != approval.scope_digest
+            || evidence.broker_authorization_digest != approval.permission_digest
+            || evidence.original_execution_started_at != durable.execution_started_at
+            || evidence.recovery_binding_digest != head.binding.binding_digest
+            || evidence.recovery_capsule_content_digest != head.capsule.content_digest
+            || evidence.recovery_capsule_key_version != head.capsule.key_version
+            || evidence.recovery_capsule_object_revision != head.capsule.object_revision
+            || evidence.recovery_head_revision != reference.head_revision
+            || evidence.recovery_head_state != reference.state
+            || evidence.credential_revision != head.binding.credential_revision
+            || evidence.selector_digest != selector.selector_digest()
+            || evidence.observation_authority_digest != observation_authority_digest
+            || evidence.shop != selector.shop().as_str()
+            || evidence.shop != draft.tenant_scope().shop().as_str()
+            || evidence.api_version != selector.api_version().as_str()
+            || evidence.api_version != draft.api_version().as_str()
+            || evidence.fulfillment_id != selector.fulfillment_id().as_str()
+            || evidence.order_id != draft.order_gid().as_str()
+            || evidence.fulfillment_order_id != draft.fulfillment_order_gid().as_str()
+            || evidence.line_item_binding_digest
+                != approved_line_item_binding_digest(draft.line_items())
+            || evidence.fulfillment_status.trim().is_empty()
+            || evidence.provider_created_at != durable.receipt.accepted_at
+            || evidence.provider_created_at < durable.execution_started_at
+            || evidence.provider_updated_at < evidence.provider_created_at
+            || evidence.observed_at < evidence.provider_updated_at
+            || durable.completion.operation_at() < evidence.observed_at
+            || evidence.provenance_class != ProviderProvenanceClass::ProductionProvider
+            || durable.receipt.external_id
+                != recovered_shopify_external_id(&evidence.fulfillment_id)
+            || !is_sha256(&evidence.secret_broker_use_digest)
+            || !is_sha256(&evidence.line_item_binding_digest)
+            || !is_sha256(&evidence.native_response_digest)
+            || !is_sha256(&evidence.native_evidence_digest)
+            || !optional_digests_are_valid
+        {
+            return Err(ShopifyRecoveryError::InvalidReceiptEvidence);
+        }
+        Ok(())
+    }
+
     fn load_current_authority(
         &self,
         project_id: &hartevo_domain_kernel::ProjectId,
@@ -880,6 +1062,27 @@ impl ApplicationService {
         reference: &ShopifyRecoveryCapsuleRef,
     ) -> Result<ReopenedShopifyReconciliation, ShopifyRecoveryError> {
         ShopifySecureRecovery::new(&mut self.store, material).reopen_reconciliation(reference)
+    }
+
+    /// Re-authenticates one committed Phase-A receipt against the exact
+    /// selector/recovery authority before restart projection. No provider or
+    /// credential path is reachable from this method.
+    pub fn authenticate_shopify_receipt_found(
+        &mut self,
+        material: &ProjectContextMaterialSession,
+        reference: &ShopifyRecoveryCapsuleRef,
+        selector: &ShopifyFulfillmentReadbackRequest,
+        observation_authority_digest: &str,
+        effect: &Effect,
+        durable: &DurableReceiptReconciliation,
+    ) -> Result<(), ShopifyRecoveryError> {
+        ShopifySecureRecovery::new(&mut self.store, material).authenticate_receipt_found(
+            reference,
+            selector,
+            observation_authority_digest,
+            effect,
+            durable,
+        )
     }
 }
 
@@ -1058,6 +1261,10 @@ fn canonical_digest(fields: &[String]) -> String {
 
 fn sha256(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
+}
+
+fn recovered_shopify_external_id(fulfillment_id: &str) -> String {
+    format!("shopify-fulfillment:{}", sha256(fulfillment_id.as_bytes()))
 }
 
 fn is_sha256(value: &str) -> bool {

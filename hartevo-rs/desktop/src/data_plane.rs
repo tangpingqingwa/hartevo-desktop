@@ -65,10 +65,11 @@ use hartevo_domain_kernel::{
     VerificationStatus, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
-    BrokerResult, EffectBroker, EffectExecutor, EffectPolicy, EffectRateLimit,
-    EffectReceiptReconciler, EffectReconciler, EffectVerifier, ExecutionDisposition,
-    ReceiptReconciliationFailure, ReceiptReconciliationResult, ReconciliationObservation,
-    SecretBrokerConsumer, SecretBrokerService, SecretScope, StagedReceiptFound,
+    BrokerResult, DurableReceiptReconciliation, EffectBroker, EffectExecutor, EffectPolicy,
+    EffectRateLimit, EffectReceiptReconciler, EffectReconciler, EffectVerifier,
+    ExecutionDisposition, ReceiptReconciliationFailure, ReceiptReconciliationResult,
+    ReconciliationObservation, SecretBrokerConsumer, SecretBrokerService, SecretScope,
+    StagedReceiptFound,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
 use hartevo_storage::{
@@ -718,12 +719,24 @@ pub type DesktopShopifyReceiptIdentityProjection = ShopifyReadbackIdentityMetada
 /// First durable Shopify recovery projection. It exposes the Receipt id and
 /// recovery state only; the provider identity, encrypted CAS locator, and
 /// deferred Verification remain below the Desktop boundary.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct DesktopShopifyReceiptRecovery {
     pub snapshot: DesktopSnapshot,
     pub disposition: ExecutionDisposition,
     pub receipt_id: ReceiptId,
     pub recovery_state: ProviderRecoveryState,
+}
+
+impl fmt::Debug for DesktopShopifyReceiptRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopShopifyReceiptRecovery")
+            .field("snapshot", &self.snapshot)
+            .field("disposition", &self.disposition)
+            .field("receipt_id", &"[REDACTED]")
+            .field("recovery_state", &self.recovery_state)
+            .finish()
+    }
 }
 
 /// Read-only reconciliation projection. The Receipt was recovered/reused,
@@ -810,6 +823,27 @@ where
         DateTime<Utc>,
     ) -> Result<ShopifyBrokeredReadback, DesktopShopifyReadbackError>,
 {
+    fn validate_recovered_receipt(
+        &mut self,
+        effect: &Effect,
+        durable: &DurableReceiptReconciliation,
+    ) -> Result<(), ReceiptReconciliationFailure> {
+        self.authority_service
+            .authenticate_shopify_receipt_found(
+                self.context_session,
+                &self.recovery,
+                &self.selector,
+                &self.observation_authority_digest,
+                effect,
+                durable,
+            )
+            .map_err(|error| {
+                classify_shopify_receipt_reconciliation_failure(
+                    &DesktopShopifyReadbackError::Recovery(error),
+                )
+            })
+    }
+
     fn reconcile_receipt(
         &mut self,
         effect: &Effect,
@@ -13787,13 +13821,79 @@ sleep 30"#;
         else {
             panic!("N15 Phase A must acquire the reconciliation lease")
         };
-        let evidence_digest = "e".repeat(64);
+        let (_, _, context_session) = plane
+            .open_ready_runtime_project(&secrets, &project_id, now + Duration::seconds(8))
+            .expect("Context session for authentic N15 evidence");
+        let observation_authority_digest = request
+            .recovery
+            .readback_authority_digest(&request.readback.readback)
+            .expect("exact N15 observation authority");
+        let provider_created_at = execution_started_at + Duration::milliseconds(1);
+        let provider_updated_at = execution_started_at + Duration::milliseconds(2);
+        let observed_at = now + Duration::seconds(8);
+        let mut line_item_digest = Sha256::new();
+        for field in [
+            "hartevo-shopify-readback-line-items/v1",
+            "gid://shopify/FulfillmentOrderLineItem/4001",
+            "2",
+        ] {
+            line_item_digest.update(field.len().to_be_bytes());
+            line_item_digest.update(field.as_bytes());
+        }
+        let line_item_digest = format!("{:x}", line_item_digest.finalize());
+        let approval = effect.approval.as_ref().expect("N15 approval");
+        let evidence_json = serde_json::to_string(&serde_json::json!({
+            "schema": "hartevo-shopify-receipt-found-evidence/v1",
+            "effectId": effect.id.as_str(),
+            "effectApprovalDigest": approval.scope_digest,
+            "brokerAuthorizationDigest": approval.permission_digest,
+            "originalExecutionStartedAt": execution_started_at,
+            "recoveryBindingDigest": request.recovery.binding_digest,
+            "recoveryCapsuleContentDigest": request.recovery.content_digest,
+            "recoveryCapsuleKeyVersion": request.recovery.key_version,
+            "recoveryCapsuleObjectRevision": request.recovery.object_revision,
+            "recoveryHeadRevision": request.recovery.head_revision,
+            "recoveryHeadState": request.recovery.state,
+            "credentialRevision": request.readback.binding.credential_revision(),
+            "secretBrokerUseDigest": "c".repeat(64),
+            "selectorDigest": request.readback.readback.selector_digest(),
+            "observationAuthorityDigest": observation_authority_digest,
+            "shop": request.readback.readback.shop().as_str(),
+            "apiVersion": request.readback.readback.api_version().as_str(),
+            "fulfillmentId": request.readback.readback.fulfillment_id().as_str(),
+            "fulfillmentStatus": "SUCCESS",
+            "orderId": "gid://shopify/Order/1001",
+            "fulfillmentOrderId": "gid://shopify/FulfillmentOrder/2001",
+            "lineItemBindingDigest": line_item_digest,
+            "nativeResponseDigest": "a".repeat(64),
+            "nativeEvidenceDigest": "b".repeat(64),
+            "nativeRequestIdDigest": null,
+            "providerCreatedAt": provider_created_at,
+            "providerUpdatedAt": provider_updated_at,
+            "observedAt": observed_at,
+            "provenanceClass": "production_provider"
+        }))
+        .expect("encode authentic N15 evidence");
+        let evidence_descriptor = context_session
+            .put_text(&evidence_json)
+            .expect("write authentic encrypted N15 evidence");
+        let evidence_digest = evidence_descriptor.content_digest.clone();
         let staged = StagedReceiptFound::new(
             &effect,
-            format!("shopify-fulfillment:{evidence_digest}"),
-            execution_started_at + Duration::milliseconds(1),
+            format!(
+                "shopify-fulfillment:{:x}",
+                Sha256::digest(
+                    request
+                        .readback
+                        .readback
+                        .fulfillment_id()
+                        .as_str()
+                        .as_bytes()
+                )
+            ),
+            provider_created_at,
             evidence_digest.clone(),
-            now + Duration::seconds(8),
+            observed_at,
             ReceiptRecoveryFence::new(
                 mission_before.revision,
                 connection.snapshot(),
@@ -13802,7 +13902,7 @@ sleep 30"#;
                 request.recovery.content_digest.clone(),
                 request.recovery.key_version,
                 request.recovery.object_revision,
-                format!("cas://{evidence_digest}"),
+                evidence_descriptor.storage_ref.clone(),
                 evidence_digest.clone(),
             )
             .expect("exact N15 recovery fence"),
@@ -13828,6 +13928,173 @@ sleep 30"#;
         );
         drop(store);
 
+        let evidence_path = context_session
+            .project_root()
+            .join(".hartevo")
+            .join("context-material")
+            .join(&evidence_digest[..2])
+            .join(format!("{evidence_digest}.hctx"));
+        std::fs::remove_file(&evidence_path).expect("remove N15 evidence CAS for fail-closed test");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let missing_calls = Arc::clone(&provider_calls);
+        let mut broker = shopify_readback_broker();
+        let missing = plane.recover_shopify_receipt_found_with(
+            &secrets,
+            request.clone(),
+            &mut broker,
+            now + Duration::seconds(10),
+            move |_, _, _, _, _, _, _| {
+                missing_calls.fetch_add(1, Ordering::SeqCst);
+                Err(DesktopShopifyReadbackError::Bridge(
+                    ShopifyReadbackBridgeError::Transport(ShopifyNativeReadbackError::NotFound),
+                ))
+            },
+        );
+        assert!(matches!(
+            missing,
+            Err(DesktopShopifyReadbackError::Desktop(
+                DesktopDataError::Application(ApplicationError::Broker(
+                    hartevo_effect_broker::BrokerError::ReceiptReconciliationFailed(
+                        ReceiptReconciliationFailure::InvalidEvidence
+                            | ReceiptReconciliationFailure::EvidenceUnavailable
+                    )
+                ))
+            ))
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(10))
+            .expect("Application after missing N15 CAS");
+        assert_eq!(
+            service
+                .load_mission(&request.readback.project_id, &request.readback.mission_id)
+                .expect("Mission after missing N15 CAS"),
+            mission_before
+        );
+        assert_eq!(
+            service
+                .mission_events(&request.readback.project_id, &request.readback.mission_id)
+                .expect("events after missing N15 CAS"),
+            events_before
+        );
+        drop(service);
+        let restored_descriptor = context_session
+            .put_text(&evidence_json)
+            .expect("restore exact N15 evidence CAS");
+        assert_eq!(restored_descriptor.content_digest, evidence_digest);
+
+        std::fs::write(&evidence_path, b"corrupt-n15-evidence")
+            .expect("corrupt encrypted N15 evidence for fail-closed test");
+        let corrupt_calls = Arc::clone(&provider_calls);
+        let corrupt = plane.recover_shopify_receipt_found_with(
+            &secrets,
+            request.clone(),
+            &mut broker,
+            now + Duration::seconds(10),
+            move |_, _, _, _, _, _, _| {
+                corrupt_calls.fetch_add(1, Ordering::SeqCst);
+                Err(DesktopShopifyReadbackError::Bridge(
+                    ShopifyReadbackBridgeError::Transport(ShopifyNativeReadbackError::NotFound),
+                ))
+            },
+        );
+        assert!(matches!(
+            corrupt,
+            Err(DesktopShopifyReadbackError::Desktop(
+                DesktopDataError::Application(ApplicationError::Broker(
+                    hartevo_effect_broker::BrokerError::ReceiptReconciliationFailed(
+                        ReceiptReconciliationFailure::EvidenceUnavailable
+                    )
+                ))
+            ))
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        std::fs::remove_file(&evidence_path).expect("remove corrupt N15 evidence record");
+        let restored_descriptor = context_session
+            .put_text(&evidence_json)
+            .expect("restore exact N15 evidence after corruption");
+        assert_eq!(restored_descriptor.content_digest, evidence_digest);
+
+        let mut changed_selector = request.clone();
+        changed_selector.readback.readback = ShopifyFulfillmentReadbackRequest::new(
+            changed_selector.readback.readback.shop().clone(),
+            changed_selector.readback.readback.api_version().clone(),
+            ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3999")
+                .expect("changed N15 selector"),
+        )
+        .expect("syntactically valid changed N15 selector");
+        let changed_selector_calls = Arc::clone(&provider_calls);
+        let changed_selector_result = plane.recover_shopify_receipt_found_with(
+            &secrets,
+            changed_selector,
+            &mut broker,
+            now + Duration::seconds(10),
+            move |_, _, _, _, _, _, _| {
+                changed_selector_calls.fetch_add(1, Ordering::SeqCst);
+                Err(DesktopShopifyReadbackError::Bridge(
+                    ShopifyReadbackBridgeError::Transport(ShopifyNativeReadbackError::NotFound),
+                ))
+            },
+        );
+        assert!(matches!(
+            changed_selector_result,
+            Err(DesktopShopifyReadbackError::Desktop(
+                DesktopDataError::Application(ApplicationError::Broker(
+                    hartevo_effect_broker::BrokerError::ReceiptReconciliationFailed(
+                        ReceiptReconciliationFailure::InvalidEvidence
+                            | ReceiptReconciliationFailure::BindingMismatch
+                    )
+                ))
+            ))
+        ));
+
+        let mut changed_recovery = request.clone();
+        changed_recovery.recovery.head_revision = changed_recovery
+            .recovery
+            .head_revision
+            .checked_sub(1)
+            .expect("nonzero changed recovery revision");
+        let changed_recovery_calls = Arc::clone(&provider_calls);
+        let changed_recovery_result = plane.recover_shopify_receipt_found_with(
+            &secrets,
+            changed_recovery,
+            &mut broker,
+            now + Duration::seconds(10),
+            move |_, _, _, _, _, _, _| {
+                changed_recovery_calls.fetch_add(1, Ordering::SeqCst);
+                Err(DesktopShopifyReadbackError::Bridge(
+                    ShopifyReadbackBridgeError::Transport(ShopifyNativeReadbackError::NotFound),
+                ))
+            },
+        );
+        assert!(matches!(
+            changed_recovery_result,
+            Err(DesktopShopifyReadbackError::Desktop(
+                DesktopDataError::Application(ApplicationError::Broker(
+                    hartevo_effect_broker::BrokerError::ReceiptReconciliationFailed(
+                        ReceiptReconciliationFailure::BindingMismatch
+                    )
+                ))
+            ))
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(10))
+            .expect("Application after mismatched N15 authorities");
+        assert_eq!(
+            service
+                .load_mission(&request.readback.project_id, &request.readback.mission_id)
+                .expect("Mission after mismatched N15 authorities"),
+            mission_before
+        );
+        assert_eq!(
+            service
+                .mission_events(&request.readback.project_id, &request.readback.mission_id)
+                .expect("events after mismatched N15 authorities"),
+            events_before
+        );
+        drop(service);
+
         let (mut service, _) = plane
             .open_application_from_secret(&database_secret, now + Duration::seconds(10))
             .expect("Application before N15 restart recovery");
@@ -13841,7 +14108,6 @@ sleep 30"#;
         drop(service);
         request.readback.cancellation.cancel();
 
-        let mut broker = shopify_readback_broker();
         let recovered = plane
             .recover_shopify_receipt_found_with(
                 &secrets,
@@ -13862,6 +14128,10 @@ sleep 30"#;
             recovered.recovery_state,
             ProviderRecoveryState::ReceiptObserved
         );
+        assert!(!recovered.receipt_id.as_str().contains(&evidence_digest));
+        let recovered_debug = format!("{recovered:?}");
+        assert!(!recovered_debug.contains(recovered.receipt_id.as_str()));
+        assert!(!recovered_debug.contains(&evidence_digest));
 
         let (service, _) = plane
             .open_application_from_secret(&database_secret, now + Duration::seconds(12))
@@ -13886,6 +14156,14 @@ sleep 30"#;
                 .expect("one N15 receipt event")
                 .event_type,
             "effect.reconciliation_receipt_found"
+        );
+        assert!(
+            !events_after
+                .last()
+                .expect("one N15 receipt event")
+                .payload
+                .to_string()
+                .contains(&evidence_digest)
         );
         drop(service);
 

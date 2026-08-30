@@ -230,6 +230,12 @@ impl ReceiptReconciliationInfrastructure for ProjectStore {
             transaction.commit().map_err(persistence)?;
             return Ok(None);
         }
+        if record.receipt_json.is_none()
+            || record.verification_json.is_some()
+            || record.uncertain_reason.is_some()
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
         let Some(reconciliation_head) = load_reconciliation_head(&transaction, effect)? else {
             transaction.commit().map_err(persistence)?;
             return Ok(None);
@@ -344,9 +350,10 @@ impl ReceiptReconciliationInfrastructure for ProjectStore {
             .execute(
                 "UPDATE effect_idempotency
                  SET status = 'receipt_recorded', receipt_json = ?4,
-                     uncertain_reason = NULL, updated_at = ?5
+                     verification_json = NULL, uncertain_reason = NULL, updated_at = ?5
                  WHERE project_id = ?1 AND effect_id = ?2
-                   AND approval_digest = ?3 AND status = 'uncertain'",
+                   AND approval_digest = ?3 AND status = 'uncertain'
+                   AND verification_json IS NULL",
                 params![
                     effect.project_id.as_str(),
                     effect.id.as_str(),
