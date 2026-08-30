@@ -5,6 +5,7 @@
 //! redirect, select an arbitrary host, or retain an access token. Credentials
 //! are borrowed for one bounded call and never enter a request/response model.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{
     Arc,
@@ -12,6 +13,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,15 +24,21 @@ use hartevo_connector_sdk::ProviderProvenanceClass;
 use crate::shopify::{
     SHOPIFY_LATEST_API_VERSION, ShopDomain, ShopifyApiVersion, ShopifyGraphqlRequest,
 };
-use crate::shopify_effect::FULFILLMENT_READBACK_QUERY;
+use crate::shopify_effect::{
+    FULFILLMENT_READBACK_QUERY, SHOPIFY_FULFILLMENT_MAX_LINE_ITEMS, ShopifyFulfillmentLineItem,
+    ShopifyFulfillmentOrderGid, ShopifyFulfillmentOrderLineItemGid, ShopifyOrderGid,
+};
 
 pub const SHOPIFY_READBACK_OPERATION_NAME: &str = "ShopifyFulfillmentReadback";
+pub const SHOPIFY_RECEIPT_IDENTITY_OPERATION_NAME: &str = "ShopifyFulfillmentReceiptIdentity";
+pub const SHOPIFY_RECEIPT_IDENTITY_QUERY: &str = "query ShopifyFulfillmentReceiptIdentity($id: ID!) { fulfillment(id: $id) { id status createdAt updatedAt order { id } fulfillmentOrders(first: 2) { nodes { id lineItems(first: 101) { nodes { id lineItem { id } totalQuantity remainingQuantity } pageInfo { hasNextPage } } } pageInfo { hasNextPage } } fulfillmentLineItems(first: 101) { nodes { lineItem { id } quantity } pageInfo { hasNextPage } } } }";
 pub const SHOPIFY_READBACK_MAX_REQUEST_BYTES: usize = 16 * 1024;
 pub const SHOPIFY_READBACK_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 pub const SHOPIFY_READBACK_MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 pub const SHOPIFY_READBACK_GLOBAL_TIMEOUT_SECONDS: u64 = 15;
 
 const SHOPIFY_FULFILLMENT_GID_PREFIX: &str = "gid://shopify/Fulfillment/";
+const SHOPIFY_LINE_ITEM_GID_PREFIX: &str = "gid://shopify/LineItem/";
 
 /// Exact provider identifier required by the fixed readback query.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -74,6 +82,69 @@ pub struct ShopifyFulfillmentReadbackRequest {
     shop: ShopDomain,
     api_version: ShopifyApiVersion,
     fulfillment_id: ShopifyFulfillmentGid,
+    expected_identity: Option<ShopifyExpectedFulfillmentIdentity>,
+}
+
+/// Exact approved provider identity used only to validate a known fulfillment
+/// object. It contains IDs and quantities, never customer or credential data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShopifyExpectedFulfillmentIdentity {
+    order_id: ShopifyOrderGid,
+    fulfillment_order_id: ShopifyFulfillmentOrderGid,
+    line_items: Vec<ShopifyFulfillmentLineItem>,
+}
+
+impl ShopifyExpectedFulfillmentIdentity {
+    pub fn new(
+        order_id: ShopifyOrderGid,
+        fulfillment_order_id: ShopifyFulfillmentOrderGid,
+        mut line_items: Vec<ShopifyFulfillmentLineItem>,
+    ) -> Result<Self, ShopifyNativeReadbackError> {
+        let validated_order_id = ShopifyOrderGid::parse(order_id.as_str().to_owned())
+            .map_err(|_| ShopifyNativeReadbackError::InvalidRequest)?;
+        let validated_fulfillment_order_id =
+            ShopifyFulfillmentOrderGid::parse(fulfillment_order_id.as_str().to_owned())
+                .map_err(|_| ShopifyNativeReadbackError::InvalidRequest)?;
+        // Consume the potentially deserialized wrappers. Only the canonical
+        // values reconstructed above may enter the exact provider request.
+        drop(order_id);
+        drop(fulfillment_order_id);
+        if line_items.is_empty() || line_items.len() > SHOPIFY_FULFILLMENT_MAX_LINE_ITEMS {
+            return Err(ShopifyNativeReadbackError::InvalidRequest);
+        }
+        for item in &mut line_items {
+            item.line_item_gid =
+                ShopifyFulfillmentOrderLineItemGid::parse(item.line_item_gid.as_str().to_owned())
+                    .map_err(|_| ShopifyNativeReadbackError::InvalidRequest)?;
+            if item.quantity == 0 {
+                return Err(ShopifyNativeReadbackError::InvalidRequest);
+            }
+        }
+        line_items.sort();
+        if line_items
+            .windows(2)
+            .any(|items| items[0].line_item_gid == items[1].line_item_gid)
+        {
+            return Err(ShopifyNativeReadbackError::InvalidRequest);
+        }
+        Ok(Self {
+            order_id: validated_order_id,
+            fulfillment_order_id: validated_fulfillment_order_id,
+            line_items,
+        })
+    }
+
+    pub fn order_id(&self) -> &ShopifyOrderGid {
+        &self.order_id
+    }
+
+    pub fn fulfillment_order_id(&self) -> &ShopifyFulfillmentOrderGid {
+        &self.fulfillment_order_id
+    }
+
+    pub fn line_items(&self) -> &[ShopifyFulfillmentLineItem] {
+        &self.line_items
+    }
 }
 
 impl ShopifyFulfillmentReadbackRequest {
@@ -101,7 +172,24 @@ impl ShopifyFulfillmentReadbackRequest {
             shop: validated_shop,
             api_version,
             fulfillment_id: validated_fulfillment_id,
+            expected_identity: None,
         };
+        let encoded = serde_json::to_vec(&request.graphql_body())
+            .map_err(|_| ShopifyNativeReadbackError::InvalidRequest)?;
+        if encoded.len() > SHOPIFY_READBACK_MAX_REQUEST_BYTES {
+            return Err(ShopifyNativeReadbackError::InvalidRequest);
+        }
+        Ok(request)
+    }
+
+    pub fn new_exact(
+        shop: ShopDomain,
+        api_version: ShopifyApiVersion,
+        fulfillment_id: ShopifyFulfillmentGid,
+        expected_identity: ShopifyExpectedFulfillmentIdentity,
+    ) -> Result<Self, ShopifyNativeReadbackError> {
+        let mut request = Self::new(shop, api_version, fulfillment_id)?;
+        request.expected_identity = Some(expected_identity);
         let encoded = serde_json::to_vec(&request.graphql_body())
             .map_err(|_| ShopifyNativeReadbackError::InvalidRequest)?;
         if encoded.len() > SHOPIFY_READBACK_MAX_REQUEST_BYTES {
@@ -122,6 +210,10 @@ impl ShopifyFulfillmentReadbackRequest {
         &self.fulfillment_id
     }
 
+    pub fn expected_identity(&self) -> Option<&ShopifyExpectedFulfillmentIdentity> {
+        self.expected_identity.as_ref()
+    }
+
     pub fn endpoint(&self) -> String {
         self.shop
             .admin_graphql_endpoint(&self.api_version)
@@ -129,11 +221,19 @@ impl ShopifyFulfillmentReadbackRequest {
     }
 
     fn graphql_body(&self) -> Value {
+        let (operation_name, query) = if self.expected_identity.is_some() {
+            (
+                SHOPIFY_RECEIPT_IDENTITY_OPERATION_NAME,
+                SHOPIFY_RECEIPT_IDENTITY_QUERY,
+            )
+        } else {
+            (SHOPIFY_READBACK_OPERATION_NAME, FULFILLMENT_READBACK_QUERY)
+        };
         ShopifyGraphqlRequest::new(
             self.shop.clone(),
             self.api_version.clone(),
-            SHOPIFY_READBACK_OPERATION_NAME,
-            FULFILLMENT_READBACK_QUERY,
+            operation_name,
+            query,
             json!({ "id": self.fulfillment_id.as_str() }),
         )
         .expect("fixed Shopify readback request is valid")
@@ -193,6 +293,44 @@ impl ShopifyFulfillmentStatus {
     }
 }
 
+/// Canonical provider response identity for one exact approved fulfillment.
+/// The raw GraphQL body and order-line mapping never cross this boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShopifyFulfillmentReceiptIdentity {
+    order_id: ShopifyOrderGid,
+    fulfillment_order_id: ShopifyFulfillmentOrderGid,
+    line_items: Vec<ShopifyFulfillmentLineItem>,
+    provider_created_at: DateTime<Utc>,
+    provider_updated_at: DateTime<Utc>,
+    response_digest: String,
+}
+
+impl ShopifyFulfillmentReceiptIdentity {
+    pub fn order_id(&self) -> &ShopifyOrderGid {
+        &self.order_id
+    }
+
+    pub fn fulfillment_order_id(&self) -> &ShopifyFulfillmentOrderGid {
+        &self.fulfillment_order_id
+    }
+
+    pub fn line_items(&self) -> &[ShopifyFulfillmentLineItem] {
+        &self.line_items
+    }
+
+    pub const fn provider_created_at(&self) -> DateTime<Utc> {
+        self.provider_created_at
+    }
+
+    pub const fn provider_updated_at(&self) -> DateTime<Utc> {
+        self.provider_updated_at
+    }
+
+    pub fn response_digest(&self) -> &str {
+        &self.response_digest
+    }
+}
+
 /// Minimal provider metadata returned across the native transport boundary.
 /// No response body, header value, token, or GraphQL error text is retained.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,6 +341,7 @@ pub struct ShopifyFulfillmentReadback {
     request_id_digest: Option<String>,
     evidence_digest: String,
     provenance_class: ProviderProvenanceClass,
+    receipt_identity: Option<ShopifyFulfillmentReceiptIdentity>,
 }
 
 impl ShopifyFulfillmentReadback {
@@ -230,6 +369,10 @@ impl ShopifyFulfillmentReadback {
         self.provenance_class
     }
 
+    pub fn receipt_identity(&self) -> Option<&ShopifyFulfillmentReceiptIdentity> {
+        self.receipt_identity.as_ref()
+    }
+
     /// Deterministic offline observation for host-composition tests. Runtime
     /// native providers reject this provenance before accepting evidence.
     pub fn fixture(
@@ -251,6 +394,55 @@ impl ShopifyFulfillmentReadback {
             request_id_digest: None,
             evidence_digest,
             provenance_class: ProviderProvenanceClass::Fixture,
+            receipt_identity: None,
+        })
+    }
+
+    /// Deterministic exact-identity fixture. A production provider rejects its
+    /// provenance, so tests cannot promote it into live evidence.
+    pub fn fixture_exact(
+        request: &ShopifyFulfillmentReadbackRequest,
+        status: impl Into<String>,
+        provider_created_at: DateTime<Utc>,
+        provider_updated_at: DateTime<Utc>,
+    ) -> Result<Self, ShopifyNativeReadbackError> {
+        let expected = request
+            .expected_identity()
+            .ok_or(ShopifyNativeReadbackError::InvalidRequest)?;
+        if provider_updated_at < provider_created_at {
+            return Err(ShopifyNativeReadbackError::MalformedResponse);
+        }
+        let status = ShopifyFulfillmentStatus::parse(status)?;
+        let response_digest = receipt_identity_digest(
+            request,
+            expected,
+            status.as_str(),
+            provider_created_at,
+            provider_updated_at,
+        );
+        let evidence_digest = digest_fields([
+            "hartevo-shopify-fixture-receipt-identity/v1",
+            request.shop().as_str(),
+            request.api_version().as_str(),
+            request.fulfillment_id().as_str(),
+            status.as_str(),
+            response_digest.as_str(),
+        ]);
+        Ok(Self {
+            fulfillment_id: request.fulfillment_id().clone(),
+            status,
+            api_version: request.api_version().clone(),
+            request_id_digest: None,
+            evidence_digest,
+            provenance_class: ProviderProvenanceClass::Fixture,
+            receipt_identity: Some(ShopifyFulfillmentReceiptIdentity {
+                order_id: expected.order_id().clone(),
+                fulfillment_order_id: expected.fulfillment_order_id().clone(),
+                line_items: expected.line_items().to_vec(),
+                provider_created_at,
+                provider_updated_at,
+                response_digest,
+            }),
         })
     }
 }
@@ -446,6 +638,9 @@ fn decode_readback(
     {
         return Err(ShopifyNativeReadbackError::GraphqlRejected);
     }
+    if request.expected_identity().is_some() {
+        return decode_receipt_identity(request, body, request_id_digest);
+    }
     let node = body
         .pointer("/data/node")
         .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
@@ -479,7 +674,260 @@ fn decode_readback(
         request_id_digest,
         evidence_digest,
         provenance_class: ProviderProvenanceClass::ProductionProvider,
+        receipt_identity: None,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn decode_receipt_identity(
+    request: &ShopifyFulfillmentReadbackRequest,
+    body: &Value,
+    request_id_digest: Option<String>,
+) -> Result<ShopifyFulfillmentReadback, ShopifyNativeReadbackError> {
+    let expected = request
+        .expected_identity()
+        .ok_or(ShopifyNativeReadbackError::InvalidRequest)?;
+    let fulfillment = body
+        .pointer("/data/fulfillment")
+        .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+    if fulfillment.is_null() {
+        return Err(ShopifyNativeReadbackError::NotFound);
+    }
+    let id = required_string(fulfillment, "id")?;
+    if id != request.fulfillment_id().as_str() {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+    let status = ShopifyFulfillmentStatus::parse(required_string(fulfillment, "status")?)?;
+    let provider_created_at = required_timestamp(fulfillment, "createdAt")?;
+    let provider_updated_at = required_timestamp(fulfillment, "updatedAt")?;
+    if provider_updated_at < provider_created_at {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+    let order_id = fulfillment
+        .pointer("/order/id")
+        .and_then(Value::as_str)
+        .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+    if order_id != expected.order_id().as_str() {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+
+    let fulfillment_orders = required_complete_nodes(fulfillment, "fulfillmentOrders", 1)?;
+    let fulfillment_order = fulfillment_orders
+        .first()
+        .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+    let fulfillment_order_id = required_string(fulfillment_order, "id")?;
+    if fulfillment_order_id != expected.fulfillment_order_id().as_str() {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+
+    let order_line_nodes = required_complete_nodes(
+        fulfillment_order,
+        "lineItems",
+        SHOPIFY_FULFILLMENT_MAX_LINE_ITEMS,
+    )?;
+    let mut order_line_ids = BTreeMap::new();
+    for node in order_line_nodes {
+        let line_item_id = required_string(node, "id")?;
+        ShopifyFulfillmentOrderLineItemGid::parse(line_item_id.to_owned())
+            .map_err(|_| ShopifyNativeReadbackError::MalformedResponse)?;
+        let order_line_id = node
+            .pointer("/lineItem/id")
+            .and_then(Value::as_str)
+            .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+        validate_numeric_gid(order_line_id, SHOPIFY_LINE_ITEM_GID_PREFIX)?;
+        let total_quantity = required_positive_quantity(node, "totalQuantity")?;
+        let remaining_quantity = required_nonnegative_quantity(node, "remainingQuantity")?;
+        if remaining_quantity > total_quantity
+            || order_line_ids
+                .insert(
+                    line_item_id.to_owned(),
+                    (order_line_id.to_owned(), total_quantity),
+                )
+                .is_some()
+        {
+            return Err(ShopifyNativeReadbackError::MalformedResponse);
+        }
+    }
+
+    let fulfillment_line_nodes = required_complete_nodes(
+        fulfillment,
+        "fulfillmentLineItems",
+        SHOPIFY_FULFILLMENT_MAX_LINE_ITEMS,
+    )?;
+    let mut fulfilled_quantities = BTreeMap::new();
+    for node in fulfillment_line_nodes {
+        let order_line_id = node
+            .pointer("/lineItem/id")
+            .and_then(Value::as_str)
+            .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+        validate_numeric_gid(order_line_id, SHOPIFY_LINE_ITEM_GID_PREFIX)?;
+        let quantity = required_positive_quantity(node, "quantity")?;
+        if fulfilled_quantities
+            .insert(order_line_id.to_owned(), quantity)
+            .is_some()
+        {
+            return Err(ShopifyNativeReadbackError::MalformedResponse);
+        }
+    }
+
+    let mut expected_order_lines = BTreeSet::new();
+    for item in expected.line_items() {
+        let (order_line_id, total_quantity) = order_line_ids
+            .get(item.line_item_gid.as_str())
+            .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+        if item.quantity > *total_quantity
+            || !expected_order_lines.insert(order_line_id.clone())
+            || fulfilled_quantities.get(order_line_id) != Some(&item.quantity)
+        {
+            return Err(ShopifyNativeReadbackError::MalformedResponse);
+        }
+    }
+    if fulfilled_quantities.len() != expected_order_lines.len()
+        || fulfilled_quantities
+            .keys()
+            .any(|line_id| !expected_order_lines.contains(line_id))
+    {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+
+    let response_digest = receipt_identity_digest(
+        request,
+        expected,
+        status.as_str(),
+        provider_created_at,
+        provider_updated_at,
+    );
+    let evidence_digest = digest_fields([
+        "hartevo-shopify-native-receipt-identity/v1",
+        request.shop().as_str(),
+        request.api_version().as_str(),
+        id,
+        status.as_str(),
+        response_digest.as_str(),
+        request_id_digest.as_deref().unwrap_or("none"),
+    ]);
+    Ok(ShopifyFulfillmentReadback {
+        fulfillment_id: request.fulfillment_id().clone(),
+        status,
+        api_version: request.api_version().clone(),
+        request_id_digest,
+        evidence_digest,
+        provenance_class: ProviderProvenanceClass::ProductionProvider,
+        receipt_identity: Some(ShopifyFulfillmentReceiptIdentity {
+            order_id: expected.order_id().clone(),
+            fulfillment_order_id: expected.fulfillment_order_id().clone(),
+            line_items: expected.line_items().to_vec(),
+            provider_created_at,
+            provider_updated_at,
+            response_digest,
+        }),
+    })
+}
+
+fn required_string<'a>(
+    value: &'a Value,
+    field: &str,
+) -> Result<&'a str, ShopifyNativeReadbackError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .ok_or(ShopifyNativeReadbackError::MalformedResponse)
+}
+
+fn required_timestamp(
+    value: &Value,
+    field: &str,
+) -> Result<DateTime<Utc>, ShopifyNativeReadbackError> {
+    DateTime::parse_from_rfc3339(required_string(value, field)?)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| ShopifyNativeReadbackError::MalformedResponse)
+}
+
+fn required_complete_nodes<'a>(
+    parent: &'a Value,
+    field: &str,
+    max_nodes: usize,
+) -> Result<Vec<&'a Value>, ShopifyNativeReadbackError> {
+    let connection = parent
+        .get(field)
+        .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+    if connection
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+    let nodes = connection
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or(ShopifyNativeReadbackError::MalformedResponse)?;
+    if nodes.is_empty() || nodes.len() > max_nodes {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+    Ok(nodes.iter().collect())
+}
+
+fn required_positive_quantity(
+    value: &Value,
+    field: &str,
+) -> Result<u32, ShopifyNativeReadbackError> {
+    let quantity = required_nonnegative_quantity(value, field)?;
+    if quantity == 0 {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+    Ok(quantity)
+}
+
+fn required_nonnegative_quantity(
+    value: &Value,
+    field: &str,
+) -> Result<u32, ShopifyNativeReadbackError> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|quantity| u32::try_from(quantity).ok())
+        .ok_or(ShopifyNativeReadbackError::MalformedResponse)
+}
+
+fn validate_numeric_gid(value: &str, prefix: &str) -> Result<(), ShopifyNativeReadbackError> {
+    let suffix = value.strip_prefix(prefix).unwrap_or_default();
+    if suffix.is_empty()
+        || suffix.len() > 32
+        || suffix.starts_with('0')
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(ShopifyNativeReadbackError::MalformedResponse);
+    }
+    Ok(())
+}
+
+fn receipt_identity_digest(
+    request: &ShopifyFulfillmentReadbackRequest,
+    expected: &ShopifyExpectedFulfillmentIdentity,
+    status: &str,
+    provider_created_at: DateTime<Utc>,
+    provider_updated_at: DateTime<Utc>,
+) -> String {
+    let mut fields = vec![
+        "hartevo-shopify-fulfillment-receipt-identity/v1".to_owned(),
+        request.shop().as_str().to_owned(),
+        request.api_version().as_str().to_owned(),
+        request.fulfillment_id().as_str().to_owned(),
+        expected.order_id().as_str().to_owned(),
+        expected.fulfillment_order_id().as_str().to_owned(),
+        status.to_owned(),
+        provider_created_at.to_rfc3339(),
+        provider_updated_at.to_rfc3339(),
+    ];
+    fields.extend(expected.line_items().iter().flat_map(|item| {
+        [
+            item.line_item_gid.as_str().to_owned(),
+            item.quantity.to_string(),
+        ]
+    }));
+    digest_field_iter(fields.iter().map(String::as_str))
 }
 
 fn classify_transport_error(error: &ureq::Error) -> ShopifyNativeReadbackError {
@@ -505,6 +953,10 @@ fn classify_body_error(error: &ureq::Error) -> ShopifyNativeReadbackError {
 }
 
 fn digest_fields<const N: usize>(fields: [&str; N]) -> String {
+    digest_field_iter(fields)
+}
+
+fn digest_field_iter<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
     let mut hasher = Sha256::new();
     for field in fields {
         hasher.update(field.len().to_be_bytes());
@@ -524,6 +976,66 @@ mod tests {
             ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
         )
         .unwrap()
+    }
+
+    fn exact_request() -> ShopifyFulfillmentReadbackRequest {
+        ShopifyFulfillmentReadbackRequest::new_exact(
+            ShopDomain::parse("n12c.myshopify.com").unwrap(),
+            ShopifyApiVersion::latest(),
+            ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
+            ShopifyExpectedFulfillmentIdentity::new(
+                ShopifyOrderGid::parse("gid://shopify/Order/1001").unwrap(),
+                ShopifyFulfillmentOrderGid::parse("gid://shopify/FulfillmentOrder/2001").unwrap(),
+                vec![
+                    ShopifyFulfillmentLineItem::new(
+                        ShopifyFulfillmentOrderLineItemGid::parse(
+                            "gid://shopify/FulfillmentOrderLineItem/4001",
+                        )
+                        .unwrap(),
+                        2,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn exact_body() -> Value {
+        json!({
+            "data": {
+                "fulfillment": {
+                    "id": "gid://shopify/Fulfillment/3001",
+                    "status": "SUCCESS",
+                    "createdAt": "2026-08-30T08:00:00Z",
+                    "updatedAt": "2026-08-30T08:01:00Z",
+                    "order": { "id": "gid://shopify/Order/1001" },
+                    "fulfillmentOrders": {
+                        "nodes": [{
+                            "id": "gid://shopify/FulfillmentOrder/2001",
+                            "lineItems": {
+                                "nodes": [{
+                                    "id": "gid://shopify/FulfillmentOrderLineItem/4001",
+                                    "lineItem": { "id": "gid://shopify/LineItem/5001" },
+                                    "totalQuantity": 3,
+                                    "remainingQuantity": 1
+                                }],
+                                "pageInfo": { "hasNextPage": false }
+                            }
+                        }],
+                        "pageInfo": { "hasNextPage": false }
+                    },
+                    "fulfillmentLineItems": {
+                        "nodes": [{
+                            "lineItem": { "id": "gid://shopify/LineItem/5001" },
+                            "quantity": 2
+                        }],
+                        "pageInfo": { "hasNextPage": false }
+                    }
+                }
+            }
+        })
     }
 
     #[test]
@@ -610,6 +1122,97 @@ mod tests {
         let debug = format!("{readback:?}");
         assert!(!debug.contains("access-token"));
         assert!(!debug.contains("X-Shopify"));
+    }
+
+    #[test]
+    fn exact_identity_query_binds_order_fulfillment_order_lines_and_time() {
+        let request = exact_request();
+        assert_eq!(
+            request.graphql_body(),
+            json!({
+                "operationName": SHOPIFY_RECEIPT_IDENTITY_OPERATION_NAME,
+                "query": SHOPIFY_RECEIPT_IDENTITY_QUERY,
+                "variables": { "id": "gid://shopify/Fulfillment/3001" }
+            })
+        );
+        let readback =
+            decode_readback(&request, &exact_body(), Some(digest_fields(["request-id"]))).unwrap();
+        let identity = readback.receipt_identity().expect("exact identity");
+        assert_eq!(identity.order_id().as_str(), "gid://shopify/Order/1001");
+        assert_eq!(
+            identity.fulfillment_order_id().as_str(),
+            "gid://shopify/FulfillmentOrder/2001"
+        );
+        assert_eq!(
+            identity.line_items(),
+            request.expected_identity().unwrap().line_items()
+        );
+        assert_eq!(identity.response_digest().len(), 64);
+        assert_eq!(
+            identity.provider_created_at().to_rfc3339(),
+            "2026-08-30T08:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn exact_identity_rejects_partial_ambiguous_or_mismatched_provider_state() {
+        let request = exact_request();
+        let mut partial = exact_body();
+        partial["data"]["fulfillment"]["fulfillmentLineItems"]["pageInfo"]["hasNextPage"] =
+            json!(true);
+        assert_eq!(
+            decode_readback(&request, &partial, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+
+        let mut wrong_quantity = exact_body();
+        wrong_quantity["data"]["fulfillment"]["fulfillmentLineItems"]["nodes"][0]["quantity"] =
+            json!(1);
+        assert_eq!(
+            decode_readback(&request, &wrong_quantity, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+
+        let mut wrong_order = exact_body();
+        wrong_order["data"]["fulfillment"]["order"]["id"] = json!("gid://shopify/Order/1002");
+        assert_eq!(
+            decode_readback(&request, &wrong_order, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+
+        let mut wrong_fulfillment_order = exact_body();
+        wrong_fulfillment_order["data"]["fulfillment"]["fulfillmentOrders"]["nodes"][0]["id"] =
+            json!("gid://shopify/FulfillmentOrder/2002");
+        assert_eq!(
+            decode_readback(&request, &wrong_fulfillment_order, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+
+        let mut wrong_line_item = exact_body();
+        wrong_line_item["data"]["fulfillment"]["fulfillmentOrders"]["nodes"][0]["lineItems"]["nodes"]
+            [0]["id"] = json!("gid://shopify/FulfillmentOrderLineItem/4002");
+        assert_eq!(
+            decode_readback(&request, &wrong_line_item, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+
+        let mut ambiguous = exact_body();
+        let duplicate = ambiguous["data"]["fulfillment"]["fulfillmentOrders"]["nodes"][0].clone();
+        ambiguous["data"]["fulfillment"]["fulfillmentOrders"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert_eq!(
+            decode_readback(&request, &ambiguous, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+
+        let mut future_before_create = exact_body();
+        future_before_create["data"]["fulfillment"]["updatedAt"] = json!("2026-08-30T07:59:59Z");
+        assert_eq!(
+            decode_readback(&request, &future_before_create, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
     }
 
     #[test]

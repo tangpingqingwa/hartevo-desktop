@@ -16,6 +16,10 @@ use hartevo_commerce_connector::shopify_effect_reconcile::{
     ShopifyApprovedDraftFulfillment, ShopifyPluginRevision, ShopifyTypedEffectBoundary,
     shopify_sdk_effect_idempotency_key,
 };
+use hartevo_commerce_connector::shopify_transport::{
+    ShopifyExpectedFulfillmentIdentity, ShopifyFulfillmentReadbackRequest,
+    ShopifyNativeReadbackError,
+};
 use hartevo_connector_sdk::{EffectExecutionContext, PreparedEffect, ProviderCapabilityKey};
 use hartevo_domain_kernel::{ApprovalDecision, Effect, EffectStatus};
 use hartevo_effect_broker::{EffectPermissionResolver, EffectPolicy, PermissionEvidence};
@@ -31,7 +35,7 @@ use super::shopify::{
     SHOPIFY_APPLICATION_ADAPTER_ID, ShopifyAdapterError, ShopifyEffectAdapter,
     validate_controlled_recovery_effect,
 };
-use crate::ProjectContextMaterialSession;
+use crate::{ApplicationService, ProjectContextMaterialSession};
 
 const SHOPIFY_RECOVERY_CAPSULE_SCHEMA: &str = "hartevo-shopify-recovery-capsule/v1";
 const SHOPIFY_RECOVERY_CAPSULE_REVISION: u64 = 1;
@@ -70,7 +74,9 @@ impl fmt::Debug for ShopifyRecoveryCapsuleRef {
 }
 
 impl ShopifyRecoveryCapsuleRef {
-    fn from_head(head: &ProviderRecoveryHead) -> Self {
+    /// Produces the current content-free handle after a durable recovery-state
+    /// transition. The encrypted capsule and provider payload remain sealed.
+    pub fn from_head(head: &ProviderRecoveryHead) -> Self {
         Self {
             project_id: head.binding.project_id.clone(),
             effect_id: head.binding.effect_id.clone(),
@@ -127,6 +133,69 @@ impl<B> ClaimedShopifyRecovery<B> {
 
     pub fn into_adapter(self) -> ShopifyEffectAdapter<B> {
         self.adapter
+    }
+}
+
+/// Read-only reopening of the approved private capsule for an already
+/// uncertain Effect. It carries no adapter, execution handle, or provider.
+pub struct ReopenedShopifyReconciliation {
+    approved: ShopifyApprovedDraftFulfillment,
+    effect: Effect,
+    head: ProviderRecoveryHead,
+    current_mission_revision: u64,
+}
+
+impl fmt::Debug for ReopenedShopifyReconciliation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReopenedShopifyReconciliation")
+            .field("effect_id", &self.effect.id)
+            .field("current_mission_revision", &self.current_mission_revision)
+            .field("recovery_state", &self.head.state)
+            .field("recovery_revision", &self.head.revision)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReopenedShopifyReconciliation {
+    /// Confirms that Desktop's already-loaded Cordis fence still names this
+    /// exact reopened Effect and credential generation without exposing the
+    /// decrypted approved draft or recovery head.
+    pub fn matches_current_fence(
+        &self,
+        effect: &Effect,
+        expected_mission_revision: u64,
+        credential_revision: u64,
+    ) -> bool {
+        self.current_mission_revision == expected_mission_revision
+            && &self.effect == effect
+            && self.head.binding.credential_revision == credential_revision
+    }
+
+    /// Replaces a minimal known-GID request with one bound to the exact
+    /// approved private draft. No draft field crosses into Desktop.
+    pub fn bind_exact_readback(
+        &self,
+        request: &ShopifyFulfillmentReadbackRequest,
+    ) -> Result<ShopifyFulfillmentReadbackRequest, ShopifyNativeReadbackError> {
+        let draft = self.approved.draft();
+        if request.expected_identity().is_some()
+            || draft.api_version() != request.api_version()
+            || draft.tenant_scope().shop() != request.shop()
+        {
+            return Err(ShopifyNativeReadbackError::InvalidRequest);
+        }
+        let expected = ShopifyExpectedFulfillmentIdentity::new(
+            draft.order_gid().clone(),
+            draft.fulfillment_order_gid().clone(),
+            draft.line_items().to_vec(),
+        )?;
+        ShopifyFulfillmentReadbackRequest::new_exact(
+            request.shop().clone(),
+            request.api_version().clone(),
+            request.fulfillment_id().clone(),
+            expected,
+        )
     }
 }
 
@@ -370,6 +439,115 @@ impl<'a> ShopifySecureRecovery<'a> {
         Ok(head)
     }
 
+    /// Reopens an exact reconciliation-only capsule without changing its
+    /// durable head or issuing an execution-capable adapter.
+    pub fn reopen_reconciliation(
+        &mut self,
+        reference: &ShopifyRecoveryCapsuleRef,
+    ) -> Result<ReopenedShopifyReconciliation, ShopifyRecoveryError> {
+        let head = self
+            .store
+            .load_provider_recovery(&reference.project_id, &reference.effect_id)?;
+        if !reference.matches_head(&head)
+            || !matches!(
+                head.state,
+                ProviderRecoveryState::InFlight | ProviderRecoveryState::Uncertain
+            )
+            || head.capsule.object_revision != SHOPIFY_RECOVERY_CAPSULE_REVISION
+            || head.readback_storage_ref.is_some()
+            || head.receipt_evidence_digest.is_some()
+            || head.verification_evidence_digest.is_some()
+        {
+            return Err(ShopifyRecoveryError::ReconciliationOnly);
+        }
+        if self.material.project_id() != &head.binding.project_id
+            || self.material.keyring_revision() != head.binding.keyring_revision
+            || !self
+                .material
+                .readable_key_versions()
+                .contains(&head.capsule.key_version)
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let resolved = self
+            .material
+            .load_text(&head.capsule.storage_ref)?
+            .ok_or(ShopifyRecoveryError::InvalidCapsule)?;
+        if sha256(resolved.as_str().as_bytes()) != head.capsule.content_digest
+            || u64::try_from(resolved.as_str().len()).ok() != Some(head.capsule.byte_len)
+        {
+            return Err(ShopifyRecoveryError::InvalidCapsule);
+        }
+        let private: StoredShopifyRecoveryCapsule = serde_json::from_str(resolved.as_str())
+            .map_err(|_| ShopifyRecoveryError::InvalidCapsule)?;
+        if private.schema != SHOPIFY_RECOVERY_CAPSULE_SCHEMA
+            || private.binding_digest != head.binding.binding_digest
+        {
+            return Err(ShopifyRecoveryError::InvalidCapsule);
+        }
+
+        let project = self.store.load_project(&head.binding.project_id)?;
+        let mission = self
+            .store
+            .load_mission(&head.binding.project_id, &head.binding.mission_id)?;
+        let effect = mission
+            .effect(&head.binding.effect_id)
+            .map_err(|_| ShopifyRecoveryError::BindingMismatch)?
+            .clone();
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let connection_id = effect
+            .connection_id
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let connection = self
+            .store
+            .load_connection(&head.binding.project_id, connection_id)?;
+        if project.tenant_id != mission.tenant_id
+            || mission.project_id != project.id
+            || mission.revision < head.binding.mission_revision
+            || self.material.tenant_id != mission.tenant_id
+            || effect.status != EffectStatus::VerificationRequired
+            || effect.receipt.is_some()
+            || effect.verification.is_some()
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || connection.tenant_id() != &effect.tenant_id
+            || connection.project_id() != &effect.project_id
+            || connection.provider() != SHOPIFY_PROVIDER_ID
+            || connection.revision() != head.binding.credential_revision
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let approved = rebuild_approved(
+            private.draft,
+            ShopifyPluginRevision::new(head.binding.plugin_revision)
+                .map_err(|_| ShopifyRecoveryError::BindingMismatch)?,
+            &approval.permission_digest,
+            effect.expires_at,
+        )?;
+        validate_controlled_recovery_effect(&effect, &approved)?;
+        let live_binding = recovery_binding(
+            &effect,
+            head.binding.mission_revision,
+            head.binding.credential_revision,
+            &approved,
+            self.material.keyring_revision(),
+            head.capsule.key_version,
+        )?;
+        if live_binding != head.binding {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        Ok(ReopenedShopifyReconciliation {
+            approved,
+            effect,
+            head,
+            current_mission_revision: mission.revision,
+        })
+    }
+
     fn load_current_authority(
         &self,
         project_id: &hartevo_domain_kernel::ProjectId,
@@ -415,6 +593,18 @@ impl<'a> ShopifySecureRecovery<'a> {
             authorization_digest: claim_context.authorization_digest,
             permission_evidence,
         })
+    }
+}
+
+impl ApplicationService {
+    /// Application-owned wrapper so Desktop never obtains the ProjectStore or
+    /// decrypted capsule bytes.
+    pub fn reopen_shopify_reconciliation(
+        &mut self,
+        material: &ProjectContextMaterialSession,
+        reference: &ShopifyRecoveryCapsuleRef,
+    ) -> Result<ReopenedShopifyReconciliation, ShopifyRecoveryError> {
+        ShopifySecureRecovery::new(&mut self.store, material).reopen_reconciliation(reference)
     }
 }
 
@@ -610,6 +800,7 @@ mod tests {
     use hartevo_commerce_connector::shopify_effect_reconcile::{
         ShopifyEffectBoundaryReadback, ShopifyEffectBoundaryReceipt,
     };
+    use hartevo_commerce_connector::shopify_transport::ShopifyFulfillmentGid;
     use hartevo_connector_sdk::{ConnectorError, ConnectorScope, ProviderCapabilityKey};
     use hartevo_domain_kernel::{
         AccountId, ActorId, Approval, ApprovalId, Connection, ConnectionId, ConnectionProbe,
@@ -981,6 +1172,159 @@ mod tests {
         let head = recovery.load_head(&current_ref).unwrap();
         assert_eq!(head.state, ProviderRecoveryState::InFlight);
         assert_eq!(head.revision, 2);
+    }
+
+    #[test]
+    fn uncertain_capsule_reopens_read_only_without_execution_or_head_mutation() {
+        let temporary = TempDir::new().unwrap();
+        let database_path = temporary.path().join("shopify-reconciliation.sqlite3");
+        let now = Utc::now();
+        let mut store = ProjectStore::open(&database_path, &database_key()).unwrap();
+        let (approved, effect, policy) = persist_live_authority(&mut store, temporary.path(), now);
+        let material = material_session(temporary.path(), &effect.tenant_id, &effect.project_id);
+        let prepared = ShopifySecureRecovery::new(&mut store, &material)
+            .prepare_controlled(&effect, &approved, &policy, now)
+            .unwrap();
+        assert!(matches!(
+            ShopifySecureRecovery::new(&mut store, &material).reopen_reconciliation(&prepared),
+            Err(ShopifyRecoveryError::ReconciliationOnly)
+        ));
+
+        let claimed = ShopifySecureRecovery::new(&mut store, &material)
+            .claim_controlled_adapter(&prepared, &policy, NeverCalledBoundary, now)
+            .unwrap();
+        let reference = ShopifyRecoveryCapsuleRef::from_head(claimed.head());
+        drop(claimed);
+
+        let mut mission = store
+            .load_mission(&effect.project_id, &effect.mission_id)
+            .unwrap();
+        let current_effect = mission
+            .effects
+            .iter_mut()
+            .find(|candidate| candidate.id == effect.id)
+            .unwrap();
+        current_effect.status = EffectStatus::VerificationRequired;
+        mission.revision += 1;
+        let current_revision = mission.revision;
+        store.save_mission(&mission).unwrap();
+        let head_before = store
+            .load_provider_recovery(&effect.project_id, &effect.id)
+            .unwrap();
+
+        let reopened = ShopifySecureRecovery::new(&mut store, &material)
+            .reopen_reconciliation(&reference)
+            .unwrap();
+        assert_eq!(reopened.approved.draft(), approved.draft());
+        assert_eq!(
+            reopened.approved.prepared_effect(),
+            approved.prepared_effect()
+        );
+        assert_eq!(
+            reopened.approved.approval_binding_digest(),
+            approved.approval_binding_digest()
+        );
+        assert_eq!(reopened.effect.status, EffectStatus::VerificationRequired);
+        assert_eq!(reopened.current_mission_revision, current_revision);
+        assert_eq!(reopened.head, head_before);
+        let exact_readback = reopened
+            .bind_exact_readback(
+                &ShopifyFulfillmentReadbackRequest::new(
+                    approved.draft().tenant_scope().shop().clone(),
+                    approved.draft().api_version().clone(),
+                    ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let expected_identity = exact_readback
+            .expected_identity()
+            .expect("approved capsule binds exact identity");
+        assert_eq!(expected_identity.order_id(), approved.draft().order_gid());
+        assert_eq!(
+            expected_identity.fulfillment_order_id(),
+            approved.draft().fulfillment_order_gid()
+        );
+        assert_eq!(
+            expected_identity.line_items(),
+            approved.draft().line_items()
+        );
+        let wrong_shop = ShopifyFulfillmentReadbackRequest::new(
+            ShopDomain::parse("other.myshopify.com").unwrap(),
+            approved.draft().api_version().clone(),
+            ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.bind_exact_readback(&wrong_shop),
+            Err(ShopifyNativeReadbackError::InvalidRequest)
+        );
+        assert_eq!(
+            store
+                .load_provider_recovery(&effect.project_id, &effect.id)
+                .unwrap(),
+            head_before
+        );
+    }
+
+    #[test]
+    fn reconciliation_reopen_rejects_connection_rotation_without_mutating_head() {
+        let temporary = TempDir::new().unwrap();
+        let database_path = temporary
+            .path()
+            .join("shopify-reconciliation-rotation.sqlite3");
+        let now = Utc::now();
+        let mut store = ProjectStore::open(&database_path, &database_key()).unwrap();
+        let (approved, effect, policy) = persist_live_authority(&mut store, temporary.path(), now);
+        let material = material_session(temporary.path(), &effect.tenant_id, &effect.project_id);
+        let prepared = ShopifySecureRecovery::new(&mut store, &material)
+            .prepare_controlled(&effect, &approved, &policy, now)
+            .unwrap();
+        let claimed = ShopifySecureRecovery::new(&mut store, &material)
+            .claim_controlled_adapter(&prepared, &policy, NeverCalledBoundary, now)
+            .unwrap();
+        let reference = ShopifyRecoveryCapsuleRef::from_head(claimed.head());
+        drop(claimed);
+        let mut mission = store
+            .load_mission(&effect.project_id, &effect.mission_id)
+            .unwrap();
+        mission
+            .effects
+            .iter_mut()
+            .find(|candidate| candidate.id == effect.id)
+            .unwrap()
+            .status = EffectStatus::VerificationRequired;
+        mission.revision += 1;
+        store.save_mission(&mission).unwrap();
+
+        let connection_id = effect.connection_id.as_ref().unwrap();
+        let mut connection = store
+            .load_connection(&effect.project_id, connection_id)
+            .unwrap();
+        let expected_revision = connection.revision();
+        connection.begin_probe(now).unwrap();
+        store
+            .update_connection(
+                &connection,
+                expected_revision,
+                "connection.probe_started",
+                &serde_json::json!({}),
+                now,
+            )
+            .unwrap();
+        let head_before = store
+            .load_provider_recovery(&effect.project_id, &effect.id)
+            .unwrap();
+        assert!(matches!(
+            ShopifySecureRecovery::new(&mut store, &material).reopen_reconciliation(&reference),
+            Err(ShopifyRecoveryError::BindingMismatch)
+        ));
+        assert_eq!(
+            store
+                .load_provider_recovery(&effect.project_id, &effect.id)
+                .unwrap(),
+            head_before
+        );
     }
 
     #[test]

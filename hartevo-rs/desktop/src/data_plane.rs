@@ -14,7 +14,10 @@ use chrono::{DateTime, Duration, Utc};
 use hartevo_application::connectors::shopify_readback::{
     SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopifyFulfillmentReadbackRequest,
     ShopifyNativeReadbackError, ShopifyReadbackBridgeError, ShopifyReadbackCancellation,
-    ShopifyReadbackCredentialBinding, ShopifyReadbackMetadata,
+    ShopifyReadbackCredentialBinding, ShopifyReadbackIdentityMetadata, ShopifyReadbackMetadata,
+};
+use hartevo_application::connectors::shopify_recovery::{
+    ShopifyRecoveryCapsuleRef, ShopifyRecoveryError,
 };
 use hartevo_application::{
     AcceptWorkProduct, AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
@@ -92,6 +95,7 @@ use crate::runtime_plane::{
 };
 use crate::runtime_subscription::DesktopCatalogRuntimeDispatchAuthority;
 use crate::shopify_readback::{
+    dispatch_os_keyring_shopify_readback_identity_metadata,
     dispatch_os_keyring_shopify_readback_metadata, prepare_shopify_readback_broker,
 };
 
@@ -685,6 +689,29 @@ impl fmt::Debug for DesktopShopifyReadbackRequest {
 /// redacted metadata projection. It is not a Receipt, Verification, E4 fact,
 /// or Mission completion result.
 pub type DesktopShopifyReadbackProjection = ShopifyReadbackMetadata;
+
+/// Exact read-only identity admission for one N12B recovery capsule. The
+/// capsule reference is redacted at the Desktop boundary and is reopened only
+/// inside the existing Cordis reconciliation permit.
+#[derive(Clone)]
+pub struct DesktopShopifyReceiptIdentityRequest {
+    pub readback: DesktopShopifyReadbackRequest,
+    pub recovery: ShopifyRecoveryCapsuleRef,
+}
+
+impl fmt::Debug for DesktopShopifyReceiptIdentityRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopShopifyReceiptIdentityRequest")
+            .field("readback", &self.readback)
+            .field("recovery", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Stable, redacted identity observation only. This is not a Broker Receipt,
+/// Verification, E4 fact, or Mission completion result.
+pub type DesktopShopifyReceiptIdentityProjection = ShopifyReadbackIdentityMetadata;
 
 /// Read-only reconciliation projection. The Receipt was recovered/reused,
 /// never produced by a provider execution in this call, and remains distinct
@@ -2829,7 +2856,37 @@ impl DesktopDataPlane {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Reopens the exact encrypted N12B capsule inside the existing Cordis
+    /// permit, binds its approved order/fulfillment-order/line items to one
+    /// native readback, and returns observation metadata only.
+    pub fn dispatch_shopify_receipt_identity_os(
+        &self,
+        request: DesktopShopifyReceiptIdentityRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopShopifyReceiptIdentityProjection, DesktopShopifyReadbackError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)
+            .map_err(DesktopDataError::from)
+            .map_err(DesktopShopifyReadbackError::Desktop)?;
+        let DesktopShopifyReceiptIdentityRequest { readback, recovery } = request;
+        self.dispatch_shopify_readback_reconciliation_admission(
+            &secret_store,
+            readback,
+            Some(&recovery),
+            now,
+            |_, binding, readback, cancellation, consumer, service, at| {
+                dispatch_os_keyring_shopify_readback_identity_metadata(
+                    binding,
+                    readback,
+                    cancellation,
+                    consumer,
+                    service,
+                    at,
+                )
+                .map_err(DesktopShopifyReadbackError::Bridge)
+            },
+        )
+    }
+
     fn dispatch_shopify_readback_admission<S, Observe>(
         &self,
         secret_store: &S,
@@ -2849,6 +2906,36 @@ impl DesktopDataPlane {
             DateTime<Utc>,
         )
             -> Result<DesktopShopifyReadbackProjection, DesktopShopifyReadbackError>,
+    {
+        self.dispatch_shopify_readback_reconciliation_admission(
+            secret_store,
+            request,
+            None,
+            now,
+            observe,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_shopify_readback_reconciliation_admission<S, Projection, Observe>(
+        &self,
+        secret_store: &S,
+        request: DesktopShopifyReadbackRequest,
+        recovery: Option<&ShopifyRecoveryCapsuleRef>,
+        now: DateTime<Utc>,
+        observe: Observe,
+    ) -> Result<Projection, DesktopShopifyReadbackError>
+    where
+        S: SecretStore,
+        Observe: FnOnce(
+            &S,
+            ShopifyReadbackCredentialBinding,
+            ShopifyFulfillmentReadbackRequest,
+            ShopifyReadbackCancellation,
+            &SecretBrokerConsumer,
+            &mut SecretBrokerService,
+            DateTime<Utc>,
+        ) -> Result<Projection, DesktopShopifyReadbackError>,
     {
         let DesktopShopifyReadbackRequest {
             project_id,
@@ -2870,6 +2957,10 @@ impl DesktopDataPlane {
             || binding.scope().provider_id() != SHOPIFY_PROVIDER_ID
             || binding.scope().capability_id() != SHOPIFY_FULFILLMENT_CAPABILITY
             || binding.shop() != readback.shop()
+            || readback.expected_identity().is_some()
+            || recovery.is_some_and(|reference| {
+                reference.project_id != project_id || reference.effect_id != effect_id
+            })
         {
             return Err(DesktopShopifyReadbackError::InvalidRequest);
         }
@@ -2881,7 +2972,7 @@ impl DesktopDataPlane {
             ));
         }
 
-        let (service, _runtime_reconciliation, _context_session) =
+        let (mut service, _runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
         let mission = service.load_mission(&project_id, &mission_id)?;
         if mission.revision != expected_mission_revision {
@@ -2993,6 +3084,24 @@ impl DesktopDataPlane {
                         ),
                     ));
                 }
+                let readback = if let Some(reference) = recovery {
+                    let reopened = service
+                        .reopen_shopify_reconciliation(&context_session, reference)
+                        .map_err(DesktopShopifyReadbackError::Recovery)?;
+                    if !reopened.matches_current_fence(
+                        &effect,
+                        expected_mission_revision,
+                        binding.credential_revision(),
+                    ) {
+                        return Err(DesktopShopifyReadbackError::BindingMismatch);
+                    }
+                    reopened
+                        .bind_exact_readback(&readback)
+                        .map_err(ShopifyReadbackBridgeError::Transport)
+                        .map_err(DesktopShopifyReadbackError::Bridge)?
+                } else {
+                    readback
+                };
                 observe(
                     secret_store,
                     binding,
@@ -5779,6 +5888,8 @@ pub enum DesktopShopifyReadbackError {
     #[error(transparent)]
     Bridge(#[from] ShopifyReadbackBridgeError),
     #[error(transparent)]
+    Recovery(#[from] ShopifyRecoveryError),
+    #[error(transparent)]
     Desktop(#[from] DesktopDataError),
     #[error("Cordis Shopify readback admission failed across phases: {0}")]
     Dispatch(#[source] Box<AuthorityDispatchError<DesktopShopifyReadbackError>>),
@@ -5960,7 +6071,7 @@ mod tests {
         EffectBroker, EffectExecutor, EffectVerifier, ProviderAdapterIdentity, ProviderFailure,
         SecretBrokerProvider, SecretProviderError, SecretUseHandle,
     };
-    use hartevo_storage::MemorySecretStore;
+    use hartevo_storage::{MemorySecretStore, ProviderRecoveryState};
     use rust_decimal::Decimal;
 
     use crate::runtime_subscription::{
@@ -12585,6 +12696,72 @@ sleep 30"#;
     }
 
     #[test]
+    fn shopify_receipt_identity_requires_the_exact_recovery_head_before_observe() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(25);
+        let request = uncertain_shopify_readback_request(&plane, &secrets, &project_id, now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("uncertain Shopify Application");
+        let before = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("uncertain Shopify Mission");
+        let events_before = service
+            .mission_events(&request.project_id, &request.mission_id)
+            .expect("Mission events before identity rejection");
+        drop(service);
+
+        let missing = ShopifyRecoveryCapsuleRef {
+            project_id: request.project_id.clone(),
+            effect_id: request.effect_id.clone(),
+            binding_digest: "c".repeat(64),
+            storage_ref: "context-material://must-not-leave-application".into(),
+            content_digest: "d".repeat(64),
+            key_version: 1,
+            object_revision: 1,
+            head_revision: 2,
+            state: ProviderRecoveryState::InFlight,
+        };
+        let result: Result<DesktopShopifyReceiptIdentityProjection, _> = plane
+            .dispatch_shopify_readback_reconciliation_admission(
+                &secrets,
+                request.clone(),
+                Some(&missing),
+                now + Duration::seconds(9),
+                |_, _, _, _, _, _, _| panic!("provider callback must not be reached"),
+            );
+        assert!(matches!(
+            result,
+            Err(DesktopShopifyReadbackError::Recovery(
+                ShopifyRecoveryError::Storage(StorageError::ScopedRecordNotFound {
+                    kind: "provider recovery",
+                    ..
+                })
+            ))
+        ));
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(10))
+            .expect("reopen Shopify Application");
+        let after = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("Mission after identity rejection");
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(
+            service
+                .mission_events(&request.project_id, &request.mission_id)
+                .expect("Mission events after identity rejection"),
+            events_before
+        );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+        assert!(cordis.active_effect_execution_scope().is_none());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn shopify_readback_admission_rejects_stale_scope_and_cancel_before_observe() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -12847,6 +13024,26 @@ sleep 30"#;
         assert!(!debug.contains("storage_reference"));
         assert!(!debug.contains("gid://shopify/Fulfillment/3001"));
         assert!(!debug.contains("n13.myshopify.com"));
+
+        let identity_request = DesktopShopifyReceiptIdentityRequest {
+            recovery: ShopifyRecoveryCapsuleRef {
+                project_id: request.project_id.clone(),
+                effect_id: request.effect_id.clone(),
+                binding_digest: "c".repeat(64),
+                storage_ref: "context-material://private-shopify-capsule".into(),
+                content_digest: "d".repeat(64),
+                key_version: 1,
+                object_revision: 1,
+                head_revision: 2,
+                state: ProviderRecoveryState::InFlight,
+            },
+            readback: request,
+        };
+        let identity_debug = format!("{identity_request:?}");
+        assert!(identity_debug.contains("[REDACTED]"));
+        assert!(!identity_debug.contains("private-shopify-capsule"));
+        assert!(!identity_debug.contains(&"c".repeat(64)));
+        assert!(!identity_debug.contains(&"d".repeat(64)));
     }
 
     #[test]

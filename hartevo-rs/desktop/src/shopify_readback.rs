@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use hartevo_application::connectors::shopify_readback::{
-    ShopifyBrokeredReadback, ShopifyReadbackMetadata,
+    ShopifyBrokeredReadback, ShopifyReadbackIdentityMetadata, ShopifyReadbackMetadata,
 };
 use hartevo_application::connectors::{
     ShopifyFulfillmentReadbackRequest, ShopifyReadbackBridgeError, ShopifyReadbackCancellation,
@@ -76,6 +76,21 @@ pub fn dispatch_os_keyring_shopify_readback_metadata(
 ) -> Result<ShopifyReadbackMetadata, ShopifyReadbackBridgeError> {
     dispatch_os_keyring_shopify_readback(binding, request, cancellation, consumer, service, now)
         .map(|outcome| outcome.metadata())
+}
+
+/// Production Desktop projection for an exact fulfillment identity. Provider
+/// and credential objects remain below this boundary, and the Application
+/// timestamp/lease checks run before the metadata can leave.
+pub fn dispatch_os_keyring_shopify_readback_identity_metadata(
+    binding: ShopifyReadbackCredentialBinding,
+    request: ShopifyFulfillmentReadbackRequest,
+    cancellation: ShopifyReadbackCancellation,
+    consumer: &SecretBrokerConsumer,
+    service: &mut SecretBrokerService,
+    now: DateTime<Utc>,
+) -> Result<ShopifyReadbackIdentityMetadata, ShopifyReadbackBridgeError> {
+    dispatch_os_keyring_shopify_readback(binding, request, cancellation, consumer, service, now)?
+        .identity_metadata(now)
 }
 
 #[cfg(test)]
