@@ -75,6 +75,10 @@ impl ShopifyReadbackCredentialBinding {
         shop: hartevo_commerce_connector::shopify::ShopDomain,
         credential_revision: u64,
     ) -> Result<Self, ShopifyReadbackBridgeError> {
+        let validated_shop =
+            hartevo_commerce_connector::shopify::ShopDomain::parse(shop.as_str().to_owned())
+                .map_err(|_| ShopifyReadbackBridgeError::BindingMismatch)?;
+        drop(shop);
         if scope.provider_id() != SHOPIFY_PROVIDER_ID
             || scope.capability_id() != SHOPIFY_FULFILLMENT_CAPABILITY
             || credential_revision == 0
@@ -85,14 +89,18 @@ impl ShopifyReadbackCredentialBinding {
             tenant_id: scope.tenant_id().clone(),
             project_id: scope.project_id().clone(),
             provider: SHOPIFY_PROVIDER_ID.to_owned(),
-            account_scope: format!("{}@{}", scope.account_id().as_str(), shop.as_str()),
+            account_scope: format!(
+                "{}@{}",
+                scope.account_id().as_str(),
+                validated_shop.as_str()
+            ),
             purpose: SHOPIFY_READBACK_SECRET_PURPOSE.to_owned(),
             version: credential_revision,
         };
         let credential_id = storage_reference.credential_id()?;
         Ok(Self {
             scope,
-            shop,
+            shop: validated_shop,
             storage_reference,
             broker_reference_id: format!("secret-ref-{credential_id}"),
         })
@@ -625,6 +633,12 @@ mod tests {
     #[test]
     fn production_constructor_is_sealed_to_native_transport_and_shop_drift_fails() {
         let scope = scope();
+        let bypassed_shop: ShopDomain =
+            serde_json::from_str("\"safe.myshopify.com@attacker.example\"").unwrap();
+        assert!(matches!(
+            ShopifyReadbackCredentialBinding::new(scope.clone(), bypassed_shop, 7),
+            Err(ShopifyReadbackBridgeError::BindingMismatch)
+        ));
         let shop = ShopDomain::parse("n12c.myshopify.com").unwrap();
         let binding = ShopifyReadbackCredentialBinding::new(scope, shop.clone(), 7).unwrap();
         let secrets = MemorySecretStore::default();

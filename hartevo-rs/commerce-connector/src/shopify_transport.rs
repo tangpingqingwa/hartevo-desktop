@@ -33,7 +33,7 @@ pub const SHOPIFY_READBACK_GLOBAL_TIMEOUT_SECONDS: u64 = 15;
 const SHOPIFY_FULFILLMENT_GID_PREFIX: &str = "gid://shopify/Fulfillment/";
 
 /// Exact provider identifier required by the fixed readback query.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ShopifyFulfillmentGid(String);
 
@@ -58,6 +58,16 @@ impl ShopifyFulfillmentGid {
     }
 }
 
+impl<'de> Deserialize<'de> for ShopifyFulfillmentGid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Content-free call model. Access-token bytes are deliberately absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShopifyFulfillmentReadbackRequest {
@@ -72,13 +82,25 @@ impl ShopifyFulfillmentReadbackRequest {
         api_version: ShopifyApiVersion,
         fulfillment_id: ShopifyFulfillmentGid,
     ) -> Result<Self, ShopifyNativeReadbackError> {
+        // Existing Shopify value objects predate this native credential path
+        // and may have been created through transparent deserialization.
+        // Re-parse at the final request boundary so an invalid typed wrapper
+        // can never steer an access token to an arbitrary host or node ID.
+        let validated_shop = ShopDomain::parse(shop.as_str().to_owned())
+            .map_err(|_| ShopifyNativeReadbackError::InvalidShopDomain)?;
+        let validated_fulfillment_id =
+            ShopifyFulfillmentGid::parse(fulfillment_id.as_str().to_owned())?;
+        // Consume and discard both potentially deserialized wrappers. Only
+        // the canonical values reconstructed above enter the request.
+        drop(shop);
+        drop(fulfillment_id);
         if api_version.as_str() != SHOPIFY_LATEST_API_VERSION {
             return Err(ShopifyNativeReadbackError::ApiVersionNotAllowed);
         }
         let request = Self {
-            shop,
+            shop: validated_shop,
             api_version,
-            fulfillment_id,
+            fulfillment_id: validated_fulfillment_id,
         };
         let encoded = serde_json::to_vec(&request.graphql_body())
             .map_err(|_| ShopifyNativeReadbackError::InvalidRequest)?;
@@ -235,6 +257,8 @@ impl ShopifyFulfillmentReadback {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ShopifyNativeReadbackError {
+    #[error("Shopify shop domain is invalid")]
+    InvalidShopDomain,
     #[error("Shopify fulfillment ID is invalid")]
     InvalidFulfillmentId,
     #[error("Shopify API version is outside the fixed allowlist")]
@@ -528,6 +552,38 @@ mod tests {
         assert_eq!(
             ShopifyFulfillmentGid::parse("shopify-provider-op-3001"),
             Err(ShopifyNativeReadbackError::InvalidFulfillmentId)
+        );
+        let bypassed_shop: ShopDomain = serde_json::from_str("\"attacker.example\"").unwrap();
+        assert_eq!(
+            ShopifyFulfillmentReadbackRequest::new(
+                bypassed_shop,
+                ShopifyApiVersion::latest(),
+                ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
+            ),
+            Err(ShopifyNativeReadbackError::InvalidShopDomain)
+        );
+        let bypassed_userinfo: ShopDomain =
+            serde_json::from_str("\"safe.myshopify.com@attacker.example\"").unwrap();
+        assert_eq!(
+            ShopifyFulfillmentReadbackRequest::new(
+                bypassed_userinfo,
+                ShopifyApiVersion::latest(),
+                ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
+            ),
+            Err(ShopifyNativeReadbackError::InvalidShopDomain)
+        );
+        let bypassed_gid = ShopifyFulfillmentGid("gid://shopify/Fulfillment/0001".to_owned());
+        assert_eq!(
+            ShopifyFulfillmentReadbackRequest::new(
+                ShopDomain::parse("n12c.myshopify.com").unwrap(),
+                ShopifyApiVersion::latest(),
+                bypassed_gid,
+            ),
+            Err(ShopifyNativeReadbackError::InvalidFulfillmentId)
+        );
+        assert!(
+            serde_json::from_str::<ShopifyFulfillmentGid>("\"gid://shopify/Fulfillment/0001\"")
+                .is_err()
         );
     }
 
