@@ -681,9 +681,6 @@ impl fmt::Debug for DesktopShopifyReadbackRequest {
     }
 }
 
-/// Alias for callers that use the admission terminology from the node.
-pub type DesktopShopifyReadbackAdmissionRequest = DesktopShopifyReadbackRequest;
-
 /// The Shopify readback result is deliberately just the Application's typed,
 /// redacted metadata projection. It is not a Receipt, Verification, E4 fact,
 /// or Mission completion result.
@@ -2975,14 +2972,26 @@ impl DesktopDataPlane {
                     return Err(CordisError::EffectReconciliationPermitMismatch.into());
                 }
                 let connection = service.load_connection(&project_id, &connection_id)?;
+                let connection_snapshot = connection.snapshot();
                 if connection.tenant_id() != &effect.tenant_id
                     || connection.project_id() != &project_id
                     || connection.provider() != SHOPIFY_PROVIDER_ID
                     || connection.account_id() != expected_secret_scope.account_id()
                     || connection.revision() != binding.credential_revision()
                     || !connection.permits_scopes(&effect.required_scopes, now)
+                    || connection_snapshot.expected_external_account_id != binding.shop().as_str()
+                    || connection_snapshot.last_probe.as_ref().is_none_or(|probe| {
+                        probe.observed_external_account_id != binding.shop().as_str()
+                    })
                 {
                     return Err(DesktopShopifyReadbackError::BindingMismatch);
+                }
+                if cancellation.is_cancelled() {
+                    return Err(DesktopShopifyReadbackError::Bridge(
+                        ShopifyReadbackBridgeError::Transport(
+                            ShopifyNativeReadbackError::CancelledBeforeDispatch,
+                        ),
+                    ));
                 }
                 observe(
                     secret_store,
@@ -5786,9 +5795,6 @@ impl From<CordisError> for DesktopShopifyReadbackError {
         Self::Desktop(DesktopDataError::Cordis(error))
     }
 }
-
-/// Admission terminology alias for callers and tests that use the node name.
-pub type DesktopShopifyReadbackAdmissionError = DesktopShopifyReadbackError;
 
 #[derive(Debug, Error)]
 pub enum DesktopDataError {
@@ -12048,12 +12054,28 @@ sleep 30"#;
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn uncertain_shopify_readback_request(
         plane: &DesktopDataPlane,
         secrets: &MemorySecretStore,
         project_id: &ProjectId,
         now: DateTime<Utc>,
+    ) -> DesktopShopifyReadbackRequest {
+        uncertain_shopify_readback_request_with_connection_shop(
+            plane,
+            secrets,
+            project_id,
+            now,
+            "n13.myshopify.com",
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn uncertain_shopify_readback_request_with_connection_shop(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        now: DateTime<Utc>,
+        connection_shop: &str,
     ) -> DesktopShopifyReadbackRequest {
         let started = plane
             .start_mission_with(
@@ -12148,7 +12170,7 @@ sleep 30"#;
                     project_id.clone(),
                     SHOPIFY_PROVIDER_ID,
                     account_id.clone(),
-                    "n13.myshopify.com",
+                    connection_shop,
                     granted_scopes.clone(),
                     now + Duration::seconds(3),
                 )
@@ -12162,7 +12184,7 @@ sleep 30"#;
                 &connection_id,
                 ConnectionProbe {
                     outcome: ProbeOutcome::Successful,
-                    observed_external_account_id: "n13.myshopify.com".into(),
+                    observed_external_account_id: connection_shop.into(),
                     granted_scopes,
                     probed_at: now + Duration::seconds(3),
                     valid_until: now + Duration::days(30),
@@ -12379,6 +12401,35 @@ sleep 30"#;
         _now: DateTime<Utc>,
     ) -> Result<DesktopShopifyReadbackProjection, DesktopShopifyReadbackError> {
         panic!("Shopify provider callback must not be reached");
+    }
+
+    #[derive(Debug)]
+    struct CancelAfterFirstSecretRead<'a> {
+        inner: &'a MemorySecretStore,
+        cancellation: ShopifyReadbackCancellation,
+        reads: AtomicUsize,
+    }
+
+    impl SecretStore for CancelAfterFirstSecretRead<'_> {
+        fn put(
+            &self,
+            reference: &SecretReference,
+            secret: &SecretBytes,
+        ) -> Result<(), SecretStoreError> {
+            self.inner.put(reference, secret)
+        }
+
+        fn get(&self, reference: &SecretReference) -> Result<SecretBytes, SecretStoreError> {
+            let result = self.inner.get(reference);
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.cancellation.cancel();
+            }
+            result
+        }
+
+        fn delete(&self, reference: &SecretReference) -> Result<(), SecretStoreError> {
+            self.inner.delete(reference)
+        }
     }
 
     struct DesktopPreviewReconciler {
@@ -12698,6 +12749,57 @@ sleep 30"#;
                 .expect("Mission events after negative reads"),
             events_before
         );
+    }
+
+    #[test]
+    fn shopify_readback_admission_rejects_a_connection_for_another_shop() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(40);
+        let request = uncertain_shopify_readback_request_with_connection_shop(
+            &plane,
+            &secrets,
+            &project_id,
+            now,
+            "other.myshopify.com",
+        );
+        assert!(matches!(
+            plane.dispatch_shopify_readback_admission(
+                &secrets,
+                request,
+                now + Duration::seconds(9),
+                unexpected_shopify_observe,
+            ),
+            Err(DesktopShopifyReadbackError::BindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn shopify_readback_admission_rechecks_cancellation_inside_the_permit() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(50);
+        let request = uncertain_shopify_readback_request(&plane, &secrets, &project_id, now);
+        let cancelling_store = CancelAfterFirstSecretRead {
+            inner: &secrets,
+            cancellation: request.cancellation.clone(),
+            reads: AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            plane.dispatch_shopify_readback_admission(
+                &cancelling_store,
+                request,
+                now + Duration::seconds(9),
+                |_, _, _, _, _, _, _| panic!("provider callback must not be reached"),
+            ),
+            Err(DesktopShopifyReadbackError::Bridge(
+                ShopifyReadbackBridgeError::Transport(
+                    ShopifyNativeReadbackError::CancelledBeforeDispatch
+                )
+            ))
+        ));
+        assert!(cancelling_store.reads.load(Ordering::SeqCst) >= 1);
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+        assert!(cordis.active_effect_execution_scope().is_none());
     }
 
     #[test]

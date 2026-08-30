@@ -384,9 +384,6 @@ pub struct ShopifyReadbackMetadata {
     pub provenance_class: ProviderProvenanceClass,
 }
 
-/// Naming alias for callers that describe the value as a projection.
-pub type ShopifyReadbackMetadataProjection = ShopifyReadbackMetadata;
-
 impl ShopifyBrokeredReadback {
     pub fn readback(&self) -> &ShopifyFulfillmentReadback {
         &self.readback
