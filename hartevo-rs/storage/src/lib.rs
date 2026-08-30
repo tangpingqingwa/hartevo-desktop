@@ -4419,27 +4419,7 @@ impl ProjectStore {
         }
         if current_schema_version(&self.connection)? < 48 {
             let transaction = self.connection.transaction()?;
-            transaction.execute_batch(
-                "CREATE TABLE IF NOT EXISTS provider_recovery_heads (
-                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
-                   project_id TEXT NOT NULL CHECK (length(trim(project_id)) > 0),
-                   mission_id TEXT NOT NULL CHECK (length(trim(mission_id)) > 0),
-                   effect_id TEXT NOT NULL CHECK (length(trim(effect_id)) > 0),
-                   binding_digest TEXT NOT NULL CHECK (length(binding_digest) = 64),
-                   state TEXT NOT NULL CHECK (state IN (
-                     'prepared', 'in_flight', 'uncertain', 'not_executed',
-                     'receipt_observed', 'verified', 'failed_closed'
-                   )),
-                   revision INTEGER NOT NULL CHECK (revision > 0),
-                   updated_at TEXT NOT NULL,
-                   record_json TEXT NOT NULL,
-                   PRIMARY KEY (project_id, effect_id)
-                 );
-                 CREATE INDEX IF NOT EXISTS provider_recovery_scope_state_idx
-                   ON provider_recovery_heads(
-                     tenant_id, project_id, mission_id, state, updated_at
-                   );",
-            )?;
+            provider_recovery_store::install_provider_recovery_schema(&transaction)?;
             provider_recovery_store::verify_provider_recovery_schema(&transaction)?;
             record_migration(&transaction, 48)?;
             transaction.commit()?;

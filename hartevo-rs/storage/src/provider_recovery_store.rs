@@ -1,48 +1,85 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use hartevo_domain_kernel::{EffectId, MissionId, ProjectId, TenantId};
+use hartevo_domain_kernel::{Effect, EffectId, MissionId, ProjectId, TenantId};
+use hartevo_effect_broker::PermissionEvidence;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{ProjectStore, StorageError};
+use crate::{ProjectStore, StorageError, authorization, normalized};
+
+const PROVIDER_RECOVERY_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS provider_recovery_heads (
+  tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+  project_id TEXT NOT NULL CHECK (length(trim(project_id)) > 0),
+  mission_id TEXT NOT NULL CHECK (length(trim(mission_id)) > 0),
+  effect_id TEXT NOT NULL CHECK (length(trim(effect_id)) > 0),
+  binding_digest TEXT NOT NULL CHECK (length(binding_digest) = 64),
+  state TEXT NOT NULL CHECK (state IN (
+    'prepared', 'in_flight', 'uncertain', 'not_executed',
+    'receipt_observed', 'verified', 'failed_closed'
+  )),
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  updated_at TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  PRIMARY KEY (project_id, effect_id)
+)";
+
+const PROVIDER_RECOVERY_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS provider_recovery_scope_state_idx
+     ON provider_recovery_heads(tenant_id, project_id, mission_id, state, updated_at)";
+
+pub(crate) fn install_provider_recovery_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StorageError> {
+    transaction.execute_batch(PROVIDER_RECOVERY_TABLE_SQL)?;
+    transaction.execute_batch(PROVIDER_RECOVERY_INDEX_SQL)?;
+    Ok(())
+}
 
 pub(crate) fn verify_provider_recovery_schema(
     connection: &rusqlite::Connection,
 ) -> Result<(), StorageError> {
-    let columns = connection
-        .prepare("PRAGMA table_info(provider_recovery_heads)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if columns
-        != [
-            "tenant_id",
-            "project_id",
-            "mission_id",
-            "effect_id",
-            "binding_digest",
-            "state",
-            "revision",
-            "updated_at",
-            "record_json",
-        ]
-    {
+    let table_sql = schema_sql(connection, "table", "provider_recovery_heads")?;
+    let index_sql = schema_sql(connection, "index", "provider_recovery_scope_state_idx")?;
+    if normalize_schema_sql(&table_sql) != normalize_schema_sql(PROVIDER_RECOVERY_TABLE_SQL) {
         return Err(StorageError::DomainDecode(
-            "provider recovery schema does not match v48".into(),
+            "provider recovery table definition does not match v48".into(),
         ));
     }
-    let index_count = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-         WHERE type = 'index' AND name = 'provider_recovery_scope_state_idx'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if index_count != 1 {
+    if normalize_schema_sql(&index_sql) != normalize_schema_sql(PROVIDER_RECOVERY_INDEX_SQL) {
         return Err(StorageError::DomainDecode(
-            "provider recovery v48 index is missing".into(),
+            "provider recovery v48 index definition does not match".into(),
         ));
     }
     Ok(())
+}
+
+fn schema_sql(
+    connection: &rusqlite::Connection,
+    object_type: &str,
+    name: &str,
+) -> Result<String, StorageError> {
+    connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            params![object_type, name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::DomainDecode(format!(
+                "provider recovery v48 {object_type} {name} is missing"
+            ))
+        })
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .replace("create table if not exists", "create table")
+        .replace("create index if not exists", "create index")
 }
 
 /// Durable state for one provider write. Only `Prepared` may be claimed for
@@ -376,7 +413,8 @@ impl ProjectStore {
         })
     }
 
-    pub fn claim_provider_recovery_execution(
+    #[cfg(test)]
+    pub(crate) fn claim_provider_recovery_execution(
         &mut self,
         project_id: &ProjectId,
         effect_id: &EffectId,
@@ -390,6 +428,35 @@ impl ProjectStore {
             expected_revision,
             expected_binding_digest,
             ProviderRecoveryTransition::Claim,
+            None,
+            now,
+        )
+    }
+
+    /// Claims one prepared recovery only after the current durable Mission,
+    /// Effect/Approval, and permission fences have been re-read and locked in
+    /// the same SQLCipher transaction as the state transition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_provider_recovery_execution_authorized(
+        &mut self,
+        project_id: &ProjectId,
+        effect_id: &EffectId,
+        expected_revision: u64,
+        expected_binding_digest: &str,
+        effect: &Effect,
+        permission_evidence: &PermissionEvidence,
+        now: DateTime<Utc>,
+    ) -> Result<ProviderRecoveryHead, StorageError> {
+        self.transition_provider_recovery(
+            project_id,
+            effect_id,
+            expected_revision,
+            expected_binding_digest,
+            ProviderRecoveryTransition::Claim,
+            Some(ProviderRecoveryClaimAuthority {
+                effect,
+                permission_evidence,
+            }),
             now,
         )
     }
@@ -408,6 +475,7 @@ impl ProjectStore {
             expected_revision,
             expected_binding_digest,
             ProviderRecoveryTransition::Uncertain,
+            None,
             now,
         )
     }
@@ -432,6 +500,7 @@ impl ProjectStore {
                 readback_storage_ref,
                 readback_content_digest,
             },
+            None,
             now,
         )
     }
@@ -458,6 +527,7 @@ impl ProjectStore {
                 readback_content_digest,
                 receipt_evidence_digest,
             },
+            None,
             now,
         )
     }
@@ -479,6 +549,7 @@ impl ProjectStore {
             ProviderRecoveryTransition::Verified {
                 verification_evidence_digest,
             },
+            None,
             now,
         )
     }
@@ -497,6 +568,7 @@ impl ProjectStore {
             expected_revision,
             expected_binding_digest,
             ProviderRecoveryTransition::FailedClosed,
+            None,
             now,
         )
     }
@@ -509,6 +581,7 @@ impl ProjectStore {
         expected_revision: u64,
         expected_binding_digest: &str,
         transition: ProviderRecoveryTransition,
+        claim_authority: Option<ProviderRecoveryClaimAuthority<'_>>,
         now: DateTime<Utc>,
     ) -> Result<ProviderRecoveryHead, StorageError> {
         if !is_sha256(expected_binding_digest) {
@@ -526,6 +599,12 @@ impl ProjectStore {
             || head.binding.binding_digest != expected_binding_digest
         {
             return Err(conflict(effect_id, expected_revision));
+        }
+        if let Some(authority) = claim_authority {
+            if !matches!(transition, ProviderRecoveryTransition::Claim) {
+                return Err(invalid_record());
+            }
+            validate_claim_authority(&transaction, &head, &authority)?;
         }
         let previous_state = head.state;
         apply_transition(&mut head, transition, now)?;
@@ -552,6 +631,55 @@ impl ProjectStore {
         transaction.commit()?;
         Ok(head)
     }
+}
+
+struct ProviderRecoveryClaimAuthority<'a> {
+    effect: &'a Effect,
+    permission_evidence: &'a PermissionEvidence,
+}
+
+fn validate_claim_authority(
+    transaction: &rusqlite::Transaction<'_>,
+    head: &ProviderRecoveryHead,
+    authority: &ProviderRecoveryClaimAuthority<'_>,
+) -> Result<(), StorageError> {
+    let binding = &head.binding;
+    let effect = authority.effect;
+    if effect.tenant_id != binding.tenant_id
+        || effect.project_id != binding.project_id
+        || effect.mission_id != binding.mission_id
+        || effect.id != binding.effect_id
+        || effect.approval_digest() != binding.approval_scope_digest
+        || effect.approval.as_ref().is_none_or(|approval| {
+            approval.permission_digest != binding.broker_authorization_digest
+        })
+    {
+        return Err(invalid_record());
+    }
+    let mission =
+        normalized::load_mission_normalized(transaction, &binding.project_id, &binding.mission_id)?
+            .ok_or_else(invalid_record)?;
+    let current_effect = mission
+        .effects
+        .iter()
+        .find(|candidate| candidate.id == binding.effect_id)
+        .ok_or_else(invalid_record)?;
+    if mission.tenant_id != binding.tenant_id
+        || mission.revision != binding.mission_revision
+        || current_effect != effect
+    {
+        return Err(invalid_record());
+    }
+    authority
+        .permission_evidence
+        .validate_for_effect(current_effect)
+        .map_err(|_| invalid_record())?;
+    authorization::validate_permission_fences(
+        transaction,
+        current_effect,
+        authority.permission_evidence,
+    )
+    .map_err(|_| invalid_record())
 }
 
 enum ProviderRecoveryTransition {
@@ -877,6 +1005,59 @@ mod tests {
             .unwrap();
         retry.migrate().unwrap();
         assert_eq!(retry.schema_version().unwrap(), 48);
+    }
+
+    #[test]
+    fn migration_v48_rejects_constraint_and_index_collisions() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE provider_recovery_heads;
+                 DELETE FROM schema_migrations WHERE version >= 48;
+                 CREATE TABLE provider_recovery_heads (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   effect_id TEXT NOT NULL,
+                   binding_digest TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   revision INTEGER NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   record_json TEXT NOT NULL
+                 );
+                 CREATE INDEX provider_recovery_scope_state_idx
+                   ON provider_recovery_heads(effect_id);",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.migrate(),
+            Err(StorageError::DomainDecode(_))
+        ));
+        assert_eq!(store.schema_version().unwrap(), 47);
+        assert!(verify_provider_recovery_schema(&store.connection).is_err());
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO provider_recovery_heads VALUES
+                   ('tenant', 'project', 'mission', 'effect', 'digest', 'prepared', 1, 'now', '{}');
+                 INSERT INTO provider_recovery_heads VALUES
+                   ('tenant', 'project', 'mission', 'effect', 'digest', 'in_flight', 2, 'later', '{}');",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM provider_recovery_heads
+                     WHERE project_id = 'project' AND effect_id = 'effect'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
