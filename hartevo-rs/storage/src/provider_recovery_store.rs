@@ -1077,6 +1077,29 @@ mod tests {
     }
 
     #[test]
+    fn schema_verifier_rejects_index_drift_when_v48_database_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider-recovery-v48.sqlite3");
+        {
+            let store = ProjectStore::open(&path, &database_key()).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 48);
+            store
+                .connection
+                .execute_batch(
+                    "DROP INDEX provider_recovery_scope_state_idx;
+                     CREATE INDEX provider_recovery_scope_state_idx
+                       ON provider_recovery_heads(effect_id);",
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            ProjectStore::open(&path, &database_key()),
+            Err(StorageError::DomainDecode(_))
+        ));
+    }
+
+    #[test]
     fn prepared_head_is_idempotent_and_claim_is_single_use() {
         let mut store = ProjectStore::in_memory().unwrap();
         let prepared = prepared_head();

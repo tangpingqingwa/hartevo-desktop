@@ -4424,6 +4424,7 @@ impl ProjectStore {
             record_migration(&transaction, 48)?;
             transaction.commit()?;
         }
+        provider_recovery_store::verify_provider_recovery_schema(&self.connection)?;
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
