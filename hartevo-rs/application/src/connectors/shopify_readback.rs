@@ -12,7 +12,8 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 pub use hartevo_commerce_connector::shopify::{SHOPIFY_PROVIDER_ID, ShopDomain, ShopifyApiVersion};
 pub use hartevo_commerce_connector::shopify_effect::{
-    SHOPIFY_FULFILLMENT_CAPABILITY, ShopifyFulfillmentOrderGid, ShopifyOrderGid,
+    SHOPIFY_FULFILLMENT_CAPABILITY, ShopifyFulfillmentLineItem, ShopifyFulfillmentOrderGid,
+    ShopifyOrderGid,
 };
 pub use hartevo_commerce_connector::shopify_transport::{
     ShopifyAdminReadbackTransport, ShopifyExpectedFulfillmentIdentity, ShopifyFulfillmentGid,
@@ -538,6 +539,16 @@ fn line_item_binding_digest(identity: &ShopifyFulfillmentReceiptIdentity) -> Str
     format!("{:x}", digest.finalize())
 }
 
+pub(crate) fn approved_line_item_binding_digest(items: &[ShopifyFulfillmentLineItem]) -> String {
+    let mut digest = Sha256::new();
+    hash_field(&mut digest, "hartevo-shopify-readback-line-items/v1");
+    for item in items {
+        hash_field(&mut digest, item.line_item_gid.as_str());
+        hash_field(&mut digest, &item.quantity.to_string());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 fn hash_field(digest: &mut Sha256, value: &str) {
     digest.update(value.len().to_be_bytes());
     digest.update(value.as_bytes());
@@ -584,6 +595,71 @@ where
         (Err(error), _) => Err(ShopifyReadbackBridgeError::SecretBroker(error)),
         (Ok(_), _) => Err(ShopifyReadbackBridgeError::MissingProviderOutcome),
     }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ExactFixtureReadbackTransport {
+    provider_created_at: DateTime<Utc>,
+    provider_updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+impl ShopifyAdminReadbackTransport for ExactFixtureReadbackTransport {
+    fn readback(
+        &self,
+        _access_token: &[u8],
+        request: &ShopifyFulfillmentReadbackRequest,
+        cancellation: &ShopifyReadbackCancellation,
+    ) -> Result<ShopifyFulfillmentReadback, ShopifyNativeReadbackError> {
+        if cancellation.is_cancelled() {
+            return Err(ShopifyNativeReadbackError::CancelledBeforeDispatch);
+        }
+        ShopifyFulfillmentReadback::fixture_exact(
+            request,
+            "SUCCESS",
+            self.provider_created_at,
+            self.provider_updated_at,
+        )
+    }
+}
+
+/// Produces an unforgeable brokered fixture for Application boundary tests.
+/// This helper is unavailable to production and downstream crates.
+#[cfg(test)]
+pub(crate) fn fixture_brokered_exact_readback(
+    binding: ShopifyReadbackCredentialBinding,
+    request: ShopifyFulfillmentReadbackRequest,
+    provider_created_at: DateTime<Utc>,
+    provider_updated_at: DateTime<Utc>,
+    used_at: DateTime<Utc>,
+) -> Result<ShopifyBrokeredReadback, ShopifyReadbackBridgeError> {
+    let secret_store = hartevo_storage::MemorySecretStore::default();
+    secret_store.put(
+        binding.storage_reference(),
+        &hartevo_storage::SecretBytes::new(b"fixture-only-shopify-readback".to_vec())?,
+    )?;
+    let definition = SecretBrokerServiceDefinition::production()?;
+    let reference = binding.broker_reference(&definition)?;
+    let mut service = SecretBrokerService::new(definition, reference)?;
+    service.mount(used_at)?;
+    let consumer = SecretBrokerConsumer::new(
+        "secret-consumer-fixture-shopify-receipt",
+        binding.scope().tenant_id().clone(),
+        binding.scope().project_id().clone(),
+        binding.scope().mission_id().clone(),
+    )?;
+    let mut provider = ShopifySecretReadbackProvider::fixture(
+        &secret_store,
+        binding,
+        request,
+        ShopifyReadbackCancellation::default(),
+        ExactFixtureReadbackTransport {
+            provider_created_at,
+            provider_updated_at,
+        },
+    )?;
+    dispatch_shopify_readback(&consumer, &mut service, &mut provider, used_at)
 }
 
 #[cfg(test)]

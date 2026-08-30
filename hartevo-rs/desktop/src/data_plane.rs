@@ -12,9 +12,10 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_application::connectors::shopify_readback::{
-    SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopifyFulfillmentReadbackRequest,
-    ShopifyNativeReadbackError, ShopifyReadbackBridgeError, ShopifyReadbackCancellation,
-    ShopifyReadbackCredentialBinding, ShopifyReadbackIdentityMetadata, ShopifyReadbackMetadata,
+    SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopifyBrokeredReadback,
+    ShopifyFulfillmentReadbackRequest, ShopifyNativeReadbackError, ShopifyReadbackBridgeError,
+    ShopifyReadbackCancellation, ShopifyReadbackCredentialBinding, ShopifyReadbackIdentityMetadata,
+    ShopifyReadbackMetadata,
 };
 use hartevo_application::connectors::shopify_recovery::{
     ShopifyRecoveryCapsuleRef, ShopifyRecoveryError,
@@ -64,15 +65,16 @@ use hartevo_domain_kernel::{
     VerificationStatus, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
-    BrokerResult, EffectBroker, EffectExecutor, EffectPolicy, EffectRateLimit, EffectReconciler,
-    EffectVerifier, ExecutionDisposition, ReconciliationObservation, SecretBrokerConsumer,
-    SecretBrokerService, SecretScope,
+    BrokerResult, EffectBroker, EffectExecutor, EffectPolicy, EffectRateLimit,
+    EffectReceiptReconciler, EffectReconciler, EffectVerifier, ExecutionDisposition,
+    ReceiptReconciliationFailure, ReceiptReconciliationResult, ReconciliationObservation,
+    SecretBrokerConsumer, SecretBrokerService, SecretScope, StagedReceiptFound,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
 use hartevo_storage::{
     ContextMaterialStoreError, DatabaseKey, KeyMaterial, OsSecretStore, ProjectStore,
-    RuntimeTurnStartupReconciliation, SecretBytes, SecretReference, SecretStore, SecretStoreError,
-    StorageError,
+    ProviderRecoveryState, RuntimeTurnStartupReconciliation, SecretBytes, SecretReference,
+    SecretStore, SecretStoreError, StorageError,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -95,7 +97,7 @@ use crate::runtime_plane::{
 };
 use crate::runtime_subscription::DesktopCatalogRuntimeDispatchAuthority;
 use crate::shopify_readback::{
-    dispatch_os_keyring_shopify_readback_identity_metadata,
+    dispatch_os_keyring_shopify_readback, dispatch_os_keyring_shopify_readback_identity_metadata,
     dispatch_os_keyring_shopify_readback_metadata, prepare_shopify_readback_broker,
 };
 
@@ -713,6 +715,17 @@ impl fmt::Debug for DesktopShopifyReceiptIdentityRequest {
 /// Verification, E4 fact, or Mission completion result.
 pub type DesktopShopifyReceiptIdentityProjection = ShopifyReadbackIdentityMetadata;
 
+/// First durable Shopify recovery projection. It exposes the Receipt id and
+/// recovery state only; the provider identity, encrypted CAS locator, and
+/// deferred Verification remain below the Desktop boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesktopShopifyReceiptRecovery {
+    pub snapshot: DesktopSnapshot,
+    pub disposition: ExecutionDisposition,
+    pub receipt_id: ReceiptId,
+    pub recovery_state: ProviderRecoveryState,
+}
+
 /// Read-only reconciliation projection. The Receipt was recovered/reused,
 /// never produced by a provider execution in this call, and remains distinct
 /// from the independent Verification.
@@ -765,6 +778,240 @@ where
             };
         }
         self.delegate.reconcile(effect)
+    }
+}
+
+struct DesktopShopifyReceiptFoundReconciler<'a, S, Observe> {
+    secret_store: &'a S,
+    authority_service: &'a mut ApplicationService,
+    context_session: &'a ProjectContextMaterialSession,
+    binding: ShopifyReadbackCredentialBinding,
+    selector: ShopifyFulfillmentReadbackRequest,
+    cancellation: ShopifyReadbackCancellation,
+    recovery: ShopifyRecoveryCapsuleRef,
+    expected_effect: Effect,
+    expected_mission_revision: u64,
+    expected_scope: AuthorityScope,
+    observation_authority_digest: String,
+    entry_at: DateTime<Utc>,
+    observe: Observe,
+}
+
+impl<S, Observe> EffectReceiptReconciler for DesktopShopifyReceiptFoundReconciler<'_, S, Observe>
+where
+    S: SecretStore,
+    Observe: FnMut(
+        &S,
+        ShopifyReadbackCredentialBinding,
+        ShopifyFulfillmentReadbackRequest,
+        ShopifyReadbackCancellation,
+        &SecretBrokerConsumer,
+        &mut SecretBrokerService,
+        DateTime<Utc>,
+    ) -> Result<ShopifyBrokeredReadback, DesktopShopifyReadbackError>,
+{
+    fn reconcile_receipt(
+        &mut self,
+        effect: &Effect,
+        execution_started_at: DateTime<Utc>,
+    ) -> Result<StagedReceiptFound, ReceiptReconciliationFailure> {
+        self.reconcile_receipt_inner(effect, execution_started_at)
+            .map_err(|error| classify_shopify_receipt_reconciliation_failure(&error))
+    }
+}
+
+impl<S, Observe> DesktopShopifyReceiptFoundReconciler<'_, S, Observe>
+where
+    S: SecretStore,
+    Observe: FnMut(
+        &S,
+        ShopifyReadbackCredentialBinding,
+        ShopifyFulfillmentReadbackRequest,
+        ShopifyReadbackCancellation,
+        &SecretBrokerConsumer,
+        &mut SecretBrokerService,
+        DateTime<Utc>,
+    ) -> Result<ShopifyBrokeredReadback, DesktopShopifyReadbackError>,
+{
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_receipt_inner(
+        &mut self,
+        effect: &Effect,
+        execution_started_at: DateTime<Utc>,
+    ) -> Result<StagedReceiptFound, DesktopShopifyReadbackError> {
+        if effect != &self.expected_effect {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        if self.cancellation.is_cancelled() {
+            return Err(ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::CancelledBeforeDispatch,
+            )
+            .into());
+        }
+        let mission = self.authority_service.load_mission(
+            &self.expected_effect.project_id,
+            &self.expected_effect.mission_id,
+        )?;
+        let current_effect = mission
+            .effect(&self.expected_effect.id)
+            .map_err(ApplicationError::from)?;
+        let current_scope = mission_authority_scope(
+            self.authority_service,
+            &self.expected_effect.project_id,
+            &self.expected_effect.mission_id,
+        )?;
+        let connection_id = self
+            .expected_effect
+            .connection_id
+            .as_ref()
+            .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+        let account_id = self
+            .expected_effect
+            .account_id
+            .as_ref()
+            .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+        let connection = self
+            .authority_service
+            .load_connection(&self.expected_effect.project_id, connection_id)?;
+        let connection_snapshot = connection.snapshot();
+        if mission.revision != self.expected_mission_revision
+            || current_effect != &self.expected_effect
+            || current_scope != self.expected_scope
+            || connection.tenant_id() != &self.expected_effect.tenant_id
+            || connection.provider() != SHOPIFY_PROVIDER_ID
+            || connection.account_id() != account_id
+            || connection.revision() != self.binding.credential_revision()
+            || !connection.permits_scopes(&self.expected_effect.required_scopes, self.entry_at)
+            || connection_snapshot.expected_external_account_id != self.binding.shop().as_str()
+            || connection_snapshot.last_probe.as_ref().is_none_or(|probe| {
+                probe.observed_external_account_id != self.binding.shop().as_str()
+            })
+        {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        let reopened = self
+            .authority_service
+            .reopen_shopify_reconciliation(self.context_session, &self.recovery)?;
+        if !reopened.matches_current_fence(
+            &self.expected_effect,
+            self.expected_mission_revision,
+            self.binding.credential_revision(),
+        ) {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        let exact_request = reopened
+            .bind_exact_readback(&self.selector, &self.observation_authority_digest)
+            .map_err(ShopifyReadbackBridgeError::Transport)?;
+        let (consumer, mut broker_service) =
+            prepare_shopify_readback_broker(&self.binding, self.entry_at)?;
+        let brokered = (self.observe)(
+            self.secret_store,
+            self.binding.clone(),
+            exact_request.clone(),
+            self.cancellation.clone(),
+            &consumer,
+            &mut broker_service,
+            self.entry_at,
+        )?;
+        if self.cancellation.is_cancelled() {
+            return Err(ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::CancelledAfterDispatch,
+            )
+            .into());
+        }
+
+        let mission = self.authority_service.load_mission(
+            &self.expected_effect.project_id,
+            &self.expected_effect.mission_id,
+        )?;
+        let current_effect = mission
+            .effect(&self.expected_effect.id)
+            .map_err(ApplicationError::from)?;
+        let current_scope = mission_authority_scope(
+            self.authority_service,
+            &self.expected_effect.project_id,
+            &self.expected_effect.mission_id,
+        )?;
+        let connection = self
+            .authority_service
+            .load_connection(&self.expected_effect.project_id, connection_id)?;
+        if mission.revision != self.expected_mission_revision
+            || current_effect != &self.expected_effect
+            || current_scope != self.expected_scope
+            || connection.snapshot() != connection_snapshot
+        {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        let reopened = self
+            .authority_service
+            .reopen_shopify_reconciliation(self.context_session, &self.recovery)?;
+        if !reopened.matches_current_fence(
+            current_effect,
+            self.expected_mission_revision,
+            self.binding.credential_revision(),
+        ) {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        reopened
+            .seal_receipt_found(
+                &brokered,
+                &self.selector,
+                &exact_request,
+                connection_snapshot,
+                self.context_session,
+                &self.observation_authority_digest,
+                execution_started_at,
+                self.entry_at,
+            )
+            .map_err(DesktopShopifyReadbackError::Recovery)
+    }
+}
+
+fn classify_shopify_receipt_reconciliation_failure(
+    error: &DesktopShopifyReadbackError,
+) -> ReceiptReconciliationFailure {
+    match error {
+        DesktopShopifyReadbackError::Bridge(ShopifyReadbackBridgeError::Transport(
+            ShopifyNativeReadbackError::CancelledBeforeDispatch
+            | ShopifyNativeReadbackError::CancelledAfterDispatch,
+        )) => ReceiptReconciliationFailure::Cancelled,
+        DesktopShopifyReadbackError::Bridge(ShopifyReadbackBridgeError::Transport(
+            ShopifyNativeReadbackError::NotFound,
+        )) => ReceiptReconciliationFailure::NotFound,
+        DesktopShopifyReadbackError::Bridge(ShopifyReadbackBridgeError::Transport(
+            ShopifyNativeReadbackError::Unauthorized | ShopifyNativeReadbackError::Forbidden,
+        )) => ReceiptReconciliationFailure::Unauthorized,
+        DesktopShopifyReadbackError::Bridge(ShopifyReadbackBridgeError::Transport(
+            ShopifyNativeReadbackError::RateLimited,
+        )) => ReceiptReconciliationFailure::RateLimited,
+        DesktopShopifyReadbackError::Bridge(
+            ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::TimedOut
+                | ShopifyNativeReadbackError::TransportUnavailable,
+            )
+            | ShopifyReadbackBridgeError::SecretStore(_)
+            | ShopifyReadbackBridgeError::SecretBroker(_),
+        ) => ReceiptReconciliationFailure::ProviderUnavailable,
+        DesktopShopifyReadbackError::Recovery(ShopifyRecoveryError::ContextMaterial(_)) => {
+            ReceiptReconciliationFailure::EvidenceUnavailable
+        }
+        DesktopShopifyReadbackError::Recovery(ShopifyRecoveryError::InvalidReceiptEvidence)
+        | DesktopShopifyReadbackError::Bridge(
+            ShopifyReadbackBridgeError::MissingReceiptIdentity
+            | ShopifyReadbackBridgeError::InvalidReceiptIdentity
+            | ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::UnexpectedHttpStatus
+                | ShopifyNativeReadbackError::GraphqlRejected
+                | ShopifyNativeReadbackError::ResponseTooLarge
+                | ShopifyNativeReadbackError::MalformedResponse,
+            ),
+        ) => ReceiptReconciliationFailure::InvalidEvidence,
+        DesktopShopifyReadbackError::InvalidRequest
+        | DesktopShopifyReadbackError::BindingMismatch
+        | DesktopShopifyReadbackError::Bridge(_)
+        | DesktopShopifyReadbackError::Recovery(_)
+        | DesktopShopifyReadbackError::Desktop(_)
+        | DesktopShopifyReadbackError::Dispatch(_) => ReceiptReconciliationFailure::BindingMismatch,
     }
 }
 
@@ -2885,6 +3132,234 @@ impl DesktopDataPlane {
                 .map_err(DesktopShopifyReadbackError::Bridge)
             },
         )
+    }
+
+    /// Claims the reconciliation lease before performing the real Shopify
+    /// readback, then atomically records only the exact ReceiptFound outcome.
+    /// Independent Verification remains a later, separate phase.
+    pub fn recover_shopify_receipt_found_os(
+        &self,
+        request: DesktopShopifyReceiptIdentityRequest,
+        broker: &mut EffectBroker,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopShopifyReceiptRecovery, DesktopShopifyReadbackError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)
+            .map_err(DesktopDataError::from)
+            .map_err(DesktopShopifyReadbackError::Desktop)?;
+        self.recover_shopify_receipt_found_with(
+            &secret_store,
+            request,
+            broker,
+            now,
+            |_, binding, readback, cancellation, consumer, service, at| {
+                dispatch_os_keyring_shopify_readback(
+                    binding,
+                    readback,
+                    cancellation,
+                    consumer,
+                    service,
+                    at,
+                )
+                .map_err(DesktopShopifyReadbackError::Bridge)
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn recover_shopify_receipt_found_with<S, Observe>(
+        &self,
+        secret_store: &S,
+        request: DesktopShopifyReceiptIdentityRequest,
+        broker: &mut EffectBroker,
+        now: DateTime<Utc>,
+        observe: Observe,
+    ) -> Result<DesktopShopifyReceiptRecovery, DesktopShopifyReadbackError>
+    where
+        S: SecretStore,
+        Observe: FnMut(
+            &S,
+            ShopifyReadbackCredentialBinding,
+            ShopifyFulfillmentReadbackRequest,
+            ShopifyReadbackCancellation,
+            &SecretBrokerConsumer,
+            &mut SecretBrokerService,
+            DateTime<Utc>,
+        ) -> Result<ShopifyBrokeredReadback, DesktopShopifyReadbackError>,
+    {
+        let DesktopShopifyReceiptIdentityRequest {
+            readback: request,
+            recovery,
+        } = request;
+        let DesktopShopifyReadbackRequest {
+            project_id,
+            mission_id,
+            effect_id,
+            expected_scope_digest,
+            expected_broker_authorization_digest,
+            expected_mission_revision,
+            binding,
+            readback,
+            cancellation,
+        } = request;
+        let observation_authority_digest = recovery
+            .readback_authority_digest(&readback)
+            .map_err(ShopifyReadbackBridgeError::Transport)?;
+        if expected_mission_revision == 0
+            || !is_canonical_sha256(&expected_scope_digest)
+            || !is_canonical_sha256(&expected_broker_authorization_digest)
+            || binding.scope().project_id() != &project_id
+            || binding.scope().mission_id() != &mission_id
+            || binding.scope().provider_id() != SHOPIFY_PROVIDER_ID
+            || binding.scope().capability_id() != SHOPIFY_FULFILLMENT_CAPABILITY
+            || binding.shop() != readback.shop()
+            || readback.expected_identity().is_some()
+            || recovery.project_id != project_id
+            || recovery.effect_id != effect_id
+        {
+            return Err(DesktopShopifyReadbackError::InvalidRequest);
+        }
+
+        let (mut service, runtime_reconciliation, context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let database_secret = secret_store
+            .get(&self.database_key_reference)
+            .map_err(|error| {
+                if matches!(error, SecretStoreError::SecretNotFound) {
+                    DesktopShopifyReadbackError::Desktop(DesktopDataError::MissingDatabaseKey)
+                } else {
+                    DesktopShopifyReadbackError::Desktop(DesktopDataError::SecretStore(error))
+                }
+            })?;
+        let mut authority_service = self.open_read_application_from_secret(&database_secret)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.revision != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: mission.revision,
+            }
+            .into());
+        }
+        let scope = authority_scope_for_mission(&mission, &project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+        let approval = effect
+            .approval
+            .clone()
+            .ok_or(ApplicationError::EffectReconciliationAuthorityMismatch)?;
+        let account_id = effect
+            .account_id
+            .as_ref()
+            .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+        if effect.project_id != project_id
+            || effect.mission_id != mission_id
+            || effect.provider != SHOPIFY_PROVIDER_ID
+            || effect.capability != SHOPIFY_FULFILLMENT_CAPABILITY
+            || effect.effect_class != EffectClass::ExternalWrite
+            || effect.connection_id.is_none()
+            || !matches!(
+                effect.status,
+                hartevo_domain_kernel::EffectStatus::VerificationRequired
+                    | hartevo_domain_kernel::EffectStatus::ReceiptRecorded
+            )
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || approval.scope_digest != expected_scope_digest
+            || approval.permission_digest != expected_broker_authorization_digest
+        {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        let expected_secret_scope = SecretScope::new(
+            effect.tenant_id.clone(),
+            project_id.clone(),
+            mission_id.clone(),
+            SHOPIFY_PROVIDER_ID,
+            account_id.clone(),
+            SHOPIFY_FULFILLMENT_CAPABILITY,
+        )
+        .map_err(ShopifyReadbackBridgeError::from)?;
+        if binding.scope() != &expected_secret_scope {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        let reconciliation_binding = EffectReconciliationBinding::new_observation_bound(
+            effect_id.as_str(),
+            expected_scope_digest.clone(),
+            expected_broker_authorization_digest.clone(),
+            &observation_authority_digest,
+        )?;
+        let (consent, record) = live_effect_consent_facts(&service, &effect, now)?;
+        let expected_scope = scope.clone();
+        let (_, result): (_, ReceiptReconciliationResult) =
+            map_shopify_readback_dispatch_result(dispatch_live_effect_reconciliation(
+                &self.cordis,
+                DesktopEffectReconciliationAuthorization::new(scope, reconciliation_binding),
+                &consent,
+                record.as_ref(),
+                Some(&approval),
+                now,
+                |permit| {
+                    let current_scope =
+                        mission_authority_scope(&service, &project_id, &mission_id)?;
+                    if &current_scope != permit.scope()
+                        || permit.binding().effect_id() != effect_id.as_str()
+                        || permit.binding().approval_scope_digest()
+                            != expected_scope_digest.as_str()
+                        || permit.binding().broker_authorization_digest()
+                            != expected_broker_authorization_digest.as_str()
+                        || permit.binding().observation_authority_digest()
+                            != Some(observation_authority_digest.as_str())
+                    {
+                        return Err(CordisError::EffectReconciliationPermitMismatch.into());
+                    }
+                    let mut reconciler = DesktopShopifyReceiptFoundReconciler {
+                        secret_store,
+                        authority_service: &mut authority_service,
+                        context_session: &context_session,
+                        binding,
+                        selector: readback,
+                        cancellation,
+                        recovery,
+                        expected_effect: effect,
+                        expected_mission_revision,
+                        expected_scope,
+                        observation_authority_digest,
+                        entry_at: now,
+                        observe,
+                    };
+                    service
+                        .reconcile_uncertain_receipt_at_revision(
+                            broker,
+                            &ReconcileUncertainEffect {
+                                project_id: project_id.clone(),
+                                mission_id: mission_id.clone(),
+                                effect_id: effect_id.clone(),
+                                expected_scope_digest: expected_scope_digest.clone(),
+                                expected_broker_authorization_digest:
+                                    expected_broker_authorization_digest.clone(),
+                                expected_mission_revision,
+                            },
+                            &mut reconciler,
+                            now,
+                        )
+                        .map_err(DesktopShopifyReadbackError::from)
+                },
+            ))?;
+        let snapshot = self
+            .build_snapshot(
+                &service,
+                secret_store,
+                runtime_reconciliation,
+                load_product_evidence(now)?,
+                now,
+            )
+            .map_err(DesktopShopifyReadbackError::Desktop)?;
+        Ok(DesktopShopifyReceiptRecovery {
+            snapshot,
+            disposition: result.disposition,
+            receipt_id: result.receipt.id,
+            recovery_state: ProviderRecoveryState::ReceiptObserved,
+        })
     }
 
     fn dispatch_shopify_readback_admission<S, Observe>(
@@ -6150,9 +6625,10 @@ mod tests {
         VerificationId, VerificationStatus, WorkProductId, WorkerLeaseStatus,
     };
     use hartevo_effect_broker::{
-        EffectBroker, EffectExecutor, EffectPermissionResolver, EffectVerifier,
-        ProviderAdapterIdentity, ProviderFailure, SecretBrokerProvider, SecretProviderError,
-        SecretUseHandle,
+        DurableEffectLedger, EffectBroker, EffectExecutor, EffectPermissionResolver,
+        EffectVerifier, ProviderAdapterIdentity, ProviderFailure,
+        ReceiptReconciliationInfrastructure, ReceiptRecoveryFence, ReconciliationClaim,
+        ReconciliationPolicy, SecretBrokerProvider, SecretProviderError, SecretUseHandle,
     };
     use hartevo_storage::{MemorySecretStore, ProviderRecoveryState};
     use rust_decimal::Decimal;
@@ -13115,6 +13591,338 @@ sleep 30"#;
         let cordis = plane.lock_cordis();
         assert!(cordis.active_effect_reconciliation_scope().is_none());
         assert!(cordis.active_effect_execution_scope().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn n15_claims_before_read_and_not_found_remains_uncertain_without_verification() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(26) + Duration::seconds(30);
+        let request =
+            uncertain_shopify_recovery_identity_request(&plane, &secrets, &project_id, now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let database_key =
+            DatabaseKey::from_secret(&database_secret).expect("database key before N15");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("Application before N15 receipt recovery");
+        let mission_before = service
+            .load_mission(&request.readback.project_id, &request.readback.mission_id)
+            .expect("Mission before N15 receipt recovery");
+        let events_before = service
+            .mission_events(&request.readback.project_id, &request.readback.mission_id)
+            .expect("events before N15 receipt recovery");
+        drop(service);
+        let head_before = ProjectStore::open(&plane.database_path, &database_key)
+            .expect("N15 store before")
+            .load_provider_recovery(&request.recovery.project_id, &request.recovery.effect_id)
+            .expect("N15 provider recovery head before");
+        assert_eq!(head_before.state, ProviderRecoveryState::Uncertain);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let callback_project_id = request.readback.project_id.clone();
+        let callback_mission_id = request.readback.mission_id.clone();
+        let callback_effect_id = request.readback.effect_id.clone();
+        let callback_recovery = request.recovery.clone();
+        let observed_project_id = callback_project_id.clone();
+        let observed_mission_id = callback_mission_id.clone();
+        let observed_effect_id = callback_effect_id.clone();
+        let observed_recovery = callback_recovery.clone();
+        let observed_database_path = plane.database_path.clone();
+        let observed_database_key =
+            DatabaseKey::from_secret(&database_secret).expect("database key inside N15 callback");
+        let mut broker = shopify_readback_broker();
+        let result = plane.recover_shopify_receipt_found_with(
+            &secrets,
+            request,
+            &mut broker,
+            now + Duration::seconds(9),
+            move |_, _, _, _, _, _, at| {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                let mut store = ProjectStore::open(&observed_database_path, &observed_database_key)
+                    .expect("independent N15 claim observer");
+                let callback_effect = store
+                    .load_mission(&observed_project_id, &observed_mission_id)
+                    .expect("Mission inside N15 provider callback")
+                    .effect(&observed_effect_id)
+                    .expect("Effect inside N15 provider callback")
+                    .clone();
+                assert!(matches!(
+                    store.claim_reconciliation(
+                        &callback_effect,
+                        &ReconciliationPolicy::default(),
+                        "competing-n15-reconciler",
+                        at,
+                        at + Duration::seconds(30),
+                    ),
+                    Ok(ReconciliationClaim::Busy)
+                ));
+                assert_eq!(
+                    store
+                        .load_provider_recovery(
+                            &observed_recovery.project_id,
+                            &observed_recovery.effect_id,
+                        )
+                        .expect("provider head during N15 callback")
+                        .state,
+                    ProviderRecoveryState::Uncertain
+                );
+                Err(DesktopShopifyReadbackError::Bridge(
+                    ShopifyReadbackBridgeError::Transport(ShopifyNativeReadbackError::NotFound),
+                ))
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DesktopShopifyReadbackError::Desktop(
+                DesktopDataError::Application(ApplicationError::Broker(
+                    hartevo_effect_broker::BrokerError::ReceiptReconciliationFailed(
+                        ReceiptReconciliationFailure::NotFound
+                    )
+                ))
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(10))
+            .expect("Application after N15 NotFound");
+        let mission_after = service
+            .load_mission(&callback_project_id, &callback_mission_id)
+            .expect("Mission after N15 NotFound");
+        assert_eq!(mission_after, mission_before);
+        assert_eq!(
+            service
+                .mission_events(&callback_project_id, &callback_mission_id)
+                .expect("events after N15 NotFound"),
+            events_before
+        );
+        let effect_after = mission_after
+            .effect(&callback_effect_id)
+            .expect("Effect after N15 NotFound");
+        assert_eq!(effect_after.status, EffectStatus::VerificationRequired);
+        assert!(effect_after.receipt.is_none());
+        assert!(effect_after.verification.is_none());
+        drop(service);
+
+        let mut store = ProjectStore::open(&plane.database_path, &database_key)
+            .expect("N15 store after NotFound");
+        assert_eq!(
+            store
+                .load_provider_recovery(
+                    &callback_recovery.project_id,
+                    &callback_recovery.effect_id,
+                )
+                .expect("N15 provider recovery head after NotFound"),
+            head_before
+        );
+        assert!(matches!(
+            store.claim_reconciliation(
+                effect_after,
+                &ReconciliationPolicy::default(),
+                "post-not-found-n15-reconciler",
+                now + Duration::seconds(10),
+                now + Duration::seconds(40),
+            ),
+            Ok(ReconciliationClaim::Busy)
+        ));
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+        assert!(cordis.active_effect_execution_scope().is_none());
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn n15_restart_recovers_committed_receipt_without_provider_and_projects_once() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(26) + Duration::seconds(45);
+        let mut request =
+            uncertain_shopify_recovery_identity_request(&plane, &secrets, &project_id, now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let database_key =
+            DatabaseKey::from_secret(&database_secret).expect("database key before N15 restart");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("Application before durable N15 receipt");
+        let mission_before = service
+            .load_mission(&request.readback.project_id, &request.readback.mission_id)
+            .expect("Mission before durable N15 receipt");
+        let events_before = service
+            .mission_events(&request.readback.project_id, &request.readback.mission_id)
+            .expect("events before durable N15 receipt");
+        drop(service);
+        let mut store = ProjectStore::open(&plane.database_path, &database_key)
+            .expect("N15 restart store before durable receipt");
+        let effect = mission_before
+            .effect(&request.readback.effect_id)
+            .expect("uncertain Effect before durable N15 receipt")
+            .clone();
+        let connection_id = effect
+            .connection_id
+            .as_ref()
+            .expect("connection-bound N15 Effect")
+            .clone();
+        let connection = store
+            .load_connection(&request.readback.project_id, &connection_id)
+            .expect("exact Connection before durable N15 receipt");
+        let ReconciliationClaim::Acquired {
+            lease,
+            execution_started_at,
+        } = store
+            .claim_reconciliation(
+                &effect,
+                &ReconciliationPolicy::default(),
+                "n15-phase-a-restart-worker",
+                now + Duration::seconds(8),
+                now + Duration::seconds(38),
+            )
+            .expect("claim N15 Phase A reconciliation")
+        else {
+            panic!("N15 Phase A must acquire the reconciliation lease")
+        };
+        let evidence_digest = "e".repeat(64);
+        let staged = StagedReceiptFound::new(
+            &effect,
+            format!("shopify-fulfillment:{evidence_digest}"),
+            execution_started_at + Duration::milliseconds(1),
+            evidence_digest.clone(),
+            now + Duration::seconds(8),
+            ReceiptRecoveryFence::new(
+                mission_before.revision,
+                connection.snapshot(),
+                request.recovery.head_revision,
+                request.recovery.binding_digest.clone(),
+                request.recovery.content_digest.clone(),
+                request.recovery.key_version,
+                request.recovery.object_revision,
+                format!("cas://{evidence_digest}"),
+                evidence_digest.clone(),
+            )
+            .expect("exact N15 recovery fence"),
+        )
+        .expect("valid N15 staged receipt");
+        let durable = store
+            .record_staged_receipt(&effect, &lease, &staged, now + Duration::seconds(9))
+            .expect("atomically commit N15 Phase A receipt");
+        assert_eq!(durable.receipt, *staged.receipt());
+        assert_eq!(
+            store
+                .load_provider_recovery(&request.recovery.project_id, &request.recovery.effect_id)
+                .expect("provider recovery after N15 Phase A")
+                .state,
+            ProviderRecoveryState::ReceiptObserved
+        );
+        assert_eq!(
+            store
+                .load_mission(&request.readback.project_id, &request.readback.mission_id)
+                .expect("Mission remains unprojected after N15 Phase A"),
+            mission_before,
+            "Phase A must not partially project the Mission"
+        );
+        drop(store);
+
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(10))
+            .expect("Application before N15 restart recovery");
+        service
+            .revoke_connection(
+                &request.readback.project_id,
+                &connection_id,
+                now + Duration::seconds(10),
+            )
+            .expect("revoke Connection after durable N15 Phase A");
+        drop(service);
+        request.readback.cancellation.cancel();
+
+        let mut broker = shopify_readback_broker();
+        let recovered = plane
+            .recover_shopify_receipt_found_with(
+                &secrets,
+                request.clone(),
+                &mut broker,
+                now + Duration::seconds(11),
+                |_, _, _, _, _, _, _| {
+                    panic!("durable N15 restart recovery must not contact Shopify")
+                },
+            )
+            .expect("recover durable N15 Phase A after restart");
+        assert_eq!(
+            recovered.disposition,
+            ExecutionDisposition::ReusedIdempotentReceipt
+        );
+        assert_eq!(recovered.receipt_id, durable.receipt.id);
+        assert_eq!(
+            recovered.recovery_state,
+            ProviderRecoveryState::ReceiptObserved
+        );
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(12))
+            .expect("Application after N15 restart recovery");
+        let mission_after = service
+            .load_mission(&request.readback.project_id, &request.readback.mission_id)
+            .expect("Mission after N15 restart recovery");
+        let events_after = service
+            .mission_events(&request.readback.project_id, &request.readback.mission_id)
+            .expect("events after N15 restart recovery");
+        let effect_after = mission_after
+            .effect(&request.readback.effect_id)
+            .expect("Effect after N15 restart recovery");
+        assert_eq!(mission_after.revision, mission_before.revision + 1);
+        assert_eq!(effect_after.status, EffectStatus::ReceiptRecorded);
+        assert_eq!(effect_after.receipt.as_ref(), Some(&durable.receipt));
+        assert!(effect_after.verification.is_none());
+        assert_eq!(events_after.len(), events_before.len() + 1);
+        assert_eq!(
+            events_after
+                .last()
+                .expect("one N15 receipt event")
+                .event_type,
+            "effect.reconciliation_receipt_found"
+        );
+        drop(service);
+
+        request.readback.expected_mission_revision = mission_after.revision;
+        let replay = plane
+            .recover_shopify_receipt_found_with(
+                &secrets,
+                request.clone(),
+                &mut broker,
+                now + Duration::seconds(13),
+                |_, _, _, _, _, _, _| {
+                    panic!("idempotent N15 restart recovery must not contact Shopify")
+                },
+            )
+            .expect("idempotently recover the already projected N15 receipt");
+        assert_eq!(replay.receipt_id, recovered.receipt_id);
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(14))
+            .expect("Application after idempotent N15 recovery");
+        assert_eq!(
+            service
+                .load_mission(&request.readback.project_id, &request.readback.mission_id)
+                .expect("Mission after idempotent N15 recovery"),
+            mission_after
+        );
+        assert_eq!(
+            service
+                .mission_events(&request.readback.project_id, &request.readback.mission_id)
+                .expect("events after idempotent N15 recovery"),
+            events_after,
+            "an already projected receipt must not append a duplicate event"
+        );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+        assert!(cordis.active_effect_execution_scope().is_none());
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
     }
 
     #[test]

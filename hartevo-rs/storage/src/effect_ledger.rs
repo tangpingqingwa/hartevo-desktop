@@ -3,16 +3,20 @@ use hartevo_domain_kernel::{
     Effect, ExecutionAttemptId, Receipt, Verification, VerificationStatus,
 };
 use hartevo_effect_broker::{
-    DurableClaimDirective, DurableEffectLedger, DurableRateLimitDirective, ExecutionClaimContext,
-    ExecutionLease, LedgerClaim, LedgerError, PersistedClaimState, PersistedCompletionPoint,
-    RateLimitRequest, ReconciliationClaim, ReconciliationDisposition, ReconciliationLease,
-    ReconciliationObservation, ReconciliationPolicy, decide_durable_claim,
-    decide_durable_rate_limit,
+    DurableClaimDirective, DurableEffectLedger, DurableRateLimitDirective,
+    DurableReceiptReconciliation, ExecutionClaimContext, ExecutionLease, LedgerClaim, LedgerError,
+    PersistedClaimState, PersistedCompletionPoint, RateLimitRequest,
+    ReceiptReconciliationInfrastructure, ReconciliationClaim, ReconciliationDisposition,
+    ReconciliationLease, ReconciliationObservation, ReconciliationPolicy, StagedReceiptFound,
+    decide_durable_claim, decide_durable_rate_limit,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-use crate::ProjectStore;
+use crate::provider_recovery_store::{
+    load_provider_recovery_in_transaction, record_provider_recovery_receipt_in_transaction,
+};
+use crate::{ProjectStore, ProviderRecoveryHead, ProviderRecoveryState, authorization, normalized};
 
 impl DurableEffectLedger for ProjectStore {
     fn claim(
@@ -210,6 +214,247 @@ impl DurableEffectLedger for ProjectStore {
     ) -> Result<ReconciliationDisposition, LedgerError> {
         record_effect_reconciliation(self, effect, lease, observation, now)
     }
+}
+
+impl ReceiptReconciliationInfrastructure for ProjectStore {
+    fn recover_staged_receipt(
+        &mut self,
+        effect: &Effect,
+    ) -> Result<Option<DurableReceiptReconciliation>, LedgerError> {
+        let transaction = self.connection.transaction().map_err(persistence)?;
+        let Some(record) = load_idempotency(&transaction, effect)? else {
+            transaction.commit().map_err(persistence)?;
+            return Ok(None);
+        };
+        if record.status != "receipt_recorded" {
+            transaction.commit().map_err(persistence)?;
+            return Ok(None);
+        }
+        let Some(reconciliation_head) = load_reconciliation_head(&transaction, effect)? else {
+            transaction.commit().map_err(persistence)?;
+            return Ok(None);
+        };
+        if reconciliation_head.status != "receipt_found" {
+            transaction.commit().map_err(persistence)?;
+            return Ok(None);
+        }
+        let Some(recovery_head) =
+            load_provider_recovery_in_transaction(&transaction, &effect.project_id, &effect.id)
+                .map_err(storage_persistence)?
+        else {
+            transaction.commit().map_err(persistence)?;
+            return Ok(None);
+        };
+        let (receipt, execution_started_at) =
+            decode_durable_receipt(&transaction, effect, &record)?;
+        let completion = persisted_receipt_completion(
+            &transaction,
+            effect,
+            &record,
+            &receipt,
+            execution_started_at,
+        )?;
+        validate_staged_recovery_head(
+            effect,
+            &recovery_head,
+            &receipt,
+            reconciliation_head
+                .evidence_digest
+                .as_deref()
+                .ok_or(LedgerError::ScopeConflict)?,
+            reconciliation_head.updated_at,
+        )?;
+        transaction.commit().map_err(persistence)?;
+        Ok(Some(DurableReceiptReconciliation {
+            receipt,
+            execution_started_at,
+            completion,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn record_staged_receipt(
+        &mut self,
+        effect: &Effect,
+        lease: &ReconciliationLease,
+        staged: &StagedReceiptFound,
+        operation_at: DateTime<Utc>,
+    ) -> Result<DurableReceiptReconciliation, LedgerError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(persistence)?;
+        let reconciliation_head =
+            load_reconciliation_head(&transaction, effect)?.ok_or(LedgerError::LeaseLost)?;
+        require_current_reconciliation_lease(&reconciliation_head, lease, operation_at)?;
+        let execution_started_at = initial_execution_started_at(&transaction, effect)?;
+        staged.validate_for(effect, execution_started_at)?;
+        if operation_at < staged.observed_at() {
+            return Err(LedgerError::ScopeConflict);
+        }
+
+        let current_mission = normalized::load_mission_normalized(
+            &transaction,
+            &effect.project_id,
+            &effect.mission_id,
+        )
+        .map_err(storage_persistence)?
+        .ok_or(LedgerError::ScopeConflict)?;
+        let current_effect = current_mission
+            .effects
+            .iter()
+            .find(|candidate| candidate.id == effect.id)
+            .ok_or(LedgerError::ScopeConflict)?;
+        if current_mission.revision != staged.recovery().mission_revision()
+            || current_effect != effect
+            || current_effect.status != hartevo_domain_kernel::EffectStatus::VerificationRequired
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        let connection = authorization::load_connection_in_transaction(
+            &transaction,
+            &effect.project_id,
+            &staged.recovery().connection().id,
+        )
+        .map_err(storage_persistence)?;
+        if connection.snapshot() != *staged.recovery().connection()
+            || !connection.permits_scopes(&effect.required_scopes, operation_at)
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        let recovery_head =
+            load_provider_recovery_in_transaction(&transaction, &effect.project_id, &effect.id)
+                .map_err(storage_persistence)?
+                .ok_or(LedgerError::ScopeConflict)?;
+        validate_staged_recovery_fence(effect, &recovery_head, staged)?;
+
+        let observation = staged.observation();
+        finish_reconciliation_rows(
+            &transaction,
+            effect,
+            &reconciliation_head,
+            "receipt_found",
+            "",
+            &observation,
+            None,
+            operation_at,
+        )?;
+        let receipt_json = serde_json::to_string(staged.receipt()).map_err(persistence)?;
+        let updated = transaction
+            .execute(
+                "UPDATE effect_idempotency
+                 SET status = 'receipt_recorded', receipt_json = ?4,
+                     uncertain_reason = NULL, updated_at = ?5
+                 WHERE project_id = ?1 AND effect_id = ?2
+                   AND approval_digest = ?3 AND status = 'uncertain'",
+                params![
+                    effect.project_id.as_str(),
+                    effect.id.as_str(),
+                    effect.approval_digest(),
+                    receipt_json,
+                    operation_at.to_rfc3339(),
+                ],
+            )
+            .map_err(persistence)?;
+        if updated != 1 {
+            return Err(LedgerError::ScopeConflict);
+        }
+        let committed_recovery = record_provider_recovery_receipt_in_transaction(
+            &transaction,
+            &effect.project_id,
+            &effect.id,
+            staged.recovery().recovery_revision(),
+            staged.recovery().recovery_binding_digest(),
+            staged.recovery().readback_storage_ref().to_owned(),
+            staged.recovery().readback_content_digest().to_owned(),
+            staged.evidence_digest().to_owned(),
+            operation_at,
+        )
+        .map_err(storage_persistence)?;
+        validate_staged_recovery_head(
+            effect,
+            &committed_recovery,
+            staged.receipt(),
+            staged.evidence_digest(),
+            operation_at,
+        )?;
+        transaction.commit().map_err(persistence)?;
+        Ok(DurableReceiptReconciliation {
+            receipt: staged.receipt().clone(),
+            execution_started_at,
+            completion: PersistedCompletionPoint::reconciliation_head_receipt_found(operation_at),
+        })
+    }
+}
+
+fn validate_staged_recovery_fence(
+    effect: &Effect,
+    head: &ProviderRecoveryHead,
+    staged: &StagedReceiptFound,
+) -> Result<(), LedgerError> {
+    let fence = staged.recovery();
+    let binding = &head.binding;
+    let approval = effect.approval.as_ref().ok_or(LedgerError::ScopeConflict)?;
+    if !matches!(
+        head.state,
+        ProviderRecoveryState::InFlight | ProviderRecoveryState::Uncertain
+    ) || head.revision != fence.recovery_revision()
+        || binding.binding_digest != fence.recovery_binding_digest()
+        || head.capsule.content_digest != fence.recovery_capsule_content_digest()
+        || head.capsule.key_version != fence.recovery_capsule_key_version()
+        || head.capsule.object_revision != fence.recovery_capsule_object_revision()
+        || binding.tenant_id != effect.tenant_id
+        || binding.project_id != effect.project_id
+        || binding.mission_id != effect.mission_id
+        || binding.effect_id != effect.id
+        || binding.approval_scope_digest != effect.approval_digest()
+        || binding.broker_authorization_digest != approval.permission_digest
+        || binding.provider_id != effect.provider
+        || binding.capability_id != effect.capability
+        || binding.credential_revision != fence.connection().revision
+        || effect.account_id.as_ref() != Some(&fence.connection().account_id)
+        || head.readback_storage_ref.is_some()
+        || head.receipt_evidence_digest.is_some()
+        || head.verification_evidence_digest.is_some()
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn validate_staged_recovery_head(
+    effect: &Effect,
+    head: &ProviderRecoveryHead,
+    receipt: &Receipt,
+    evidence_digest: &str,
+    operation_at: DateTime<Utc>,
+) -> Result<(), LedgerError> {
+    let binding = &head.binding;
+    let approval = effect.approval.as_ref().ok_or(LedgerError::ScopeConflict)?;
+    let expected_storage_ref = format!("cas://{evidence_digest}");
+    if head.state != ProviderRecoveryState::ReceiptObserved
+        || head.updated_at != operation_at
+        || head.readback_storage_ref.as_deref() != Some(expected_storage_ref.as_str())
+        || head.readback_content_digest.as_deref() != Some(evidence_digest)
+        || head.receipt_evidence_digest.as_deref() != Some(evidence_digest)
+        || head.verification_evidence_digest.is_some()
+        || receipt.response_digest != evidence_digest
+        || binding.tenant_id != effect.tenant_id
+        || binding.project_id != effect.project_id
+        || binding.mission_id != effect.mission_id
+        || binding.effect_id != effect.id
+        || binding.approval_scope_digest != effect.approval_digest()
+        || binding.broker_authorization_digest != approval.permission_digest
+        || binding.provider_id != effect.provider
+        || binding.capability_id != effect.capability
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn storage_persistence(error: impl std::fmt::Display) -> LedgerError {
+    LedgerError::Persistence(error.to_string())
 }
 
 #[derive(Debug)]

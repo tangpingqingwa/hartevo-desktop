@@ -16,6 +16,70 @@ use sha2::{Digest, Sha256};
 
 use crate::{PersistedMutation, ProjectStore, StorageError};
 
+pub(crate) fn load_connection_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    connection_id: &ConnectionId,
+) -> Result<Connection, StorageError> {
+    load_connection_from(transaction, project_id, connection_id)
+}
+
+fn load_connection_from(
+    connection: &rusqlite::Connection,
+    project_id: &ProjectId,
+    connection_id: &ConnectionId,
+) -> Result<Connection, StorageError> {
+    let row = connection
+        .query_row(
+            "SELECT id, tenant_id, project_id, provider, account_id,
+                    expected_external_account_id, required_scopes_json, granted_scopes_json,
+                    status, last_probe_json, revoked_at, revision, created_at, updated_at
+             FROM connections WHERE project_id = ?1 AND id = ?2",
+            params![project_id.as_str(), connection_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::ScopedRecordNotFound {
+            kind: "connection",
+            project_id: project_id.clone(),
+            id: connection_id.to_string(),
+        })?;
+    Connection::restore(ConnectionSnapshot {
+        id: ConnectionId::from_stable(row.0),
+        tenant_id: hartevo_domain_kernel::TenantId::from_stable(row.1),
+        project_id: ProjectId::from_stable(row.2),
+        provider: row.3,
+        account_id: hartevo_domain_kernel::AccountId::from_stable(row.4),
+        expected_external_account_id: row.5,
+        required_scopes: decode_json(&row.6)?,
+        granted_scopes: decode_json(&row.7)?,
+        status: decode_enum(&row.8)?,
+        last_probe: row.9.as_deref().map(decode_json).transpose()?,
+        revoked_at: row.10.as_deref().map(parse_time).transpose()?,
+        revision: from_sql_u64(row.11, "connection revision")?,
+        created_at: parse_time(&row.12)?,
+        updated_at: parse_time(&row.13)?,
+    })
+    .map_err(|error| StorageError::DomainDecode(error.to_string()))
+}
+
 impl ProjectStore {
     pub fn create_connection(
         &mut self,
@@ -78,56 +142,7 @@ impl ProjectStore {
         project_id: &ProjectId,
         connection_id: &ConnectionId,
     ) -> Result<Connection, StorageError> {
-        let row = self
-            .connection
-            .query_row(
-                "SELECT id, tenant_id, project_id, provider, account_id,
-                        expected_external_account_id, required_scopes_json, granted_scopes_json,
-                        status, last_probe_json, revoked_at, revision, created_at, updated_at
-                 FROM connections WHERE project_id = ?1 AND id = ?2",
-                params![project_id.as_str(), connection_id.as_str()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, i64>(11)?,
-                        row.get::<_, String>(12)?,
-                        row.get::<_, String>(13)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| StorageError::ScopedRecordNotFound {
-                kind: "connection",
-                project_id: project_id.clone(),
-                id: connection_id.to_string(),
-            })?;
-        Connection::restore(ConnectionSnapshot {
-            id: ConnectionId::from_stable(row.0),
-            tenant_id: hartevo_domain_kernel::TenantId::from_stable(row.1),
-            project_id: ProjectId::from_stable(row.2),
-            provider: row.3,
-            account_id: hartevo_domain_kernel::AccountId::from_stable(row.4),
-            expected_external_account_id: row.5,
-            required_scopes: decode_json(&row.6)?,
-            granted_scopes: decode_json(&row.7)?,
-            status: decode_enum(&row.8)?,
-            last_probe: row.9.as_deref().map(decode_json).transpose()?,
-            revoked_at: row.10.as_deref().map(parse_time).transpose()?,
-            revision: from_sql_u64(row.11, "connection revision")?,
-            created_at: parse_time(&row.12)?,
-            updated_at: parse_time(&row.13)?,
-        })
-        .map_err(|error| StorageError::DomainDecode(error.to_string()))
+        load_connection_from(&self.connection, project_id, connection_id)
     }
 
     /// Reloads every Connection for one Project from its durable record.

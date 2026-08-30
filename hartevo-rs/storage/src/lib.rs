@@ -4679,21 +4679,22 @@ mod tests {
     use chrono::{Duration, TimeZone};
     use hartevo_domain_kernel::{
         AccountId, ActorId, Approval, ApprovalDecision, ApprovalId, Cadence, Company, CompanyId,
-        Connection as ProviderConnection, ConnectionId, ConsentState, ContactChannel, Conversation,
-        ConversationId, ConversationState, CurrencyCode, DeletionId, DeletionReason,
-        DeletionRecord, DeletionSurface, DeletionTombstone, Effect, EffectClass, EffectId,
-        EffectRisk, EffectSpec, Evidence, EvidenceId, EvidenceStatus, ExternalIdentity,
+        Connection as ProviderConnection, ConnectionId, ConnectionProbe, ConsentState,
+        ContactChannel, Conversation, ConversationId, ConversationState, CurrencyCode, DeletionId,
+        DeletionReason, DeletionRecord, DeletionSurface, DeletionTombstone, Effect, EffectClass,
+        EffectId, EffectRisk, EffectSpec, Evidence, EvidenceId, EvidenceStatus, ExternalIdentity,
         IdentityLink, IdentityLinkId, IdentitySubject, MessagingGateway,
         MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointRoute,
         MissionContract, MissionDefinition, MissionStage, Money, OperatingMode, Outcome,
-        OutcomeDecision, Person, PersonId, Receipt, ReceiptId, StorageMode, Verification,
-        VerificationId, VerificationStatus, WorkProduct, WorkProductId,
+        OutcomeDecision, Person, PersonId, ProbeOutcome, Receipt, ReceiptId, StorageMode,
+        Verification, VerificationId, VerificationStatus, WorkProduct, WorkProductId,
     };
     use hartevo_effect_broker::{
-        DurableEffectLedger, EffectPolicy, EffectRateLimit, ExecutionClaimContext, ExecutionLease,
-        LedgerClaim, LedgerError, PermissionEvidence, PersistedCompletionPoint,
+        DurableEffectLedger, EffectPermissionResolver, EffectPolicy, EffectRateLimit,
+        ExecutionClaimContext, ExecutionLease, LedgerClaim, LedgerError, PermissionEvidence,
+        PersistedCompletionPoint, ReceiptReconciliationInfrastructure, ReceiptRecoveryFence,
         ReconciliationClaim, ReconciliationDisposition, ReconciliationObservation,
-        ReconciliationPolicy,
+        ReconciliationPolicy, StagedReceiptFound,
     };
     use proptest::prelude::*;
 
@@ -10300,6 +10301,328 @@ mod tests {
             panic!("expected recovery execution lease")
         };
         lease
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn staged_receipt_found_commits_all_recovery_heads_atomically_without_verification() {
+        let (mut store, project, mut mission, mut effect) =
+            local_recovery_store("staged-receipt-atomic");
+        let connection_id = ConnectionId::from("connection-staged-receipt-atomic");
+        let account_id = AccountId::from("account-staged-receipt-atomic");
+        let required_scopes = BTreeSet::from(["channel.preview".to_owned()]);
+        let mut connection = ProviderConnection::register(
+            connection_id.clone(),
+            effect.tenant_id.clone(),
+            project.id.clone(),
+            effect.provider.clone(),
+            account_id.clone(),
+            "external-staged-receipt-atomic",
+            required_scopes.clone(),
+            now(),
+        )
+        .expect("receipt recovery connection");
+        store
+            .create_connection(
+                &connection,
+                "connection.registered",
+                &serde_json::json!({}),
+                now(),
+            )
+            .expect("persist receipt recovery connection");
+        connection
+            .begin_probe(now())
+            .expect("begin connection probe");
+        store
+            .update_connection(
+                &connection,
+                1,
+                "connection.probe_started",
+                &serde_json::json!({}),
+                now(),
+            )
+            .expect("persist connection probe start");
+        connection
+            .apply_probe(
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "external-staged-receipt-atomic".into(),
+                    granted_scopes: required_scopes.clone(),
+                    probed_at: now(),
+                    valid_until: now() + Duration::hours(1),
+                    credential_expires_at: now() + Duration::hours(1),
+                    evidence_digest: "a".repeat(64),
+                },
+                now(),
+            )
+            .expect("complete connection probe");
+        store
+            .update_connection(
+                &connection,
+                2,
+                "connection.probed",
+                &serde_json::json!({}),
+                now(),
+            )
+            .expect("persist connected state");
+
+        effect.connection_id = Some(connection_id);
+        effect.account_id = Some(account_id);
+        effect.required_scopes = required_scopes;
+        let approval_scope_digest = effect.approval_digest();
+        effect
+            .approval
+            .as_mut()
+            .expect("approved recovery effect")
+            .scope_digest = approval_scope_digest.clone();
+        let permission_evidence = store
+            .authorize(&effect, now())
+            .expect("live connection permission evidence");
+        let claim_context = effect_policy(&effect)
+            .execution_claim_context(&effect, permission_evidence.clone())
+            .expect("connection-bound execution context");
+        effect
+            .approval
+            .as_mut()
+            .expect("approved recovery effect")
+            .permission_digest = claim_context.authorization_digest.clone();
+        mission.effects[0] = effect.clone();
+        store
+            .save_mission(&mission)
+            .expect("persist connection-bound approved effect");
+
+        let binding_digest = "8".repeat(64);
+        let capsule_digest = "9".repeat(64);
+        let prepared = ProviderRecoveryHead::prepared(
+            ProviderRecoveryBinding {
+                tenant_id: effect.tenant_id.clone(),
+                project_id: effect.project_id.clone(),
+                mission_id: effect.mission_id.clone(),
+                mission_revision: mission.revision,
+                effect_id: effect.id.clone(),
+                effect_digest: effect.approval_digest(),
+                approval_scope_digest,
+                broker_authorization_digest: claim_context.authorization_digest.clone(),
+                provider_id: effect.provider.clone(),
+                capability_id: effect.capability.clone(),
+                account_scope_digest: "4".repeat(64),
+                adapter_id: "application.fixture.receipt-recovery".into(),
+                adapter_version: 1,
+                plugin_revision: 1,
+                provider_generation: 1,
+                payload_digest: effect.payload_digest.clone(),
+                provider_idempotency_key_digest: "6".repeat(64),
+                sdk_idempotency_key_digest: "7".repeat(64),
+                credential_revision: connection.revision(),
+                keyring_revision: 1,
+                binding_digest: binding_digest.clone(),
+            },
+            ProviderRecoveryCapsule {
+                storage_ref: format!("cas://{capsule_digest}"),
+                content_digest: capsule_digest.clone(),
+                byte_len: 512,
+                key_version: 1,
+                object_revision: 1,
+            },
+            now(),
+            now() + Duration::minutes(30),
+        )
+        .expect("prepared provider recovery");
+        store
+            .prepare_provider_recovery(&prepared)
+            .expect("persist prepared provider recovery");
+        let in_flight = store
+            .claim_provider_recovery_execution_authorized(
+                &effect.project_id,
+                &effect.id,
+                prepared.revision,
+                &binding_digest,
+                &effect,
+                &permission_evidence,
+                now(),
+            )
+            .expect("claim exact provider recovery");
+
+        let LedgerClaim::Acquired {
+            lease,
+            receipt: None,
+            execution_started_at,
+        } = store
+            .claim(
+                &effect,
+                Some(&claim_context),
+                "staged-receipt-executor",
+                now(),
+                now() + Duration::seconds(30),
+            )
+            .expect("claim original execution")
+        else {
+            panic!("expected one original execution lease")
+        };
+        store
+            .record_uncertain(
+                &effect,
+                &lease,
+                "provider submit crossed the uncertain boundary",
+                now() + Duration::seconds(1),
+            )
+            .expect("persist original uncertainty");
+        let uncertain_recovery = store
+            .mark_provider_recovery_uncertain(
+                &effect.project_id,
+                &effect.id,
+                in_flight.revision,
+                &binding_digest,
+                now() + Duration::seconds(1),
+            )
+            .expect("persist provider recovery uncertainty");
+        mission
+            .begin_effect(&effect.id, now())
+            .expect("project original execution");
+        mission
+            .mark_effect_uncertain(&effect.id, now() + Duration::seconds(1))
+            .expect("project original uncertainty");
+        store
+            .save_mission(&mission)
+            .expect("persist uncertain Mission projection");
+        let effect = mission
+            .effect(&effect.id)
+            .expect("uncertain recovery effect")
+            .clone();
+
+        let ReconciliationClaim::Acquired {
+            lease: reconciliation_lease,
+            execution_started_at: reconciled_execution_started_at,
+        } = store
+            .claim_reconciliation(
+                &effect,
+                &ReconciliationPolicy::default(),
+                "staged-receipt-reconciler",
+                now() + Duration::seconds(2),
+                now() + Duration::seconds(32),
+            )
+            .expect("claim receipt-only reconciliation")
+        else {
+            panic!("expected receipt-only reconciliation lease")
+        };
+        assert_eq!(reconciled_execution_started_at, execution_started_at);
+
+        let evidence_digest = "e".repeat(64);
+        let stage_receipt = |recovery_revision| {
+            let fence = ReceiptRecoveryFence::new(
+                mission.revision,
+                connection.snapshot(),
+                recovery_revision,
+                binding_digest.clone(),
+                capsule_digest.clone(),
+                prepared.capsule.key_version,
+                prepared.capsule.object_revision,
+                format!("cas://{evidence_digest}"),
+                evidence_digest.clone(),
+            )
+            .expect("valid receipt recovery fence");
+            StagedReceiptFound::new(
+                &effect,
+                "external-provider-receipt-atomic",
+                now() + Duration::seconds(1),
+                evidence_digest.clone(),
+                now() + Duration::seconds(2),
+                fence,
+            )
+            .expect("valid staged receipt")
+        };
+
+        let before_stale = effect_recovery_snapshot(&store, &effect);
+        let provider_before_stale = store
+            .load_provider_recovery(&effect.project_id, &effect.id)
+            .expect("provider head before stale write");
+        let stale = stage_receipt(
+            uncertain_recovery
+                .revision
+                .checked_add(1)
+                .expect("stale revision fixture"),
+        );
+        assert!(
+            store
+                .record_staged_receipt(
+                    &effect,
+                    &reconciliation_lease,
+                    &stale,
+                    now() + Duration::seconds(3),
+                )
+                .is_err(),
+            "a stale provider recovery fence must fail closed"
+        );
+        assert_eq!(effect_recovery_snapshot(&store, &effect), before_stale);
+        assert_eq!(
+            store
+                .load_provider_recovery(&effect.project_id, &effect.id)
+                .expect("provider head after stale write"),
+            provider_before_stale,
+            "ledger and provider recovery writes must roll back together"
+        );
+
+        let staged = stage_receipt(uncertain_recovery.revision);
+        let durable = store
+            .record_staged_receipt(
+                &effect,
+                &reconciliation_lease,
+                &staged,
+                now() + Duration::seconds(3),
+            )
+            .expect("atomically commit staged receipt");
+        assert_eq!(durable.receipt, *staged.receipt());
+        assert_eq!(durable.execution_started_at, execution_started_at);
+        assert_eq!(
+            durable.completion,
+            PersistedCompletionPoint::reconciliation_head_receipt_found(
+                now() + Duration::seconds(3)
+            )
+        );
+
+        let committed = effect_recovery_snapshot(&store, &effect);
+        let completion = committed
+            .completion
+            .as_ref()
+            .expect("durable effect completion");
+        assert_eq!(completion.idempotency.status, "receipt_recorded");
+        assert!(completion.idempotency.receipt_json.is_some());
+        assert!(completion.idempotency.verification_json.is_none());
+        assert_eq!(completion.attempts.len(), 1);
+        assert_eq!(completion.attempts[0].status, "uncertain");
+        assert!(completion.attempts[0].receipt_json.is_none());
+        assert!(completion.attempts[0].verification_json.is_none());
+        let reconciliation_head = committed.head.as_ref().expect("receipt-found head");
+        assert_eq!(reconciliation_head.status, "receipt_found");
+        assert_eq!(committed.reconciliation_attempts.len(), 1);
+        assert_eq!(committed.reconciliation_attempts[0].status, "receipt_found");
+        let provider_head = store
+            .load_provider_recovery(&effect.project_id, &effect.id)
+            .expect("receipt-observed provider recovery");
+        assert_eq!(provider_head.state, ProviderRecoveryState::ReceiptObserved);
+        assert_eq!(
+            provider_head.revision,
+            uncertain_recovery.revision + 1,
+            "receipt observation is exactly one provider recovery transition"
+        );
+        assert_eq!(
+            provider_head.receipt_evidence_digest.as_deref(),
+            Some(evidence_digest.as_str())
+        );
+        assert!(provider_head.verification_evidence_digest.is_none());
+
+        let before_recovery_read = effect_recovery_snapshot(&store, &effect);
+        assert_eq!(
+            store
+                .recover_staged_receipt(&effect)
+                .expect("read durable staged receipt"),
+            Some(durable)
+        );
+        assert_eq!(
+            effect_recovery_snapshot(&store, &effect),
+            before_recovery_read,
+            "durable recovery read must be side-effect free"
+        );
     }
 
     #[test]

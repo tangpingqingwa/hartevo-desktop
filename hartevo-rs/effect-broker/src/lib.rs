@@ -45,10 +45,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{
-    AccountId, ActorId, Approval, ApprovalDecision, ApprovalId, ConnectionId, ConsentRecordId,
-    ConsentState, ConversationId, CreatorHiringId, CurrencyCode, DurableProviderState, Effect,
-    EffectClass, EffectId, EffectStatus, ExecutionAttemptId, Mission, MissionCheckpointStatus,
-    MissionError, MissionStage, PartnerId, Receipt, Verification, VerificationStatus,
+    AccountId, ActorId, Approval, ApprovalDecision, ApprovalId, ConnectionId, ConnectionSnapshot,
+    ConsentRecordId, ConsentState, ConversationId, CreatorHiringId, CurrencyCode,
+    DurableProviderState, Effect, EffectClass, EffectId, EffectStatus, ExecutionAttemptId, Mission,
+    MissionCheckpointStatus, MissionError, MissionStage, PartnerId, Receipt, ReceiptId,
+    Verification, VerificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -567,6 +568,24 @@ pub struct BrokerResult {
     pub verification: Verification,
 }
 
+/// Successful receipt-only recovery. Verification remains a separate later
+/// phase and is deliberately absent from this projection.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReceiptReconciliationResult {
+    pub disposition: ExecutionDisposition,
+    pub receipt: Receipt,
+}
+
+impl std::fmt::Debug for ReceiptReconciliationResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceiptReconciliationResult")
+            .field("disposition", &self.disposition)
+            .field("receipt", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ProviderFailure {
     #[error("provider rejected the effect: {0}")]
@@ -1040,6 +1059,46 @@ impl AuthorityBoundBrokerResult {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub struct AuthorityBoundReceiptReconciliationResult {
+    result: ReceiptReconciliationResult,
+    authority: EffectCompletionAuthority,
+    projection_committed: bool,
+}
+
+impl std::fmt::Debug for AuthorityBoundReceiptReconciliationResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorityBoundReceiptReconciliationResult")
+            .field("disposition", &self.result.disposition)
+            .field("authority", &self.authority)
+            .field("projection_committed", &self.projection_committed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorityBoundReceiptReconciliationResult {
+    #[must_use]
+    pub const fn result(&self) -> &ReceiptReconciliationResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> &EffectCompletionAuthority {
+        &self.authority
+    }
+
+    #[must_use]
+    pub const fn projection_committed(&self) -> bool {
+        self.projection_committed
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ReceiptReconciliationResult, EffectCompletionAuthority) {
+        (self.result, self.authority)
+    }
+}
+
 #[derive(PartialEq)]
 pub struct AuthorityBoundBrokerError {
     inner: Box<AuthorityBoundBrokerErrorInner>,
@@ -1146,6 +1205,7 @@ fn broker_error_kind(error: &BrokerError) -> &'static str {
         BrokerError::ReconciliationNotRequired => "reconciliation_not_required",
         BrokerError::ReconciliationBusy => "reconciliation_busy",
         BrokerError::ReconciliationNotReady { .. } => "reconciliation_not_ready",
+        BrokerError::ReceiptReconciliationFailed(_) => "receipt_reconciliation_failed",
         BrokerError::ReconciliationStillUncertain { .. } => "reconciliation_still_uncertain",
         BrokerError::ProviderNotExecuted { .. } => "provider_not_executed",
         BrokerError::ReconciliationDeadLetter { .. } => "reconciliation_dead_letter",
@@ -1331,6 +1391,319 @@ impl ReconciliationObservation {
             | Self::StillUncertain { observed_at, .. } => *observed_at,
         }
     }
+}
+
+/// Exact durable fences carried by a staged receipt observation. The value is
+/// content-free: provider response bodies and credentials remain in encrypted
+/// project material, while the ledger receives only their CAS locator and
+/// digest.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReceiptRecoveryFence {
+    mission_revision: u64,
+    connection: ConnectionSnapshot,
+    recovery_revision: u64,
+    recovery_binding_digest: String,
+    recovery_capsule_content_digest: String,
+    recovery_capsule_key_version: u64,
+    recovery_capsule_object_revision: u64,
+    readback_storage_ref: String,
+    readback_content_digest: String,
+}
+
+impl std::fmt::Debug for ReceiptRecoveryFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReceiptRecoveryFence")
+            .field("mission_revision", &self.mission_revision)
+            .field("connection_revision", &self.connection.revision)
+            .field("recovery_revision", &self.recovery_revision)
+            .field("recovery_binding_digest", &"[DIGEST]")
+            .field("recovery_capsule_content_digest", &"[DIGEST]")
+            .field(
+                "recovery_capsule_key_version",
+                &self.recovery_capsule_key_version,
+            )
+            .field(
+                "recovery_capsule_object_revision",
+                &self.recovery_capsule_object_revision,
+            )
+            .field("readback_storage_ref", &"[REDACTED]")
+            .field("readback_content_digest", &"[DIGEST]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReceiptRecoveryFence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mission_revision: u64,
+        connection: ConnectionSnapshot,
+        recovery_revision: u64,
+        recovery_binding_digest: String,
+        recovery_capsule_content_digest: String,
+        recovery_capsule_key_version: u64,
+        recovery_capsule_object_revision: u64,
+        readback_storage_ref: String,
+        readback_content_digest: String,
+    ) -> Result<Self, LedgerError> {
+        let fence = Self {
+            mission_revision,
+            connection,
+            recovery_revision,
+            recovery_binding_digest,
+            recovery_capsule_content_digest,
+            recovery_capsule_key_version,
+            recovery_capsule_object_revision,
+            readback_storage_ref,
+            readback_content_digest,
+        };
+        fence.validate()?;
+        Ok(fence)
+    }
+
+    fn validate(&self) -> Result<(), LedgerError> {
+        self.connection
+            .validate()
+            .map_err(|_| LedgerError::ScopeConflict)?;
+        if self.mission_revision == 0
+            || self.recovery_revision == 0
+            || self.recovery_capsule_key_version == 0
+            || self.recovery_capsule_object_revision == 0
+            || !is_sha256(&self.recovery_binding_digest)
+            || !is_sha256(&self.recovery_capsule_content_digest)
+            || !is_sha256(&self.readback_content_digest)
+            || self.readback_storage_ref != format!("cas://{}", self.readback_content_digest)
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn mission_revision(&self) -> u64 {
+        self.mission_revision
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> &ConnectionSnapshot {
+        &self.connection
+    }
+
+    #[must_use]
+    pub const fn recovery_revision(&self) -> u64 {
+        self.recovery_revision
+    }
+
+    #[must_use]
+    pub fn recovery_binding_digest(&self) -> &str {
+        &self.recovery_binding_digest
+    }
+
+    #[must_use]
+    pub fn recovery_capsule_content_digest(&self) -> &str {
+        &self.recovery_capsule_content_digest
+    }
+
+    #[must_use]
+    pub const fn recovery_capsule_key_version(&self) -> u64 {
+        self.recovery_capsule_key_version
+    }
+
+    #[must_use]
+    pub const fn recovery_capsule_object_revision(&self) -> u64 {
+        self.recovery_capsule_object_revision
+    }
+
+    #[must_use]
+    pub fn readback_storage_ref(&self) -> &str {
+        &self.readback_storage_ref
+    }
+
+    #[must_use]
+    pub fn readback_content_digest(&self) -> &str {
+        &self.readback_content_digest
+    }
+}
+
+/// Receipt-only reconciliation outcome. Unlike [`ReconciliationObservation`],
+/// this type cannot represent not-executed, provider rejection, or a generic
+/// uncertain observation and therefore cannot accidentally promote those
+/// outcomes to a durable Receipt.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StagedReceiptFound {
+    receipt: Receipt,
+    evidence_digest: String,
+    observed_at: DateTime<Utc>,
+    recovery: ReceiptRecoveryFence,
+}
+
+impl std::fmt::Debug for StagedReceiptFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedReceiptFound")
+            .field("receipt", &"[REDACTED]")
+            .field("evidence_digest", &"[DIGEST]")
+            .field("observed_at", &self.observed_at)
+            .field("recovery", &self.recovery)
+            .finish()
+    }
+}
+
+impl StagedReceiptFound {
+    pub fn new(
+        effect: &Effect,
+        external_id: impl Into<String>,
+        accepted_at: DateTime<Utc>,
+        evidence_digest: String,
+        observed_at: DateTime<Utc>,
+        recovery: ReceiptRecoveryFence,
+    ) -> Result<Self, LedgerError> {
+        let external_id = external_id.into();
+        if external_id.trim().is_empty()
+            || !is_sha256(&evidence_digest)
+            || recovery.readback_content_digest != evidence_digest
+            || recovery.connection.project_id != effect.project_id
+            || recovery.connection.tenant_id != effect.tenant_id
+            || effect.connection_id.as_ref() != Some(&recovery.connection.id)
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        let receipt = Receipt {
+            id: ReceiptId::from_stable(format!(
+                "reconciled-receipt:{}:{}",
+                effect.id, evidence_digest
+            )),
+            provider: effect.provider.clone(),
+            external_id,
+            accepted_at,
+            request_digest: effect.approval_digest(),
+            response_digest: evidence_digest.clone(),
+        };
+        let staged = Self {
+            receipt,
+            evidence_digest,
+            observed_at,
+            recovery,
+        };
+        staged.recovery.validate()?;
+        if staged.receipt.accepted_at >= effect.expires_at
+            || staged.observed_at < staged.receipt.accepted_at
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        Ok(staged)
+    }
+
+    pub fn validate_for(
+        &self,
+        effect: &Effect,
+        execution_started_at: DateTime<Utc>,
+    ) -> Result<(), LedgerError> {
+        self.recovery.validate()?;
+        if self.receipt.response_digest != self.evidence_digest
+            || self.recovery.readback_content_digest != self.evidence_digest
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        self.observation()
+            .validate_for(effect, execution_started_at)
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &Receipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    #[must_use]
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    #[must_use]
+    pub const fn recovery(&self) -> &ReceiptRecoveryFence {
+        &self.recovery
+    }
+
+    #[must_use]
+    pub fn observation(&self) -> ReconciliationObservation {
+        ReconciliationObservation::ReceiptFound {
+            receipt: self.receipt.clone(),
+            evidence_digest: self.evidence_digest.clone(),
+            observed_at: self.observed_at,
+        }
+    }
+}
+
+/// Redacted failure classes for the receipt-only provider read. None of these
+/// classes is durable evidence that the original provider write did not run.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ReceiptReconciliationFailure {
+    #[error("receipt readback was cancelled")]
+    Cancelled,
+    #[error("receipt readback did not find an exact provider object")]
+    NotFound,
+    #[error("receipt readback was not authorized")]
+    Unauthorized,
+    #[error("receipt readback was rate limited")]
+    RateLimited,
+    #[error("receipt readback provider is unavailable")]
+    ProviderUnavailable,
+    #[error("receipt readback binding changed")]
+    BindingMismatch,
+    #[error("receipt readback evidence is invalid")]
+    InvalidEvidence,
+    #[error("receipt readback evidence could not be sealed")]
+    EvidenceUnavailable,
+}
+
+/// A provider adapter for the staged receipt-only path. The Broker invokes it
+/// only after a durable reconciliation lease has been acquired.
+pub trait EffectReceiptReconciler {
+    fn reconcile_receipt(
+        &mut self,
+        effect: &Effect,
+        execution_started_at: DateTime<Utc>,
+    ) -> Result<StagedReceiptFound, ReceiptReconciliationFailure>;
+}
+
+/// Durable receipt state returned by the infrastructure after the ledger and
+/// provider-recovery head have committed atomically.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DurableReceiptReconciliation {
+    pub receipt: Receipt,
+    pub execution_started_at: DateTime<Utc>,
+    pub completion: PersistedCompletionPoint,
+}
+
+impl std::fmt::Debug for DurableReceiptReconciliation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableReceiptReconciliation")
+            .field("receipt", &"[REDACTED]")
+            .field("execution_started_at", &self.execution_started_at)
+            .field("completion", &self.completion)
+            .finish()
+    }
+}
+
+pub trait ReceiptReconciliationInfrastructure: DurableEffectLedger {
+    fn recover_staged_receipt(
+        &mut self,
+        effect: &Effect,
+    ) -> Result<Option<DurableReceiptReconciliation>, LedgerError>;
+
+    fn record_staged_receipt(
+        &mut self,
+        effect: &Effect,
+        lease: &ReconciliationLease,
+        staged: &StagedReceiptFound,
+        operation_at: DateTime<Utc>,
+    ) -> Result<DurableReceiptReconciliation, LedgerError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2781,6 +3154,172 @@ impl EffectBroker {
         Ok(())
     }
 
+    /// Records one exact, already-existing provider Receipt without entering
+    /// the generic reconciliation outcome matrix or issuing a verification
+    /// lease. The provider callback is invoked only after the reconciliation
+    /// lease has durably committed.
+    #[allow(clippy::too_many_lines)]
+    pub fn reconcile_uncertain_receipt_authority_bound<Infrastructure, Reconciler>(
+        &mut self,
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        infrastructure: &mut Infrastructure,
+        reconciler: &mut Reconciler,
+        entry_at: DateTime<Utc>,
+    ) -> Result<AuthorityBoundReceiptReconciliationResult, AuthorityBoundBrokerError>
+    where
+        Infrastructure: ReceiptReconciliationInfrastructure,
+        Reconciler: EffectReceiptReconciler,
+    {
+        let mut authority = EffectCompletionAuthority::new(entry_at);
+        let mut projection_committed = false;
+        let mut clock = match EffectAuthorityClock::system(entry_at) {
+            Ok(clock) => clock,
+            Err(error) => {
+                return Err(AuthorityBoundBrokerError::new(
+                    error,
+                    authority,
+                    projection_committed,
+                ));
+            }
+        };
+        let outcome = (|| {
+            let effect = mission.effect(effect_id)?.clone();
+            if !matches!(
+                effect.status,
+                EffectStatus::VerificationRequired | EffectStatus::ReceiptRecorded
+            ) {
+                return Err(BrokerError::ReconciliationNotRequired);
+            }
+
+            if let Some(durable) = infrastructure.recover_staged_receipt(&effect)? {
+                Self::validate_durable_receipt_reconciliation(&effect, &durable)?;
+                Self::validate_persisted_completion(
+                    &clock,
+                    durable.completion,
+                    PersistedCompletionStage::Reconciliation,
+                    PersistedCompletionProvenance::ReconciliationHeadReceiptFound,
+                    durable.execution_started_at,
+                    Some(durable.receipt.accepted_at),
+                )?;
+                authority.accept_persisted(
+                    EffectCompletionBoundary::Reconciliation,
+                    durable.completion,
+                )?;
+                let mut candidate = mission.clone();
+                candidate.reconcile_durable_receipt(
+                    effect_id,
+                    durable.receipt.clone(),
+                    durable.execution_started_at,
+                )?;
+                Self::bind_receipt_projection_at(&mut candidate, durable.completion.operation_at());
+                projection_committed = candidate != *mission;
+                *mission = candidate;
+                return Ok(ReceiptReconciliationResult {
+                    disposition: ExecutionDisposition::ReusedIdempotentReceipt,
+                    receipt: durable.receipt,
+                });
+            }
+
+            if effect.status == EffectStatus::ReceiptRecorded {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            }
+            let now = clock.entry_at();
+            let claim = infrastructure.claim_reconciliation(
+                &effect,
+                &self.reconciliation_policy,
+                &self.worker_id,
+                now,
+                self.lease_expiry(now)?,
+            )?;
+            let (lease, execution_started_at) = match claim {
+                ReconciliationClaim::Acquired {
+                    lease,
+                    execution_started_at,
+                } => (lease, execution_started_at),
+                ReconciliationClaim::NotReady { retry_at } => {
+                    return Err(BrokerError::ReconciliationNotReady { retry_at });
+                }
+                ReconciliationClaim::Busy => return Err(BrokerError::ReconciliationBusy),
+                ReconciliationClaim::Resolved(_) | ReconciliationClaim::NotRequired => {
+                    return Err(BrokerError::ReconciliationNotRequired);
+                }
+            };
+
+            let staged = reconciler.reconcile_receipt(&effect, execution_started_at)?;
+            let reconciliation_sample =
+                clock.sample_post_external_call(authority.sampling_floor())?;
+            let reconciliation_operation_at = reconciliation_sample.operation_at;
+            staged.validate_for(&effect, execution_started_at)?;
+            if reconciliation_operation_at < staged.observed_at() {
+                return Err(BrokerError::InvalidAuthorityClock);
+            }
+            let durable = infrastructure.record_staged_receipt(
+                &effect,
+                &lease,
+                &staged,
+                reconciliation_operation_at,
+            )?;
+            Self::validate_durable_receipt_reconciliation(&effect, &durable)?;
+            if durable.receipt != *staged.receipt()
+                || durable.execution_started_at != execution_started_at
+                || durable.completion.operation_at() != reconciliation_operation_at
+            {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            }
+            authority.accept(
+                EffectCompletionBoundary::Reconciliation,
+                reconciliation_sample,
+            )?;
+            let mut candidate = mission.clone();
+            candidate.reconcile_durable_receipt(
+                effect_id,
+                durable.receipt.clone(),
+                durable.execution_started_at,
+            )?;
+            Self::bind_receipt_projection_at(&mut candidate, reconciliation_operation_at);
+            projection_committed = candidate != *mission;
+            *mission = candidate;
+            Ok(ReceiptReconciliationResult {
+                disposition: ExecutionDisposition::ReusedIdempotentReceipt,
+                receipt: durable.receipt,
+            })
+        })();
+
+        match outcome {
+            Ok(result) => Ok(AuthorityBoundReceiptReconciliationResult {
+                result,
+                authority,
+                projection_committed,
+            }),
+            Err(error) => Err(AuthorityBoundBrokerError::new(
+                error,
+                authority,
+                projection_committed,
+            )),
+        }
+    }
+
+    fn validate_durable_receipt_reconciliation(
+        effect: &Effect,
+        durable: &DurableReceiptReconciliation,
+    ) -> Result<(), BrokerError> {
+        ReconciliationObservation::ReceiptFound {
+            receipt: durable.receipt.clone(),
+            evidence_digest: durable.receipt.response_digest.clone(),
+            observed_at: durable.completion.operation_at(),
+        }
+        .validate_for(effect, durable.execution_started_at)?;
+        if durable.completion.stage() != PersistedCompletionStage::Reconciliation
+            || durable.completion.provenance()
+                != PersistedCompletionProvenance::ReconciliationHeadReceiptFound
+            || durable.completion.operation_at() < durable.receipt.accepted_at
+        {
+            return Err(BrokerError::DurableProjectionRecoveryRequired);
+        }
+        Ok(())
+    }
+
     pub fn reconcile_uncertain(
         &mut self,
         mission: &mut Mission,
@@ -3351,6 +3890,8 @@ pub enum BrokerError {
     ReconciliationBusy,
     #[error("effect reconciliation cannot run before {retry_at}")]
     ReconciliationNotReady { retry_at: DateTime<Utc> },
+    #[error(transparent)]
+    ReceiptReconciliationFailed(#[from] ReceiptReconciliationFailure),
     #[error(
         "Provider reconciliation remains uncertain until {retry_at}: {reason} ({evidence_digest})"
     )]
@@ -3482,8 +4023,9 @@ mod tests {
 
     use chrono::{Duration, TimeZone};
     use hartevo_domain_kernel::{
-        ConversationEffectGuard, EffectRisk, EffectSpec, MissionContract, MissionId, Outcome,
-        OutcomeDecision, ProjectId, ReceiptId, VerificationId,
+        Connection, ConnectionProbe, ConversationEffectGuard, EffectRisk, EffectSpec,
+        MissionContract, MissionId, Outcome, OutcomeDecision, ProbeOutcome, ProjectId, ReceiptId,
+        VerificationId,
     };
     use proptest::prelude::*;
 
@@ -3512,6 +4054,40 @@ mod tests {
                 scope_digest: "7".repeat(64),
             }),
         )
+    }
+
+    fn connected_snapshot(effect: &Effect) -> ConnectionSnapshot {
+        let connection_id = effect.connection_id.clone().expect("connection id");
+        let account_id = effect.account_id.clone().expect("account id");
+        let mut connection = Connection::register(
+            connection_id,
+            effect.tenant_id.clone(),
+            effect.project_id.clone(),
+            effect.provider.clone(),
+            account_id.clone(),
+            account_id.to_string(),
+            effect.required_scopes.clone(),
+            now() - Duration::minutes(1),
+        )
+        .expect("connection");
+        connection
+            .begin_probe(now() - Duration::seconds(30))
+            .expect("probe start");
+        connection
+            .apply_probe(
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: account_id.to_string(),
+                    granted_scopes: effect.required_scopes.clone(),
+                    probed_at: now() - Duration::seconds(20),
+                    valid_until: now() + Duration::hours(1),
+                    credential_expires_at: now() + Duration::hours(1),
+                    evidence_digest: "9".repeat(64),
+                },
+                now() - Duration::seconds(20),
+            )
+            .expect("successful probe");
+        connection.snapshot()
     }
 
     fn proposed_mission_fixture(
@@ -4101,6 +4677,55 @@ mod tests {
         }
     }
 
+    impl ReceiptReconciliationInfrastructure for TestLedger {
+        fn recover_staged_receipt(
+            &mut self,
+            _effect: &Effect,
+        ) -> Result<Option<DurableReceiptReconciliation>, LedgerError> {
+            Ok(self
+                .receipt
+                .clone()
+                .zip(self.reconciliation_operation_at)
+                .map(|(receipt, operation_at)| DurableReceiptReconciliation {
+                    receipt,
+                    execution_started_at: self.execution_started_at.unwrap_or(operation_at),
+                    completion: PersistedCompletionPoint::reconciliation_head_receipt_found(
+                        operation_at,
+                    ),
+                }))
+        }
+
+        fn record_staged_receipt(
+            &mut self,
+            effect: &Effect,
+            lease: &ReconciliationLease,
+            staged: &StagedReceiptFound,
+            operation_at: DateTime<Utc>,
+        ) -> Result<DurableReceiptReconciliation, LedgerError> {
+            self.require_reconciliation_completion_live(lease, operation_at)?;
+            let execution_started_at = self.execution_started_at.unwrap_or(operation_at);
+            staged.validate_for(effect, execution_started_at)?;
+            if self.reconciliation_attempts != lease.attempt_no
+                || self.receipt.is_some()
+                || self.verification.is_some()
+            {
+                return Err(LedgerError::LeaseLost);
+            }
+            self.receipt = Some(staged.receipt().clone());
+            self.receipt_operation_at = Some(operation_at);
+            self.reconciliation_operation_at = Some(operation_at);
+            self.reconciliation_observed_at = Some(staged.observed_at());
+            self.uncertain = None;
+            Ok(DurableReceiptReconciliation {
+                receipt: staged.receipt().clone(),
+                execution_started_at,
+                completion: PersistedCompletionPoint::reconciliation_head_receipt_found(
+                    operation_at,
+                ),
+            })
+        }
+    }
+
     #[derive(Debug, Default)]
     struct CountingExecutor {
         calls: usize,
@@ -4172,6 +4797,24 @@ mod tests {
     struct CountingReconciler {
         calls: usize,
         observation: ReconciliationObservation,
+    }
+
+    struct CountingReceiptReconciler {
+        calls: usize,
+        staged: Option<StagedReceiptFound>,
+    }
+
+    impl EffectReceiptReconciler for CountingReceiptReconciler {
+        fn reconcile_receipt(
+            &mut self,
+            _effect: &Effect,
+            _execution_started_at: DateTime<Utc>,
+        ) -> Result<StagedReceiptFound, ReceiptReconciliationFailure> {
+            self.calls += 1;
+            self.staged
+                .take()
+                .ok_or(ReceiptReconciliationFailure::BindingMismatch)
+        }
     }
 
     impl EffectReconciler for CountingReconciler {
@@ -5674,6 +6317,118 @@ mod tests {
             mission.effect(&effect_id).expect("effect").status,
             EffectStatus::Verified
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn receipt_only_reconciliation_claims_first_skips_verification_and_recovers_idempotently() {
+        let (mut mission, effect_id) = proposed_mission_with_connection();
+        let mut broker = broker();
+        let mut ledger = TestLedger {
+            permission_evidence_digest: Some("8".repeat(64)),
+            permission_revision: 3,
+            ..TestLedger::default()
+        };
+        broker
+            .approve(
+                &mut mission,
+                &effect_id,
+                ActorId::from("user-1"),
+                &ledger,
+                now(),
+            )
+            .expect("approval");
+        let mut executor = CountingExecutor {
+            uncertain: true,
+            ..CountingExecutor::default()
+        };
+        let mut unused_verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        assert!(matches!(
+            broker.execute_and_verify(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut unused_verifier,
+                now(),
+            ),
+            Err(BrokerError::ProviderUncertain(_))
+        ));
+        let effect = mission
+            .effect(&effect_id)
+            .expect("uncertain effect")
+            .clone();
+        let evidence_digest = "f".repeat(64);
+        let recovery = ReceiptRecoveryFence::new(
+            mission.revision,
+            connected_snapshot(&effect),
+            7,
+            "a".repeat(64),
+            "b".repeat(64),
+            4,
+            1,
+            format!("cas://{evidence_digest}"),
+            evidence_digest.clone(),
+        )
+        .expect("recovery fence");
+        let staged = StagedReceiptFound::new(
+            &effect,
+            "provider-existing-object",
+            now() + Duration::seconds(1),
+            evidence_digest,
+            now() + Duration::seconds(2),
+            recovery,
+        )
+        .expect("staged receipt");
+        let expected_receipt = staged.receipt().clone();
+        let mut reconciler = CountingReceiptReconciler {
+            calls: 0,
+            staged: Some(staged),
+        };
+        let first = broker
+            .reconcile_uncertain_receipt_authority_bound(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut reconciler,
+                now() + Duration::seconds(2),
+            )
+            .expect("receipt-only recovery");
+        assert!(first.projection_committed());
+        assert_eq!(first.result().receipt, expected_receipt);
+        let recovery_debug = format!("{first:?} {:?}", first.result());
+        assert!(!recovery_debug.contains("provider-existing-object"));
+        assert!(!recovery_debug.contains(&expected_receipt.response_digest));
+        assert_eq!(reconciler.calls, 1);
+        assert_eq!(unused_verifier.calls, 0);
+        let recovered_effect = mission.effect(&effect_id).expect("receipt projection");
+        assert_eq!(recovered_effect.status, EffectStatus::ReceiptRecorded);
+        assert_eq!(recovered_effect.receipt.as_ref(), Some(&expected_receipt));
+        assert!(recovered_effect.verification.is_none());
+        assert_eq!(ledger.verification_write_calls, 0);
+
+        let mission_after_first = mission.clone();
+        let mut forbidden_reconciler = CountingReceiptReconciler {
+            calls: 0,
+            staged: None,
+        };
+        let duplicate = broker
+            .reconcile_uncertain_receipt_authority_bound(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut forbidden_reconciler,
+                now() + Duration::seconds(3),
+            )
+            .expect("durable receipt replay");
+        assert!(!duplicate.projection_committed());
+        assert_eq!(duplicate.result().receipt, expected_receipt);
+        assert_eq!(forbidden_reconciler.calls, 0);
+        assert_eq!(mission, mission_after_first);
+        assert_eq!(executor.calls, 1);
     }
 
     #[test]

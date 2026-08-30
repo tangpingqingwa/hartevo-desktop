@@ -587,49 +587,103 @@ impl ProjectStore {
             return Err(invalid_record());
         }
         let transaction = self.connection.transaction()?;
-        let mut head = load_head(&transaction, project_id, effect_id)?.ok_or_else(|| {
-            StorageError::ScopedRecordNotFound {
-                kind: "provider recovery",
-                project_id: project_id.clone(),
-                id: effect_id.to_string(),
-            }
-        })?;
-        if head.revision != expected_revision
-            || head.binding.binding_digest != expected_binding_digest
-        {
-            return Err(conflict(effect_id, expected_revision));
-        }
-        if let Some(authority) = claim_authority {
-            if !matches!(transition, ProviderRecoveryTransition::Claim) {
-                return Err(invalid_record());
-            }
-            validate_claim_authority(&transaction, &head, &authority)?;
-        }
-        let previous_state = head.state;
-        apply_transition(&mut head, transition, now)?;
-        let changed = transaction.execute(
-            "UPDATE provider_recovery_heads
-             SET state = ?1, revision = ?2, updated_at = ?3, record_json = ?4
-             WHERE project_id = ?5 AND effect_id = ?6 AND revision = ?7
-               AND binding_digest = ?8 AND state = ?9",
-            params![
-                head.state.as_str(),
-                to_sql_u64(head.revision)?,
-                head.updated_at.to_rfc3339(),
-                serde_json::to_string(&head)?,
-                project_id.as_str(),
-                effect_id.as_str(),
-                to_sql_u64(expected_revision)?,
-                expected_binding_digest,
-                previous_state.as_str(),
-            ],
+        let head = transition_provider_recovery_in_transaction(
+            &transaction,
+            project_id,
+            effect_id,
+            expected_revision,
+            expected_binding_digest,
+            transition,
+            claim_authority,
+            now,
         )?;
-        if changed != 1 {
-            return Err(conflict(effect_id, expected_revision));
-        }
         transaction.commit()?;
         Ok(head)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_provider_recovery_receipt_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    effect_id: &EffectId,
+    expected_revision: u64,
+    expected_binding_digest: &str,
+    readback_storage_ref: String,
+    readback_content_digest: String,
+    receipt_evidence_digest: String,
+    now: DateTime<Utc>,
+) -> Result<ProviderRecoveryHead, StorageError> {
+    transition_provider_recovery_in_transaction(
+        transaction,
+        project_id,
+        effect_id,
+        expected_revision,
+        expected_binding_digest,
+        ProviderRecoveryTransition::Receipt {
+            readback_storage_ref,
+            readback_content_digest,
+            receipt_evidence_digest,
+        },
+        None,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_provider_recovery_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    effect_id: &EffectId,
+    expected_revision: u64,
+    expected_binding_digest: &str,
+    transition: ProviderRecoveryTransition,
+    claim_authority: Option<ProviderRecoveryClaimAuthority<'_>>,
+    now: DateTime<Utc>,
+) -> Result<ProviderRecoveryHead, StorageError> {
+    if !is_sha256(expected_binding_digest) {
+        return Err(invalid_record());
+    }
+    let mut head = load_head(transaction, project_id, effect_id)?.ok_or_else(|| {
+        StorageError::ScopedRecordNotFound {
+            kind: "provider recovery",
+            project_id: project_id.clone(),
+            id: effect_id.to_string(),
+        }
+    })?;
+    if head.revision != expected_revision || head.binding.binding_digest != expected_binding_digest
+    {
+        return Err(conflict(effect_id, expected_revision));
+    }
+    if let Some(authority) = claim_authority {
+        if !matches!(transition, ProviderRecoveryTransition::Claim) {
+            return Err(invalid_record());
+        }
+        validate_claim_authority(transaction, &head, &authority)?;
+    }
+    let previous_state = head.state;
+    apply_transition(&mut head, transition, now)?;
+    let changed = transaction.execute(
+        "UPDATE provider_recovery_heads
+             SET state = ?1, revision = ?2, updated_at = ?3, record_json = ?4
+             WHERE project_id = ?5 AND effect_id = ?6 AND revision = ?7
+               AND binding_digest = ?8 AND state = ?9",
+        params![
+            head.state.as_str(),
+            to_sql_u64(head.revision)?,
+            head.updated_at.to_rfc3339(),
+            serde_json::to_string(&head)?,
+            project_id.as_str(),
+            effect_id.as_str(),
+            to_sql_u64(expected_revision)?,
+            expected_binding_digest,
+            previous_state.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(conflict(effect_id, expected_revision));
+    }
+    Ok(head)
 }
 
 struct ProviderRecoveryClaimAuthority<'a> {
@@ -809,6 +863,14 @@ fn insert_head(
         ],
     )?;
     Ok(())
+}
+
+pub(crate) fn load_provider_recovery_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    effect_id: &EffectId,
+) -> Result<Option<ProviderRecoveryHead>, StorageError> {
+    load_head(transaction, project_id, effect_id)
 }
 
 fn load_head(

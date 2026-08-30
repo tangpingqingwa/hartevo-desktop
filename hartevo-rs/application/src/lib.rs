@@ -124,7 +124,8 @@ use hartevo_domain_kernel::{
 };
 use hartevo_effect_broker::{
     BrokerError, BrokerResult, EffectBroker, EffectCompletionAuthority, EffectCompletionPoint,
-    EffectExecutor, EffectReconciler, EffectVerifier,
+    EffectExecutor, EffectReceiptReconciler, EffectReconciler, EffectVerifier,
+    ReceiptReconciliationResult,
 };
 use hartevo_runtime_adapter::{
     AdapterError, LeaseFence, MappedTurnEventKind, ObservedRuntimeProcessIdentity,
@@ -13398,6 +13399,102 @@ impl ApplicationService {
         )
     }
 
+    /// Projects one exact receipt-only provider recovery. This path accepts no
+    /// verifier and cannot represent NotExecuted, ProviderRejected, or a
+    /// generic uncertain observation as a successful result.
+    pub fn reconcile_uncertain_receipt_at_revision(
+        &mut self,
+        broker: &mut EffectBroker,
+        command: &ReconcileUncertainEffect,
+        reconciler: &mut impl EffectReceiptReconciler,
+        now: DateTime<Utc>,
+    ) -> Result<(Mission, ReceiptReconciliationResult), ApplicationError> {
+        if command.expected_mission_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || !is_canonical_sha256_text(&command.expected_scope_digest)
+            || !is_canonical_sha256_text(&command.expected_broker_authorization_digest)
+        {
+            return Err(ApplicationError::EffectReconciliationCommandMismatch);
+        }
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        let effect = mission.effect(&command.effect_id)?;
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ApplicationError::EffectReconciliationAuthorityMismatch)?;
+        if !matches!(
+            effect.status,
+            EffectStatus::VerificationRequired | EffectStatus::ReceiptRecorded
+        ) || (effect.status == EffectStatus::ReceiptRecorded
+            && (effect.receipt.is_none() || effect.verification.is_some()))
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || approval.scope_digest != command.expected_scope_digest
+            || approval.permission_digest != command.expected_broker_authorization_digest
+        {
+            return Err(ApplicationError::EffectReconciliationAuthorityMismatch);
+        }
+        let mission_before = mission.clone();
+        let expected_revision = mission.revision;
+        let conversation_guard = effect.conversation_guard.clone();
+        let bound = broker
+            .reconcile_uncertain_receipt_authority_bound(
+                &mut mission,
+                &command.effect_id,
+                &mut self.store,
+                reconciler,
+                now,
+            )
+            .map_err(|bound_error| {
+                let projection_committed = bound_error.projection_committed();
+                let (error, authority) = bound_error.into_parts();
+                if projection_committed
+                    || mission != mission_before
+                    || authority.latest_accepted().is_some()
+                {
+                    return ApplicationError::EffectReceiptRecoveryProjectionMismatch;
+                }
+                error.into()
+            })?;
+        let projection_committed = bound.projection_committed();
+        let (result, authority) = bound.into_parts();
+        if !projection_committed {
+            if mission != mission_before
+                || mission.effect(&command.effect_id)?.receipt.as_ref() != Some(&result.receipt)
+            {
+                return Err(ApplicationError::EffectReceiptRecoveryProjectionMismatch);
+            }
+            return Ok((mission, result));
+        }
+        let effect = mission.effect(&command.effect_id)?;
+        if effect.status != EffectStatus::ReceiptRecorded
+            || effect.receipt.as_ref() != Some(&result.receipt)
+            || effect.verification.is_some()
+            || authority.reconciliation().is_none()
+            || authority.verification().is_some()
+        {
+            return Err(ApplicationError::EffectReceiptRecoveryProjectionMismatch);
+        }
+        let events = vec![effect_receipt_found_event(effect, &result, &authority)?];
+        self.persist_reconciled_receipt_boundaries(
+            &mission,
+            expected_revision,
+            conversation_guard.as_ref(),
+            &command.effect_id,
+            &authority,
+            &events,
+        )?;
+        Ok((mission, result))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn reconcile_loaded_effect(
         &mut self,
@@ -21195,6 +21292,39 @@ fn effect_reconciliation_events(
     Ok(events)
 }
 
+fn effect_receipt_found_event(
+    effect: &Effect,
+    result: &ReceiptReconciliationResult,
+    authority: &EffectCompletionAuthority,
+) -> Result<PendingEvent, ApplicationError> {
+    if accepted_effect_projection_route(authority)? != AcceptedEffectProjectionRoute::Reconciliation
+        || effect.status != EffectStatus::ReceiptRecorded
+        || effect.receipt.as_ref() != Some(&result.receipt)
+        || effect.verification.is_some()
+        || result.disposition
+            != hartevo_effect_broker::ExecutionDisposition::ReusedIdempotentReceipt
+        || authority.verification().is_some()
+    {
+        return Err(BrokerError::InvalidAuthorityClock.into());
+    }
+    let reconciliation = authority
+        .reconciliation()
+        .ok_or(BrokerError::InvalidAuthorityClock)?;
+    Ok(PendingEvent::new(
+        "effect.reconciliation_receipt_found",
+        serde_json::json!({
+            "effectId": effect.id,
+            "receiptId": result.receipt.id,
+            "disposition": format!("{:?}", result.disposition),
+            "readOnlyReconciliation": true,
+            "providerExecutionReplayed": false,
+            "verificationDeferred": true,
+            "authoritySequence": reconciliation.sequence(),
+        }),
+        reconciliation.operation_at(),
+    ))
+}
+
 fn effect_reconciliation_error_events(
     effect: &Effect,
     error: &BrokerError,
@@ -22775,6 +22905,8 @@ pub enum ApplicationError {
         "the uncertain Effect or its original Broker authorization no longer matches the reconciliation command"
     )]
     EffectReconciliationAuthorityMismatch,
+    #[error("receipt-only recovery no longer matches its durable Mission projection")]
+    EffectReceiptRecoveryProjectionMismatch,
     #[error("preview Effect id already exists in this Mission: {0}")]
     DuplicatePreviewEffectId(EffectId),
     #[error(
