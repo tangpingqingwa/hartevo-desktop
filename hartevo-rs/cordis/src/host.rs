@@ -8,8 +8,9 @@ use chrono::{DateTime, Utc};
 use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 use crate::authority::{
     AuthorityScope, DomainCommandBinding, DomainCommandLease, DomainCommandPermit,
-    EffectExecutionBinding, EffectExecutionLease, EffectExecutionPermit, RuntimeDispatchCompletion,
-    RuntimeDispatchLease, RuntimeDispatchPermit,
+    EffectExecutionBinding, EffectExecutionLease, EffectExecutionPermit,
+    EffectReconciliationBinding, EffectReconciliationLease, EffectReconciliationPermit,
+    RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
 };
 use crate::context::{Context, CordisError, TeardownTransaction, keys};
 use crate::invariants::{
@@ -42,6 +43,8 @@ pub struct CordisHost {
     next_domain_command_serial: u64,
     active_effect_execution: Option<ActiveEffectExecution>,
     next_effect_execution_serial: u64,
+    active_effect_reconciliation: Option<ActiveEffectReconciliation>,
+    next_effect_reconciliation_serial: u64,
     active_runtime: Option<ActiveRuntimeDispatch>,
     next_runtime_serial: u64,
 }
@@ -60,6 +63,14 @@ struct ActiveEffectExecution {
     scope: AuthorityScope,
     binding: EffectExecutionBinding,
     lease: std::sync::Arc<EffectExecutionLease>,
+}
+
+#[derive(Debug)]
+struct ActiveEffectReconciliation {
+    serial: u64,
+    scope: AuthorityScope,
+    binding: EffectReconciliationBinding,
+    lease: std::sync::Arc<EffectReconciliationLease>,
 }
 
 #[derive(Debug)]
@@ -85,6 +96,14 @@ impl std::fmt::Debug for CordisHost {
                 "next_effect_execution_serial",
                 &self.next_effect_execution_serial,
             )
+            .field(
+                "active_effect_reconciliation",
+                &self.active_effect_reconciliation,
+            )
+            .field(
+                "next_effect_reconciliation_serial",
+                &self.next_effect_reconciliation_serial,
+            )
             .field("active_runtime", &self.active_runtime)
             .field("next_runtime_serial", &self.next_runtime_serial)
             .finish()
@@ -109,6 +128,8 @@ impl CordisHost {
             next_domain_command_serial: 0,
             active_effect_execution: None,
             next_effect_execution_serial: 0,
+            active_effect_reconciliation: None,
+            next_effect_reconciliation_serial: 0,
             active_runtime: None,
             next_runtime_serial: 0,
         })
@@ -149,6 +170,8 @@ impl CordisHost {
                 next_domain_command_serial: 0,
                 active_effect_execution: None,
                 next_effect_execution_serial: 0,
+                active_effect_reconciliation: None,
+                next_effect_reconciliation_serial: 0,
                 active_runtime: None,
                 next_runtime_serial: 0,
             },
@@ -187,12 +210,16 @@ impl CordisHost {
     ) -> Result<RuntimeDispatchPermit, CordisError> {
         self.reap_abandoned_domain_command();
         self.reap_abandoned_effect_execution();
+        self.reap_abandoned_effect_reconciliation();
         self.reap_abandoned_runtime();
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
         if self.active_effect_execution.is_some() {
             return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if self.active_effect_reconciliation.is_some() {
+            return Err(CordisError::EffectReconciliationDispatchBusy);
         }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
@@ -283,12 +310,16 @@ impl CordisHost {
     ) -> Result<DomainCommandPermit, CordisError> {
         self.reap_abandoned_domain_command();
         self.reap_abandoned_effect_execution();
+        self.reap_abandoned_effect_reconciliation();
         self.reap_abandoned_runtime();
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
         }
         if self.active_effect_execution.is_some() {
             return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if self.active_effect_reconciliation.is_some() {
+            return Err(CordisError::EffectReconciliationDispatchBusy);
         }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
@@ -353,6 +384,7 @@ impl CordisHost {
     ) -> Result<EffectExecutionPermit, CordisError> {
         self.reap_abandoned_domain_command();
         self.reap_abandoned_effect_execution();
+        self.reap_abandoned_effect_reconciliation();
         self.reap_abandoned_runtime();
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
@@ -362,6 +394,9 @@ impl CordisHost {
         }
         if self.active_effect_execution.is_some() {
             return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if self.active_effect_reconciliation.is_some() {
+            return Err(CordisError::EffectReconciliationDispatchBusy);
         }
         if scope.runtime().is_some() {
             return Err(CordisError::EffectExecutionRuntimeBound);
@@ -411,6 +446,81 @@ impl CordisHost {
         Ok(())
     }
 
+    /// Issue a one-shot permit for one exact uncertain-Effect observation.
+    ///
+    /// This path checks only generic host/runtime invariants. It deliberately
+    /// does not call `apply_effect`, because the original approval window may
+    /// have expired and reconciliation has no provider-write capability.
+    pub fn authorize_effect_reconciliation(
+        &mut self,
+        scope: &AuthorityScope,
+        binding: EffectReconciliationBinding,
+    ) -> Result<EffectReconciliationPermit, CordisError> {
+        self.reap_abandoned_domain_command();
+        self.reap_abandoned_effect_execution();
+        self.reap_abandoned_effect_reconciliation();
+        self.reap_abandoned_runtime();
+        if self.active_domain_command.is_some() {
+            return Err(CordisError::DomainCommandDispatchBusy);
+        }
+        if self.active_runtime.is_some() {
+            return Err(CordisError::RuntimeDispatchBusy);
+        }
+        if self.active_effect_execution.is_some() {
+            return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if self.active_effect_reconciliation.is_some() {
+            return Err(CordisError::EffectReconciliationDispatchBusy);
+        }
+        if scope.runtime().is_some() {
+            return Err(CordisError::EffectReconciliationRuntimeBound);
+        }
+        let Some(bound_scope) = self.bound_scope.as_ref() else {
+            return Err(CordisError::AuthorityScopeUnbound);
+        };
+        if bound_scope != scope {
+            return Err(CordisError::AuthorityScopeMismatch);
+        }
+        host_is_cordis_loop(self)?;
+        enforce_runtime_invariants(&self.ctx)?;
+
+        let serial = self
+            .next_effect_reconciliation_serial
+            .checked_add(1)
+            .ok_or(CordisError::EffectReconciliationSerialOverflow)?;
+        let (permit, lease) =
+            EffectReconciliationPermit::issue(serial, scope.clone(), binding.clone());
+        self.next_effect_reconciliation_serial = serial;
+        self.active_effect_reconciliation = Some(ActiveEffectReconciliation {
+            serial,
+            scope: scope.clone(),
+            binding,
+            lease,
+        });
+        Ok(permit)
+    }
+
+    /// Settle one exact read/recovery observation after Application returns.
+    pub fn finish_effect_reconciliation(
+        &mut self,
+        permit: EffectReconciliationPermit,
+    ) -> Result<(), CordisError> {
+        self.reap_abandoned_effect_reconciliation();
+        let Some(active) = self.active_effect_reconciliation.as_ref() else {
+            return Err(CordisError::EffectReconciliationPermitMismatch);
+        };
+        if active.serial != permit.serial()
+            || active.scope != *permit.scope()
+            || active.binding != *permit.binding()
+            || !permit.owns_lease(&active.lease)
+        {
+            return Err(CordisError::EffectReconciliationPermitMismatch);
+        }
+        self.active_effect_reconciliation = None;
+        permit.complete();
+        Ok(())
+    }
+
     /// Legacy symbolic Effect invariant probe. It never executes a provider.
     pub fn apply_effect(&self) -> Result<(), CordisError> {
         apply_effect(&self.ctx)
@@ -430,6 +540,7 @@ impl CordisHost {
     ) -> Result<(), CordisError> {
         self.reap_abandoned_domain_command();
         self.reap_abandoned_effect_execution();
+        self.reap_abandoned_effect_reconciliation();
         self.reap_abandoned_runtime();
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
@@ -439,6 +550,9 @@ impl CordisHost {
         }
         if self.active_effect_execution.is_some() {
             return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if self.active_effect_reconciliation.is_some() {
+            return Err(CordisError::EffectReconciliationDispatchBusy);
         }
         self.bound_scope = None;
         self.bind_domain_kernel_facts(consent, record, approval, now)
@@ -455,6 +569,7 @@ impl CordisHost {
     ) -> Result<(), CordisError> {
         self.reap_abandoned_domain_command();
         self.reap_abandoned_effect_execution();
+        self.reap_abandoned_effect_reconciliation();
         self.reap_abandoned_runtime();
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
@@ -464,6 +579,9 @@ impl CordisHost {
         }
         if self.active_effect_execution.is_some() {
             return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if self.active_effect_reconciliation.is_some() {
+            return Err(CordisError::EffectReconciliationDispatchBusy);
         }
         self.bind_domain_kernel_facts(consent, record, approval, now)?;
         self.bound_scope = Some(scope);
@@ -516,6 +634,14 @@ impl CordisHost {
     }
 
     #[must_use]
+    pub fn active_effect_reconciliation_scope(&self) -> Option<&AuthorityScope> {
+        self.active_effect_reconciliation
+            .as_ref()
+            .filter(|active| active.lease.is_active())
+            .map(|active| &active.scope)
+    }
+
+    #[must_use]
     pub fn runtime_plugin(&self) -> Option<&'static str> {
         self.ctx
             .runtime::<RuntimeSurface>()
@@ -543,6 +669,9 @@ impl CordisHost {
             active.lease.release();
         }
         if let Some(active) = self.active_effect_execution.take() {
+            active.lease.release();
+        }
+        if let Some(active) = self.active_effect_reconciliation.take() {
             active.lease.release();
         }
         if let Some(active) = self.active_runtime.take() {
@@ -601,6 +730,16 @@ impl CordisHost {
             .is_some_and(|active| !active.lease.is_active())
         {
             self.active_effect_execution = None;
+        }
+    }
+
+    fn reap_abandoned_effect_reconciliation(&mut self) {
+        if self
+            .active_effect_reconciliation
+            .as_ref()
+            .is_some_and(|active| !active.lease.is_active())
+        {
+            self.active_effect_reconciliation = None;
         }
     }
 }

@@ -1361,6 +1361,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidEffectProposal
         | DesktopDataError::InvalidWaitingApprovalGrant
         | DesktopDataError::InvalidApprovedEffectExecution
+        | DesktopDataError::InvalidEffectReconciliation
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::BrowserWorkspaceUnavailable
         | DesktopDataError::BrowserWorkspaceContinueNotHeld
@@ -1386,6 +1387,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::RuntimeDispatch(_)
         | DesktopDataError::DomainCommandDispatch(_)
         | DesktopDataError::EffectExecutionDispatch(_)
+        | DesktopDataError::EffectReconciliationDispatch(_)
         | DesktopDataError::Cordis(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
     };
     NativeJourneyError::new(code)

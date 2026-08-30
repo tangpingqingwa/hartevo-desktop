@@ -13,9 +13,10 @@ use chrono::{DateTime, Utc};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, DomainCommandAuthority,
     DomainCommandBinding, DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding,
-    EffectExecutionPermit, Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision,
-    KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
+    EffectExecutionPermit, EffectReconciliationAuthority, EffectReconciliationBinding,
+    EffectReconciliationPermit, Fiber, FiberState, FiberUid, KernelApproval,
+    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
+    RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -217,6 +218,15 @@ impl DesktopCordisCoordinator {
         self.host.authorize_effect_execution(&scope, effect)
     }
 
+    fn authorize_bound_effect_reconciliation(
+        &mut self,
+        binding: DesktopCordisBindingReceipt,
+        effect: EffectReconciliationBinding,
+    ) -> Result<EffectReconciliationPermit, CordisError> {
+        let scope = self.consume_binding(binding)?;
+        self.host.authorize_effect_reconciliation(&scope, effect)
+    }
+
     fn bind_and_authorize_runtime(
         &mut self,
         scope: AuthorityScope,
@@ -255,6 +265,19 @@ impl DesktopCordisCoordinator {
         self.authorize_bound_effect_execution(binding, effect)
     }
 
+    fn bind_and_authorize_effect_reconciliation(
+        &mut self,
+        scope: AuthorityScope,
+        consent: KernelConsentState,
+        record: Option<KernelConsentRecord>,
+        approval: Option<KernelApproval>,
+        effect: EffectReconciliationBinding,
+        now: DateTime<Utc>,
+    ) -> Result<EffectReconciliationPermit, CordisError> {
+        let binding = self.bind_domain_kernel_scope(scope, consent, record, approval, now)?;
+        self.authorize_bound_effect_reconciliation(binding, effect)
+    }
+
     fn finish_runtime(
         &mut self,
         permit: RuntimeDispatchPermit,
@@ -271,6 +294,13 @@ impl DesktopCordisCoordinator {
         permit: EffectExecutionPermit,
     ) -> Result<(), CordisError> {
         self.host.finish_effect_execution(permit)
+    }
+
+    fn finish_effect_reconciliation(
+        &mut self,
+        permit: EffectReconciliationPermit,
+    ) -> Result<(), CordisError> {
+        self.host.finish_effect_reconciliation(permit)
     }
 
     #[cfg(test)]
@@ -487,6 +517,30 @@ where
     }
 }
 
+/// Private Desktop adapter for one Cordis-authorized read reconciliation.
+struct DesktopEffectReconciliationAuthority<Observe> {
+    observe: Observe,
+}
+
+impl<Observe> DesktopEffectReconciliationAuthority<Observe> {
+    fn new(observe: Observe) -> Self {
+        Self { observe }
+    }
+}
+
+impl<Observe, Output, AdapterError> EffectReconciliationAuthority
+    for DesktopEffectReconciliationAuthority<Observe>
+where
+    Observe: FnOnce(&EffectReconciliationPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn reconcile(self, permit: &EffectReconciliationPermit) -> Result<Self::Output, Self::Error> {
+        (self.observe)(permit)
+    }
+}
+
 /// Exact Cordis scope plus the single Domain command admitted in that scope.
 pub(crate) struct DesktopDomainCommandAuthorization {
     scope: AuthorityScope,
@@ -507,6 +561,19 @@ pub(crate) struct DesktopEffectExecutionAuthorization {
 
 impl DesktopEffectExecutionAuthorization {
     pub(crate) fn new(scope: AuthorityScope, effect: EffectExecutionBinding) -> Self {
+        Self { scope, effect }
+    }
+}
+
+/// Exact Cordis scope plus the immutable uncertain-Effect fence admitted for
+/// read reconciliation. It grants no execution or provider-write capability.
+pub(crate) struct DesktopEffectReconciliationAuthorization {
+    scope: AuthorityScope,
+    effect: EffectReconciliationBinding,
+}
+
+impl DesktopEffectReconciliationAuthorization {
+    pub(crate) fn new(scope: AuthorityScope, effect: EffectReconciliationBinding) -> Self {
         Self { scope, effect }
     }
 }
@@ -657,6 +724,55 @@ where
     }
 }
 
+/// Bind exact live facts, issue a one-shot read-reconciliation permit, release
+/// the coordinator lock for Application/Broker/observer/verifier work, then
+/// settle under a second short lock. No executor exists in this signature.
+pub(crate) fn dispatch_live_effect_reconciliation<Observe, Output, AdapterError>(
+    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    authorization: DesktopEffectReconciliationAuthorization,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+    observe: Observe,
+) -> Result<Output, AuthorityDispatchError<AdapterError>>
+where
+    Observe: FnOnce(&EffectReconciliationPermit) -> Result<Output, AdapterError>,
+{
+    let DesktopEffectReconciliationAuthorization { scope, effect } = authorization;
+    let permit = {
+        let mut host = cordis
+            .lock()
+            .map_err(|_| CordisError::EffectReconciliationCoordinatorPoisoned)?;
+        host.bind_and_authorize_effect_reconciliation(
+            scope,
+            kernel_consent_state(consent),
+            record.map(kernel_consent_record),
+            approval.map(kernel_approval),
+            effect,
+            now,
+        )?
+    };
+    let (output, authority) =
+        match DesktopEffectReconciliationAuthority::new(observe).reconcile(&permit) {
+            Ok(output) => (Some(output), None),
+            Err(error) => (None, Some(error)),
+        };
+    let finish = match cordis.lock() {
+        Ok(mut host) => host.finish_effect_reconciliation(permit).err(),
+        Err(_) => Some(CordisError::EffectReconciliationCoordinatorPoisoned),
+    };
+    if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
+        Err(error)
+    } else {
+        output.ok_or_else(|| {
+            AuthorityDispatchError::Cordis(Box::new(
+                CordisError::EffectReconciliationPermitMismatch,
+            ))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -672,9 +788,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use hartevo_cordis::{
         AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
-        DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding, FiberState,
-        OPENINTERPRETER, RuntimeBinding, SurfaceOwner, enforce_invariants, events,
-        host_is_cordis_loop, invariant_missing, keys,
+        DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding,
+        EffectReconciliationBinding, FiberState, OPENINTERPRETER, RuntimeBinding, SurfaceOwner,
+        enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -685,9 +801,10 @@ mod tests {
 
     use super::{
         DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
-        bind_live_domain_kernel, bind_live_domain_kernel_scope, dispatch_live_domain_command,
-        dispatch_live_effect_execution, dispatch_live_runtime, mount_cordis_host,
-        openinterpreter_runtime_plugin,
+        DesktopEffectReconciliationAuthorization, bind_live_domain_kernel,
+        bind_live_domain_kernel_scope, dispatch_live_domain_command,
+        dispatch_live_effect_execution, dispatch_live_effect_reconciliation, dispatch_live_runtime,
+        mount_cordis_host, openinterpreter_runtime_plugin,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -731,6 +848,10 @@ mod tests {
 
     fn effect_execution() -> EffectExecutionBinding {
         EffectExecutionBinding::new("effect-a", "a".repeat(64), "b".repeat(64)).unwrap()
+    }
+
+    fn effect_reconciliation() -> EffectReconciliationBinding {
+        EffectReconciliationBinding::new("effect-a", "a".repeat(64), "b".repeat(64)).unwrap()
     }
 
     fn assert_emit_source(error: &CordisError, expected: &'static str) {
@@ -1078,6 +1199,119 @@ mod tests {
         assert!(host.active_effect_execution_scope().is_none());
         assert!(host.active_domain_command_scope().is_none());
         assert!(host.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn desktop_effect_reconciliation_releases_lock_and_has_no_execution_authority() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let probe = Arc::clone(&host);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let nested_calls = Arc::new(AtomicUsize::new(0));
+        let observed_nested_calls = Arc::clone(&nested_calls);
+        let expected_scope = domain_scope();
+        let expected_binding = effect_reconciliation();
+        let expired_approval = approved(now() - Duration::minutes(1));
+        let nested_approval = expired_approval.clone();
+
+        let output = dispatch_live_effect_reconciliation(
+            &host,
+            DesktopEffectReconciliationAuthorization::new(
+                expected_scope.clone(),
+                expected_binding.clone(),
+            ),
+            &ConsentState::Missing,
+            None,
+            Some(&expired_approval),
+            now(),
+            move |permit| {
+                assert_eq!(permit.scope(), &expected_scope);
+                assert_eq!(permit.binding(), &expected_binding);
+                assert!(
+                    probe.try_lock().is_ok(),
+                    "Application/Broker observer must run without the Cordis lock"
+                );
+                let nested = dispatch_live_effect_reconciliation(
+                    &probe,
+                    DesktopEffectReconciliationAuthorization::new(
+                        permit.scope().clone(),
+                        permit.binding().clone(),
+                    ),
+                    &ConsentState::Missing,
+                    None,
+                    Some(&nested_approval),
+                    now(),
+                    move |_| {
+                        observed_nested_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, &'static str>(())
+                    },
+                );
+                assert_eq!(
+                    nested.unwrap_err(),
+                    AuthorityDispatchError::Cordis(Box::new(
+                        CordisError::EffectReconciliationDispatchBusy
+                    ))
+                );
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, &'static str>("application-effect-reconciliation")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, "application-effect-reconciliation");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(nested_calls.load(Ordering::SeqCst), 0);
+        let host = host.lock().unwrap();
+        assert!(host.active_effect_reconciliation_scope().is_none());
+        assert!(host.active_effect_execution_scope().is_none());
+        assert!(host.active_domain_command_scope().is_none());
+        assert!(host.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn abandoned_desktop_effect_reconciliation_recovers_on_next_dispatch() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let panic_host = Arc::clone(&host);
+        let approval = approved(now() - Duration::minutes(1));
+        let panic_approval = approval.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = dispatch_live_effect_reconciliation(
+                &panic_host,
+                DesktopEffectReconciliationAuthorization::new(
+                    domain_scope(),
+                    effect_reconciliation(),
+                ),
+                &ConsentState::Missing,
+                None,
+                Some(&panic_approval),
+                now(),
+                |_| -> Result<(), &'static str> { panic!("reconciliation observer panic") },
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            host.lock()
+                .unwrap()
+                .active_effect_reconciliation_scope()
+                .is_none()
+        );
+
+        dispatch_live_effect_reconciliation(
+            &host,
+            DesktopEffectReconciliationAuthorization::new(domain_scope(), effect_reconciliation()),
+            &ConsentState::Missing,
+            None,
+            Some(&approval),
+            now(),
+            |_| Ok::<_, &'static str>(()),
+        )
+        .unwrap();
     }
 
     #[test]

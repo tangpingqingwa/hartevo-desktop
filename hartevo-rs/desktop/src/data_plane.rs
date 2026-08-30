@@ -22,11 +22,12 @@ use hartevo_application::{
     KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
     ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession,
     ProjectEncryptionReadiness, ProposePreviewEffect, ProvisionProjectEncryption,
-    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
-    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
-    RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
-    RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission, Vm11NextContractOrValidTerminalResult,
+    ReconcileUncertainEffect, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
+    RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
+    RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
+    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
+    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
+    Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -39,7 +40,7 @@ use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblySta
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, DomainCommandBinding, DomainCommandKind,
-    EffectExecutionBinding, RuntimeBinding, RuntimeRecordBinding,
+    EffectExecutionBinding, EffectReconciliationBinding, RuntimeBinding, RuntimeRecordBinding,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -55,8 +56,8 @@ use hartevo_domain_kernel::{
     VerificationStatus, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
-    BrokerResult, EffectBroker, EffectExecutor, EffectPolicy, EffectRateLimit, EffectVerifier,
-    ExecutionDisposition,
+    BrokerResult, EffectBroker, EffectExecutor, EffectPolicy, EffectRateLimit, EffectReconciler,
+    EffectVerifier, ExecutionDisposition, ReconciliationObservation,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
 use hartevo_storage::{
@@ -70,8 +71,9 @@ use zeroize::Zeroizing;
 
 use crate::cordis_host::{
     DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
-    DesktopEffectExecutionAuthorization, dispatch_live_domain_command,
-    dispatch_live_effect_execution, dispatch_live_runtime, mount_cordis_host,
+    DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
+    dispatch_live_domain_command, dispatch_live_effect_execution,
+    dispatch_live_effect_reconciliation, dispatch_live_runtime, mount_cordis_host,
 };
 #[cfg(test)]
 use crate::cordis_host::{
@@ -608,6 +610,88 @@ pub struct DesktopApprovedEffectExecution {
     pub verification_id: VerificationId,
     pub verification_status: VerificationStatus,
     pub verification_independent: bool,
+}
+
+/// Exact Desktop-to-Cordis fence for one read-only observation of an
+/// already-uncertain Effect. No provider payload, credential, execution
+/// policy, or retry authority crosses this request.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopUncertainEffectReconciliationRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_broker_authorization_digest: String,
+    pub expected_mission_revision: u64,
+}
+
+impl fmt::Debug for DesktopUncertainEffectReconciliationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopUncertainEffectReconciliationRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("effect_id", &self.effect_id)
+            .field("expected_scope_digest", &"[DIGEST]")
+            .field("expected_broker_authorization_digest", &"[DIGEST]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .finish()
+    }
+}
+
+/// Read-only reconciliation projection. The Receipt was recovered/reused,
+/// never produced by a provider execution in this call, and remains distinct
+/// from the independent Verification.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesktopUncertainEffectReconciliation {
+    pub snapshot: DesktopSnapshot,
+    pub disposition: ExecutionDisposition,
+    pub receipt_id: ReceiptId,
+    pub verification_id: VerificationId,
+    pub verification_status: VerificationStatus,
+    pub verification_independent: bool,
+}
+
+/// Desktop-owned identity fence around an infrastructure reconciler. The
+/// delegate sees only the exact Effect snapshot that Desktop authorized; it
+/// receives no execution lease or executor.
+struct DesktopBoundEffectReconciler<'a, Reconciler> {
+    delegate: &'a mut Reconciler,
+    expected_effect: Effect,
+    observed_at: DateTime<Utc>,
+}
+
+impl<'a, Reconciler> DesktopBoundEffectReconciler<'a, Reconciler> {
+    fn new(
+        delegate: &'a mut Reconciler,
+        expected_effect: Effect,
+        observed_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            delegate,
+            expected_effect,
+            observed_at,
+        }
+    }
+}
+
+impl<Reconciler> EffectReconciler for DesktopBoundEffectReconciler<'_, Reconciler>
+where
+    Reconciler: EffectReconciler,
+{
+    fn reconcile(&mut self, effect: &Effect) -> ReconciliationObservation {
+        if effect != &self.expected_effect {
+            return ReconciliationObservation::StillUncertain {
+                reason: "desktop reconciliation observer scope mismatch".to_owned(),
+                evidence_digest: format!(
+                    "{:x}",
+                    Sha256::digest(b"desktop-reconciliation-observer-scope-mismatch")
+                ),
+                observed_at: self.observed_at,
+            };
+        }
+        self.delegate.reconcile(effect)
+    }
 }
 
 /// Exact Desktop-to-Cordis proposal fence for one preview Effect. The complete
@@ -2539,6 +2623,124 @@ impl DesktopDataPlane {
             now,
         )?;
         Ok(DesktopApprovedEffectExecution {
+            snapshot,
+            disposition: result.disposition,
+            receipt_id: result.receipt.id,
+            verification_id: result.verification.id,
+            verification_status: result.verification.status,
+            verification_independent: result.verification.independent,
+        })
+    }
+
+    /// Reconcile one exact already-uncertain Effect through
+    /// Cordis → Desktop → Application → Effect Broker.
+    ///
+    /// This API accepts only a read reconciler and independent verifier. It
+    /// has no executor parameter, does not select a provider connector, and
+    /// cannot replay the original external write.
+    pub fn reconcile_uncertain_effect_with<Reconciler, Verifier>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopUncertainEffectReconciliationRequest,
+        broker: &mut EffectBroker,
+        reconciler: &mut Reconciler,
+        verifier: &mut Verifier,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopUncertainEffectReconciliation, DesktopDataError>
+    where
+        Reconciler: EffectReconciler,
+        Verifier: EffectVerifier,
+    {
+        let DesktopUncertainEffectReconciliationRequest {
+            project_id,
+            mission_id,
+            effect_id,
+            expected_scope_digest,
+            expected_broker_authorization_digest,
+            expected_mission_revision,
+        } = request;
+        if expected_mission_revision == 0
+            || effect_id.as_str().trim().is_empty()
+            || !is_canonical_sha256(&expected_scope_digest)
+            || !is_canonical_sha256(&expected_broker_authorization_digest)
+        {
+            return Err(DesktopDataError::InvalidEffectReconciliation);
+        }
+
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.revision != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: mission.revision,
+            }
+            .into());
+        }
+        let scope = authority_scope_for_mission(&mission, &project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+        let approval = effect
+            .approval
+            .clone()
+            .ok_or(ApplicationError::EffectReconciliationAuthorityMismatch)?;
+        let (consent, record) = live_effect_consent_facts(&service, &effect, now)?;
+        let binding = EffectReconciliationBinding::new(
+            effect_id.as_str(),
+            expected_scope_digest.clone(),
+            expected_broker_authorization_digest.clone(),
+        )?;
+        let mut bound_reconciler = DesktopBoundEffectReconciler::new(reconciler, effect, now);
+
+        let (_, result): (_, BrokerResult) =
+            map_effect_reconciliation_dispatch_result(dispatch_live_effect_reconciliation(
+                &self.cordis,
+                DesktopEffectReconciliationAuthorization::new(scope, binding),
+                &consent,
+                record.as_ref(),
+                Some(&approval),
+                now,
+                |permit| {
+                    let current_scope =
+                        mission_authority_scope(&service, &project_id, &mission_id)?;
+                    if &current_scope != permit.scope()
+                        || permit.binding().effect_id() != effect_id.as_str()
+                        || permit.binding().approval_scope_digest()
+                            != expected_scope_digest.as_str()
+                        || permit.binding().broker_authorization_digest()
+                            != expected_broker_authorization_digest.as_str()
+                    {
+                        return Err(CordisError::EffectReconciliationPermitMismatch.into());
+                    }
+                    service
+                        .reconcile_uncertain_effect_at_revision(
+                            broker,
+                            &ReconcileUncertainEffect {
+                                project_id: project_id.clone(),
+                                mission_id: mission_id.clone(),
+                                effect_id: effect_id.clone(),
+                                expected_scope_digest: expected_scope_digest.clone(),
+                                expected_broker_authorization_digest:
+                                    expected_broker_authorization_digest.clone(),
+                                expected_mission_revision,
+                            },
+                            &mut bound_reconciler,
+                            verifier,
+                            now,
+                        )
+                        .map_err(DesktopDataError::from)
+                },
+            ))?;
+        let snapshot = self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
+            now,
+        )?;
+        Ok(DesktopUncertainEffectReconciliation {
             snapshot,
             disposition: result.disposition,
             receipt_id: result.receipt.id,
@@ -5281,6 +5483,19 @@ fn map_effect_execution_dispatch_result<T>(
     }
 }
 
+fn map_effect_reconciliation_dispatch_result<T>(
+    result: Result<T, AuthorityDispatchError<DesktopDataError>>,
+) -> Result<T, DesktopDataError> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(AuthorityDispatchError::Cordis(error)) => Err((*error).into()),
+        Err(AuthorityDispatchError::Authority(error)) => Err(error),
+        Err(error @ AuthorityDispatchError::Combined(_)) => Err(
+            DesktopDataError::EffectReconciliationDispatch(Box::new(error)),
+        ),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DesktopDataError {
     #[error("Desktop data root must be an absolute non-symlink directory: {0}")]
@@ -5317,6 +5532,10 @@ pub enum DesktopDataError {
         "Approved Effect execution requires exact scope/Broker authorization digests and a Mission CAS revision"
     )]
     InvalidApprovedEffectExecution,
+    #[error(
+        "uncertain Effect reconciliation requires exact scope/Broker authorization digests and a Mission CAS revision"
+    )]
+    InvalidEffectReconciliation,
     #[error(
         "Effect proposal requires a typed payload, canonical digest, stable idempotency key, positive expiry, and exact Mission CAS revision"
     )]
@@ -5385,6 +5604,8 @@ pub enum DesktopDataError {
     DomainCommandDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error("Cordis Effect execution failed across phases: {0}")]
     EffectExecutionDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
+    #[error("Cordis Effect reconciliation failed across phases: {0}")]
+    EffectReconciliationDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -11558,6 +11779,23 @@ sleep 30"#;
         }
     }
 
+    struct DesktopPreviewReconciler {
+        calls: usize,
+        receipt: Receipt,
+        observed_at: DateTime<Utc>,
+    }
+
+    impl EffectReconciler for DesktopPreviewReconciler {
+        fn reconcile(&mut self, _effect: &Effect) -> ReconciliationObservation {
+            self.calls += 1;
+            ReconciliationObservation::ReceiptFound {
+                receipt: self.receipt.clone(),
+                evidence_digest: "7".repeat(64),
+                observed_at: self.observed_at,
+            }
+        }
+    }
+
     #[test]
     fn effect_proposal_routes_through_cordis_and_stops_at_waiting_approval() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -12339,11 +12577,226 @@ sleep 30"#;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn uncertain_effect_reconciles_through_cordis_without_replaying_provider() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(7);
+        let execution_request =
+            approved_preview_execution_request(&plane, &secrets, &project_id, "reconcile", now);
+        let entry_at = now + Duration::seconds(5);
+        let mut broker = production_preview_broker();
+        let mut executor = DesktopPreviewExecutor {
+            calls: 0,
+            accepted_at: entry_at,
+            uncertain: true,
+        };
+        let mut execution_verifier = DesktopPreviewVerifier {
+            calls: 0,
+            observed_at: entry_at + Duration::milliseconds(1),
+        };
+        assert!(matches!(
+            plane.execute_approved_effect_with(
+                &secrets,
+                execution_request.clone(),
+                &mut broker,
+                &mut executor,
+                &mut execution_verifier,
+                entry_at,
+            ),
+            Err(DesktopDataError::Application(ApplicationError::Broker(
+                hartevo_effect_broker::BrokerError::ProviderUncertain(_)
+            )))
+        ));
+        assert_eq!((executor.calls, execution_verifier.calls), (1, 0));
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, entry_at)
+            .expect("uncertain Application");
+        let uncertain = service
+            .load_mission(&execution_request.project_id, &execution_request.mission_id)
+            .expect("uncertain Mission");
+        let effect = uncertain
+            .effect(&execution_request.effect_id)
+            .expect("uncertain Effect")
+            .clone();
+        assert_eq!(effect.status, EffectStatus::VerificationRequired);
+        let approval = effect.approval.as_ref().expect("original Approval");
+        let request = DesktopUncertainEffectReconciliationRequest {
+            project_id: execution_request.project_id.clone(),
+            mission_id: execution_request.mission_id.clone(),
+            effect_id: execution_request.effect_id.clone(),
+            expected_scope_digest: approval.scope_digest.clone(),
+            expected_broker_authorization_digest: approval.permission_digest.clone(),
+            expected_mission_revision: uncertain.revision,
+        };
+        let events_before = service
+            .mission_events(&request.project_id, &request.mission_id)
+            .expect("uncertain events");
+        drop(service);
+
+        let receipt = Receipt {
+            id: ReceiptId::from_stable(format!(
+                "desktop-cordis-reconciled-receipt:{}",
+                effect.id.as_str()
+            )),
+            provider: effect.provider.clone(),
+            external_id: format!("reconciled-preview-{}", effect.id.as_str()),
+            accepted_at: entry_at + Duration::milliseconds(1),
+            request_digest: effect.approval_digest(),
+            response_digest: "8".repeat(64),
+        };
+        let mut reconciler = DesktopPreviewReconciler {
+            calls: 0,
+            receipt,
+            observed_at: entry_at + Duration::milliseconds(2),
+        };
+        let mut verifier = DesktopPreviewVerifier {
+            calls: 0,
+            observed_at: entry_at + Duration::milliseconds(3),
+        };
+
+        let mut stale = request.clone();
+        stale.expected_mission_revision = stale.expected_mission_revision.saturating_add(1);
+        assert!(matches!(
+            plane.reconcile_uncertain_effect_with(
+                &secrets,
+                stale,
+                &mut broker,
+                &mut reconciler,
+                &mut verifier,
+                entry_at + Duration::milliseconds(2),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::MissionRevisionMismatch { .. }
+            ))
+        ));
+        let mut swapped_scope = request.clone();
+        swapped_scope.expected_scope_digest = "a".repeat(64);
+        if swapped_scope.expected_scope_digest == request.expected_scope_digest {
+            swapped_scope.expected_scope_digest = "b".repeat(64);
+        }
+        assert!(matches!(
+            plane.reconcile_uncertain_effect_with(
+                &secrets,
+                swapped_scope,
+                &mut broker,
+                &mut reconciler,
+                &mut verifier,
+                entry_at + Duration::milliseconds(2),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::EffectReconciliationAuthorityMismatch
+            ))
+        ));
+        let mut swapped_authorization = request.clone();
+        swapped_authorization.expected_broker_authorization_digest = "c".repeat(64);
+        assert!(matches!(
+            plane.reconcile_uncertain_effect_with(
+                &secrets,
+                swapped_authorization,
+                &mut broker,
+                &mut reconciler,
+                &mut verifier,
+                entry_at + Duration::milliseconds(2),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::EffectReconciliationAuthorityMismatch
+            ))
+        ));
+        assert_eq!((reconciler.calls, verifier.calls), (0, 0));
+        assert_eq!(executor.calls, 1, "reconciliation must not replay provider");
+
+        let recovery = plane
+            .reconcile_uncertain_effect_with(
+                &secrets,
+                request.clone(),
+                &mut broker,
+                &mut reconciler,
+                &mut verifier,
+                entry_at + Duration::milliseconds(2),
+            )
+            .expect("Cordis-authorized read reconciliation");
+        assert_eq!((reconciler.calls, verifier.calls), (1, 1));
+        assert_eq!(executor.calls, 1, "provider call count stays frozen");
+        assert_eq!(
+            recovery.disposition,
+            ExecutionDisposition::ReusedIdempotentReceipt
+        );
+        assert_eq!(recovery.verification_status, VerificationStatus::Confirmed);
+        assert!(recovery.verification_independent);
+        assert_ne!(
+            recovery.receipt_id.as_str(),
+            recovery.verification_id.as_str()
+        );
+        let projected = recovery.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == request.mission_id)
+            .expect("reconciled Mission projection");
+        assert_eq!(projected.verified_effect_count, 1);
+        assert_ne!(projected.stage, MissionStage::Completed);
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, entry_at)
+            .expect("reopen reconciled Application");
+        let mission = service
+            .load_mission(&request.project_id, &request.mission_id)
+            .expect("durable reconciled Mission");
+        let durable_effect = mission.effect(&request.effect_id).expect("durable Effect");
+        assert_eq!(durable_effect.status, EffectStatus::Verified);
+        assert_eq!(
+            durable_effect.receipt.as_ref().unwrap().id,
+            recovery.receipt_id
+        );
+        assert_eq!(
+            durable_effect.verification.as_ref().unwrap().id,
+            recovery.verification_id
+        );
+        let events = service
+            .mission_events(&request.project_id, &request.mission_id)
+            .expect("reconciliation events");
+        assert!(events.len() > events_before.len());
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "effect.reconciliation_receipt_found")
+            .expect("read-only reconciliation event");
+        assert_eq!(event.payload["readOnlyReconciliation"], true);
+        assert_eq!(event.payload["providerExecutionReplayed"], false);
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_effect_reconciliation_scope().is_none());
+        assert!(cordis.active_effect_execution_scope().is_none());
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
+    }
+
+    #[test]
     fn approved_effect_execution_request_debug_redacts_both_authority_digests() {
         let request = DesktopApprovedEffectExecutionRequest {
             project_id: ProjectId::from_stable("desktop-effect-debug-project"),
             mission_id: MissionId::from_stable("desktop-effect-debug-mission"),
             effect_id: EffectId::from_stable("desktop-effect-debug-effect"),
+            expected_scope_digest: "a".repeat(64),
+            expected_broker_authorization_digest: "b".repeat(64),
+            expected_mission_revision: 7,
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("[DIGEST]"));
+        assert!(!debug.contains(&"a".repeat(64)));
+        assert!(!debug.contains(&"b".repeat(64)));
+        assert!(!debug.contains("provider"));
+        assert!(!debug.contains("idempotency"));
+        assert!(!debug.contains("payload"));
+    }
+
+    #[test]
+    fn uncertain_effect_reconciliation_request_debug_redacts_authority_digests() {
+        let request = DesktopUncertainEffectReconciliationRequest {
+            project_id: ProjectId::from_stable("desktop-reconcile-debug-project"),
+            mission_id: MissionId::from_stable("desktop-reconcile-debug-mission"),
+            effect_id: EffectId::from_stable("desktop-reconcile-debug-effect"),
             expected_scope_digest: "a".repeat(64),
             expected_broker_authorization_digest: "b".repeat(64),
             expected_mission_revision: 7,
