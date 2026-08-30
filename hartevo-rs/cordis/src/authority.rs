@@ -225,6 +225,7 @@ pub struct EffectReconciliationBinding {
     effect_id: String,
     approval_scope_digest: String,
     broker_authorization_digest: String,
+    observation_authority_digest: Option<String>,
 }
 
 impl EffectReconciliationBinding {
@@ -243,7 +244,29 @@ impl EffectReconciliationBinding {
                 broker_authorization_digest.into(),
                 "effect_reconciliation_broker_authorization_digest",
             )?,
+            observation_authority_digest: None,
         })
+    }
+
+    /// Binds one content-free, provider-specific observation selector to the
+    /// original approved Effect. It grants no provider, secret, write,
+    /// Receipt, or Verification capability.
+    pub fn new_observation_bound(
+        effect_id: impl Into<String>,
+        approval_scope_digest: impl Into<String>,
+        broker_authorization_digest: impl Into<String>,
+        observation_authority_digest: impl Into<String>,
+    ) -> Result<Self, CordisError> {
+        let mut binding = Self::new(
+            effect_id,
+            approval_scope_digest,
+            broker_authorization_digest,
+        )?;
+        binding.observation_authority_digest = Some(canonical_digest(
+            observation_authority_digest.into(),
+            "effect_reconciliation_observation_authority_digest",
+        )?);
+        Ok(binding)
     }
 
     #[must_use]
@@ -260,6 +283,11 @@ impl EffectReconciliationBinding {
     pub fn broker_authorization_digest(&self) -> &str {
         &self.broker_authorization_digest
     }
+
+    #[must_use]
+    pub fn observation_authority_digest(&self) -> Option<&str> {
+        self.observation_authority_digest.as_deref()
+    }
 }
 
 impl fmt::Debug for EffectReconciliationBinding {
@@ -269,6 +297,13 @@ impl fmt::Debug for EffectReconciliationBinding {
             .field("effect_id", &self.effect_id)
             .field("approval_scope_digest", &"[DIGEST]")
             .field("broker_authorization_digest", &"[DIGEST]")
+            .field(
+                "observation_authority_digest",
+                &self
+                    .observation_authority_digest
+                    .as_ref()
+                    .map(|_| "[DIGEST]"),
+            )
             .finish()
     }
 }

@@ -76,8 +76,10 @@ impl<'de> Deserialize<'de> for ShopifyFulfillmentGid {
     }
 }
 
-/// Content-free call model. Access-token bytes are deliberately absent.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Credential-free call model. Exact recovery requests may contain sealed
+/// business identifiers in memory, so their `Debug` representation is always
+/// redacted. Access-token bytes are deliberately absent.
+#[derive(Clone, Eq, PartialEq)]
 pub struct ShopifyFulfillmentReadbackRequest {
     shop: ShopDomain,
     api_version: ShopifyApiVersion,
@@ -87,11 +89,12 @@ pub struct ShopifyFulfillmentReadbackRequest {
 
 /// Exact approved provider identity used only to validate a known fulfillment
 /// object. It contains IDs and quantities, never customer or credential data.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ShopifyExpectedFulfillmentIdentity {
     order_id: ShopifyOrderGid,
     fulfillment_order_id: ShopifyFulfillmentOrderGid,
     line_items: Vec<ShopifyFulfillmentLineItem>,
+    provider_created_at_not_before: DateTime<Utc>,
 }
 
 impl ShopifyExpectedFulfillmentIdentity {
@@ -99,6 +102,7 @@ impl ShopifyExpectedFulfillmentIdentity {
         order_id: ShopifyOrderGid,
         fulfillment_order_id: ShopifyFulfillmentOrderGid,
         mut line_items: Vec<ShopifyFulfillmentLineItem>,
+        provider_created_at_not_before: DateTime<Utc>,
     ) -> Result<Self, ShopifyNativeReadbackError> {
         let validated_order_id = ShopifyOrderGid::parse(order_id.as_str().to_owned())
             .map_err(|_| ShopifyNativeReadbackError::InvalidRequest)?;
@@ -131,6 +135,7 @@ impl ShopifyExpectedFulfillmentIdentity {
             order_id: validated_order_id,
             fulfillment_order_id: validated_fulfillment_order_id,
             line_items,
+            provider_created_at_not_before,
         })
     }
 
@@ -144,6 +149,20 @@ impl ShopifyExpectedFulfillmentIdentity {
 
     pub fn line_items(&self) -> &[ShopifyFulfillmentLineItem] {
         &self.line_items
+    }
+
+    pub const fn provider_created_at_not_before(&self) -> DateTime<Utc> {
+        self.provider_created_at_not_before
+    }
+}
+
+impl fmt::Debug for ShopifyExpectedFulfillmentIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyExpectedFulfillmentIdentity")
+            .field("identity", &"[REDACTED]")
+            .field("provider_time_fence", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -214,6 +233,18 @@ impl ShopifyFulfillmentReadbackRequest {
         self.expected_identity.as_ref()
     }
 
+    /// Content-free selector binding used to tie a known fulfillment GID to
+    /// one exact Cordis reconciliation permit. The digest is evidence, never
+    /// provider or execution authority.
+    pub fn selector_digest(&self) -> String {
+        digest_fields([
+            "hartevo-shopify-readback-selector/v1",
+            self.shop.as_str(),
+            self.api_version.as_str(),
+            self.fulfillment_id.as_str(),
+        ])
+    }
+
     pub fn endpoint(&self) -> String {
         self.shop
             .admin_graphql_endpoint(&self.api_version)
@@ -238,6 +269,17 @@ impl ShopifyFulfillmentReadbackRequest {
         )
         .expect("fixed Shopify readback request is valid")
         .json_body()
+    }
+}
+
+impl fmt::Debug for ShopifyFulfillmentReadbackRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyFulfillmentReadbackRequest")
+            .field("selector", &"[DIGEST]")
+            .field("api_version", &self.api_version)
+            .field("has_expected_identity", &self.expected_identity.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -295,11 +337,12 @@ impl ShopifyFulfillmentStatus {
 
 /// Canonical provider response identity for one exact approved fulfillment.
 /// The raw GraphQL body and order-line mapping never cross this boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ShopifyFulfillmentReceiptIdentity {
     order_id: ShopifyOrderGid,
     fulfillment_order_id: ShopifyFulfillmentOrderGid,
     line_items: Vec<ShopifyFulfillmentLineItem>,
+    provider_created_at_not_before: DateTime<Utc>,
     provider_created_at: DateTime<Utc>,
     provider_updated_at: DateTime<Utc>,
     response_digest: String,
@@ -318,6 +361,10 @@ impl ShopifyFulfillmentReceiptIdentity {
         &self.line_items
     }
 
+    pub const fn provider_created_at_not_before(&self) -> DateTime<Utc> {
+        self.provider_created_at_not_before
+    }
+
     pub const fn provider_created_at(&self) -> DateTime<Utc> {
         self.provider_created_at
     }
@@ -328,6 +375,17 @@ impl ShopifyFulfillmentReceiptIdentity {
 
     pub fn response_digest(&self) -> &str {
         &self.response_digest
+    }
+}
+
+impl fmt::Debug for ShopifyFulfillmentReceiptIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyFulfillmentReceiptIdentity")
+            .field("identity", &"[REDACTED]")
+            .field("provider_time_fence", &"[REDACTED]")
+            .field("response_digest", &"[DIGEST]")
+            .finish()
     }
 }
 
@@ -409,7 +467,9 @@ impl ShopifyFulfillmentReadback {
         let expected = request
             .expected_identity()
             .ok_or(ShopifyNativeReadbackError::InvalidRequest)?;
-        if provider_updated_at < provider_created_at {
+        if provider_created_at < expected.provider_created_at_not_before()
+            || provider_updated_at < provider_created_at
+        {
             return Err(ShopifyNativeReadbackError::MalformedResponse);
         }
         let status = ShopifyFulfillmentStatus::parse(status)?;
@@ -439,6 +499,7 @@ impl ShopifyFulfillmentReadback {
                 order_id: expected.order_id().clone(),
                 fulfillment_order_id: expected.fulfillment_order_id().clone(),
                 line_items: expected.line_items().to_vec(),
+                provider_created_at_not_before: expected.provider_created_at_not_before(),
                 provider_created_at,
                 provider_updated_at,
                 response_digest,
@@ -700,7 +761,9 @@ fn decode_receipt_identity(
     let status = ShopifyFulfillmentStatus::parse(required_string(fulfillment, "status")?)?;
     let provider_created_at = required_timestamp(fulfillment, "createdAt")?;
     let provider_updated_at = required_timestamp(fulfillment, "updatedAt")?;
-    if provider_updated_at < provider_created_at {
+    if provider_created_at < expected.provider_created_at_not_before()
+        || provider_updated_at < provider_created_at
+    {
         return Err(ShopifyNativeReadbackError::MalformedResponse);
     }
     let order_id = fulfillment
@@ -817,6 +880,7 @@ fn decode_receipt_identity(
             order_id: expected.order_id().clone(),
             fulfillment_order_id: expected.fulfillment_order_id().clone(),
             line_items: expected.line_items().to_vec(),
+            provider_created_at_not_before: expected.provider_created_at_not_before(),
             provider_created_at,
             provider_updated_at,
             response_digest,
@@ -911,13 +975,14 @@ fn receipt_identity_digest(
     provider_updated_at: DateTime<Utc>,
 ) -> String {
     let mut fields = vec![
-        "hartevo-shopify-fulfillment-receipt-identity/v1".to_owned(),
+        "hartevo-shopify-fulfillment-receipt-identity/v2".to_owned(),
         request.shop().as_str().to_owned(),
         request.api_version().as_str().to_owned(),
         request.fulfillment_id().as_str().to_owned(),
         expected.order_id().as_str().to_owned(),
         expected.fulfillment_order_id().as_str().to_owned(),
         status.to_owned(),
+        expected.provider_created_at_not_before().to_rfc3339(),
         provider_created_at.to_rfc3339(),
         provider_updated_at.to_rfc3339(),
     ];
@@ -996,6 +1061,9 @@ mod tests {
                     )
                     .unwrap(),
                 ],
+                DateTime::parse_from_rfc3339("2026-08-30T07:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
             )
             .unwrap(),
         )
@@ -1152,6 +1220,26 @@ mod tests {
             identity.provider_created_at().to_rfc3339(),
             "2026-08-30T08:00:00+00:00"
         );
+        assert_eq!(
+            identity.provider_created_at_not_before().to_rfc3339(),
+            "2026-08-30T07:00:00+00:00"
+        );
+        let debug = format!(
+            "{request:?} {:?} {identity:?}",
+            request.expected_identity().unwrap()
+        );
+        for private in [
+            "n12c.myshopify.com",
+            "gid://shopify/Fulfillment/3001",
+            "gid://shopify/Order/1001",
+            "gid://shopify/FulfillmentOrder/2001",
+            "gid://shopify/FulfillmentOrderLineItem/4001",
+            "line_items",
+            "quantity",
+            SHOPIFY_RECEIPT_IDENTITY_QUERY,
+        ] {
+            assert!(!debug.contains(private), "Debug leaked {private}");
+        }
     }
 
     #[test]
@@ -1211,6 +1299,14 @@ mod tests {
         future_before_create["data"]["fulfillment"]["updatedAt"] = json!("2026-08-30T07:59:59Z");
         assert_eq!(
             decode_readback(&request, &future_before_create, None),
+            Err(ShopifyNativeReadbackError::MalformedResponse)
+        );
+
+        let mut before_approved_effect = exact_body();
+        before_approved_effect["data"]["fulfillment"]["createdAt"] = json!("2026-08-30T06:59:00Z");
+        before_approved_effect["data"]["fulfillment"]["updatedAt"] = json!("2026-08-30T06:59:30Z");
+        assert_eq!(
+            decode_readback(&request, &before_approved_effect, None),
             Err(ShopifyNativeReadbackError::MalformedResponse)
         );
     }

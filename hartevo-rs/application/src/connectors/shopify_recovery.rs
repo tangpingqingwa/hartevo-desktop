@@ -9,8 +9,12 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use hartevo_commerce_connector::shopify::SHOPIFY_PROVIDER_ID;
+pub use hartevo_commerce_connector::shopify_effect::{
+    DraftFulfillmentRequest, ShopifyApprovalRevision, ShopifyEffectIdempotencyKey,
+    ShopifyFulfillmentLineItem, ShopifyFulfillmentOrderLineItemGid, ShopifyFulfillmentScope,
+};
 use hartevo_commerce_connector::shopify_effect::{
-    DraftFulfillmentRequest, SHOPIFY_FULFILLMENT_CAPABILITY, shopify_fulfillment_adapter_identity,
+    SHOPIFY_FULFILLMENT_CAPABILITY, shopify_fulfillment_adapter_identity,
 };
 use hartevo_commerce_connector::shopify_effect_reconcile::{
     ShopifyApprovedDraftFulfillment, ShopifyPluginRevision, ShopifyTypedEffectBoundary,
@@ -20,6 +24,7 @@ use hartevo_commerce_connector::shopify_transport::{
     ShopifyExpectedFulfillmentIdentity, ShopifyFulfillmentReadbackRequest,
     ShopifyNativeReadbackError,
 };
+pub use hartevo_connector_sdk::ConnectorScope;
 use hartevo_connector_sdk::{EffectExecutionContext, PreparedEffect, ProviderCapabilityKey};
 use hartevo_domain_kernel::{ApprovalDecision, Effect, EffectStatus};
 use hartevo_effect_broker::{EffectPermissionResolver, EffectPolicy, PermissionEvidence};
@@ -101,6 +106,50 @@ impl ShopifyRecoveryCapsuleRef {
             && self.head_revision == head.revision
             && self.state == head.state
     }
+
+    /// Content-free immutable link between this exact recovery head and one
+    /// known-GID readback selector. Desktop binds this digest into the Cordis
+    /// reconciliation permit; Application recomputes it after reopening the
+    /// authenticated capsule.
+    pub fn readback_authority_digest(
+        &self,
+        request: &ShopifyFulfillmentReadbackRequest,
+    ) -> Result<String, ShopifyNativeReadbackError> {
+        if request.expected_identity().is_some()
+            || self.head_revision == 0
+            || self.key_version == 0
+            || self.object_revision != SHOPIFY_RECOVERY_CAPSULE_REVISION
+            || !is_sha256(&self.binding_digest)
+            || !is_sha256(&self.content_digest)
+            || !matches!(
+                self.state,
+                ProviderRecoveryState::InFlight | ProviderRecoveryState::Uncertain
+            )
+        {
+            return Err(ShopifyNativeReadbackError::InvalidRequest);
+        }
+        Ok(canonical_digest(&[
+            "hartevo-shopify-recovery-readback-authority/v1".to_owned(),
+            self.project_id.to_string(),
+            self.effect_id.to_string(),
+            self.binding_digest.clone(),
+            self.content_digest.clone(),
+            self.key_version.to_string(),
+            self.object_revision.to_string(),
+            self.head_revision.to_string(),
+            match self.state {
+                ProviderRecoveryState::Prepared => "prepared",
+                ProviderRecoveryState::InFlight => "in_flight",
+                ProviderRecoveryState::Uncertain => "uncertain",
+                ProviderRecoveryState::NotExecuted => "not_executed",
+                ProviderRecoveryState::ReceiptObserved => "receipt_observed",
+                ProviderRecoveryState::Verified => "verified",
+                ProviderRecoveryState::FailedClosed => "failed_closed",
+            }
+            .to_owned(),
+            request.selector_digest(),
+        ]))
+    }
 }
 
 /// Result of a claim-before-return recovery. The contained adapter is still
@@ -177,9 +226,15 @@ impl ReopenedShopifyReconciliation {
     pub fn bind_exact_readback(
         &self,
         request: &ShopifyFulfillmentReadbackRequest,
+        authority_digest: &str,
     ) -> Result<ShopifyFulfillmentReadbackRequest, ShopifyNativeReadbackError> {
         let draft = self.approved.draft();
-        if request.expected_identity().is_some()
+        let current_reference = ShopifyRecoveryCapsuleRef::from_head(&self.head);
+        if current_reference
+            .readback_authority_digest(request)?
+            .as_str()
+            != authority_digest
+            || request.expected_identity().is_some()
             || draft.api_version() != request.api_version()
             || draft.tenant_scope().shop() != request.shop()
         {
@@ -189,6 +244,11 @@ impl ReopenedShopifyReconciliation {
             draft.order_gid().clone(),
             draft.fulfillment_order_gid().clone(),
             draft.line_items().to_vec(),
+            self.effect
+                .approval
+                .as_ref()
+                .map(|approval| approval.decided_at.max(self.head.prepared_at))
+                .ok_or(ShopifyNativeReadbackError::InvalidRequest)?,
         )?;
         ShopifyFulfillmentReadbackRequest::new_exact(
             request.shop().clone(),
@@ -597,6 +657,33 @@ impl<'a> ShopifySecureRecovery<'a> {
 }
 
 impl ApplicationService {
+    /// Application-owned preparation seam for Desktop: reconstructs the
+    /// approved typed payload only from the current durable Effect approval,
+    /// then publishes the encrypted N12B capsule. No provider is obtained.
+    pub fn prepare_shopify_controlled_recovery_draft(
+        &mut self,
+        material: &ProjectContextMaterialSession,
+        effect: &Effect,
+        draft: DraftFulfillmentRequest,
+        plugin_revision: u64,
+        policy: &EffectPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<ShopifyRecoveryCapsuleRef, ShopifyRecoveryError> {
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let approved = rebuild_approved(
+            draft,
+            ShopifyPluginRevision::new(plugin_revision)
+                .map_err(|_| ShopifyRecoveryError::BindingMismatch)?,
+            &approval.permission_digest,
+            effect.expires_at,
+        )?;
+        ShopifySecureRecovery::new(&mut self.store, material)
+            .prepare_controlled(effect, &approved, policy, now)
+    }
+
     /// Application-owned wrapper so Desktop never obtains the ProjectStore or
     /// decrypted capsule bytes.
     pub fn reopen_shopify_reconciliation(
@@ -785,6 +872,13 @@ fn sha256(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -868,6 +962,72 @@ mod tests {
             readable_key_versions: BTreeSet::from([1]),
             unavailable_historical_key_versions: BTreeSet::new(),
         }
+    }
+
+    fn assert_n14_exact_readback_binding(
+        reopened: &ReopenedShopifyReconciliation,
+        reference: &ShopifyRecoveryCapsuleRef,
+        approved: &ShopifyApprovedDraftFulfillment,
+        effect: &Effect,
+        head_before: &ProviderRecoveryHead,
+    ) {
+        let selector = ShopifyFulfillmentReadbackRequest::new(
+            approved.draft().tenant_scope().shop().clone(),
+            approved.draft().api_version().clone(),
+            ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
+        )
+        .unwrap();
+        let authority_digest = reference.readback_authority_digest(&selector).unwrap();
+        let other_selector = ShopifyFulfillmentReadbackRequest::new(
+            approved.draft().tenant_scope().shop().clone(),
+            approved.draft().api_version().clone(),
+            ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3002").unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            authority_digest,
+            reference
+                .readback_authority_digest(&other_selector)
+                .unwrap()
+        );
+        let exact_readback = reopened
+            .bind_exact_readback(&selector, &authority_digest)
+            .unwrap();
+        let expected_identity = exact_readback
+            .expected_identity()
+            .expect("approved capsule binds exact identity");
+        assert_eq!(effect.target_resource, "shopify://recovery/fulfillment");
+        assert_eq!(expected_identity.order_id(), approved.draft().order_gid());
+        assert_eq!(
+            expected_identity.fulfillment_order_id(),
+            approved.draft().fulfillment_order_gid()
+        );
+        assert_eq!(
+            expected_identity.line_items(),
+            approved.draft().line_items()
+        );
+        assert_eq!(
+            expected_identity.provider_created_at_not_before(),
+            head_before.prepared_at
+        );
+        let observed = hartevo_commerce_connector::shopify_transport::ShopifyFulfillmentReadback::fixture_exact(
+            &exact_readback,
+            "SUCCESS",
+            head_before.prepared_at + Duration::seconds(1),
+            head_before.prepared_at + Duration::seconds(2),
+        )
+        .unwrap();
+        assert!(observed.receipt_identity().is_some());
+        let wrong_shop = ShopifyFulfillmentReadbackRequest::new(
+            ShopDomain::parse("other.myshopify.com").unwrap(),
+            approved.draft().api_version().clone(),
+            ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.bind_exact_readback(&wrong_shop, &authority_digest),
+            Err(ShopifyNativeReadbackError::InvalidRequest)
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1175,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_capsule_reopens_read_only_without_execution_or_head_mutation() {
+    fn n12b_uncertain_capsule_binds_n14_known_gid_without_rewriting_effect_or_head() {
         let temporary = TempDir::new().unwrap();
         let database_path = temporary.path().join("shopify-reconciliation.sqlite3");
         let now = Utc::now();
@@ -1227,38 +1387,7 @@ mod tests {
         assert_eq!(reopened.effect.status, EffectStatus::VerificationRequired);
         assert_eq!(reopened.current_mission_revision, current_revision);
         assert_eq!(reopened.head, head_before);
-        let exact_readback = reopened
-            .bind_exact_readback(
-                &ShopifyFulfillmentReadbackRequest::new(
-                    approved.draft().tenant_scope().shop().clone(),
-                    approved.draft().api_version().clone(),
-                    ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let expected_identity = exact_readback
-            .expected_identity()
-            .expect("approved capsule binds exact identity");
-        assert_eq!(expected_identity.order_id(), approved.draft().order_gid());
-        assert_eq!(
-            expected_identity.fulfillment_order_id(),
-            approved.draft().fulfillment_order_gid()
-        );
-        assert_eq!(
-            expected_identity.line_items(),
-            approved.draft().line_items()
-        );
-        let wrong_shop = ShopifyFulfillmentReadbackRequest::new(
-            ShopDomain::parse("other.myshopify.com").unwrap(),
-            approved.draft().api_version().clone(),
-            ShopifyFulfillmentGid::parse("gid://shopify/Fulfillment/3001").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            reopened.bind_exact_readback(&wrong_shop),
-            Err(ShopifyNativeReadbackError::InvalidRequest)
-        );
+        assert_n14_exact_readback_binding(&reopened, &reference, &approved, &effect, &head_before);
         assert_eq!(
             store
                 .load_provider_recovery(&effect.project_id, &effect.id)

@@ -10,8 +10,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-pub use hartevo_commerce_connector::shopify::SHOPIFY_PROVIDER_ID;
-pub use hartevo_commerce_connector::shopify::ShopifyApiVersion;
+pub use hartevo_commerce_connector::shopify::{SHOPIFY_PROVIDER_ID, ShopDomain, ShopifyApiVersion};
 pub use hartevo_commerce_connector::shopify_effect::{
     SHOPIFY_FULFILLMENT_CAPABILITY, ShopifyFulfillmentOrderGid, ShopifyOrderGid,
 };
@@ -175,9 +174,9 @@ impl fmt::Debug for ShopifyReadbackCredentialBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ShopifyReadbackCredentialBinding")
-            .field("scope_digest", &self.scope.digest())
-            .field("shop", &self.shop)
-            .field("storage_reference", &self.storage_reference)
+            .field("scope_digest", &"[DIGEST]")
+            .field("shop", &"[REDACTED]")
+            .field("storage_reference", &"[REDACTED]")
             .field("credential_revision", &self.credential_revision())
             .finish_non_exhaustive()
     }
@@ -312,8 +311,13 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ShopifySecretReadbackProvider")
-            .field("binding", &self.binding)
-            .field("request", &self.request)
+            .field("scope_digest", &"[DIGEST]")
+            .field("credential_revision", &self.binding.credential_revision())
+            .field("request_selector", &"[DIGEST]")
+            .field(
+                "has_expected_identity",
+                &self.request.expected_identity().is_some(),
+            )
             .field("expected_provenance", &self.expected_provenance)
             .field("has_outcome", &self.outcome.is_some())
             .finish_non_exhaustive()
@@ -394,7 +398,7 @@ pub struct ShopifyReadbackMetadata {
 
 /// Redacted, exact provider identity observation. This is sufficient for a
 /// later reviewed Receipt mapper, but is not itself a Domain Receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ShopifyReadbackIdentityMetadata {
     pub fulfillment_id: ShopifyFulfillmentGid,
     pub status: ShopifyFulfillmentStatus,
@@ -410,6 +414,25 @@ pub struct ShopifyReadbackIdentityMetadata {
     pub credential_use_digest: String,
     pub lease_reclaimed: bool,
     pub provenance_class: ProviderProvenanceClass,
+}
+
+impl fmt::Debug for ShopifyReadbackIdentityMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyReadbackIdentityMetadata")
+            .field("identity", &"[REDACTED]")
+            .field("line_item_binding_digest", &"[DIGEST]")
+            .field(
+                "request_id_digest",
+                &self.request_id_digest.as_ref().map(|_| "[DIGEST]"),
+            )
+            .field("response_digest", &"[DIGEST]")
+            .field("evidence_digest", &"[DIGEST]")
+            .field("credential_use_digest", &"[DIGEST]")
+            .field("lease_reclaimed", &self.lease_reclaimed)
+            .field("provenance_class", &self.provenance_class)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShopifyBrokeredReadback {
@@ -446,7 +469,8 @@ impl ShopifyBrokeredReadback {
             .readback
             .receipt_identity()
             .ok_or(ShopifyReadbackBridgeError::MissingReceiptIdentity)?;
-        if identity.provider_updated_at() < identity.provider_created_at()
+        if identity.provider_created_at() < identity.provider_created_at_not_before()
+            || identity.provider_updated_at() < identity.provider_created_at()
             || identity.provider_created_at() > now
             || identity.provider_updated_at() > now
             || !self.credential_use.lease_reclaimed()
@@ -628,6 +652,7 @@ mod tests {
                     )
                     .unwrap(),
                 ],
+                now() - Duration::minutes(2),
             )
             .unwrap(),
         )
@@ -761,6 +786,16 @@ mod tests {
         let debug = format!("{metadata:?} {provider:?} {outcome:?}");
         assert!(!debug.contains("shpat_exact"));
         assert!(!debug.contains("never-logged"));
+        for private in [
+            "n12c.myshopify.com",
+            "gid://shopify/Order/1001",
+            "gid://shopify/FulfillmentOrder/2001",
+            "gid://shopify/FulfillmentOrderLineItem/4001",
+            "line_items",
+            "quantity",
+        ] {
+            assert!(!debug.contains(private), "Debug leaked {private}");
+        }
     }
 
     #[test]

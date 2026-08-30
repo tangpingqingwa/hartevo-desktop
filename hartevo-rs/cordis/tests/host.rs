@@ -448,7 +448,13 @@ fn effect_execution_binding_rejects_noncanonical_or_content_like_inputs() {
 fn effect_reconciliation_is_exact_read_only_and_does_not_require_live_approval() {
     let mut host = CordisHost::boot(false).unwrap();
     let scope = domain_scope("project-a", "mission-a", 7);
-    let binding = effect_reconciliation("effect-a", 'a', 'b');
+    let binding = EffectReconciliationBinding::new_observation_bound(
+        "effect-a",
+        "a".repeat(64),
+        "b".repeat(64),
+        "c".repeat(64),
+    )
+    .unwrap();
     host.bind_domain_kernel_scope(
         scope.clone(),
         KernelConsentState::Missing,
@@ -468,6 +474,10 @@ fn effect_reconciliation_is_exact_read_only_and_does_not_require_live_approval()
     assert_eq!(
         permit.binding().broker_authorization_digest(),
         "b".repeat(64)
+    );
+    assert_eq!(
+        permit.binding().observation_authority_digest(),
+        Some("c".repeat(64).as_str())
     );
     assert_eq!(host.active_effect_reconciliation_scope(), Some(&scope));
     assert!(host.active_effect_execution_scope().is_none());
@@ -550,10 +560,23 @@ fn effect_reconciliation_is_mutually_exclusive_drop_safe_and_teardown_revoked() 
 #[test]
 fn effect_reconciliation_binding_is_distinct_redacted_and_canonical() {
     let binding = effect_reconciliation("effect-a", 'a', 'b');
+    assert!(binding.observation_authority_digest().is_none());
     let debug = format!("{binding:?}");
     assert!(debug.contains("effect-a"));
     assert!(!debug.contains(&"a".repeat(64)));
     assert!(!debug.contains(&"b".repeat(64)));
+    let bounded = EffectReconciliationBinding::new_observation_bound(
+        "effect-a",
+        "a".repeat(64),
+        "b".repeat(64),
+        "c".repeat(64),
+    )
+    .unwrap();
+    assert_eq!(
+        bounded.observation_authority_digest(),
+        Some("c".repeat(64).as_str())
+    );
+    assert!(!format!("{bounded:?}").contains(&"c".repeat(64)));
     assert_eq!(
         EffectReconciliationBinding::new(" effect-a", "a".repeat(64), "b".repeat(64)).unwrap_err(),
         CordisError::InvalidAuthorityScope {
@@ -570,6 +593,18 @@ fn effect_reconciliation_binding_is_distinct_redacted_and_canonical() {
         EffectReconciliationBinding::new("effect-a", "a".repeat(64), "provider-token").unwrap_err(),
         CordisError::InvalidAuthorityDigest {
             field: "effect_reconciliation_broker_authorization_digest"
+        }
+    );
+    assert_eq!(
+        EffectReconciliationBinding::new_observation_bound(
+            "effect-a",
+            "a".repeat(64),
+            "b".repeat(64),
+            "Provider-GID",
+        )
+        .unwrap_err(),
+        CordisError::InvalidAuthorityDigest {
+            field: "effect_reconciliation_observation_authority_digest"
         }
     );
 }
