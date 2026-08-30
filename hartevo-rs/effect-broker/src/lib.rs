@@ -42,6 +42,7 @@ pub use secret_broker::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{
@@ -49,7 +50,7 @@ use hartevo_domain_kernel::{
     ConsentRecordId, ConsentState, ConversationId, CreatorHiringId, CurrencyCode,
     DurableProviderState, Effect, EffectClass, EffectId, EffectStatus, ExecutionAttemptId, Mission,
     MissionCheckpointStatus, MissionError, MissionStage, PartnerId, Receipt, ReceiptId,
-    Verification, VerificationStatus,
+    Verification, VerificationId, VerificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -602,6 +603,348 @@ pub trait EffectVerifier {
     fn verify(&mut self, effect: &Effect, receipt: &Receipt) -> Verification;
 }
 
+/// Exact durable subject presented to the independent, read-only
+/// verification source. It contains only the provider/capability and
+/// content-free approval fences needed to select a fresh read, plus the
+/// recorded Receipt and its original execution fence. Effect payload,
+/// target-resource, executor, and execution-lease data never cross this
+/// boundary.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReceiptVerificationSubject {
+    effect_id: EffectId,
+    provider: String,
+    capability: String,
+    approval_scope_digest: String,
+    broker_authorization_digest: String,
+    receipt: Receipt,
+    execution_started_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for ReceiptVerificationSubject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReceiptVerificationSubject")
+            .field("effect_id", &self.effect_id)
+            .field("provider", &self.provider)
+            .field("capability", &self.capability)
+            .field("approval_scope_digest", &"[DIGEST]")
+            .field("broker_authorization_digest", &"[DIGEST]")
+            .field("receipt", &"[REDACTED]")
+            .field("execution_started_at", &self.execution_started_at)
+            .finish()
+    }
+}
+
+impl ReceiptVerificationSubject {
+    fn new(
+        effect: &Effect,
+        binding: &ReceiptVerificationClaimBinding,
+        receipt: Receipt,
+        execution_started_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            effect_id: effect.id.clone(),
+            provider: effect.provider.clone(),
+            capability: effect.capability.clone(),
+            approval_scope_digest: binding.approval_scope_digest.clone(),
+            broker_authorization_digest: binding.broker_authorization_digest.clone(),
+            receipt,
+            execution_started_at,
+        }
+    }
+
+    #[must_use]
+    pub fn effect_id(&self) -> &EffectId {
+        &self.effect_id
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    #[must_use]
+    pub fn approval_scope_digest(&self) -> &str {
+        &self.approval_scope_digest
+    }
+
+    #[must_use]
+    pub fn broker_authorization_digest(&self) -> &str {
+        &self.broker_authorization_digest
+    }
+
+    #[must_use]
+    pub fn receipt(&self) -> &Receipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub const fn execution_started_at(&self) -> DateTime<Utc> {
+        self.execution_started_at
+    }
+}
+
+/// Observation returned by a fresh independent source.  The source owns the
+/// verifier identity; Broker-owned durable state owns the resulting
+/// Verification record and operation time.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum IndependentVerificationObservation {
+    Confirmed {
+        evidence_digest: String,
+        observed_at: DateTime<Utc>,
+    },
+    Rejected {
+        evidence_digest: String,
+        observed_at: DateTime<Utc>,
+    },
+    Inconclusive {
+        evidence_digest: String,
+        observed_at: DateTime<Utc>,
+    },
+}
+
+impl std::fmt::Debug for IndependentVerificationObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (outcome, observed_at) = match self {
+            Self::Confirmed { observed_at, .. } => ("confirmed", observed_at),
+            Self::Rejected { observed_at, .. } => ("rejected", observed_at),
+            Self::Inconclusive { observed_at, .. } => ("inconclusive", observed_at),
+        };
+        formatter
+            .debug_struct("IndependentVerificationObservation")
+            .field("outcome", &outcome)
+            .field("observed_at", observed_at)
+            .field("evidence_digest", &"[DIGEST]")
+            .finish()
+    }
+}
+
+impl IndependentVerificationObservation {
+    pub fn validate_for(&self, subject: &ReceiptVerificationSubject) -> Result<(), LedgerError> {
+        let (evidence_digest, observed_at) = match self {
+            Self::Confirmed {
+                evidence_digest,
+                observed_at,
+            }
+            | Self::Rejected {
+                evidence_digest,
+                observed_at,
+            }
+            | Self::Inconclusive {
+                evidence_digest,
+                observed_at,
+            } => (evidence_digest, observed_at),
+        };
+        if !is_sha256(evidence_digest)
+            || *observed_at < subject.receipt.accepted_at
+            || subject.receipt.provider != subject.provider
+            || subject.receipt.external_id.trim().is_empty()
+            || subject.receipt.request_digest != subject.approval_scope_digest
+            || !is_sha256(&subject.receipt.response_digest)
+            || evidence_digest.as_str() == subject.receipt.response_digest.as_str()
+            || subject.receipt.accepted_at < subject.execution_started_at
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn evidence_digest(&self) -> &str {
+        match self {
+            Self::Confirmed {
+                evidence_digest, ..
+            }
+            | Self::Rejected {
+                evidence_digest, ..
+            }
+            | Self::Inconclusive {
+                evidence_digest, ..
+            } => evidence_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Confirmed { observed_at, .. }
+            | Self::Rejected { observed_at, .. }
+            | Self::Inconclusive { observed_at, .. } => *observed_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> VerificationStatus {
+        match self {
+            Self::Confirmed { .. } => VerificationStatus::Confirmed,
+            Self::Rejected { .. } => VerificationStatus::Rejected,
+            Self::Inconclusive { .. } => VerificationStatus::Inconclusive,
+        }
+    }
+}
+
+/// Stable content-free claim binding for one verification attempt. The
+/// observation selector and source identity are included so a stale or
+/// swapped read cannot settle an otherwise valid Effect lease.
+#[allow(clippy::struct_field_names)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReceiptVerificationClaimBinding {
+    approval_scope_digest: String,
+    broker_authorization_digest: String,
+    receipt_binding_digest: String,
+    observation_authority_digest: String,
+    source_binding_digest: String,
+}
+
+impl fmt::Debug for ReceiptVerificationClaimBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReceiptVerificationClaimBinding")
+            .field("approval_scope_digest", &"[DIGEST]")
+            .field("broker_authorization_digest", &"[DIGEST]")
+            .field("receipt_binding_digest", &"[DIGEST]")
+            .field("observation_authority_digest", &"[DIGEST]")
+            .field("source_binding_digest", &"[DIGEST]")
+            .finish()
+    }
+}
+
+impl ReceiptVerificationClaimBinding {
+    pub fn new(
+        approval_scope_digest: impl Into<String>,
+        broker_authorization_digest: impl Into<String>,
+        receipt_binding_digest: impl Into<String>,
+        observation_authority_digest: impl Into<String>,
+        source_binding_digest: impl Into<String>,
+    ) -> Result<Self, LedgerError> {
+        let binding = Self {
+            approval_scope_digest: approval_scope_digest.into(),
+            broker_authorization_digest: broker_authorization_digest.into(),
+            receipt_binding_digest: receipt_binding_digest.into(),
+            observation_authority_digest: observation_authority_digest.into(),
+            source_binding_digest: source_binding_digest.into(),
+        };
+        if [
+            binding.approval_scope_digest.as_str(),
+            binding.broker_authorization_digest.as_str(),
+            binding.receipt_binding_digest.as_str(),
+            binding.observation_authority_digest.as_str(),
+            binding.source_binding_digest.as_str(),
+        ]
+        .iter()
+        .any(|value| !is_sha256(value))
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        Ok(binding)
+    }
+
+    #[must_use]
+    pub fn approval_scope_digest(&self) -> &str {
+        &self.approval_scope_digest
+    }
+
+    #[must_use]
+    pub fn broker_authorization_digest(&self) -> &str {
+        &self.broker_authorization_digest
+    }
+
+    #[must_use]
+    pub fn receipt_binding_digest(&self) -> &str {
+        &self.receipt_binding_digest
+    }
+
+    #[must_use]
+    pub fn observation_authority_digest(&self) -> &str {
+        &self.observation_authority_digest
+    }
+
+    #[must_use]
+    pub fn source_binding_digest(&self) -> &str {
+        &self.source_binding_digest
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut digest = Sha256::new();
+        hash_field(&mut digest, "hartevo-receipt-verification-claim/v1");
+        for value in [
+            self.approval_scope_digest.as_str(),
+            self.broker_authorization_digest.as_str(),
+            self.receipt_binding_digest.as_str(),
+            self.observation_authority_digest.as_str(),
+            self.source_binding_digest.as_str(),
+        ] {
+            hash_field(&mut digest, value);
+        }
+        format!("{:x}", digest.finalize())
+    }
+
+    pub fn validate_for(&self, effect: &Effect, receipt: &Receipt) -> Result<(), LedgerError> {
+        if !is_sha256(&self.approval_scope_digest)
+            || !is_sha256(&self.broker_authorization_digest)
+            || !is_sha256(&self.receipt_binding_digest)
+            || !is_sha256(&self.observation_authority_digest)
+            || !is_sha256(&self.source_binding_digest)
+            || self.approval_scope_digest != effect.approval_digest()
+            || effect.approval.as_ref().is_none_or(|approval| {
+                approval.permission_digest != self.broker_authorization_digest
+            })
+            || self.receipt_binding_digest != receipt_binding_digest(receipt)
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum VerificationSourceError {
+    #[error("independent verification source is unavailable")]
+    Unavailable,
+    #[error("independent verification source was cancelled")]
+    Cancelled,
+    #[error("independent verification source rejected the exact selector")]
+    Rejected,
+}
+
+/// Independent read-only source boundary.  Implementors should construct a
+/// fresh source instance for each verification call; the source must not reuse
+/// N15 reconciliation response material or a mutable execution adapter.
+pub trait ReceiptVerificationSource {
+    fn verifier_id(&self) -> &str;
+
+    /// Digest of the exact source configuration/selector this instance is
+    /// authorized to use. Every source must attest its adapter, generation,
+    /// and selector fences explicitly; identity-only defaults are forbidden.
+    fn source_binding_digest(&self) -> String;
+
+    fn observe(
+        &mut self,
+        subject: &ReceiptVerificationSubject,
+    ) -> Result<IndependentVerificationObservation, VerificationSourceError>;
+
+    /// Revalidates durable verification evidence locally after a process
+    /// restart. Implementations must not call a provider from this hook.
+    fn validate_recovered(
+        &self,
+        subject: &ReceiptVerificationSubject,
+        verification: &Verification,
+    ) -> Result<(), VerificationSourceError>;
+}
+
+/// Naming alias used by callers that model the source as a verifier.  It is a
+/// marker only and intentionally does not expose the legacy `EffectVerifier`.
+pub trait IndependentReceiptVerifier: ReceiptVerificationSource {}
+
+impl<T> IndependentReceiptVerifier for T where T: ReceiptVerificationSource {}
+
 /// A trusted time source used only by [`EffectAuthorityClock`]. UI and Domain
 /// callers never supply a completion `DateTime` or its wall-clock anchor.
 trait EffectAuthorityTimeSource {
@@ -1026,6 +1369,51 @@ pub struct AuthorityBoundBrokerResult {
     projection_committed: bool,
 }
 
+/// Result of the verification-only Broker route.  The operation timestamp is
+/// sampled from Broker-owned authority time after the fresh source returns;
+/// it is never taken from UI input or source wall-clock data.
+#[derive(Clone, Eq, PartialEq)]
+pub struct IndependentVerificationResult {
+    pub receipt: Receipt,
+    pub verification: Verification,
+    pub operation_at: DateTime<Utc>,
+    completion: EffectCompletionPoint,
+    authority: EffectCompletionAuthority,
+}
+
+impl fmt::Debug for IndependentVerificationResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndependentVerificationResult")
+            .field("receipt", &"[REDACTED]")
+            .field("verification_id", &self.verification.id)
+            .field("verification_status", &self.verification.status)
+            .field("verification_independent", &self.verification.independent)
+            .field("verification_evidence_digest", &"[DIGEST]")
+            .field("operation_at", &self.operation_at)
+            .field("authority_sequence", &self.completion.sequence)
+            // The authority contains the durable history used to prove this
+            // point and must not be exposed through diagnostic formatting.
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndependentVerificationResult {
+    /// The Broker-owned completion point assigned after the durable
+    /// verification commit. Its sequence is safe for the application event
+    /// projection; callers must not synthesize one from receipt history.
+    #[must_use]
+    pub const fn completion(&self) -> EffectCompletionPoint {
+        self.completion
+    }
+
+    /// The redacted authority history used to establish `completion`.
+    #[must_use]
+    pub const fn authority(&self) -> &EffectCompletionAuthority {
+        &self.authority
+    }
+}
+
 impl std::fmt::Debug for AuthorityBoundBrokerResult {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1209,8 +1597,10 @@ fn broker_error_kind(error: &BrokerError) -> &'static str {
         BrokerError::ReconciliationStillUncertain { .. } => "reconciliation_still_uncertain",
         BrokerError::ProviderNotExecuted { .. } => "provider_not_executed",
         BrokerError::ReconciliationDeadLetter { .. } => "reconciliation_dead_letter",
+        BrokerError::VerificationBusy => "verification_busy",
         BrokerError::VerificationRejected => "verification_rejected",
         BrokerError::VerificationInconclusive => "verification_inconclusive",
+        BrokerError::VerificationSourceUnavailable(_) => "verification_source_unavailable",
         BrokerError::MissingReceipt => "missing_receipt",
         BrokerError::MissingVerification => "missing_verification",
     }
@@ -1222,6 +1612,79 @@ pub struct ExecutionLease {
     pub owner: String,
     pub generation: u64,
     pub expires_at: DateTime<Utc>,
+}
+
+/// Durable lease for the independent verification attempt.  This is a
+/// distinct type from [`ExecutionLease`] and [`ReconciliationLease`], so a
+/// verifier cannot be passed to either provider-write or N15 reconciliation
+/// APIs by accident.
+#[derive(Clone, Eq, PartialEq)]
+pub struct VerificationLease {
+    pub attempt_id: ExecutionAttemptId,
+    pub owner: String,
+    pub generation: u64,
+    pub attempt_no: u32,
+    pub binding_digest: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for VerificationLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerificationLease")
+            .field("generation", &self.generation)
+            .field("attempt_no", &self.attempt_no)
+            .field("expires_at", &self.expires_at)
+            // The omitted attempt, owner, and binding fields are durable
+            // authorization material and are intentionally redacted.
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum VerificationClaim {
+    Acquired {
+        lease: VerificationLease,
+        receipt: Receipt,
+        execution_started_at: DateTime<Utc>,
+        receipt_completion: PersistedCompletionPoint,
+    },
+    AlreadyCompleted {
+        receipt: Receipt,
+        verification: Verification,
+        execution_started_at: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
+        receipt_completion: PersistedCompletionPoint,
+    },
+    Busy,
+}
+
+impl fmt::Debug for VerificationClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Acquired {
+                lease,
+                execution_started_at,
+                ..
+            } => formatter
+                .debug_struct("VerificationClaim::Acquired")
+                .field("lease", lease)
+                .field("execution_started_at", execution_started_at)
+                .finish(),
+            Self::AlreadyCompleted {
+                verification,
+                execution_started_at,
+                operation_at,
+                ..
+            } => formatter
+                .debug_struct("VerificationClaim::AlreadyCompleted")
+                .field("verification_status", &verification.status)
+                .field("execution_started_at", execution_started_at)
+                .field("operation_at", operation_at)
+                .finish(),
+            Self::Busy => formatter.write_str("VerificationClaim::Busy"),
+        }
+    }
 }
 
 /// Bounded policy for read-only Provider reconciliation. This policy never
@@ -2122,6 +2585,32 @@ pub trait DurableEffectLedger {
     ) -> Result<ReconciliationDisposition, LedgerError>;
 }
 
+/// Storage boundary dedicated to the independent verification route.  The
+/// implementation must claim the typed verification lease before any source
+/// gets a Secret Broker capability and must commit the verification attempt,
+/// effect idempotency record, and provider-recovery head atomically.
+pub trait ReceiptVerificationInfrastructure {
+    fn claim_verification(
+        &mut self,
+        effect: &Effect,
+        binding: &ReceiptVerificationClaimBinding,
+        expected_mission_revision: u64,
+        owner: &str,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<VerificationClaim, LedgerError>;
+
+    fn commit_verification(
+        &mut self,
+        effect: &Effect,
+        binding: &ReceiptVerificationClaimBinding,
+        lease: &VerificationLease,
+        verification: &Verification,
+        expected_mission_revision: u64,
+        operation_at: DateTime<Utc>,
+    ) -> Result<(), LedgerError>;
+}
+
 /// A single infrastructure object supplies both fresh authorization state and
 /// durable execution state, avoiding a check/execute path that can accidentally
 /// use an in-memory ledger.
@@ -2199,6 +2688,198 @@ impl EffectBroker {
         };
         mission.approve_effect(effect_id, approval)?;
         Ok(())
+    }
+
+    /// Verify one durable N15 Receipt with a fresh, independent read-only
+    /// source.  This route has no executor, reconciler, or legacy generic
+    /// `EffectVerifier` in its type boundary and claims the typed
+    /// [`VerificationLease`] before invoking the source.
+    #[allow(clippy::too_many_lines)]
+    pub fn verify_recorded_receipt(
+        &mut self,
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        infrastructure: &mut impl ReceiptVerificationInfrastructure,
+        binding: &ReceiptVerificationClaimBinding,
+        source: &mut impl ReceiptVerificationSource,
+        entry_at: DateTime<Utc>,
+    ) -> Result<IndependentVerificationResult, BrokerError> {
+        let effect = mission.effect(effect_id)?.clone();
+        if !matches!(
+            &effect.status,
+            EffectStatus::ReceiptRecorded
+                | EffectStatus::VerificationRequired
+                | EffectStatus::Verified
+                | EffectStatus::Failed
+        ) {
+            return Err(BrokerError::NotApproved(effect.status.clone()));
+        }
+        // Validate the caller's authority time and the exact source binding
+        // before opening the durable claim. Source identity is content-free,
+        // but it is still part of the claim and must not be swapped after a
+        // verifying attempt has been inserted.
+        let mut clock = EffectAuthorityClock::system(entry_at)?;
+        let mut authority = EffectCompletionAuthority::new(entry_at);
+        let verifier_id = canonical_verifier_id(source.verifier_id()).ok_or(
+            BrokerError::VerificationSourceUnavailable(VerificationSourceError::Rejected),
+        )?;
+        if source.source_binding_digest() != binding.source_binding_digest() {
+            return Err(BrokerError::VerificationSourceUnavailable(
+                VerificationSourceError::Rejected,
+            ));
+        }
+        let lease_expires_at = self.lease_expiry(entry_at)?;
+        let claim = infrastructure.claim_verification(
+            &effect,
+            binding,
+            mission.revision,
+            &self.worker_id,
+            entry_at,
+            lease_expires_at,
+        )?;
+        let (receipt, verification, operation_at, candidate, completion) = match claim {
+            VerificationClaim::AlreadyCompleted {
+                receipt,
+                verification,
+                execution_started_at,
+                operation_at,
+                receipt_completion,
+            } => {
+                if verification.receipt_id != receipt.id
+                    || !verification.independent
+                    || canonical_verifier_id(&verification.verifier).as_deref()
+                        != Some(verification.verifier.as_str())
+                    || !is_sha256(&verification.evidence_digest)
+                    || verification.observed_at < receipt.accepted_at
+                    || verification.evidence_digest == receipt.response_digest
+                    || independent_verification_id(
+                        &effect,
+                        &receipt,
+                        &verification.verifier,
+                        &verification.evidence_digest,
+                    ) != verification.id
+                {
+                    return Err(BrokerError::MissingDurableRecovery);
+                }
+                clock.validate_persisted_completion(receipt_completion.operation_at())?;
+                clock.validate_persisted_completion(operation_at)?;
+                if operation_at < execution_started_at
+                    || operation_at < receipt.accepted_at
+                    || operation_at < verification.observed_at
+                    || operation_at < receipt_completion.operation_at()
+                {
+                    return Err(BrokerError::InvalidAuthorityClock);
+                }
+                authority.accept_persisted(
+                    EffectCompletionBoundary::Reconciliation,
+                    receipt_completion,
+                )?;
+                authority.accept_persisted(
+                    EffectCompletionBoundary::Verification,
+                    PersistedCompletionPoint::effect_idempotency_verification(operation_at),
+                )?;
+                binding.validate_for(&effect, &receipt)?;
+                let subject = ReceiptVerificationSubject::new(
+                    &effect,
+                    binding,
+                    receipt.clone(),
+                    execution_started_at,
+                );
+                if verification.verifier != verifier_id {
+                    return Err(BrokerError::VerificationSourceUnavailable(
+                        VerificationSourceError::Rejected,
+                    ));
+                }
+                source
+                    .validate_recovered(&subject, &verification)
+                    .map_err(BrokerError::VerificationSourceUnavailable)?;
+                let mut candidate = mission.clone();
+                if candidate.effect(effect_id)?.verification.as_ref() != Some(&verification) {
+                    candidate
+                        .record_verification(effect_id, verification.clone())
+                        .map_err(|_| BrokerError::DurableProjectionRecoveryRequired)?;
+                    Self::bind_verification_projection_at(&mut candidate, operation_at);
+                }
+                let completion = authority
+                    .verification()
+                    .ok_or(BrokerError::InvalidAuthorityClock)?;
+                (receipt, verification, operation_at, candidate, completion)
+            }
+            VerificationClaim::Busy => return Err(BrokerError::VerificationBusy),
+            VerificationClaim::Acquired {
+                lease,
+                receipt,
+                execution_started_at,
+                receipt_completion,
+            } => {
+                if lease.binding_digest != binding.digest() {
+                    return Err(BrokerError::InvalidLease);
+                }
+                clock.validate_persisted_completion(receipt_completion.operation_at())?;
+                authority.accept_persisted(
+                    EffectCompletionBoundary::Reconciliation,
+                    receipt_completion,
+                )?;
+                binding.validate_for(&effect, &receipt)?;
+                let subject = ReceiptVerificationSubject::new(
+                    &effect,
+                    binding,
+                    receipt.clone(),
+                    execution_started_at,
+                );
+                let observation = source
+                    .observe(&subject)
+                    .map_err(BrokerError::VerificationSourceUnavailable)?;
+                observation.validate_for(&subject)?;
+                let sample = clock.sample_post_external_call(entry_at)?;
+                let operation_at = sample.operation_at;
+                if operation_at < observation.observed_at() {
+                    return Err(BrokerError::InvalidAuthorityClock);
+                }
+                let verification = Verification {
+                    id: independent_verification_id(
+                        &effect,
+                        &receipt,
+                        &verifier_id,
+                        observation.evidence_digest(),
+                    ),
+                    status: observation.status(),
+                    verifier: verifier_id,
+                    independent: true,
+                    observed_at: observation.observed_at(),
+                    evidence_digest: observation.evidence_digest().to_owned(),
+                    receipt_id: receipt.id.clone(),
+                };
+                let mut candidate = mission.clone();
+                candidate
+                    .record_verification(effect_id, verification.clone())
+                    .map_err(|_| BrokerError::DurableProjectionRecoveryRequired)?;
+                Self::bind_verification_projection_at(&mut candidate, operation_at);
+                let mut candidate_authority = authority;
+                candidate_authority.accept(EffectCompletionBoundary::Verification, sample)?;
+                infrastructure.commit_verification(
+                    &effect,
+                    binding,
+                    &lease,
+                    &verification,
+                    mission.revision,
+                    operation_at,
+                )?;
+                authority = candidate_authority;
+                let completion = authority
+                    .verification()
+                    .ok_or(BrokerError::InvalidAuthorityClock)?;
+                (receipt, verification, operation_at, candidate, completion)
+            }
+        };
+        *mission = candidate;
+        Ok(IndependentVerificationResult {
+            receipt,
+            verification,
+            operation_at,
+            completion,
+            authority,
+        })
     }
 
     pub fn execute_and_verify(
@@ -3918,10 +4599,14 @@ pub enum BrokerError {
         evidence_digest: String,
         attempts: u32,
     },
+    #[error("independent verification is leased by another current worker")]
+    VerificationBusy,
     #[error("independent verification rejected the provider receipt")]
     VerificationRejected,
     #[error("independent verification was inconclusive; reconciliation is required")]
     VerificationInconclusive,
+    #[error("independent verification source was unavailable")]
+    VerificationSourceUnavailable(VerificationSourceError),
     #[error("verified effect has no receipt")]
     MissingReceipt,
     #[error("verified effect has no verification")]
@@ -3934,6 +4619,57 @@ fn opaque_reconciled_receipt_id(effect: &Effect, evidence_digest: &str) -> Recei
     hash_field(&mut digest, effect.id.as_str());
     hash_field(&mut digest, evidence_digest);
     ReceiptId::from_stable(format!("reconciled-receipt-v1:{:x}", digest.finalize()))
+}
+
+#[must_use]
+pub fn independent_verification_id(
+    effect: &Effect,
+    receipt: &Receipt,
+    verifier_id: &str,
+    evidence_digest: &str,
+) -> VerificationId {
+    let mut digest = Sha256::new();
+    hash_field(&mut digest, "hartevo-independent-verification/v1");
+    hash_field(&mut digest, effect.id.as_str());
+    hash_field(&mut digest, receipt.id.as_str());
+    hash_field(&mut digest, verifier_id);
+    hash_field(&mut digest, evidence_digest);
+    VerificationId::from_stable(format!(
+        "independent-verification-v1:{:x}",
+        digest.finalize()
+    ))
+}
+
+#[must_use]
+pub fn receipt_binding_digest(receipt: &Receipt) -> String {
+    let mut digest = Sha256::new();
+    hash_field(&mut digest, "hartevo-receipt-binding/v1");
+    hash_field(&mut digest, receipt.id.as_str());
+    hash_field(&mut digest, &receipt.provider);
+    hash_field(&mut digest, &receipt.external_id);
+    hash_field(&mut digest, &receipt.accepted_at.to_rfc3339());
+    hash_field(&mut digest, &receipt.request_digest);
+    hash_field(&mut digest, &receipt.response_digest);
+    format!("{:x}", digest.finalize())
+}
+
+/// Returns the canonical, bounded verifier identity that may be persisted in
+/// a Domain `Verification`. Whitespace/control characters and oversized
+/// identities are rejected so a source cannot smuggle provider/error data into
+/// the durable public projection.
+#[must_use]
+pub fn canonical_verifier_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value.is_ascii()
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -4032,7 +4768,7 @@ fn effect_class_name(value: &EffectClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::Cell,
+        cell::{Cell, RefCell},
         collections::{BTreeSet, VecDeque},
         rc::Rc,
     };
@@ -4973,6 +5709,206 @@ mod tests {
             observed_at: now() + Duration::seconds(2),
             evidence_digest: "b".repeat(64),
             receipt_id: receipt.id.clone(),
+        }
+    }
+
+    struct TestReceiptVerificationInfrastructure {
+        claim: Option<VerificationClaim>,
+        events: Rc<RefCell<Vec<&'static str>>>,
+        committed: Option<Verification>,
+    }
+
+    impl ReceiptVerificationInfrastructure for TestReceiptVerificationInfrastructure {
+        fn claim_verification(
+            &mut self,
+            _effect: &Effect,
+            _binding: &ReceiptVerificationClaimBinding,
+            _expected_mission_revision: u64,
+            _owner: &str,
+            _now: DateTime<Utc>,
+            _lease_expires_at: DateTime<Utc>,
+        ) -> Result<VerificationClaim, LedgerError> {
+            self.events.borrow_mut().push("claim");
+            self.claim.take().ok_or(LedgerError::LeaseLost)
+        }
+
+        fn commit_verification(
+            &mut self,
+            _effect: &Effect,
+            binding: &ReceiptVerificationClaimBinding,
+            lease: &VerificationLease,
+            verification: &Verification,
+            _expected_mission_revision: u64,
+            _operation_at: DateTime<Utc>,
+        ) -> Result<(), LedgerError> {
+            if lease.binding_digest != binding.digest() {
+                return Err(LedgerError::LeaseLost);
+            }
+            self.events.borrow_mut().push("commit");
+            self.committed = Some(verification.clone());
+            Ok(())
+        }
+    }
+
+    struct TestReceiptVerificationSource {
+        status: VerificationStatus,
+        evidence_digest: String,
+        source_binding_digest: String,
+        observed_at: DateTime<Utc>,
+        events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl ReceiptVerificationSource for TestReceiptVerificationSource {
+        fn verifier_id(&self) -> &'static str {
+            "test.independent-verifier"
+        }
+
+        fn source_binding_digest(&self) -> String {
+            self.source_binding_digest.clone()
+        }
+
+        fn observe(
+            &mut self,
+            _subject: &ReceiptVerificationSubject,
+        ) -> Result<IndependentVerificationObservation, VerificationSourceError> {
+            self.events.borrow_mut().push("observe");
+            Ok(match self.status {
+                VerificationStatus::Confirmed => IndependentVerificationObservation::Confirmed {
+                    evidence_digest: self.evidence_digest.clone(),
+                    observed_at: self.observed_at,
+                },
+                VerificationStatus::Rejected => IndependentVerificationObservation::Rejected {
+                    evidence_digest: self.evidence_digest.clone(),
+                    observed_at: self.observed_at,
+                },
+                VerificationStatus::Inconclusive => {
+                    IndependentVerificationObservation::Inconclusive {
+                        evidence_digest: self.evidence_digest.clone(),
+                        observed_at: self.observed_at,
+                    }
+                }
+            })
+        }
+
+        fn validate_recovered(
+            &self,
+            subject: &ReceiptVerificationSubject,
+            verification: &Verification,
+        ) -> Result<(), VerificationSourceError> {
+            if verification.receipt_id != subject.receipt().id {
+                return Err(VerificationSourceError::Rejected);
+            }
+            self.events.borrow_mut().push("recover");
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn independent_verification_claims_before_fresh_read_and_restarts_without_provider() {
+        for (status, marker) in [
+            (VerificationStatus::Confirmed, 'b'),
+            (VerificationStatus::Rejected, 'c'),
+            (VerificationStatus::Inconclusive, 'd'),
+        ] {
+            let (mut mission, effect_id, mut broker, _) = approved_mission();
+            let effect = mission.effect(&effect_id).expect("effect").clone();
+            let receipt = durable_receipt(&effect, "independent-verification");
+            let receipt_completed_at = now() + Duration::seconds(2);
+            mission
+                .reconcile_durable_receipt(&effect_id, receipt.clone(), now())
+                .expect("project N15 Receipt");
+            let source_digest = "e".repeat(64);
+            let binding = ReceiptVerificationClaimBinding::new(
+                effect.approval_digest(),
+                effect
+                    .approval
+                    .as_ref()
+                    .expect("approval")
+                    .permission_digest
+                    .clone(),
+                receipt_binding_digest(&receipt),
+                "f".repeat(64),
+                source_digest.clone(),
+            )
+            .expect("claim binding");
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let entry_at = Utc::now() - Duration::seconds(1);
+            let mut infrastructure = TestReceiptVerificationInfrastructure {
+                claim: Some(VerificationClaim::Acquired {
+                    lease: VerificationLease {
+                        attempt_id: ExecutionAttemptId::from("verification-attempt-1"),
+                        owner: "effect-broker-test-worker".into(),
+                        generation: 1,
+                        attempt_no: 1,
+                        binding_digest: binding.digest(),
+                        expires_at: entry_at + Duration::minutes(5),
+                    },
+                    receipt: receipt.clone(),
+                    execution_started_at: now(),
+                    receipt_completion: PersistedCompletionPoint::reconciliation_head_receipt_found(
+                        receipt_completed_at,
+                    ),
+                }),
+                events: Rc::clone(&events),
+                committed: None,
+            };
+            let mut source = TestReceiptVerificationSource {
+                status: status.clone(),
+                evidence_digest: marker.to_string().repeat(64),
+                source_binding_digest: source_digest.clone(),
+                observed_at: entry_at + Duration::milliseconds(1),
+                events: Rc::clone(&events),
+            };
+            let result = broker
+                .verify_recorded_receipt(
+                    &mut mission,
+                    &effect_id,
+                    &mut infrastructure,
+                    &binding,
+                    &mut source,
+                    entry_at,
+                )
+                .expect("fresh independent verification");
+            assert_eq!(result.verification.status, status);
+            assert!(result.verification.independent);
+            assert_eq!(infrastructure.committed, Some(result.verification.clone()));
+            assert_eq!(events.borrow().as_slice(), ["claim", "observe", "commit"]);
+
+            let replay_events = Rc::new(RefCell::new(Vec::new()));
+            let mut replay_infrastructure = TestReceiptVerificationInfrastructure {
+                claim: Some(VerificationClaim::AlreadyCompleted {
+                    receipt: result.receipt.clone(),
+                    verification: result.verification.clone(),
+                    execution_started_at: now(),
+                    operation_at: result.operation_at,
+                    receipt_completion: PersistedCompletionPoint::reconciliation_head_receipt_found(
+                        receipt_completed_at,
+                    ),
+                }),
+                events: Rc::clone(&replay_events),
+                committed: None,
+            };
+            let mut replay_source = TestReceiptVerificationSource {
+                status: status.clone(),
+                evidence_digest: marker.to_string().repeat(64),
+                source_binding_digest: source_digest,
+                observed_at: entry_at + Duration::milliseconds(1),
+                events: Rc::clone(&replay_events),
+            };
+            let replayed = broker
+                .verify_recorded_receipt(
+                    &mut mission,
+                    &effect_id,
+                    &mut replay_infrastructure,
+                    &binding,
+                    &mut replay_source,
+                    Utc::now(),
+                )
+                .expect("restart recovers locally");
+            assert_eq!(replayed.verification, result.verification);
+            assert_eq!(replay_events.borrow().as_slice(), ["claim", "recover"]);
+            assert!(replay_infrastructure.committed.is_none());
         }
     }
 

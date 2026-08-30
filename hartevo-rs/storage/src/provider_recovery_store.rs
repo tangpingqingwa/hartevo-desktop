@@ -804,11 +804,12 @@ fn apply_transition(
             ProviderRecoveryState::Verified
         }
         ProviderRecoveryTransition::FailedClosed
-            if !matches!(
+            if matches!(
                 head.state,
-                ProviderRecoveryState::NotExecuted
-                    | ProviderRecoveryState::Verified
-                    | ProviderRecoveryState::FailedClosed
+                ProviderRecoveryState::Prepared
+                    | ProviderRecoveryState::InFlight
+                    | ProviderRecoveryState::Uncertain
+                    | ProviderRecoveryState::ReceiptObserved
             ) =>
         {
             ProviderRecoveryState::FailedClosed
@@ -871,6 +872,49 @@ pub(crate) fn load_provider_recovery_in_transaction(
     effect_id: &EffectId,
 ) -> Result<Option<ProviderRecoveryHead>, StorageError> {
     load_head(transaction, project_id, effect_id)
+}
+
+pub(crate) fn record_provider_recovery_verified_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    effect_id: &EffectId,
+    expected_revision: u64,
+    expected_binding_digest: &str,
+    verification_evidence_digest: String,
+    now: DateTime<Utc>,
+) -> Result<ProviderRecoveryHead, StorageError> {
+    transition_provider_recovery_in_transaction(
+        transaction,
+        project_id,
+        effect_id,
+        expected_revision,
+        expected_binding_digest,
+        ProviderRecoveryTransition::Verified {
+            verification_evidence_digest,
+        },
+        None,
+        now,
+    )
+}
+
+pub(crate) fn fail_provider_recovery_closed_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &ProjectId,
+    effect_id: &EffectId,
+    expected_revision: u64,
+    expected_binding_digest: &str,
+    now: DateTime<Utc>,
+) -> Result<ProviderRecoveryHead, StorageError> {
+    transition_provider_recovery_in_transaction(
+        transaction,
+        project_id,
+        effect_id,
+        expected_revision,
+        expected_binding_digest,
+        ProviderRecoveryTransition::FailedClosed,
+        None,
+        now,
+    )
 }
 
 fn load_head(

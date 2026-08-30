@@ -228,6 +228,103 @@ pub struct EffectReconciliationBinding {
     observation_authority_digest: Option<String>,
 }
 
+/// Content-minimized fence for one exact independent verification of a
+/// durable Receipt recorded by the Effect Broker.
+///
+/// Verification is deliberately a third authority family, separate from
+/// execution and uncertain-effect reconciliation.  Cordis carries only
+/// opaque, immutable digests: it never receives the Receipt, Verification,
+/// provider capability, secret, executor, or reconciler.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct EffectVerificationBinding {
+    effect_id: String,
+    approval_scope_digest: String,
+    broker_authorization_digest: String,
+    receipt_binding_digest: String,
+    observation_authority_digest: String,
+    source_binding_digest: String,
+}
+
+impl EffectVerificationBinding {
+    /// Construct one exact independent-verification fence.
+    pub fn new(
+        effect_id: impl Into<String>,
+        approval_scope_digest: impl Into<String>,
+        broker_authorization_digest: impl Into<String>,
+        receipt_binding_digest: impl Into<String>,
+        observation_authority_digest: impl Into<String>,
+        source_binding_digest: impl Into<String>,
+    ) -> Result<Self, CordisError> {
+        Ok(Self {
+            effect_id: normalized_id(effect_id.into(), "effect_verification_effect_id")?,
+            approval_scope_digest: canonical_digest(
+                approval_scope_digest.into(),
+                "effect_verification_approval_scope_digest",
+            )?,
+            broker_authorization_digest: canonical_digest(
+                broker_authorization_digest.into(),
+                "effect_verification_broker_authorization_digest",
+            )?,
+            receipt_binding_digest: canonical_digest(
+                receipt_binding_digest.into(),
+                "effect_verification_receipt_binding_digest",
+            )?,
+            observation_authority_digest: canonical_digest(
+                observation_authority_digest.into(),
+                "effect_verification_observation_authority_digest",
+            )?,
+            source_binding_digest: canonical_digest(
+                source_binding_digest.into(),
+                "effect_verification_source_binding_digest",
+            )?,
+        })
+    }
+
+    #[must_use]
+    pub fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+
+    #[must_use]
+    pub fn approval_scope_digest(&self) -> &str {
+        &self.approval_scope_digest
+    }
+
+    #[must_use]
+    pub fn broker_authorization_digest(&self) -> &str {
+        &self.broker_authorization_digest
+    }
+
+    #[must_use]
+    pub fn receipt_binding_digest(&self) -> &str {
+        &self.receipt_binding_digest
+    }
+
+    #[must_use]
+    pub fn observation_authority_digest(&self) -> &str {
+        &self.observation_authority_digest
+    }
+
+    #[must_use]
+    pub fn source_binding_digest(&self) -> &str {
+        &self.source_binding_digest
+    }
+}
+
+impl fmt::Debug for EffectVerificationBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EffectVerificationBinding")
+            .field("effect_id", &self.effect_id)
+            .field("approval_scope_digest", &"[DIGEST]")
+            .field("broker_authorization_digest", &"[DIGEST]")
+            .field("receipt_binding_digest", &"[DIGEST]")
+            .field("observation_authority_digest", &"[DIGEST]")
+            .field("source_binding_digest", &"[DIGEST]")
+            .finish()
+    }
+}
+
 impl EffectReconciliationBinding {
     pub fn new(
         effect_id: impl Into<String>,
@@ -713,6 +810,112 @@ impl fmt::Debug for EffectReconciliationLease {
     }
 }
 
+/// Unforgeable, one-shot proof that Cordis admitted one exact independent
+/// Receipt verification.
+///
+/// The concrete read-only source, encrypted evidence, and durable Broker
+/// commit remain in Desktop/Application.  This permit only proves that the
+/// host admitted the exact opaque scope and fences.
+pub struct EffectVerificationPermit {
+    serial: u64,
+    scope: AuthorityScope,
+    binding: EffectVerificationBinding,
+    lease: Arc<EffectVerificationLease>,
+    settled: bool,
+}
+
+impl EffectVerificationPermit {
+    pub(crate) fn issue(
+        serial: u64,
+        scope: AuthorityScope,
+        binding: EffectVerificationBinding,
+    ) -> (Self, Arc<EffectVerificationLease>) {
+        let lease = Arc::new(EffectVerificationLease::new());
+        (
+            Self {
+                serial,
+                scope,
+                binding,
+                lease: Arc::clone(&lease),
+                settled: false,
+            },
+            lease,
+        )
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &AuthorityScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &EffectVerificationBinding {
+        &self.binding
+    }
+
+    pub(crate) const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    pub(crate) fn owns_lease(&self, lease: &Arc<EffectVerificationLease>) -> bool {
+        Arc::ptr_eq(&self.lease, lease)
+    }
+
+    pub(crate) fn complete(mut self) {
+        self.lease.release();
+        self.settled = true;
+    }
+}
+
+impl fmt::Debug for EffectVerificationPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EffectVerificationPermit")
+            .field("serial", &self.serial)
+            .field("scope", &self.scope)
+            .field("binding", &self.binding)
+            .field("settled", &self.settled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for EffectVerificationPermit {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.lease.release();
+        }
+    }
+}
+
+pub(crate) struct EffectVerificationLease {
+    active: AtomicBool,
+}
+
+impl EffectVerificationLease {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn release(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for EffectVerificationLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EffectVerificationLease")
+            .field("active", &self.is_active())
+            .finish_non_exhaustive()
+    }
+}
+
 impl EffectExecutionLease {
     fn new() -> Self {
         Self {
@@ -962,6 +1165,31 @@ where
     type Error = AdapterError;
 
     fn reconcile(self, permit: &EffectReconciliationPermit) -> Result<Self::Output, Self::Error> {
+        self(permit)
+    }
+}
+
+/// One-shot typed adapter for the Application-owned independent Receipt
+/// verification path.
+///
+/// This trait is intentionally separate from both execution and uncertain
+/// reconciliation. A verification adapter receives no executor, mutable
+/// provider adapter, reconciler, or legacy generic `EffectVerifier`.
+pub trait EffectVerificationAuthority {
+    type Output;
+    type Error;
+
+    fn verify(self, permit: &EffectVerificationPermit) -> Result<Self::Output, Self::Error>;
+}
+
+impl<F, Output, AdapterError> EffectVerificationAuthority for F
+where
+    F: FnOnce(&EffectVerificationPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn verify(self, permit: &EffectVerificationPermit) -> Result<Self::Output, Self::Error> {
         self(permit)
     }
 }

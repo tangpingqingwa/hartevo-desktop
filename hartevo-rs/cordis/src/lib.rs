@@ -34,7 +34,8 @@ pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
     DomainCommandBinding, DomainCommandKind, DomainCommandPermit, EffectExecutionAuthority,
     EffectExecutionBinding, EffectExecutionPermit, EffectReconciliationAuthority,
-    EffectReconciliationBinding, EffectReconciliationPermit, RuntimeAuthority, RuntimeBinding,
+    EffectReconciliationBinding, EffectReconciliationPermit, EffectVerificationAuthority,
+    EffectVerificationBinding, EffectVerificationPermit, RuntimeAuthority, RuntimeBinding,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
 };
 pub use config::{ConfigValue, InterpolateError};
