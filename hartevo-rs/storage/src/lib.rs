@@ -29,6 +29,7 @@ mod normalized;
 mod outbox;
 mod outcome_review_store;
 mod outcome_store;
+mod provider_recovery_store;
 mod registration_store;
 mod relationship_store;
 mod runtime_process_store;
@@ -60,6 +61,10 @@ pub use keyring_store::{DeviceAttachmentPrepareOutcome, ProjectKeySecretReferenc
 pub use outbox::{
     OutboxAcknowledgeTimes, OutboxMessage, OutboxRelease, OutboxReleaseTimes, OutboxStatus,
 };
+pub use provider_recovery_store::{
+    ProviderRecoveryBinding, ProviderRecoveryCapsule, ProviderRecoveryHead,
+    ProviderRecoveryPrepareOutcome, ProviderRecoveryState,
+};
 pub use registration_store::{
     LocalProjectCloudRegistration, LocalProjectCloudRegistrationPrepareOutcome,
     ProjectCloudRegistrationStatus,
@@ -90,7 +95,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 47;
+pub const STORAGE_SCHEMA_VERSION: i64 = 48;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4412,6 +4417,33 @@ impl ProjectStore {
             record_migration(&transaction, 47)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 48 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS provider_recovery_heads (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL CHECK (length(trim(project_id)) > 0),
+                   mission_id TEXT NOT NULL CHECK (length(trim(mission_id)) > 0),
+                   effect_id TEXT NOT NULL CHECK (length(trim(effect_id)) > 0),
+                   binding_digest TEXT NOT NULL CHECK (length(binding_digest) = 64),
+                   state TEXT NOT NULL CHECK (state IN (
+                     'prepared', 'in_flight', 'uncertain', 'not_executed',
+                     'receipt_observed', 'verified', 'failed_closed'
+                   )),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   updated_at TEXT NOT NULL,
+                   record_json TEXT NOT NULL,
+                   PRIMARY KEY (project_id, effect_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS provider_recovery_scope_state_idx
+                   ON provider_recovery_heads(
+                     tenant_id, project_id, mission_id, state, updated_at
+                   );",
+            )?;
+            provider_recovery_store::verify_provider_recovery_schema(&transaction)?;
+            record_migration(&transaction, 48)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4604,6 +4636,8 @@ pub enum StorageError {
         aggregate: String,
         expected_revision: u64,
     },
+    #[error("provider recovery cannot transition from durable state {state}")]
+    InvalidProviderRecoveryTransition { state: String },
     #[error("stored domain data could not be decoded: {0}")]
     DomainDecode(String),
     #[error("key bootstrap operation is malformed or has an invalid terminal state")]
@@ -5343,7 +5377,10 @@ mod tests {
 
         let mut migrated =
             ProjectStore::open(&database, &database_key()).expect("migrate v46 to v47");
-        assert_eq!(migrated.schema_version().expect("v47 schema"), 47);
+        assert_eq!(
+            migrated.schema_version().expect("current schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert!(checkpoint_policy_table_sql(&migrated.connection).contains("effect_readback_v2"));
         assert_eq!(
             migrated
@@ -5454,7 +5491,10 @@ mod tests {
             .execute_batch("DROP TABLE mission_checkpoints_v47;")
             .expect("remove injected collision");
         store.migrate().expect("retry v47 migration");
-        assert_eq!(store.schema_version().expect("retried schema"), 47);
+        assert_eq!(
+            store.schema_version().expect("retried schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert_eq!(
             store
                 .load_mission(&project.id, &legacy.id)

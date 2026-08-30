@@ -341,6 +341,22 @@ where
     ShopifyEffectAdapter::controlled(boundary, approved, effect)
 }
 
+/// Reuses the exact N12A binding gate before a controlled approved payload is
+/// encrypted or recovered. This grants no execution permit and remains
+/// crate-private so provider-specific recovery cannot become a generic bypass.
+pub(super) fn validate_controlled_recovery_effect(
+    effect: &Effect,
+    approved: &ShopifyApprovedDraftFulfillment,
+) -> Result<(), ShopifyAdapterError> {
+    let binding = ShopifyDomainEffectBinding::capture(effect)?;
+    validate_bound_effect(
+        effect,
+        approved,
+        &binding,
+        ProviderProvenanceClass::ControlledProvider,
+    )
+}
+
 impl<B> EffectExecutor for ShopifyEffectExecutor<B>
 where
     B: ShopifyTypedEffectBoundary,
