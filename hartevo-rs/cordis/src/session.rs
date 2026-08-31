@@ -1,17 +1,38 @@
 //! Minimal Rust-native Session boundary log adapted from DeepSeek Harness.
 //!
-//! This slice records and validates turn/step lifecycle only. Message history,
-//! durable persistence, surface replacement, and the wider Harness vocabulary
-//! remain separate follow-up work.
+//! This slice records and validates turn/step lifecycle and exposes the typed
+//! event/flush seam consumed by persistence plugins. A durable backend, message
+//! history, surface replacement, and the wider Harness vocabulary remain
+//! separate follow-up work.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 
+use crate::context::EventReentry;
+use crate::event::{Emit, EventKey, EventSchemaId, Parallel};
+
 /// The Rust Session format written by this bounded implementation.
 pub const SESSION_FORMAT_VERSION: u32 = 0;
+
+/// Typed Cordis events forming the storage-agnostic Session persistence seam.
+pub mod events {
+    use super::{Emit, EventKey, EventSchemaId, Parallel, SessionCheckpoint, SessionEventRecord};
+
+    /// One committed append, published only after it entered the live log.
+    pub const SESSION_EVENT: EventKey<Emit, SessionEventRecord, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.session.event.v1"),
+        "session/event",
+    );
+    /// Awaited durability checkpoint over one immutable Session prefix.
+    pub const SESSION_FLUSH: EventKey<Parallel, SessionCheckpoint, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.session.flush.v1"),
+        "session/flush",
+    );
+}
 
 /// Stable identity for one Session log.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -116,6 +137,27 @@ pub struct SessionEvent {
     pub seq: u64,
     pub time_ms: i64,
     pub kind: SessionEventKind,
+}
+
+/// Detached notification for one event that is already committed in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEventRecord {
+    pub header: SessionHeader,
+    pub event: SessionEvent,
+}
+
+/// Immutable Session prefix presented to every durability listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCheckpoint {
+    pub header: SessionHeader,
+    pub events: Vec<SessionEvent>,
+}
+
+impl SessionCheckpoint {
+    #[must_use]
+    pub fn through_seq(&self) -> Option<u64> {
+        self.events.last().map(|event| event.seq)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -347,14 +389,25 @@ fn validate_header(header: &SessionHeader, event_count: usize) -> Result<(), Ses
 /// Shared handle to one live Session log.
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
+    id: SessionId,
     inner: Arc<Mutex<SessionLog>>,
+    event_dispatcher: Option<EventReentry>,
+    appending: Arc<AtomicBool>,
 }
 
 impl SessionHandle {
-    fn new(log: SessionLog) -> Self {
+    fn new(log: SessionLog, event_dispatcher: Option<EventReentry>) -> Self {
         Self {
+            id: log.header().id.clone(),
             inner: Arc::new(Mutex::new(log)),
+            event_dispatcher,
+            appending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &SessionId {
+        &self.id
     }
 
     pub fn header(&self) -> Result<SessionHeader, SessionError> {
@@ -366,23 +419,99 @@ impl SessionHandle {
     }
 
     pub fn start_turn(&self) -> Result<u64, SessionError> {
-        self.lock()?.start_turn()
+        self.commit(SessionLog::start_turn)
     }
 
     pub fn finish_turn(&self, turn: u64, reason: TurnEndReason) -> Result<(), SessionError> {
-        self.lock()?.finish_turn(turn, reason)
+        self.commit(|log| log.finish_turn(turn, reason))
     }
 
     pub fn start_step(&self, turn: u64) -> Result<u64, SessionError> {
-        self.lock()?.start_step(turn)
+        self.commit(|log| log.start_step(turn))
     }
 
     pub fn finish_step(&self, turn: u64, step: u64) -> Result<(), SessionError> {
-        self.lock()?.finish_step(turn, step)
+        self.commit(|log| log.finish_step(turn, step))
+    }
+
+    fn commit<R>(
+        &self,
+        append: impl FnOnce(&mut SessionLog) -> Result<R, SessionError>,
+    ) -> Result<R, SessionError> {
+        let _permit = SessionAppendPermit::enter(&self.appending, &self.id)?;
+        let (result, record) = {
+            let mut log = self.lock()?;
+            let previous_len = log.events().len();
+            let result = append(&mut log)?;
+            let expected_seq =
+                u64::try_from(previous_len).map_err(|_| SessionError::EventSequenceOverflow)?;
+            let event = log
+                .events()
+                .get(previous_len)
+                .filter(|event| event.seq == expected_seq)
+                .cloned()
+                .ok_or(SessionError::EventSequenceOverflow)?;
+            if log.events().len() != previous_len + 1 {
+                return Err(SessionError::EventSequenceOverflow);
+            }
+            let record = SessionEventRecord {
+                header: log.header().clone(),
+                event,
+            };
+            (result, record)
+        };
+
+        if let Some(dispatcher) = &self.event_dispatcher {
+            // The append is authoritative. Observation failures are contained
+            // here; persistence adapters report durability at the flush edge.
+            let _ = dispatcher.emit_contained(events::SESSION_EVENT, &record);
+        }
+        Ok(result)
+    }
+
+    fn checkpoint(&self) -> Result<SessionCheckpoint, SessionError> {
+        let log = self.lock()?;
+        Ok(SessionCheckpoint {
+            header: log.header().clone(),
+            events: log.events().to_vec(),
+        })
+    }
+
+    async fn flush(&self) -> Result<bool, SessionError> {
+        let Some(dispatcher) = &self.event_dispatcher else {
+            return Ok(false);
+        };
+        let listener_count = dispatcher
+            .parallel(events::SESSION_FLUSH, self.checkpoint()?)
+            .await
+            .map_err(|error| SessionError::FlushFailed {
+                message: error.to_string(),
+            })?;
+        Ok(listener_count != 0)
+    }
+
+    fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, SessionLog>, SessionError> {
         self.inner.lock().map_err(|_| SessionError::LogPoisoned)
+    }
+}
+
+struct SessionAppendPermit<'a>(&'a AtomicBool);
+
+impl<'a> SessionAppendPermit<'a> {
+    fn enter(flag: &'a AtomicBool, id: &SessionId) -> Result<Self, SessionError> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self(flag))
+            .map_err(|_| SessionError::AppendInProgress { id: id.clone() })
+    }
+}
+
+impl Drop for SessionAppendPermit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -392,15 +521,32 @@ struct SessionStoreState {
 }
 
 /// In-memory Session store mounted at `ctx.sessions`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SessionStore {
     inner: Arc<Mutex<SessionStoreState>>,
+    event_dispatcher: Option<EventReentry>,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionStore {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Arc::new(Mutex::new(SessionStoreState::default())),
+            event_dispatcher: None,
+        }
+    }
+
+    pub(crate) fn with_event_dispatcher(event_dispatcher: EventReentry) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SessionStoreState::default())),
+            event_dispatcher: Some(event_dispatcher),
+        }
     }
 
     pub fn create(&self, id: SessionId) -> Result<SessionHandle, SessionError> {
@@ -408,7 +554,8 @@ impl SessionStore {
         if state.sessions.contains_key(&id) {
             return Err(SessionError::SessionAlreadyExists { id });
         }
-        let handle = SessionHandle::new(SessionLog::new(id.clone())?);
+        let handle =
+            SessionHandle::new(SessionLog::new(id.clone())?, self.event_dispatcher.clone());
         state.sessions.insert(id, handle.clone());
         Ok(handle)
     }
@@ -425,7 +572,10 @@ impl SessionStore {
             });
         }
         let id = header.id.clone();
-        let handle = SessionHandle::new(SessionLog::restore(header, events)?);
+        let handle = SessionHandle::new(
+            SessionLog::restore(header, events)?,
+            self.event_dispatcher.clone(),
+        );
         state.sessions.insert(id, handle.clone());
         Ok(handle)
     }
@@ -499,7 +649,7 @@ impl SessionStore {
                 turn,
             });
         }
-        let child = SessionHandle::new(child_log);
+        let child = SessionHandle::new(child_log, self.event_dispatcher.clone());
         state.sessions.insert(child_id, child.clone());
         Ok(child)
     }
@@ -513,9 +663,31 @@ impl SessionStore {
         if let Some(session) = state.sessions.get(&id) {
             return Ok(session.clone());
         }
-        let handle = SessionHandle::new(SessionLog::new(id.clone())?);
+        let handle =
+            SessionHandle::new(SessionLog::new(id.clone())?, self.event_dispatcher.clone());
         state.sessions.insert(id, handle.clone());
         Ok(handle)
+    }
+
+    /// Wait until every persistence listener has handled one immutable prefix.
+    ///
+    /// Returns `false` when no persistence listener is mounted. Listener
+    /// failures are reported after the complete callback snapshot settles.
+    pub async fn flush(&self, session: &SessionHandle) -> Result<bool, SessionError> {
+        {
+            let state = self.lock()?;
+            let Some(live) = state.sessions.get(session.id()) else {
+                return Err(SessionError::SessionNotLive {
+                    id: session.id().clone(),
+                });
+            };
+            if !session.same_instance(live) {
+                return Err(SessionError::SessionNotLive {
+                    id: session.id().clone(),
+                });
+            }
+        }
+        session.flush().await
     }
 
     pub fn len(&self) -> Result<usize, SessionError> {
@@ -582,6 +754,12 @@ pub enum SessionError {
     SessionAlreadyExists { id: SessionId },
     #[error("session `{id}` was not found")]
     SessionNotFound { id: SessionId },
+    #[error("session `{id}` is not live in this store")]
+    SessionNotLive { id: SessionId },
+    #[error("session `{id}` append is already being published")]
+    AppendInProgress { id: SessionId },
+    #[error("session flush failed: {message}")]
+    FlushFailed { message: String },
     #[error("fork boundary {boundary} does not exist in session `{id}` (last seq: {last_seq:?})")]
     ForkBoundaryDoesNotExist {
         id: SessionId,

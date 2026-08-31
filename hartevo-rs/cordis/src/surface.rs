@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::context::{Context, CordisError, keys};
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
-use crate::session::SessionStore;
+use crate::session::{SessionStore, events as session_events};
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
@@ -420,9 +420,13 @@ pub(crate) fn map_surfaces(
     }
     validate_mapped_events(ctx)?;
 
+    let session_dispatcher = ctx.event_reentry()?;
     ctx.provide(keys::TOOLS, ToolsSurface::new())?;
     ctx.provide(keys::LLM, LlmSurface::new())?;
-    ctx.provide(keys::SESSIONS, SessionStore::new())?;
+    ctx.provide(
+        keys::SESSIONS,
+        SessionStore::with_event_dispatcher(session_dispatcher),
+    )?;
     ctx.provide(keys::AGENTS, AgentsSurface::new())?;
     ctx.provide_reserved(authority, keys::DOMAIN, surfaces.domain)?;
     ctx.provide_reserved(authority, keys::EFFECT_BROKER, surfaces.effect_broker)?;
@@ -439,6 +443,8 @@ fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
     validate_mapped_event(ctx, events::LLM_STREAM)?;
     validate_mapped_event(ctx, events::AGENT_CREATED)?;
     validate_mapped_event(ctx, events::AGENT_DISPOSED)?;
+    validate_mapped_event(ctx, session_events::SESSION_EVENT)?;
+    validate_mapped_event(ctx, session_events::SESSION_FLUSH)?;
     Ok(())
 }
 
@@ -482,6 +488,8 @@ fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
     ctx.lock_event_key(events::LLM_STREAM)?;
     ctx.lock_event_key(events::AGENT_CREATED)?;
     ctx.lock_event_key(events::AGENT_DISPOSED)?;
+    ctx.lock_event_key(session_events::SESSION_EVENT)?;
+    ctx.lock_event_key(session_events::SESSION_FLUSH)?;
     Ok(())
 }
 
@@ -559,7 +567,10 @@ pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
         "tools/pre-execute" | "tools/execute" | "tools/post-execute" | "llm/stream" => {
             Some(DispatchMode::Waterfall)
         }
-        "tools/result" | "agent/created" | "agent/disposed" => Some(DispatchMode::Emit),
+        "tools/result" | "agent/created" | "agent/disposed" | "session/event" => {
+            Some(DispatchMode::Emit)
+        }
+        "session/flush" => Some(DispatchMode::Parallel),
         _ => None,
     }
 }

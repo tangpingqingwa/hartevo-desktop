@@ -1,9 +1,23 @@
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentStep, CordisError, CordisHost, KernelApproval, KernelApprovalDecision, KernelConsentState,
-    SessionError, SessionEventKind, SessionId, SessionLog, SessionStore, TurnEndReason,
-    invariant_missing,
+    AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
+    KernelConsentState, SessionError, SessionEventKind, SessionId, SessionLog, SessionStore,
+    TurnEndReason, invariant_missing, session_events,
 };
+
+#[derive(Debug)]
+struct PersistenceTestError(&'static str);
+
+impl fmt::Display for PersistenceTestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PersistenceTestError {}
 
 fn approved_host() -> CordisHost {
     let now = Utc.with_ymd_and_hms(2026, 8, 31, 1, 0, 0).unwrap();
@@ -165,6 +179,133 @@ fn blocked_turn_closes_without_step_or_agent_execution() {
             .unwrap()
             .list()
             .is_empty()
+    );
+}
+
+#[test]
+fn committed_session_events_publish_post_append_and_reject_reentry() {
+    let mut host = approved_host();
+    assert_eq!(
+        host.context().event_mode(session_events::SESSION_EVENT),
+        Some(DispatchMode::Emit)
+    );
+    assert_eq!(
+        host.context().event_mode(session_events::SESSION_FLUSH),
+        Some(DispatchMode::Parallel)
+    );
+
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let id = SessionId::new("session-feed").unwrap();
+    let session = sessions.create(id.clone()).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let reentry_errors = Arc::new(Mutex::new(Vec::new()));
+
+    let callback_session = session.clone();
+    let callback_observed = Arc::clone(&observed);
+    let callback_errors = Arc::clone(&reentry_errors);
+    host.context_mut()
+        .on_emit(session_events::SESSION_EVENT, move |record| {
+            let committed = callback_session.events().unwrap();
+            assert_eq!(committed.last(), Some(&record.event));
+            callback_observed.lock().unwrap().push(record.clone());
+            callback_errors
+                .lock()
+                .unwrap()
+                .push(callback_session.start_turn().unwrap_err());
+        })
+        .unwrap();
+    host.context_mut()
+        .try_on_emit(session_events::SESSION_EVENT, |_| {
+            Err::<(), _>(PersistenceTestError("write-behind failed"))
+        })
+        .unwrap();
+    let reached_after_failure = Arc::new(Mutex::new(0_u64));
+    let callback_reached = Arc::clone(&reached_after_failure);
+    host.context_mut()
+        .on_emit(session_events::SESSION_EVENT, move |_| {
+            *callback_reached.lock().unwrap() += 1;
+        })
+        .unwrap();
+
+    let turn = session.start_turn().unwrap();
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].header.id, id);
+    assert_eq!(observed[0].event.kind, SessionEventKind::TurnStart { turn });
+    assert_eq!(
+        observed[1].event.kind,
+        SessionEventKind::TurnEnd {
+            turn,
+            reason: TurnEndReason::Completed,
+        }
+    );
+    assert_eq!(
+        *reentry_errors.lock().unwrap(),
+        [
+            SessionError::AppendInProgress {
+                id: SessionId::new("session-feed").unwrap(),
+            },
+            SessionError::AppendInProgress {
+                id: SessionId::new("session-feed").unwrap(),
+            },
+        ]
+    );
+    assert_eq!(*reached_after_failure.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn flush_awaits_exact_checkpoint_and_contains_listener_failures() {
+    let mut host = approved_host();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("session-flush").unwrap())
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    let checkpoints = Arc::new(Mutex::new(Vec::new()));
+    let callback_checkpoints = Arc::clone(&checkpoints);
+    host.context_mut()
+        .on_parallel(session_events::SESSION_FLUSH, move |checkpoint| {
+            let callback_checkpoints = Arc::clone(&callback_checkpoints);
+            async move {
+                tokio::task::yield_now().await;
+                callback_checkpoints.lock().unwrap().push(checkpoint);
+                Ok::<(), PersistenceTestError>(())
+            }
+        })
+        .unwrap();
+
+    assert!(sessions.flush(&session).await.unwrap());
+    let first = checkpoints.lock().unwrap().pop().unwrap();
+    assert_eq!(first.header.id, *session.id());
+    assert_eq!(first.through_seq(), Some(1));
+    assert_eq!(first.events, session.events().unwrap());
+
+    host.context_mut()
+        .on_parallel(session_events::SESSION_FLUSH, |_| async {
+            Err::<(), _>(PersistenceTestError("disk unavailable"))
+        })
+        .unwrap();
+    let error = sessions.flush(&session).await.unwrap_err();
+    assert!(matches!(
+        error,
+        SessionError::FlushFailed { ref message } if message.contains("disk unavailable")
+    ));
+    assert_eq!(checkpoints.lock().unwrap().len(), 1);
+
+    let standalone = SessionStore::new();
+    let standalone_session = standalone
+        .create(SessionId::new("standalone").unwrap())
+        .unwrap();
+    assert!(!standalone.flush(&standalone_session).await.unwrap());
+    assert_eq!(
+        standalone.flush(&session).await.unwrap_err(),
+        SessionError::SessionNotLive {
+            id: SessionId::new("session-flush").unwrap(),
+        }
     );
 }
 

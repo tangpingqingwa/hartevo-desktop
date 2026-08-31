@@ -84,8 +84,9 @@ pub use service::{
     ServiceViewKind, associated_key, merge_service_config,
 };
 pub use session::{
-    SESSION_FORMAT_VERSION, SessionCancelCause, SessionError, SessionEvent, SessionEventKind,
-    SessionHandle, SessionHeader, SessionId, SessionLog, SessionStore, TurnEndReason,
+    SESSION_FORMAT_VERSION, SessionCancelCause, SessionCheckpoint, SessionError, SessionEvent,
+    SessionEventKind, SessionEventRecord, SessionHandle, SessionHeader, SessionId, SessionLog,
+    SessionStore, TurnEndReason, events as session_events,
 };
 pub use surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmStream,
