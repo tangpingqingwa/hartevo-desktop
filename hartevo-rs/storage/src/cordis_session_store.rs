@@ -789,7 +789,7 @@ mod tests {
             seq: 0,
             time_ms: 1,
             kind: PersistedSessionEventKind::AgentInboxSpliced {
-                target: PersistedAgentInboxTarget::NextTurn,
+                target: PersistedAgentInboxTarget::NextStep,
                 start: 0,
                 removed_count: None,
                 inserted: vec![user_message()],
@@ -798,7 +798,7 @@ mod tests {
         };
         let encoded = serde_json::to_value(&event).unwrap();
         let splice = &encoded["kind"]["agent_inbox_spliced"];
-        assert_eq!(splice["target"], "next-turn");
+        assert_eq!(splice["target"], "next-step");
         assert!(splice.get("removedCount").is_none());
         assert!(splice.get("removed_count").is_none());
         assert_eq!(

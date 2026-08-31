@@ -2073,7 +2073,7 @@ mod tests {
             seq: 0,
             time_ms: 1,
             kind: SessionEventKind::AgentInboxSpliced {
-                target: AgentInboxTarget::NextTurn,
+                target: AgentInboxTarget::NextStep,
                 start: 0,
                 removed_count: None,
                 inserted: vec![message.clone()],
@@ -2085,7 +2085,7 @@ mod tests {
         assert!(matches!(
             &persisted.kind,
             PersistedSessionEventKind::AgentInboxSpliced {
-                target: PersistedAgentInboxTarget::NextTurn,
+                target: PersistedAgentInboxTarget::NextStep,
                 start: 0,
                 removed_count: None,
                 inserted,
@@ -2117,7 +2117,21 @@ mod tests {
             }],
             source: SessionMessageSource::User,
         };
+        let step_message = SessionMessage {
+            id: "persisted-step".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "persist next step".into(),
+            }],
+            source: SessionMessageSource::Plugin {
+                plugin: "watcher".into(),
+            },
+        };
         session.inbox().append_next_turn(message.clone()).unwrap();
+        session
+            .inbox()
+            .append_next_step(step_message.clone())
+            .unwrap();
         live.session_persistence.persist_live(&session).unwrap();
         let store = live
             .session_persistence
@@ -2142,6 +2156,7 @@ mod tests {
             restored.inbox().next_turn().unwrap().as_slice(),
             std::slice::from_ref(&message)
         );
+        assert_eq!(restored.inbox().next_step().unwrap(), [step_message]);
     }
 
     #[test]

@@ -67,6 +67,11 @@ fn append_commits_before_projection_and_contains_reentrant_mutation() {
     assert_eq!(session.events().unwrap().len(), 1);
     assert_eq!(session.derive_messages().unwrap(), []);
     assert!(matches!(
+        inbox.append_next_step(outer.clone()),
+        Err(SessionError::DuplicatePendingMessage { id }) if id == outer.id
+    ));
+    assert_eq!(session.events().unwrap().len(), 1);
+    assert!(matches!(
         &session.events().unwrap()[0].kind,
         SessionEventKind::AgentInboxSpliced {
             target: AgentInboxTarget::NextTurn,
@@ -94,6 +99,91 @@ fn append_commits_before_projection_and_contains_reentrant_mutation() {
         })
     ));
     assert_eq!(session.events().unwrap().len(), 1);
+}
+
+#[test]
+fn next_step_claim_requires_the_exact_turn_and_drains_fifo_before_projection() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("inbox-step-claim").unwrap())
+        .unwrap();
+    let inbox = session.inbox();
+    let queued_turn = user_message("turn", "turn");
+    let first = user_message("step-first", "first");
+    let second = user_message("step-second", "second");
+    inbox.append_next_turn(queued_turn.clone()).unwrap();
+    inbox.append_next_step(first.clone()).unwrap();
+    inbox.append_next_step(second.clone()).unwrap();
+
+    assert_eq!(inbox.claim_next_step(1), Err(SessionError::NoOpenTurn));
+    let turn = session.start_turn().unwrap();
+    assert_eq!(
+        inbox.claim_next_step(turn + 1),
+        Err(SessionError::TurnMismatch {
+            expected: turn,
+            actual: turn + 1,
+        })
+    );
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let reentry_errors = Arc::new(Mutex::new(Vec::new()));
+    let callback_inbox = inbox.clone();
+    let callback_observed = Arc::clone(&observed);
+    let callback_errors = Arc::clone(&reentry_errors);
+    host.context_mut()
+        .on_emit(session_events::SESSION_EVENT, move |record| {
+            if !matches!(
+                record.event.kind,
+                SessionEventKind::AgentInboxSpliced {
+                    target: AgentInboxTarget::NextStep,
+                    removed_count: Some(_),
+                    ..
+                }
+            ) {
+                return;
+            }
+            callback_observed
+                .lock()
+                .unwrap()
+                .push(callback_inbox.next_step().unwrap());
+            callback_errors.lock().unwrap().push(
+                callback_inbox
+                    .append_next_step(user_message("nested-step", "nested"))
+                    .unwrap_err(),
+            );
+        })
+        .unwrap();
+
+    assert_eq!(
+        inbox.claim_next_step(turn).unwrap(),
+        [first.clone(), second.clone()]
+    );
+    assert_eq!(*observed.lock().unwrap(), [vec![first, second]]);
+    assert_eq!(
+        *reentry_errors.lock().unwrap(),
+        [SessionError::InboxMutationInProgress {
+            id: SessionId::new("inbox-step-claim").unwrap(),
+        }]
+    );
+    assert!(inbox.next_step().unwrap().is_empty());
+    assert_eq!(inbox.next_turn().unwrap(), [queued_turn]);
+    assert!(matches!(
+        &session.events().unwrap().last().unwrap().kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextStep,
+            start: 0,
+            removed_count: Some(2),
+            inserted,
+            outcome: None,
+        } if inserted.is_empty()
+    ));
+
+    let event_count = session.events().unwrap().len();
+    assert!(inbox.claim_next_step(turn).unwrap().is_empty());
+    assert_eq!(session.events().unwrap().len(), event_count);
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+    assert_eq!(inbox.claim_next_step(turn), Err(SessionError::NoOpenTurn));
 }
 
 #[test]
@@ -158,6 +248,11 @@ fn restore_rejects_invalid_splices_and_forks_start_with_an_empty_owned_suffix() 
         .inbox()
         .append_next_turn(parent_message.clone())
         .unwrap();
+    let parent_step = user_message("parent-step", "parent step");
+    parent
+        .inbox()
+        .append_next_step(parent_step.clone())
+        .unwrap();
 
     let restored = SessionStore::new()
         .restore(parent.header().unwrap(), parent.events().unwrap())
@@ -166,21 +261,26 @@ fn restore_rejects_invalid_splices_and_forks_start_with_an_empty_owned_suffix() 
         restored.inbox().next_turn().unwrap().as_slice(),
         std::slice::from_ref(&parent_message)
     );
+    assert_eq!(restored.inbox().next_step().unwrap(), [parent_step]);
 
     let child = store
         .fork(parent.id(), None, SessionId::new("inbox-child").unwrap())
         .unwrap();
-    assert_eq!(child.header().unwrap().seed_length, Some(1));
+    assert_eq!(child.header().unwrap().seed_length, Some(2));
     assert!(child.inbox().next_turn().unwrap().is_empty());
+    assert!(child.inbox().next_step().unwrap().is_empty());
     let child_message = user_message("child", "child");
+    let child_step = user_message("child-step", "child step");
     child
         .inbox()
         .append_next_turn(child_message.clone())
         .unwrap();
+    child.inbox().append_next_step(child_step.clone()).unwrap();
     let cold_child = SessionStore::new()
         .restore(child.header().unwrap(), child.events().unwrap())
         .unwrap();
     assert_eq!(cold_child.inbox().next_turn().unwrap(), [child_message]);
+    assert_eq!(cold_child.inbox().next_step().unwrap(), [child_step]);
 
     let invalid_header =
         SessionHeader::new_at(SessionId::new("invalid-splice").unwrap(), 1).unwrap();
