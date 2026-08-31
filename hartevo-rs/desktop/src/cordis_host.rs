@@ -18,12 +18,13 @@ use hartevo_cordis::{
     EffectReconciliationPermit, EffectVerificationAuthority, EffectVerificationBinding,
     EffectVerificationPermit, Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision,
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
-    SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
-    SessionHandle, SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionStore,
-    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop,
-    keys, session_events,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCallConfig, SessionCancelCause,
+    SessionCheckpoint, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
+    SessionEventKind, SessionEventRecord, SessionHandle, SessionHeader, SessionId, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
+    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamChunk,
+    SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop, keys,
+    session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -184,6 +185,10 @@ impl DesktopCordisCoordinator {
 
     /// Append one closed, idempotent projection of a real Application Runtime
     /// turn and commit it through the existing SQLCipher Session adapter.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transactional boundary keeps exact replay validation and first Session append together"
+    )]
     pub(crate) fn record_runtime_transcript(
         &mut self,
         transcript: DesktopRuntimeSessionTranscript,
@@ -211,6 +216,19 @@ impl DesktopCordisCoordinator {
                 model: transcript.model.clone(),
             },
         });
+        let expected_header = SessionEpochHeader {
+            config: SessionCallConfig {
+                provider: transcript.provider.clone(),
+                model: transcript.model.clone(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+            adapter_defaults: None,
+            system: None,
+            tools: None,
+        };
         let expected_chunks = transcript
             .assistant_chunks
             .into_iter()
@@ -230,7 +248,12 @@ impl DesktopCordisCoordinator {
             .filter(|message| expected_ids.contains(&message.id.as_str()))
             .collect::<Vec<_>>();
         if !recorded.is_empty() {
-            if recorded != expected {
+            if recorded != expected
+                || session
+                    .request_header()?
+                    .as_ref()
+                    .is_some_and(|header| header != &expected_header)
+            {
                 return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
                     transcript.session_id,
                 ));
@@ -268,6 +291,11 @@ impl DesktopCordisCoordinator {
         }
 
         let turn = session.start_turn()?;
+        session.append_request_header(
+            expected_header,
+            SessionRequestHeaderReason::Initial,
+            false,
+        )?;
         let step = session.start_step(turn)?;
         session.append_user_message(user)?;
         session.append_request_context(SessionRequestContext {

@@ -12588,7 +12588,8 @@ sleep 30"#;
     )]
     fn desktop_runtime_journey_declines_local_write_and_adopts_only_completed_message() {
         use hartevo_cordis::{
-            SessionContentBlock, SessionEventKind, SessionId, SessionMessageSource, SessionStore,
+            SessionCallConfig, SessionContentBlock, SessionEpochHeader, SessionEventKind,
+            SessionId, SessionMessageSource, SessionRequestHeaderReason, SessionStore,
             SessionStreamChunk,
         };
 
@@ -12650,6 +12651,19 @@ sleep 30"#;
         assert_eq!(runtime.process_cleanup_attempt_count, 1);
         assert!(!runtime.requires_reconciliation);
 
+        let expected_request_header = SessionEpochHeader {
+            config: SessionCallConfig {
+                provider: "fixture-provider".into(),
+                model: "fixture-model".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+            adapter_defaults: None,
+            system: None,
+            tools: None,
+        };
         let (expected_session_events, expected_session_messages) = plane.with_cordis_host(|host| {
             let session = host
                 .context()
@@ -12659,7 +12673,13 @@ sleep 30"#;
                 .expect("Runtime Session lookup")
                 .expect("real Runtime Session");
             let events = session.events().expect("real Runtime Session events");
-            assert_eq!(events.len(), 9);
+            assert_eq!(events.len(), 10);
+            assert!(matches!(
+                events.get(1).map(|event| &event.kind),
+                Some(SessionEventKind::RequestHeader { request })
+                    if request.reason == SessionRequestHeaderReason::Initial
+                        && !request.starts_series
+            ));
             assert!(matches!(
                 events.last().map(|event| &event.kind),
                 Some(SessionEventKind::TurnEnd {
@@ -12703,6 +12723,12 @@ sleep 30"#;
                     },
                 ]
             );
+            assert_eq!(
+                session
+                    .request_header()
+                    .expect("real Runtime request header"),
+                Some(expected_request_header.clone())
+            );
             (events, messages)
         });
         let replay = plane
@@ -12733,6 +12759,10 @@ sleep 30"#;
             assert_eq!(
                 recovered.derive_messages().unwrap(),
                 expected_session_messages
+            );
+            assert_eq!(
+                recovered.request_header().unwrap(),
+                Some(expected_request_header.clone())
             );
         });
 
@@ -12806,6 +12836,10 @@ sleep 30"#;
             assert_eq!(
                 restored.derive_messages().unwrap(),
                 expected_session_messages
+            );
+            assert_eq!(
+                restored.request_header().unwrap(),
+                Some(expected_request_header)
             );
         });
     }
