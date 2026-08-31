@@ -87,7 +87,8 @@ pub use session::{
     SESSION_FORMAT_VERSION, SessionCancelCause, SessionCheckpoint, SessionContentBlock,
     SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHandle, SessionHeader,
     SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
-    TurnEndReason, events as session_events,
+    SessionSurface, SessionSurfaceIntent, SessionSurfaceOp, TurnEndReason,
+    events as session_events,
 };
 pub use surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmStream,

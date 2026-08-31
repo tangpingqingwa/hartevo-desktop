@@ -20,8 +20,8 @@ use hartevo_cordis::{
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
     SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHeader, SessionId,
-    SessionLog, SessionMessage, SessionStore, TurnEndReason, host_is_cordis_loop, keys,
-    session_events,
+    SessionLog, SessionMessage, SessionStore, SessionSurfaceIntent, TurnEndReason,
+    host_is_cordis_loop, keys, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -594,26 +594,33 @@ fn encode_event(
                 turn: *turn,
                 step: *step,
             },
-            SessionEventKind::UserMessage { message } => PersistedSessionEventKind::UserMessage {
-                message: message.to_json_value()?,
-            },
+            SessionEventKind::UserMessage { message, surface } => {
+                PersistedSessionEventKind::UserMessage {
+                    message: message.to_json_value()?,
+                    surface: Some(surface.to_json_value()?),
+                }
+            }
             SessionEventKind::AssistantMessage {
                 turn,
                 step,
                 message,
+                surface,
             } => PersistedSessionEventKind::AssistantMessage {
                 turn: *turn,
                 step: *step,
                 message: message.to_json_value()?,
+                surface: Some(surface.to_json_value()?),
             },
             SessionEventKind::ToolResult {
                 turn,
                 step,
                 message,
+                surface,
             } => PersistedSessionEventKind::ToolResult {
                 turn: *turn,
                 step: *step,
                 message: message.to_json_value()?,
+                surface: Some(surface.to_json_value()?),
             },
         },
     })
@@ -686,26 +693,52 @@ fn decode_event(
                 turn: *turn,
                 step: *step,
             },
-            PersistedSessionEventKind::UserMessage { message } => SessionEventKind::UserMessage {
-                message: SessionMessage::from_json_value(message.clone())?,
-            },
+            PersistedSessionEventKind::UserMessage { message, surface } => {
+                SessionEventKind::UserMessage {
+                    message: SessionMessage::from_json_value(message.clone())?,
+                    // N22 rows predate surface metadata and were append-only.
+                    surface: surface.as_ref().map_or_else(
+                        || Ok(SessionSurfaceIntent::append()),
+                        |value| {
+                            SessionSurfaceIntent::from_json_value(value.clone())
+                                .map_err(DesktopSessionPersistenceError::from)
+                        },
+                    )?,
+                }
+            }
             PersistedSessionEventKind::AssistantMessage {
                 turn,
                 step,
                 message,
+                surface,
             } => SessionEventKind::AssistantMessage {
                 turn: *turn,
                 step: *step,
                 message: SessionMessage::from_json_value(message.clone())?,
+                surface: surface.as_ref().map_or_else(
+                    || Ok(SessionSurfaceIntent::append()),
+                    |value| {
+                        SessionSurfaceIntent::from_json_value(value.clone())
+                            .map_err(DesktopSessionPersistenceError::from)
+                    },
+                )?,
             },
             PersistedSessionEventKind::ToolResult {
                 turn,
                 step,
                 message,
+                surface,
             } => SessionEventKind::ToolResult {
                 turn: *turn,
                 step: *step,
                 message: SessionMessage::from_json_value(message.clone())?,
+                surface: surface.as_ref().map_or_else(
+                    || Ok(SessionSurfaceIntent::append()),
+                    |value| {
+                        SessionSurfaceIntent::from_json_value(value.clone())
+                            .map_err(DesktopSessionPersistenceError::from)
+                    },
+                )?,
             },
         },
     })
@@ -1253,8 +1286,9 @@ mod tests {
         AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
         DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding,
         EffectReconciliationBinding, EffectVerificationBinding, FiberState, OPENINTERPRETER,
-        RuntimeBinding, SurfaceOwner, enforce_invariants, events, host_is_cordis_loop,
-        invariant_missing, keys,
+        RuntimeBinding, SessionContentBlock, SessionEventKind, SessionMessage, SessionMessageRole,
+        SessionMessageSource, SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner,
+        enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -1262,14 +1296,15 @@ mod tests {
         ProjectId, TenantId,
     };
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
+    use hartevo_storage::{PersistedSessionEvent, PersistedSessionEventKind};
 
     use super::{
         DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
         DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
-        bind_live_domain_kernel, bind_live_domain_kernel_scope, dispatch_live_domain_command,
-        dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
-        dispatch_live_effect_verification, dispatch_live_runtime, mount_cordis_host,
-        openinterpreter_runtime_plugin,
+        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_event,
+        dispatch_live_domain_command, dispatch_live_effect_execution,
+        dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
+        dispatch_live_runtime, mount_cordis_host, openinterpreter_runtime_plugin,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -1284,6 +1319,37 @@ mod tests {
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         }
+    }
+
+    #[test]
+    fn legacy_n22_message_without_surface_decodes_as_append() {
+        let message = SessionMessage {
+            id: "legacy-user".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "legacy".into(),
+            }],
+            source: SessionMessageSource::User,
+        };
+        let event = PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::UserMessage {
+                message: message.to_json_value().unwrap(),
+                surface: None,
+            },
+        };
+
+        assert!(matches!(
+            decode_event(&event).unwrap().kind,
+            SessionEventKind::UserMessage {
+                surface: SessionSurfaceIntent {
+                    surface_op: SessionSurfaceOp::Append,
+                    source_event_seqs: None,
+                },
+                ..
+            }
+        ));
     }
 
     #[derive(Debug, Eq, PartialEq)]

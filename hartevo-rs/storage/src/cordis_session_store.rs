@@ -93,7 +93,7 @@ pub enum PersistedTurnEndReason {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PersistedSessionEventKind {
     TurnStart {
         turn: u64,
@@ -112,16 +112,22 @@ pub enum PersistedSessionEventKind {
     },
     UserMessage {
         message: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<serde_json::Value>,
     },
     AssistantMessage {
         turn: u64,
         step: u64,
         message: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<serde_json::Value>,
     },
     ToolResult {
         turn: u64,
         step: u64,
         message: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<serde_json::Value>,
     },
 }
 
@@ -321,21 +327,25 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
             | PersistedSessionEventKind::TurnEnd { turn, .. } => (Some(*turn), None),
             PersistedSessionEventKind::StepStart { turn, step }
             | PersistedSessionEventKind::StepEnd { turn, step } => (Some(*turn), Some(*step)),
-            PersistedSessionEventKind::UserMessage { message } => {
+            PersistedSessionEventKind::UserMessage { message, surface } => {
                 validate_message_json(message)?;
+                validate_surface_json(surface.as_ref())?;
                 (None, None)
             }
             PersistedSessionEventKind::AssistantMessage {
                 turn,
                 step,
                 message,
+                surface,
             }
             | PersistedSessionEventKind::ToolResult {
                 turn,
                 step,
                 message,
+                surface,
             } => {
                 validate_message_json(message)?;
+                validate_surface_json(surface.as_ref())?;
                 (Some(*turn), Some(*step))
             }
         };
@@ -360,6 +370,15 @@ fn validate_message_json(message: &serde_json::Value) -> Result<(), StorageError
     if !message.is_object() {
         return Err(StorageError::InvalidSessionCheckpoint(
             "message payload must be a JSON object",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_surface_json(surface: Option<&serde_json::Value>) -> Result<(), StorageError> {
+    if surface.is_some_and(|value| !value.is_object()) {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "surface metadata must be a JSON object",
         ));
     }
     Ok(())
@@ -513,6 +532,10 @@ mod tests {
         serde_json::json!({ "id": "tool-1", "role": "user", "content": ["ok"] })
     }
 
+    fn append_surface() -> serde_json::Value {
+        serde_json::json!({ "surfaceOp": { "op": "append" } })
+    }
+
     fn completed_turn() -> Vec<PersistedSessionEvent> {
         vec![
             PersistedSessionEvent {
@@ -525,6 +548,7 @@ mod tests {
                 time_ms: 3,
                 kind: PersistedSessionEventKind::UserMessage {
                     message: user_message(),
+                    surface: Some(append_surface()),
                 },
             },
             PersistedSessionEvent {
@@ -539,6 +563,7 @@ mod tests {
                     turn: 1,
                     step: 1,
                     message: assistant_message(),
+                    surface: Some(append_surface()),
                 },
             },
             PersistedSessionEvent {
@@ -548,6 +573,7 @@ mod tests {
                     turn: 1,
                     step: 1,
                     message: tool_result_message(),
+                    surface: Some(append_surface()),
                 },
             },
             PersistedSessionEvent {
@@ -614,6 +640,33 @@ mod tests {
             ))
         ));
         assert!(store.load_session_checkpoints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_surface_checkpoint_is_rejected_before_storage() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        let mut invalid = checkpoint(completed_turn());
+        let PersistedSessionEventKind::UserMessage { surface, .. } = &mut invalid.events[1].kind
+        else {
+            panic!("fixture must contain a user message");
+        };
+        *surface = Some(serde_json::Value::Null);
+
+        assert!(matches!(
+            store.persist_session_checkpoint(&invalid),
+            Err(StorageError::InvalidSessionCheckpoint(
+                "surface metadata must be a JSON object"
+            ))
+        ));
+        assert!(store.load_session_checkpoints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn persisted_event_rejects_unknown_variant_fields() {
+        let mut encoded = serde_json::to_value(&completed_turn()[1]).unwrap();
+        encoded["kind"]["user_message"]["unknown"] = serde_json::Value::Bool(true);
+
+        assert!(serde_json::from_value::<PersistedSessionEvent>(encoded).is_err());
     }
 
     #[test]
