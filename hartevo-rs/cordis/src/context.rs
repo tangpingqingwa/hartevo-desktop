@@ -670,7 +670,7 @@ impl Drop for EventOperationPermit {
     }
 }
 
-/// Cloneable typed-Emit capability for safe callback re-entry.
+/// Cloneable typed event capability for safe callback re-entry.
 ///
 /// The capability captures one exact Context, active Fiber owner, and event
 /// scope without retaining a borrow of [`Context`] or [`ContextView`]. It may
@@ -679,8 +679,9 @@ impl Drop for EventOperationPermit {
 /// listener it creates is owned by the captured Fiber and is removed when that
 /// Fiber is cleaned up.
 ///
-/// This is the synchronous N2 boundary only. It deliberately does not grant
-/// provider, Fiber-lifecycle, or [`crate::LifecycleContextView`] authority.
+/// It supports synchronous Emit and awaited Parallel dispatch only. It
+/// deliberately does not grant provider, Fiber-lifecycle, or
+/// [`crate::LifecycleContextView`] authority.
 #[derive(Clone)]
 pub struct EventReentry {
     context_id: u64,
@@ -859,6 +860,41 @@ impl EventReentry {
         self.events
             .emit_owned(key, payload, self.dispatch_target.as_ref(), &self.owner)
             .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
+    }
+
+    /// Dispatch an observer firehose while containing each listener failure.
+    pub fn emit_contained<P>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        payload: &P,
+    ) -> Result<usize, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        let _permit = self.enter()?;
+        self.events
+            .emit_contained_owned(key, payload, self.dispatch_target.as_ref(), &self.owner)
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
+    }
+
+    /// Dispatch every matching Parallel listener and wait for all of them.
+    ///
+    /// The returned count is the exact callback snapshot selected for this
+    /// dispatch. Listener failures are retained and returned only after the
+    /// complete snapshot has settled.
+    pub async fn parallel<P>(
+        &self,
+        key: EventKey<Parallel, P, ()>,
+        payload: P,
+    ) -> Result<usize, CordisError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        let _permit = self.enter()?;
+        self.events
+            .parallel(key, payload, self.dispatch_target.as_ref())
+            .await
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Parallel, error))
     }
 }
 
@@ -2823,6 +2859,7 @@ impl Context {
         self.events
             .parallel(key, payload, None)
             .await
+            .map(|_| ())
             .map_err(|error| into_cordis_error(key.name(), DispatchMode::Parallel, error))
     }
 
@@ -4097,6 +4134,7 @@ impl ContextView<'_> {
             .events
             .parallel(key, payload, Some(&scope))
             .await
+            .map(|_| ())
             .map_err(|error| into_cordis_error(key.name(), DispatchMode::Parallel, error))
     }
 

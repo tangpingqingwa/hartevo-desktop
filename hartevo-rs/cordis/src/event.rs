@@ -2212,6 +2212,36 @@ impl EventBus {
         self.run_emit_snapshots(payload, snapshots)
     }
 
+    /// Run an observer firehose without allowing one callback to suppress the
+    /// remaining snapshot. Schema/payload mismatches remain structural errors;
+    /// listener failures and panics are contained after their exact callback.
+    pub(crate) fn emit_contained_owned<P>(
+        &self,
+        key: EventKey<Emit, P, ()>,
+        payload: &P,
+        target: Option<&EventScope>,
+        owner: &Fiber,
+    ) -> Result<usize, EventBusError>
+    where
+        P: Any + Send + Sync + 'static,
+    {
+        let snapshots = self.snapshots(key.name(), key.descriptor(), target, Some(owner))?;
+        let listener_count = snapshots.len();
+        for listener in snapshots {
+            let Some(_invocation) = self.begin_invoke(&listener) else {
+                continue;
+            };
+            let Callback::Emit(callback) = &listener.callback else {
+                return Err(EventBusError::Payload);
+            };
+            match catch_unwind(AssertUnwindSafe(|| callback(payload))) {
+                Ok(Ok(()) | Err(CallbackFailure::Source(_))) | Err(_) => {}
+                Ok(Err(CallbackFailure::Payload)) => return Err(EventBusError::Payload),
+            }
+        }
+        Ok(listener_count)
+    }
+
     fn run_emit_snapshots(
         &self,
         payload: &AnyRef,
@@ -2294,11 +2324,12 @@ impl EventBus {
         key: EventKey<Parallel, P, ()>,
         payload: P,
         target: Option<&EventScope>,
-    ) -> Result<(), EventBusError>
+    ) -> Result<usize, EventBusError>
     where
         P: Any + Send + Sync + 'static,
     {
         let snapshots = self.snapshots(key.name(), key.descriptor(), target, None)?;
+        let listener_count = snapshots.len();
         let payload: ArcPayload = Arc::new(payload);
         let futures = snapshots.into_iter().map(|listener| {
             let bus = self.clone();
@@ -2330,7 +2361,7 @@ impl EventBus {
             resume_unwind(payload);
         }
         if errors.is_empty() {
-            Ok(())
+            Ok(listener_count)
         } else {
             Err(EventBusError::Parallel(EventErrors::new(errors)))
         }

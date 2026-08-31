@@ -5,7 +5,8 @@ use hartevo_cordis::{
     AgentRef, Context, CordisError, CordisHost, DispatchMode, DomainSurface, EffectBrokerSurface,
     Emit, EnvironmentOverlay, EventKey, LlmStream, LoaderContext, MAPPED_KEYS, PluginId,
     RuntimeSurface, SurfaceOwner, ToolCall, ToolsSurface, Waterfall, events, expected_mode, keys,
-    register_agent, register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
+    register_agent, register_llm_stream, register_tool, run_tools_pipeline, session_events,
+    stream_llm,
 };
 
 fn mapped() -> Context {
@@ -100,7 +101,7 @@ fn tools_pipeline_locks_exactly_one_mode_per_event() {
 }
 
 #[test]
-fn all_seven_mapped_events_keep_their_exact_typed_descriptors() {
+fn all_nine_mapped_events_keep_their_exact_typed_descriptors() {
     let ctx = mapped();
     macro_rules! assert_mapped {
         ($key:expr, $mode:expr) => {{
@@ -117,6 +118,8 @@ fn all_seven_mapped_events_keep_their_exact_typed_descriptors() {
     assert_mapped!(events::LLM_STREAM, DispatchMode::Waterfall);
     assert_mapped!(events::AGENT_CREATED, DispatchMode::Emit);
     assert_mapped!(events::AGENT_DISPOSED, DispatchMode::Emit);
+    assert_mapped!(session_events::SESSION_EVENT, DispatchMode::Emit);
+    assert_mapped!(session_events::SESSION_FLUSH, DispatchMode::Parallel);
 }
 
 #[test]
@@ -381,6 +384,8 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
         events::LLM_STREAM.name(),
         events::AGENT_CREATED.name(),
         events::AGENT_DISPOSED.name(),
+        session_events::SESSION_EVENT.name(),
+        session_events::SESSION_FLUSH.name(),
     ] {
         assert_eq!(ctx.listener_count(name), 0);
         assert_eq!(ctx.event_mode(name), None, "{name} lock must reverse");
