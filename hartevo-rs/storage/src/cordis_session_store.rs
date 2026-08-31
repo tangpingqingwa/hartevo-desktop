@@ -120,6 +120,12 @@ pub enum PersistedSessionEventKind {
         step: u64,
         chunk: serde_json::Value,
     },
+    RequestHeader {
+        request: serde_json::Value,
+    },
+    RequestContext {
+        context: serde_json::Value,
+    },
     AssistantMessage {
         turn: u64,
         step: u64,
@@ -341,6 +347,14 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
                 validate_chunk_json(chunk)?;
                 (Some(*turn), Some(*step))
             }
+            PersistedSessionEventKind::RequestHeader { request } => {
+                validate_request_json(request, "request/header payload must be a JSON object")?;
+                (None, None)
+            }
+            PersistedSessionEventKind::RequestContext { context } => {
+                validate_request_json(context, "request/context payload must be a JSON object")?;
+                (None, None)
+            }
             PersistedSessionEventKind::AssistantMessage {
                 turn,
                 step,
@@ -389,6 +403,16 @@ fn validate_chunk_json(chunk: &serde_json::Value) -> Result<(), StorageError> {
         return Err(StorageError::InvalidSessionCheckpoint(
             "assistant chunk payload must be a JSON object",
         ));
+    }
+    Ok(())
+}
+
+fn validate_request_json(
+    request: &serde_json::Value,
+    expected: &'static str,
+) -> Result<(), StorageError> {
+    if !request.is_object() {
+        return Err(StorageError::InvalidSessionCheckpoint(expected));
     }
     Ok(())
 }
@@ -558,6 +582,19 @@ mod tests {
         serde_json::json!({ "type": "text-delta", "index": 0, "text": "hello" })
     }
 
+    fn request_header() -> serde_json::Value {
+        serde_json::json!({
+            "header": { "config": { "provider": "provider", "model": "model" } },
+            "reason": "initial"
+        })
+    }
+
+    fn request_context() -> serde_json::Value {
+        serde_json::json!({
+            "provider": "provider", "model": "model", "contextWindow": 32_768
+        })
+    }
+
     fn completed_turn() -> Vec<PersistedSessionEvent> {
         vec![
             PersistedSessionEvent {
@@ -679,6 +716,63 @@ mod tests {
 
         assert!(store.persist_session_checkpoint(&chunk).unwrap());
         assert_eq!(store.load_session_checkpoints().unwrap(), vec![chunk]);
+    }
+
+    #[test]
+    fn request_state_round_trips_without_storage_interpretation() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        let request_state = checkpoint(vec![
+            PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: PersistedSessionEventKind::RequestHeader {
+                    request: request_header(),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 1,
+                time_ms: 2,
+                kind: PersistedSessionEventKind::RequestContext {
+                    context: request_context(),
+                },
+            },
+        ]);
+
+        assert!(store.persist_session_checkpoint(&request_state).unwrap());
+        assert_eq!(
+            store.load_session_checkpoints().unwrap(),
+            vec![request_state]
+        );
+    }
+
+    #[test]
+    fn malformed_request_state_is_rejected_before_storage() {
+        for (kind, expected) in [
+            (
+                PersistedSessionEventKind::RequestHeader {
+                    request: serde_json::Value::Null,
+                },
+                "request/header payload must be a JSON object",
+            ),
+            (
+                PersistedSessionEventKind::RequestContext {
+                    context: serde_json::json!([]),
+                },
+                "request/context payload must be a JSON object",
+            ),
+        ] {
+            let mut store = ProjectStore::in_memory().unwrap();
+            let invalid = checkpoint(vec![PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind,
+            }]);
+            assert!(matches!(
+                store.persist_session_checkpoint(&invalid),
+                Err(StorageError::InvalidSessionCheckpoint(actual)) if actual == expected
+            ));
+            assert!(store.load_session_checkpoints().unwrap().is_empty());
+        }
     }
 
     #[test]

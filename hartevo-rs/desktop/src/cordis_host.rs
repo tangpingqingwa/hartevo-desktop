@@ -20,8 +20,9 @@ use hartevo_cordis::{
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
     SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHeader, SessionId,
-    SessionLog, SessionMessage, SessionStore, SessionStreamChunk, SessionSurfaceIntent,
-    TurnEndReason, host_is_cordis_loop, keys, session_events,
+    SessionLog, SessionMessage, SessionRequestContext, SessionRequestHeader, SessionStore,
+    SessionStreamChunk, SessionSurfaceIntent, TurnEndReason, host_is_cordis_loop, keys,
+    session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -607,6 +608,16 @@ fn encode_event(
                     chunk: chunk.to_json_value()?,
                 }
             }
+            SessionEventKind::RequestHeader { request } => {
+                PersistedSessionEventKind::RequestHeader {
+                    request: request.to_json_value()?,
+                }
+            }
+            SessionEventKind::RequestContext { context } => {
+                PersistedSessionEventKind::RequestContext {
+                    context: context.to_json_value()?,
+                }
+            }
             SessionEventKind::AssistantMessage {
                 turn,
                 step,
@@ -718,6 +729,16 @@ fn decode_event(
                     turn: *turn,
                     step: *step,
                     chunk: SessionStreamChunk::from_json_value(chunk)?,
+                }
+            }
+            PersistedSessionEventKind::RequestHeader { request } => {
+                SessionEventKind::RequestHeader {
+                    request: SessionRequestHeader::from_json_value(request)?,
+                }
+            }
+            PersistedSessionEventKind::RequestContext { context } => {
+                SessionEventKind::RequestContext {
+                    context: SessionRequestContext::from_json_value(context)?,
                 }
             }
             PersistedSessionEventKind::AssistantMessage {
@@ -1387,6 +1408,30 @@ mod tests {
             decode_event(&event),
             Err(super::DesktopSessionPersistenceError::Session(
                 SessionError::InvalidAssistantChunkEncoding
+            ))
+        ));
+    }
+
+    #[test]
+    fn persisted_request_header_with_unknown_shape_fails_closed() {
+        let event = PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::RequestHeader {
+                request: serde_json::json!({
+                    "header": {
+                        "config": { "provider": "provider", "model": "model" },
+                        "unknown": true
+                    },
+                    "reason": "initial"
+                }),
+            },
+        };
+
+        assert!(matches!(
+            decode_event(&event),
+            Err(super::DesktopSessionPersistenceError::Session(
+                SessionError::InvalidRequestHeaderEncoding
             ))
         ));
     }
