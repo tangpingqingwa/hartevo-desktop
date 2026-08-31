@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
-    KernelConsentState, SessionError, SessionEvent, SessionEventKind, SessionHeader, SessionId,
-    SessionLog, SessionStore, TurnEndReason, invariant_missing, session_events,
+    KernelConsentState, SessionContentBlock, SessionError, SessionEvent, SessionEventKind,
+    SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionStore, TurnEndReason, invariant_missing, session_events,
 };
 
 #[derive(Debug)]
@@ -35,6 +36,42 @@ fn approved_host() -> CordisHost {
     host
 }
 
+fn user_message(id: &str, text: &str) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::Text { text: text.into() }],
+        source: SessionMessageSource::User,
+    }
+}
+
+fn assistant_message(id: &str, content: Vec<SessionContentBlock>) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::Assistant,
+        content,
+        source: SessionMessageSource::Model {
+            provider: "mock".into(),
+            model: "mock".into(),
+        },
+    }
+}
+
+fn tool_result_message(id: &str, call_id: &str, text: &str) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::ToolResult {
+            tool_call_id: call_id.into(),
+            content: vec![SessionContentBlock::Text { text: text.into() }],
+            is_error: false,
+        }],
+        source: SessionMessageSource::Tool {
+            call_id: call_id.into(),
+        },
+    }
+}
+
 #[test]
 fn boundary_log_is_contiguous_and_restores_exactly() {
     let id = SessionId::new("session-1").unwrap();
@@ -62,6 +99,150 @@ fn boundary_log_is_contiguous_and_restores_exactly() {
     let restored = SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap();
     assert_eq!(restored, log);
     assert_eq!(restored.header().id, id);
+}
+
+#[test]
+fn message_history_derives_replays_and_detaches_from_the_log() {
+    let mut log = SessionLog::new_at(SessionId::new("message-history").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let user = user_message("user-1", "hello");
+    log.append_user_message(user.clone()).unwrap();
+    let step = log.start_step(turn).unwrap();
+    let assistant = assistant_message(
+        "assistant-1",
+        vec![
+            SessionContentBlock::Text {
+                text: "let me check".into(),
+            },
+            SessionContentBlock::ToolCall {
+                id: "call-1".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            },
+        ],
+    );
+    log.append_assistant_message(turn, step, assistant.clone())
+        .unwrap();
+    let tool = tool_result_message("tool-1", "call-1", "ok");
+    log.append_tool_result(turn, step, tool.clone()).unwrap();
+    log.finish_step(turn, step).unwrap();
+    log.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    let expected = vec![user, assistant, tool];
+    assert_eq!(log.derive_messages(), expected);
+    assert_eq!(
+        log.events()
+            .iter()
+            .map(|event| event.kind.event_type())
+            .collect::<Vec<_>>(),
+        [
+            "turn/start",
+            "user/message",
+            "step/start",
+            "assistant/message",
+            "tool/result",
+            "step/end",
+            "turn/end",
+        ]
+    );
+
+    let restored = SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap();
+    assert_eq!(restored.derive_messages(), expected);
+
+    let mut detached = restored.derive_messages();
+    let SessionContentBlock::Text { text } = &mut detached[0].content[0] else {
+        panic!("first message must retain its text block");
+    };
+    *text = "mutated copy".into();
+    assert_eq!(
+        restored.derive_messages()[0].content[0],
+        expected[0].content[0]
+    );
+}
+
+#[test]
+fn empty_assistant_message_is_durable_but_absent_from_history() {
+    let mut log = SessionLog::new_at(SessionId::new("empty-assistant").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let step = log.start_step(turn).unwrap();
+    log.append_assistant_message(turn, step, assistant_message("usage-only", vec![]))
+        .unwrap();
+    log.finish_step(turn, step).unwrap();
+    log.finish_turn(turn, TurnEndReason::MaxTokens).unwrap();
+
+    assert_eq!(log.events()[2].kind.event_type(), "assistant/message");
+    assert!(log.derive_messages().is_empty());
+}
+
+#[test]
+fn malformed_message_replay_fails_closed() {
+    let mut log = SessionLog::new_at(SessionId::new("message-validation").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    log.append_user_message(user_message("user-1", "hello"))
+        .unwrap();
+    let step = log.start_step(turn).unwrap();
+    log.append_tool_result(turn, step, tool_result_message("tool-1", "call-1", "ok"))
+        .unwrap();
+
+    let mut empty_id = log.events().to_vec();
+    let SessionEventKind::UserMessage { message } = &mut empty_id[1].kind else {
+        panic!("fixture must contain a user message");
+    };
+    message.id.clear();
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), empty_id).unwrap_err(),
+        SessionError::EmptyMessageId {
+            event_type: "user/message"
+        }
+    );
+
+    let mut wrong_role = log.events().to_vec();
+    let SessionEventKind::UserMessage { message } = &mut wrong_role[1].kind else {
+        panic!("fixture must contain a user message");
+    };
+    message.role = SessionMessageRole::Assistant;
+    assert!(matches!(
+        SessionLog::restore(log.header().clone(), wrong_role),
+        Err(SessionError::UnexpectedMessageRole {
+            event_type: "user/message",
+            ..
+        })
+    ));
+
+    let mut mismatched_call = log.events().to_vec();
+    let SessionEventKind::ToolResult { message, .. } = &mut mismatched_call[3].kind else {
+        panic!("fixture must contain a tool result");
+    };
+    message.source = SessionMessageSource::Tool {
+        call_id: "other-call".into(),
+    };
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), mismatched_call).unwrap_err(),
+        SessionError::MismatchedToolCallIds
+    );
+}
+
+#[test]
+fn message_json_rejects_unknown_nested_fields() {
+    for invalid in [
+        serde_json::json!({
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": [{ "text": { "text": "hello", "unknown": true } }],
+            "source": { "model": { "provider": "mock", "model": "mock" } }
+        }),
+        serde_json::json!({
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": [{ "text": { "text": "hello" } }],
+            "source": { "model": { "provider": "mock", "model": "mock", "unknown": true } }
+        }),
+    ] {
+        assert_eq!(
+            SessionMessage::from_json_value(invalid).unwrap_err(),
+            SessionError::InvalidMessageEncoding
+        );
+    }
 }
 
 #[test]

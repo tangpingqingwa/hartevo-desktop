@@ -1,4 +1,4 @@
-//! Durable, content-free Cordis Session checkpoints.
+//! Durable Cordis Session checkpoints in the private SQLCipher database.
 //!
 //! Storage owns neutral rows and never depends on `hartevo-cordis`. Desktop
 //! converts the live typed Session boundary to these records after SQLCipher
@@ -92,7 +92,7 @@ pub enum PersistedTurnEndReason {
     Interrupted,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistedSessionEventKind {
     TurnStart {
@@ -109,6 +109,19 @@ pub enum PersistedSessionEventKind {
     StepEnd {
         turn: u64,
         step: u64,
+    },
+    UserMessage {
+        message: serde_json::Value,
+    },
+    AssistantMessage {
+        turn: u64,
+        step: u64,
+        message: serde_json::Value,
+    },
+    ToolResult {
+        turn: u64,
+        step: u64,
+        message: serde_json::Value,
     },
 }
 
@@ -303,24 +316,52 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
                 "event time must be non-negative",
             ));
         }
-        let (turn, step) = match event.kind {
+        let (turn, step) = match &event.kind {
             PersistedSessionEventKind::TurnStart { turn }
-            | PersistedSessionEventKind::TurnEnd { turn, .. } => (turn, None),
+            | PersistedSessionEventKind::TurnEnd { turn, .. } => (Some(*turn), None),
             PersistedSessionEventKind::StepStart { turn, step }
-            | PersistedSessionEventKind::StepEnd { turn, step } => (turn, Some(step)),
+            | PersistedSessionEventKind::StepEnd { turn, step } => (Some(*turn), Some(*step)),
+            PersistedSessionEventKind::UserMessage { message } => {
+                validate_message_json(message)?;
+                (None, None)
+            }
+            PersistedSessionEventKind::AssistantMessage {
+                turn,
+                step,
+                message,
+            }
+            | PersistedSessionEventKind::ToolResult {
+                turn,
+                step,
+                message,
+            } => {
+                validate_message_json(message)?;
+                (Some(*turn), Some(*step))
+            }
         };
-        if turn == 0 || step == Some(0) {
+        if turn == Some(0) || step == Some(0) {
             return Err(StorageError::InvalidSessionCheckpoint(
                 "turn and step numbers must be positive",
             ));
         }
         sqlite_u64(event.seq, "event sequence")?;
-        sqlite_u64(turn, "turn")?;
+        if let Some(turn) = turn {
+            sqlite_u64(turn, "turn")?;
+        }
         if let Some(step) = step {
             sqlite_u64(step, "step")?;
         }
     }
     sqlite_usize(checkpoint.events.len(), "event count")?;
+    Ok(())
+}
+
+fn validate_message_json(message: &serde_json::Value) -> Result<(), StorageError> {
+    if !message.is_object() {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "message payload must be a JSON object",
+        ));
+    }
     Ok(())
 }
 
@@ -460,6 +501,18 @@ mod tests {
         }
     }
 
+    fn user_message() -> serde_json::Value {
+        serde_json::json!({ "id": "user-1", "role": "user", "content": ["hello"] })
+    }
+
+    fn assistant_message() -> serde_json::Value {
+        serde_json::json!({ "id": "assistant-1", "role": "assistant", "content": ["checking"] })
+    }
+
+    fn tool_result_message() -> serde_json::Value {
+        serde_json::json!({ "id": "tool-1", "role": "user", "content": ["ok"] })
+    }
+
     fn completed_turn() -> Vec<PersistedSessionEvent> {
         vec![
             PersistedSessionEvent {
@@ -470,16 +523,41 @@ mod tests {
             PersistedSessionEvent {
                 seq: 1,
                 time_ms: 3,
-                kind: PersistedSessionEventKind::StepStart { turn: 1, step: 1 },
+                kind: PersistedSessionEventKind::UserMessage {
+                    message: user_message(),
+                },
             },
             PersistedSessionEvent {
                 seq: 2,
                 time_ms: 4,
-                kind: PersistedSessionEventKind::StepEnd { turn: 1, step: 1 },
+                kind: PersistedSessionEventKind::StepStart { turn: 1, step: 1 },
             },
             PersistedSessionEvent {
                 seq: 3,
                 time_ms: 5,
+                kind: PersistedSessionEventKind::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    message: assistant_message(),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 4,
+                time_ms: 6,
+                kind: PersistedSessionEventKind::ToolResult {
+                    turn: 1,
+                    step: 1,
+                    message: tool_result_message(),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 5,
+                time_ms: 7,
+                kind: PersistedSessionEventKind::StepEnd { turn: 1, step: 1 },
+            },
+            PersistedSessionEvent {
+                seq: 6,
+                time_ms: 8,
                 kind: PersistedSessionEventKind::TurnEnd {
                     turn: 1,
                     reason: PersistedTurnEndReason::Completed,
@@ -508,7 +586,7 @@ mod tests {
         store.persist_session_checkpoint(&complete).unwrap();
 
         let mut divergent = complete.clone();
-        divergent.events[3].kind = PersistedSessionEventKind::TurnEnd {
+        divergent.events[6].kind = PersistedSessionEventKind::TurnEnd {
             turn: 1,
             reason: PersistedTurnEndReason::Error,
         };
@@ -517,6 +595,25 @@ mod tests {
             Err(StorageError::ImmutableRecordMismatch { .. })
         ));
         assert_eq!(store.load_session_checkpoints().unwrap(), vec![complete]);
+    }
+
+    #[test]
+    fn malformed_message_checkpoint_is_rejected_before_storage() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        let mut invalid = checkpoint(completed_turn());
+        let PersistedSessionEventKind::ToolResult { message, .. } = &mut invalid.events[4].kind
+        else {
+            panic!("fixture must contain a tool result");
+        };
+        *message = serde_json::Value::Null;
+
+        assert!(matches!(
+            store.persist_session_checkpoint(&invalid),
+            Err(StorageError::InvalidSessionCheckpoint(
+                "message payload must be a JSON object"
+            ))
+        ));
+        assert!(store.load_session_checkpoints().unwrap().is_empty());
     }
 
     #[test]

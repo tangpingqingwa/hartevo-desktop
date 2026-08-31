@@ -20,7 +20,8 @@ use hartevo_cordis::{
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
     SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHeader, SessionId,
-    SessionLog, SessionStore, TurnEndReason, host_is_cordis_loop, keys, session_events,
+    SessionLog, SessionMessage, SessionStore, TurnEndReason, host_is_cordis_loop, keys,
+    session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -482,7 +483,7 @@ impl DesktopSessionPersistence {
                 store.persist_session_checkpoint(&encode_checkpoint(&SessionCheckpoint {
                     header: header.clone(),
                     events: events.clone(),
-                }))?;
+                })?)?;
             }
         }
 
@@ -505,7 +506,7 @@ impl DesktopSessionPersistence {
         checkpoint: &SessionCheckpoint,
     ) -> Result<(), DesktopSessionPersistenceError> {
         SessionLog::restore(checkpoint.header.clone(), checkpoint.events.clone())?;
-        let persisted = encode_checkpoint(checkpoint);
+        let persisted = encode_checkpoint(checkpoint)?;
         let mut state = self
             .store
             .lock()
@@ -548,8 +549,10 @@ pub(crate) enum DesktopSessionPersistenceError {
     Session(#[from] SessionError),
 }
 
-fn encode_checkpoint(checkpoint: &SessionCheckpoint) -> PersistedSessionCheckpoint {
-    PersistedSessionCheckpoint {
+fn encode_checkpoint(
+    checkpoint: &SessionCheckpoint,
+) -> Result<PersistedSessionCheckpoint, DesktopSessionPersistenceError> {
+    Ok(PersistedSessionCheckpoint {
         header: PersistedSessionHeader {
             version: checkpoint.header.version,
             id: checkpoint.header.id.as_str().to_owned(),
@@ -561,28 +564,59 @@ fn encode_checkpoint(checkpoint: &SessionCheckpoint) -> PersistedSessionCheckpoi
                 .map(|id| id.as_str().to_owned()),
             seed_length: checkpoint.header.seed_length,
         },
-        events: checkpoint.events.iter().map(encode_event).collect(),
-    }
+        events: checkpoint
+            .events
+            .iter()
+            .map(encode_event)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
-fn encode_event(event: &SessionEvent) -> PersistedSessionEvent {
-    PersistedSessionEvent {
+fn encode_event(
+    event: &SessionEvent,
+) -> Result<PersistedSessionEvent, DesktopSessionPersistenceError> {
+    Ok(PersistedSessionEvent {
         seq: event.seq,
         time_ms: event.time_ms,
-        kind: match event.kind {
-            SessionEventKind::TurnStart { turn } => PersistedSessionEventKind::TurnStart { turn },
+        kind: match &event.kind {
+            SessionEventKind::TurnStart { turn } => {
+                PersistedSessionEventKind::TurnStart { turn: *turn }
+            }
             SessionEventKind::TurnEnd { turn, reason } => PersistedSessionEventKind::TurnEnd {
-                turn,
-                reason: encode_turn_end_reason(reason),
+                turn: *turn,
+                reason: encode_turn_end_reason(*reason),
             },
-            SessionEventKind::StepStart { turn, step } => {
-                PersistedSessionEventKind::StepStart { turn, step }
-            }
-            SessionEventKind::StepEnd { turn, step } => {
-                PersistedSessionEventKind::StepEnd { turn, step }
-            }
+            SessionEventKind::StepStart { turn, step } => PersistedSessionEventKind::StepStart {
+                turn: *turn,
+                step: *step,
+            },
+            SessionEventKind::StepEnd { turn, step } => PersistedSessionEventKind::StepEnd {
+                turn: *turn,
+                step: *step,
+            },
+            SessionEventKind::UserMessage { message } => PersistedSessionEventKind::UserMessage {
+                message: message.to_json_value()?,
+            },
+            SessionEventKind::AssistantMessage {
+                turn,
+                step,
+                message,
+            } => PersistedSessionEventKind::AssistantMessage {
+                turn: *turn,
+                step: *step,
+                message: message.to_json_value()?,
+            },
+            SessionEventKind::ToolResult {
+                turn,
+                step,
+                message,
+            } => PersistedSessionEventKind::ToolResult {
+                turn: *turn,
+                step: *step,
+                message: message.to_json_value()?,
+            },
         },
-    }
+    })
 }
 
 const fn encode_turn_end_reason(reason: TurnEndReason) -> PersistedTurnEndReason {
@@ -622,28 +656,59 @@ fn decode_checkpoint(
             .transpose()?,
         seed_length: checkpoint.header.seed_length,
     };
-    let events = checkpoint.events.iter().map(decode_event).collect();
+    let events = checkpoint
+        .events
+        .iter()
+        .map(decode_event)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((header, events))
 }
 
-fn decode_event(event: &PersistedSessionEvent) -> SessionEvent {
-    SessionEvent {
+fn decode_event(
+    event: &PersistedSessionEvent,
+) -> Result<SessionEvent, DesktopSessionPersistenceError> {
+    Ok(SessionEvent {
         seq: event.seq,
         time_ms: event.time_ms,
-        kind: match event.kind {
-            PersistedSessionEventKind::TurnStart { turn } => SessionEventKind::TurnStart { turn },
+        kind: match &event.kind {
+            PersistedSessionEventKind::TurnStart { turn } => {
+                SessionEventKind::TurnStart { turn: *turn }
+            }
             PersistedSessionEventKind::TurnEnd { turn, reason } => SessionEventKind::TurnEnd {
-                turn,
-                reason: decode_turn_end_reason(reason),
+                turn: *turn,
+                reason: decode_turn_end_reason(*reason),
             },
-            PersistedSessionEventKind::StepStart { turn, step } => {
-                SessionEventKind::StepStart { turn, step }
-            }
-            PersistedSessionEventKind::StepEnd { turn, step } => {
-                SessionEventKind::StepEnd { turn, step }
-            }
+            PersistedSessionEventKind::StepStart { turn, step } => SessionEventKind::StepStart {
+                turn: *turn,
+                step: *step,
+            },
+            PersistedSessionEventKind::StepEnd { turn, step } => SessionEventKind::StepEnd {
+                turn: *turn,
+                step: *step,
+            },
+            PersistedSessionEventKind::UserMessage { message } => SessionEventKind::UserMessage {
+                message: SessionMessage::from_json_value(message.clone())?,
+            },
+            PersistedSessionEventKind::AssistantMessage {
+                turn,
+                step,
+                message,
+            } => SessionEventKind::AssistantMessage {
+                turn: *turn,
+                step: *step,
+                message: SessionMessage::from_json_value(message.clone())?,
+            },
+            PersistedSessionEventKind::ToolResult {
+                turn,
+                step,
+                message,
+            } => SessionEventKind::ToolResult {
+                turn: *turn,
+                step: *step,
+                message: SessionMessage::from_json_value(message.clone())?,
+            },
         },
-    }
+    })
 }
 
 const fn decode_turn_end_reason(reason: PersistedTurnEndReason) -> TurnEndReason {
