@@ -1603,13 +1603,15 @@ impl DesktopDataPlane {
             Ok(secret) => {
                 let (service, runtime_reconciliation) =
                     self.open_application_from_secret(&secret, now)?;
-                Ok(DesktopLoadState::Ready(Box::new(self.build_snapshot(
+                let snapshot = self.build_snapshot(
                     &service,
                     secret_store,
                     runtime_reconciliation,
                     product_evidence,
                     now,
-                )?)))
+                )?;
+                self.activate_cordis_session_persistence(&secret)?;
+                Ok(DesktopLoadState::Ready(Box::new(snapshot)))
             }
             Err(SecretStoreError::SecretNotFound) if !self.database_path.exists() => {
                 Ok(DesktopLoadState::Uninitialized { product_evidence })
@@ -1720,13 +1722,15 @@ impl DesktopDataPlane {
         };
         let (service, runtime_reconciliation) = self.open_application_from_secret(&secret, now)?;
         let product_evidence = load_product_evidence(now)?;
-        self.build_snapshot(
+        let snapshot = self.build_snapshot(
             &service,
             secret_store,
             runtime_reconciliation,
             product_evidence,
             now,
-        )
+        )?;
+        self.activate_cordis_session_persistence(&secret)?;
+        Ok(snapshot)
     }
 
     pub fn start_mission_with(
@@ -5816,6 +5820,25 @@ impl DesktopDataPlane {
         Ok(ApplicationService::new(store))
     }
 
+    fn activate_cordis_session_persistence(
+        &self,
+        secret: &hartevo_storage::SecretBytes,
+    ) -> Result<(), DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_key = DatabaseKey::from_secret(secret)?;
+        let store = ProjectStore::open(&self.database_path, &database_key)?;
+        self.cordis
+            .lock()
+            .map_err(|_| {
+                DesktopDataError::CordisSessionPersistence(
+                    "Desktop Cordis coordinator is poisoned".into(),
+                )
+            })?
+            .bind_session_persistence(store)
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn bind_live_domain_kernel_from_store(
         &self,
@@ -7188,6 +7211,8 @@ pub enum DesktopDataError {
     ProjectContextIntegrityError(ProjectId),
     #[error("Runtime text subscription context does not match the authorized Tenant and Project")]
     RuntimeSubscriptionContextMismatch,
+    #[error("Desktop Cordis Session persistence failed: {0}")]
+    CordisSessionPersistence(String),
     #[error("the selected WorkProduct revision no longer matches the current Mission projection")]
     WorkProductActionStale,
     #[error("no live Runtime local-write approval is held for this Desktop turn")]
@@ -7354,6 +7379,113 @@ mod tests {
         let installed = DesktopDataPlane::install_persistent(&cell, first);
         let raced = DesktopDataPlane::install_persistent(&cell, second);
         assert!(installed.shares_cordis_coordinator(&raced));
+    }
+
+    #[tokio::test]
+    async fn flushed_cordis_session_restores_read_only_and_resumes_after_restart() {
+        use hartevo_cordis::{
+            SessionId, SessionStore, TurnEndReason, events as cordis_events, session_events,
+        };
+
+        let directory = tempfile::tempdir().expect("directory");
+        let data_root = directory.path().join("desktop-session-restart");
+        let secrets = MemorySecretStore::default();
+        let first = DesktopDataPlane::at_data_root(&data_root).expect("first Desktop plane");
+        first
+            .initialize_with(&secrets, observed_at())
+            .expect("initialize and bind Session persistence");
+
+        let (sessions, session, expected_header, expected_events) =
+            first.with_cordis_host(|host| {
+                let sessions = host
+                    .context()
+                    .sessions::<SessionStore>()
+                    .expect("Cordis Session store");
+                let session = sessions
+                    .create(SessionId::new("desktop-restart-session").unwrap())
+                    .expect("live Session");
+                let turn = session.start_turn().expect("turn start");
+                let step = session.start_step(turn).expect("step start");
+                session.finish_step(turn, step).expect("step end");
+                session
+                    .finish_turn(turn, TurnEndReason::Completed)
+                    .expect("turn end");
+                let header = session.header().expect("header");
+                let events = session.events().expect("events");
+                (sessions, session, header, events)
+            });
+        assert!(sessions.flush(&session).await.expect("durable flush"));
+        drop(session);
+        drop(sessions);
+        drop(first);
+
+        let second = DesktopDataPlane::at_data_root(&data_root).expect("restarted Desktop plane");
+        let execution_events = Arc::new(AtomicUsize::new(0));
+        second.with_cordis_host(|host| {
+            let session_count = Arc::clone(&execution_events);
+            host.context_mut()
+                .on_emit(session_events::SESSION_EVENT, move |_| {
+                    session_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            let agent_count = Arc::clone(&execution_events);
+            host.context_mut()
+                .on_emit(cordis_events::AGENT_CREATED, move |_| {
+                    agent_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            let tool_count = Arc::clone(&execution_events);
+            host.context_mut()
+                .on_emit(cordis_events::TOOLS_RESULT, move |_| {
+                    tool_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+        });
+
+        assert!(matches!(
+            second.load_with(&secrets, observed_at()).unwrap(),
+            DesktopLoadState::Ready(_)
+        ));
+        assert_eq!(
+            execution_events.load(Ordering::SeqCst),
+            0,
+            "restore must not publish live Session, agent, or tool events"
+        );
+
+        let (restored_sessions, restored) = second.with_cordis_host(|host| {
+            let sessions = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("restored Session store");
+            let restored = sessions
+                .get(&expected_header.id)
+                .expect("Session lookup")
+                .expect("restored Session");
+            assert_eq!(restored.header().unwrap(), expected_header);
+            assert_eq!(restored.events().unwrap(), expected_events);
+            (sessions, restored)
+        });
+        let turn = restored.start_turn().expect("resumed turn start");
+        restored
+            .finish_turn(turn, TurnEndReason::Completed)
+            .expect("resumed turn end");
+        assert!(
+            restored_sessions
+                .flush(&restored)
+                .await
+                .expect("resumed durable flush")
+        );
+
+        let secret = secrets
+            .get(second.database_key_reference())
+            .expect("database secret");
+        let key = DatabaseKey::from_secret(&secret).expect("database key");
+        let store = ProjectStore::open(&second.database_path, &key).expect("Session store read");
+        let checkpoints = store
+            .load_session_checkpoints()
+            .expect("durable Session checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].events.len(), expected_events.len() + 2);
     }
 
     fn production_preview_broker() -> EffectBroker {
