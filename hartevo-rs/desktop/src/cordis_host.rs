@@ -110,17 +110,23 @@ pub(crate) struct DesktopRuntimeSessionTranscript {
     user_body: String,
     provider: String,
     model: String,
+    assistant_chunks: Vec<String>,
     assistant_body: Option<String>,
     end_reason: TurnEndReason,
 }
 
 impl DesktopRuntimeSessionTranscript {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private boundary keeps exact Session, Runtime turn, route, chunks, final body, and terminal identity visible without another transport type"
+    )]
     pub(crate) fn new(
         session_id: impl Into<String>,
         runtime_turn_id: impl Into<String>,
         user_body: impl Into<String>,
         provider: impl Into<String>,
         model: impl Into<String>,
+        assistant_chunks: Vec<String>,
         assistant_body: Option<String>,
         end_reason: TurnEndReason,
     ) -> Self {
@@ -130,6 +136,7 @@ impl DesktopRuntimeSessionTranscript {
             user_body: user_body.into(),
             provider: provider.into(),
             model: model.into(),
+            assistant_chunks,
             assistant_body,
             end_reason,
         }
@@ -204,6 +211,11 @@ impl DesktopCordisCoordinator {
                 model: transcript.model.clone(),
             },
         });
+        let expected_chunks = transcript
+            .assistant_chunks
+            .into_iter()
+            .map(|text| SessionStreamChunk::TextDelta { index: 0, text })
+            .collect::<Vec<_>>();
         let expected = std::iter::once(&user)
             .chain(assistant.iter())
             .cloned()
@@ -223,6 +235,35 @@ impl DesktopCordisCoordinator {
                     transcript.session_id,
                 ));
             }
+            if let Some(assistant) = assistant.as_ref() {
+                let location = session.events()?.into_iter().find_map(|event| {
+                    let SessionEventKind::AssistantMessage {
+                        turn,
+                        step,
+                        message,
+                        ..
+                    } = event.kind
+                    else {
+                        return None;
+                    };
+                    (message.id == assistant.id).then_some((turn, step))
+                });
+                let Some((turn, step)) = location else {
+                    return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                        transcript.session_id,
+                    ));
+                };
+                let recorded_chunks = session
+                    .assistant_chunks(turn, step)?
+                    .into_iter()
+                    .map(|chunk| chunk.chunk)
+                    .collect::<Vec<_>>();
+                if !recorded_chunks.is_empty() && recorded_chunks != expected_chunks {
+                    return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                        transcript.session_id,
+                    ));
+                }
+            }
             return self.session_persistence.persist_live(&session);
         }
 
@@ -234,6 +275,9 @@ impl DesktopCordisCoordinator {
             model: transcript.model,
             context_window: None,
         })?;
+        for chunk in expected_chunks {
+            session.append_assistant_chunk(turn, step, chunk)?;
+        }
         if let Some(message) = assistant {
             session.append_assistant_message(turn, step, message)?;
         }

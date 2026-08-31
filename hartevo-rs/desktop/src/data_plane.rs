@@ -62,8 +62,9 @@ use hartevo_domain_kernel::{
     MissionConversationRole, MissionId, MissionStage, Money, OperatingMode, OutcomeDecision,
     PersonId, ProjectEncryptionMode, ProjectId, ProjectKeyring, Receipt, ReceiptId, ReviewDecision,
     ReviewId, RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy,
-    RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId,
-    VerificationId, VerificationStatus, WorkProductId, WorkerHandleStatus,
+    RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnPrivateMessage, RuntimeTurnStatus,
+    StorageMode, TaskId, TenantId, VerificationId, VerificationStatus, WorkProductId,
+    WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
     BrokerResult, DurableReceiptReconciliation, EffectBroker, EffectExecutor, EffectPolicy,
@@ -4761,7 +4762,7 @@ impl DesktopDataPlane {
                 &turn.id,
                 runtime.provider(),
                 runtime.model(),
-                Some(&message.body),
+                Some(message),
                 TurnEndReason::Completed,
             )?;
         }
@@ -5209,9 +5210,7 @@ impl DesktopDataPlane {
             &turn_id,
             &runtime_provider,
             &runtime_model,
-            completed_message
-                .as_ref()
-                .map(|message| message.body.as_str()),
+            completed_message.as_ref(),
             session_end_reason,
         )?;
         let outcome = match attempt.status {
@@ -5894,7 +5893,7 @@ impl DesktopDataPlane {
         turn_id: &RuntimeTurnAttemptId,
         provider: &str,
         model: &str,
-        assistant_body: Option<&str>,
+        assistant_message: Option<&RuntimeTurnPrivateMessage>,
         end_reason: TurnEndReason,
     ) -> Result<(), DesktopDataError> {
         let user_body = if mission.definition.is_some() {
@@ -5907,6 +5906,16 @@ impl DesktopDataPlane {
                 .map_or_else(|| mission.contract.goal.clone(), |message| message.body)
         } else {
             mission.contract.goal.clone()
+        };
+        let assistant_chunks = if let Some(message) = assistant_message {
+            service
+                .runtime_turn_private_text_deltas(&mission.project_id, turn_id)?
+                .into_iter()
+                .filter(|delta| delta.item_id_digest == message.item_id_digest)
+                .map(|delta| delta.delta)
+                .collect()
+        } else {
+            Vec::new()
         };
         self.cordis
             .lock()
@@ -5921,7 +5930,8 @@ impl DesktopDataPlane {
                 user_body,
                 provider,
                 model,
-                assistant_body.map(str::to_owned),
+                assistant_chunks,
+                assistant_message.map(|message| message.body.clone()),
                 end_reason,
             ))
             .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))
@@ -12579,6 +12589,7 @@ sleep 30"#;
     fn desktop_runtime_journey_declines_local_write_and_adopts_only_completed_message() {
         use hartevo_cordis::{
             SessionContentBlock, SessionEventKind, SessionId, SessionMessageSource, SessionStore,
+            SessionStreamChunk,
         };
 
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -12648,7 +12659,7 @@ sleep 30"#;
                 .expect("Runtime Session lookup")
                 .expect("real Runtime Session");
             let events = session.events().expect("real Runtime Session events");
-            assert_eq!(events.len(), 7);
+            assert_eq!(events.len(), 9);
             assert!(matches!(
                 events.last().map(|event| &event.kind),
                 Some(SessionEventKind::TurnEnd {
@@ -12674,6 +12685,24 @@ sleep 30"#;
                     && model == "fixture-model"
                     && text == "Reviewable local runtime draft; no external effect occurred."
             ));
+            assert_eq!(
+                session
+                    .assistant_chunks(1, 1)
+                    .expect("real Runtime Session chunks")
+                    .into_iter()
+                    .map(|chunk| chunk.chunk)
+                    .collect::<Vec<_>>(),
+                vec![
+                    SessionStreamChunk::TextDelta {
+                        index: 0,
+                        text: "Reviewable local runtime ".into(),
+                    },
+                    SessionStreamChunk::TextDelta {
+                        index: 0,
+                        text: "draft; no external effect occurred.".into(),
+                    },
+                ]
+            );
             (events, messages)
         });
         let replay = plane
@@ -12737,6 +12766,16 @@ sleep 30"#;
                 .windows("Reviewable local runtime draft".len())
                 .any(|window| window == b"Reviewable local runtime draft")
         );
+        for chunk in [
+            b"Reviewable local runtime ".as_slice(),
+            b"draft; no external effect occurred.".as_slice(),
+        ] {
+            assert!(
+                !database_bytes
+                    .windows(chunk.len())
+                    .any(|window| window == chunk)
+            );
+        }
         assert!(
             !projected
                 .work_products
