@@ -20,8 +20,8 @@ use hartevo_cordis::{
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
     SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHeader, SessionId,
-    SessionLog, SessionMessage, SessionStore, SessionSurfaceIntent, TurnEndReason,
-    host_is_cordis_loop, keys, session_events,
+    SessionLog, SessionMessage, SessionStore, SessionStreamChunk, SessionSurfaceIntent,
+    TurnEndReason, host_is_cordis_loop, keys, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -600,6 +600,13 @@ fn encode_event(
                     surface: Some(surface.to_json_value()?),
                 }
             }
+            SessionEventKind::AssistantChunk { turn, step, chunk } => {
+                PersistedSessionEventKind::AssistantChunk {
+                    turn: *turn,
+                    step: *step,
+                    chunk: chunk.to_json_value()?,
+                }
+            }
             SessionEventKind::AssistantMessage {
                 turn,
                 step,
@@ -704,6 +711,13 @@ fn decode_event(
                                 .map_err(DesktopSessionPersistenceError::from)
                         },
                     )?,
+                }
+            }
+            PersistedSessionEventKind::AssistantChunk { turn, step, chunk } => {
+                SessionEventKind::AssistantChunk {
+                    turn: *turn,
+                    step: *step,
+                    chunk: SessionStreamChunk::from_json_value(chunk)?,
                 }
             }
             PersistedSessionEventKind::AssistantMessage {
@@ -1286,9 +1300,9 @@ mod tests {
         AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
         DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding,
         EffectReconciliationBinding, EffectVerificationBinding, FiberState, OPENINTERPRETER,
-        RuntimeBinding, SessionContentBlock, SessionEventKind, SessionMessage, SessionMessageRole,
-        SessionMessageSource, SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner,
-        enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys,
+        RuntimeBinding, SessionContentBlock, SessionError, SessionEventKind, SessionMessage,
+        SessionMessageRole, SessionMessageSource, SessionSurfaceIntent, SessionSurfaceOp,
+        SurfaceOwner, enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -1349,6 +1363,31 @@ mod tests {
                 },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn persisted_assistant_chunk_with_unknown_shape_fails_closed() {
+        let event = PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::AssistantChunk {
+                turn: 1,
+                step: 1,
+                chunk: serde_json::json!({
+                    "type": "text-delta",
+                    "index": 0,
+                    "text": "hello",
+                    "unknown": true
+                }),
+            },
+        };
+
+        assert!(matches!(
+            decode_event(&event),
+            Err(super::DesktopSessionPersistenceError::Session(
+                SessionError::InvalidAssistantChunkEncoding
+            ))
         ));
     }
 

@@ -84,11 +84,12 @@ pub use service::{
     ServiceViewKind, associated_key, merge_service_config,
 };
 pub use session::{
-    SESSION_FORMAT_VERSION, SessionCancelCause, SessionCheckpoint, SessionContentBlock,
-    SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHandle, SessionHeader,
-    SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
-    SessionSurface, SessionSurfaceIntent, SessionSurfaceOp, TurnEndReason,
-    events as session_events,
+    SESSION_FORMAT_VERSION, SessionAssistantChunk, SessionCancelCause, SessionCheckpoint,
+    SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
+    SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurface, SessionSurfaceIntent,
+    SessionSurfaceOp, SessionTokenUsage, TurnEndReason, events as session_events,
 };
 pub use surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmStream,

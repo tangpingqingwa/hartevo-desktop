@@ -115,6 +115,11 @@ pub enum PersistedSessionEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<serde_json::Value>,
     },
+    AssistantChunk {
+        turn: u64,
+        step: u64,
+        chunk: serde_json::Value,
+    },
     AssistantMessage {
         turn: u64,
         step: u64,
@@ -332,6 +337,10 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
                 validate_surface_json(surface.as_ref())?;
                 (None, None)
             }
+            PersistedSessionEventKind::AssistantChunk { turn, step, chunk } => {
+                validate_chunk_json(chunk)?;
+                (Some(*turn), Some(*step))
+            }
             PersistedSessionEventKind::AssistantMessage {
                 turn,
                 step,
@@ -370,6 +379,15 @@ fn validate_message_json(message: &serde_json::Value) -> Result<(), StorageError
     if !message.is_object() {
         return Err(StorageError::InvalidSessionCheckpoint(
             "message payload must be a JSON object",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chunk_json(chunk: &serde_json::Value) -> Result<(), StorageError> {
+    if !chunk.is_object() {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "assistant chunk payload must be a JSON object",
         ));
     }
     Ok(())
@@ -536,6 +554,10 @@ mod tests {
         serde_json::json!({ "surfaceOp": { "op": "append" } })
     }
 
+    fn assistant_chunk() -> serde_json::Value {
+        serde_json::json!({ "type": "text-delta", "index": 0, "text": "hello" })
+    }
+
     fn completed_turn() -> Vec<PersistedSessionEvent> {
         vec![
             PersistedSessionEvent {
@@ -637,6 +659,45 @@ mod tests {
             store.persist_session_checkpoint(&invalid),
             Err(StorageError::InvalidSessionCheckpoint(
                 "message payload must be a JSON object"
+            ))
+        ));
+        assert!(store.load_session_checkpoints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn assistant_chunk_round_trips_without_storage_interpretation() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        let chunk = checkpoint(vec![PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::AssistantChunk {
+                turn: 1,
+                step: 1,
+                chunk: assistant_chunk(),
+            },
+        }]);
+
+        assert!(store.persist_session_checkpoint(&chunk).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![chunk]);
+    }
+
+    #[test]
+    fn malformed_assistant_chunk_is_rejected_before_storage() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        let invalid = checkpoint(vec![PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::AssistantChunk {
+                turn: 1,
+                step: 1,
+                chunk: serde_json::Value::Null,
+            },
+        }]);
+
+        assert!(matches!(
+            store.persist_session_checkpoint(&invalid),
+            Err(StorageError::InvalidSessionCheckpoint(
+                "assistant chunk payload must be a JSON object"
             ))
         ));
         assert!(store.load_session_checkpoints().unwrap().is_empty());

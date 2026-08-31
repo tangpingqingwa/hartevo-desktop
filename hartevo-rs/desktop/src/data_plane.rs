@@ -7459,6 +7459,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn flushed_cordis_session_restores_read_only_and_resumes_after_restart() {
         use hartevo_cordis::{SessionId, SessionStore, TurnEndReason};
 
@@ -7477,6 +7478,7 @@ mod tests {
             expected_events,
             expected_surface,
             expected_messages,
+            expected_chunks,
         ) = first.with_cordis_host(|host| {
             let sessions = host
                 .context()
@@ -7489,8 +7491,59 @@ mod tests {
             let [user, assistant, tool, summary] = desktop_restart_messages();
             session.append_user_message(user).expect("user message");
             let step = session.start_step(turn).expect("step start");
+            let chunks = vec![
+                hartevo_cordis::SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: hartevo_cordis::SessionStreamBlockType::Text,
+                },
+                hartevo_cordis::SessionStreamChunk::TextDelta {
+                    index: 0,
+                    text: "checking".into(),
+                },
+                hartevo_cordis::SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: hartevo_cordis::SessionContentBlock::Text {
+                        text: "checking".into(),
+                    },
+                },
+                hartevo_cordis::SessionStreamChunk::BlockStart {
+                    index: 1,
+                    block_type: hartevo_cordis::SessionStreamBlockType::ToolCall,
+                },
+                hartevo_cordis::SessionStreamChunk::ToolCallDelta {
+                    index: 1,
+                    id: "desktop-call-1".into(),
+                    name: Some("echo".into()),
+                    arguments_delta: "{}".into(),
+                },
+                hartevo_cordis::SessionStreamChunk::BlockEnd {
+                    index: 1,
+                    block: hartevo_cordis::SessionContentBlock::ToolCall {
+                        id: "desktop-call-1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                hartevo_cordis::SessionStreamChunk::Finish {
+                    reason: hartevo_cordis::SessionFinishReason::ToolCalls,
+                    replay_state: None,
+                },
+            ];
+            let source_seqs = chunks
+                .into_iter()
+                .map(|chunk| {
+                    session
+                        .append_assistant_chunk(turn, step, chunk)
+                        .expect("assistant chunk")
+                })
+                .collect::<Vec<_>>();
             session
-                .append_assistant_message(turn, step, assistant)
+                .append_assistant_message_with_surface(
+                    turn,
+                    step,
+                    assistant,
+                    hartevo_cordis::SessionSurfaceIntent::append_from(source_seqs),
+                )
                 .expect("assistant message");
             session
                 .append_tool_result(turn, step, tool)
@@ -7504,7 +7557,10 @@ mod tests {
             let events = session.events().expect("events");
             let surface = session.surface().expect("surface");
             let messages = session.derive_messages().expect("message history");
-            (sessions, session, header, events, surface, messages)
+            let chunks = session
+                .assistant_chunks(turn, step)
+                .expect("assistant chunk replay");
+            (sessions, session, header, events, surface, messages, chunks)
         });
         assert!(sessions.flush(&session).await.expect("durable flush"));
         drop(session);
@@ -7537,6 +7593,7 @@ mod tests {
             assert_eq!(restored.events().unwrap(), expected_events);
             assert_eq!(restored.surface().unwrap(), expected_surface);
             assert_eq!(restored.derive_messages().unwrap(), expected_messages);
+            assert_eq!(restored.assistant_chunks(1, 1).unwrap(), expected_chunks);
             (sessions, restored)
         });
         let turn = restored.start_turn().expect("resumed turn start");
