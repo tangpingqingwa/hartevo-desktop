@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
-    KernelConsentState, SessionError, SessionEventKind, SessionId, SessionLog, SessionStore,
-    TurnEndReason, invariant_missing, session_events,
+    KernelConsentState, SessionError, SessionEvent, SessionEventKind, SessionHeader, SessionId,
+    SessionLog, SessionStore, TurnEndReason, invariant_missing, session_events,
 };
 
 #[derive(Debug)]
@@ -92,6 +92,83 @@ fn invalid_transition_or_corrupt_replay_is_rejected_before_mutation() {
             actual: 9,
         }
     );
+}
+
+#[test]
+fn interrupted_tail_repair_is_deterministic_idempotent_and_resumable() {
+    let header = SessionHeader::new_at(SessionId::new("crashed-step").unwrap(), 1).unwrap();
+    let mut log = SessionLog::restore(
+        header,
+        vec![
+            SessionEvent {
+                seq: 0,
+                time_ms: 10,
+                kind: SessionEventKind::TurnStart { turn: 1 },
+            },
+            SessionEvent {
+                seq: 1,
+                time_ms: 20,
+                kind: SessionEventKind::StepStart { turn: 1, step: 1 },
+            },
+        ],
+    )
+    .unwrap();
+
+    assert!(log.repair_interrupted_tail().unwrap());
+    assert_eq!(
+        &log.events()[2..],
+        [
+            SessionEvent {
+                seq: 2,
+                time_ms: 20,
+                kind: SessionEventKind::StepEnd { turn: 1, step: 1 },
+            },
+            SessionEvent {
+                seq: 3,
+                time_ms: 20,
+                kind: SessionEventKind::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Interrupted,
+                },
+            },
+        ]
+    );
+    let repaired = log.events().to_vec();
+    assert!(!log.repair_interrupted_tail().unwrap());
+    assert_eq!(log.events(), repaired);
+    assert_eq!(log.start_turn().unwrap(), 2);
+
+    let header = SessionHeader::new_at(SessionId::new("crashed-turn").unwrap(), 1).unwrap();
+    let mut turn_only = SessionLog::restore(
+        header,
+        vec![SessionEvent {
+            seq: 0,
+            time_ms: 30,
+            kind: SessionEventKind::TurnStart { turn: 1 },
+        }],
+    )
+    .unwrap();
+    assert!(turn_only.repair_interrupted_tail().unwrap());
+    assert_eq!(
+        turn_only.events()[1],
+        SessionEvent {
+            seq: 1,
+            time_ms: 30,
+            kind: SessionEventKind::TurnEnd {
+                turn: 1,
+                reason: TurnEndReason::Interrupted,
+            },
+        }
+    );
+
+    let mut balanced = SessionLog::new_at(SessionId::new("balanced").unwrap(), 1).unwrap();
+    let turn = balanced.start_turn().unwrap();
+    balanced
+        .finish_turn(turn, TurnEndReason::Completed)
+        .unwrap();
+    let unchanged = balanced.events().to_vec();
+    assert!(!balanced.repair_interrupted_tail().unwrap());
+    assert_eq!(balanced.events(), unchanged);
 }
 
 #[test]
