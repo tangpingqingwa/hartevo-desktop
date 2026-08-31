@@ -21,6 +21,7 @@ fn mapped_keys_are_provided_and_looked_up() {
         [
             keys::TOOLS,
             keys::LLM,
+            keys::SESSIONS,
             keys::AGENTS,
             keys::DOMAIN,
             keys::EFFECT_BROKER,
@@ -363,6 +364,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
     for key in [
         keys::TOOLS,
         keys::LLM,
+        keys::SESSIONS,
         keys::AGENTS,
         keys::DOMAIN,
         keys::EFFECT_BROKER,

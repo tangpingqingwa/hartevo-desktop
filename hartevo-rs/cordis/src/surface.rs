@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::context::{Context, CordisError, keys};
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
+use crate::session::SessionStore;
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
     keys::TOOLS,
     keys::LLM,
+    keys::SESSIONS,
     keys::AGENTS,
     keys::DOMAIN,
     keys::EFFECT_BROKER,
@@ -420,6 +422,7 @@ pub(crate) fn map_surfaces(
 
     ctx.provide(keys::TOOLS, ToolsSurface::new())?;
     ctx.provide(keys::LLM, LlmSurface::new())?;
+    ctx.provide(keys::SESSIONS, SessionStore::new())?;
     ctx.provide(keys::AGENTS, AgentsSurface::new())?;
     ctx.provide_reserved(authority, keys::DOMAIN, surfaces.domain)?;
     ctx.provide_reserved(authority, keys::EFFECT_BROKER, surfaces.effect_broker)?;

@@ -14,9 +14,7 @@ use crate::authority::{
     RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
 };
 use crate::context::{Context, CordisError, TeardownTransaction, keys};
-use crate::invariants::{
-    InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, enforce_runtime_invariants,
-};
+use crate::invariants::{InvariantGate, OPENINTERPRETER, apply_effect, enforce_runtime_invariants};
 use crate::kernel::{
     KernelApproval, KernelConsentRecord, KernelConsentState, bind_domain_kernel_facts,
 };
@@ -24,6 +22,7 @@ use crate::loader::{
     EnvironmentOverlay, LoadReport, LoaderContext, PluginId, PluginSpec, load_plugins,
 };
 use crate::service::Service;
+use crate::session::SessionStore;
 use crate::surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
     LlmSurface, RuntimeSurface, SurfaceOwner, ToolsSurface, events, map_surfaces,
@@ -219,7 +218,6 @@ impl CordisHost {
     /// This API exercises the generic tool/LLM surface and is not the Desktop
     /// production Runtime path. Desktop uses [`Self::authorize_runtime`].
     pub fn step(&mut self, step: AgentStep) -> Result<AgentStepResult, CordisError> {
-        enforce_invariants(&self.ctx)?;
         run_agent_step(&mut self.ctx, step)
     }
 
@@ -782,10 +780,11 @@ impl CordisHost {
     }
 
     #[must_use]
-    pub fn mounted_keys(&self) -> [&'static str; 7] {
+    pub fn mounted_keys(&self) -> [&'static str; 8] {
         [
             keys::TOOLS,
             keys::LLM,
+            keys::SESSIONS,
             keys::AGENTS,
             keys::DOMAIN,
             keys::EFFECT_BROKER,
@@ -905,7 +904,7 @@ fn desktop_surfaces(openinterpreter: bool) -> HartevoSurfaces {
     }
 }
 
-/// Boot-time host check: the seven keys, Hartevo ownership of Domain/Effect,
+/// Boot-time host check: the eight keys, Hartevo ownership of Domain/Effect,
 /// Receipt ≠ Verification, and local-first/sqlcipher/eval_gate.
 ///
 /// Consent and approval are *not* required here. They are step-time
@@ -924,6 +923,11 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
     if host.ctx.llm::<LlmSurface>().is_none() {
         return Err(CordisError::MissingDependencies(vec![
             keys::LLM.to_string(),
+        ]));
+    }
+    if host.ctx.sessions::<SessionStore>().is_none() {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::SESSIONS.to_string(),
         ]));
     }
     if host.ctx.agents::<AgentsSurface>().is_none() {

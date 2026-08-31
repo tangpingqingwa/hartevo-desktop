@@ -469,6 +469,8 @@ pub enum CordisError {
     },
     #[error(transparent)]
     Interpolate(#[from] crate::config::InterpolateError),
+    #[error(transparent)]
+    Session(#[from] crate::session::SessionError),
 }
 
 /// Service container and plugin host.
