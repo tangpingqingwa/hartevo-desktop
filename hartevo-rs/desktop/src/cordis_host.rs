@@ -618,6 +618,19 @@ fn encode_event(
                     context: context.to_json_value()?,
                 }
             }
+            SessionEventKind::ToolCall {
+                turn,
+                step,
+                call_id,
+                name,
+                arguments,
+            } => PersistedSessionEventKind::ToolCall {
+                turn: *turn,
+                step: *step,
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
             SessionEventKind::AssistantMessage {
                 turn,
                 step,
@@ -741,6 +754,19 @@ fn decode_event(
                     context: SessionRequestContext::from_json_value(context)?,
                 }
             }
+            PersistedSessionEventKind::ToolCall {
+                turn,
+                step,
+                call_id,
+                name,
+                arguments,
+            } => SessionEventKind::ToolCall {
+                turn: *turn,
+                step: *step,
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
             PersistedSessionEventKind::AssistantMessage {
                 turn,
                 step,

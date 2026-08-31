@@ -1,11 +1,11 @@
 //! Minimal Rust-native Session boundary log adapted from DeepSeek Harness.
 //!
 //! This slice records and validates turn/step lifecycle, request state, raw
-//! assistant stream chunks, and the three durable message events that form
-//! model history. Its ordered surface can append or replace model-visible nodes
-//! without deleting the source log, and it exposes the typed event/flush seam
-//! consumed by persistence plugins. The wider Harness vocabulary remains
-//! separate follow-up work.
+//! assistant stream chunks, tool-call identities, and the three durable message
+//! events that form model history. Its ordered surface can append or replace
+//! model-visible nodes without deleting the source log, and it exposes the
+//! typed event/flush seam consumed by persistence plugins. The wider Harness
+//! vocabulary remains separate follow-up work.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -462,6 +462,19 @@ pub struct SessionAssistantChunk {
     pub chunk: SessionStreamChunk,
 }
 
+/// Detached log-only tool invocation returned in authoritative Session order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionToolCall {
+    pub seq: u64,
+    pub time_ms: i64,
+    pub turn: u64,
+    pub step: u64,
+    pub call_id: String,
+    pub name: String,
+    /// Raw JSON string exactly as the model produced it; never parsed here.
+    pub arguments: String,
+}
+
 /// One identified immutable message shared by durable history and replay.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -588,7 +601,7 @@ pub struct SessionSurface {
     pub replace_generation: u64,
 }
 
-/// The bounded Session event vocabulary through N25.
+/// The bounded Session event vocabulary through N26.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
     TurnStart {
@@ -616,6 +629,13 @@ pub enum SessionEventKind {
     },
     RequestContext {
         context: SessionRequestContext,
+    },
+    ToolCall {
+        turn: u64,
+        step: u64,
+        call_id: String,
+        name: String,
+        arguments: String,
     },
     UserMessage {
         message: SessionMessage,
@@ -646,6 +666,7 @@ impl SessionEventKind {
             Self::AssistantChunk { .. } => "assistant/chunk",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
+            Self::ToolCall { .. } => "tool/call",
             Self::UserMessage { .. } => "user/message",
             Self::AssistantMessage { .. } => "assistant/message",
             Self::ToolResult { .. } => "tool/result",
@@ -663,7 +684,8 @@ impl SessionEventKind {
             | Self::StepEnd { .. }
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
-            | Self::RequestContext { .. } => None,
+            | Self::RequestContext { .. }
+            | Self::ToolCall { .. } => None,
         }
     }
 
@@ -678,7 +700,8 @@ impl SessionEventKind {
             | Self::StepEnd { .. }
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
-            | Self::RequestContext { .. } => None,
+            | Self::RequestContext { .. }
+            | Self::ToolCall { .. } => None,
         }
     }
 }
@@ -789,6 +812,21 @@ impl SessionState {
                 require_open_turn(self.open_turn)?;
                 validate_request_context(context)?;
             }
+            SessionEventKind::ToolCall {
+                turn,
+                step,
+                call_id,
+                name,
+                ..
+            } => {
+                require_turn(self.open_turn, *turn)?;
+                require_step(self.open_step, *turn, *step)?;
+                if call_id.is_empty() || name.is_empty() {
+                    return Err(SessionError::InvalidToolCall {
+                        expected: "non-empty call id and name",
+                    });
+                }
+            }
             SessionEventKind::UserMessage { .. }
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ToolResult { .. } => self.validate_message_event(kind)?,
@@ -861,7 +899,8 @@ impl SessionState {
             | SessionEventKind::StepEnd { .. }
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
-            | SessionEventKind::RequestContext { .. } => Ok(()),
+            | SessionEventKind::RequestContext { .. }
+            | SessionEventKind::ToolCall { .. } => Ok(()),
         }
     }
 }
@@ -1494,6 +1533,26 @@ impl SessionLog {
         Ok(())
     }
 
+    /// Append one model-requested invocation without parsing its raw arguments.
+    pub fn append_tool_call(
+        &mut self,
+        turn: u64,
+        step: u64,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::ToolCall {
+                turn,
+                step,
+                call_id: call_id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            })?
+            .seq)
+    }
+
     pub fn append_assistant_message(
         &mut self,
         turn: u64,
@@ -1585,6 +1644,35 @@ impl SessionLog {
                     turn: *chunk_turn,
                     step: *chunk_step,
                     chunk: chunk.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Replay detached tool invocations for one step in authoritative order.
+    #[must_use]
+    pub fn tool_calls(&self, turn: u64, step: u64) -> Vec<SessionToolCall> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let SessionEventKind::ToolCall {
+                    turn: call_turn,
+                    step: call_step,
+                    call_id,
+                    name,
+                    arguments,
+                } = &event.kind
+                else {
+                    return None;
+                };
+                (*call_turn == turn && *call_step == step).then(|| SessionToolCall {
+                    seq: event.seq,
+                    time_ms: event.time_ms,
+                    turn: *call_turn,
+                    step: *call_step,
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
                 })
             })
             .collect()
@@ -1779,6 +1867,17 @@ impl SessionHandle {
         self.commit(|log| log.append_request_context(context))
     }
 
+    pub fn append_tool_call(
+        &self,
+        turn: u64,
+        step: u64,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Result<u64, SessionError> {
+        self.commit(|log| log.append_tool_call(turn, step, call_id, name, arguments))
+    }
+
     pub fn append_assistant_message(
         &self,
         turn: u64,
@@ -1827,6 +1926,10 @@ impl SessionHandle {
         step: u64,
     ) -> Result<Vec<SessionAssistantChunk>, SessionError> {
         Ok(self.lock()?.assistant_chunks(turn, step))
+    }
+
+    pub fn tool_calls(&self, turn: u64, step: u64) -> Result<Vec<SessionToolCall>, SessionError> {
+        Ok(self.lock()?.tool_calls(turn, step))
     }
 
     pub fn request_header(&self) -> Result<Option<SessionEpochHeader>, SessionError> {
@@ -2173,6 +2276,8 @@ pub enum SessionError {
     InvalidToolResultShape,
     #[error("session tool/result source and content call ids must match")]
     MismatchedToolCallIds,
+    #[error("session tool/call must have {expected}")]
+    InvalidToolCall { expected: &'static str },
     #[error("session message persistence encoding is invalid")]
     InvalidMessageEncoding,
     #[error("session assistant chunk persistence encoding is invalid")]

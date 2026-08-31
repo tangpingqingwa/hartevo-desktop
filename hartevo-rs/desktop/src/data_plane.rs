@@ -7483,6 +7483,7 @@ mod tests {
             expected_surface,
             expected_messages,
             expected_chunks,
+            expected_tool_calls,
             expected_request_header,
             expected_request_context,
         ) = first.with_cordis_host(|host| {
@@ -7593,6 +7594,9 @@ mod tests {
                 )
                 .expect("assistant message");
             session
+                .append_tool_call(turn, step, "desktop-call-1", "echo", "{}")
+                .expect("tool call");
+            session
                 .append_tool_result(turn, step, tool)
                 .expect("tool result");
             replace_desktop_restart_surface(&session, turn, step, summary);
@@ -7607,6 +7611,7 @@ mod tests {
             let chunks = session
                 .assistant_chunks(turn, step)
                 .expect("assistant chunk replay");
+            let tool_calls = session.tool_calls(turn, step).expect("tool call replay");
             (
                 sessions,
                 session,
@@ -7615,6 +7620,7 @@ mod tests {
                 surface,
                 messages,
                 chunks,
+                tool_calls,
                 request_header,
                 request_context,
             )
@@ -7651,6 +7657,7 @@ mod tests {
             assert_eq!(restored.surface().unwrap(), expected_surface);
             assert_eq!(restored.derive_messages().unwrap(), expected_messages);
             assert_eq!(restored.assistant_chunks(1, 1).unwrap(), expected_chunks);
+            assert_eq!(restored.tool_calls(1, 1).unwrap(), expected_tool_calls);
             assert_eq!(
                 restored.request_header().unwrap(),
                 Some(expected_request_header)
