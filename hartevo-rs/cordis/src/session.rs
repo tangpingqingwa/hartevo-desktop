@@ -16,6 +16,9 @@ use chrono::Utc;
 
 use crate::context::EventReentry;
 use crate::event::{Emit, EventKey, EventSchemaId, Parallel};
+use crate::inbox::{
+    AgentInbox, AgentInboxOutcome, AgentInboxState, AgentInboxTarget, validate_agent_inbox_event,
+};
 
 /// The Rust Session format written by this bounded implementation.
 pub const SESSION_FORMAT_VERSION: u32 = 0;
@@ -618,7 +621,7 @@ pub struct SessionSurface {
     pub replace_generation: u64,
 }
 
-/// The bounded Session event vocabulary through N27.
+/// The bounded Session event vocabulary through N37.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
     TurnStart {
@@ -635,6 +638,13 @@ pub enum SessionEventKind {
     StepEnd {
         turn: u64,
         step: u64,
+    },
+    AgentInboxSpliced {
+        target: AgentInboxTarget,
+        start: u64,
+        removed_count: Option<u64>,
+        inserted: Vec<SessionMessage>,
+        outcome: Option<AgentInboxOutcome>,
     },
     AssistantChunk {
         turn: u64,
@@ -681,6 +691,7 @@ impl SessionEventKind {
             Self::TurnEnd { .. } => "turn/end",
             Self::StepStart { .. } => "step/start",
             Self::StepEnd { .. } => "step/end",
+            Self::AgentInboxSpliced { .. } => "agent/inbox/spliced",
             Self::AssistantChunk { .. } => "assistant/chunk",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
@@ -700,6 +711,7 @@ impl SessionEventKind {
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
             | Self::StepEnd { .. }
+            | Self::AgentInboxSpliced { .. }
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
             | Self::RequestContext { .. }
@@ -716,6 +728,7 @@ impl SessionEventKind {
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
             | Self::StepEnd { .. }
+            | Self::AgentInboxSpliced { .. }
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
             | Self::RequestContext { .. }
@@ -819,6 +832,12 @@ impl SessionState {
                 self.pending_tool_calls.clear();
                 self.open_step = None;
             }
+            SessionEventKind::AgentInboxSpliced {
+                removed_count,
+                inserted,
+                outcome,
+                ..
+            } => self.validate_inbox_splice(*removed_count, inserted, *outcome)?,
             SessionEventKind::AssistantChunk { turn, step, chunk } => {
                 require_turn(self.open_turn, *turn)?;
                 require_step(self.open_step, *turn, *step)?;
@@ -838,16 +857,7 @@ impl SessionState {
                 call_id,
                 name,
                 ..
-            } => {
-                require_turn(self.open_turn, *turn)?;
-                require_step(self.open_step, *turn, *step)?;
-                if call_id.is_empty() || name.is_empty() {
-                    return Err(SessionError::InvalidToolCall {
-                        expected: "non-empty call id and name",
-                    });
-                }
-                self.pending_tool_calls.insert(call_id.clone());
-            }
+            } => self.apply_tool_call(*turn, *step, call_id, name)?,
             SessionEventKind::ToolResult {
                 message,
                 error,
@@ -857,6 +867,37 @@ impl SessionState {
             SessionEventKind::UserMessage { .. } | SessionEventKind::AssistantMessage { .. } => {
                 self.validate_message_event(kind)?;
             }
+        }
+        Ok(())
+    }
+
+    fn apply_tool_call(
+        &mut self,
+        turn: u64,
+        step: u64,
+        call_id: &str,
+        name: &str,
+    ) -> Result<(), SessionError> {
+        require_turn(self.open_turn, turn)?;
+        require_step(self.open_step, turn, step)?;
+        if call_id.is_empty() || name.is_empty() {
+            return Err(SessionError::InvalidToolCall {
+                expected: "non-empty call id and name",
+            });
+        }
+        self.pending_tool_calls.insert(call_id.to_owned());
+        Ok(())
+    }
+
+    fn validate_inbox_splice(
+        &self,
+        removed_count: Option<u64>,
+        inserted: &[SessionMessage],
+        outcome: Option<AgentInboxOutcome>,
+    ) -> Result<(), SessionError> {
+        validate_agent_inbox_event(removed_count, inserted, outcome)?;
+        if removed_count.is_some() && outcome.is_none() {
+            require_open_turn(self.open_turn)?;
         }
         Ok(())
     }
@@ -894,13 +935,7 @@ impl SessionState {
                 message,
                 SessionMessageRole::User,
                 "user/message",
-                |source| {
-                    matches!(source, SessionMessageSource::User)
-                        || matches!(
-                            source,
-                            SessionMessageSource::Plugin { plugin } if !plugin.is_empty()
-                        )
-                },
+                valid_user_source,
                 "user or non-empty plugin",
             ),
             SessionEventKind::AssistantMessage {
@@ -953,12 +988,31 @@ impl SessionState {
             | SessionEventKind::TurnEnd { .. }
             | SessionEventKind::StepStart { .. }
             | SessionEventKind::StepEnd { .. }
+            | SessionEventKind::AgentInboxSpliced { .. }
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
             | SessionEventKind::RequestContext { .. }
             | SessionEventKind::ToolCall { .. } => Ok(()),
         }
     }
+}
+
+pub(crate) fn validate_inbox_user_message(message: &SessionMessage) -> Result<(), SessionError> {
+    validate_message(
+        message,
+        SessionMessageRole::User,
+        "agent/inbox/spliced",
+        valid_user_source,
+        "user or non-empty plugin",
+    )
+}
+
+fn valid_user_source(source: &SessionMessageSource) -> bool {
+    matches!(source, SessionMessageSource::User)
+        || matches!(
+            source,
+            SessionMessageSource::Plugin { plugin } if !plugin.is_empty()
+        )
 }
 
 fn validate_request_header(request: &SessionRequestHeader) -> Result<(), SessionError> {
@@ -1166,6 +1220,7 @@ fn pending_interrupted_tool_calls(events: &[SessionEvent]) -> Vec<(String, u64, 
                 }
             }
             SessionEventKind::StepStart { .. }
+            | SessionEventKind::AgentInboxSpliced { .. }
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
             | SessionEventKind::RequestContext { .. }
@@ -1613,6 +1668,25 @@ impl SessionLog {
         Ok(())
     }
 
+    fn append_agent_inbox_splice(
+        &mut self,
+        target: AgentInboxTarget,
+        start: u64,
+        removed_count: Option<u64>,
+        inserted: Vec<SessionMessage>,
+        outcome: Option<AgentInboxOutcome>,
+    ) -> Result<SessionEvent, SessionError> {
+        Ok(self
+            .append(SessionEventKind::AgentInboxSpliced {
+                target,
+                start,
+                removed_count,
+                inserted,
+                outcome,
+            })?
+            .clone())
+    }
+
     pub fn append_user_message(&mut self, message: SessionMessage) -> Result<(), SessionError> {
         self.append_user_message_with_surface(message, SessionSurfaceIntent::append())
     }
@@ -1963,16 +2037,21 @@ pub struct SessionHandle {
     inner: Arc<Mutex<SessionLog>>,
     event_dispatcher: Option<EventReentry>,
     appending: Arc<AtomicBool>,
+    inbox_state: Arc<Mutex<AgentInboxState>>,
+    inbox_mutating: Arc<AtomicBool>,
 }
 
 impl SessionHandle {
-    fn new(log: SessionLog, event_dispatcher: Option<EventReentry>) -> Self {
-        Self {
+    fn new(log: SessionLog, event_dispatcher: Option<EventReentry>) -> Result<Self, SessionError> {
+        let inbox_state = AgentInboxState::restore(log.header(), log.events())?;
+        Ok(Self {
             id: log.header().id.clone(),
             inner: Arc::new(Mutex::new(log)),
             event_dispatcher,
             appending: Arc::new(AtomicBool::new(false)),
-        }
+            inbox_state: Arc::new(Mutex::new(inbox_state)),
+            inbox_mutating: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     #[must_use]
@@ -1992,6 +2071,16 @@ impl SessionHandle {
         Ok(self.lock()?.surface())
     }
 
+    /// Return the single shared pending-input projection owned by this Session.
+    #[must_use]
+    pub fn inbox(&self) -> AgentInbox {
+        AgentInbox::new(
+            self.clone(),
+            Arc::clone(&self.inbox_state),
+            Arc::clone(&self.inbox_mutating),
+        )
+    }
+
     pub fn start_turn(&self) -> Result<u64, SessionError> {
         self.commit(SessionLog::start_turn)
     }
@@ -2006,6 +2095,38 @@ impl SessionHandle {
 
     pub fn finish_step(&self, turn: u64, step: u64) -> Result<(), SessionError> {
         self.commit(|log| log.finish_step(turn, step))
+    }
+
+    pub(crate) fn require_open_turn(&self, turn: u64) -> Result<(), SessionError> {
+        require_turn(self.lock()?.open_turn(), turn)
+    }
+
+    pub(crate) fn append_agent_inbox_splice(
+        &self,
+        target: AgentInboxTarget,
+        start: u64,
+        removed_count: Option<u64>,
+        inserted: Vec<SessionMessage>,
+        outcome: Option<AgentInboxOutcome>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.commit(|log| {
+            log.append_agent_inbox_splice(target, start, removed_count, inserted, outcome)
+        })
+    }
+
+    pub(crate) fn claim_agent_inbox_splice(
+        &self,
+        turn: u64,
+        target: AgentInboxTarget,
+        start: u64,
+        removed_count: Option<u64>,
+        inserted: Vec<SessionMessage>,
+        outcome: Option<AgentInboxOutcome>,
+    ) -> Result<SessionEvent, SessionError> {
+        self.commit(|log| {
+            require_turn(log.open_turn(), turn)?;
+            log.append_agent_inbox_splice(target, start, removed_count, inserted, outcome)
+        })
     }
 
     pub fn append_user_message(&self, message: SessionMessage) -> Result<(), SessionError> {
@@ -2239,7 +2360,7 @@ impl SessionStore {
             return Err(SessionError::SessionAlreadyExists { id });
         }
         let handle =
-            SessionHandle::new(SessionLog::new(id.clone())?, self.event_dispatcher.clone());
+            SessionHandle::new(SessionLog::new(id.clone())?, self.event_dispatcher.clone())?;
         state.sessions.insert(id, handle.clone());
         Ok(handle)
     }
@@ -2259,7 +2380,7 @@ impl SessionStore {
         let handle = SessionHandle::new(
             SessionLog::restore(header, events)?,
             self.event_dispatcher.clone(),
-        );
+        )?;
         state.sessions.insert(id, handle.clone());
         Ok(handle)
     }
@@ -2333,7 +2454,7 @@ impl SessionStore {
                 turn,
             });
         }
-        let child = SessionHandle::new(child_log, self.event_dispatcher.clone());
+        let child = SessionHandle::new(child_log, self.event_dispatcher.clone())?;
         state.sessions.insert(child_id, child.clone());
         Ok(child)
     }
@@ -2348,7 +2469,7 @@ impl SessionStore {
             return Ok(session.clone());
         }
         let handle =
-            SessionHandle::new(SessionLog::new(id.clone())?, self.event_dispatcher.clone());
+            SessionHandle::new(SessionLog::new(id.clone())?, self.event_dispatcher.clone())?;
         state.sessions.insert(id, handle.clone());
         Ok(handle)
     }
@@ -2512,6 +2633,18 @@ pub enum SessionError {
     ToolResultSurfaceReplaceDrift,
     #[error("session surface replacement generation overflowed")]
     SurfaceGenerationOverflow,
+    #[error("session agent inbox splice must have {expected}")]
+    InvalidInboxSplice { expected: &'static str },
+    #[error("session agent inbox message `{id}` is already pending")]
+    DuplicatePendingMessage { id: String },
+    #[error("session agent inbox persisted splice at seq {seq} is invalid")]
+    InvalidPersistedInboxSplice { seq: u64 },
+    #[error("session `{id}` agent inbox mutation is already being published")]
+    InboxMutationInProgress { id: SessionId },
+    #[error("session agent inbox live projection drifted from its committed event")]
+    InboxProjectionDrift,
+    #[error("session agent inbox projection mutex is poisoned")]
+    InboxProjectionPoisoned,
     #[error("session seed length {seed_length} exceeds event count {event_count}")]
     SeedBeyondLog { seed_length: u64, event_count: u64 },
     #[error("session `{id}` already exists")]

@@ -12,27 +12,29 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use hartevo_cordis::{
-    AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, DomainCommandAuthority,
-    DomainCommandBinding, DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding,
-    EffectExecutionPermit, EffectReconciliationAuthority, EffectReconciliationBinding,
-    EffectReconciliationPermit, EffectVerificationAuthority, EffectVerificationBinding,
-    EffectVerificationPermit, Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision,
-    KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCallConfig, SessionCancelCause,
-    SessionCheckpoint, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
-    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
-    SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
-    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
-    TurnEndReason, host_is_cordis_loop, keys, session_events,
+    AgentInboxOutcome, AgentInboxTarget, AuthorityDispatchError, AuthorityScope, CordisError,
+    CordisHost, DomainCommandAuthority, DomainCommandBinding, DomainCommandPermit,
+    EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
+    EffectReconciliationAuthority, EffectReconciliationBinding, EffectReconciliationPermit,
+    EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, Fiber,
+    FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
+    KernelConsentState, KernelConsentStatus, RuntimeAuthority, RuntimeDispatchCompletion,
+    RuntimeDispatchPermit, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
+    SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent, SessionEventKind,
+    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
+    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop,
+    keys, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
 };
 use hartevo_storage::{
-    PersistedSessionCancelCause, PersistedSessionCheckpoint, PersistedSessionEvent,
-    PersistedSessionEventKind, PersistedSessionHeader, PersistedSessionToolError,
-    PersistedTurnEndReason, ProjectStore, StorageError,
+    PersistedAgentInboxOutcome, PersistedAgentInboxTarget, PersistedSessionCancelCause,
+    PersistedSessionCheckpoint, PersistedSessionEvent, PersistedSessionEventKind,
+    PersistedSessionHeader, PersistedSessionToolError, PersistedTurnEndReason, ProjectStore,
+    StorageError,
 };
 use thiserror::Error;
 
@@ -1146,6 +1148,22 @@ fn encode_event(
                 turn: *turn,
                 step: *step,
             },
+            SessionEventKind::AgentInboxSpliced {
+                target,
+                start,
+                removed_count,
+                inserted,
+                outcome,
+            } => PersistedSessionEventKind::AgentInboxSpliced {
+                target: encode_inbox_target(*target),
+                start: *start,
+                removed_count: *removed_count,
+                inserted: inserted
+                    .iter()
+                    .map(SessionMessage::to_json_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+                outcome: outcome.map(encode_inbox_outcome),
+            },
             SessionEventKind::UserMessage { message, surface } => {
                 PersistedSessionEventKind::UserMessage {
                     message: message.to_json_value()?,
@@ -1226,6 +1244,19 @@ const fn encode_turn_end_reason(reason: TurnEndReason) -> PersistedTurnEndReason
     }
 }
 
+const fn encode_inbox_target(target: AgentInboxTarget) -> PersistedAgentInboxTarget {
+    match target {
+        AgentInboxTarget::NextTurn => PersistedAgentInboxTarget::NextTurn,
+        AgentInboxTarget::NextStep => PersistedAgentInboxTarget::NextStep,
+    }
+}
+
+const fn encode_inbox_outcome(outcome: AgentInboxOutcome) -> PersistedAgentInboxOutcome {
+    match outcome {
+        AgentInboxOutcome::Canceled => PersistedAgentInboxOutcome::Canceled,
+    }
+}
+
 const fn encode_cancel_cause(cause: SessionCancelCause) -> PersistedSessionCancelCause {
     match cause {
         SessionCancelCause::User => PersistedSessionCancelCause::User,
@@ -1280,18 +1311,15 @@ fn decode_event(
                 turn: *turn,
                 step: *step,
             },
+            PersistedSessionEventKind::AgentInboxSpliced {
+                target,
+                start,
+                removed_count,
+                inserted,
+                outcome,
+            } => decode_inbox_splice(*target, *start, *removed_count, inserted, *outcome)?,
             PersistedSessionEventKind::UserMessage { message, surface } => {
-                SessionEventKind::UserMessage {
-                    message: SessionMessage::from_json_value(message.clone())?,
-                    // N22 rows predate surface metadata and were append-only.
-                    surface: surface.as_ref().map_or_else(
-                        || Ok(SessionSurfaceIntent::append()),
-                        |value| {
-                            SessionSurfaceIntent::from_json_value(value.clone())
-                                .map_err(DesktopSessionPersistenceError::from)
-                        },
-                    )?,
-                }
+                decode_user_message(message, surface.as_ref())?
             }
             PersistedSessionEventKind::AssistantChunk { turn, step, chunk } => {
                 SessionEventKind::AssistantChunk {
@@ -1363,6 +1391,43 @@ fn decode_event(
     })
 }
 
+fn decode_inbox_splice(
+    target: PersistedAgentInboxTarget,
+    start: u64,
+    removed_count: Option<u64>,
+    inserted: &[serde_json::Value],
+    outcome: Option<PersistedAgentInboxOutcome>,
+) -> Result<SessionEventKind, DesktopSessionPersistenceError> {
+    Ok(SessionEventKind::AgentInboxSpliced {
+        target: decode_inbox_target(target),
+        start,
+        removed_count,
+        inserted: inserted
+            .iter()
+            .cloned()
+            .map(SessionMessage::from_json_value)
+            .collect::<Result<Vec<_>, _>>()?,
+        outcome: outcome.map(decode_inbox_outcome),
+    })
+}
+
+fn decode_user_message(
+    message: &serde_json::Value,
+    surface: Option<&serde_json::Value>,
+) -> Result<SessionEventKind, DesktopSessionPersistenceError> {
+    Ok(SessionEventKind::UserMessage {
+        message: SessionMessage::from_json_value(message.clone())?,
+        // N22 rows predate surface metadata and were append-only.
+        surface: surface.map_or_else(
+            || Ok(SessionSurfaceIntent::append()),
+            |value| {
+                SessionSurfaceIntent::from_json_value(value.clone())
+                    .map_err(DesktopSessionPersistenceError::from)
+            },
+        )?,
+    })
+}
+
 fn decode_tool_error(error: Option<&PersistedSessionToolError>) -> Option<SessionToolError> {
     error.map(|error| SessionToolError {
         name: error.name.clone(),
@@ -1380,6 +1445,19 @@ const fn decode_turn_end_reason(reason: PersistedTurnEndReason) -> TurnEndReason
         PersistedTurnEndReason::Error => TurnEndReason::Error,
         PersistedTurnEndReason::MaxTokens => TurnEndReason::MaxTokens,
         PersistedTurnEndReason::Interrupted => TurnEndReason::Interrupted,
+    }
+}
+
+const fn decode_inbox_target(target: PersistedAgentInboxTarget) -> AgentInboxTarget {
+    match target {
+        PersistedAgentInboxTarget::NextTurn => AgentInboxTarget::NextTurn,
+        PersistedAgentInboxTarget::NextStep => AgentInboxTarget::NextStep,
+    }
+}
+
+const fn decode_inbox_outcome(outcome: PersistedAgentInboxOutcome) -> AgentInboxOutcome {
+    match outcome {
+        PersistedAgentInboxOutcome::Canceled => AgentInboxOutcome::Canceled,
     }
 }
 
@@ -1909,12 +1987,13 @@ mod tests {
 
     use chrono::{Duration, TimeZone, Utc};
     use hartevo_cordis::{
-        AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
-        DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding,
-        EffectReconciliationBinding, EffectVerificationBinding, FiberState, OPENINTERPRETER,
-        RuntimeBinding, SessionContentBlock, SessionError, SessionEventKind, SessionMessage,
-        SessionMessageRole, SessionMessageSource, SessionSurfaceIntent, SessionSurfaceOp,
-        SurfaceOwner, enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys,
+        AgentInboxTarget, AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope,
+        CordisError, CordisHost, DomainCommandBinding, DomainCommandKind, DomainSurface,
+        EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding, FiberState,
+        OPENINTERPRETER, RuntimeBinding, SessionContentBlock, SessionError, SessionEventKind,
+        SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
+        SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner, enforce_invariants, events,
+        host_is_cordis_loop, invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -1922,7 +2001,9 @@ mod tests {
         ProjectId, TenantId,
     };
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
-    use hartevo_storage::{PersistedSessionEvent, PersistedSessionEventKind};
+    use hartevo_storage::{
+        PersistedAgentInboxTarget, PersistedSessionEvent, PersistedSessionEventKind, ProjectStore,
+    };
 
     use super::{
         DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
@@ -1930,7 +2011,7 @@ mod tests {
         bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_event,
         dispatch_live_domain_command, dispatch_live_effect_execution,
         dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
-        dispatch_live_runtime, mount_cordis_host, openinterpreter_runtime_plugin,
+        dispatch_live_runtime, encode_event, mount_cordis_host, openinterpreter_runtime_plugin,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -1976,6 +2057,91 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn agent_inbox_splice_codec_round_trips_exactly() {
+        let message = SessionMessage {
+            id: "queued-user".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "queued".into(),
+            }],
+            source: SessionMessageSource::User,
+        };
+        let event = hartevo_cordis::SessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: SessionEventKind::AgentInboxSpliced {
+                target: AgentInboxTarget::NextTurn,
+                start: 0,
+                removed_count: None,
+                inserted: vec![message.clone()],
+                outcome: None,
+            },
+        };
+
+        let persisted = encode_event(&event).unwrap();
+        assert!(matches!(
+            &persisted.kind,
+            PersistedSessionEventKind::AgentInboxSpliced {
+                target: PersistedAgentInboxTarget::NextTurn,
+                start: 0,
+                removed_count: None,
+                inserted,
+                outcome: None,
+            } if inserted == &[message.to_json_value().unwrap()]
+        ));
+        assert_eq!(decode_event(&persisted).unwrap(), event);
+    }
+
+    #[test]
+    fn agent_inbox_survives_desktop_session_persistence_rebind() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(
+            live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+                .unwrap(),
+            0
+        );
+        let sessions = live.context().sessions::<SessionStore>().unwrap();
+        let session = sessions
+            .create(SessionId::new("persisted-inbox").unwrap())
+            .unwrap();
+        let message = SessionMessage {
+            id: "persisted-user".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "persist me".into(),
+            }],
+            source: SessionMessageSource::User,
+        };
+        session.inbox().append_next_turn(message.clone()).unwrap();
+        live.session_persistence.persist_live(&session).unwrap();
+        let store = live
+            .session_persistence
+            .store
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+
+        let mut cold =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(cold.bind_session_persistence(store).unwrap(), 1);
+        let restored = cold
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&SessionId::new("persisted-inbox").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.inbox().next_turn().unwrap().as_slice(),
+            std::slice::from_ref(&message)
+        );
     }
 
     #[test]
