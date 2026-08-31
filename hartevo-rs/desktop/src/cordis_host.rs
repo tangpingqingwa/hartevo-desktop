@@ -116,6 +116,35 @@ pub(crate) struct DesktopRuntimeSessionTranscript {
     end_reason: TurnEndReason,
 }
 
+/// Exact model-request facts that must be durable before Application calls the
+/// external Runtime. This does not carry or compose the private Context
+/// envelope used by Application.
+pub(crate) struct DesktopRuntimeSessionPreflight {
+    session_id: String,
+    runtime_turn_id: String,
+    user_body: String,
+    provider: String,
+    model: String,
+}
+
+impl DesktopRuntimeSessionPreflight {
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        runtime_turn_id: impl Into<String>,
+        user_body: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            runtime_turn_id: runtime_turn_id.into(),
+            user_body: user_body.into(),
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
 impl DesktopRuntimeSessionTranscript {
     #[allow(
         clippy::too_many_arguments,
@@ -142,6 +171,110 @@ impl DesktopRuntimeSessionTranscript {
             end_reason,
         }
     }
+}
+
+fn runtime_user_message(runtime_turn_id: &str, user_body: String) -> SessionMessage {
+    SessionMessage {
+        id: format!("runtime:{runtime_turn_id}:user"),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::Text { text: user_body }],
+        source: SessionMessageSource::User,
+    }
+}
+
+fn runtime_request_header(provider: &str, model: &str) -> SessionEpochHeader {
+    SessionEpochHeader {
+        config: SessionCallConfig {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            reasoning_effort: None,
+            temperature: None,
+            max_tokens: None,
+            stop: None,
+        },
+        adapter_defaults: None,
+        system: None,
+        tools: None,
+    }
+}
+
+fn runtime_request_context(provider: &str, model: &str) -> SessionRequestContext {
+    SessionRequestContext {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        context_window: None,
+    }
+}
+
+fn append_runtime_preflight(
+    session: &SessionHandle,
+    user: SessionMessage,
+    header: SessionEpochHeader,
+    context: SessionRequestContext,
+) -> Result<(u64, u64), SessionError> {
+    let turn = session.start_turn()?;
+    session.append_request_header(header, SessionRequestHeaderReason::Initial, false)?;
+    let step = session.start_step(turn)?;
+    session.append_user_message(user)?;
+    session.append_request_context(context)?;
+    Ok((turn, step))
+}
+
+fn runtime_preflight_location(
+    events: &[SessionEvent],
+    user: &SessionMessage,
+    header: &SessionEpochHeader,
+    context: &SessionRequestContext,
+) -> Option<(u64, u64)> {
+    let mut matches = events.iter().enumerate().filter_map(|(index, event)| {
+        let SessionEventKind::UserMessage { message, surface } = &event.kind else {
+            return None;
+        };
+        (message.id == user.id).then_some((index, message, surface))
+    });
+    let (user_index, recorded_user, surface) = matches.next()?;
+    if matches.next().is_some()
+        || recorded_user != user
+        || surface != &SessionSurfaceIntent::append()
+        || user_index.checked_add(1)? != events.len().checked_sub(1)?
+    {
+        return None;
+    }
+    let prefix_start = user_index.checked_sub(3)?;
+    let turn = match &events.get(prefix_start)?.kind {
+        SessionEventKind::TurnStart { turn } => *turn,
+        _ => return None,
+    };
+    let SessionEventKind::RequestHeader { request } = &events.get(prefix_start + 1)?.kind else {
+        return None;
+    };
+    if request.header != *header
+        || request.reason != SessionRequestHeaderReason::Initial
+        || request.starts_series
+    {
+        return None;
+    }
+    let step = match &events.get(prefix_start + 2)?.kind {
+        SessionEventKind::StepStart {
+            turn: step_turn,
+            step,
+        } if *step_turn == turn => *step,
+        _ => return None,
+    };
+    match &events.get(user_index + 1)?.kind {
+        SessionEventKind::RequestContext { context: recorded } if recorded == context => {
+            Some((turn, step))
+        }
+        _ => None,
+    }
+}
+
+fn runtime_open_turn(events: &[SessionEvent]) -> Option<u64> {
+    events.iter().fold(None, |open, event| match &event.kind {
+        SessionEventKind::TurnStart { turn } => Some(*turn),
+        SessionEventKind::TurnEnd { turn, .. } if open == Some(*turn) => None,
+        _ => open,
+    })
 }
 
 impl DesktopCordisCoordinator {
@@ -183,6 +316,58 @@ impl DesktopCordisCoordinator {
         self.session_persistence.bind_and_restore(store, &sessions)
     }
 
+    /// Persist the exact open Session prefix before Application dispatches the
+    /// matching external Runtime turn.
+    pub(crate) fn prepare_runtime_transcript(
+        &mut self,
+        preflight: DesktopRuntimeSessionPreflight,
+    ) -> Result<(), DesktopSessionPersistenceError> {
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
+        let session = sessions.get_or_create(SessionId::new(preflight.session_id.clone())?)?;
+        let user = runtime_user_message(&preflight.runtime_turn_id, preflight.user_body);
+        let assistant_id = format!("runtime:{}:assistant", preflight.runtime_turn_id);
+        let header = runtime_request_header(&preflight.provider, &preflight.model);
+        let context = runtime_request_context(&preflight.provider, &preflight.model);
+        let events = session.events()?;
+        let identity_exists = events.iter().any(|event| match &event.kind {
+            SessionEventKind::UserMessage { message, .. }
+            | SessionEventKind::AssistantMessage { message, .. } => {
+                message.id == user.id || message.id == assistant_id
+            }
+            _ => false,
+        });
+        if identity_exists {
+            let Some((turn, step)) = runtime_preflight_location(&events, &user, &header, &context)
+            else {
+                return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                    preflight.session_id,
+                ));
+            };
+            if runtime_open_turn(&events) != Some(turn)
+                || !session.assistant_chunks(turn, step)?.is_empty()
+                || events.iter().any(|event| {
+                    matches!(
+                        &event.kind,
+                        SessionEventKind::AssistantMessage { message, .. }
+                            if message.id == assistant_id
+                    )
+                })
+            {
+                return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                    preflight.session_id,
+                ));
+            }
+            return self.session_persistence.persist_live(&session);
+        }
+
+        append_runtime_preflight(&session, user, header, context)?;
+        self.session_persistence.persist_live(&session)
+    }
+
     /// Append one closed, idempotent projection of a real Application Runtime
     /// turn and commit it through the existing SQLCipher Session adapter.
     #[allow(
@@ -199,14 +384,7 @@ impl DesktopCordisCoordinator {
             .sessions::<SessionStore>()
             .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
         let session = sessions.get_or_create(SessionId::new(transcript.session_id.clone())?)?;
-        let user = SessionMessage {
-            id: format!("runtime:{}:user", transcript.runtime_turn_id),
-            role: SessionMessageRole::User,
-            content: vec![SessionContentBlock::Text {
-                text: transcript.user_body,
-            }],
-            source: SessionMessageSource::User,
-        };
+        let user = runtime_user_message(&transcript.runtime_turn_id, transcript.user_body);
         let assistant_body = transcript.assistant_body;
         let assistant = assistant_body.as_ref().map(|body| SessionMessage {
             id: format!("runtime:{}:assistant", transcript.runtime_turn_id),
@@ -217,19 +395,8 @@ impl DesktopCordisCoordinator {
                 model: transcript.model.clone(),
             },
         });
-        let expected_header = SessionEpochHeader {
-            config: SessionCallConfig {
-                provider: transcript.provider.clone(),
-                model: transcript.model.clone(),
-                reasoning_effort: None,
-                temperature: None,
-                max_tokens: None,
-                stop: None,
-            },
-            adapter_defaults: None,
-            system: None,
-            tools: None,
-        };
+        let expected_header = runtime_request_header(&transcript.provider, &transcript.model);
+        let expected_context = runtime_request_context(&transcript.provider, &transcript.model);
         let legacy_chunks = transcript
             .assistant_chunks
             .into_iter()
@@ -268,7 +435,29 @@ impl DesktopCordisCoordinator {
             .into_iter()
             .filter(|message| expected_ids.contains(&message.id.as_str()))
             .collect::<Vec<_>>();
-        if !recorded.is_empty() {
+        let events = session.events()?;
+        let partial_location = if let Some(open_turn) = runtime_open_turn(&events) {
+            let Some((turn, step)) =
+                runtime_preflight_location(&events, &user, &expected_header, &expected_context)
+            else {
+                return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                    transcript.session_id,
+                ));
+            };
+            if turn != open_turn
+                || recorded.len() != 1
+                || recorded.first() != Some(&user)
+                || !session.assistant_chunks(turn, step)?.is_empty()
+            {
+                return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                    transcript.session_id,
+                ));
+            }
+            Some((turn, step))
+        } else {
+            None
+        };
+        if !recorded.is_empty() && partial_location.is_none() {
             if recorded != expected
                 || session
                     .request_header()?
@@ -280,17 +469,17 @@ impl DesktopCordisCoordinator {
                 ));
             }
             if let Some(assistant) = assistant.as_ref() {
-                let location = session.events()?.into_iter().find_map(|event| {
+                let location = events.iter().find_map(|event| {
                     let SessionEventKind::AssistantMessage {
                         turn,
                         step,
                         message,
                         surface,
-                    } = event.kind
+                    } = &event.kind
                     else {
                         return None;
                     };
-                    (message.id == assistant.id).then_some((turn, step, surface))
+                    (message.id == assistant.id).then(|| (*turn, *step, surface.clone()))
                 });
                 let Some((turn, step, surface)) = location else {
                     return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
@@ -325,19 +514,11 @@ impl DesktopCordisCoordinator {
             return self.session_persistence.persist_live(&session);
         }
 
-        let turn = session.start_turn()?;
-        session.append_request_header(
-            expected_header,
-            SessionRequestHeaderReason::Initial,
-            false,
-        )?;
-        let step = session.start_step(turn)?;
-        session.append_user_message(user)?;
-        session.append_request_context(SessionRequestContext {
-            provider: transcript.provider,
-            model: transcript.model,
-            context_window: None,
-        })?;
+        let (turn, step) = if let Some(location) = partial_location {
+            location
+        } else {
+            append_runtime_preflight(&session, user, expected_header, expected_context)?
+        };
         let source_seqs = expected_chunks
             .into_iter()
             .map(|chunk| session.append_assistant_chunk(turn, step, chunk))

@@ -88,8 +88,8 @@ use zeroize::Zeroizing;
 use crate::cordis_host::{
     DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
     DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
-    DesktopEffectVerificationAuthorization, DesktopRuntimeSessionTranscript,
-    dispatch_live_domain_command, dispatch_live_effect_execution,
+    DesktopEffectVerificationAuthorization, DesktopRuntimeSessionPreflight,
+    DesktopRuntimeSessionTranscript, dispatch_live_domain_command, dispatch_live_effect_execution,
     dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
     mount_cordis_host,
 };
@@ -4990,7 +4990,14 @@ impl DesktopDataPlane {
         let expected_handle_revision = managed.handle.revision;
         let expected_recovery_revision = managed.recovery.revision;
         let attachment_epoch = managed.handle.attachment_epoch;
-        let dispatch = service.dispatch_context_runtime_turn(
+        self.prepare_runtime_session_transcript(
+            service,
+            &mission,
+            &turn_id,
+            &runtime_provider,
+            &runtime_model,
+        )?;
+        let dispatch = match service.dispatch_context_runtime_turn(
             &mut managed,
             DispatchContextRuntimeTurn {
                 id: turn_id.clone(),
@@ -5005,13 +5012,36 @@ impl DesktopDataPlane {
             },
             &envelope,
             now + Duration::milliseconds(logical_millis),
-        )?;
+        ) {
+            Ok(dispatch) => dispatch,
+            Err(error) => {
+                self.record_runtime_session_transcript(
+                    service,
+                    &mission,
+                    &turn_id,
+                    &runtime_provider,
+                    &runtime_model,
+                    None,
+                    TurnEndReason::Error,
+                )?;
+                return Err(error.into());
+            }
+        };
         if dispatch.disposition != RuntimeTurnDispatchDisposition::Running {
             let outcome = if dispatch.disposition == RuntimeTurnDispatchDisposition::Failed {
                 DesktopMissionRuntimeOutcome::DispatchFailed
             } else {
                 DesktopMissionRuntimeOutcome::Uncertain
             };
+            self.record_runtime_session_transcript(
+                service,
+                &mission,
+                &turn_id,
+                &runtime_provider,
+                &runtime_model,
+                None,
+                TurnEndReason::Error,
+            )?;
             service.shutdown_managed_context_runtime(
                 managed,
                 now + Duration::milliseconds(logical_millis + 1),
@@ -5882,6 +5912,49 @@ impl DesktopDataPlane {
         Ok(())
     }
 
+    fn runtime_session_user_body(
+        service: &ApplicationService,
+        mission: &Mission,
+    ) -> Result<String, DesktopDataError> {
+        if mission.definition.is_some() {
+            Ok(service
+                .mission_conversation(&mission.project_id, &mission.id)?
+                .messages
+                .into_iter()
+                .rev()
+                .find(|message| message.role == MissionConversationRole::User)
+                .map_or_else(|| mission.contract.goal.clone(), |message| message.body))
+        } else {
+            Ok(mission.contract.goal.clone())
+        }
+    }
+
+    fn prepare_runtime_session_transcript(
+        &self,
+        service: &ApplicationService,
+        mission: &Mission,
+        turn_id: &RuntimeTurnAttemptId,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), DesktopDataError> {
+        let user_body = Self::runtime_session_user_body(service, mission)?;
+        self.cordis
+            .lock()
+            .map_err(|_| {
+                DesktopDataError::CordisSessionPersistence(
+                    "Desktop Cordis coordinator is poisoned".into(),
+                )
+            })?
+            .prepare_runtime_transcript(DesktopRuntimeSessionPreflight::new(
+                mission.id.as_str(),
+                turn_id.as_str(),
+                user_body,
+                provider,
+                model,
+            ))
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the bridge keeps exact Application service, Mission, Runtime turn, route, content, and terminal identity visible at its only production call boundary"
@@ -5896,17 +5969,7 @@ impl DesktopDataPlane {
         assistant_message: Option<&RuntimeTurnPrivateMessage>,
         end_reason: TurnEndReason,
     ) -> Result<(), DesktopDataError> {
-        let user_body = if mission.definition.is_some() {
-            service
-                .mission_conversation(&mission.project_id, &mission.id)?
-                .messages
-                .into_iter()
-                .rev()
-                .find(|message| message.role == MissionConversationRole::User)
-                .map_or_else(|| mission.contract.goal.clone(), |message| message.body)
-        } else {
-            mission.contract.goal.clone()
-        };
+        let user_body = Self::runtime_session_user_body(service, mission)?;
         let assistant_chunks = if let Some(message) = assistant_message {
             service
                 .runtime_turn_private_text_deltas(&mission.project_id, turn_id)?
@@ -11987,6 +12050,155 @@ sleep 30"#;
             runtime_subscription_durable_snapshot(&plane, &secrets, &project_id,),
             durable_before_context_failure
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one concurrent journey observes the durable Session prefix while the real Runtime fixture is waiting, then proves the exact interrupted suffix"
+    )]
+    fn desktop_runtime_session_preflight_precedes_terminal_observation() {
+        use hartevo_cordis::{
+            SessionContentBlock, SessionEventKind, SessionId, SessionMessageRole,
+            SessionMessageSource, SessionRequestHeaderReason, SessionStore, SessionSurfaceIntent,
+        };
+
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let before = match plane
+            .load_with(&secrets, observed_at() + Duration::minutes(2))
+            .expect("ready Desktop state")
+        {
+            DesktopLoadState::Ready(snapshot) => snapshot.inventory.projects[0]
+                .missions
+                .iter()
+                .map(|mission| mission.mission_id.clone())
+                .collect::<BTreeSet<_>>(),
+            DesktopLoadState::Uninitialized { .. } => panic!("fixture must be initialized"),
+        };
+        let user_body = "Persist the Cordis preflight before this interruptible Runtime call";
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                user_body,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("start one exact Mission");
+        let mission_id = started.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| !before.contains(&mission.mission_id))
+            .expect("new Mission projection")
+            .mission_id
+            .clone();
+        let cancellation = DesktopRuntimeCancellation::default();
+
+        let submission = std::thread::scope(|scope| {
+            let runner = scope.spawn(|| {
+                plane.resume_mission_runtime_with_cancellation(
+                    &secrets,
+                    &project_id,
+                    &mission_id,
+                    Some(interruptible_runtime_fixture_source()),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    Some(&cancellation),
+                    observed_at() + Duration::minutes(4),
+                )
+            });
+            let mut dispatched = false;
+            for _ in 0..200 {
+                dispatched = cancellation
+                    .progress_since(0)
+                    .iter()
+                    .any(|event| event.phase == DesktopRuntimeProgressPhase::Dispatched);
+                if dispatched {
+                    break;
+                }
+                std::thread::sleep(StdDuration::from_millis(25));
+            }
+            assert!(dispatched, "Runtime fixture never reached dispatch");
+
+            plane.with_cordis_host(|host| {
+                let session = host
+                    .context()
+                    .sessions::<SessionStore>()
+                    .expect("Cordis Session store")
+                    .get(&SessionId::new(mission_id.as_str()).unwrap())
+                    .expect("Session lookup")
+                    .expect("preflight Session");
+                let events = session.events().expect("preflight events");
+                assert_eq!(events.len(), 5);
+                assert!(matches!(
+                    &events[0].kind,
+                    SessionEventKind::TurnStart { turn: 1 }
+                ));
+                assert!(matches!(
+                    &events[1].kind,
+                    SessionEventKind::RequestHeader { request }
+                        if request.reason == SessionRequestHeaderReason::Initial
+                            && !request.starts_series
+                            && request.header.config.provider == "fixture-provider"
+                            && request.header.config.model == "fixture-model"
+                ));
+                assert!(matches!(
+                    &events[2].kind,
+                    SessionEventKind::StepStart { turn: 1, step: 1 }
+                ));
+                assert!(matches!(
+                    &events[3].kind,
+                    SessionEventKind::UserMessage { message, surface }
+                        if message.role == SessionMessageRole::User
+                            && message.source == SessionMessageSource::User
+                            && message.content
+                                == vec![SessionContentBlock::Text {
+                                    text: user_body.into()
+                                }]
+                            && surface == &SessionSurfaceIntent::append()
+                ));
+                assert!(matches!(
+                    &events[4].kind,
+                    SessionEventKind::RequestContext { context }
+                        if context.provider == "fixture-provider"
+                            && context.model == "fixture-model"
+                            && context.context_window.is_none()
+                ));
+                assert_eq!(session.derive_messages().unwrap().len(), 1);
+            });
+
+            cancellation.request();
+            runner
+                .join()
+                .expect("Runtime worker thread")
+                .expect("cooperative Runtime interruption")
+        });
+        assert_eq!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::Interrupted
+        );
+        plane.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .unwrap()
+                .expect("closed Session");
+            let events = session.events().unwrap();
+            assert_eq!(events.len(), 7);
+            assert!(matches!(
+                &events[5].kind,
+                SessionEventKind::StepEnd { turn: 1, step: 1 }
+            ));
+            assert!(matches!(
+                &events[6].kind,
+                SessionEventKind::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Interrupted,
+                }
+            ));
+            assert_eq!(session.derive_messages().unwrap().len(), 1);
+        });
     }
 
     #[cfg(unix)]
