@@ -12590,7 +12590,7 @@ sleep 30"#;
         use hartevo_cordis::{
             SessionCallConfig, SessionContentBlock, SessionEpochHeader, SessionEventKind,
             SessionFinishReason, SessionId, SessionMessageSource, SessionRequestHeaderReason,
-            SessionStore, SessionStreamBlockType, SessionStreamChunk,
+            SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
         };
 
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -12738,9 +12738,19 @@ sleep 30"#;
                     },
                 ]
             );
+            let stream_source_seqs = events
+                .iter()
+                .filter_map(|event| {
+                    matches!(&event.kind, SessionEventKind::AssistantChunk { .. })
+                        .then_some(event.seq)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(stream_source_seqs, vec![5, 6, 7, 8, 9]);
             assert!(matches!(
                 events.get(10).map(|event| &event.kind),
-                Some(SessionEventKind::AssistantMessage { .. })
+                Some(SessionEventKind::AssistantMessage { surface, .. })
+                    if surface
+                        == &SessionSurfaceIntent::append_from(stream_source_seqs.clone())
             ));
             assert_eq!(
                 session
