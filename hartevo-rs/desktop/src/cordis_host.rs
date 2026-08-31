@@ -20,11 +20,11 @@ use hartevo_cordis::{
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCallConfig, SessionCancelCause,
     SessionCheckpoint, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
-    SessionEventKind, SessionEventRecord, SessionHandle, SessionHeader, SessionId, SessionLog,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
-    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamChunk,
-    SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop, keys,
-    session_events,
+    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
+    SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
+    TurnEndReason, host_is_cordis_loop, keys, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -207,10 +207,11 @@ impl DesktopCordisCoordinator {
             }],
             source: SessionMessageSource::User,
         };
-        let assistant = transcript.assistant_body.map(|body| SessionMessage {
+        let assistant_body = transcript.assistant_body;
+        let assistant = assistant_body.as_ref().map(|body| SessionMessage {
             id: format!("runtime:{}:assistant", transcript.runtime_turn_id),
             role: SessionMessageRole::Assistant,
-            content: vec![SessionContentBlock::Text { text: body }],
+            content: vec![SessionContentBlock::Text { text: body.clone() }],
             source: SessionMessageSource::Model {
                 provider: transcript.provider.clone(),
                 model: transcript.model.clone(),
@@ -229,11 +230,31 @@ impl DesktopCordisCoordinator {
             system: None,
             tools: None,
         };
-        let expected_chunks = transcript
+        let legacy_chunks = transcript
             .assistant_chunks
             .into_iter()
             .map(|text| SessionStreamChunk::TextDelta { index: 0, text })
             .collect::<Vec<_>>();
+        let mut expected_chunks = Vec::with_capacity(legacy_chunks.len().saturating_add(3));
+        if assistant_body.is_some() {
+            expected_chunks.push(SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            });
+        }
+        expected_chunks.extend(legacy_chunks.iter().cloned());
+        if let Some(body) = assistant_body {
+            expected_chunks.push(SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::Text { text: body },
+            });
+            if transcript.end_reason == TurnEndReason::Completed {
+                expected_chunks.push(SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                });
+            }
+        }
         let expected = std::iter::once(&user)
             .chain(assistant.iter())
             .cloned()
@@ -281,7 +302,10 @@ impl DesktopCordisCoordinator {
                     .into_iter()
                     .map(|chunk| chunk.chunk)
                     .collect::<Vec<_>>();
-                if !recorded_chunks.is_empty() && recorded_chunks != expected_chunks {
+                if !recorded_chunks.is_empty()
+                    && recorded_chunks != legacy_chunks
+                    && recorded_chunks != expected_chunks
+                {
                     return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
                         transcript.session_id,
                     ));
