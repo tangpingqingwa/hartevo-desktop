@@ -14,6 +14,7 @@ mod context_foundation_store;
 mod context_material_store;
 mod context_store;
 mod context_worker_graph_store;
+mod cordis_session_store;
 mod creator;
 mod creator_hiring_store;
 mod deletion_propagation;
@@ -50,6 +51,10 @@ pub use context_material_store::{
 };
 pub use context_worker_graph_store::{
     ContextWorkerGraphError, ContextWorkerGraphSnapshot, WorkerGraphStoreDisposition,
+};
+pub use cordis_session_store::{
+    PersistedSessionCancelCause, PersistedSessionCheckpoint, PersistedSessionEvent,
+    PersistedSessionEventKind, PersistedSessionHeader, PersistedTurnEndReason,
 };
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};
@@ -95,7 +100,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 48;
+pub const STORAGE_SCHEMA_VERSION: i64 = 49;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4424,7 +4429,15 @@ impl ProjectStore {
             record_migration(&transaction, 48)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 49 {
+            let transaction = self.connection.transaction()?;
+            cordis_session_store::install_cordis_session_schema(&transaction)?;
+            cordis_session_store::verify_cordis_session_schema(&transaction)?;
+            record_migration(&transaction, 49)?;
+            transaction.commit()?;
+        }
         provider_recovery_store::verify_provider_recovery_schema(&self.connection)?;
+        cordis_session_store::verify_cordis_session_schema(&self.connection)?;
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4621,6 +4634,8 @@ pub enum StorageError {
     InvalidProviderRecoveryTransition { state: String },
     #[error("stored domain data could not be decoded: {0}")]
     DomainDecode(String),
+    #[error("Cordis Session checkpoint is invalid: {0}")]
+    InvalidSessionCheckpoint(&'static str),
     #[error("key bootstrap operation is malformed or has an invalid terminal state")]
     InvalidKeyBootstrapOperation,
     #[error("key bootstrap operation cannot make the requested revision transition")]

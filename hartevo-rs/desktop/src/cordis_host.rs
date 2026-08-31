@@ -5,6 +5,7 @@
 //! Application coordinator runs exactly once. OpenInterpreter may occupy the
 //! optional plugin slot; it never owns Domain, Effect, or execution authority.
 
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
@@ -17,11 +18,19 @@ use hartevo_cordis::{
     EffectReconciliationPermit, EffectVerificationAuthority, EffectVerificationBinding,
     EffectVerificationPermit, Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision,
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
+    SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHeader, SessionId,
+    SessionLog, SessionStore, TurnEndReason, host_is_cordis_loop, keys, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
 };
+use hartevo_storage::{
+    PersistedSessionCancelCause, PersistedSessionCheckpoint, PersistedSessionEvent,
+    PersistedSessionEventKind, PersistedSessionHeader, PersistedTurnEndReason, ProjectStore,
+    StorageError,
+};
+use thiserror::Error;
 
 use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -80,6 +89,7 @@ impl DesktopCordisBindingReceipt {
 #[derive(Debug)]
 pub(crate) struct DesktopCordisCoordinator {
     host: CordisHost,
+    session_persistence: DesktopSessionPersistence,
     identity: Arc<()>,
     root_fiber: Fiber,
     successful_bindings: u64,
@@ -87,10 +97,14 @@ pub(crate) struct DesktopCordisCoordinator {
 }
 
 impl DesktopCordisCoordinator {
-    fn new(host: CordisHost) -> Result<Self, CordisError> {
+    fn new(
+        host: CordisHost,
+        session_persistence: DesktopSessionPersistence,
+    ) -> Result<Self, CordisError> {
         let root_fiber = host.context().root_fiber();
         let coordinator = Self {
             host,
+            session_persistence,
             identity: Arc::new(()),
             root_fiber,
             successful_bindings: 0,
@@ -107,6 +121,18 @@ impl DesktopCordisCoordinator {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn bind_session_persistence(
+        &mut self,
+        store: ProjectStore,
+    ) -> Result<usize, DesktopSessionPersistenceError> {
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
+        self.session_persistence.bind_and_restore(store, &sessions)
     }
 
     fn next_binding_sequence(&self) -> Result<u64, CordisError> {
@@ -380,9 +406,252 @@ impl DerefMut for DesktopCordisCoordinator {
 pub(crate) fn mount_cordis_host(
     runtime: &DesktopRuntimeProjection,
 ) -> Result<DesktopCordisCoordinator, CordisError> {
-    let host = CordisHost::boot(openinterpreter_runtime_plugin(runtime))?;
+    let mut host = CordisHost::boot(openinterpreter_runtime_plugin(runtime))?;
     host_is_cordis_loop(&host)?;
-    DesktopCordisCoordinator::new(host)
+    let session_persistence = DesktopSessionPersistence::default();
+    session_persistence.mount(&mut host)?;
+    DesktopCordisCoordinator::new(host, session_persistence)
+}
+
+/// Desktop-owned SQLCipher adapter for Cordis' storage-agnostic Session seam.
+///
+/// `session/event` only marks the live prefix dirty. The awaited
+/// `session/flush` callback is the single durability boundary and extends the
+/// encrypted log transactionally. The already-open database connection is
+/// retained; raw key bytes never enter Cordis or either listener.
+#[derive(Clone, Debug, Default)]
+struct DesktopSessionPersistence {
+    store: Arc<Mutex<Option<ProjectStore>>>,
+    observed: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+impl DesktopSessionPersistence {
+    fn mount(&self, host: &mut CordisHost) -> Result<(), CordisError> {
+        let observed = Arc::clone(&self.observed);
+        host.context_mut().on_emit(
+            session_events::SESSION_EVENT,
+            move |record: &SessionEventRecord| {
+                observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(record.header.id.as_str().to_owned(), record.event.seq);
+            },
+        )?;
+
+        let persistence = self.clone();
+        host.context_mut().on_parallel(
+            session_events::SESSION_FLUSH,
+            move |checkpoint: SessionCheckpoint| {
+                let persistence = persistence.clone();
+                async move { persistence.persist(&checkpoint) }
+            },
+        )?;
+        Ok(())
+    }
+
+    fn bind_and_restore(
+        &self,
+        store: ProjectStore,
+        sessions: &SessionStore,
+    ) -> Result<usize, DesktopSessionPersistenceError> {
+        let checkpoints = store
+            .load_session_checkpoints()?
+            .into_iter()
+            .map(decode_checkpoint)
+            .collect::<Result<Vec<_>, _>>()?;
+        for (header, events) in &checkpoints {
+            SessionLog::restore(header.clone(), events.clone())?;
+            if let Some(live) = sessions.get(&header.id)? {
+                let live_header = live.header()?;
+                let live_events = live.events()?;
+                if live_header != *header || !live_events.starts_with(events) {
+                    return Err(DesktopSessionPersistenceError::LiveSessionDiverged(
+                        header.id.to_string(),
+                    ));
+                }
+            }
+        }
+        let mut restored = 0;
+        for (header, events) in checkpoints {
+            if sessions.get(&header.id)?.is_none() {
+                sessions.restore(header, events)?;
+                restored += 1;
+            }
+        }
+        *self
+            .store
+            .lock()
+            .map_err(|_| DesktopSessionPersistenceError::StatePoisoned)? = Some(store);
+        Ok(restored)
+    }
+
+    fn persist(
+        &self,
+        checkpoint: &SessionCheckpoint,
+    ) -> Result<(), DesktopSessionPersistenceError> {
+        SessionLog::restore(checkpoint.header.clone(), checkpoint.events.clone())?;
+        let persisted = encode_checkpoint(checkpoint);
+        let mut state = self
+            .store
+            .lock()
+            .map_err(|_| DesktopSessionPersistenceError::StatePoisoned)?;
+        let store = state
+            .as_mut()
+            .ok_or(DesktopSessionPersistenceError::Unbound)?;
+        store.persist_session_checkpoint(&persisted)?;
+        drop(state);
+
+        if let Some(through_seq) = checkpoint.through_seq() {
+            let mut observed = self
+                .observed
+                .lock()
+                .map_err(|_| DesktopSessionPersistenceError::StatePoisoned)?;
+            if observed
+                .get(checkpoint.header.id.as_str())
+                .is_some_and(|seen| *seen <= through_seq)
+            {
+                observed.remove(checkpoint.header.id.as_str());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum DesktopSessionPersistenceError {
+    #[error("Desktop Session persistence is not bound to an unlocked database")]
+    Unbound,
+    #[error("Desktop Session persistence state is poisoned")]
+    StatePoisoned,
+    #[error("Cordis did not mount its Session store")]
+    MissingSessionStore,
+    #[error("live Cordis Session {0} diverges from its durable prefix")]
+    LiveSessionDiverged(String),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
+}
+
+fn encode_checkpoint(checkpoint: &SessionCheckpoint) -> PersistedSessionCheckpoint {
+    PersistedSessionCheckpoint {
+        header: PersistedSessionHeader {
+            version: checkpoint.header.version,
+            id: checkpoint.header.id.as_str().to_owned(),
+            created_at_ms: checkpoint.header.created_at_ms,
+            parent_session: checkpoint
+                .header
+                .parent_session
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+            seed_length: checkpoint.header.seed_length,
+        },
+        events: checkpoint.events.iter().map(encode_event).collect(),
+    }
+}
+
+fn encode_event(event: &SessionEvent) -> PersistedSessionEvent {
+    PersistedSessionEvent {
+        seq: event.seq,
+        time_ms: event.time_ms,
+        kind: match event.kind {
+            SessionEventKind::TurnStart { turn } => PersistedSessionEventKind::TurnStart { turn },
+            SessionEventKind::TurnEnd { turn, reason } => PersistedSessionEventKind::TurnEnd {
+                turn,
+                reason: encode_turn_end_reason(reason),
+            },
+            SessionEventKind::StepStart { turn, step } => {
+                PersistedSessionEventKind::StepStart { turn, step }
+            }
+            SessionEventKind::StepEnd { turn, step } => {
+                PersistedSessionEventKind::StepEnd { turn, step }
+            }
+        },
+    }
+}
+
+const fn encode_turn_end_reason(reason: TurnEndReason) -> PersistedTurnEndReason {
+    match reason {
+        TurnEndReason::Completed => PersistedTurnEndReason::Completed,
+        TurnEndReason::Aborted(cause) => {
+            PersistedTurnEndReason::Aborted(encode_cancel_cause(cause))
+        }
+        TurnEndReason::Blocked => PersistedTurnEndReason::Blocked,
+        TurnEndReason::Error => PersistedTurnEndReason::Error,
+        TurnEndReason::MaxTokens => PersistedTurnEndReason::MaxTokens,
+        TurnEndReason::Interrupted => PersistedTurnEndReason::Interrupted,
+    }
+}
+
+const fn encode_cancel_cause(cause: SessionCancelCause) -> PersistedSessionCancelCause {
+    match cause {
+        SessionCancelCause::User => PersistedSessionCancelCause::User,
+        SessionCancelCause::Parent => PersistedSessionCancelCause::Parent,
+        SessionCancelCause::Hook => PersistedSessionCancelCause::Hook,
+        SessionCancelCause::Disposed => PersistedSessionCancelCause::Disposed,
+        SessionCancelCause::Legacy => PersistedSessionCancelCause::Legacy,
+    }
+}
+
+fn decode_checkpoint(
+    checkpoint: PersistedSessionCheckpoint,
+) -> Result<(SessionHeader, Vec<SessionEvent>), DesktopSessionPersistenceError> {
+    let header = SessionHeader {
+        version: checkpoint.header.version,
+        id: SessionId::new(checkpoint.header.id)?,
+        created_at_ms: checkpoint.header.created_at_ms,
+        parent_session: checkpoint
+            .header
+            .parent_session
+            .map(SessionId::new)
+            .transpose()?,
+        seed_length: checkpoint.header.seed_length,
+    };
+    let events = checkpoint.events.iter().map(decode_event).collect();
+    Ok((header, events))
+}
+
+fn decode_event(event: &PersistedSessionEvent) -> SessionEvent {
+    SessionEvent {
+        seq: event.seq,
+        time_ms: event.time_ms,
+        kind: match event.kind {
+            PersistedSessionEventKind::TurnStart { turn } => SessionEventKind::TurnStart { turn },
+            PersistedSessionEventKind::TurnEnd { turn, reason } => SessionEventKind::TurnEnd {
+                turn,
+                reason: decode_turn_end_reason(reason),
+            },
+            PersistedSessionEventKind::StepStart { turn, step } => {
+                SessionEventKind::StepStart { turn, step }
+            }
+            PersistedSessionEventKind::StepEnd { turn, step } => {
+                SessionEventKind::StepEnd { turn, step }
+            }
+        },
+    }
+}
+
+const fn decode_turn_end_reason(reason: PersistedTurnEndReason) -> TurnEndReason {
+    match reason {
+        PersistedTurnEndReason::Completed => TurnEndReason::Completed,
+        PersistedTurnEndReason::Aborted(cause) => {
+            TurnEndReason::Aborted(decode_cancel_cause(cause))
+        }
+        PersistedTurnEndReason::Blocked => TurnEndReason::Blocked,
+        PersistedTurnEndReason::Error => TurnEndReason::Error,
+        PersistedTurnEndReason::MaxTokens => TurnEndReason::MaxTokens,
+        PersistedTurnEndReason::Interrupted => TurnEndReason::Interrupted,
+    }
+}
+
+const fn decode_cancel_cause(cause: PersistedSessionCancelCause) -> SessionCancelCause {
+    match cause {
+        PersistedSessionCancelCause::User => SessionCancelCause::User,
+        PersistedSessionCancelCause::Parent => SessionCancelCause::Parent,
+        PersistedSessionCancelCause::Hook => SessionCancelCause::Hook,
+        PersistedSessionCancelCause::Disposed => SessionCancelCause::Disposed,
+        PersistedSessionCancelCause::Legacy => SessionCancelCause::Legacy,
+    }
 }
 
 /// Map a Domain Kernel [`ConsentState`] onto the host-side DTO.
