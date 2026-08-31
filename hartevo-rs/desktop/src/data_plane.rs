@@ -89,7 +89,8 @@ use crate::cordis_host::{
     DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
     DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
     DesktopEffectVerificationAuthorization, DesktopRuntimeSessionPreflight,
-    DesktopRuntimeSessionTranscript, dispatch_live_domain_command, dispatch_live_effect_execution,
+    DesktopRuntimeSessionStreamFlush, DesktopRuntimeSessionTranscript,
+    dispatch_live_domain_command, dispatch_live_effect_execution,
     dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
     mount_cordis_host,
 };
@@ -5100,6 +5101,16 @@ impl DesktopDataPlane {
                 },
                 now + Duration::milliseconds(logical_millis),
             )?;
+            if let Some(delta) = observation.agent_message_delta.as_ref() {
+                self.flush_runtime_session_stream(
+                    service,
+                    &mission,
+                    &turn_id,
+                    &runtime_provider,
+                    &runtime_model,
+                    &delta.item_id_digest,
+                )?;
+            }
             attempt = observation.attempt;
             if let Some(control) = cancellation {
                 let phase = match &observation.kind {
@@ -5957,6 +5968,44 @@ impl DesktopDataPlane {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the live flush binds one exact Application turn, route, Session, and already-durable Runtime item without another authority layer"
+    )]
+    fn flush_runtime_session_stream(
+        &self,
+        service: &ApplicationService,
+        mission: &Mission,
+        turn_id: &RuntimeTurnAttemptId,
+        provider: &str,
+        model: &str,
+        item_id_digest: &str,
+    ) -> Result<(), DesktopDataError> {
+        let user_body = Self::runtime_session_user_body(service, mission)?;
+        let assistant_chunks = service
+            .runtime_turn_private_text_deltas(&mission.project_id, turn_id)?
+            .into_iter()
+            .filter(|delta| delta.item_id_digest == item_id_digest)
+            .map(|delta| delta.delta)
+            .collect();
+        self.cordis
+            .lock()
+            .map_err(|_| {
+                DesktopDataError::CordisSessionPersistence(
+                    "Desktop Cordis coordinator is poisoned".into(),
+                )
+            })?
+            .flush_runtime_stream(DesktopRuntimeSessionStreamFlush::new(
+                mission.id.as_str(),
+                turn_id.as_str(),
+                user_body,
+                provider,
+                model,
+                assistant_chunks,
+            ))
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         reason = "the bridge keeps exact Application service, Mission, Runtime turn, route, content, and terminal identity visible at its only production call boundary"
     )]
     fn record_runtime_session_transcript(
@@ -5970,16 +6019,22 @@ impl DesktopDataPlane {
         end_reason: TurnEndReason,
     ) -> Result<(), DesktopDataError> {
         let user_body = Self::runtime_session_user_body(service, mission)?;
-        let assistant_chunks = if let Some(message) = assistant_message {
-            service
-                .runtime_turn_private_text_deltas(&mission.project_id, turn_id)?
+        let durable_deltas =
+            service.runtime_turn_private_text_deltas(&mission.project_id, turn_id)?;
+        let item_id_digest = assistant_message
+            .map(|message| message.item_id_digest.clone())
+            .or_else(|| {
+                durable_deltas
+                    .last()
+                    .map(|delta| delta.item_id_digest.clone())
+            });
+        let assistant_chunks = item_id_digest.map_or_else(Vec::new, |item_id_digest| {
+            durable_deltas
                 .into_iter()
-                .filter(|delta| delta.item_id_digest == message.item_id_digest)
+                .filter(|delta| delta.item_id_digest == item_id_digest)
                 .map(|delta| delta.delta)
                 .collect()
-        } else {
-            Vec::new()
-        };
+        });
         self.cordis
             .lock()
             .map_err(|_| {
@@ -9228,6 +9283,82 @@ sleep 30"#
     }
 
     #[cfg(unix)]
+    fn live_stream_interruptible_runtime_fixture_command(
+        project_root: &Path,
+        runtime_home: &Path,
+    ) -> RuntimeCommand {
+        let project_root = project_root
+            .canonicalize()
+            .expect("canonical fixture project root");
+        let runtime_home = runtime_home
+            .canonicalize()
+            .expect("canonical fixture runtime home");
+        let [
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+        ] = runtime_fixture_start_messages(&project_root, &runtime_home);
+        let [item_started, first_delta, _, _, _] = runtime_fixture_completion_messages();
+        let turn_interrupted = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "threadId": "desktop-fixture-thread",
+                "turn": {"id": "desktop-fixture-turn", "status": "interrupted"},
+            },
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), &project_root);
+        command.args = vec![
+            "-c".into(),
+            r#"IFS= read -r initialize
+case "$initialize" in *'"method":"initialize"'*) ;; *) exit 61 ;; esac
+printf '%s\n' "$1"
+IFS= read -r thread
+case "$thread" in *'"method":"thread/start"'*) ;; *) exit 62 ;; esac
+printf '%s\n' "$2"
+IFS= read -r turn
+case "$turn" in *'"method":"turn/start"'*) ;; *) exit 63 ;; esac
+printf '%s\n' "$3"
+printf '%s\n' "$4"
+printf '%s\n' "$5"
+printf '%s\n' "$6"
+IFS= read -r interrupt
+case "$interrupt" in *'"method":"turn/interrupt"'*) ;; *) exit 64 ;; esac
+interrupt_id="$(printf '%s\n' "$interrupt" | /usr/bin/sed -E 's/.*"id":([^,}]+).*/\1/')"
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$interrupt_id"
+printf '%s\n' "$7"
+sleep 30"#
+                .into(),
+            "hartevo-desktop-live-stream-interrupt-runtime-fixture".into(),
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+            item_started,
+            first_delta,
+            turn_interrupted,
+        ];
+        command.environment.insert(
+            "INTERPRETER_HOME".into(),
+            runtime_home.to_string_lossy().into_owned(),
+        );
+        command.openinterpreter_home = Some(runtime_home);
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn live_stream_interruptible_runtime_fixture_source() -> DesktopRuntimeSource {
+        DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(live_stream_interruptible_runtime_fixture_command),
+        }
+    }
+
+    #[cfg(unix)]
     fn local_write_approve_runtime_fixture_command(
         project_root: &Path,
         runtime_home: &Path,
@@ -12192,6 +12323,202 @@ sleep 30"#;
             ));
             assert!(matches!(
                 &events[6].kind,
+                SessionEventKind::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Interrupted,
+                }
+            ));
+            assert_eq!(session.derive_messages().unwrap().len(), 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one concurrent journey proves the exact live Session and SQLCipher prefix before allowing the same Runtime attempt to terminate"
+    )]
+    fn desktop_runtime_text_delta_flushes_before_terminal_observation() {
+        use hartevo_cordis::{
+            SessionContentBlock, SessionEventKind, SessionId, SessionStore, SessionStreamBlockType,
+            SessionStreamChunk,
+        };
+        use hartevo_storage::PersistedSessionEventKind;
+
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let before = match plane
+            .load_with(&secrets, observed_at() + Duration::minutes(2))
+            .expect("ready Desktop state")
+        {
+            DesktopLoadState::Ready(snapshot) => snapshot.inventory.projects[0]
+                .missions
+                .iter()
+                .map(|mission| mission.mission_id.clone())
+                .collect::<BTreeSet<_>>(),
+            DesktopLoadState::Uninitialized { .. } => panic!("fixture must be initialized"),
+        };
+        let user_body = "Flush this exact Runtime delta into the open Cordis Session";
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                user_body,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("start one exact Mission");
+        let mission_id = started.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| !before.contains(&mission.mission_id))
+            .expect("new Mission projection")
+            .mission_id
+            .clone();
+        let cancellation = DesktopRuntimeCancellation::default();
+
+        let (live, durable, submission) = std::thread::scope(|scope| {
+            let runner = scope.spawn(|| {
+                plane.resume_mission_runtime_with_cancellation(
+                    &secrets,
+                    &project_id,
+                    &mission_id,
+                    Some(live_stream_interruptible_runtime_fixture_source()),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    Some(&cancellation),
+                    observed_at() + Duration::minutes(4),
+                )
+            });
+            let mut live = None;
+            for _ in 0..200 {
+                live = plane.with_cordis_host(|host| {
+                    let sessions = host.context().sessions::<SessionStore>()?;
+                    let id = SessionId::new(mission_id.as_str()).ok()?;
+                    let session = sessions.get(&id).ok().flatten()?;
+                    let events = session.events().ok()?;
+                    let chunks = session.assistant_chunks(1, 1).ok()?;
+                    (chunks.len() == 2).then_some((events, chunks))
+                });
+                if live.is_some() {
+                    break;
+                }
+                std::thread::sleep(StdDuration::from_millis(25));
+            }
+            let durable = live.as_ref().and_then(|_| {
+                let secret = secrets.get(plane.database_key_reference()).ok()?;
+                let key = DatabaseKey::from_secret(&secret).ok()?;
+                ProjectStore::open(&plane.database_path, &key)
+                    .ok()?
+                    .load_session_checkpoints()
+                    .ok()?
+                    .into_iter()
+                    .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
+            });
+            cancellation.request();
+            let submission = runner
+                .join()
+                .expect("Runtime worker thread")
+                .expect("cooperative Runtime interruption");
+            (live, durable, submission)
+        });
+
+        assert_eq!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::Interrupted
+        );
+        let (live_events, live_chunks) = live.expect("live Cordis stream prefix");
+        assert_eq!(live_events.len(), 7);
+        assert_eq!(
+            live_chunks
+                .iter()
+                .map(|chunk| (chunk.seq, chunk.chunk.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    5,
+                    SessionStreamChunk::BlockStart {
+                        index: 0,
+                        block_type: SessionStreamBlockType::Text,
+                    },
+                ),
+                (
+                    6,
+                    SessionStreamChunk::TextDelta {
+                        index: 0,
+                        text: "Reviewable local runtime ".into(),
+                    },
+                ),
+            ]
+        );
+        let durable = durable.expect("SQLCipher live Session prefix");
+        assert_eq!(durable.events.len(), 7);
+        let durable_chunks = durable
+            .events
+            .iter()
+            .filter_map(|event| {
+                let PersistedSessionEventKind::AssistantChunk { chunk, .. } = &event.kind else {
+                    return None;
+                };
+                SessionStreamChunk::from_json_value(chunk).ok()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            durable_chunks,
+            vec![
+                SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                },
+                SessionStreamChunk::TextDelta {
+                    index: 0,
+                    text: "Reviewable local runtime ".into(),
+                },
+            ]
+        );
+
+        plane.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .unwrap()
+                .expect("closed Session");
+            let events = session.events().unwrap();
+            assert_eq!(events.len(), 10);
+            assert_eq!(
+                session
+                    .assistant_chunks(1, 1)
+                    .unwrap()
+                    .into_iter()
+                    .map(|chunk| chunk.chunk)
+                    .collect::<Vec<_>>(),
+                vec![
+                    SessionStreamChunk::BlockStart {
+                        index: 0,
+                        block_type: SessionStreamBlockType::Text,
+                    },
+                    SessionStreamChunk::TextDelta {
+                        index: 0,
+                        text: "Reviewable local runtime ".into(),
+                    },
+                    SessionStreamChunk::BlockEnd {
+                        index: 0,
+                        block: SessionContentBlock::Text {
+                            text: "Reviewable local runtime ".into(),
+                        },
+                    },
+                ]
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(&event.kind, SessionEventKind::AssistantMessage { .. }))
+            );
+            assert!(matches!(
+                &events[8].kind,
+                SessionEventKind::StepEnd { turn: 1, step: 1 }
+            ));
+            assert!(matches!(
+                &events[9].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
                     reason: TurnEndReason::Interrupted,
