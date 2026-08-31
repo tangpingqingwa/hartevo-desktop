@@ -50,7 +50,7 @@ use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, DomainCommandBinding, DomainCommandKind,
     EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding, RuntimeBinding,
-    RuntimeRecordBinding,
+    RuntimeRecordBinding, TurnEndReason,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -87,9 +87,10 @@ use zeroize::Zeroizing;
 use crate::cordis_host::{
     DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
     DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
-    DesktopEffectVerificationAuthorization, dispatch_live_domain_command,
-    dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
-    dispatch_live_effect_verification, dispatch_live_runtime, mount_cordis_host,
+    DesktopEffectVerificationAuthorization, DesktopRuntimeSessionTranscript,
+    dispatch_live_domain_command, dispatch_live_effect_execution,
+    dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
+    mount_cordis_host,
 };
 #[cfg(test)]
 use crate::cordis_host::{
@@ -4745,12 +4746,29 @@ impl DesktopDataPlane {
                 now,
             );
         }
+        let completed_message = match current_turn {
+            Some(turn) if turn.status == RuntimeTurnStatus::Completed => {
+                service.latest_runtime_turn_private_message(project_id, &turn.id)?
+            }
+            _ => None,
+        };
+        if let (Some(turn), Some(message), Some(runtime)) =
+            (current_turn, completed_message.as_ref(), runtime.as_ref())
+        {
+            self.record_runtime_session_transcript(
+                service,
+                &mission,
+                &turn.id,
+                runtime.provider(),
+                runtime.model(),
+                Some(&message.body),
+                TurnEndReason::Completed,
+            )?;
+        }
         if let Some(turn) = current_turn
             && turn.status == RuntimeTurnStatus::Completed
             && mission.definition.is_some()
-            && service
-                .latest_runtime_turn_private_message(project_id, &turn.id)?
-                .is_some()
+            && completed_message.is_some()
         {
             let conversation = service.mission_conversation(project_id, &mission_id)?;
             let adoption = service.adopt_runtime_turn_draft(
@@ -4872,7 +4890,7 @@ impl DesktopDataPlane {
         let runtime_provider = runtime.provider().to_owned();
         let runtime_model = runtime.model().to_owned();
         let tokenizer = ConservativeByteBudgetTokenizer::new(
-            runtime_provider,
+            runtime_provider.clone(),
             runtime_model.clone(),
             2_048,
             4 * 1024 * 1024,
@@ -4939,7 +4957,7 @@ impl DesktopDataPlane {
                     attachment_epoch: prepared.handle.attachment_epoch,
                     strategy: resume_plan.strategy,
                     resume_thread_id: resume_plan.resume_thread_id,
-                    model: Some(runtime_model),
+                    model: Some(runtime_model.clone()),
                     max_process_attempts: 3,
                     health_timeout: StdDuration::from_secs(15),
                     thread_timeout: StdDuration::from_secs(15),
@@ -5168,11 +5186,37 @@ impl DesktopDataPlane {
                 now + Duration::milliseconds(logical_millis),
             )?;
         }
+        let completed_message = if attempt.status == RuntimeTurnStatus::Completed {
+            service.latest_runtime_turn_private_message(project_id, &turn_id)?
+        } else {
+            None
+        };
+        let session_end_reason = match attempt.status {
+            RuntimeTurnStatus::Completed => TurnEndReason::Completed,
+            RuntimeTurnStatus::Interrupted => TurnEndReason::Interrupted,
+            RuntimeTurnStatus::Prepared
+            | RuntimeTurnStatus::Dispatching
+            | RuntimeTurnStatus::Running
+            | RuntimeTurnStatus::WaitingLocalApproval
+            | RuntimeTurnStatus::ApprovalResponding
+            | RuntimeTurnStatus::InterruptRequested
+            | RuntimeTurnStatus::Failed
+            | RuntimeTurnStatus::Uncertain => TurnEndReason::Error,
+        };
+        self.record_runtime_session_transcript(
+            service,
+            &mission,
+            &turn_id,
+            &runtime_provider,
+            &runtime_model,
+            completed_message
+                .as_ref()
+                .map(|message| message.body.as_str()),
+            session_end_reason,
+        )?;
         let outcome = match attempt.status {
             RuntimeTurnStatus::Completed => {
-                if let Some(message) =
-                    service.latest_runtime_turn_private_message(project_id, &turn_id)?
-                {
+                if let Some(message) = completed_message {
                     if mission.definition.is_some() {
                         let conversation = service.mission_conversation(project_id, &mission_id)?;
                         let adoption = service.adopt_runtime_turn_draft(
@@ -5837,6 +5881,50 @@ impl DesktopDataPlane {
             .bind_session_persistence(store)
             .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
         Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the bridge keeps exact Application service, Mission, Runtime turn, route, content, and terminal identity visible at its only production call boundary"
+    )]
+    fn record_runtime_session_transcript(
+        &self,
+        service: &ApplicationService,
+        mission: &Mission,
+        turn_id: &RuntimeTurnAttemptId,
+        provider: &str,
+        model: &str,
+        assistant_body: Option<&str>,
+        end_reason: TurnEndReason,
+    ) -> Result<(), DesktopDataError> {
+        let user_body = if mission.definition.is_some() {
+            service
+                .mission_conversation(&mission.project_id, &mission.id)?
+                .messages
+                .into_iter()
+                .rev()
+                .find(|message| message.role == MissionConversationRole::User)
+                .map_or_else(|| mission.contract.goal.clone(), |message| message.body)
+        } else {
+            mission.contract.goal.clone()
+        };
+        self.cordis
+            .lock()
+            .map_err(|_| {
+                DesktopDataError::CordisSessionPersistence(
+                    "Desktop Cordis coordinator is poisoned".into(),
+                )
+            })?
+            .record_runtime_transcript(DesktopRuntimeSessionTranscript::new(
+                mission.id.as_str(),
+                turn_id.as_str(),
+                user_body,
+                provider,
+                model,
+                assistant_body.map(str::to_owned),
+                end_reason,
+            ))
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))
     }
 
     #[cfg(test)]
@@ -12484,8 +12572,16 @@ sleep 30"#;
 
     #[cfg(unix)]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one deterministic journey proves real Runtime execution, idempotent transcript recovery, SQLCipher persistence, and exact Desktop cold restart"
+    )]
     fn desktop_runtime_journey_declines_local_write_and_adopts_only_completed_message() {
-        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        use hartevo_cordis::{
+            SessionContentBlock, SessionEventKind, SessionId, SessionMessageSource, SessionStore,
+        };
+
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
         let submission = plane
             .start_mission_and_run_with(
                 &secrets,
@@ -12543,11 +12639,79 @@ sleep 30"#;
         assert_eq!(runtime.process_cleanup_attempt_count, 1);
         assert!(!runtime.requires_reconciliation);
 
+        let (expected_session_events, expected_session_messages) = plane.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("Cordis Session store")
+                .get(&SessionId::new(submission.mission_id.as_str()).unwrap())
+                .expect("Runtime Session lookup")
+                .expect("real Runtime Session");
+            let events = session.events().expect("real Runtime Session events");
+            assert_eq!(events.len(), 7);
+            assert!(matches!(
+                events.last().map(|event| &event.kind),
+                Some(SessionEventKind::TurnEnd {
+                    reason: TurnEndReason::Completed,
+                    ..
+                })
+            ));
+            let messages = session
+                .derive_messages()
+                .expect("real Runtime Session messages");
+            assert_eq!(messages.len(), 2);
+            assert!(matches!(
+                messages[0].content.as_slice(),
+                [SessionContentBlock::Text { text }]
+                    if text == "生成一个仅供审阅的本地研究草稿；禁止外部动作和本地文件写入"
+            ));
+            assert!(matches!(
+                (&messages[1].source, messages[1].content.as_slice()),
+                (
+                    SessionMessageSource::Model { provider, model },
+                    [SessionContentBlock::Text { text }]
+                ) if provider == "fixture-provider"
+                    && model == "fixture-model"
+                    && text == "Reviewable local runtime draft; no external effect occurred."
+            ));
+            (events, messages)
+        });
+        let replay = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                Some(completed_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("completed Runtime transcript recovery");
+        assert_eq!(
+            replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ReplaySuppressed {
+                turn_status: RuntimeTurnStatus::Completed,
+            }
+        );
+        plane.with_cordis_host(|host| {
+            let recovered = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("recovered Cordis Session store")
+                .get(&SessionId::new(submission.mission_id.as_str()).unwrap())
+                .expect("recovered Runtime Session lookup")
+                .expect("recovered real Runtime Session");
+            assert_eq!(recovered.events().unwrap(), expected_session_events);
+            assert_eq!(
+                recovered.derive_messages().unwrap(),
+                expected_session_messages
+            );
+        });
+
         let database_secret = secrets
             .get(plane.database_key_reference())
             .expect("database secret");
         let (service, _) = plane
-            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(4))
             .expect("reopen Application");
         let mission = service
             .load_mission(&project_id, &submission.mission_id)
@@ -12579,6 +12743,32 @@ sleep 30"#;
                 .iter()
                 .any(|work_product| work_product.title.contains("complete"))
         );
+
+        drop(service);
+        drop(database_secret);
+        drop(plane);
+        let restarted = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("restarted Desktop plane");
+        assert!(matches!(
+            restarted
+                .load_with(&secrets, observed_at() + Duration::minutes(5))
+                .expect("restore encrypted Runtime Session"),
+            DesktopLoadState::Ready(_)
+        ));
+        restarted.with_cordis_host(|host| {
+            let restored = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("restored Cordis Session store")
+                .get(&SessionId::new(submission.mission_id.as_str()).unwrap())
+                .expect("restored Runtime Session lookup")
+                .expect("restored real Runtime Session");
+            assert_eq!(restored.events().unwrap(), expected_session_events);
+            assert_eq!(
+                restored.derive_messages().unwrap(),
+                expected_session_messages
+            );
+        });
     }
 
     #[cfg(unix)]
