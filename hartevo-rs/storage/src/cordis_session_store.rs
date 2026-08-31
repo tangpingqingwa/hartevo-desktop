@@ -93,6 +93,13 @@ pub enum PersistedTurnEndReason {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PersistedSessionToolError {
+    pub name: String,
+    pub code: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PersistedSessionEventKind {
     TurnStart {
@@ -145,6 +152,8 @@ pub enum PersistedSessionEventKind {
         turn: u64,
         step: u64,
         message: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<PersistedSessionToolError>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<serde_json::Value>,
     },
@@ -403,14 +412,27 @@ fn validate_event_payload(
             step,
             message,
             surface,
+        } => {
+            validate_message_json(message)?;
+            validate_surface_json(surface.as_ref())?;
+            (Some(*turn), Some(*step))
         }
-        | PersistedSessionEventKind::ToolResult {
+        PersistedSessionEventKind::ToolResult {
             turn,
             step,
             message,
+            error,
             surface,
         } => {
             validate_message_json(message)?;
+            if error
+                .as_ref()
+                .is_some_and(|error| error.name.is_empty() || error.code.is_empty())
+            {
+                return Err(StorageError::InvalidSessionCheckpoint(
+                    "tool/result error name and code must not be empty",
+                ));
+            }
             validate_surface_json(surface.as_ref())?;
             (Some(*turn), Some(*step))
         }
@@ -671,6 +693,7 @@ mod tests {
                     turn: 1,
                     step: 1,
                     message: tool_result_message(),
+                    error: None,
                     surface: Some(append_surface()),
                 },
             },
@@ -738,6 +761,49 @@ mod tests {
             ))
         ));
         assert!(store.load_session_checkpoints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_result_error_metadata_round_trips_and_legacy_rows_default_to_none() {
+        let legacy = completed_turn()[5].clone();
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json["kind"]["tool_result"].get("error").is_none());
+        assert_eq!(
+            serde_json::from_value::<PersistedSessionEvent>(legacy_json).unwrap(),
+            legacy
+        );
+
+        let mut complete = checkpoint(completed_turn());
+        let PersistedSessionEventKind::ToolResult { error, .. } = &mut complete.events[5].kind
+        else {
+            panic!("fixture must contain a tool result");
+        };
+        *error = Some(PersistedSessionToolError {
+            name: "ToolOutcomeUnknownError".into(),
+            code: "TOOL_OUTCOME_UNKNOWN".into(),
+        });
+        let mut store = ProjectStore::in_memory().unwrap();
+        assert!(store.persist_session_checkpoint(&complete).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![complete]);
+
+        for (name, code) in [("", "TOOL_OUTCOME_UNKNOWN"), ("ToolError", "")] {
+            let mut invalid = checkpoint(completed_turn());
+            let PersistedSessionEventKind::ToolResult { error, .. } = &mut invalid.events[5].kind
+            else {
+                panic!("fixture must contain a tool result");
+            };
+            *error = Some(PersistedSessionToolError {
+                name: name.into(),
+                code: code.into(),
+            });
+            let mut store = ProjectStore::in_memory().unwrap();
+            assert!(matches!(
+                store.persist_session_checkpoint(&invalid),
+                Err(StorageError::InvalidSessionCheckpoint(
+                    "tool/result error name and code must not be empty"
+                ))
+            ));
+        }
     }
 
     #[test]

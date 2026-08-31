@@ -7743,10 +7743,13 @@ mod tests {
     fn assert_durable_crash_repair(
         plane: &DesktopDataPlane,
         secrets: &MemorySecretStore,
+        real_event_count: usize,
         event_count: usize,
         repair_time_ms: i64,
     ) {
-        use hartevo_storage::{PersistedSessionEventKind, PersistedTurnEndReason};
+        use hartevo_storage::{
+            PersistedSessionEventKind, PersistedSessionToolError, PersistedTurnEndReason,
+        };
 
         let secret = secrets
             .get(plane.database_key_reference())
@@ -7758,24 +7761,75 @@ mod tests {
             .expect("durable repaired Session");
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints[0].events.len(), event_count);
+        let [started, unstarted, step_end, turn_end] = &checkpoints[0].events[real_event_count..]
+        else {
+            panic!("durable repair must append two tool results and two lifecycle closers");
+        };
+        let PersistedSessionEventKind::ToolResult {
+            error: started_error,
+            surface: started_surface,
+            ..
+        } = &started.kind
+        else {
+            panic!("first repair event must be the started tool result");
+        };
         assert_eq!(
-            checkpoints[0].events[2].kind,
+            started_error,
+            &Some(PersistedSessionToolError {
+                name: "ToolOutcomeUnknownError".into(),
+                code: "TOOL_OUTCOME_UNKNOWN".into(),
+            })
+        );
+        assert_eq!(
+            started_surface,
+            &Some(serde_json::json!({
+                "surfaceOp": { "op": "append" },
+                "sourceEventSeqs": [3]
+            }))
+        );
+        let PersistedSessionEventKind::ToolResult {
+            error: unstarted_error,
+            surface: unstarted_surface,
+            ..
+        } = &unstarted.kind
+        else {
+            panic!("second repair event must be the unstarted tool result");
+        };
+        assert_eq!(
+            unstarted_error,
+            &Some(PersistedSessionToolError {
+                name: "ToolNotStartedError".into(),
+                code: "TOOL_NOT_STARTED".into(),
+            })
+        );
+        assert_eq!(
+            unstarted_surface,
+            &Some(serde_json::json!({ "surfaceOp": { "op": "append" } }))
+        );
+        assert_eq!(
+            step_end.kind,
             PersistedSessionEventKind::StepEnd { turn: 1, step: 1 }
         );
         assert_eq!(
-            checkpoints[0].events[3].kind,
+            turn_end.kind,
             PersistedSessionEventKind::TurnEnd {
                 turn: 1,
                 reason: PersistedTurnEndReason::Interrupted,
             }
         );
-        assert_eq!(checkpoints[0].events[2].time_ms, repair_time_ms);
-        assert_eq!(checkpoints[0].events[3].time_ms, repair_time_ms);
+        for event in [started, unstarted, step_end, turn_end] {
+            assert_eq!(event.time_ms, repair_time_ms);
+        }
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn crashed_cordis_session_is_repaired_durably_once_before_restore() {
-        use hartevo_cordis::{SessionEventKind, SessionId, SessionStore, TurnEndReason};
+        use hartevo_cordis::{
+            SessionContentBlock, SessionEventKind, SessionId, SessionMessage, SessionMessageRole,
+            SessionMessageSource, SessionStore, SessionSurfaceIntent, SessionToolError,
+            TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason,
+        };
 
         let directory = tempfile::tempdir().expect("directory");
         let data_root = directory.path().join("desktop-session-crash-repair");
@@ -7785,19 +7839,46 @@ mod tests {
             .initialize_with(&secrets, observed_at())
             .expect("initialize and bind Session persistence");
 
-        let (sessions, session, real_events) = first.with_cordis_host(|host| {
-            let sessions = host
-                .context()
-                .sessions::<SessionStore>()
-                .expect("Cordis Session store");
-            let session = sessions
-                .create(SessionId::new("desktop-crashed-session").unwrap())
-                .expect("live Session");
-            let turn = session.start_turn().expect("turn start");
-            session.start_step(turn).expect("step start");
-            let events = session.events().expect("open events");
-            (sessions, session, events)
-        });
+        let (sessions, session, real_events, assistant, call_seq) =
+            first.with_cordis_host(|host| {
+                let sessions = host
+                    .context()
+                    .sessions::<SessionStore>()
+                    .expect("Cordis Session store");
+                let session = sessions
+                    .create(SessionId::new("desktop-crashed-session").unwrap())
+                    .expect("live Session");
+                let turn = session.start_turn().expect("turn start");
+                let step = session.start_step(turn).expect("step start");
+                let assistant = SessionMessage {
+                    id: "desktop-crashed-assistant".into(),
+                    role: SessionMessageRole::Assistant,
+                    content: vec![
+                        SessionContentBlock::ToolCall {
+                            id: "desktop-started-call".into(),
+                            name: "write".into(),
+                            arguments: "{}".into(),
+                        },
+                        SessionContentBlock::ToolCall {
+                            id: "desktop-unstarted-call".into(),
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    ],
+                    source: SessionMessageSource::Model {
+                        provider: "mock".into(),
+                        model: "mock".into(),
+                    },
+                };
+                session
+                    .append_assistant_message(turn, step, assistant.clone())
+                    .expect("assistant tool requests");
+                let call_seq = session
+                    .append_tool_call(turn, step, "desktop-started-call", "write", "{}")
+                    .expect("durable started call");
+                let events = session.events().expect("open events");
+                (sessions, session, events, assistant, call_seq)
+            });
         assert!(sessions.flush(&session).await.expect("durable open flush"));
 
         assert!(matches!(
@@ -7829,16 +7910,72 @@ mod tests {
         let (_, restored) = desktop_cordis_session(&second, "desktop-crashed-session");
         let repaired_events = restored.events().expect("repaired events");
         let repair_time_ms = real_events.last().expect("last real event").time_ms;
+        let started_message = SessionMessage {
+            id: "interrupted-tool-result-desktop-started-call-4".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::ToolResult {
+                tool_call_id: "desktop-started-call".into(),
+                content: vec![SessionContentBlock::Text {
+                    text: "The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.".into(),
+                }],
+                is_error: true,
+            }],
+            source: SessionMessageSource::Tool {
+                call_id: "desktop-started-call".into(),
+            },
+        };
+        let unstarted_message = SessionMessage {
+            id: "interrupted-tool-result-desktop-unstarted-call-5".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::ToolResult {
+                tool_call_id: "desktop-unstarted-call".into(),
+                content: vec![SessionContentBlock::Text {
+                    text: "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.".into(),
+                }],
+                is_error: true,
+            }],
+            source: SessionMessageSource::Tool {
+                call_id: "desktop-unstarted-call".into(),
+            },
+        };
         assert_eq!(
             &repaired_events[real_events.len()..],
             [
                 hartevo_cordis::SessionEvent {
-                    seq: 2,
+                    seq: 4,
+                    time_ms: repair_time_ms,
+                    kind: SessionEventKind::ToolResult {
+                        turn: 1,
+                        step: 1,
+                        message: started_message.clone(),
+                        error: Some(SessionToolError {
+                            name: "ToolOutcomeUnknownError".into(),
+                            code: TOOL_OUTCOME_UNKNOWN.into(),
+                        }),
+                        surface: SessionSurfaceIntent::append_from(vec![call_seq]),
+                    },
+                },
+                hartevo_cordis::SessionEvent {
+                    seq: 5,
+                    time_ms: repair_time_ms,
+                    kind: SessionEventKind::ToolResult {
+                        turn: 1,
+                        step: 1,
+                        message: unstarted_message.clone(),
+                        error: Some(SessionToolError {
+                            name: "ToolNotStartedError".into(),
+                            code: TOOL_NOT_STARTED.into(),
+                        }),
+                        surface: SessionSurfaceIntent::append(),
+                    },
+                },
+                hartevo_cordis::SessionEvent {
+                    seq: 6,
                     time_ms: repair_time_ms,
                     kind: SessionEventKind::StepEnd { turn: 1, step: 1 },
                 },
                 hartevo_cordis::SessionEvent {
-                    seq: 3,
+                    seq: 7,
                     time_ms: repair_time_ms,
                     kind: SessionEventKind::TurnEnd {
                         turn: 1,
@@ -7847,8 +7984,18 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            restored.derive_messages().unwrap(),
+            vec![assistant, started_message, unstarted_message]
+        );
 
-        assert_durable_crash_repair(&second, &secrets, repaired_events.len(), repair_time_ms);
+        assert_durable_crash_repair(
+            &second,
+            &secrets,
+            real_events.len(),
+            repaired_events.len(),
+            repair_time_ms,
+        );
         assert_eq!(restored.start_turn().expect("next turn"), 2);
         drop(restored);
         drop(second);

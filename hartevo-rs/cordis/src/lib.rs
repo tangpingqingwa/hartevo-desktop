@@ -91,8 +91,8 @@ pub use session::{
     SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
     SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurface, SessionSurfaceIntent,
-    SessionSurfaceOp, SessionTokenUsage, SessionToolCall, SessionToolSchema, TurnEndReason,
-    events as session_events,
+    SessionSurfaceOp, SessionTokenUsage, SessionToolCall, SessionToolError, SessionToolSchema,
+    TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, events as session_events,
 };
 pub use surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmStream,

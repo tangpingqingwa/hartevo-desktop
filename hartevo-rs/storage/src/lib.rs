@@ -54,7 +54,8 @@ pub use context_worker_graph_store::{
 };
 pub use cordis_session_store::{
     PersistedSessionCancelCause, PersistedSessionCheckpoint, PersistedSessionEvent,
-    PersistedSessionEventKind, PersistedSessionHeader, PersistedTurnEndReason,
+    PersistedSessionEventKind, PersistedSessionHeader, PersistedSessionToolError,
+    PersistedTurnEndReason,
 };
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};
