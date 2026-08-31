@@ -1,11 +1,12 @@
 //! Minimal Rust-native Session boundary log adapted from DeepSeek Harness.
 //!
 //! This slice records and validates turn/step lifecycle plus the three durable
-//! message events that form model history. It exposes the typed event/flush
-//! seam consumed by persistence plugins. Surface replacement and the wider
-//! Harness vocabulary remain separate follow-up work.
+//! message events that form model history. Its ordered surface can append or
+//! replace model-visible nodes without deleting the source log, and it exposes
+//! the typed event/flush seam consumed by persistence plugins. The wider
+//! Harness vocabulary remains separate follow-up work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -219,7 +220,99 @@ impl SessionMessage {
     }
 }
 
-/// The bounded Session event vocabulary through N22.
+/// How one message-producing event enters the ordered model-visible surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionSurfaceOp {
+    Append,
+    Replace { start: u64, end: u64 },
+}
+
+/// Surface placement plus the complete known provenance for one message event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionSurfaceIntent {
+    pub surface_op: SessionSurfaceOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_seqs: Option<Vec<u64>>,
+}
+
+impl SessionSurfaceIntent {
+    #[must_use]
+    pub const fn append() -> Self {
+        Self {
+            surface_op: SessionSurfaceOp::Append,
+            source_event_seqs: None,
+        }
+    }
+
+    #[must_use]
+    pub fn append_from(source_event_seqs: Vec<u64>) -> Self {
+        Self {
+            surface_op: SessionSurfaceOp::Append,
+            source_event_seqs: Some(source_event_seqs),
+        }
+    }
+
+    #[must_use]
+    pub fn replace(start: u64, end: u64, source_event_seqs: Vec<u64>) -> Self {
+        Self {
+            surface_op: SessionSurfaceOp::Replace { start, end },
+            source_event_seqs: Some(source_event_seqs),
+        }
+    }
+
+    /// Encode validated typed surface metadata for a neutral persistence adapter.
+    pub fn to_json_value(&self) -> Result<serde_json::Value, SessionError> {
+        serde_json::to_value(self).map_err(|_| SessionError::InvalidSurfaceEncoding)
+    }
+
+    /// Decode neutral persistence metadata before Session replay validates it.
+    pub fn from_json_value(value: serde_json::Value) -> Result<Self, SessionError> {
+        if !surface_json_shape_is_exact(&value) {
+            return Err(SessionError::InvalidSurfaceEncoding);
+        }
+        serde_json::from_value(value).map_err(|_| SessionError::InvalidSurfaceEncoding)
+    }
+}
+
+fn surface_json_shape_is_exact(value: &serde_json::Value) -> bool {
+    let Some(intent) = value.as_object() else {
+        return false;
+    };
+    if !intent
+        .keys()
+        .all(|key| matches!(key.as_str(), "surfaceOp" | "sourceEventSeqs"))
+        || !intent.contains_key("surfaceOp")
+        || intent
+            .get("sourceEventSeqs")
+            .is_some_and(|sources| !sources.is_array())
+    {
+        return false;
+    }
+    let Some(operation) = intent
+        .get("surfaceOp")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    match operation.get("op").and_then(serde_json::Value::as_str) {
+        Some("append") => operation.len() == 1,
+        Some("replace") => {
+            operation.len() == 3 && operation.contains_key("start") && operation.contains_key("end")
+        }
+        _ => false,
+    }
+}
+
+/// Detached ordered-surface state for inspection and exact replay assertions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSurface {
+    pub nodes: Vec<u64>,
+    pub replace_generation: u64,
+}
+
+/// The bounded Session event vocabulary through N23.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
     TurnStart {
@@ -239,16 +332,19 @@ pub enum SessionEventKind {
     },
     UserMessage {
         message: SessionMessage,
+        surface: SessionSurfaceIntent,
     },
     AssistantMessage {
         turn: u64,
         step: u64,
         message: SessionMessage,
+        surface: SessionSurfaceIntent,
     },
     ToolResult {
         turn: u64,
         step: u64,
         message: SessionMessage,
+        surface: SessionSurfaceIntent,
     },
 }
 
@@ -268,10 +364,22 @@ impl SessionEventKind {
 
     fn derived_message(&self) -> Option<&SessionMessage> {
         match self {
-            Self::UserMessage { message } | Self::ToolResult { message, .. } => Some(message),
+            Self::UserMessage { message, .. } | Self::ToolResult { message, .. } => Some(message),
             Self::AssistantMessage { message, .. } if !message.content.is_empty() => Some(message),
             Self::AssistantMessage { .. }
             | Self::TurnStart { .. }
+            | Self::TurnEnd { .. }
+            | Self::StepStart { .. }
+            | Self::StepEnd { .. } => None,
+        }
+    }
+
+    fn surface_intent(&self) -> Option<&SessionSurfaceIntent> {
+        match self {
+            Self::UserMessage { surface, .. }
+            | Self::AssistantMessage { surface, .. }
+            | Self::ToolResult { surface, .. } => Some(surface),
+            Self::TurnStart { .. }
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
             | Self::StepEnd { .. } => None,
@@ -381,7 +489,7 @@ impl SessionState {
 
     fn validate_message_event(&self, kind: &SessionEventKind) -> Result<(), SessionError> {
         match kind {
-            SessionEventKind::UserMessage { message } => validate_message(
+            SessionEventKind::UserMessage { message, .. } => validate_message(
                 message,
                 SessionMessageRole::User,
                 "user/message",
@@ -398,6 +506,7 @@ impl SessionState {
                 turn,
                 step,
                 message,
+                ..
             } => {
                 require_turn(self.open_turn, *turn)?;
                 require_step(self.open_step, *turn, *step)?;
@@ -419,6 +528,7 @@ impl SessionState {
                 turn,
                 step,
                 message,
+                ..
             } => {
                 require_turn(self.open_turn, *turn)?;
                 require_step(self.open_step, *turn, *step)?;
@@ -540,12 +650,212 @@ fn validate_content_blocks(
     Ok(())
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionSurfaceState {
+    nodes: Vec<u64>,
+    replace_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+enum SessionSurfacePlan {
+    None,
+    Append {
+        seq: u64,
+    },
+    Replace {
+        seq: u64,
+        start_index: usize,
+        end_index: usize,
+        generation: u64,
+    },
+}
+
+impl SessionSurfaceState {
+    fn snapshot(&self) -> SessionSurface {
+        SessionSurface {
+            nodes: self.nodes.clone(),
+            replace_generation: self.replace_generation,
+        }
+    }
+
+    fn plan(
+        &self,
+        seq: u64,
+        kind: &SessionEventKind,
+        prior_events: &[SessionEvent],
+    ) -> Result<SessionSurfacePlan, SessionError> {
+        let Some(intent) = kind.surface_intent() else {
+            return Ok(SessionSurfacePlan::None);
+        };
+        match intent.surface_op {
+            SessionSurfaceOp::Append => {
+                validate_surface_provenance(seq, kind, intent, &[])?;
+                Ok(SessionSurfacePlan::Append { seq })
+            }
+            SessionSurfaceOp::Replace { start, end } => {
+                let start_index = self
+                    .nodes
+                    .iter()
+                    .position(|node| *node == start)
+                    .ok_or(SessionError::SurfaceReplaceStartNotFound { start })?;
+                let end_index = self
+                    .nodes
+                    .iter()
+                    .position(|node| *node == end)
+                    .ok_or(SessionError::SurfaceReplaceEndNotFound { end })?;
+                if start_index > end_index {
+                    return Err(SessionError::SurfaceReplaceRangeReversed { start, end });
+                }
+                let shadowed = self.nodes[start_index..=end_index].to_vec();
+                validate_surface_provenance(seq, kind, intent, &shadowed)?;
+                validate_tool_result_replacement(kind, &shadowed, prior_events)?;
+                let generation = self
+                    .replace_generation
+                    .checked_add(1)
+                    .ok_or(SessionError::SurfaceGenerationOverflow)?;
+                Ok(SessionSurfacePlan::Replace {
+                    seq,
+                    start_index,
+                    end_index,
+                    generation,
+                })
+            }
+        }
+    }
+
+    fn apply(&mut self, plan: SessionSurfacePlan) {
+        match plan {
+            SessionSurfacePlan::None => {}
+            SessionSurfacePlan::Append { seq } => self.nodes.push(seq),
+            SessionSurfacePlan::Replace {
+                seq,
+                start_index,
+                end_index,
+                generation,
+            } => {
+                self.nodes.splice(start_index..=end_index, [seq]);
+                self.replace_generation = generation;
+            }
+        }
+    }
+}
+
+fn validate_surface_provenance(
+    seq: u64,
+    kind: &SessionEventKind,
+    intent: &SessionSurfaceIntent,
+    shadowed: &[u64],
+) -> Result<(), SessionError> {
+    let mut sources = HashSet::new();
+    if let Some(source_event_seqs) = &intent.source_event_seqs {
+        if source_event_seqs.is_empty()
+            && !matches!(kind, SessionEventKind::AssistantMessage { .. })
+        {
+            return Err(SessionError::EmptySurfaceProvenance {
+                event_type: kind.event_type(),
+            });
+        }
+        for source in source_event_seqs {
+            if !sources.insert(*source) {
+                return Err(SessionError::DuplicateSurfaceProvenance {
+                    source_seq: *source,
+                });
+            }
+            if *source >= seq {
+                return Err(SessionError::SurfaceProvenanceNotEarlier {
+                    source_seq: *source,
+                    current: seq,
+                });
+            }
+        }
+    }
+    let missing = shadowed
+        .iter()
+        .copied()
+        .filter(|node| !sources.contains(node))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(SessionError::IncompleteSurfaceProvenance { missing });
+    }
+    Ok(())
+}
+
+fn validate_tool_result_replacement(
+    replacement: &SessionEventKind,
+    shadowed: &[u64],
+    prior_events: &[SessionEvent],
+) -> Result<(), SessionError> {
+    let SessionEventKind::ToolResult {
+        turn,
+        step,
+        message,
+        ..
+    } = replacement
+    else {
+        return Ok(());
+    };
+    let [original_seq] = shadowed else {
+        return Err(SessionError::ToolResultSurfaceReplaceRange);
+    };
+    let original = usize::try_from(*original_seq)
+        .ok()
+        .and_then(|index| prior_events.get(index));
+    let Some(SessionEvent {
+        kind:
+            SessionEventKind::ToolResult {
+                turn: original_turn,
+                step: original_step,
+                message: original_message,
+                ..
+            },
+        ..
+    }) = original
+    else {
+        return Err(SessionError::ToolResultSurfaceReplaceTarget);
+    };
+    if turn != original_turn
+        || step != original_step
+        || !tool_result_same_except_content(original_message, message)
+    {
+        return Err(SessionError::ToolResultSurfaceReplaceDrift);
+    }
+    Ok(())
+}
+
+fn tool_result_same_except_content(
+    original: &SessionMessage,
+    replacement: &SessionMessage,
+) -> bool {
+    if original.id != replacement.id
+        || original.role != replacement.role
+        || original.source != replacement.source
+    {
+        return false;
+    }
+    matches!(
+        (original.content.as_slice(), replacement.content.as_slice()),
+        (
+            [SessionContentBlock::ToolResult {
+                tool_call_id: original_call,
+                is_error: original_error,
+                ..
+            }],
+            [SessionContentBlock::ToolResult {
+                tool_call_id: replacement_call,
+                is_error: replacement_error,
+                ..
+            }]
+        ) if original_call == replacement_call && original_error == replacement_error
+    )
+}
+
 /// Validated append-only lifecycle log for one Session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLog {
     header: SessionHeader,
     events: Vec<SessionEvent>,
     state: SessionState,
+    surface: SessionSurfaceState,
 }
 
 impl SessionLog {
@@ -554,6 +864,7 @@ impl SessionLog {
             header: SessionHeader::new(id)?,
             events: Vec::new(),
             state: SessionState::default(),
+            surface: SessionSurfaceState::default(),
         })
     }
 
@@ -562,12 +873,14 @@ impl SessionLog {
             header: SessionHeader::new_at(id, created_at_ms)?,
             events: Vec::new(),
             state: SessionState::default(),
+            surface: SessionSurfaceState::default(),
         })
     }
 
     pub fn restore(header: SessionHeader, events: Vec<SessionEvent>) -> Result<Self, SessionError> {
         validate_header(&header, events.len())?;
         let mut state = SessionState::default();
+        let mut surface = SessionSurfaceState::default();
         for (index, event) in events.iter().enumerate() {
             let expected = u64::try_from(index).map_err(|_| SessionError::EventSequenceOverflow)?;
             if event.seq != expected {
@@ -583,11 +896,14 @@ impl SessionLog {
                 });
             }
             state.apply(&event.kind)?;
+            let plan = surface.plan(event.seq, &event.kind, &events[..index])?;
+            surface.apply(plan);
         }
         Ok(Self {
             header,
             events,
             state,
+            surface,
         })
     }
 
@@ -599,6 +915,11 @@ impl SessionLog {
     #[must_use]
     pub fn events(&self) -> &[SessionEvent] {
         &self.events
+    }
+
+    #[must_use]
+    pub fn surface(&self) -> SessionSurface {
+        self.surface.snapshot()
     }
 
     #[must_use]
@@ -643,7 +964,15 @@ impl SessionLog {
     }
 
     pub fn append_user_message(&mut self, message: SessionMessage) -> Result<(), SessionError> {
-        self.append(SessionEventKind::UserMessage { message })?;
+        self.append_user_message_with_surface(message, SessionSurfaceIntent::append())
+    }
+
+    pub fn append_user_message_with_surface(
+        &mut self,
+        message: SessionMessage,
+        surface: SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
+        self.append(SessionEventKind::UserMessage { message, surface })?;
         Ok(())
     }
 
@@ -653,10 +982,26 @@ impl SessionLog {
         step: u64,
         message: SessionMessage,
     ) -> Result<(), SessionError> {
+        self.append_assistant_message_with_surface(
+            turn,
+            step,
+            message,
+            SessionSurfaceIntent::append(),
+        )
+    }
+
+    pub fn append_assistant_message_with_surface(
+        &mut self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+        surface: SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
         self.append(SessionEventKind::AssistantMessage {
             turn,
             step,
             message,
+            surface,
         })?;
         Ok(())
     }
@@ -667,22 +1012,37 @@ impl SessionLog {
         step: u64,
         message: SessionMessage,
     ) -> Result<(), SessionError> {
+        self.append_tool_result_with_surface(turn, step, message, SessionSurfaceIntent::append())
+    }
+
+    pub fn append_tool_result_with_surface(
+        &mut self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+        surface: SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
         self.append(SessionEventKind::ToolResult {
             turn,
             step,
             message,
+            surface,
         })?;
         Ok(())
     }
 
-    /// Derive a detached model-history snapshot from the durable event order.
+    /// Derive a detached model-history snapshot from the ordered surface.
     ///
+    /// Replaced nodes remain durable but are shadowed from future requests.
     /// Lifecycle events never enter history, and an empty assistant message is
-    /// retained for accounting/replay while omitted from the model transcript.
+    /// retained on the surface for accounting while omitted from the transcript.
     #[must_use]
     pub fn derive_messages(&self) -> Vec<SessionMessage> {
-        self.events
+        self.surface
+            .nodes
             .iter()
+            .filter_map(|seq| usize::try_from(*seq).ok())
+            .filter_map(|index| self.events.get(index))
             .filter_map(|event| event.kind.derived_message().cloned())
             .collect()
     }
@@ -723,15 +1083,17 @@ impl SessionLog {
         kind: SessionEventKind,
         time_ms: i64,
     ) -> Result<&SessionEvent, SessionError> {
-        let mut next_state = self.state;
-        next_state.apply(&kind)?;
         let seq =
             u64::try_from(self.events.len()).map_err(|_| SessionError::EventSequenceOverflow)?;
         if time_ms < 0 {
             return Err(SessionError::InvalidEventTime { seq, time_ms });
         }
+        let mut next_state = self.state;
+        next_state.apply(&kind)?;
+        let surface_plan = self.surface.plan(seq, &kind, &self.events)?;
         self.events.push(SessionEvent { seq, time_ms, kind });
         self.state = next_state;
+        self.surface.apply(surface_plan);
         self.events
             .last()
             .ok_or(SessionError::EventSequenceOverflow)
@@ -795,6 +1157,10 @@ impl SessionHandle {
         Ok(self.lock()?.events().to_vec())
     }
 
+    pub fn surface(&self) -> Result<SessionSurface, SessionError> {
+        Ok(self.lock()?.surface())
+    }
+
     pub fn start_turn(&self) -> Result<u64, SessionError> {
         self.commit(SessionLog::start_turn)
     }
@@ -815,6 +1181,14 @@ impl SessionHandle {
         self.commit(|log| log.append_user_message(message))
     }
 
+    pub fn append_user_message_with_surface(
+        &self,
+        message: SessionMessage,
+        surface: SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
+        self.commit(|log| log.append_user_message_with_surface(message, surface))
+    }
+
     pub fn append_assistant_message(
         &self,
         turn: u64,
@@ -824,6 +1198,16 @@ impl SessionHandle {
         self.commit(|log| log.append_assistant_message(turn, step, message))
     }
 
+    pub fn append_assistant_message_with_surface(
+        &self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+        surface: SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
+        self.commit(|log| log.append_assistant_message_with_surface(turn, step, message, surface))
+    }
+
     pub fn append_tool_result(
         &self,
         turn: u64,
@@ -831,6 +1215,16 @@ impl SessionHandle {
         message: SessionMessage,
     ) -> Result<(), SessionError> {
         self.commit(|log| log.append_tool_result(turn, step, message))
+    }
+
+    pub fn append_tool_result_with_surface(
+        &self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+        surface: SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
+        self.commit(|log| log.append_tool_result_with_surface(turn, step, message, surface))
     }
 
     pub fn derive_messages(&self) -> Result<Vec<SessionMessage>, SessionError> {
@@ -1175,6 +1569,32 @@ pub enum SessionError {
     MismatchedToolCallIds,
     #[error("session message persistence encoding is invalid")]
     InvalidMessageEncoding,
+    #[error("session surface persistence encoding is invalid")]
+    InvalidSurfaceEncoding,
+    #[error("session {event_type} source event sequences must not be empty")]
+    EmptySurfaceProvenance { event_type: &'static str },
+    #[error("session surface source event sequence {source_seq} is duplicated")]
+    DuplicateSurfaceProvenance { source_seq: u64 },
+    #[error(
+        "session surface source event sequence {source_seq} must be earlier than current event {current}"
+    )]
+    SurfaceProvenanceNotEarlier { source_seq: u64, current: u64 },
+    #[error("session surface replace start {start} is not a current surface node")]
+    SurfaceReplaceStartNotFound { start: u64 },
+    #[error("session surface replace end {end} is not a current surface node")]
+    SurfaceReplaceEndNotFound { end: u64 },
+    #[error("session surface replace start {start} appears after end {end}")]
+    SurfaceReplaceRangeReversed { start: u64, end: u64 },
+    #[error("session surface replacement provenance is missing nodes {missing:?}")]
+    IncompleteSurfaceProvenance { missing: Vec<u64> },
+    #[error("session tool/result surface replacement must rewrite exactly one current node")]
+    ToolResultSurfaceReplaceRange,
+    #[error("session tool/result surface replacement must target a current tool/result")]
+    ToolResultSurfaceReplaceTarget,
+    #[error("session tool/result surface replacement may change only result content")]
+    ToolResultSurfaceReplaceDrift,
+    #[error("session surface replacement generation overflowed")]
+    SurfaceGenerationOverflow,
     #[error("session seed length {seed_length} exceeds event count {event_count}")]
     SeedBeyondLog { seed_length: u64, event_count: u64 },
     #[error("session `{id}` already exists")]

@@ -7381,7 +7381,7 @@ mod tests {
         assert!(installed.shares_cordis_coordinator(&raced));
     }
 
-    fn desktop_restart_messages() -> [hartevo_cordis::SessionMessage; 3] {
+    fn desktop_restart_messages() -> [hartevo_cordis::SessionMessage; 4] {
         use hartevo_cordis::{
             SessionContentBlock, SessionMessage, SessionMessageRole, SessionMessageSource,
         };
@@ -7425,7 +7425,37 @@ mod tests {
                     call_id: "desktop-call-1".into(),
                 },
             },
+            SessionMessage {
+                id: "desktop-summary-1".into(),
+                role: SessionMessageRole::Assistant,
+                content: vec![SessionContentBlock::Text {
+                    text: "compacted restart history".into(),
+                }],
+                source: SessionMessageSource::Model {
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                },
+            },
         ]
+    }
+
+    fn replace_desktop_restart_surface(
+        session: &hartevo_cordis::SessionHandle,
+        turn: u64,
+        step: u64,
+        summary: hartevo_cordis::SessionMessage,
+    ) {
+        let surface = session.surface().expect("surface before replacement");
+        let start = *surface.nodes.first().expect("surface head");
+        let end = *surface.nodes.last().expect("surface tail");
+        session
+            .append_assistant_message_with_surface(
+                turn,
+                step,
+                summary,
+                hartevo_cordis::SessionSurfaceIntent::replace(start, end, surface.nodes),
+            )
+            .expect("surface replacement");
     }
 
     #[tokio::test]
@@ -7440,34 +7470,42 @@ mod tests {
             .initialize_with(&secrets, observed_at())
             .expect("initialize and bind Session persistence");
 
-        let (sessions, session, expected_header, expected_events, expected_messages) = first
-            .with_cordis_host(|host| {
-                let sessions = host
-                    .context()
-                    .sessions::<SessionStore>()
-                    .expect("Cordis Session store");
-                let session = sessions
-                    .create(SessionId::new("desktop-restart-session").unwrap())
-                    .expect("live Session");
-                let turn = session.start_turn().expect("turn start");
-                let [user, assistant, tool] = desktop_restart_messages();
-                session.append_user_message(user).expect("user message");
-                let step = session.start_step(turn).expect("step start");
-                session
-                    .append_assistant_message(turn, step, assistant)
-                    .expect("assistant message");
-                session
-                    .append_tool_result(turn, step, tool)
-                    .expect("tool result");
-                session.finish_step(turn, step).expect("step end");
-                session
-                    .finish_turn(turn, TurnEndReason::Completed)
-                    .expect("turn end");
-                let header = session.header().expect("header");
-                let events = session.events().expect("events");
-                let messages = session.derive_messages().expect("message history");
-                (sessions, session, header, events, messages)
-            });
+        let (
+            sessions,
+            session,
+            expected_header,
+            expected_events,
+            expected_surface,
+            expected_messages,
+        ) = first.with_cordis_host(|host| {
+            let sessions = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("Cordis Session store");
+            let session = sessions
+                .create(SessionId::new("desktop-restart-session").unwrap())
+                .expect("live Session");
+            let turn = session.start_turn().expect("turn start");
+            let [user, assistant, tool, summary] = desktop_restart_messages();
+            session.append_user_message(user).expect("user message");
+            let step = session.start_step(turn).expect("step start");
+            session
+                .append_assistant_message(turn, step, assistant)
+                .expect("assistant message");
+            session
+                .append_tool_result(turn, step, tool)
+                .expect("tool result");
+            replace_desktop_restart_surface(&session, turn, step, summary);
+            session.finish_step(turn, step).expect("step end");
+            session
+                .finish_turn(turn, TurnEndReason::Completed)
+                .expect("turn end");
+            let header = session.header().expect("header");
+            let events = session.events().expect("events");
+            let surface = session.surface().expect("surface");
+            let messages = session.derive_messages().expect("message history");
+            (sessions, session, header, events, surface, messages)
+        });
         assert!(sessions.flush(&session).await.expect("durable flush"));
         drop(session);
         drop(sessions);
@@ -7497,6 +7535,7 @@ mod tests {
                 .expect("restored Session");
             assert_eq!(restored.header().unwrap(), expected_header);
             assert_eq!(restored.events().unwrap(), expected_events);
+            assert_eq!(restored.surface().unwrap(), expected_surface);
             assert_eq!(restored.derive_messages().unwrap(), expected_messages);
             (sessions, restored)
         });

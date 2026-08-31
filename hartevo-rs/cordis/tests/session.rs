@@ -6,7 +6,8 @@ use hartevo_cordis::{
     AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
     KernelConsentState, SessionContentBlock, SessionError, SessionEvent, SessionEventKind,
     SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionStore, TurnEndReason, invariant_missing, session_events,
+    SessionStore, SessionSurfaceIntent, SessionSurfaceOp, TurnEndReason, invariant_missing,
+    session_events,
 };
 
 #[derive(Debug)]
@@ -165,13 +166,227 @@ fn empty_assistant_message_is_durable_but_absent_from_history() {
     let mut log = SessionLog::new_at(SessionId::new("empty-assistant").unwrap(), 1).unwrap();
     let turn = log.start_turn().unwrap();
     let step = log.start_step(turn).unwrap();
-    log.append_assistant_message(turn, step, assistant_message("usage-only", vec![]))
-        .unwrap();
+    log.append_assistant_message_with_surface(
+        turn,
+        step,
+        assistant_message("usage-only", vec![]),
+        SessionSurfaceIntent::append_from(vec![]),
+    )
+    .unwrap();
     log.finish_step(turn, step).unwrap();
     log.finish_turn(turn, TurnEndReason::MaxTokens).unwrap();
 
     assert_eq!(log.events()[2].kind.event_type(), "assistant/message");
     assert!(log.derive_messages().is_empty());
+}
+
+#[test]
+fn surface_replacement_shadows_history_and_restores_exactly() {
+    let mut log = SessionLog::new_at(SessionId::new("surface-replace").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let first = user_message("user-1", "first");
+    let second = user_message("user-2", "second");
+    log.append_user_message(first.clone()).unwrap();
+    log.append_user_message(second.clone()).unwrap();
+    let step = log.start_step(turn).unwrap();
+    let summary = assistant_message(
+        "assistant-summary",
+        vec![SessionContentBlock::Text {
+            text: "summary".into(),
+        }],
+    );
+    log.append_assistant_message_with_surface(
+        turn,
+        step,
+        summary.clone(),
+        SessionSurfaceIntent::replace(1, 2, vec![1, 2]),
+    )
+    .unwrap();
+    log.finish_step(turn, step).unwrap();
+    log.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    assert_eq!(
+        log.surface(),
+        hartevo_cordis::SessionSurface {
+            nodes: vec![4],
+            replace_generation: 1,
+        }
+    );
+    assert_eq!(log.derive_messages(), vec![summary.clone()]);
+    assert!(matches!(
+        &log.events()[1].kind,
+        SessionEventKind::UserMessage { message, .. } if message == &first
+    ));
+    assert!(matches!(
+        &log.events()[2].kind,
+        SessionEventKind::UserMessage { message, .. } if message == &second
+    ));
+
+    let restored = SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap();
+    assert_eq!(restored.surface(), log.surface());
+    assert_eq!(restored.derive_messages(), vec![summary]);
+
+    let mut corrupt = log.events().to_vec();
+    let SessionEventKind::AssistantMessage { surface, .. } = &mut corrupt[4].kind else {
+        panic!("fixture must contain the surface replacement");
+    };
+    surface.source_event_seqs = Some(vec![1]);
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), corrupt).unwrap_err(),
+        SessionError::IncompleteSurfaceProvenance { missing: vec![2] }
+    );
+}
+
+#[test]
+fn invalid_surface_candidates_fail_before_log_or_projection_mutation() {
+    let mut log = SessionLog::new_at(SessionId::new("surface-atomic").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    log.append_user_message(user_message("user-1", "first"))
+        .unwrap();
+    log.append_user_message(user_message("user-2", "second"))
+        .unwrap();
+    let step = log.start_step(turn).unwrap();
+    let before_events = log.events().to_vec();
+    let before_surface = log.surface();
+    let summary = assistant_message(
+        "assistant-summary",
+        vec![SessionContentBlock::Text {
+            text: "summary".into(),
+        }],
+    );
+
+    assert_eq!(
+        log.append_user_message_with_surface(
+            user_message("invalid-empty-source", "ignored"),
+            SessionSurfaceIntent::append_from(vec![]),
+        )
+        .unwrap_err(),
+        SessionError::EmptySurfaceProvenance {
+            event_type: "user/message"
+        }
+    );
+    assert_eq!(
+        log.append_assistant_message_with_surface(
+            turn,
+            step,
+            summary.clone(),
+            SessionSurfaceIntent::replace(1, 2, vec![1]),
+        )
+        .unwrap_err(),
+        SessionError::IncompleteSurfaceProvenance { missing: vec![2] }
+    );
+    assert_eq!(
+        log.append_assistant_message_with_surface(
+            turn,
+            step,
+            summary.clone(),
+            SessionSurfaceIntent::replace(1, 2, vec![1, 1, 2]),
+        )
+        .unwrap_err(),
+        SessionError::DuplicateSurfaceProvenance { source_seq: 1 }
+    );
+    assert_eq!(
+        log.append_assistant_message_with_surface(
+            turn,
+            step,
+            summary.clone(),
+            SessionSurfaceIntent::append_from(vec![4]),
+        )
+        .unwrap_err(),
+        SessionError::SurfaceProvenanceNotEarlier {
+            source_seq: 4,
+            current: 4,
+        }
+    );
+    assert_eq!(
+        log.append_assistant_message_with_surface(
+            turn,
+            step,
+            summary,
+            SessionSurfaceIntent::replace(99, 2, vec![1, 2]),
+        )
+        .unwrap_err(),
+        SessionError::SurfaceReplaceStartNotFound { start: 99 }
+    );
+    assert_eq!(log.events(), before_events);
+    assert_eq!(log.surface(), before_surface);
+}
+
+#[test]
+fn tool_result_surface_rewrite_changes_content_only() {
+    let mut log = SessionLog::new_at(SessionId::new("tool-rewrite").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let step = log.start_step(turn).unwrap();
+    let original = tool_result_message("tool-1", "call-1", "before");
+    log.append_tool_result(turn, step, original.clone())
+        .unwrap();
+
+    let mut replacement = original;
+    let [SessionContentBlock::ToolResult { content, .. }] = replacement.content.as_mut_slice()
+    else {
+        panic!("fixture must contain one tool result");
+    };
+    content[0] = SessionContentBlock::Text {
+        text: "after".into(),
+    };
+    log.append_tool_result_with_surface(
+        turn,
+        step,
+        replacement.clone(),
+        SessionSurfaceIntent::replace(2, 2, vec![2]),
+    )
+    .unwrap();
+    assert_eq!(log.surface().nodes, vec![3]);
+    assert_eq!(log.derive_messages(), vec![replacement.clone()]);
+
+    let mut drifted = replacement;
+    drifted.id = "changed-id".into();
+    let before_events = log.events().to_vec();
+    assert_eq!(
+        log.append_tool_result_with_surface(
+            turn,
+            step,
+            drifted,
+            SessionSurfaceIntent::replace(3, 3, vec![3]),
+        )
+        .unwrap_err(),
+        SessionError::ToolResultSurfaceReplaceDrift
+    );
+    assert_eq!(log.events(), before_events);
+    assert_eq!(log.surface().nodes, vec![3]);
+}
+
+#[test]
+fn surface_json_rejects_unknown_nested_fields() {
+    for invalid in [
+        serde_json::json!({
+            "surfaceOp": { "op": "append", "unknown": true }
+        }),
+        serde_json::json!({
+            "surfaceOp": { "op": "replace", "start": 0, "end": 0 },
+            "sourceEventSeqs": [0],
+            "unknown": true
+        }),
+        serde_json::json!({
+            "surfaceOp": { "op": "append" },
+            "sourceEventSeqs": null
+        }),
+    ] {
+        assert_eq!(
+            SessionSurfaceIntent::from_json_value(invalid).unwrap_err(),
+            SessionError::InvalidSurfaceEncoding
+        );
+    }
+    assert_eq!(
+        SessionSurfaceIntent::from_json_value(
+            SessionSurfaceIntent::replace(0, 0, vec![0])
+                .to_json_value()
+                .unwrap()
+        )
+        .unwrap()
+        .surface_op,
+        SessionSurfaceOp::Replace { start: 0, end: 0 }
+    );
 }
 
 #[test]
@@ -185,7 +400,7 @@ fn malformed_message_replay_fails_closed() {
         .unwrap();
 
     let mut empty_id = log.events().to_vec();
-    let SessionEventKind::UserMessage { message } = &mut empty_id[1].kind else {
+    let SessionEventKind::UserMessage { message, .. } = &mut empty_id[1].kind else {
         panic!("fixture must contain a user message");
     };
     message.id.clear();
@@ -197,7 +412,7 @@ fn malformed_message_replay_fails_closed() {
     );
 
     let mut wrong_role = log.events().to_vec();
-    let SessionEventKind::UserMessage { message } = &mut wrong_role[1].kind else {
+    let SessionEventKind::UserMessage { message, .. } = &mut wrong_role[1].kind else {
         panic!("fixture must contain a user message");
     };
     message.role = SessionMessageRole::Assistant;
