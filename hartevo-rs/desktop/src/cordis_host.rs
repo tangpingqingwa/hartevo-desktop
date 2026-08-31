@@ -19,8 +19,9 @@ use hartevo_cordis::{
     EffectVerificationPermit, Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision,
     KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
-    SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHeader, SessionId,
-    SessionLog, SessionMessage, SessionRequestContext, SessionRequestHeader, SessionStore,
+    SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
+    SessionHandle, SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionStore,
     SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop,
     keys, session_events,
 };
@@ -98,6 +99,43 @@ pub(crate) struct DesktopCordisCoordinator {
     last_binding: Option<DesktopCordisBindingState>,
 }
 
+/// One already-observed Application Runtime turn projected into Cordis.
+///
+/// Bodies stay private to the encrypted Session store and are deliberately
+/// omitted from `Debug` surfaces. Application remains the execution and
+/// Mission-truth owner; this value grants no Runtime or Effect authority.
+pub(crate) struct DesktopRuntimeSessionTranscript {
+    session_id: String,
+    runtime_turn_id: String,
+    user_body: String,
+    provider: String,
+    model: String,
+    assistant_body: Option<String>,
+    end_reason: TurnEndReason,
+}
+
+impl DesktopRuntimeSessionTranscript {
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        runtime_turn_id: impl Into<String>,
+        user_body: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        assistant_body: Option<String>,
+        end_reason: TurnEndReason,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            runtime_turn_id: runtime_turn_id.into(),
+            user_body: user_body.into(),
+            provider: provider.into(),
+            model: model.into(),
+            assistant_body,
+            end_reason,
+        }
+    }
+}
+
 impl DesktopCordisCoordinator {
     fn new(
         host: CordisHost,
@@ -135,6 +173,73 @@ impl DesktopCordisCoordinator {
             .sessions::<SessionStore>()
             .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
         self.session_persistence.bind_and_restore(store, &sessions)
+    }
+
+    /// Append one closed, idempotent projection of a real Application Runtime
+    /// turn and commit it through the existing SQLCipher Session adapter.
+    pub(crate) fn record_runtime_transcript(
+        &mut self,
+        transcript: DesktopRuntimeSessionTranscript,
+    ) -> Result<(), DesktopSessionPersistenceError> {
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
+        let session = sessions.get_or_create(SessionId::new(transcript.session_id.clone())?)?;
+        let user = SessionMessage {
+            id: format!("runtime:{}:user", transcript.runtime_turn_id),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: transcript.user_body,
+            }],
+            source: SessionMessageSource::User,
+        };
+        let assistant = transcript.assistant_body.map(|body| SessionMessage {
+            id: format!("runtime:{}:assistant", transcript.runtime_turn_id),
+            role: SessionMessageRole::Assistant,
+            content: vec![SessionContentBlock::Text { text: body }],
+            source: SessionMessageSource::Model {
+                provider: transcript.provider.clone(),
+                model: transcript.model.clone(),
+            },
+        });
+        let expected = std::iter::once(&user)
+            .chain(assistant.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let expected_ids = expected
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        let recorded = session
+            .derive_messages()?
+            .into_iter()
+            .filter(|message| expected_ids.contains(&message.id.as_str()))
+            .collect::<Vec<_>>();
+        if !recorded.is_empty() {
+            if recorded != expected {
+                return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                    transcript.session_id,
+                ));
+            }
+            return self.session_persistence.persist_live(&session);
+        }
+
+        let turn = session.start_turn()?;
+        let step = session.start_step(turn)?;
+        session.append_user_message(user)?;
+        session.append_request_context(SessionRequestContext {
+            provider: transcript.provider,
+            model: transcript.model,
+            context_window: None,
+        })?;
+        if let Some(message) = assistant {
+            session.append_assistant_message(turn, step, message)?;
+        }
+        session.finish_step(turn, step)?;
+        session.finish_turn(turn, transcript.end_reason)?;
+        self.session_persistence.persist_live(&session)
     }
 
     fn next_binding_sequence(&self) -> Result<u64, CordisError> {
@@ -532,6 +637,13 @@ impl DesktopSessionPersistence {
         }
         Ok(())
     }
+
+    fn persist_live(&self, session: &SessionHandle) -> Result<(), DesktopSessionPersistenceError> {
+        self.persist(&SessionCheckpoint {
+            header: session.header()?,
+            events: session.events()?,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -544,6 +656,8 @@ pub(crate) enum DesktopSessionPersistenceError {
     MissingSessionStore,
     #[error("live Cordis Session {0} diverges from its durable prefix")]
     LiveSessionDiverged(String),
+    #[error("Cordis Runtime transcript for Session {0} diverges from its exact turn identity")]
+    RuntimeTranscriptDiverged(String),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
