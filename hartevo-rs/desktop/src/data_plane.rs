@@ -12589,8 +12589,8 @@ sleep 30"#;
     fn desktop_runtime_journey_declines_local_write_and_adopts_only_completed_message() {
         use hartevo_cordis::{
             SessionCallConfig, SessionContentBlock, SessionEpochHeader, SessionEventKind,
-            SessionId, SessionMessageSource, SessionRequestHeaderReason, SessionStore,
-            SessionStreamChunk,
+            SessionFinishReason, SessionId, SessionMessageSource, SessionRequestHeaderReason,
+            SessionStore, SessionStreamBlockType, SessionStreamChunk,
         };
 
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -12673,7 +12673,7 @@ sleep 30"#;
                 .expect("Runtime Session lookup")
                 .expect("real Runtime Session");
             let events = session.events().expect("real Runtime Session events");
-            assert_eq!(events.len(), 10);
+            assert_eq!(events.len(), 13);
             assert!(matches!(
                 events.get(1).map(|event| &event.kind),
                 Some(SessionEventKind::RequestHeader { request })
@@ -12713,6 +12713,10 @@ sleep 30"#;
                     .map(|chunk| chunk.chunk)
                     .collect::<Vec<_>>(),
                 vec![
+                    SessionStreamChunk::BlockStart {
+                        index: 0,
+                        block_type: SessionStreamBlockType::Text,
+                    },
                     SessionStreamChunk::TextDelta {
                         index: 0,
                         text: "Reviewable local runtime ".into(),
@@ -12721,8 +12725,23 @@ sleep 30"#;
                         index: 0,
                         text: "draft; no external effect occurred.".into(),
                     },
+                    SessionStreamChunk::BlockEnd {
+                        index: 0,
+                        block: SessionContentBlock::Text {
+                            text: "Reviewable local runtime draft; no external effect occurred."
+                                .into(),
+                        },
+                    },
+                    SessionStreamChunk::Finish {
+                        reason: SessionFinishReason::Stop,
+                        replay_state: None,
+                    },
                 ]
             );
+            assert!(matches!(
+                events.get(10).map(|event| &event.kind),
+                Some(SessionEventKind::AssistantMessage { .. })
+            ));
             assert_eq!(
                 session
                     .request_header()
