@@ -12340,8 +12340,8 @@ sleep 30"#;
     )]
     fn desktop_runtime_text_delta_flushes_before_terminal_observation() {
         use hartevo_cordis::{
-            SessionContentBlock, SessionEventKind, SessionId, SessionStore, SessionStreamBlockType,
-            SessionStreamChunk,
+            SessionContentBlock, SessionEventKind, SessionId, SessionMessageSource, SessionStore,
+            SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
         };
         use hartevo_storage::PersistedSessionEventKind;
 
@@ -12483,7 +12483,7 @@ sleep 30"#;
                 .unwrap()
                 .expect("closed Session");
             let events = session.events().unwrap();
-            assert_eq!(events.len(), 10);
+            assert_eq!(events.len(), 11);
             assert_eq!(
                 session
                     .assistant_chunks(1, 1)
@@ -12508,23 +12508,37 @@ sleep 30"#;
                     },
                 ]
             );
-            assert!(
-                events
-                    .iter()
-                    .all(|event| !matches!(&event.kind, SessionEventKind::AssistantMessage { .. }))
-            );
+            let messages = session.derive_messages().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert!(matches!(
+                (&messages[1].source, messages[1].content.as_slice()),
+                (
+                    SessionMessageSource::Model { provider, model },
+                    [SessionContentBlock::Text { text }]
+                ) if provider == "fixture-provider"
+                    && model == "fixture-model"
+                    && text == "Reviewable local runtime "
+            ));
             assert!(matches!(
                 &events[8].kind,
-                SessionEventKind::StepEnd { turn: 1, step: 1 }
+                SessionEventKind::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    surface,
+                    ..
+                } if surface == &SessionSurfaceIntent::append_from(vec![5, 6, 7])
             ));
             assert!(matches!(
                 &events[9].kind,
+                SessionEventKind::StepEnd { turn: 1, step: 1 }
+            ));
+            assert!(matches!(
+                &events[10].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
                     reason: TurnEndReason::Interrupted,
                 }
             ));
-            assert_eq!(session.derive_messages().unwrap().len(), 1);
         });
     }
 

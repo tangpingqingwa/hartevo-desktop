@@ -507,7 +507,12 @@ impl DesktopCordisCoordinator {
             .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
         let session = sessions.get_or_create(SessionId::new(transcript.session_id.clone())?)?;
         let user = runtime_user_message(&transcript.runtime_turn_id, transcript.user_body);
-        let assistant_body = transcript.assistant_body;
+        let assistant_chunks = transcript.assistant_chunks;
+        let partial_body = assistant_chunks.concat();
+        let assistant_body = transcript.assistant_body.or_else(|| {
+            (transcript.end_reason == TurnEndReason::Interrupted && !partial_body.trim().is_empty())
+                .then(|| partial_body.clone())
+        });
         let assistant = assistant_body.as_ref().map(|body| SessionMessage {
             id: format!("runtime:{}:assistant", transcript.runtime_turn_id),
             role: SessionMessageRole::Assistant,
@@ -519,8 +524,6 @@ impl DesktopCordisCoordinator {
         });
         let expected_header = runtime_request_header(&transcript.provider, &transcript.model);
         let expected_context = runtime_request_context(&transcript.provider, &transcript.model);
-        let assistant_chunks = transcript.assistant_chunks;
-        let partial_body = assistant_chunks.concat();
         let legacy_chunks = assistant_chunks
             .into_iter()
             .map(|text| SessionStreamChunk::TextDelta { index: 0, text })
