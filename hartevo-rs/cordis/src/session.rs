@@ -1,10 +1,11 @@
 //! Minimal Rust-native Session boundary log adapted from DeepSeek Harness.
 //!
-//! This slice records and validates turn/step lifecycle plus the three durable
-//! message events that form model history. Its ordered surface can append or
-//! replace model-visible nodes without deleting the source log, and it exposes
-//! the typed event/flush seam consumed by persistence plugins. The wider
-//! Harness vocabulary remains separate follow-up work.
+//! This slice records and validates turn/step lifecycle, raw assistant stream
+//! chunks, and the three durable message events that form model history. Its
+//! ordered surface can append or replace model-visible nodes without deleting
+//! the source log, and it exposes the typed event/flush seam consumed by
+//! persistence plugins. The wider Harness vocabulary remains separate
+//! follow-up work.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -186,6 +187,136 @@ impl fmt::Debug for SessionContentBlock {
     }
 }
 
+/// Provider-neutral block kind opened by one assistant stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionStreamBlockType {
+    Text,
+    Reasoning,
+    ToolCall,
+}
+
+/// Serializable provider or transport failure facts carried by a finish chunk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionLlmFailure {
+    pub message: String,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// Why one provider stream stopped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SessionFinishReason {
+    Stop,
+    ToolCalls,
+    MaxTokens,
+    Aborted { failure: SessionLlmFailure },
+    Error { failure: SessionLlmFailure },
+}
+
+/// Disjoint token accounting for one provider call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Adapter-private lossless JSON retained on a successful terminal chunk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionReplayEnvelope {
+    pub response: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<serde_json::Value>>,
+}
+
+/// Raw provider-neutral streaming vocabulary retained for token-level replay.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SessionStreamChunk {
+    BlockStart {
+        index: u64,
+        #[serde(rename = "blockType")]
+        block_type: SessionStreamBlockType,
+    },
+    TextDelta {
+        index: u64,
+        text: String,
+    },
+    ReasoningDelta {
+        index: u64,
+        text: String,
+    },
+    ToolCallDelta {
+        index: u64,
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(rename = "argumentsDelta")]
+        arguments_delta: String,
+    },
+    BlockEnd {
+        index: u64,
+        block: SessionContentBlock,
+    },
+    Usage {
+        usage: SessionTokenUsage,
+    },
+    Finish {
+        reason: SessionFinishReason,
+        #[serde(
+            rename = "replayState",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        replay_state: Option<SessionReplayEnvelope>,
+    },
+}
+
+impl SessionStreamChunk {
+    /// Encode one typed raw chunk for a neutral persistence adapter.
+    pub fn to_json_value(&self) -> Result<serde_json::Value, SessionError> {
+        serde_json::to_value(self).map_err(|_| SessionError::InvalidAssistantChunkEncoding)
+    }
+
+    /// Decode one exact neutral chunk shape before Session replay validates it.
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, SessionError> {
+        let chunk: Self = serde_json::from_value(value.clone())
+            .map_err(|_| SessionError::InvalidAssistantChunkEncoding)?;
+        let canonical = chunk.to_json_value()?;
+        if &canonical != value {
+            return Err(SessionError::InvalidAssistantChunkEncoding);
+        }
+        Ok(chunk)
+    }
+}
+
+/// Detached raw chunk record returned in authoritative Session order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAssistantChunk {
+    pub seq: u64,
+    pub time_ms: i64,
+    pub turn: u64,
+    pub step: u64,
+    pub chunk: SessionStreamChunk,
+}
+
 /// One identified immutable message shared by durable history and replay.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -312,7 +443,7 @@ pub struct SessionSurface {
     pub replace_generation: u64,
 }
 
-/// The bounded Session event vocabulary through N23.
+/// The bounded Session event vocabulary through N24.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
     TurnStart {
@@ -329,6 +460,11 @@ pub enum SessionEventKind {
     StepEnd {
         turn: u64,
         step: u64,
+    },
+    AssistantChunk {
+        turn: u64,
+        step: u64,
+        chunk: SessionStreamChunk,
     },
     UserMessage {
         message: SessionMessage,
@@ -356,6 +492,7 @@ impl SessionEventKind {
             Self::TurnEnd { .. } => "turn/end",
             Self::StepStart { .. } => "step/start",
             Self::StepEnd { .. } => "step/end",
+            Self::AssistantChunk { .. } => "assistant/chunk",
             Self::UserMessage { .. } => "user/message",
             Self::AssistantMessage { .. } => "assistant/message",
             Self::ToolResult { .. } => "tool/result",
@@ -370,7 +507,8 @@ impl SessionEventKind {
             | Self::TurnStart { .. }
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
-            | Self::StepEnd { .. } => None,
+            | Self::StepEnd { .. }
+            | Self::AssistantChunk { .. } => None,
         }
     }
 
@@ -382,7 +520,8 @@ impl SessionEventKind {
             Self::TurnStart { .. }
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
-            | Self::StepEnd { .. } => None,
+            | Self::StepEnd { .. }
+            | Self::AssistantChunk { .. } => None,
         }
     }
 }
@@ -480,6 +619,11 @@ impl SessionState {
                 require_step(self.open_step, turn, step)?;
                 self.open_step = None;
             }
+            SessionEventKind::AssistantChunk { turn, step, chunk } => {
+                require_turn(self.open_turn, *turn)?;
+                require_step(self.open_step, *turn, *step)?;
+                validate_assistant_chunk(chunk)?;
+            }
             SessionEventKind::UserMessage { .. }
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ToolResult { .. } => self.validate_message_event(kind)?,
@@ -549,9 +693,93 @@ impl SessionState {
             SessionEventKind::TurnStart { .. }
             | SessionEventKind::TurnEnd { .. }
             | SessionEventKind::StepStart { .. }
-            | SessionEventKind::StepEnd { .. } => Ok(()),
+            | SessionEventKind::StepEnd { .. }
+            | SessionEventKind::AssistantChunk { .. } => Ok(()),
         }
     }
+}
+
+fn validate_assistant_chunk(chunk: &SessionStreamChunk) -> Result<(), SessionError> {
+    match chunk {
+        SessionStreamChunk::BlockStart { .. }
+        | SessionStreamChunk::TextDelta { .. }
+        | SessionStreamChunk::ReasoningDelta { .. } => Ok(()),
+        SessionStreamChunk::ToolCallDelta { id, name, .. } => {
+            if id.is_empty() || name.as_ref().is_some_and(String::is_empty) {
+                return Err(SessionError::InvalidAssistantChunk {
+                    expected: "non-empty tool call id and optional name",
+                });
+            }
+            Ok(())
+        }
+        SessionStreamChunk::BlockEnd { block, .. } => {
+            if matches!(block, SessionContentBlock::ToolResult { .. }) {
+                return Err(SessionError::InvalidAssistantChunk {
+                    expected: "assistant block-end content",
+                });
+            }
+            validate_content_blocks(std::slice::from_ref(block), "assistant/chunk")
+        }
+        SessionStreamChunk::Usage { usage } => validate_token_usage(usage),
+        SessionStreamChunk::Finish {
+            reason,
+            replay_state,
+        } => {
+            let failed = matches!(
+                reason,
+                SessionFinishReason::Aborted { .. } | SessionFinishReason::Error { .. }
+            );
+            if failed && replay_state.is_some() {
+                return Err(SessionError::InvalidAssistantChunk {
+                    expected: "replay state only on a successful finish",
+                });
+            }
+            if let SessionFinishReason::Aborted { failure }
+            | SessionFinishReason::Error { failure } = reason
+            {
+                validate_llm_failure(failure)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_token_usage(usage: &SessionTokenUsage) -> Result<(), SessionError> {
+    if usage
+        .reasoning_tokens
+        .is_some_and(|reasoning| reasoning > usage.output_tokens)
+    {
+        return Err(SessionError::InvalidAssistantChunk {
+            expected: "reasoning tokens within output tokens",
+        });
+    }
+    let exact_total = usage
+        .input_tokens
+        .checked_add(usage.output_tokens)
+        .and_then(|total| total.checked_add(usage.cache_read_tokens.unwrap_or_default()))
+        .and_then(|total| total.checked_add(usage.cache_write_tokens.unwrap_or_default()))
+        .ok_or(SessionError::InvalidAssistantChunk {
+            expected: "token counts without overflow",
+        })?;
+    if usage.total_tokens.is_some_and(|total| total != exact_total) {
+        return Err(SessionError::InvalidAssistantChunk {
+            expected: "an exact total matching disjoint token counts",
+        });
+    }
+    Ok(())
+}
+
+fn validate_llm_failure(failure: &SessionLlmFailure) -> Result<(), SessionError> {
+    if failure.message.is_empty()
+        || failure.code.is_empty()
+        || failure.status == Some(0)
+        || failure.request_id.as_ref().is_some_and(String::is_empty)
+    {
+        return Err(SessionError::InvalidAssistantChunk {
+            expected: "non-empty failure message/code/request id and positive status",
+        });
+    }
+    Ok(())
 }
 
 fn validate_tool_result_message(message: &SessionMessage) -> Result<(), SessionError> {
@@ -689,7 +917,7 @@ impl SessionSurfaceState {
         };
         match intent.surface_op {
             SessionSurfaceOp::Append => {
-                validate_surface_provenance(seq, kind, intent, &[])?;
+                validate_surface_provenance(seq, kind, intent, &[], prior_events)?;
                 Ok(SessionSurfacePlan::Append { seq })
             }
             SessionSurfaceOp::Replace { start, end } => {
@@ -707,7 +935,7 @@ impl SessionSurfaceState {
                     return Err(SessionError::SurfaceReplaceRangeReversed { start, end });
                 }
                 let shadowed = self.nodes[start_index..=end_index].to_vec();
-                validate_surface_provenance(seq, kind, intent, &shadowed)?;
+                validate_surface_provenance(seq, kind, intent, &shadowed, prior_events)?;
                 validate_tool_result_replacement(kind, &shadowed, prior_events)?;
                 let generation = self
                     .replace_generation
@@ -745,6 +973,7 @@ fn validate_surface_provenance(
     kind: &SessionEventKind,
     intent: &SessionSurfaceIntent,
     shadowed: &[u64],
+    prior_events: &[SessionEvent],
 ) -> Result<(), SessionError> {
     let mut sources = HashSet::new();
     if let Some(source_event_seqs) = &intent.source_event_seqs {
@@ -766,6 +995,43 @@ fn validate_surface_provenance(
                     source_seq: *source,
                     current: seq,
                 });
+            }
+        }
+    }
+    if let (SessionEventKind::AssistantMessage { turn, step, .. }, Some(source_event_seqs)) =
+        (kind, &intent.source_event_seqs)
+    {
+        for source in source_event_seqs {
+            if shadowed.contains(source) {
+                continue;
+            }
+            let event = usize::try_from(*source)
+                .ok()
+                .and_then(|index| prior_events.get(index));
+            match event.map(|event| &event.kind) {
+                Some(SessionEventKind::AssistantChunk {
+                    turn: source_turn,
+                    step: source_step,
+                    ..
+                }) if source_turn == turn && source_step == step => {}
+                Some(SessionEventKind::AssistantChunk {
+                    turn: source_turn,
+                    step: source_step,
+                    ..
+                }) => {
+                    return Err(SessionError::AssistantChunkProvenanceScope {
+                        source_seq: *source,
+                        expected_turn: *turn,
+                        expected_step: *step,
+                        actual_turn: *source_turn,
+                        actual_step: *source_step,
+                    });
+                }
+                _ => {
+                    return Err(SessionError::AssistantChunkProvenanceTarget {
+                        source_seq: *source,
+                    });
+                }
             }
         }
     }
@@ -976,6 +1242,18 @@ impl SessionLog {
         Ok(())
     }
 
+    /// Append one raw assistant stream chunk and return its durable source seq.
+    pub fn append_assistant_chunk(
+        &mut self,
+        turn: u64,
+        step: u64,
+        chunk: SessionStreamChunk,
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::AssistantChunk { turn, step, chunk })?
+            .seq)
+    }
+
     pub fn append_assistant_message(
         &mut self,
         turn: u64,
@@ -1044,6 +1322,31 @@ impl SessionLog {
             .filter_map(|seq| usize::try_from(*seq).ok())
             .filter_map(|index| self.events.get(index))
             .filter_map(|event| event.kind.derived_message().cloned())
+            .collect()
+    }
+
+    /// Replay detached raw chunks for one step in authoritative event order.
+    #[must_use]
+    pub fn assistant_chunks(&self, turn: u64, step: u64) -> Vec<SessionAssistantChunk> {
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let SessionEventKind::AssistantChunk {
+                    turn: chunk_turn,
+                    step: chunk_step,
+                    chunk,
+                } = &event.kind
+                else {
+                    return None;
+                };
+                (*chunk_turn == turn && *chunk_step == step).then(|| SessionAssistantChunk {
+                    seq: event.seq,
+                    time_ms: event.time_ms,
+                    turn: *chunk_turn,
+                    step: *chunk_step,
+                    chunk: chunk.clone(),
+                })
+            })
             .collect()
     }
 
@@ -1189,6 +1492,15 @@ impl SessionHandle {
         self.commit(|log| log.append_user_message_with_surface(message, surface))
     }
 
+    pub fn append_assistant_chunk(
+        &self,
+        turn: u64,
+        step: u64,
+        chunk: SessionStreamChunk,
+    ) -> Result<u64, SessionError> {
+        self.commit(|log| log.append_assistant_chunk(turn, step, chunk))
+    }
+
     pub fn append_assistant_message(
         &self,
         turn: u64,
@@ -1229,6 +1541,14 @@ impl SessionHandle {
 
     pub fn derive_messages(&self) -> Result<Vec<SessionMessage>, SessionError> {
         Ok(self.lock()?.derive_messages())
+    }
+
+    pub fn assistant_chunks(
+        &self,
+        turn: u64,
+        step: u64,
+    ) -> Result<Vec<SessionAssistantChunk>, SessionError> {
+        Ok(self.lock()?.assistant_chunks(turn, step))
     }
 
     fn commit<R>(
@@ -1569,12 +1889,28 @@ pub enum SessionError {
     MismatchedToolCallIds,
     #[error("session message persistence encoding is invalid")]
     InvalidMessageEncoding,
+    #[error("session assistant chunk persistence encoding is invalid")]
+    InvalidAssistantChunkEncoding,
+    #[error("session assistant chunk must have {expected}")]
+    InvalidAssistantChunk { expected: &'static str },
     #[error("session surface persistence encoding is invalid")]
     InvalidSurfaceEncoding,
     #[error("session {event_type} source event sequences must not be empty")]
     EmptySurfaceProvenance { event_type: &'static str },
     #[error("session surface source event sequence {source_seq} is duplicated")]
     DuplicateSurfaceProvenance { source_seq: u64 },
+    #[error("session assistant message source event {source_seq} is not an assistant/chunk")]
+    AssistantChunkProvenanceTarget { source_seq: u64 },
+    #[error(
+        "session assistant message source chunk {source_seq} belongs to turn {actual_turn}/step {actual_step}, expected turn {expected_turn}/step {expected_step}"
+    )]
+    AssistantChunkProvenanceScope {
+        source_seq: u64,
+        expected_turn: u64,
+        expected_step: u64,
+        actual_turn: u64,
+        actual_step: u64,
+    },
     #[error(
         "session surface source event sequence {source_seq} must be earlier than current event {current}"
     )]

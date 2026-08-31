@@ -5,9 +5,10 @@ use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
     KernelConsentState, SessionContentBlock, SessionError, SessionEvent, SessionEventKind,
-    SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionStore, SessionSurfaceIntent, SessionSurfaceOp, TurnEndReason, invariant_missing,
-    session_events,
+    SessionFinishReason, SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionReplayEnvelope, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp, SessionTokenUsage, TurnEndReason,
+    invariant_missing, session_events,
 };
 
 #[derive(Debug)]
@@ -159,6 +160,215 @@ fn message_history_derives_replays_and_detaches_from_the_log() {
         restored.derive_messages()[0].content[0],
         expected[0].content[0]
     );
+}
+
+#[test]
+fn assistant_chunks_are_durable_ordered_and_detached_from_the_surface() {
+    let mut log = SessionLog::new_at(SessionId::new("assistant-chunks").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let step = log.start_step(turn).unwrap();
+    let chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::TextDelta {
+            index: 0,
+            text: "hel".into(),
+        },
+        SessionStreamChunk::TextDelta {
+            index: 0,
+            text: "lo".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Text {
+                text: "hello".into(),
+            },
+        },
+        SessionStreamChunk::Usage {
+            usage: SessionTokenUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            replay_state: Some(SessionReplayEnvelope {
+                response: serde_json::json!({ "id": "response-1" }),
+                blocks: Some(vec![serde_json::json!({ "nativeIndex": 0 })]),
+            }),
+        },
+    ];
+    let source_seqs = chunks
+        .iter()
+        .cloned()
+        .map(|chunk| log.append_assistant_chunk(turn, step, chunk).unwrap())
+        .collect::<Vec<_>>();
+    let assistant = assistant_message(
+        "assistant-streamed",
+        vec![SessionContentBlock::Text {
+            text: "hello".into(),
+        }],
+    );
+    log.append_assistant_message_with_surface(
+        turn,
+        step,
+        assistant.clone(),
+        SessionSurfaceIntent::append_from(source_seqs.clone()),
+    )
+    .unwrap();
+    log.finish_step(turn, step).unwrap();
+    log.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    let replay = log.assistant_chunks(turn, step);
+    assert_eq!(
+        replay.iter().map(|record| record.seq).collect::<Vec<_>>(),
+        source_seqs
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .map(|record| record.chunk.clone())
+            .collect::<Vec<_>>(),
+        chunks
+    );
+    assert_eq!(log.surface().nodes, vec![8]);
+    assert_eq!(log.derive_messages(), vec![assistant]);
+
+    let restored = SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap();
+    assert_eq!(restored.assistant_chunks(turn, step), replay);
+    assert_eq!(restored, log);
+
+    let mut detached = restored.assistant_chunks(turn, step);
+    let SessionStreamChunk::TextDelta { text, .. } = &mut detached[1].chunk else {
+        panic!("second chunk must be text");
+    };
+    *text = "mutated".into();
+    assert_eq!(restored.assistant_chunks(turn, step)[1].chunk, chunks[1]);
+}
+
+#[test]
+fn assistant_chunk_and_message_provenance_fail_closed_before_mutation() {
+    let mut log =
+        SessionLog::new_at(SessionId::new("assistant-chunk-invalid").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    assert_eq!(
+        log.append_assistant_chunk(
+            turn,
+            1,
+            SessionStreamChunk::TextDelta {
+                index: 0,
+                text: "early".into(),
+            },
+        )
+        .unwrap_err(),
+        SessionError::NoOpenStep { turn }
+    );
+    let step = log.start_step(turn).unwrap();
+    let chunk_seq = log
+        .append_assistant_chunk(
+            turn,
+            step,
+            SessionStreamChunk::TextDelta {
+                index: 0,
+                text: "ok".into(),
+            },
+        )
+        .unwrap();
+    let before_invalid_chunk = log.events().to_vec();
+    assert!(matches!(
+        log.append_assistant_chunk(
+            turn,
+            step,
+            SessionStreamChunk::Usage {
+                usage: SessionTokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    total_tokens: Some(99),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+            },
+        ),
+        Err(SessionError::InvalidAssistantChunk { .. })
+    ));
+    assert_eq!(log.events(), before_invalid_chunk);
+
+    assert_eq!(
+        log.append_assistant_message_with_surface(
+            turn,
+            step,
+            assistant_message("wrong-source", vec![]),
+            SessionSurfaceIntent::append_from(vec![1]),
+        )
+        .unwrap_err(),
+        SessionError::AssistantChunkProvenanceTarget { source_seq: 1 }
+    );
+    log.append_assistant_message_with_surface(
+        turn,
+        step,
+        assistant_message("valid-source", vec![]),
+        SessionSurfaceIntent::append_from(vec![chunk_seq]),
+    )
+    .unwrap();
+    log.finish_step(turn, step).unwrap();
+    let second_step = log.start_step(turn).unwrap();
+    let before_wrong_scope = log.events().to_vec();
+    assert_eq!(
+        log.append_assistant_message_with_surface(
+            turn,
+            second_step,
+            assistant_message("wrong-step", vec![]),
+            SessionSurfaceIntent::append_from(vec![chunk_seq]),
+        )
+        .unwrap_err(),
+        SessionError::AssistantChunkProvenanceScope {
+            source_seq: chunk_seq,
+            expected_turn: turn,
+            expected_step: second_step,
+            actual_turn: turn,
+            actual_step: step,
+        }
+    );
+    assert_eq!(log.events(), before_wrong_scope);
+}
+
+#[test]
+fn assistant_chunk_json_rejects_lossy_or_unknown_shapes() {
+    let chunk = SessionStreamChunk::ToolCallDelta {
+        index: 1,
+        id: "call-1".into(),
+        name: Some("echo".into()),
+        arguments_delta: "{}".into(),
+    };
+    assert_eq!(
+        SessionStreamChunk::from_json_value(&chunk.to_json_value().unwrap()).unwrap(),
+        chunk
+    );
+
+    for invalid in [
+        serde_json::json!({
+            "type": "text-delta", "index": 0, "text": "x", "unknown": true
+        }),
+        serde_json::json!({
+            "type": "tool-call-delta", "index": 0, "id": "call-1",
+            "name": null, "argumentsDelta": "{}"
+        }),
+        serde_json::json!({
+            "type": "finish", "reason": { "kind": "stop" }, "replayState": null
+        }),
+    ] {
+        assert_eq!(
+            SessionStreamChunk::from_json_value(&invalid).unwrap_err(),
+            SessionError::InvalidAssistantChunkEncoding
+        );
+    }
 }
 
 #[test]
