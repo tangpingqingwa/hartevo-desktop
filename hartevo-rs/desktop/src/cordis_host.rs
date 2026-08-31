@@ -127,6 +127,17 @@ pub(crate) struct DesktopRuntimeSessionPreflight {
     model: String,
 }
 
+/// Cumulative text deltas already persisted by Application for one exact
+/// Runtime attempt and ready for synchronous Session flush.
+pub(crate) struct DesktopRuntimeSessionStreamFlush {
+    session_id: String,
+    runtime_turn_id: String,
+    user_body: String,
+    provider: String,
+    model: String,
+    assistant_chunks: Vec<String>,
+}
+
 impl DesktopRuntimeSessionPreflight {
     pub(crate) fn new(
         session_id: impl Into<String>,
@@ -141,6 +152,26 @@ impl DesktopRuntimeSessionPreflight {
             user_body: user_body.into(),
             provider: provider.into(),
             model: model.into(),
+        }
+    }
+}
+
+impl DesktopRuntimeSessionStreamFlush {
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        runtime_turn_id: impl Into<String>,
+        user_body: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        assistant_chunks: Vec<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            runtime_turn_id: runtime_turn_id.into(),
+            user_body: user_body.into(),
+            provider: provider.into(),
+            model: model.into(),
+            assistant_chunks,
         }
     }
 }
@@ -220,12 +251,12 @@ fn append_runtime_preflight(
     Ok((turn, step))
 }
 
-fn runtime_preflight_location(
+fn runtime_request_location(
     events: &[SessionEvent],
     user: &SessionMessage,
     header: &SessionEpochHeader,
     context: &SessionRequestContext,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, usize)> {
     let mut matches = events.iter().enumerate().filter_map(|(index, event)| {
         let SessionEventKind::UserMessage { message, surface } = &event.kind else {
             return None;
@@ -236,7 +267,6 @@ fn runtime_preflight_location(
     if matches.next().is_some()
         || recorded_user != user
         || surface != &SessionSurfaceIntent::append()
-        || user_index.checked_add(1)? != events.len().checked_sub(1)?
     {
         return None;
     }
@@ -261,12 +291,51 @@ fn runtime_preflight_location(
         } if *step_turn == turn => *step,
         _ => return None,
     };
-    match &events.get(user_index + 1)?.kind {
+    let context_index = user_index.checked_add(1)?;
+    match &events.get(context_index)?.kind {
         SessionEventKind::RequestContext { context: recorded } if recorded == context => {
-            Some((turn, step))
+            Some((turn, step, context_index))
         }
         _ => None,
     }
+}
+
+fn runtime_preflight_location(
+    events: &[SessionEvent],
+    user: &SessionMessage,
+    header: &SessionEpochHeader,
+    context: &SessionRequestContext,
+) -> Option<(u64, u64)> {
+    let (turn, step, context_index) = runtime_request_location(events, user, header, context)?;
+    events[context_index.checked_add(1)?..]
+        .iter()
+        .all(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::AssistantChunk {
+                    turn: chunk_turn,
+                    step: chunk_step,
+                    ..
+                } if *chunk_turn == turn && *chunk_step == step
+            )
+        })
+        .then_some((turn, step))
+}
+
+fn runtime_live_chunks(chunks: Vec<String>) -> Vec<SessionStreamChunk> {
+    let mut expected = Vec::with_capacity(chunks.len().saturating_add(1));
+    if !chunks.is_empty() {
+        expected.push(SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        });
+        expected.extend(
+            chunks
+                .into_iter()
+                .map(|text| SessionStreamChunk::TextDelta { index: 0, text }),
+        );
+    }
+    expected
 }
 
 fn runtime_open_turn(events: &[SessionEvent]) -> Option<u64> {
@@ -368,6 +437,59 @@ impl DesktopCordisCoordinator {
         self.session_persistence.persist_live(&session)
     }
 
+    /// Extend the exact open Runtime step with the cumulative text stream that
+    /// Application has already persisted. Exact retries append nothing.
+    pub(crate) fn flush_runtime_stream(
+        &mut self,
+        stream: DesktopRuntimeSessionStreamFlush,
+    ) -> Result<(), DesktopSessionPersistenceError> {
+        if stream.assistant_chunks.is_empty() {
+            return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                stream.session_id,
+            ));
+        }
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
+        let session = sessions.get_or_create(SessionId::new(stream.session_id.clone())?)?;
+        let user = runtime_user_message(&stream.runtime_turn_id, stream.user_body);
+        let header = runtime_request_header(&stream.provider, &stream.model);
+        let context = runtime_request_context(&stream.provider, &stream.model);
+        let events = session.events()?;
+        let Some((turn, step)) = runtime_preflight_location(&events, &user, &header, &context)
+        else {
+            return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                stream.session_id,
+            ));
+        };
+        let recorded_messages = session
+            .derive_messages()?
+            .into_iter()
+            .filter(|message| message.id == user.id)
+            .collect::<Vec<_>>();
+        let recorded_chunks = session.assistant_chunks(turn, step)?;
+        let recorded_values = recorded_chunks
+            .iter()
+            .map(|chunk| chunk.chunk.clone())
+            .collect::<Vec<_>>();
+        let expected_chunks = runtime_live_chunks(stream.assistant_chunks);
+        if runtime_open_turn(&events) != Some(turn)
+            || recorded_messages != vec![user]
+            || recorded_values.len() > expected_chunks.len()
+            || !expected_chunks.starts_with(&recorded_values)
+        {
+            return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                stream.session_id,
+            ));
+        }
+        for chunk in expected_chunks.into_iter().skip(recorded_values.len()) {
+            session.append_assistant_chunk(turn, step, chunk)?;
+        }
+        self.session_persistence.persist_live(&session)
+    }
+
     /// Append one closed, idempotent projection of a real Application Runtime
     /// turn and commit it through the existing SQLCipher Session adapter.
     #[allow(
@@ -397,20 +519,24 @@ impl DesktopCordisCoordinator {
         });
         let expected_header = runtime_request_header(&transcript.provider, &transcript.model);
         let expected_context = runtime_request_context(&transcript.provider, &transcript.model);
-        let legacy_chunks = transcript
-            .assistant_chunks
+        let assistant_chunks = transcript.assistant_chunks;
+        let partial_body = assistant_chunks.concat();
+        let legacy_chunks = assistant_chunks
             .into_iter()
             .map(|text| SessionStreamChunk::TextDelta { index: 0, text })
             .collect::<Vec<_>>();
         let mut expected_chunks = Vec::with_capacity(legacy_chunks.len().saturating_add(3));
-        if assistant_body.is_some() {
+        let stream_body = assistant_body
+            .clone()
+            .or_else(|| (!legacy_chunks.is_empty()).then_some(partial_body));
+        if stream_body.is_some() {
             expected_chunks.push(SessionStreamChunk::BlockStart {
                 index: 0,
                 block_type: SessionStreamBlockType::Text,
             });
         }
         expected_chunks.extend(legacy_chunks.iter().cloned());
-        if let Some(body) = assistant_body {
+        if let Some(body) = stream_body {
             expected_chunks.push(SessionStreamChunk::BlockEnd {
                 index: 0,
                 block: SessionContentBlock::Text { text: body },
@@ -444,16 +570,29 @@ impl DesktopCordisCoordinator {
                     transcript.session_id,
                 ));
             };
+            let recorded_chunks = session.assistant_chunks(turn, step)?;
+            let recorded_values = recorded_chunks
+                .iter()
+                .map(|chunk| chunk.chunk.clone())
+                .collect::<Vec<_>>();
             if turn != open_turn
                 || recorded.len() != 1
                 || recorded.first() != Some(&user)
-                || !session.assistant_chunks(turn, step)?.is_empty()
+                || recorded_values.len() > expected_chunks.len()
+                || !expected_chunks.starts_with(&recorded_values)
             {
                 return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
                     transcript.session_id,
                 ));
             }
-            Some((turn, step))
+            Some((
+                turn,
+                step,
+                recorded_chunks
+                    .iter()
+                    .map(|chunk| chunk.seq)
+                    .collect::<Vec<_>>(),
+            ))
         } else {
             None
         };
@@ -514,15 +653,16 @@ impl DesktopCordisCoordinator {
             return self.session_persistence.persist_live(&session);
         }
 
-        let (turn, step) = if let Some(location) = partial_location {
+        let (turn, step, mut source_seqs) = if let Some(location) = partial_location {
             location
         } else {
-            append_runtime_preflight(&session, user, expected_header, expected_context)?
+            let (turn, step) =
+                append_runtime_preflight(&session, user, expected_header, expected_context)?;
+            (turn, step, Vec::new())
         };
-        let source_seqs = expected_chunks
-            .into_iter()
-            .map(|chunk| session.append_assistant_chunk(turn, step, chunk))
-            .collect::<Result<Vec<_>, _>>()?;
+        for chunk in expected_chunks.into_iter().skip(source_seqs.len()) {
+            source_seqs.push(session.append_assistant_chunk(turn, step, chunk)?);
+        }
         if let Some(message) = assistant {
             session.append_assistant_message_with_surface(
                 turn,
