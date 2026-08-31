@@ -20,6 +20,15 @@ use crate::event::{Emit, EventKey, EventSchemaId, Parallel};
 /// The Rust Session format written by this bounded implementation.
 pub const SESSION_FORMAT_VERSION: u32 = 0;
 
+/// Recovery code for an assistant tool request that never reached a durable call start.
+pub const TOOL_NOT_STARTED: &str = "TOOL_NOT_STARTED";
+
+/// Recovery code for a durable tool call whose outcome was not durably recorded.
+pub const TOOL_OUTCOME_UNKNOWN: &str = "TOOL_OUTCOME_UNKNOWN";
+
+const TOOL_NOT_STARTED_MESSAGE: &str = "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.";
+const TOOL_OUTCOME_UNKNOWN_MESSAGE: &str = "The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.";
+
 /// Typed Cordis events forming the storage-agnostic Session persistence seam.
 pub mod events {
     use super::{Emit, EventKey, EventSchemaId, Parallel, SessionCheckpoint, SessionEventRecord};
@@ -475,6 +484,14 @@ pub struct SessionToolCall {
     pub arguments: String,
 }
 
+/// Provider-neutral failure identity attached to one durable tool result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionToolError {
+    pub name: String,
+    pub code: String,
+}
+
 /// One identified immutable message shared by durable history and replay.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -601,7 +618,7 @@ pub struct SessionSurface {
     pub replace_generation: u64,
 }
 
-/// The bounded Session event vocabulary through N26.
+/// The bounded Session event vocabulary through N27.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
     TurnStart {
@@ -651,6 +668,7 @@ pub enum SessionEventKind {
         turn: u64,
         step: u64,
         message: SessionMessage,
+        error: Option<SessionToolError>,
         surface: SessionSurfaceIntent,
     },
 }
@@ -735,12 +753,13 @@ impl SessionCheckpoint {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionState {
     last_turn: u64,
     open_turn: Option<u64>,
     last_step: u64,
     open_step: Option<u64>,
+    pending_tool_calls: HashSet<String>,
 }
 
 impl SessionState {
@@ -797,6 +816,7 @@ impl SessionState {
                 let (turn, step) = (*turn, *step);
                 require_turn(self.open_turn, turn)?;
                 require_step(self.open_step, turn, step)?;
+                self.pending_tool_calls.clear();
                 self.open_step = None;
             }
             SessionEventKind::AssistantChunk { turn, step, chunk } => {
@@ -826,11 +846,45 @@ impl SessionState {
                         expected: "non-empty call id and name",
                     });
                 }
+                self.pending_tool_calls.insert(call_id.clone());
             }
-            SessionEventKind::UserMessage { .. }
-            | SessionEventKind::AssistantMessage { .. }
-            | SessionEventKind::ToolResult { .. } => self.validate_message_event(kind)?,
+            SessionEventKind::ToolResult {
+                message,
+                error,
+                surface,
+                ..
+            } => self.apply_tool_result(kind, message, error.as_ref(), surface)?,
+            SessionEventKind::UserMessage { .. } | SessionEventKind::AssistantMessage { .. } => {
+                self.validate_message_event(kind)?;
+            }
         }
+        Ok(())
+    }
+
+    fn apply_tool_result(
+        &mut self,
+        kind: &SessionEventKind,
+        message: &SessionMessage,
+        error: Option<&SessionToolError>,
+        surface: &SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
+        self.validate_message_event(kind)?;
+        if !matches!(surface.surface_op, SessionSurfaceOp::Append) {
+            return Ok(());
+        }
+        let SessionMessageSource::Tool { call_id } = &message.source else {
+            return Err(SessionError::InvalidMessageSource {
+                event_type: "tool/result",
+                expected: "non-empty tool call id",
+            });
+        };
+        if !self.pending_tool_calls.contains(call_id) && !synthetic_tool_not_started(message, error)
+        {
+            return Err(SessionError::ToolResultWithoutCall {
+                call_id: call_id.clone(),
+            });
+        }
+        self.pending_tool_calls.remove(call_id);
         Ok(())
     }
 
@@ -875,6 +929,7 @@ impl SessionState {
                 turn,
                 step,
                 message,
+                error,
                 ..
             } => {
                 require_turn(self.open_turn, *turn)?;
@@ -891,7 +946,8 @@ impl SessionState {
                     },
                     "non-empty tool call id",
                 )?;
-                validate_tool_result_message(message)
+                validate_tool_result_message(message)?;
+                validate_tool_result_error(message, error.as_ref())
             }
             SessionEventKind::TurnStart { .. }
             | SessionEventKind::TurnEnd { .. }
@@ -1044,6 +1100,79 @@ fn validate_tool_result_message(message: &SessionMessage) -> Result<(), SessionE
         return Err(SessionError::MismatchedToolCallIds);
     }
     Ok(())
+}
+
+fn validate_tool_result_error(
+    message: &SessionMessage,
+    error: Option<&SessionToolError>,
+) -> Result<(), SessionError> {
+    let Some(error) = error else {
+        return Ok(());
+    };
+    let [SessionContentBlock::ToolResult { is_error, .. }] = message.content.as_slice() else {
+        return Err(SessionError::InvalidToolResultShape);
+    };
+    if error.name.is_empty() || error.code.is_empty() || !is_error {
+        return Err(SessionError::InvalidToolResultError {
+            expected: "non-empty name/code on an error result",
+        });
+    }
+    Ok(())
+}
+
+fn synthetic_tool_not_started(message: &SessionMessage, error: Option<&SessionToolError>) -> bool {
+    matches!(
+        (message.content.as_slice(), error),
+        (
+            [SessionContentBlock::ToolResult { is_error: true, .. }],
+            Some(SessionToolError { code, .. })
+        ) if code == TOOL_NOT_STARTED
+    )
+}
+
+fn pending_interrupted_tool_calls(events: &[SessionEvent]) -> Vec<(String, u64, Option<u64>)> {
+    let mut pending = Vec::<(String, u64, Option<u64>)>::new();
+    for event in events {
+        match &event.kind {
+            SessionEventKind::TurnStart { .. }
+            | SessionEventKind::TurnEnd { .. }
+            | SessionEventKind::StepEnd { .. } => pending.clear(),
+            SessionEventKind::AssistantMessage { step, message, .. } => {
+                for block in &message.content {
+                    let SessionContentBlock::ToolCall { id, .. } = block else {
+                        continue;
+                    };
+                    if let Some((_, pending_step, call_seq)) =
+                        pending.iter_mut().find(|(call_id, _, _)| call_id == id)
+                    {
+                        *pending_step = *step;
+                        *call_seq = None;
+                    } else {
+                        pending.push((id.clone(), *step, None));
+                    }
+                }
+            }
+            SessionEventKind::ToolCall { call_id, .. } => {
+                if let Some((_, _, call_seq)) = pending
+                    .iter_mut()
+                    .find(|(pending_id, _, _)| pending_id == call_id)
+                {
+                    *call_seq = Some(event.seq);
+                }
+            }
+            SessionEventKind::ToolResult { message, .. } => {
+                if let SessionMessageSource::Tool { call_id } = &message.source {
+                    pending.retain(|(pending_id, _, _)| pending_id != call_id);
+                }
+            }
+            SessionEventKind::StepStart { .. }
+            | SessionEventKind::AssistantChunk { .. }
+            | SessionEventKind::RequestHeader { .. }
+            | SessionEventKind::RequestContext { .. }
+            | SessionEventKind::UserMessage { .. } => {}
+        }
+    }
+    pending
 }
 
 fn require_turn(open_turn: Option<u64>, actual: u64) -> Result<(), SessionError> {
@@ -1307,6 +1436,7 @@ fn validate_tool_result_replacement(
         turn,
         step,
         message,
+        error,
         ..
     } = replacement
     else {
@@ -1324,6 +1454,7 @@ fn validate_tool_result_replacement(
                 turn: original_turn,
                 step: original_step,
                 message: original_message,
+                error: original_error,
                 ..
             },
         ..
@@ -1333,6 +1464,7 @@ fn validate_tool_result_replacement(
     };
     if turn != original_turn
         || step != original_step
+        || error != original_error
         || !tool_result_same_except_content(original_message, message)
     {
         return Err(SessionError::ToolResultSurfaceReplaceDrift);
@@ -1603,6 +1735,7 @@ impl SessionLog {
             turn,
             step,
             message,
+            error: None,
             surface,
         })?;
         Ok(())
@@ -1702,9 +1835,9 @@ impl SessionLog {
 
     /// Close a durable turn left open by a crashed process.
     ///
-    /// Synthetic closers reuse the final real event timestamp so cold-start
-    /// repair is deterministic. A balanced log is unchanged, making repeated
-    /// startup repair idempotent.
+    /// Synthetic tool outcomes precede the lifecycle closers, making the
+    /// repaired transcript provider-valid. All synthetic events reuse the
+    /// final real timestamp, and a balanced log is unchanged.
     pub fn repair_interrupted_tail(&mut self) -> Result<bool, SessionError> {
         let Some(turn) = self.state.open_turn else {
             return Ok(false);
@@ -1714,16 +1847,61 @@ impl SessionLog {
             .last()
             .ok_or(SessionError::EventSequenceOverflow)?
             .time_ms;
-        if let Some(step) = self.state.open_step {
-            self.append_at(SessionEventKind::StepEnd { turn, step }, time_ms)?;
+
+        let mut repaired = self.clone();
+        for (call_id, step, call_seq) in pending_interrupted_tool_calls(&self.events) {
+            let seq = u64::try_from(repaired.events.len())
+                .map_err(|_| SessionError::EventSequenceOverflow)?;
+            let (name, code, text) = if call_seq.is_some() {
+                (
+                    "ToolOutcomeUnknownError",
+                    TOOL_OUTCOME_UNKNOWN,
+                    TOOL_OUTCOME_UNKNOWN_MESSAGE,
+                )
+            } else {
+                (
+                    "ToolNotStartedError",
+                    TOOL_NOT_STARTED,
+                    TOOL_NOT_STARTED_MESSAGE,
+                )
+            };
+            let surface = call_seq.map_or_else(SessionSurfaceIntent::append, |source_seq| {
+                SessionSurfaceIntent::append_from(vec![source_seq])
+            });
+            repaired.append_at(
+                SessionEventKind::ToolResult {
+                    turn,
+                    step,
+                    message: SessionMessage {
+                        id: format!("interrupted-tool-result-{call_id}-{seq}"),
+                        role: SessionMessageRole::User,
+                        content: vec![SessionContentBlock::ToolResult {
+                            tool_call_id: call_id.clone(),
+                            content: vec![SessionContentBlock::Text { text: text.into() }],
+                            is_error: true,
+                        }],
+                        source: SessionMessageSource::Tool { call_id },
+                    },
+                    error: Some(SessionToolError {
+                        name: name.into(),
+                        code: code.into(),
+                    }),
+                    surface,
+                },
+                time_ms,
+            )?;
         }
-        self.append_at(
+        if let Some(step) = repaired.state.open_step {
+            repaired.append_at(SessionEventKind::StepEnd { turn, step }, time_ms)?;
+        }
+        repaired.append_at(
             SessionEventKind::TurnEnd {
                 turn,
                 reason: TurnEndReason::Interrupted,
             },
             time_ms,
         )?;
+        *self = repaired;
         Ok(true)
     }
 
@@ -1741,7 +1919,7 @@ impl SessionLog {
         if time_ms < 0 {
             return Err(SessionError::InvalidEventTime { seq, time_ms });
         }
-        let mut next_state = self.state;
+        let mut next_state = self.state.clone();
         next_state.apply(&kind)?;
         let surface_plan = self.surface.plan(seq, &kind, &self.events)?;
         self.events.push(SessionEvent { seq, time_ms, kind });
@@ -2276,6 +2454,10 @@ pub enum SessionError {
     InvalidToolResultShape,
     #[error("session tool/result source and content call ids must match")]
     MismatchedToolCallIds,
+    #[error("session tool/result for `{call_id}` has no prior tool/call in this step")]
+    ToolResultWithoutCall { call_id: String },
+    #[error("session tool/result error must have {expected}")]
+    InvalidToolResultError { expected: &'static str },
     #[error("session tool/call must have {expected}")]
     InvalidToolCall { expected: &'static str },
     #[error("session message persistence encoding is invalid")]

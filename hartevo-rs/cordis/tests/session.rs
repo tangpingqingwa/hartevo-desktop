@@ -9,8 +9,8 @@ use hartevo_cordis::{
     SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
     SessionReplayEnvelope, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
     SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-    SessionSurfaceOp, SessionTokenUsage, SessionToolSchema, TurnEndReason, invariant_missing,
-    session_events,
+    SessionSurfaceOp, SessionTokenUsage, SessionToolError, SessionToolSchema, TOOL_NOT_STARTED,
+    TOOL_OUTCOME_UNKNOWN, TurnEndReason, invariant_missing, session_events,
 };
 
 #[derive(Debug)]
@@ -74,6 +74,15 @@ fn tool_result_message(id: &str, call_id: &str, text: &str) -> SessionMessage {
             call_id: call_id.into(),
         },
     }
+}
+
+fn error_tool_result_message(id: &str, call_id: &str, text: &str) -> SessionMessage {
+    let mut message = tool_result_message(id, call_id, text);
+    let [SessionContentBlock::ToolResult { is_error, .. }] = message.content.as_mut_slice() else {
+        unreachable!("tool-result fixture has one result block");
+    };
+    *is_error = true;
+    message
 }
 
 fn request_header(provider: &str, model: &str) -> SessionEpochHeader {
@@ -262,6 +271,51 @@ fn invalid_tool_call_fails_before_log_mutation_and_on_restore() {
         SessionLog::restore(log.header().clone(), corrupt),
         Err(SessionError::InvalidToolCall { .. })
     ));
+}
+
+#[test]
+fn tool_results_pair_once_with_a_durable_call() {
+    let mut log = SessionLog::new_at(SessionId::new("tool-pairing").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let step = log.start_step(turn).unwrap();
+    let result = tool_result_message("tool-1", "call-1", "ok");
+    let baseline = log.events().to_vec();
+
+    assert_eq!(
+        log.append_tool_result(turn, step, result.clone())
+            .unwrap_err(),
+        SessionError::ToolResultWithoutCall {
+            call_id: "call-1".into(),
+        }
+    );
+    assert_eq!(log.events(), baseline);
+
+    log.append_tool_call(turn, step, "call-1", "read", "{}")
+        .unwrap();
+    log.append_tool_result(turn, step, result.clone()).unwrap();
+    let paired = log.events().to_vec();
+    assert_eq!(
+        log.append_tool_result(turn, step, result).unwrap_err(),
+        SessionError::ToolResultWithoutCall {
+            call_id: "call-1".into(),
+        }
+    );
+    assert_eq!(log.events(), paired);
+
+    let mut invalid_error = paired;
+    let SessionEventKind::ToolResult { error, .. } = &mut invalid_error[3].kind else {
+        panic!("fixture must contain a tool result");
+    };
+    *error = Some(SessionToolError {
+        name: "UnexpectedErrorMetadata".into(),
+        code: "UNEXPECTED".into(),
+    });
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), invalid_error).unwrap_err(),
+        SessionError::InvalidToolResultError {
+            expected: "non-empty name/code on an error result",
+        }
+    );
 }
 
 #[test]
@@ -845,6 +899,8 @@ fn tool_result_surface_rewrite_changes_content_only() {
     let mut log = SessionLog::new_at(SessionId::new("tool-rewrite").unwrap(), 1).unwrap();
     let turn = log.start_turn().unwrap();
     let step = log.start_step(turn).unwrap();
+    log.append_tool_call(turn, step, "call-1", "echo", "{}")
+        .unwrap();
     let original = tool_result_message("tool-1", "call-1", "before");
     log.append_tool_result(turn, step, original.clone())
         .unwrap();
@@ -861,10 +917,10 @@ fn tool_result_surface_rewrite_changes_content_only() {
         turn,
         step,
         replacement.clone(),
-        SessionSurfaceIntent::replace(2, 2, vec![2]),
+        SessionSurfaceIntent::replace(3, 3, vec![3]),
     )
     .unwrap();
-    assert_eq!(log.surface().nodes, vec![3]);
+    assert_eq!(log.surface().nodes, vec![4]);
     assert_eq!(log.derive_messages(), vec![replacement.clone()]);
 
     let mut drifted = replacement;
@@ -875,13 +931,13 @@ fn tool_result_surface_rewrite_changes_content_only() {
             turn,
             step,
             drifted,
-            SessionSurfaceIntent::replace(3, 3, vec![3]),
+            SessionSurfaceIntent::replace(4, 4, vec![4]),
         )
         .unwrap_err(),
         SessionError::ToolResultSurfaceReplaceDrift
     );
     assert_eq!(log.events(), before_events);
-    assert_eq!(log.surface().nodes, vec![3]);
+    assert_eq!(log.surface().nodes, vec![4]);
 }
 
 #[test]
@@ -924,6 +980,8 @@ fn malformed_message_replay_fails_closed() {
     log.append_user_message(user_message("user-1", "hello"))
         .unwrap();
     let step = log.start_step(turn).unwrap();
+    log.append_tool_call(turn, step, "call-1", "echo", "{}")
+        .unwrap();
     log.append_tool_result(turn, step, tool_result_message("tool-1", "call-1", "ok"))
         .unwrap();
 
@@ -953,7 +1011,7 @@ fn malformed_message_replay_fails_closed() {
     ));
 
     let mut mismatched_call = log.events().to_vec();
-    let SessionEventKind::ToolResult { message, .. } = &mut mismatched_call[3].kind else {
+    let SessionEventKind::ToolResult { message, .. } = &mut mismatched_call[4].kind else {
         panic!("fixture must contain a tool result");
     };
     message.source = SessionMessageSource::Tool {
@@ -1093,6 +1151,108 @@ fn interrupted_tail_repair_is_deterministic_idempotent_and_resumable() {
     let unchanged = balanced.events().to_vec();
     assert!(!balanced.repair_interrupted_tail().unwrap());
     assert_eq!(balanced.events(), unchanged);
+}
+
+#[test]
+fn interrupted_tail_repairs_started_and_unstarted_tool_calls_in_order() {
+    let mut log = SessionLog::new_at(SessionId::new("crashed-tools").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let step = log.start_step(turn).unwrap();
+    let assistant = assistant_message(
+        "assistant-tools",
+        vec![
+            SessionContentBlock::ToolCall {
+                id: "started-call".into(),
+                name: "write".into(),
+                arguments: "{}".into(),
+            },
+            SessionContentBlock::ToolCall {
+                id: "unstarted-call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        ],
+    );
+    log.append_assistant_message(turn, step, assistant.clone())
+        .unwrap();
+    let call_seq = log
+        .append_tool_call(turn, step, "started-call", "write", "{}")
+        .unwrap();
+    let real_len = log.events().len();
+    let repair_time_ms = log.events().last().unwrap().time_ms;
+
+    assert!(log.repair_interrupted_tail().unwrap());
+    let started_message = error_tool_result_message(
+        "interrupted-tool-result-started-call-4",
+        "started-call",
+        "The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.",
+    );
+    let unstarted_message = error_tool_result_message(
+        "interrupted-tool-result-unstarted-call-5",
+        "unstarted-call",
+        "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.",
+    );
+    assert_eq!(
+        &log.events()[real_len..],
+        [
+            SessionEvent {
+                seq: 4,
+                time_ms: repair_time_ms,
+                kind: SessionEventKind::ToolResult {
+                    turn,
+                    step,
+                    message: started_message.clone(),
+                    error: Some(SessionToolError {
+                        name: "ToolOutcomeUnknownError".into(),
+                        code: TOOL_OUTCOME_UNKNOWN.into(),
+                    }),
+                    surface: SessionSurfaceIntent::append_from(vec![call_seq]),
+                },
+            },
+            SessionEvent {
+                seq: 5,
+                time_ms: repair_time_ms,
+                kind: SessionEventKind::ToolResult {
+                    turn,
+                    step,
+                    message: unstarted_message.clone(),
+                    error: Some(SessionToolError {
+                        name: "ToolNotStartedError".into(),
+                        code: TOOL_NOT_STARTED.into(),
+                    }),
+                    surface: SessionSurfaceIntent::append(),
+                },
+            },
+            SessionEvent {
+                seq: 6,
+                time_ms: repair_time_ms,
+                kind: SessionEventKind::StepEnd { turn, step },
+            },
+            SessionEvent {
+                seq: 7,
+                time_ms: repair_time_ms,
+                kind: SessionEventKind::TurnEnd {
+                    turn,
+                    reason: TurnEndReason::Interrupted,
+                },
+            },
+        ]
+    );
+    assert_eq!(
+        log.derive_messages(),
+        vec![assistant, started_message, unstarted_message]
+    );
+
+    let repaired = log.events().to_vec();
+    assert!(!log.repair_interrupted_tail().unwrap());
+    assert_eq!(log.events(), repaired);
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), repaired)
+            .unwrap()
+            .start_turn()
+            .unwrap(),
+        2
+    );
 }
 
 #[test]

@@ -21,16 +21,16 @@ use hartevo_cordis::{
     RuntimeDispatchCompletion, RuntimeDispatchPermit, SessionCancelCause, SessionCheckpoint,
     SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionHeader, SessionId,
     SessionLog, SessionMessage, SessionRequestContext, SessionRequestHeader, SessionStore,
-    SessionStreamChunk, SessionSurfaceIntent, TurnEndReason, host_is_cordis_loop, keys,
-    session_events,
+    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop,
+    keys, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
 };
 use hartevo_storage::{
     PersistedSessionCancelCause, PersistedSessionCheckpoint, PersistedSessionEvent,
-    PersistedSessionEventKind, PersistedSessionHeader, PersistedTurnEndReason, ProjectStore,
-    StorageError,
+    PersistedSessionEventKind, PersistedSessionHeader, PersistedSessionToolError,
+    PersistedTurnEndReason, ProjectStore, StorageError,
 };
 use thiserror::Error;
 
@@ -646,11 +646,16 @@ fn encode_event(
                 turn,
                 step,
                 message,
+                error,
                 surface,
             } => PersistedSessionEventKind::ToolResult {
                 turn: *turn,
                 step: *step,
                 message: message.to_json_value()?,
+                error: error.as_ref().map(|error| PersistedSessionToolError {
+                    name: error.name.clone(),
+                    code: error.code.clone(),
+                }),
                 surface: Some(surface.to_json_value()?),
             },
         },
@@ -788,11 +793,13 @@ fn decode_event(
                 turn,
                 step,
                 message,
+                error,
                 surface,
             } => SessionEventKind::ToolResult {
                 turn: *turn,
                 step: *step,
                 message: SessionMessage::from_json_value(message.clone())?,
+                error: decode_tool_error(error.as_ref()),
                 surface: surface.as_ref().map_or_else(
                     || Ok(SessionSurfaceIntent::append()),
                     |value| {
@@ -802,6 +809,13 @@ fn decode_event(
                 )?,
             },
         },
+    })
+}
+
+fn decode_tool_error(error: Option<&PersistedSessionToolError>) -> Option<SessionToolError> {
+    error.map(|error| SessionToolError {
+        name: error.name.clone(),
+        code: error.code.clone(),
     })
 }
 
