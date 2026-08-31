@@ -88,6 +88,9 @@ impl SurfaceOwner {
 /// One tool pipeline call. Policy may rewrite [`ToolCall::decision`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
+    /// Exact model call identity when one exists. The legacy constructor leaves
+    /// this empty so the AgentLoop can assign a deterministic step-local id.
+    pub call_id: String,
     pub name: String,
     pub arguments: String,
     pub decision: String,
@@ -102,11 +105,19 @@ impl ToolCall {
         decision: impl Into<String>,
     ) -> Self {
         Self {
+            call_id: String::new(),
             name: name.into(),
             arguments: arguments.into(),
             decision: decision.into(),
             result: String::new(),
         }
+    }
+
+    /// Preserve an exact model-provided id through policy and execution.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = call_id.into();
+        self
     }
 }
 
@@ -544,13 +555,17 @@ pub fn register_agent(ctx: &mut Context, agent: AgentRef) -> Result<(), CordisEr
 
 /// Dispatch one tools pipeline call through the locked event names.
 pub fn run_tools_pipeline(ctx: &mut Context, mut call: ToolCall) -> Result<ToolCall, CordisError> {
+    let call_id = call.call_id.clone();
     call = ctx.waterfall(events::TOOLS_PRE_EXECUTE, call)?;
+    call.call_id.clone_from(&call_id);
     if call.decision != "allow" {
         ctx.emit(events::TOOLS_RESULT, &call)?;
         return Ok(call);
     }
     call = ctx.waterfall(events::TOOLS_EXECUTE, call)?;
+    call.call_id.clone_from(&call_id);
     call = ctx.waterfall(events::TOOLS_POST_EXECUTE, call)?;
+    call.call_id = call_id;
     ctx.emit(events::TOOLS_RESULT, &call)?;
     Ok(call)
 }

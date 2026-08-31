@@ -1276,6 +1276,24 @@ fn agent_step_records_completed_turn_and_read_only_restore() {
         [
             SessionEventKind::TurnStart { turn: 1 },
             SessionEventKind::StepStart { turn: 1, step: 1 },
+            SessionEventKind::UserMessage {
+                message: user_message("mission-session:turn-1:step-1:user", "plan"),
+                surface: SessionSurfaceIntent::append(),
+            },
+            SessionEventKind::AssistantMessage {
+                turn: 1,
+                step: 1,
+                message: SessionMessage {
+                    id: "mission-session:turn-1:step-1:assistant".into(),
+                    role: SessionMessageRole::Assistant,
+                    content: Vec::new(),
+                    source: SessionMessageSource::Model {
+                        provider: "hartevo-local".into(),
+                        model: "hartevo-local".into(),
+                    },
+                },
+                surface: SessionSurfaceIntent::append(),
+            },
             SessionEventKind::StepEnd { turn: 1, step: 1 },
             SessionEventKind::TurnEnd {
                 turn: 1,
@@ -1283,12 +1301,38 @@ fn agent_step_records_completed_turn_and_read_only_restore() {
             },
             SessionEventKind::TurnStart { turn: 2 },
             SessionEventKind::StepStart { turn: 2, step: 1 },
+            SessionEventKind::UserMessage {
+                message: user_message("mission-session:turn-2:step-1:user", "plan again"),
+                surface: SessionSurfaceIntent::append(),
+            },
+            SessionEventKind::AssistantMessage {
+                turn: 2,
+                step: 1,
+                message: SessionMessage {
+                    id: "mission-session:turn-2:step-1:assistant".into(),
+                    role: SessionMessageRole::Assistant,
+                    content: Vec::new(),
+                    source: SessionMessageSource::Model {
+                        provider: "hartevo-local".into(),
+                        model: "hartevo-local".into(),
+                    },
+                },
+                surface: SessionSurfaceIntent::append(),
+            },
             SessionEventKind::StepEnd { turn: 2, step: 1 },
             SessionEventKind::TurnEnd {
                 turn: 2,
                 reason: TurnEndReason::Completed,
             },
         ]
+    );
+    assert_eq!(
+        live.derive_messages().unwrap(),
+        [
+            user_message("mission-session:turn-1:step-1:user", "plan"),
+            user_message("mission-session:turn-2:step-1:user", "plan again"),
+        ],
+        "empty assistant messages remain durable but stay outside model history"
     );
 
     let agents_before = host

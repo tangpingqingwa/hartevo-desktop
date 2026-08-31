@@ -7381,6 +7381,114 @@ mod tests {
         assert!(installed.shares_cordis_coordinator(&raced));
     }
 
+    #[tokio::test]
+    async fn cordis_agent_tool_transcript_survives_encrypted_desktop_restart() {
+        use hartevo_cordis::{
+            AgentStep, LlmStream, SessionEventKind, SessionId, SessionStore, ToolCall,
+            events as cordis_events,
+        };
+        use hartevo_domain_kernel::{Approval, ApprovalId};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let data_root = directory.path().join("desktop-agent-session");
+        let secrets = MemorySecretStore::default();
+        let first = DesktopDataPlane::at_data_root(&data_root).expect("first Desktop plane");
+        first
+            .initialize_with(&secrets, observed_at())
+            .expect("initialize encrypted Desktop storage");
+        first
+            .bind_live_domain_kernel(
+                &ConsentState::Confirmed,
+                None,
+                Some(&Approval {
+                    id: ApprovalId::from("approval-agent-session"),
+                    decision: ApprovalDecision::Approved,
+                    decided_by: ActorId::from("user-agent-session"),
+                    decided_at: observed_at(),
+                    valid_until: observed_at() + Duration::minutes(5),
+                    scope_digest: "a".repeat(64),
+                    permission_digest: "b".repeat(64),
+                }),
+                observed_at(),
+            )
+            .expect("bind approved Domain facts");
+
+        let (sessions, session, expected_events, expected_messages) =
+            first.with_cordis_host(|host| {
+                host.context_mut()
+                    .on_waterfall(cordis_events::LLM_STREAM, |mut stream: LlmStream, next| {
+                        stream.body = "I will inspect it".into();
+                        next(stream)
+                    })
+                    .unwrap();
+                host.context_mut()
+                    .on_waterfall(cordis_events::TOOLS_EXECUTE, |mut call: ToolCall, next| {
+                        call.result = "desktop result".into();
+                        next(call)
+                    })
+                    .unwrap();
+                host.step(
+                    AgentStep::new("desktop-agent-session", "inspect it").with_tool(
+                        ToolCall::new("inspect", r#"{"target":"desktop"}"#, "allow")
+                            .with_call_id("desktop-call-1"),
+                    ),
+                )
+                .expect("run Cordis agent step");
+
+                let sessions = host
+                    .context()
+                    .sessions::<SessionStore>()
+                    .expect("Cordis Session store");
+                let session = sessions
+                    .get(&SessionId::new("desktop-agent-session").unwrap())
+                    .expect("Session lookup")
+                    .expect("agent Session");
+                let events = session.events().expect("live agent Session events");
+                assert_eq!(events.len(), 8);
+                assert!(matches!(
+                    events.get(4).map(|event| &event.kind),
+                    Some(SessionEventKind::ToolCall { call_id, .. })
+                        if call_id == "desktop-call-1"
+                ));
+                assert!(matches!(
+                    events.get(5).map(|event| &event.kind),
+                    Some(SessionEventKind::ToolResult { message, surface, .. })
+                        if matches!(
+                            &message.source,
+                            hartevo_cordis::SessionMessageSource::Tool { call_id }
+                                if call_id == "desktop-call-1"
+                        )
+                            && surface.source_event_seqs.as_deref() == Some(&[4][..])
+                ));
+                let messages = session
+                    .derive_messages()
+                    .expect("live model-visible transcript");
+                assert_eq!(messages.len(), 3);
+                (sessions, session, events, messages)
+            });
+        assert!(sessions.flush(&session).await.expect("encrypted flush"));
+        drop(session);
+        drop(sessions);
+        drop(first);
+
+        let second = DesktopDataPlane::at_data_root(&data_root).expect("restarted Desktop plane");
+        assert!(matches!(
+            second.load_with(&secrets, observed_at()).unwrap(),
+            DesktopLoadState::Ready(_)
+        ));
+        second.with_cordis_host(|host| {
+            let restored = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("restored Session store")
+                .get(&SessionId::new("desktop-agent-session").unwrap())
+                .expect("restored Session lookup")
+                .expect("restored agent Session");
+            assert_eq!(restored.events().unwrap(), expected_events);
+            assert_eq!(restored.derive_messages().unwrap(), expected_messages);
+        });
+    }
+
     fn desktop_restart_messages() -> [hartevo_cordis::SessionMessage; 4] {
         use hartevo_cordis::{
             SessionContentBlock, SessionMessage, SessionMessageRole, SessionMessageSource,

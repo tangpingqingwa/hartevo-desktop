@@ -4,7 +4,10 @@
 use crate::context::{Context, CordisError, keys};
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
-use crate::session::{SessionId, SessionStore, TurnEndReason};
+use crate::session::{
+    SessionContentBlock, SessionHandle, SessionId, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionStore, SessionSurfaceIntent, TurnEndReason,
+};
 use crate::surface::{
     AgentRef, AgentsSurface, DomainSurface, EffectBrokerSurface, LlmStream, LlmSurface,
     RuntimeSurface, ToolCall, ToolsSurface, events, register_agent, run_tools_pipeline, stream_llm,
@@ -84,7 +87,7 @@ pub fn run_agent_step(ctx: &mut Context, step: AgentStep) -> Result<AgentStepRes
     }
     let session_step = session.start_step(turn)?;
 
-    let result = run_ready_agent_step(ctx, step);
+    let result = run_ready_agent_step(ctx, &session, turn, session_step, step);
     session.finish_step(turn, session_step)?;
     session.finish_turn(
         turn,
@@ -99,26 +102,105 @@ pub fn run_agent_step(ctx: &mut Context, step: AgentStep) -> Result<AgentStepRes
 
 fn run_ready_agent_step(
     ctx: &mut Context,
+    session: &SessionHandle,
+    turn: u64,
+    session_step: u64,
     step: AgentStep,
 ) -> Result<AgentStepResult, CordisError> {
     // Runtime may name OpenInterpreter as an adapter plugin; it is not the loop.
     let _runtime = ctx.runtime::<RuntimeSurface>();
 
-    let agent = AgentRef::new(step.id.clone());
+    let AgentStep {
+        id,
+        prompt,
+        mut tool,
+    } = step;
+    let agent = AgentRef::new(id.clone());
     register_agent(ctx, agent.clone())?;
     ctx.emit(events::AGENT_CREATED, &agent)?;
 
-    let plan = stream_llm(ctx, LlmStream::new("hartevo-local", step.prompt))?;
-    let tool = match step.tool {
-        Some(call) => Some(run_tools_pipeline(ctx, call)?),
+    session.append_user_message(SessionMessage {
+        id: message_id(&id, turn, session_step, "user"),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::Text {
+            text: prompt.clone(),
+        }],
+        source: SessionMessageSource::User,
+    })?;
+
+    if let Some(call) = &mut tool
+        && call.call_id.is_empty()
+    {
+        call.call_id = message_id(&id, turn, session_step, "tool-1");
+    }
+
+    let plan = stream_llm(ctx, LlmStream::new("hartevo-local", prompt))?;
+    let mut assistant_content = Vec::with_capacity(usize::from(tool.is_some()) + 1);
+    if !plan.body.is_empty() {
+        assistant_content.push(SessionContentBlock::Text {
+            text: plan.body.clone(),
+        });
+    }
+    if let Some(call) = &tool {
+        assistant_content.push(SessionContentBlock::ToolCall {
+            id: call.call_id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        });
+    }
+    session.append_assistant_message(
+        turn,
+        session_step,
+        SessionMessage {
+            id: message_id(&id, turn, session_step, "assistant"),
+            role: SessionMessageRole::Assistant,
+            content: assistant_content,
+            source: SessionMessageSource::Model {
+                provider: "hartevo-local".into(),
+                model: plan.model.clone(),
+            },
+        },
+    )?;
+
+    let tool = match tool {
+        Some(call) => {
+            let call_seq = session.append_tool_call(
+                turn,
+                session_step,
+                call.call_id.clone(),
+                call.name.clone(),
+                call.arguments.clone(),
+            )?;
+            let completed = run_tools_pipeline(ctx, call)?;
+            session.append_tool_result_with_surface(
+                turn,
+                session_step,
+                SessionMessage {
+                    id: message_id(&id, turn, session_step, "tool-result-1"),
+                    role: SessionMessageRole::User,
+                    content: vec![SessionContentBlock::ToolResult {
+                        tool_call_id: completed.call_id.clone(),
+                        content: vec![SessionContentBlock::Text {
+                            text: completed.result.clone(),
+                        }],
+                        is_error: completed.decision != "allow",
+                    }],
+                    source: SessionMessageSource::Tool {
+                        call_id: completed.call_id.clone(),
+                    },
+                },
+                SessionSurfaceIntent::append_from(vec![call_seq]),
+            )?;
+            Some(completed)
+        }
         None => None,
     };
 
-    Ok(AgentStepResult {
-        id: step.id,
-        plan,
-        tool,
-    })
+    Ok(AgentStepResult { id, plan, tool })
+}
+
+fn message_id(id: &str, turn: u64, step: u64, kind: &str) -> String {
+    format!("{id}:turn-{turn}:step-{step}:{kind}")
 }
 
 fn require_loop_surfaces(ctx: &Context) -> Result<(), CordisError> {

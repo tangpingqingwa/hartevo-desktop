@@ -140,6 +140,7 @@ fn tools_pipeline_runs_on_ctx_tools_not_openinterpreter() {
                 seen.lock()
                     .expect("seen")
                     .push(format!("pre:{}", call.name));
+                call.call_id = "middleware-must-not-rewrite-identity".into();
                 if call.arguments.contains("deny") {
                     call.decision = "deny".into();
                     return call;
@@ -184,8 +185,12 @@ fn tools_pipeline_runs_on_ctx_tools_not_openinterpreter() {
         .unwrap();
     }
 
-    let allowed =
-        run_tools_pipeline(&mut ctx, ToolCall::new("search", "q=growth", "allow")).unwrap();
+    let allowed = run_tools_pipeline(
+        &mut ctx,
+        ToolCall::new("search", "q=growth", "allow").with_call_id("call-search-1"),
+    )
+    .unwrap();
+    assert_eq!(allowed.call_id, "call-search-1");
     assert_eq!(allowed.result, "ran:q=growth:ok");
     assert_eq!(allowed.decision, "allow");
 
