@@ -285,20 +285,24 @@ impl DesktopCordisCoordinator {
                         turn,
                         step,
                         message,
-                        ..
+                        surface,
                     } = event.kind
                     else {
                         return None;
                     };
-                    (message.id == assistant.id).then_some((turn, step))
+                    (message.id == assistant.id).then_some((turn, step, surface))
                 });
-                let Some((turn, step)) = location else {
+                let Some((turn, step, surface)) = location else {
                     return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
                         transcript.session_id,
                     ));
                 };
-                let recorded_chunks = session
-                    .assistant_chunks(turn, step)?
+                let recorded_chunks = session.assistant_chunks(turn, step)?;
+                let recorded_chunk_seqs = recorded_chunks
+                    .iter()
+                    .map(|chunk| chunk.seq)
+                    .collect::<Vec<_>>();
+                let recorded_chunks = recorded_chunks
                     .into_iter()
                     .map(|chunk| chunk.chunk)
                     .collect::<Vec<_>>();
@@ -306,6 +310,13 @@ impl DesktopCordisCoordinator {
                     && recorded_chunks != legacy_chunks
                     && recorded_chunks != expected_chunks
                 {
+                    return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
+                        transcript.session_id,
+                    ));
+                }
+                let exact_provenance = recorded_chunks == expected_chunks
+                    && surface == SessionSurfaceIntent::append_from(recorded_chunk_seqs);
+                if surface != SessionSurfaceIntent::append() && !exact_provenance {
                     return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
                         transcript.session_id,
                     ));
@@ -327,11 +338,17 @@ impl DesktopCordisCoordinator {
             model: transcript.model,
             context_window: None,
         })?;
-        for chunk in expected_chunks {
-            session.append_assistant_chunk(turn, step, chunk)?;
-        }
+        let source_seqs = expected_chunks
+            .into_iter()
+            .map(|chunk| session.append_assistant_chunk(turn, step, chunk))
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(message) = assistant {
-            session.append_assistant_message(turn, step, message)?;
+            session.append_assistant_message_with_surface(
+                turn,
+                step,
+                message,
+                SessionSurfaceIntent::append_from(source_seqs),
+            )?;
         }
         session.finish_step(turn, step)?;
         session.finish_turn(turn, transcript.end_reason)?;
