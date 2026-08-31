@@ -303,7 +303,13 @@ impl ReceiptVerificationInfrastructure for ProjectStore {
                 .clone()
                 .ok_or(LedgerError::ScopeConflict)?;
             validate_durable_verification_status_shape(&record, &verification)?;
-            if recovery_head.state != expected_state
+            if independent_verification_id(
+                effect,
+                &receipt,
+                &verification.verifier,
+                &verification.evidence_digest,
+            ) != verification.id
+                || recovery_head.state != expected_state
                 || (expected_state == ProviderRecoveryState::Verified
                     && recovery_head.verification_evidence_digest.as_deref()
                         != Some(verification.evidence_digest.as_str()))
@@ -1989,12 +1995,6 @@ fn decode_durable_verification(
         || !is_sha256(&verification.evidence_digest)
         || verification.evidence_digest == receipt.response_digest
         || verification.observed_at < receipt.accepted_at
-        || independent_verification_id(
-            effect,
-            &receipt,
-            &verification.verifier,
-            &verification.evidence_digest,
-        ) != verification.id
     {
         return Err(LedgerError::Persistence(
             "durable receipt or verification integrity check failed".into(),
