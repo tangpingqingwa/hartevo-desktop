@@ -430,6 +430,80 @@ impl SessionStore {
         Ok(handle)
     }
 
+    /// Create a live child from a detached prefix of a live source Session.
+    ///
+    /// `boundary` is the inclusive source event sequence. Omitting it selects
+    /// the current last event, while omitting it on an empty source creates an
+    /// empty child. The selected prefix must end outside an open turn.
+    pub fn fork(
+        &self,
+        source_id: &SessionId,
+        boundary: Option<u64>,
+        child_id: SessionId,
+    ) -> Result<SessionHandle, SessionError> {
+        let mut state = self.lock()?;
+        if state.sessions.contains_key(&child_id) {
+            return Err(SessionError::SessionAlreadyExists { id: child_id });
+        }
+        let source = state.sessions.get(source_id).cloned().ok_or_else(|| {
+            SessionError::SessionNotFound {
+                id: source_id.clone(),
+            }
+        })?;
+        let source_log = source.lock()?;
+        let last_seq = source_log.events().last().map(|event| event.seq);
+        let selected_boundary = boundary.or(last_seq);
+        let seed = match selected_boundary {
+            None => Vec::new(),
+            Some(boundary) => {
+                let index = usize::try_from(boundary).map_err(|_| {
+                    SessionError::ForkBoundaryDoesNotExist {
+                        id: source_id.clone(),
+                        boundary,
+                        last_seq,
+                    }
+                })?;
+                let event = source_log.events().get(index).ok_or_else(|| {
+                    SessionError::ForkBoundaryDoesNotExist {
+                        id: source_id.clone(),
+                        boundary,
+                        last_seq,
+                    }
+                })?;
+                if event.seq != boundary {
+                    return Err(SessionError::ForkBoundaryNotContiguous {
+                        id: source_id.clone(),
+                        boundary,
+                    });
+                }
+                source_log.events()[..=index].to_vec()
+            }
+        };
+        drop(source_log);
+
+        let seed_length =
+            u64::try_from(seed.len()).map_err(|_| SessionError::EventSequenceOverflow)?;
+        let header = SessionHeader {
+            version: SESSION_FORMAT_VERSION,
+            id: child_id.clone(),
+            created_at_ms: Utc::now().timestamp_millis(),
+            parent_session: Some(source_id.clone()),
+            seed_length: Some(seed_length),
+        };
+        let child_log = SessionLog::restore(header, seed)?;
+        if let Some(turn) = child_log.open_turn() {
+            let boundary = selected_boundary.ok_or(SessionError::EventSequenceOverflow)?;
+            return Err(SessionError::ForkInsideOpenTurn {
+                id: source_id.clone(),
+                boundary,
+                turn,
+            });
+        }
+        let child = SessionHandle::new(child_log);
+        state.sessions.insert(child_id, child.clone());
+        Ok(child)
+    }
+
     pub fn get(&self, id: &SessionId) -> Result<Option<SessionHandle>, SessionError> {
         Ok(self.lock()?.sessions.get(id).cloned())
     }
@@ -506,6 +580,22 @@ pub enum SessionError {
     SeedBeyondLog { seed_length: u64, event_count: u64 },
     #[error("session `{id}` already exists")]
     SessionAlreadyExists { id: SessionId },
+    #[error("session `{id}` was not found")]
+    SessionNotFound { id: SessionId },
+    #[error("fork boundary {boundary} does not exist in session `{id}` (last seq: {last_seq:?})")]
+    ForkBoundaryDoesNotExist {
+        id: SessionId,
+        boundary: u64,
+        last_seq: Option<u64>,
+    },
+    #[error("fork boundary {boundary} is not contiguous in session `{id}`")]
+    ForkBoundaryNotContiguous { id: SessionId, boundary: u64 },
+    #[error("fork boundary {boundary} in session `{id}` ends inside open turn {turn}")]
+    ForkInsideOpenTurn {
+        id: SessionId,
+        boundary: u64,
+        turn: u64,
+    },
     #[error("session store mutex is poisoned")]
     StorePoisoned,
     #[error("session log mutex is poisoned")]

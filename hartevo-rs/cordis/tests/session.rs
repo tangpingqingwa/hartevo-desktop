@@ -167,3 +167,144 @@ fn blocked_turn_closes_without_step_or_agent_execution() {
             .is_empty()
     );
 }
+
+#[test]
+fn fork_detaches_empty_and_latest_closed_seeds_with_lineage() {
+    let store = SessionStore::new();
+    let empty_parent_id = SessionId::new("empty-parent").unwrap();
+    store.create(empty_parent_id.clone()).unwrap();
+    let empty_child = store
+        .fork(
+            &empty_parent_id,
+            None,
+            SessionId::new("empty-child").unwrap(),
+        )
+        .unwrap();
+    assert!(empty_child.events().unwrap().is_empty());
+    assert_eq!(
+        empty_child.header().unwrap().parent_session,
+        Some(empty_parent_id)
+    );
+    assert_eq!(empty_child.header().unwrap().seed_length, Some(0));
+
+    let parent_id = SessionId::new("fork-parent").unwrap();
+    let parent = store.create(parent_id.clone()).unwrap();
+    let turn = parent.start_turn().unwrap();
+    let step = parent.start_step(turn).unwrap();
+    parent.finish_step(turn, step).unwrap();
+    parent.finish_turn(turn, TurnEndReason::Completed).unwrap();
+    let inherited = parent.events().unwrap();
+
+    let child = store
+        .fork(&parent_id, None, SessionId::new("fork-child").unwrap())
+        .unwrap();
+    assert_eq!(child.events().unwrap(), inherited);
+    assert_eq!(child.header().unwrap().parent_session, Some(parent_id));
+    assert_eq!(child.header().unwrap().seed_length, Some(4));
+
+    let parent_turn = parent.start_turn().unwrap();
+    parent
+        .finish_turn(parent_turn, TurnEndReason::Blocked)
+        .unwrap();
+    assert_eq!(child.events().unwrap(), inherited);
+
+    let child_turn = child.start_turn().unwrap();
+    child
+        .finish_turn(child_turn, TurnEndReason::Completed)
+        .unwrap();
+    assert_eq!(parent.events().unwrap().len(), 6);
+    assert_eq!(child.events().unwrap().len(), 6);
+}
+
+#[test]
+fn fork_accepts_an_earlier_closed_boundary_from_an_open_tail() {
+    let store = SessionStore::new();
+    let parent_id = SessionId::new("earlier-parent").unwrap();
+    let parent = store.create(parent_id.clone()).unwrap();
+
+    let first_turn = parent.start_turn().unwrap();
+    let first_step = parent.start_step(first_turn).unwrap();
+    parent.finish_step(first_turn, first_step).unwrap();
+    parent
+        .finish_turn(first_turn, TurnEndReason::Completed)
+        .unwrap();
+    let first_boundary = 3;
+
+    let second_turn = parent.start_turn().unwrap();
+    parent
+        .finish_turn(second_turn, TurnEndReason::Completed)
+        .unwrap();
+    let open_turn = parent.start_turn().unwrap();
+
+    let child = store
+        .fork(
+            &parent_id,
+            Some(first_boundary),
+            SessionId::new("earlier-child").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(child.events().unwrap().len(), 4);
+    assert_eq!(child.header().unwrap().seed_length, Some(4));
+    assert_eq!(
+        parent.events().unwrap().last().unwrap().kind,
+        SessionEventKind::TurnStart { turn: open_turn }
+    );
+
+    let child_turn = child.start_turn().unwrap();
+    assert_eq!(child_turn, 2);
+    child
+        .finish_turn(child_turn, TurnEndReason::Completed)
+        .unwrap();
+}
+
+#[test]
+fn fork_rejects_missing_duplicate_invalid_and_open_sources_before_publish() {
+    let store = SessionStore::new();
+    let missing = SessionId::new("missing").unwrap();
+    let missing_child = SessionId::new("missing-child").unwrap();
+    assert_eq!(
+        store
+            .fork(&missing, None, missing_child.clone())
+            .unwrap_err(),
+        SessionError::SessionNotFound { id: missing }
+    );
+    assert!(store.get(&missing_child).unwrap().is_none());
+
+    let parent_id = SessionId::new("open-parent").unwrap();
+    let parent = store.create(parent_id.clone()).unwrap();
+    let turn = parent.start_turn().unwrap();
+    let open_child = SessionId::new("open-child").unwrap();
+    assert_eq!(
+        store
+            .fork(&parent_id, None, open_child.clone())
+            .unwrap_err(),
+        SessionError::ForkInsideOpenTurn {
+            id: parent_id.clone(),
+            boundary: 0,
+            turn,
+        }
+    );
+    assert!(store.get(&open_child).unwrap().is_none());
+
+    let invalid_child = SessionId::new("invalid-child").unwrap();
+    assert_eq!(
+        store
+            .fork(&parent_id, Some(9), invalid_child.clone())
+            .unwrap_err(),
+        SessionError::ForkBoundaryDoesNotExist {
+            id: parent_id.clone(),
+            boundary: 9,
+            last_seq: Some(0),
+        }
+    );
+    assert!(store.get(&invalid_child).unwrap().is_none());
+
+    let duplicate_id = SessionId::new("duplicate-child").unwrap();
+    store.create(duplicate_id.clone()).unwrap();
+    assert_eq!(
+        store
+            .fork(&parent_id, None, duplicate_id.clone())
+            .unwrap_err(),
+        SessionError::SessionAlreadyExists { id: duplicate_id }
+    );
+}
