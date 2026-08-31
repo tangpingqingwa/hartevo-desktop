@@ -14,9 +14,10 @@ use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, DomainCommandAuthority,
     DomainCommandBinding, DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding,
     EffectExecutionPermit, EffectReconciliationAuthority, EffectReconciliationBinding,
-    EffectReconciliationPermit, Fiber, FiberState, FiberUid, KernelApproval,
-    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
-    RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
+    EffectReconciliationPermit, EffectVerificationAuthority, EffectVerificationBinding,
+    EffectVerificationPermit, Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision,
+    KernelConsentRecord, KernelConsentState, KernelConsentStatus, RuntimeAuthority,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, host_is_cordis_loop, keys,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -227,6 +228,15 @@ impl DesktopCordisCoordinator {
         self.host.authorize_effect_reconciliation(&scope, effect)
     }
 
+    fn authorize_bound_effect_verification(
+        &mut self,
+        binding: DesktopCordisBindingReceipt,
+        effect: EffectVerificationBinding,
+    ) -> Result<EffectVerificationPermit, CordisError> {
+        let scope = self.consume_binding(binding)?;
+        self.host.authorize_effect_verification(&scope, effect)
+    }
+
     fn bind_and_authorize_runtime(
         &mut self,
         scope: AuthorityScope,
@@ -278,6 +288,19 @@ impl DesktopCordisCoordinator {
         self.authorize_bound_effect_reconciliation(binding, effect)
     }
 
+    fn bind_and_authorize_effect_verification(
+        &mut self,
+        scope: AuthorityScope,
+        consent: KernelConsentState,
+        record: Option<KernelConsentRecord>,
+        approval: Option<KernelApproval>,
+        effect: EffectVerificationBinding,
+        now: DateTime<Utc>,
+    ) -> Result<EffectVerificationPermit, CordisError> {
+        let binding = self.bind_domain_kernel_scope(scope, consent, record, approval, now)?;
+        self.authorize_bound_effect_verification(binding, effect)
+    }
+
     fn finish_runtime(
         &mut self,
         permit: RuntimeDispatchPermit,
@@ -301,6 +324,13 @@ impl DesktopCordisCoordinator {
         permit: EffectReconciliationPermit,
     ) -> Result<(), CordisError> {
         self.host.finish_effect_reconciliation(permit)
+    }
+
+    fn finish_effect_verification(
+        &mut self,
+        permit: EffectVerificationPermit,
+    ) -> Result<(), CordisError> {
+        self.host.finish_effect_verification(permit)
     }
 
     #[cfg(test)]
@@ -541,6 +571,30 @@ where
     }
 }
 
+/// Private Desktop adapter for one Cordis-authorized independent verification.
+struct DesktopEffectVerificationAuthority<Verify> {
+    verify: Verify,
+}
+
+impl<Verify> DesktopEffectVerificationAuthority<Verify> {
+    fn new(verify: Verify) -> Self {
+        Self { verify }
+    }
+}
+
+impl<Verify, Output, AdapterError> EffectVerificationAuthority
+    for DesktopEffectVerificationAuthority<Verify>
+where
+    Verify: FnOnce(&EffectVerificationPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn verify(self, permit: &EffectVerificationPermit) -> Result<Self::Output, Self::Error> {
+        (self.verify)(permit)
+    }
+}
+
 /// Exact Cordis scope plus the single Domain command admitted in that scope.
 pub(crate) struct DesktopDomainCommandAuthorization {
     scope: AuthorityScope,
@@ -574,6 +628,18 @@ pub(crate) struct DesktopEffectReconciliationAuthorization {
 
 impl DesktopEffectReconciliationAuthorization {
     pub(crate) fn new(scope: AuthorityScope, effect: EffectReconciliationBinding) -> Self {
+        Self { scope, effect }
+    }
+}
+
+/// Exact Cordis scope plus the immutable independent-verification fence.
+pub(crate) struct DesktopEffectVerificationAuthorization {
+    scope: AuthorityScope,
+    effect: EffectVerificationBinding,
+}
+
+impl DesktopEffectVerificationAuthorization {
+    pub(crate) fn new(scope: AuthorityScope, effect: EffectVerificationBinding) -> Self {
         Self { scope, effect }
     }
 }
@@ -773,6 +839,54 @@ where
     }
 }
 
+/// Bind exact live facts, issue a one-shot independent-verification permit,
+/// release the coordinator lock for Application/Broker/source work, then
+/// settle under a second short lock. No executor, reconciler, or generic
+/// EffectVerifier is present in this signature.
+pub(crate) fn dispatch_live_effect_verification<Verify, Output, AdapterError>(
+    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    authorization: DesktopEffectVerificationAuthorization,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+    verify: Verify,
+) -> Result<Output, AuthorityDispatchError<AdapterError>>
+where
+    Verify: FnOnce(&EffectVerificationPermit) -> Result<Output, AdapterError>,
+{
+    let DesktopEffectVerificationAuthorization { scope, effect } = authorization;
+    let permit = {
+        let mut host = cordis
+            .lock()
+            .map_err(|_| CordisError::EffectVerificationCoordinatorPoisoned)?;
+        host.bind_and_authorize_effect_verification(
+            scope,
+            kernel_consent_state(consent),
+            record.map(kernel_consent_record),
+            approval.map(kernel_approval),
+            effect,
+            now,
+        )?
+    };
+    let (output, authority) = match DesktopEffectVerificationAuthority::new(verify).verify(&permit)
+    {
+        Ok(output) => (Some(output), None),
+        Err(error) => (None, Some(error)),
+    };
+    let finish = match cordis.lock() {
+        Ok(mut host) => host.finish_effect_verification(permit).err(),
+        Err(_) => Some(CordisError::EffectVerificationCoordinatorPoisoned),
+    };
+    if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
+        Err(error)
+    } else {
+        output.ok_or_else(|| {
+            AuthorityDispatchError::Cordis(Box::new(CordisError::EffectVerificationPermitMismatch))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -789,8 +903,9 @@ mod tests {
     use hartevo_cordis::{
         AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
         DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding,
-        EffectReconciliationBinding, FiberState, OPENINTERPRETER, RuntimeBinding, SurfaceOwner,
-        enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys,
+        EffectReconciliationBinding, EffectVerificationBinding, FiberState, OPENINTERPRETER,
+        RuntimeBinding, SurfaceOwner, enforce_invariants, events, host_is_cordis_loop,
+        invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -801,10 +916,11 @@ mod tests {
 
     use super::{
         DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
-        DesktopEffectReconciliationAuthorization, bind_live_domain_kernel,
-        bind_live_domain_kernel_scope, dispatch_live_domain_command,
-        dispatch_live_effect_execution, dispatch_live_effect_reconciliation, dispatch_live_runtime,
-        mount_cordis_host, openinterpreter_runtime_plugin,
+        DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
+        bind_live_domain_kernel, bind_live_domain_kernel_scope, dispatch_live_domain_command,
+        dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
+        dispatch_live_effect_verification, dispatch_live_runtime, mount_cordis_host,
+        openinterpreter_runtime_plugin,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -852,6 +968,18 @@ mod tests {
 
     fn effect_reconciliation() -> EffectReconciliationBinding {
         EffectReconciliationBinding::new("effect-a", "a".repeat(64), "b".repeat(64)).unwrap()
+    }
+
+    fn effect_verification() -> EffectVerificationBinding {
+        EffectVerificationBinding::new(
+            "effect-a",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            "e".repeat(64),
+        )
+        .unwrap()
     }
 
     fn assert_emit_source(error: &CordisError, expected: &'static str) {
@@ -1269,6 +1397,87 @@ mod tests {
         assert!(host.active_effect_execution_scope().is_none());
         assert!(host.active_domain_command_scope().is_none());
         assert!(host.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn desktop_effect_verification_is_one_shot_exclusive_redacted_and_drop_safe() {
+        let host = Arc::new(Mutex::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let probe = Arc::clone(&host);
+        let expected_scope = domain_scope();
+        let expected_binding = effect_verification();
+        let approval = approved(now() + Duration::minutes(5));
+        let nested_approval = approval.clone();
+        let output = dispatch_live_effect_verification(
+            &host,
+            DesktopEffectVerificationAuthorization::new(
+                expected_scope.clone(),
+                expected_binding.clone(),
+            ),
+            &ConsentState::Confirmed,
+            None,
+            Some(&approval),
+            now(),
+            move |permit| {
+                assert_eq!(permit.scope(), &expected_scope);
+                assert_eq!(permit.binding(), &expected_binding);
+                let debug = format!("{permit:?}");
+                for digest in ["a", "b", "c", "d", "e"] {
+                    assert!(!debug.contains(&digest.repeat(64)));
+                }
+                assert!(probe.try_lock().is_ok());
+                let nested = dispatch_live_effect_verification(
+                    &probe,
+                    DesktopEffectVerificationAuthorization::new(
+                        permit.scope().clone(),
+                        permit.binding().clone(),
+                    ),
+                    &ConsentState::Confirmed,
+                    None,
+                    Some(&nested_approval),
+                    now(),
+                    |_| Ok::<_, &'static str>(()),
+                );
+                assert_eq!(
+                    nested.unwrap_err(),
+                    AuthorityDispatchError::Cordis(Box::new(
+                        CordisError::EffectVerificationDispatchBusy
+                    ))
+                );
+                Ok::<_, &'static str>("application-independent-verification")
+            },
+        )
+        .unwrap();
+        assert_eq!(output, "application-independent-verification");
+        assert!(
+            host.lock()
+                .unwrap()
+                .active_effect_verification_scope()
+                .is_none()
+        );
+
+        let panic_host = Arc::clone(&host);
+        let panic_approval = approval.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = dispatch_live_effect_verification(
+                &panic_host,
+                DesktopEffectVerificationAuthorization::new(domain_scope(), effect_verification()),
+                &ConsentState::Confirmed,
+                None,
+                Some(&panic_approval),
+                now(),
+                |_| -> Result<(), &'static str> { panic!("verification source panic") },
+            );
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            host.lock()
+                .unwrap()
+                .active_effect_verification_scope()
+                .is_none()
+        );
     }
 
     #[test]

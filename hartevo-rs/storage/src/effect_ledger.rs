@@ -6,15 +6,19 @@ use hartevo_effect_broker::{
     DurableClaimDirective, DurableEffectLedger, DurableRateLimitDirective,
     DurableReceiptReconciliation, ExecutionClaimContext, ExecutionLease, LedgerClaim, LedgerError,
     PersistedClaimState, PersistedCompletionPoint, RateLimitRequest,
-    ReceiptReconciliationInfrastructure, ReconciliationClaim, ReconciliationDisposition,
+    ReceiptReconciliationInfrastructure, ReceiptVerificationClaimBinding,
+    ReceiptVerificationInfrastructure, ReconciliationClaim, ReconciliationDisposition,
     ReconciliationLease, ReconciliationObservation, ReconciliationPolicy, StagedReceiptFound,
-    decide_durable_claim, decide_durable_rate_limit,
+    VerificationClaim, VerificationLease, canonical_verifier_id, decide_durable_claim,
+    decide_durable_rate_limit, independent_verification_id,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::provider_recovery_store::{
-    load_provider_recovery_in_transaction, record_provider_recovery_receipt_in_transaction,
+    fail_provider_recovery_closed_in_transaction, load_provider_recovery_in_transaction,
+    record_provider_recovery_receipt_in_transaction,
+    record_provider_recovery_verified_in_transaction,
 };
 use crate::{ProjectStore, ProviderRecoveryHead, ProviderRecoveryState, authorization, normalized};
 
@@ -213,6 +217,357 @@ impl DurableEffectLedger for ProjectStore {
         now: DateTime<Utc>,
     ) -> Result<ReconciliationDisposition, LedgerError> {
         record_effect_reconciliation(self, effect, lease, observation, now)
+    }
+}
+
+impl ReceiptVerificationInfrastructure for ProjectStore {
+    // Keep the claim's validation and immediate transaction in one audit
+    // boundary so no partially authenticated lease can escape.
+    #[allow(clippy::too_many_lines)]
+    fn claim_verification(
+        &mut self,
+        effect: &Effect,
+        binding: &ReceiptVerificationClaimBinding,
+        expected_mission_revision: u64,
+        owner: &str,
+        now: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<VerificationClaim, LedgerError> {
+        if owner.trim().is_empty() || lease_expires_at <= now {
+            return Err(LedgerError::Persistence(
+                "verification claim requires a non-empty owner and positive lease".into(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(persistence)?;
+        let record = load_idempotency(&transaction, effect)?.ok_or(LedgerError::ScopeConflict)?;
+        let (receipt, execution_started_at) =
+            decode_durable_receipt(&transaction, effect, &record)?;
+        let durable_verification = record
+            .verification_json
+            .as_deref()
+            .map(|_| decode_durable_verification(&transaction, effect, &record))
+            .transpose()?
+            .map(|(_, verification, _)| verification);
+        validate_current_verification_mission(
+            &transaction,
+            effect,
+            expected_mission_revision,
+            &record,
+            &receipt,
+            durable_verification.as_ref(),
+        )?;
+        binding.validate_for(effect, &receipt)?;
+        // The N15 reconciliation head is immutable input to N16. Keep this
+        // check inside the same transaction as the verification claim so a
+        // forged receipt/provider head can never acquire a verification
+        // lease without the original receipt_found triad.
+        let reconciliation_head =
+            load_reconciliation_head(&transaction, effect)?.ok_or(LedgerError::ScopeConflict)?;
+        validate_receipt_found_head(effect, &reconciliation_head, &receipt, execution_started_at)?;
+        let receipt_completion = PersistedCompletionPoint::reconciliation_head_receipt_found(
+            reconciliation_head.updated_at,
+        );
+        let recovery_head =
+            load_provider_recovery_in_transaction(&transaction, &effect.project_id, &effect.id)
+                .map_err(storage_persistence)?
+                .ok_or(LedgerError::ScopeConflict)?;
+        validate_verification_prestate(effect, &record, &recovery_head, &receipt)?;
+        ensure_verification_attempt_bindings(&transaction, effect, &binding.digest())?;
+
+        if matches!(
+            record.status.as_str(),
+            "verified" | "failed" | "verification_required"
+        ) && record.verification_json.is_some()
+        {
+            let expected_state = match record.status.as_str() {
+                "verified" => ProviderRecoveryState::Verified,
+                "failed" => ProviderRecoveryState::FailedClosed,
+                "verification_required" => ProviderRecoveryState::ReceiptObserved,
+                _ => unreachable!(),
+            };
+            let latest = latest_verification_attempt(&transaction, effect)?
+                .ok_or(LedgerError::ScopeConflict)?;
+            if latest.request_digest != binding.digest()
+                || latest.status != record.status
+                || latest.receipt_json.as_deref() != record.receipt_json.as_deref()
+                || latest.verification_json.as_deref() != record.verification_json.as_deref()
+                || latest.failure_class != record.uncertain_reason
+                || latest.updated_at != record.updated_at
+            {
+                return Err(LedgerError::ScopeConflict);
+            }
+            let verification = durable_verification
+                .clone()
+                .ok_or(LedgerError::ScopeConflict)?;
+            validate_durable_verification_status_shape(&record, &verification)?;
+            if independent_verification_id(
+                effect,
+                &receipt,
+                &verification.verifier,
+                &verification.evidence_digest,
+            ) != verification.id
+                || recovery_head.state != expected_state
+                || (expected_state == ProviderRecoveryState::Verified
+                    && recovery_head.verification_evidence_digest.as_deref()
+                        != Some(verification.evidence_digest.as_str()))
+                || (expected_state != ProviderRecoveryState::Verified
+                    && recovery_head.verification_evidence_digest.is_some())
+                || match expected_state {
+                    ProviderRecoveryState::Verified | ProviderRecoveryState::FailedClosed => {
+                        recovery_head.updated_at != record.updated_at
+                    }
+                    ProviderRecoveryState::ReceiptObserved => {
+                        recovery_head.updated_at != reconciliation_head.updated_at
+                    }
+                    _ => true,
+                }
+            {
+                return Err(LedgerError::ScopeConflict);
+            }
+            transaction.commit().map_err(persistence)?;
+            return Ok(VerificationClaim::AlreadyCompleted {
+                receipt,
+                verification,
+                execution_started_at,
+                operation_at: record.updated_at,
+                receipt_completion,
+            });
+        }
+        if record.status != "receipt_recorded"
+            || record.receipt_json.is_none()
+            || record.verification_json.is_some()
+            || record.uncertain_reason.is_some()
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        if recovery_head.state != ProviderRecoveryState::ReceiptObserved
+            || recovery_head.verification_evidence_digest.is_some()
+            || record.updated_at != reconciliation_head.updated_at
+            || recovery_head.updated_at != reconciliation_head.updated_at
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        validate_verification_connection(&transaction, effect, &recovery_head, now)?;
+        if let Some(attempt) = latest_verification_attempt(&transaction, effect)? {
+            if attempt.status != "verifying"
+                || attempt.request_digest != binding.digest()
+                || attempt.receipt_json.as_deref() != record.receipt_json.as_deref()
+                || attempt.verification_json.is_some()
+                || attempt.failure_class.is_some()
+            {
+                return Err(LedgerError::ScopeConflict);
+            }
+            if attempt.lease_expires_at > now {
+                transaction.commit().map_err(persistence)?;
+                return Ok(VerificationClaim::Busy);
+            }
+        }
+        let (attempt_no, generation) = next_attempt(&transaction, effect)?;
+        let lease = insert_verification_attempt(
+            &transaction,
+            effect,
+            &receipt,
+            owner,
+            attempt_no,
+            generation,
+            lease_expires_at,
+            now,
+            &binding.digest(),
+        )?;
+        transaction.commit().map_err(persistence)?;
+        Ok(VerificationClaim::Acquired {
+            lease,
+            receipt,
+            execution_started_at,
+            receipt_completion,
+        })
+    }
+
+    // Keep the three durable heads and their preconditions in one immediate
+    // transaction; splitting this path would obscure its atomicity proof.
+    #[allow(clippy::too_many_lines)]
+    fn commit_verification(
+        &mut self,
+        effect: &Effect,
+        binding: &ReceiptVerificationClaimBinding,
+        lease: &VerificationLease,
+        verification: &Verification,
+        expected_mission_revision: u64,
+        operation_at: DateTime<Utc>,
+    ) -> Result<(), LedgerError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(persistence)?;
+        if lease.binding_digest != binding.digest() {
+            return Err(LedgerError::LeaseLost);
+        }
+        let record = load_idempotency(&transaction, effect)?.ok_or(LedgerError::ScopeConflict)?;
+        let (receipt, execution_started_at) =
+            decode_durable_receipt(&transaction, effect, &record)?;
+        let receipt_json = serde_json::to_string(&receipt).map_err(persistence)?;
+        require_current_verification_lease(
+            &transaction,
+            effect,
+            lease,
+            binding,
+            &receipt_json,
+            operation_at,
+        )?;
+        let durable_verification = record
+            .verification_json
+            .as_deref()
+            .map(|_| decode_durable_verification(&transaction, effect, &record))
+            .transpose()?
+            .map(|(_, verification, _)| verification);
+        validate_current_verification_mission(
+            &transaction,
+            effect,
+            expected_mission_revision,
+            &record,
+            &receipt,
+            durable_verification.as_ref(),
+        )?;
+        // Re-authenticate the immutable N15 receipt_found row while the
+        // verification lease and all three durable heads are locked.
+        let reconciliation_head =
+            load_reconciliation_head(&transaction, effect)?.ok_or(LedgerError::ScopeConflict)?;
+        validate_receipt_found_head(effect, &reconciliation_head, &receipt, execution_started_at)?;
+        let recovery_head =
+            load_provider_recovery_in_transaction(&transaction, &effect.project_id, &effect.id)
+                .map_err(storage_persistence)?
+                .ok_or(LedgerError::ScopeConflict)?;
+        validate_verification_prestate(effect, &record, &recovery_head, &receipt)?;
+        if record.status != "receipt_recorded"
+            || record.receipt_json.is_none()
+            || record.verification_json.is_some()
+            || record.uncertain_reason.is_some()
+            || recovery_head.state != ProviderRecoveryState::ReceiptObserved
+            || recovery_head.verification_evidence_digest.is_some()
+            || record.updated_at != reconciliation_head.updated_at
+            || recovery_head.updated_at != reconciliation_head.updated_at
+            || operation_at < reconciliation_head.updated_at
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        validate_verification_connection(&transaction, effect, &recovery_head, operation_at)?;
+        if verification.receipt_id != receipt.id
+            || canonical_verifier_id(&verification.verifier).as_deref()
+                != Some(verification.verifier.as_str())
+            || !verification.independent
+            || !is_sha256(&verification.evidence_digest)
+            || verification.evidence_digest == receipt.response_digest
+            || verification.observed_at < receipt.accepted_at
+            || operation_at < verification.observed_at
+            || independent_verification_id(
+                effect,
+                &receipt,
+                &verification.verifier,
+                &verification.evidence_digest,
+            ) != verification.id
+        {
+            return Err(LedgerError::ScopeConflict);
+        }
+        let (status, failure_class) = match verification.status {
+            VerificationStatus::Confirmed => ("verified", None),
+            VerificationStatus::Rejected => ("failed", Some("verification_rejected")),
+            VerificationStatus::Inconclusive => {
+                ("verification_required", Some("verification_inconclusive"))
+            }
+        };
+        let verification_json = serde_json::to_string(verification).map_err(persistence)?;
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE execution_attempts SET status = ?8, receipt_json = ?9,
+                   verification_json = ?10, failure_class = ?11, updated_at = ?12
+                 WHERE id = ?1 AND project_id = ?2 AND effect_id = ?3
+                   AND generation = ?4 AND lease_owner = ?5
+                   AND lease_expires_at = ?6 AND lease_expires_at > ?7
+                   AND status = 'verifying' AND receipt_json = ?13
+                   AND verification_json IS NULL AND failure_class IS NULL",
+                params![
+                    lease.attempt_id.as_str(),
+                    effect.project_id.as_str(),
+                    effect.id.as_str(),
+                    to_sql_u64(lease.generation)?,
+                    lease.owner,
+                    lease.expires_at.to_rfc3339(),
+                    operation_at.to_rfc3339(),
+                    status,
+                    &receipt_json,
+                    verification_json,
+                    failure_class,
+                    operation_at.to_rfc3339(),
+                    &receipt_json,
+                ],
+            )
+            .map_err(persistence)?;
+        if attempt_updated != 1 {
+            return Err(LedgerError::LeaseLost);
+        }
+        let idempotency_updated = transaction
+            .execute(
+                "UPDATE effect_idempotency SET status = ?4, receipt_json = ?5,
+                   verification_json = ?6, uncertain_reason = ?7, updated_at = ?8
+                 WHERE project_id = ?1 AND idempotency_key = ?2
+                   AND approval_digest = ?3
+                   AND status = 'receipt_recorded'
+                   AND verification_json IS NULL AND uncertain_reason IS NULL",
+                params![
+                    effect.project_id.as_str(),
+                    effect.idempotency_key,
+                    effect.approval_digest(),
+                    status,
+                    &receipt_json,
+                    verification_json,
+                    failure_class,
+                    operation_at.to_rfc3339(),
+                ],
+            )
+            .map_err(persistence)?;
+        if idempotency_updated != 1 {
+            return Err(LedgerError::ScopeConflict);
+        }
+        match verification.status {
+            VerificationStatus::Confirmed => {
+                let committed = record_provider_recovery_verified_in_transaction(
+                    &transaction,
+                    &effect.project_id,
+                    &effect.id,
+                    recovery_head.revision,
+                    &recovery_head.binding.binding_digest,
+                    verification.evidence_digest.clone(),
+                    operation_at,
+                )
+                .map_err(storage_persistence)?;
+                if committed.state != ProviderRecoveryState::Verified
+                    || committed.verification_evidence_digest.as_deref()
+                        != Some(verification.evidence_digest.as_str())
+                {
+                    return Err(LedgerError::ScopeConflict);
+                }
+            }
+            VerificationStatus::Rejected => {
+                let committed = fail_provider_recovery_closed_in_transaction(
+                    &transaction,
+                    &effect.project_id,
+                    &effect.id,
+                    recovery_head.revision,
+                    &recovery_head.binding.binding_digest,
+                    operation_at,
+                )
+                .map_err(storage_persistence)?;
+                if committed.state != ProviderRecoveryState::FailedClosed {
+                    return Err(LedgerError::ScopeConflict);
+                }
+            }
+            VerificationStatus::Inconclusive => {}
+        }
+        let _ = execution_started_at;
+        transaction.commit().map_err(persistence)
     }
 }
 
@@ -471,6 +826,347 @@ struct IdempotencyRecord {
     verification_json: Option<String>,
     uncertain_reason: Option<String>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct LatestVerificationAttempt {
+    status: String,
+    request_digest: String,
+    lease_expires_at: DateTime<Utc>,
+    receipt_json: Option<String>,
+    verification_json: Option<String>,
+    failure_class: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+fn latest_verification_attempt(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+) -> Result<Option<LatestVerificationAttempt>, LedgerError> {
+    transaction
+        .query_row(
+            "SELECT status, request_digest, lease_expires_at, receipt_json,
+                    verification_json, failure_class, updated_at
+             FROM execution_attempts
+             WHERE project_id = ?1 AND effect_id = ?2
+               AND id LIKE 'verification-attempt:%'
+             ORDER BY generation DESC LIMIT 1",
+            params![effect.project_id.as_str(), effect.id.as_str()],
+            |row| {
+                Ok(LatestVerificationAttempt {
+                    status: row.get(0)?,
+                    request_digest: row.get(1)?,
+                    lease_expires_at: parse_time(&row.get::<_, String>(2)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    receipt_json: row.get(3)?,
+                    verification_json: row.get(4)?,
+                    failure_class: row.get(5)?,
+                    updated_at: parse_time(&row.get::<_, String>(6)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(persistence)
+}
+
+fn ensure_verification_attempt_bindings(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+    binding_digest: &str,
+) -> Result<(), LedgerError> {
+    let conflicting = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM execution_attempts
+                 WHERE project_id = ?1 AND effect_id = ?2
+                   AND id LIKE 'verification-attempt:%'
+                   AND request_digest <> ?3
+             )",
+            params![
+                effect.project_id.as_str(),
+                effect.id.as_str(),
+                binding_digest
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(persistence)?;
+    if conflicting != 0 {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_verification_attempt(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+    receipt: &Receipt,
+    owner: &str,
+    attempt_no: u64,
+    generation: u64,
+    lease_expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    binding_digest: &str,
+) -> Result<VerificationLease, LedgerError> {
+    let attempt_id = ExecutionAttemptId::from_stable(format!(
+        "verification-attempt:{}:{attempt_no}:{generation}",
+        effect.id
+    ));
+    let receipt_json = serde_json::to_string(receipt).map_err(persistence)?;
+    transaction
+        .execute(
+            "INSERT INTO execution_attempts
+               (id, tenant_id, project_id, mission_id, effect_id, attempt_no, generation,
+                status, lease_owner, lease_expires_at, request_digest, receipt_json,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'verifying', ?8, ?9, ?10, ?11, ?12, ?12)",
+            params![
+                attempt_id.as_str(),
+                effect.tenant_id.as_str(),
+                effect.project_id.as_str(),
+                effect.mission_id.as_str(),
+                effect.id.as_str(),
+                to_sql_u64(attempt_no)?,
+                to_sql_u64(generation)?,
+                owner,
+                lease_expires_at.to_rfc3339(),
+                binding_digest,
+                receipt_json,
+                now.to_rfc3339(),
+            ],
+        )
+        .map_err(persistence)?;
+    Ok(VerificationLease {
+        attempt_id,
+        owner: owner.into(),
+        generation,
+        attempt_no: u32::try_from(attempt_no)
+            .map_err(|_| LedgerError::Persistence("verification attempt number overflow".into()))?,
+        binding_digest: binding_digest.to_owned(),
+        expires_at: lease_expires_at,
+    })
+}
+
+fn require_current_verification_lease(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+    lease: &VerificationLease,
+    binding: &ReceiptVerificationClaimBinding,
+    receipt_json: &str,
+    operation_at: DateTime<Utc>,
+) -> Result<(), LedgerError> {
+    let row = transaction
+        .query_row(
+            "SELECT lease_owner, generation, attempt_no, lease_expires_at, status,
+                    request_digest, receipt_json, verification_json, failure_class
+             FROM execution_attempts
+             WHERE id = ?1 AND project_id = ?2 AND effect_id = ?3
+               AND generation = (
+                 SELECT MAX(current.generation) FROM execution_attempts current
+                 WHERE current.project_id = ?2 AND current.effect_id = ?3
+                   AND current.id LIKE 'verification-attempt:%'
+               )",
+            params![
+                lease.attempt_id.as_str(),
+                effect.project_id.as_str(),
+                effect.id.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(persistence)?;
+    let Some((
+        owner,
+        generation,
+        attempt_no,
+        expires_at,
+        status,
+        request_digest,
+        stored_receipt_json,
+        stored_verification_json,
+        failure_class,
+    )) = row
+    else {
+        return Err(LedgerError::LeaseLost);
+    };
+    let expires_at = parse_time(&expires_at)?;
+    if owner != lease.owner
+        || u64::try_from(generation).ok() != Some(lease.generation)
+        || u32::try_from(attempt_no).ok() != Some(lease.attempt_no)
+        || expires_at != lease.expires_at
+        || expires_at <= operation_at
+        || status != "verifying"
+        || request_digest != binding.digest()
+        || stored_receipt_json.as_deref() != Some(receipt_json)
+        || stored_verification_json.is_some()
+        || failure_class.is_some()
+    {
+        return Err(LedgerError::LeaseLost);
+    }
+    Ok(())
+}
+
+fn validate_verification_prestate(
+    effect: &Effect,
+    record: &IdempotencyRecord,
+    recovery_head: &ProviderRecoveryHead,
+    receipt: &Receipt,
+) -> Result<(), LedgerError> {
+    let approval = effect.approval.as_ref().ok_or(LedgerError::ScopeConflict)?;
+    let expected_storage_ref = format!("cas://{}", receipt.response_digest);
+    let binding = &recovery_head.binding;
+    if binding.tenant_id != effect.tenant_id
+        || binding.project_id != effect.project_id
+        || binding.mission_id != effect.mission_id
+        || binding.effect_id != effect.id
+        || binding.approval_scope_digest != effect.approval_digest()
+        || binding.broker_authorization_digest != approval.permission_digest
+        || binding.provider_id != effect.provider
+        || binding.capability_id != effect.capability
+        || recovery_head.readback_storage_ref.as_deref() != Some(expected_storage_ref.as_str())
+        || recovery_head.readback_content_digest.as_deref()
+            != Some(receipt.response_digest.as_str())
+        || recovery_head.receipt_evidence_digest.as_deref()
+            != Some(receipt.response_digest.as_str())
+        || receipt.provider != effect.provider
+        || receipt.external_id.trim().is_empty()
+        || receipt.request_digest != effect.approval_digest()
+        || !is_sha256(&receipt.response_digest)
+        || record.receipt_json.is_none()
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn validate_durable_verification_status_shape(
+    record: &IdempotencyRecord,
+    verification: &Verification,
+) -> Result<(), LedgerError> {
+    let expected_failure = match (record.status.as_str(), &verification.status) {
+        ("verified", VerificationStatus::Confirmed) => None,
+        ("failed", VerificationStatus::Rejected) => Some("verification_rejected"),
+        ("verification_required", VerificationStatus::Inconclusive) => {
+            Some("verification_inconclusive")
+        }
+        _ => return Err(LedgerError::ScopeConflict),
+    };
+    if record.uncertain_reason.as_deref() != expected_failure {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn validate_verification_connection(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+    recovery_head: &ProviderRecoveryHead,
+    at: DateTime<Utc>,
+) -> Result<(), LedgerError> {
+    let connection_id = effect
+        .connection_id
+        .as_ref()
+        .ok_or(LedgerError::ScopeConflict)?;
+    let account_id = effect
+        .account_id
+        .as_ref()
+        .ok_or(LedgerError::ScopeConflict)?;
+    let connection = authorization::load_connection_in_transaction(
+        transaction,
+        &effect.project_id,
+        connection_id,
+    )
+    .map_err(storage_persistence)?;
+    let snapshot = connection.snapshot();
+    if snapshot.tenant_id != effect.tenant_id
+        || snapshot.project_id != effect.project_id
+        || snapshot.provider != effect.provider
+        || snapshot.account_id != *account_id
+        || connection.revision() != recovery_head.binding.credential_revision
+        || !connection.permits_scopes(&effect.required_scopes, at)
+    {
+        return Err(LedgerError::ScopeConflict);
+    }
+    Ok(())
+}
+
+fn validate_current_verification_mission(
+    transaction: &Transaction<'_>,
+    effect: &Effect,
+    expected_mission_revision: u64,
+    record: &IdempotencyRecord,
+    receipt: &Receipt,
+    durable_verification: Option<&Verification>,
+) -> Result<(), LedgerError> {
+    if expected_mission_revision == 0 {
+        return Err(LedgerError::ScopeConflict);
+    }
+    let current_mission =
+        normalized::load_mission_normalized(transaction, &effect.project_id, &effect.mission_id)
+            .map_err(storage_persistence)?
+            .ok_or(LedgerError::ScopeConflict)?;
+    let current_effect = current_mission
+        .effects
+        .iter()
+        .find(|candidate| candidate.id == effect.id)
+        .ok_or(LedgerError::ScopeConflict)?;
+    if current_mission.revision != expected_mission_revision || current_effect != effect {
+        return Err(LedgerError::ScopeConflict);
+    }
+    let projected_status = match record.status.as_str() {
+        "verified" => hartevo_domain_kernel::EffectStatus::Verified,
+        "failed" => hartevo_domain_kernel::EffectStatus::Failed,
+        "verification_required" => hartevo_domain_kernel::EffectStatus::VerificationRequired,
+        "receipt_recorded" => hartevo_domain_kernel::EffectStatus::ReceiptRecorded,
+        _ => return Err(LedgerError::ScopeConflict),
+    };
+    if current_effect.receipt.as_ref() != Some(receipt) {
+        return Err(LedgerError::ScopeConflict);
+    }
+    match record.status.as_str() {
+        "receipt_recorded" => {
+            if record.verification_json.is_some()
+                || record.uncertain_reason.is_some()
+                || current_effect.status != projected_status
+                || current_effect.verification.is_some()
+                || durable_verification.is_some()
+            {
+                return Err(LedgerError::ScopeConflict);
+            }
+        }
+        "verified" | "failed" | "verification_required" => {
+            let Some(durable_verification) = durable_verification else {
+                return Err(LedgerError::ScopeConflict);
+            };
+            // During the crash window between the SQL commit and Mission
+            // projection the Domain shape is still the exact receipt-only
+            // N15 state. After projection it must carry the matching status
+            // and the exact durable Verification object.
+            let pre_projection = current_effect.status
+                == hartevo_domain_kernel::EffectStatus::ReceiptRecorded
+                && current_effect.verification.is_none();
+            let projected = current_effect.status == projected_status
+                && current_effect.verification.as_ref() == Some(durable_verification);
+            if !pre_projection && !projected {
+                return Err(LedgerError::ScopeConflict);
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1293,9 +1989,11 @@ fn decode_durable_verification(
     };
     if verification.status != expected_status
         || verification.receipt_id != receipt.id
-        || verification.verifier.trim().is_empty()
+        || canonical_verifier_id(&verification.verifier).as_deref()
+            != Some(verification.verifier.as_str())
         || !verification.independent
         || !is_sha256(&verification.evidence_digest)
+        || verification.evidence_digest == receipt.response_digest
         || verification.observed_at < receipt.accepted_at
     {
         return Err(LedgerError::Persistence(

@@ -125,7 +125,8 @@ use hartevo_domain_kernel::{
 use hartevo_effect_broker::{
     BrokerError, BrokerResult, EffectBroker, EffectCompletionAuthority, EffectCompletionPoint,
     EffectExecutor, EffectReceiptReconciler, EffectReconciler, EffectVerifier,
-    ReceiptReconciliationResult,
+    IndependentVerificationResult, ReceiptReconciliationResult, ReceiptVerificationClaimBinding,
+    ReceiptVerificationSource, canonical_verifier_id,
 };
 use hartevo_runtime_adapter::{
     AdapterError, LeaseFence, MappedTurnEventKind, ObservedRuntimeProcessIdentity,
@@ -609,6 +610,49 @@ pub struct ReconcileUncertainEffect {
     pub expected_scope_digest: String,
     pub expected_broker_authorization_digest: String,
     pub expected_mission_revision: u64,
+}
+
+/// Exact Application command for the independent N16 receipt verification
+/// route. The receipt/recovery/source digests are all re-read and checked
+/// against current SQLCipher state before the Broker can claim a lease.
+#[derive(Clone, Eq, PartialEq)]
+pub struct VerifyRecordedReceiptAtRevision {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_receipt_id: ReceiptId,
+    pub expected_receipt_accepted_at: DateTime<Utc>,
+    pub expected_receipt_request_digest: String,
+    pub expected_receipt_response_digest: String,
+    pub expected_receipt_binding_digest: String,
+    pub expected_n15_evidence_digest: String,
+    pub expected_observation_authority_digest: String,
+    pub expected_source_binding_digest: String,
+    pub expected_scope_digest: String,
+    pub expected_broker_authorization_digest: String,
+    pub expected_mission_revision: u64,
+}
+
+impl fmt::Debug for VerifyRecordedReceiptAtRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifyRecordedReceiptAtRevision")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("effect_id", &self.effect_id)
+            .field("expected_receipt_id", &"[REDACTED]")
+            .field("expected_receipt_accepted_at", &"[REDACTED]")
+            .field("expected_receipt_request_digest", &"[DIGEST]")
+            .field("expected_receipt_response_digest", &"[DIGEST]")
+            .field("expected_receipt_binding_digest", &"[DIGEST]")
+            .field("expected_n15_evidence_digest", &"[DIGEST]")
+            .field("expected_observation_authority_digest", &"[DIGEST]")
+            .field("expected_source_binding_digest", &"[DIGEST]")
+            .field("expected_scope_digest", &"[DIGEST]")
+            .field("expected_broker_authorization_digest", &"[DIGEST]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -13331,6 +13375,142 @@ impl ApplicationService {
         Ok((mission, result))
     }
 
+    /// Verifies one durable N15 receipt with a fresh independent source. This
+    /// route never acquires an execution/reconciliation capability and emits
+    /// at most one redacted verification event; it does not touch
+    /// Conversation, Outcome, Connected, or E4 state.
+    // Command fencing, Broker invocation, durable projection, and the single
+    // redacted event form one atomic application boundary.
+    #[allow(clippy::too_many_lines)]
+    pub fn verify_recorded_receipt_at_revision(
+        &mut self,
+        broker: &mut EffectBroker,
+        command: &VerifyRecordedReceiptAtRevision,
+        binding: &ReceiptVerificationClaimBinding,
+        source: &mut impl ReceiptVerificationSource,
+        now: DateTime<Utc>,
+    ) -> Result<(Mission, IndependentVerificationResult), ApplicationError> {
+        if command.expected_mission_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || command.expected_receipt_id.as_str().trim().is_empty()
+            || !is_canonical_sha256_text(&command.expected_receipt_request_digest)
+            || !is_canonical_sha256_text(&command.expected_receipt_response_digest)
+            || !is_canonical_sha256_text(&command.expected_receipt_binding_digest)
+            || !is_canonical_sha256_text(&command.expected_n15_evidence_digest)
+            || !is_canonical_sha256_text(&command.expected_observation_authority_digest)
+            || !is_canonical_sha256_text(&command.expected_source_binding_digest)
+            || !is_canonical_sha256_text(&command.expected_scope_digest)
+            || !is_canonical_sha256_text(&command.expected_broker_authorization_digest)
+        {
+            return Err(ApplicationError::EffectVerificationCommandMismatch);
+        }
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        let effect = mission
+            .effect(&command.effect_id)
+            .map_err(|_| ApplicationError::EffectVerificationAuthorityMismatch)?;
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ApplicationError::EffectVerificationAuthorityMismatch)?;
+        let receipt = effect
+            .receipt
+            .as_ref()
+            .ok_or(ApplicationError::EffectVerificationAuthorityMismatch)?;
+        let status_shape_is_valid = match effect.status {
+            EffectStatus::ReceiptRecorded => effect.verification.is_none(),
+            EffectStatus::VerificationRequired | EffectStatus::Verified | EffectStatus::Failed => {
+                effect.verification.is_some()
+            }
+            _ => false,
+        };
+        if !status_shape_is_valid
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || approval.scope_digest != command.expected_scope_digest
+            || approval.permission_digest != command.expected_broker_authorization_digest
+            || receipt.id != command.expected_receipt_id
+            || receipt.accepted_at != command.expected_receipt_accepted_at
+            || receipt.provider != effect.provider
+            || receipt.request_digest != command.expected_receipt_request_digest
+            || receipt.response_digest != command.expected_receipt_response_digest
+            || command.expected_n15_evidence_digest != receipt.response_digest
+            || binding.approval_scope_digest() != command.expected_scope_digest
+            || binding.broker_authorization_digest() != command.expected_broker_authorization_digest
+            || binding.receipt_binding_digest() != command.expected_receipt_binding_digest
+            || binding.observation_authority_digest()
+                != command.expected_observation_authority_digest
+            || binding.source_binding_digest() != command.expected_source_binding_digest
+            || binding.validate_for(effect, receipt).is_err()
+            || canonical_verifier_id(source.verifier_id()).is_none()
+            || source.source_binding_digest() != command.expected_source_binding_digest
+        {
+            return Err(ApplicationError::EffectVerificationAuthorityMismatch);
+        }
+
+        let mission_before = mission.clone();
+        let result = broker.verify_recorded_receipt(
+            &mut mission,
+            &command.effect_id,
+            &mut self.store,
+            binding,
+            source,
+            now,
+        )?;
+        let projected_effect = mission.effect(&command.effect_id).map_err(|_| {
+            ApplicationError::Broker(BrokerError::DurableProjectionRecoveryRequired)
+        })?;
+        let expected_status = match result.verification.status {
+            VerificationStatus::Confirmed => EffectStatus::Verified,
+            VerificationStatus::Rejected => EffectStatus::Failed,
+            VerificationStatus::Inconclusive => EffectStatus::VerificationRequired,
+        };
+        if projected_effect.receipt.as_ref() != Some(&result.receipt)
+            || projected_effect.verification.as_ref() != Some(&result.verification)
+            || projected_effect.status != expected_status
+        {
+            return Err(ApplicationError::Broker(
+                BrokerError::DurableProjectionRecoveryRequired,
+            ));
+        }
+        if mission != mission_before {
+            let event_type = match result.verification.status {
+                VerificationStatus::Confirmed => "effect.reconciliation_verified",
+                VerificationStatus::Rejected => "effect.reconciliation_verification_rejected",
+                VerificationStatus::Inconclusive => {
+                    "effect.reconciliation_verification_inconclusive"
+                }
+            };
+            let event = PendingEvent::new(
+                event_type,
+                serde_json::json!({
+                    "effectId": command.effect_id,
+                    "verificationId": result.verification.id,
+                    "status": result.verification.status,
+                    "readOnlyReconciliation": true,
+                    "providerExecutionReplayed": false,
+                    "verificationDeferred": false,
+                    "independent": true,
+                    "authoritySequence": result.completion().sequence(),
+                }),
+                result.completion().operation_at(),
+            );
+            self.store
+                .update_mission_atomic(&mission, command.expected_mission_revision, &[event])
+                .map_err(|_| {
+                    ApplicationError::Broker(BrokerError::DurableProjectionRecoveryRequired)
+                })?;
+        }
+        Ok((mission, result))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn reconcile_effect(
         &mut self,
@@ -22907,6 +23087,14 @@ pub enum ApplicationError {
     EffectReconciliationAuthorityMismatch,
     #[error("receipt-only recovery no longer matches its durable Mission projection")]
     EffectReceiptRecoveryProjectionMismatch,
+    #[error(
+        "independent receipt verification requires the exact Mission, Receipt, N15, source, and authority digests"
+    )]
+    EffectVerificationCommandMismatch,
+    #[error("the recorded Receipt or independent verification authority no longer matches")]
+    EffectVerificationAuthorityMismatch,
+    #[error("durable independent verification could not be projected exactly into the Mission")]
+    EffectVerificationProjectionMismatch,
     #[error("preview Effect id already exists in this Mission: {0}")]
     DuplicatePreviewEffectId(EffectId),
     #[error(
@@ -23033,6 +23221,8 @@ pub enum ApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use chrono::TimeZone;
     use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
     #[cfg(unix)]
@@ -23053,10 +23243,16 @@ mod tests {
         MarketExperimentPlanItem, MarketUncertainty, MarketUncertaintyMateriality,
     };
     use hartevo_effect_broker::{
-        EffectPolicy, EffectRateLimit, PermissionFailure, ProviderFailure,
-        ReconciliationObservation, ReconciliationPolicy,
+        DurableEffectLedger, EffectPermissionResolver, EffectPolicy, EffectRateLimit,
+        IndependentVerificationObservation, LedgerClaim, PermissionFailure, ProviderFailure,
+        ReceiptReconciliationInfrastructure, ReceiptRecoveryFence, ReconciliationClaim,
+        ReconciliationObservation, ReconciliationPolicy, StagedReceiptFound,
+        VerificationSourceError, receipt_binding_digest,
     };
-    use hartevo_storage::{DatabaseKey, LocalInboundSyncStatus, MemorySecretStore};
+    use hartevo_storage::{
+        DatabaseKey, LocalInboundSyncStatus, MemorySecretStore, ProviderRecoveryBinding,
+        ProviderRecoveryCapsule, ProviderRecoveryHead, ProviderRecoveryState,
+    };
 
     use super::*;
 
@@ -32425,6 +32621,431 @@ sleep 30"#
         ));
         assert_eq!(executor.calls, 1);
         fixture
+    }
+
+    struct ApplicationIndependentVerificationSource {
+        source_binding_digest: String,
+        evidence_digest: String,
+        observe_calls: Rc<Cell<usize>>,
+        recovered_calls: Rc<Cell<usize>>,
+    }
+
+    impl ReceiptVerificationSource for ApplicationIndependentVerificationSource {
+        fn verifier_id(&self) -> &'static str {
+            "application.independent-verifier"
+        }
+
+        fn source_binding_digest(&self) -> String {
+            self.source_binding_digest.clone()
+        }
+
+        fn observe(
+            &mut self,
+            _subject: &hartevo_effect_broker::ReceiptVerificationSubject,
+        ) -> Result<IndependentVerificationObservation, VerificationSourceError> {
+            self.observe_calls.set(self.observe_calls.get() + 1);
+            Ok(IndependentVerificationObservation::Confirmed {
+                evidence_digest: self.evidence_digest.clone(),
+                observed_at: Utc::now(),
+            })
+        }
+
+        fn validate_recovered(
+            &self,
+            subject: &hartevo_effect_broker::ReceiptVerificationSubject,
+            verification: &Verification,
+        ) -> Result<(), VerificationSourceError> {
+            if verification.receipt_id != subject.receipt().id
+                || verification.evidence_digest != self.evidence_digest
+            {
+                return Err(VerificationSourceError::Rejected);
+            }
+            self.recovered_calls.set(self.recovered_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn independent_verification_projects_one_event_and_restart_is_projection_only() {
+        let mut fixture = approved_preview_fixture("independent-verification-event");
+        let connection_id = ConnectionId::from("connection-independent-verification");
+        let account_id = AccountId::from("account-independent-verification");
+        let required_scopes = BTreeSet::from(["preview.publish".to_owned()]);
+        let approved = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("approved Mission");
+        let tenant_id = approved.tenant_id.clone();
+        fixture
+            .service
+            .register_connection(
+                Connection::register(
+                    connection_id.clone(),
+                    tenant_id,
+                    fixture.project_id.clone(),
+                    "fixture-provider",
+                    account_id.clone(),
+                    "external-independent-account",
+                    required_scopes.clone(),
+                    now() + Duration::seconds(2),
+                )
+                .expect("verification Connection"),
+                now() + Duration::seconds(2),
+            )
+            .expect("persist verification Connection");
+        let connection = fixture
+            .service
+            .record_connection_probe(
+                &fixture.project_id,
+                &connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "external-independent-account".into(),
+                    granted_scopes: required_scopes.clone(),
+                    probed_at: now() + Duration::seconds(2),
+                    valid_until: Utc::now() + Duration::days(2),
+                    credential_expires_at: Utc::now() + Duration::days(2),
+                    evidence_digest: "7".repeat(64),
+                },
+                now() + Duration::seconds(2),
+            )
+            .expect("probe verification Connection");
+
+        let mut mission = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("Mission before exact connection binding");
+        let mut effect = mission
+            .effect(&fixture.effect_id)
+            .expect("approved Effect")
+            .clone();
+        effect.connection_id = Some(connection_id);
+        effect.account_id = Some(account_id);
+        effect.required_scopes = required_scopes;
+        let approval_scope_digest = effect.approval_digest();
+        effect
+            .approval
+            .as_mut()
+            .expect("approved Effect")
+            .scope_digest = approval_scope_digest.clone();
+        let permission_evidence = fixture
+            .service
+            .store
+            .authorize(&effect, now() + Duration::seconds(3))
+            .expect("live verification permission");
+        let policy = EffectPolicy {
+            version: "policy-v1".into(),
+            allowed_capabilities: BTreeSet::from(["channel.preview".into()]),
+            allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
+            max_amounts_minor: BTreeMap::from([(CurrencyCode::parse("CNY").expect("CNY"), 0)]),
+            rate_limits: vec![EffectRateLimit {
+                rule_id: "preview-recovery-per-minute".into(),
+                provider: "fixture-provider".into(),
+                capability: "channel.preview".into(),
+                max_executions: 10,
+                window_seconds: 60,
+            }],
+        };
+        let claim_context = policy
+            .execution_claim_context(&effect, permission_evidence.clone())
+            .expect("connection-bound claim context");
+        effect
+            .approval
+            .as_mut()
+            .expect("approved Effect")
+            .permission_digest = claim_context.authorization_digest.clone();
+        mission.effects[0] = effect.clone();
+        fixture
+            .service
+            .store
+            .save_mission(&mission)
+            .expect("persist exact connected Effect");
+
+        let binding_digest = "8".repeat(64);
+        let capsule_digest = "9".repeat(64);
+        let prepared = ProviderRecoveryHead::prepared(
+            ProviderRecoveryBinding {
+                tenant_id: effect.tenant_id.clone(),
+                project_id: effect.project_id.clone(),
+                mission_id: effect.mission_id.clone(),
+                mission_revision: mission.revision,
+                effect_id: effect.id.clone(),
+                effect_digest: effect.approval_digest(),
+                approval_scope_digest,
+                broker_authorization_digest: claim_context.authorization_digest.clone(),
+                provider_id: effect.provider.clone(),
+                capability_id: effect.capability.clone(),
+                account_scope_digest: "a".repeat(64),
+                adapter_id: "application.fixture.independent-verification".into(),
+                adapter_version: 1,
+                plugin_revision: 1,
+                provider_generation: 1,
+                payload_digest: effect.payload_digest.clone(),
+                provider_idempotency_key_digest: "b".repeat(64),
+                sdk_idempotency_key_digest: "c".repeat(64),
+                credential_revision: connection.revision(),
+                keyring_revision: 1,
+                binding_digest: binding_digest.clone(),
+            },
+            ProviderRecoveryCapsule {
+                storage_ref: format!("cas://{capsule_digest}"),
+                content_digest: capsule_digest.clone(),
+                byte_len: 256,
+                key_version: 1,
+                object_revision: 1,
+            },
+            now() + Duration::seconds(3),
+            now() + Duration::hours(1),
+        )
+        .expect("prepared recovery head");
+        fixture
+            .service
+            .store
+            .prepare_provider_recovery(&prepared)
+            .expect("persist prepared recovery");
+        let in_flight = fixture
+            .service
+            .store
+            .claim_provider_recovery_execution_authorized(
+                &effect.project_id,
+                &effect.id,
+                prepared.revision,
+                &binding_digest,
+                &effect,
+                &permission_evidence,
+                now() + Duration::seconds(3),
+            )
+            .expect("claim provider recovery execution");
+        let LedgerClaim::Acquired {
+            lease,
+            receipt: None,
+            execution_started_at,
+        } = fixture
+            .service
+            .store
+            .claim(
+                &effect,
+                Some(&claim_context),
+                "application-verification-executor",
+                now() + Duration::seconds(4),
+                now() + Duration::seconds(34),
+            )
+            .expect("claim original execution")
+        else {
+            panic!("expected original execution lease")
+        };
+        fixture
+            .service
+            .store
+            .record_uncertain(
+                &effect,
+                &lease,
+                "provider completion is uncertain",
+                now() + Duration::seconds(5),
+            )
+            .expect("persist original uncertainty");
+        let uncertain_head = fixture
+            .service
+            .store
+            .mark_provider_recovery_uncertain(
+                &effect.project_id,
+                &effect.id,
+                in_flight.revision,
+                &binding_digest,
+                now() + Duration::seconds(5),
+            )
+            .expect("persist provider uncertainty");
+        mission
+            .begin_effect(&effect.id, now() + Duration::seconds(4))
+            .expect("project execution");
+        mission
+            .mark_effect_uncertain(&effect.id, now() + Duration::seconds(5))
+            .expect("project uncertainty");
+        fixture
+            .service
+            .store
+            .save_mission(&mission)
+            .expect("persist uncertain Mission");
+        let effect = mission
+            .effect(&effect.id)
+            .expect("uncertain Effect")
+            .clone();
+        let ReconciliationClaim::Acquired {
+            lease: reconciliation_lease,
+            ..
+        } = fixture
+            .service
+            .store
+            .claim_reconciliation(
+                &effect,
+                &ReconciliationPolicy::default(),
+                "application-receipt-reconciler",
+                now() + Duration::seconds(6),
+                now() + Duration::seconds(36),
+            )
+            .expect("claim receipt reconciliation")
+        else {
+            panic!("expected reconciliation lease")
+        };
+        let receipt_evidence_digest = "e".repeat(64);
+        let staged = StagedReceiptFound::new(
+            &effect,
+            "external-independent-receipt",
+            execution_started_at + Duration::milliseconds(1),
+            receipt_evidence_digest.clone(),
+            now() + Duration::seconds(6),
+            ReceiptRecoveryFence::new(
+                mission.revision,
+                connection.snapshot(),
+                uncertain_head.revision,
+                binding_digest,
+                capsule_digest,
+                prepared.capsule.key_version,
+                prepared.capsule.object_revision,
+                format!("cas://{receipt_evidence_digest}"),
+                receipt_evidence_digest.clone(),
+            )
+            .expect("receipt recovery fence"),
+        )
+        .expect("staged Receipt");
+        let durable = fixture
+            .service
+            .store
+            .record_staged_receipt(
+                &effect,
+                &reconciliation_lease,
+                &staged,
+                now() + Duration::seconds(7),
+            )
+            .expect("commit N15 Receipt");
+        mission
+            .reconcile_durable_receipt(&effect.id, durable.receipt.clone(), execution_started_at)
+            .expect("project N15 Receipt");
+        fixture
+            .service
+            .store
+            .save_mission(&mission)
+            .expect("persist receipt-only Mission");
+
+        let projected_effect = mission.effect(&effect.id).expect("receipt-only Effect");
+        let approval = projected_effect.approval.as_ref().expect("approval");
+        let source_binding_digest = "5".repeat(64);
+        let observation_authority_digest = "4".repeat(64);
+        let claim_binding = ReceiptVerificationClaimBinding::new(
+            projected_effect.approval_digest(),
+            approval.permission_digest.clone(),
+            receipt_binding_digest(&durable.receipt),
+            observation_authority_digest.clone(),
+            source_binding_digest.clone(),
+        )
+        .expect("verification claim binding");
+        let mut command = VerifyRecordedReceiptAtRevision {
+            project_id: fixture.project_id.clone(),
+            mission_id: fixture.mission_id.clone(),
+            effect_id: fixture.effect_id.clone(),
+            expected_receipt_id: durable.receipt.id.clone(),
+            expected_receipt_accepted_at: durable.receipt.accepted_at,
+            expected_receipt_request_digest: durable.receipt.request_digest.clone(),
+            expected_receipt_response_digest: durable.receipt.response_digest.clone(),
+            expected_receipt_binding_digest: receipt_binding_digest(&durable.receipt),
+            expected_n15_evidence_digest: durable.receipt.response_digest.clone(),
+            expected_observation_authority_digest: observation_authority_digest,
+            expected_source_binding_digest: source_binding_digest.clone(),
+            expected_scope_digest: approval.scope_digest.clone(),
+            expected_broker_authorization_digest: approval.permission_digest.clone(),
+            expected_mission_revision: mission.revision,
+        };
+        let events_before = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("events before independent verification");
+        let observe_calls = Rc::new(Cell::new(0));
+        let recovered_calls = Rc::new(Cell::new(0));
+        let verification_evidence_digest = "6".repeat(64);
+        let mut source = ApplicationIndependentVerificationSource {
+            source_binding_digest: source_binding_digest.clone(),
+            evidence_digest: verification_evidence_digest.clone(),
+            observe_calls: Rc::clone(&observe_calls),
+            recovered_calls: Rc::clone(&recovered_calls),
+        };
+        let (verified_mission, result) = fixture
+            .service
+            .verify_recorded_receipt_at_revision(
+                &mut fixture.broker,
+                &command,
+                &claim_binding,
+                &mut source,
+                Utc::now() - Duration::seconds(1),
+            )
+            .expect("project independent Verification");
+        assert_eq!((observe_calls.get(), recovered_calls.get()), (1, 0));
+        assert_eq!(result.verification.status, VerificationStatus::Confirmed);
+        assert_eq!(
+            verified_mission
+                .effect(&fixture.effect_id)
+                .expect("verified Effect")
+                .status,
+            EffectStatus::Verified
+        );
+        let events_after = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("events after independent verification");
+        let appended = &events_after[events_before.len()..];
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].event_type, "effect.reconciliation_verified");
+        assert_eq!(appended[0].payload["independent"], true);
+        assert_eq!(appended[0].payload["providerExecutionReplayed"], false);
+        assert_eq!(appended[0].payload["authoritySequence"], 2);
+        assert!(
+            !appended[0]
+                .payload
+                .to_string()
+                .contains(&verification_evidence_digest)
+        );
+        assert_eq!(
+            fixture
+                .service
+                .store
+                .load_provider_recovery(&fixture.project_id, &fixture.effect_id)
+                .expect("verified recovery head")
+                .state,
+            ProviderRecoveryState::Verified
+        );
+
+        command.expected_mission_revision = verified_mission.revision;
+        let replay_observe_calls = Rc::new(Cell::new(0));
+        let replay_recovered_calls = Rc::new(Cell::new(0));
+        let mut replay_source = ApplicationIndependentVerificationSource {
+            source_binding_digest,
+            evidence_digest: verification_evidence_digest,
+            observe_calls: Rc::clone(&replay_observe_calls),
+            recovered_calls: Rc::clone(&replay_recovered_calls),
+        };
+        let (replayed_mission, replayed_result) = fixture
+            .service
+            .verify_recorded_receipt_at_revision(
+                &mut fixture.broker,
+                &command,
+                &claim_binding,
+                &mut replay_source,
+                Utc::now(),
+            )
+            .expect("restart projects no duplicate event");
+        assert_eq!(replayed_mission, verified_mission);
+        assert_eq!(replayed_result.verification, result.verification);
+        assert_eq!(
+            (replay_observe_calls.get(), replay_recovered_calls.get()),
+            (0, 1)
+        );
+        assert_eq!(
+            fixture
+                .service
+                .mission_events(&fixture.project_id, &fixture.mission_id)
+                .expect("events after verification replay"),
+            events_after
+        );
     }
 
     #[test]

@@ -40,6 +40,15 @@ pub const SHOPIFY_READBACK_ADAPTER_VERSION: u32 = 1;
 pub const SHOPIFY_READBACK_REGISTRY_VERSION: &str = "cordis-shopify-readback-2026-07-v1";
 pub const SHOPIFY_READBACK_SECRET_PURPOSE: &str = "admin-graphql-fulfillment-readback";
 
+/// Independent verification intentionally uses a separate adapter identity
+/// and registry generation from the N15 receipt readback. A source cannot
+/// satisfy both routes by reusing one registration or lease binding.
+pub const SHOPIFY_INDEPENDENT_VERIFICATION_ADAPTER_ID: &str =
+    "application.shopify.fulfillment.independent-verification";
+pub const SHOPIFY_INDEPENDENT_VERIFICATION_ADAPTER_VERSION: u32 = 1;
+pub const SHOPIFY_INDEPENDENT_VERIFICATION_REGISTRY_VERSION: &str =
+    "cordis-shopify-independent-verification-2026-08-v1";
+
 pub fn shopify_readback_adapter_identity() -> Result<ProviderAdapterIdentity, ProviderContractError>
 {
     ProviderAdapterIdentity::new(
@@ -48,9 +57,27 @@ pub fn shopify_readback_adapter_identity() -> Result<ProviderAdapterIdentity, Pr
     )
 }
 
+pub fn shopify_independent_verification_adapter_identity()
+-> Result<ProviderAdapterIdentity, ProviderContractError> {
+    ProviderAdapterIdentity::new(
+        SHOPIFY_INDEPENDENT_VERIFICATION_ADAPTER_ID,
+        SHOPIFY_INDEPENDENT_VERIFICATION_ADAPTER_VERSION,
+    )
+}
+
 /// Builds a call-local metadata registry. It grants no Connected, execution,
 /// Receipt, Verification, or E4 authority.
 pub fn shopify_readback_registry() -> Result<ProviderAdapterRegistry, ProviderContractError> {
+    shopify_readback_registry_for(
+        shopify_readback_adapter_identity()?,
+        SHOPIFY_READBACK_REGISTRY_VERSION,
+    )
+}
+
+pub fn shopify_readback_registry_for(
+    adapter: ProviderAdapterIdentity,
+    registry_version: &str,
+) -> Result<ProviderAdapterRegistry, ProviderContractError> {
     let support = ProviderEvidenceSupport::new(
         ProviderAdapterOperation::Read,
         ProviderEvidenceClass::ReadObservation,
@@ -58,10 +85,10 @@ pub fn shopify_readback_registry() -> Result<ProviderAdapterRegistry, ProviderCo
     )?;
     let registration = ProviderCapabilitySupport::new(
         ProviderCapabilityKey::new(SHOPIFY_PROVIDER_ID, SHOPIFY_FULFILLMENT_CAPABILITY)?,
-        shopify_readback_adapter_identity()?,
+        adapter,
         [support],
     )?;
-    ProviderAdapterRegistry::new(SHOPIFY_READBACK_REGISTRY_VERSION, [registration])
+    ProviderAdapterRegistry::new(registry_version, [registration])
 }
 
 /// Exact metadata binding between the broker reference and the OS-keyring
@@ -73,6 +100,7 @@ pub struct ShopifyReadbackCredentialBinding {
     shop: hartevo_commerce_connector::shopify::ShopDomain,
     storage_reference: StorageSecretReference,
     broker_reference_id: String,
+    adapter: ProviderAdapterIdentity,
 }
 
 impl ShopifyReadbackCredentialBinding {
@@ -80,6 +108,20 @@ impl ShopifyReadbackCredentialBinding {
         scope: SecretScope,
         shop: hartevo_commerce_connector::shopify::ShopDomain,
         credential_revision: u64,
+    ) -> Result<Self, ShopifyReadbackBridgeError> {
+        Self::new_with_adapter(
+            scope,
+            shop,
+            credential_revision,
+            shopify_readback_adapter_identity()?,
+        )
+    }
+
+    pub(crate) fn new_with_adapter(
+        scope: SecretScope,
+        shop: hartevo_commerce_connector::shopify::ShopDomain,
+        credential_revision: u64,
+        adapter: ProviderAdapterIdentity,
     ) -> Result<Self, ShopifyReadbackBridgeError> {
         let validated_shop =
             hartevo_commerce_connector::shopify::ShopDomain::parse(shop.as_str().to_owned())
@@ -109,6 +151,7 @@ impl ShopifyReadbackCredentialBinding {
             shop: validated_shop,
             storage_reference,
             broker_reference_id: format!("secret-ref-{credential_id}"),
+            adapter,
         })
     }
 
@@ -130,6 +173,10 @@ impl ShopifyReadbackCredentialBinding {
 
     pub const fn credential_revision(&self) -> u64 {
         self.storage_reference.version
+    }
+
+    pub fn adapter(&self) -> &ProviderAdapterIdentity {
+        &self.adapter
     }
 
     pub fn broker_reference(
@@ -159,9 +206,7 @@ impl ShopifyReadbackCredentialBinding {
         if handle.reference_id() != self.broker_reference_id
             || handle.scope() != &self.scope
             || handle.credential_revision() != self.credential_revision()
-            || handle.adapter()
-                != &shopify_readback_adapter_identity()
-                    .map_err(|_| ShopifyReadbackProviderError::BindingMismatch)?
+            || handle.adapter() != &self.adapter
             || handle.issued_at() >= handle.expires_at()
             || handle.expires_at() > max_expires_at
         {
@@ -240,13 +285,14 @@ where
         cancellation: ShopifyReadbackCancellation,
         transport: UreqShopifyAdminReadbackTransport,
     ) -> Result<Self, ShopifyReadbackBridgeError> {
-        Self::new(
+        Self::new_with_identity(
             secret_store,
             binding,
             request,
             cancellation,
             transport,
             ProviderProvenanceClass::ProductionProvider,
+            shopify_readback_adapter_identity()?,
         )
     }
 }
@@ -256,15 +302,16 @@ where
     S: SecretStore,
     T: ShopifyAdminReadbackTransport,
 {
-    fn new(
+    pub(crate) fn new_with_identity(
         secret_store: &'a S,
         binding: ShopifyReadbackCredentialBinding,
         request: ShopifyFulfillmentReadbackRequest,
         cancellation: ShopifyReadbackCancellation,
         transport: T,
         expected_provenance: ProviderProvenanceClass,
+        identity: ProviderAdapterIdentity,
     ) -> Result<Self, ShopifyReadbackBridgeError> {
-        if binding.shop() != request.shop() {
+        if binding.shop() != request.shop() || binding.adapter() != &identity {
             return Err(ShopifyReadbackBridgeError::BindingMismatch);
         }
         Ok(Self {
@@ -273,7 +320,7 @@ where
             request,
             cancellation,
             transport,
-            identity: shopify_readback_adapter_identity()?,
+            identity,
             expected_provenance,
             outcome: None,
         })
@@ -287,13 +334,14 @@ where
         cancellation: ShopifyReadbackCancellation,
         transport: T,
     ) -> Result<Self, ShopifyReadbackBridgeError> {
-        Self::new(
+        Self::new_with_identity(
             secret_store,
             binding,
             request,
             cancellation,
             transport,
             ProviderProvenanceClass::Fixture,
+            shopify_readback_adapter_identity()?,
         )
     }
 
@@ -572,9 +620,23 @@ where
     T: ShopifyAdminReadbackTransport,
 {
     let registry = shopify_readback_registry()?;
+    dispatch_shopify_readback_with_registry(consumer, service, provider, &registry, now)
+}
+
+pub(crate) fn dispatch_shopify_readback_with_registry<S, T>(
+    consumer: &SecretBrokerConsumer,
+    service: &mut SecretBrokerService,
+    provider: &mut ShopifySecretReadbackProvider<'_, S, T>,
+    registry: &ProviderAdapterRegistry,
+    now: DateTime<Utc>,
+) -> Result<ShopifyBrokeredReadback, ShopifyReadbackBridgeError>
+where
+    S: SecretStore,
+    T: ShopifyAdminReadbackTransport,
+{
     let dispatch = service.provider_dispatch()?;
     let broker_result =
-        consumer.dispatch_with_provider(service, &registry, provider, &dispatch, now);
+        consumer.dispatch_with_provider(service, registry, provider, &dispatch, now);
     let provider_outcome = provider.take_outcome();
     match (broker_result, provider_outcome) {
         (Ok(credential_use), Some(Ok(readback))) => Ok(ShopifyBrokeredReadback {

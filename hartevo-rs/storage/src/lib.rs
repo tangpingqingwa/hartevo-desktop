@@ -4693,8 +4693,9 @@ mod tests {
         DurableEffectLedger, EffectPermissionResolver, EffectPolicy, EffectRateLimit,
         ExecutionClaimContext, ExecutionLease, LedgerClaim, LedgerError, PermissionEvidence,
         PersistedCompletionPoint, ReceiptReconciliationInfrastructure, ReceiptRecoveryFence,
-        ReconciliationClaim, ReconciliationDisposition, ReconciliationObservation,
-        ReconciliationPolicy, StagedReceiptFound,
+        ReceiptVerificationClaimBinding, ReceiptVerificationInfrastructure, ReconciliationClaim,
+        ReconciliationDisposition, ReconciliationObservation, ReconciliationPolicy,
+        StagedReceiptFound, VerificationClaim, independent_verification_id, receipt_binding_digest,
     };
     use proptest::prelude::*;
 
@@ -10305,7 +10306,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn staged_receipt_found_commits_all_recovery_heads_atomically_without_verification() {
+    fn staged_receipt_and_independent_verification_commit_all_heads_atomically() {
         let (mut store, project, mut mission, mut effect) =
             local_recovery_store("staged-receipt-atomic");
         let connection_id = ConnectionId::from("connection-staged-receipt-atomic");
@@ -10616,12 +10617,262 @@ mod tests {
             store
                 .recover_staged_receipt(&effect)
                 .expect("read durable staged receipt"),
-            Some(durable)
+            Some(durable.clone())
         );
         assert_eq!(
             effect_recovery_snapshot(&store, &effect),
             before_recovery_read,
             "durable recovery read must be side-effect free"
+        );
+
+        for (status, marker, expected_ledger_status, expected_recovery_state) in [
+            (
+                VerificationStatus::Confirmed,
+                '1',
+                "verified",
+                ProviderRecoveryState::Verified,
+            ),
+            (
+                VerificationStatus::Rejected,
+                '2',
+                "failed",
+                ProviderRecoveryState::FailedClosed,
+            ),
+            (
+                VerificationStatus::Inconclusive,
+                '3',
+                "verification_required",
+                ProviderRecoveryState::ReceiptObserved,
+            ),
+        ] {
+            let mut verification_store = ProjectStore::in_memory().expect("verification clone");
+            {
+                let backup = Backup::new(&store.connection, &mut verification_store.connection)
+                    .expect("open verification fixture backup");
+                backup
+                    .run_to_completion(128, StdDuration::from_millis(1), None)
+                    .expect("clone exact N15 prestate");
+            }
+            let mut verification_mission = verification_store
+                .load_mission(&effect.project_id, &effect.mission_id)
+                .expect("load uncertain Mission");
+            verification_mission
+                .reconcile_durable_receipt(
+                    &effect.id,
+                    durable.receipt.clone(),
+                    durable.execution_started_at,
+                )
+                .expect("project exact N15 Receipt");
+            verification_store
+                .save_mission(&verification_mission)
+                .expect("persist receipt-only Mission projection");
+            let verification_effect = verification_mission
+                .effect(&effect.id)
+                .expect("receipt-only Effect")
+                .clone();
+            let receipt = verification_effect
+                .receipt
+                .as_ref()
+                .expect("projected Receipt")
+                .clone();
+            let claim_binding = ReceiptVerificationClaimBinding::new(
+                verification_effect.approval_digest(),
+                verification_effect
+                    .approval
+                    .as_ref()
+                    .expect("approval")
+                    .permission_digest
+                    .clone(),
+                receipt_binding_digest(&receipt),
+                "4".repeat(64),
+                "5".repeat(64),
+            )
+            .expect("verification claim binding");
+            let VerificationClaim::Acquired {
+                lease: verification_lease,
+                receipt: claimed_receipt,
+                execution_started_at: claimed_execution_started_at,
+                receipt_completion,
+            } = verification_store
+                .claim_verification(
+                    &verification_effect,
+                    &claim_binding,
+                    verification_mission.revision,
+                    "independent-verifier",
+                    now() + Duration::seconds(4),
+                    now() + Duration::seconds(34),
+                )
+                .expect("claim independent verification")
+            else {
+                panic!("expected verification lease")
+            };
+            assert_eq!(claimed_receipt, receipt);
+            assert_eq!(claimed_execution_started_at, now());
+            assert_eq!(
+                receipt_completion,
+                PersistedCompletionPoint::reconciliation_head_receipt_found(
+                    now() + Duration::seconds(3)
+                )
+            );
+            let evidence_digest = marker.to_string().repeat(64);
+            let verification = Verification {
+                id: independent_verification_id(
+                    &verification_effect,
+                    &receipt,
+                    "shopify.independent-verification",
+                    &evidence_digest,
+                ),
+                status: status.clone(),
+                verifier: "shopify.independent-verification".into(),
+                independent: true,
+                observed_at: now() + Duration::seconds(4),
+                evidence_digest: evidence_digest.clone(),
+                receipt_id: receipt.id.clone(),
+            };
+            verification_store
+                .commit_verification(
+                    &verification_effect,
+                    &claim_binding,
+                    &verification_lease,
+                    &verification,
+                    verification_mission.revision,
+                    now() + Duration::seconds(5),
+                )
+                .expect("atomic independent verification commit");
+
+            let durable_status = verification_store
+                .connection
+                .query_row(
+                    "SELECT status FROM effect_idempotency
+                     WHERE project_id = ?1 AND effect_id = ?2",
+                    params![
+                        verification_effect.project_id.as_str(),
+                        verification_effect.id.as_str()
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("durable verification status");
+            assert_eq!(durable_status, expected_ledger_status);
+            let committed_recovery = verification_store
+                .load_provider_recovery(&verification_effect.project_id, &verification_effect.id)
+                .expect("committed provider recovery head");
+            assert_eq!(committed_recovery.state, expected_recovery_state);
+            match status {
+                VerificationStatus::Confirmed => {
+                    assert_eq!(
+                        committed_recovery.verification_evidence_digest.as_deref(),
+                        Some(evidence_digest.as_str())
+                    );
+                    assert_eq!(committed_recovery.updated_at, now() + Duration::seconds(5));
+                }
+                VerificationStatus::Rejected => {
+                    assert!(committed_recovery.verification_evidence_digest.is_none());
+                    assert_eq!(committed_recovery.updated_at, now() + Duration::seconds(5));
+                }
+                VerificationStatus::Inconclusive => {
+                    assert!(committed_recovery.verification_evidence_digest.is_none());
+                    assert_eq!(committed_recovery.updated_at, now() + Duration::seconds(3));
+                }
+            }
+
+            assert_eq!(
+                verification_store
+                    .claim_verification(
+                        &verification_effect,
+                        &claim_binding,
+                        verification_mission.revision,
+                        "restart-reader",
+                        now() + Duration::hours(2),
+                        now() + Duration::hours(2) + Duration::seconds(30),
+                    )
+                    .expect("restart reads terminal verification"),
+                VerificationClaim::AlreadyCompleted {
+                    receipt,
+                    verification,
+                    execution_started_at: now(),
+                    operation_at: now() + Duration::seconds(5),
+                    receipt_completion: PersistedCompletionPoint::reconciliation_head_receipt_found(
+                        now() + Duration::seconds(3)
+                    ),
+                }
+            );
+        }
+
+        let mut corrupted_store = ProjectStore::in_memory().expect("corruption clone");
+        {
+            let backup = Backup::new(&store.connection, &mut corrupted_store.connection)
+                .expect("open corruption fixture backup");
+            backup
+                .run_to_completion(128, StdDuration::from_millis(1), None)
+                .expect("clone exact N15 corruption prestate");
+        }
+        let mut corrupted_mission = corrupted_store
+            .load_mission(&effect.project_id, &effect.mission_id)
+            .expect("load corruption Mission");
+        corrupted_mission
+            .reconcile_durable_receipt(
+                &effect.id,
+                durable.receipt.clone(),
+                durable.execution_started_at,
+            )
+            .expect("project corruption fixture Receipt");
+        corrupted_store
+            .save_mission(&corrupted_mission)
+            .expect("persist corruption fixture Mission");
+        let corrupted_effect = corrupted_mission
+            .effect(&effect.id)
+            .expect("corruption Effect")
+            .clone();
+        let corrupted_receipt = corrupted_effect.receipt.as_ref().expect("Receipt");
+        let corrupted_binding = ReceiptVerificationClaimBinding::new(
+            corrupted_effect.approval_digest(),
+            corrupted_effect
+                .approval
+                .as_ref()
+                .expect("approval")
+                .permission_digest
+                .clone(),
+            receipt_binding_digest(corrupted_receipt),
+            "4".repeat(64),
+            "5".repeat(64),
+        )
+        .expect("corruption binding");
+        assert!(matches!(
+            corrupted_store
+                .claim_verification(
+                    &corrupted_effect,
+                    &corrupted_binding,
+                    corrupted_mission.revision,
+                    "first-verifier",
+                    now() + Duration::seconds(4),
+                    now() + Duration::seconds(5),
+                )
+                .expect("first verification claim"),
+            VerificationClaim::Acquired { .. }
+        ));
+        corrupted_store
+            .connection
+            .execute(
+                "UPDATE execution_attempts SET receipt_json = '{\"tampered\":true}'
+                 WHERE project_id = ?1 AND effect_id = ?2
+                   AND id LIKE 'verification-attempt:%'",
+                params![
+                    corrupted_effect.project_id.as_str(),
+                    corrupted_effect.id.as_str()
+                ],
+            )
+            .expect("tamper expired verification attempt");
+        assert_eq!(
+            corrupted_store.claim_verification(
+                &corrupted_effect,
+                &corrupted_binding,
+                corrupted_mission.revision,
+                "replacement-verifier",
+                now() + Duration::seconds(6),
+                now() + Duration::seconds(36),
+            ),
+            Err(LedgerError::ScopeConflict),
+            "expiry must not allow a corrupted attempt or swapped Receipt to be reclaimed"
         );
 
         store

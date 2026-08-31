@@ -15,7 +15,7 @@ use hartevo_application::connectors::shopify_readback::{
     SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopifyBrokeredReadback,
     ShopifyFulfillmentReadbackRequest, ShopifyNativeReadbackError, ShopifyReadbackBridgeError,
     ShopifyReadbackCancellation, ShopifyReadbackCredentialBinding, ShopifyReadbackIdentityMetadata,
-    ShopifyReadbackMetadata,
+    ShopifyReadbackMetadata, UreqShopifyAdminReadbackTransport,
 };
 use hartevo_application::connectors::shopify_recovery::{
     ShopifyRecoveryCapsuleRef, ShopifyRecoveryError,
@@ -36,7 +36,7 @@ use hartevo_application::{
     RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
     RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
     RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
-    Vm11NextContractOrValidTerminalResult,
+    VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -49,27 +49,30 @@ use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblySta
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, DomainCommandBinding, DomainCommandKind,
-    EffectExecutionBinding, EffectReconciliationBinding, RuntimeBinding, RuntimeRecordBinding,
+    EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding, RuntimeBinding,
+    RuntimeRecordBinding,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
     BrowserWorkspaceId, CompanyId, ConnectionId, ConsentRecord, ConsentState, ConsentStatus,
     ContactChannel, Conversation, ConversationId, CreatorTaskId, CurrencyCode, DeliverableId,
-    DeviceId, Effect, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
-    MessagingGateway, Mission, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
-    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, PersonId,
-    ProjectEncryptionMode, ProjectId, ProjectKeyring, ReceiptId, ReviewDecision, ReviewId,
-    RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
-    RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId, VerificationId,
-    VerificationStatus, WorkProductId, WorkerHandleStatus,
+    DeviceId, Effect, EffectClass, EffectId, EffectStatus, KeyManagementError, KeyRecipient,
+    KpiContract, MessagingGateway, Mission, MissionCheckpointCompletionPolicy,
+    MissionCheckpointExecutor, MissionConversationMessageId, MissionConversationMessageKind,
+    MissionConversationRole, MissionId, MissionStage, Money, OperatingMode, OutcomeDecision,
+    PersonId, ProjectEncryptionMode, ProjectId, ProjectKeyring, Receipt, ReceiptId, ReviewDecision,
+    ReviewId, RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy,
+    RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId,
+    VerificationId, VerificationStatus, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
     BrokerResult, DurableReceiptReconciliation, EffectBroker, EffectExecutor, EffectPolicy,
     EffectRateLimit, EffectReceiptReconciler, EffectReconciler, EffectVerifier,
-    ExecutionDisposition, ReceiptReconciliationFailure, ReceiptReconciliationResult,
-    ReconciliationObservation, SecretBrokerConsumer, SecretBrokerService, SecretScope,
-    StagedReceiptFound,
+    ExecutionDisposition, IndependentVerificationObservation, IndependentVerificationResult,
+    ReceiptReconciliationFailure, ReceiptReconciliationResult, ReceiptVerificationClaimBinding,
+    ReceiptVerificationSource, ReceiptVerificationSubject, ReconciliationObservation,
+    SecretBrokerConsumer, SecretBrokerService, SecretScope, StagedReceiptFound,
+    VerificationSourceError,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
 use hartevo_storage::{
@@ -84,8 +87,9 @@ use zeroize::Zeroizing;
 use crate::cordis_host::{
     DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
     DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
-    dispatch_live_domain_command, dispatch_live_effect_execution,
-    dispatch_live_effect_reconciliation, dispatch_live_runtime, mount_cordis_host,
+    DesktopEffectVerificationAuthorization, dispatch_live_domain_command,
+    dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
+    dispatch_live_effect_verification, dispatch_live_runtime, mount_cordis_host,
 };
 #[cfg(test)]
 use crate::cordis_host::{
@@ -716,6 +720,82 @@ impl fmt::Debug for DesktopShopifyReceiptIdentityRequest {
 /// Verification, E4 fact, or Mission completion result.
 pub type DesktopShopifyReceiptIdentityProjection = ShopifyReadbackIdentityMetadata;
 
+/// Exact Desktop admission for the independent N16 verification route. The
+/// request carries only immutable identity/digest fences; the Receipt,
+/// encrypted N15 capsule, and provider evidence remain below Application.
+#[derive(Clone)]
+pub struct DesktopShopifyIndependentVerificationRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_receipt_id: ReceiptId,
+    pub expected_receipt_accepted_at: DateTime<Utc>,
+    pub expected_receipt_request_digest: String,
+    pub expected_receipt_response_digest: String,
+    pub expected_receipt_binding_digest: String,
+    pub expected_n15_evidence_digest: String,
+    pub expected_observation_authority_digest: String,
+    pub expected_source_binding_digest: String,
+    pub expected_scope_digest: String,
+    pub expected_broker_authorization_digest: String,
+    pub expected_mission_revision: u64,
+    pub recovery: ShopifyRecoveryCapsuleRef,
+    pub readback: ShopifyFulfillmentReadbackRequest,
+    pub cancellation: ShopifyReadbackCancellation,
+}
+
+impl fmt::Debug for DesktopShopifyIndependentVerificationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopShopifyIndependentVerificationRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("effect_id", &self.effect_id)
+            .field("expected_receipt_id", &"[REDACTED]")
+            .field("expected_receipt_accepted_at", &"[REDACTED]")
+            .field("expected_receipt_request_digest", &"[DIGEST]")
+            .field("expected_receipt_response_digest", &"[DIGEST]")
+            .field("expected_receipt_binding_digest", &"[DIGEST]")
+            .field("expected_n15_evidence_digest", &"[DIGEST]")
+            .field("expected_observation_authority_digest", &"[DIGEST]")
+            .field("expected_source_binding_digest", &"[DIGEST]")
+            .field("expected_scope_digest", &"[DIGEST]")
+            .field("expected_broker_authorization_digest", &"[DIGEST]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field("recovery", &"[REDACTED]")
+            .field("readback", &"[REDACTED]")
+            .field("cancellation", &self.cancellation)
+            .finish()
+    }
+}
+
+/// Redacted Desktop projection for one accepted independent verification.
+/// It exposes only opaque Domain ids, status, and Broker-owned authority
+/// sequence; no selector, provider response, CAS locator, or evidence digest.
+#[derive(Clone, PartialEq)]
+pub struct DesktopShopifyIndependentVerification {
+    pub snapshot: DesktopSnapshot,
+    pub receipt_id: ReceiptId,
+    pub verification_id: VerificationId,
+    pub verification_status: VerificationStatus,
+    pub verification_independent: bool,
+    pub authority_sequence: u64,
+}
+
+impl fmt::Debug for DesktopShopifyIndependentVerification {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopShopifyIndependentVerification")
+            .field("snapshot", &"[REDACTED]")
+            .field("receipt_id", &"[REDACTED]")
+            .field("verification_id", &self.verification_id)
+            .field("verification_status", &self.verification_status)
+            .field("verification_independent", &self.verification_independent)
+            .field("authority_sequence", &self.authority_sequence)
+            .finish()
+    }
+}
+
 /// First durable Shopify recovery projection. It exposes the Receipt id and
 /// recovery state only; the provider identity, encrypted CAS locator, and
 /// deferred Verification remain below the Desktop boundary.
@@ -808,6 +888,114 @@ struct DesktopShopifyReceiptFoundReconciler<'a, S, Observe> {
     observation_authority_digest: String,
     entry_at: DateTime<Utc>,
     observe: Observe,
+}
+
+/// Second-authority wrapper for the N16 source. Broker claim happens before
+/// this wrapper is called; therefore the pre/post checks here are the final
+/// Mission/Effect/Connection/cancellation fences immediately around the one
+/// credentialed provider read. Recovery validation intentionally delegates
+/// only to the source's local CAS authenticator.
+struct DesktopBoundShopifyVerificationSource<'a, Source> {
+    delegate: Source,
+    authority_service: &'a mut ApplicationService,
+    project_id: ProjectId,
+    mission_id: MissionId,
+    effect_id: EffectId,
+    expected_effect: Effect,
+    expected_receipt: Receipt,
+    expected_approval: Approval,
+    expected_scope: AuthorityScope,
+    claim_binding: ReceiptVerificationClaimBinding,
+    readback_binding: ShopifyReadbackCredentialBinding,
+    requires_live_connection: bool,
+    expected_mission_revision: u64,
+    cancellation: ShopifyReadbackCancellation,
+    now: DateTime<Utc>,
+}
+
+impl<Source> DesktopBoundShopifyVerificationSource<'_, Source>
+where
+    Source: ReceiptVerificationSource,
+{
+    fn map_fence_error(error: &DesktopShopifyReadbackError) -> VerificationSourceError {
+        if matches!(
+            error,
+            DesktopShopifyReadbackError::Bridge(ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::CancelledBeforeDispatch
+                    | ShopifyNativeReadbackError::CancelledAfterDispatch,
+            ))
+        ) {
+            VerificationSourceError::Cancelled
+        } else {
+            VerificationSourceError::Rejected
+        }
+    }
+
+    fn validate_subject(
+        &mut self,
+        subject: &ReceiptVerificationSubject,
+    ) -> Result<(), VerificationSourceError> {
+        if subject.effect_id() != &self.effect_id
+            || subject.provider() != self.expected_effect.provider
+            || subject.capability() != self.expected_effect.capability
+            || subject.approval_scope_digest() != self.expected_approval.scope_digest
+            || subject.broker_authorization_digest() != self.expected_approval.permission_digest
+            || subject.receipt() != &self.expected_receipt
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        validate_desktop_independent_verification_fence(
+            self.authority_service,
+            &self.project_id,
+            &self.mission_id,
+            &self.effect_id,
+            &self.expected_effect,
+            &self.expected_receipt,
+            &self.expected_approval,
+            &self.expected_scope,
+            &self.claim_binding,
+            &self.readback_binding,
+            self.requires_live_connection,
+            self.expected_mission_revision,
+            &self.cancellation,
+            self.now,
+        )
+        .map_err(|error| Self::map_fence_error(&error))
+    }
+}
+
+impl<Source> ReceiptVerificationSource for DesktopBoundShopifyVerificationSource<'_, Source>
+where
+    Source: ReceiptVerificationSource,
+{
+    fn verifier_id(&self) -> &str {
+        self.delegate.verifier_id()
+    }
+
+    fn source_binding_digest(&self) -> String {
+        self.delegate.source_binding_digest()
+    }
+
+    fn observe(
+        &mut self,
+        subject: &ReceiptVerificationSubject,
+    ) -> Result<IndependentVerificationObservation, VerificationSourceError> {
+        // The first fence runs after Broker's durable verification claim.
+        self.validate_subject(subject)?;
+        let observation = self.delegate.observe(subject)?;
+        // The second fence runs before the Broker can accept the observation
+        // or enter its atomic commit transaction.
+        self.validate_subject(subject)?;
+        Ok(observation)
+    }
+
+    fn validate_recovered(
+        &self,
+        subject: &ReceiptVerificationSubject,
+        verification: &hartevo_domain_kernel::Verification,
+    ) -> Result<(), VerificationSourceError> {
+        self.delegate.validate_recovered(subject, verification)
+    }
 }
 
 impl<S, Observe> EffectReceiptReconciler for DesktopShopifyReceiptFoundReconciler<'_, S, Observe>
@@ -3396,6 +3584,314 @@ impl DesktopDataPlane {
         })
     }
 
+    /// Dispatch one independent N16 verification through the dedicated
+    /// Cordis verification permit. The source is prepared from the exact
+    /// encrypted N15 capsule before claim; Secret Broker/provider work remains
+    /// lazy and occurs only inside `observe` after the verification claim.
+    pub fn dispatch_shopify_independent_verification_os(
+        &self,
+        request: DesktopShopifyIndependentVerificationRequest,
+        broker: &mut EffectBroker,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopShopifyIndependentVerification, DesktopShopifyReadbackError> {
+        if request.cancellation.is_cancelled() {
+            return Err(ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::CancelledBeforeDispatch,
+            )
+            .into());
+        }
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)
+            .map_err(DesktopDataError::from)
+            .map_err(DesktopShopifyReadbackError::Desktop)?;
+        self.dispatch_shopify_independent_verification_with(&secret_store, request, broker, now)
+    }
+
+    /// Stable production-surface spelling; it retains the OS Secret Broker
+    /// path used by the explicit `_os` entry point.
+    pub fn dispatch_shopify_independent_verification(
+        &self,
+        request: DesktopShopifyIndependentVerificationRequest,
+        broker: &mut EffectBroker,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopShopifyIndependentVerification, DesktopShopifyReadbackError> {
+        self.dispatch_shopify_independent_verification_os(request, broker, now)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_shopify_independent_verification_with<S>(
+        &self,
+        secret_store: &S,
+        request: DesktopShopifyIndependentVerificationRequest,
+        broker: &mut EffectBroker,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopShopifyIndependentVerification, DesktopShopifyReadbackError>
+    where
+        S: SecretStore,
+    {
+        let DesktopShopifyIndependentVerificationRequest {
+            project_id,
+            mission_id,
+            effect_id,
+            expected_receipt_id,
+            expected_receipt_accepted_at,
+            expected_receipt_request_digest,
+            expected_receipt_response_digest,
+            expected_receipt_binding_digest,
+            expected_n15_evidence_digest,
+            expected_observation_authority_digest,
+            expected_source_binding_digest,
+            expected_scope_digest,
+            expected_broker_authorization_digest,
+            expected_mission_revision,
+            recovery,
+            readback,
+            cancellation,
+        } = request;
+        if cancellation.is_cancelled()
+            || expected_mission_revision == 0
+            || !is_canonical_sha256(&expected_receipt_request_digest)
+            || !is_canonical_sha256(&expected_receipt_response_digest)
+            || !is_canonical_sha256(&expected_receipt_binding_digest)
+            || !is_canonical_sha256(&expected_n15_evidence_digest)
+            || !is_canonical_sha256(&expected_observation_authority_digest)
+            || !is_canonical_sha256(&expected_source_binding_digest)
+            || !is_canonical_sha256(&expected_scope_digest)
+            || !is_canonical_sha256(&expected_broker_authorization_digest)
+            || readback.expected_identity().is_some()
+            || recovery.project_id != project_id
+            || recovery.effect_id != effect_id
+        {
+            if cancellation.is_cancelled() {
+                return Err(ShopifyReadbackBridgeError::Transport(
+                    ShopifyNativeReadbackError::CancelledBeforeDispatch,
+                )
+                .into());
+            }
+            return Err(DesktopShopifyReadbackError::InvalidRequest);
+        }
+        let observation_authority_digest = recovery
+            .readback_authority_digest(&readback)
+            .map_err(ShopifyReadbackBridgeError::Transport)?;
+        if observation_authority_digest != expected_observation_authority_digest {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+
+        let (mut service, runtime_reconciliation, context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let database_secret = secret_store
+            .get(&self.database_key_reference)
+            .map_err(|error| {
+                if matches!(error, SecretStoreError::SecretNotFound) {
+                    DesktopShopifyReadbackError::Desktop(DesktopDataError::MissingDatabaseKey)
+                } else {
+                    DesktopShopifyReadbackError::Desktop(DesktopDataError::SecretStore(error))
+                }
+            })?;
+        // This independent read-only authority service is intentionally a
+        // separate database view. It fences Mission/Effect/Connection before
+        // and after source work.
+        let mut authority_service = self.open_read_application_from_secret(&database_secret)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.revision != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: mission.revision,
+            }
+            .into());
+        }
+        let scope = authority_scope_for_mission(&mission, &project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+        let receipt = effect
+            .receipt
+            .clone()
+            .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+        let approval = effect
+            .approval
+            .clone()
+            .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+        if effect.project_id != project_id
+            || effect.mission_id != mission_id
+            || effect.provider != SHOPIFY_PROVIDER_ID
+            || effect.capability != SHOPIFY_FULFILLMENT_CAPABILITY
+            || effect.effect_class != EffectClass::ExternalWrite
+            || !matches!(
+                effect.status,
+                hartevo_domain_kernel::EffectStatus::ReceiptRecorded
+                    | hartevo_domain_kernel::EffectStatus::VerificationRequired
+                    | hartevo_domain_kernel::EffectStatus::Verified
+                    | hartevo_domain_kernel::EffectStatus::Failed
+            )
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || approval.scope_digest != expected_scope_digest
+            || approval.permission_digest != expected_broker_authorization_digest
+            || receipt.id != expected_receipt_id
+            || receipt.accepted_at != expected_receipt_accepted_at
+            || receipt.request_digest != expected_receipt_request_digest
+            || receipt.response_digest != expected_receipt_response_digest
+            || expected_n15_evidence_digest != receipt.response_digest
+        {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+
+        // Preparation reopens and authenticates the encrypted N15 evidence;
+        // it never resolves a provider Secret or performs a network read.
+        let source = service.prepare_shopify_independent_verification_source(
+            secret_store,
+            &context_session,
+            &recovery,
+            readback,
+            expected_observation_authority_digest.clone(),
+            cancellation.clone(),
+            UreqShopifyAdminReadbackTransport::new(),
+        )?;
+        let claim_binding = source.claim_binding()?;
+        if claim_binding.approval_scope_digest() != expected_scope_digest
+            || claim_binding.broker_authorization_digest() != expected_broker_authorization_digest
+            || claim_binding.receipt_binding_digest() != expected_receipt_binding_digest
+            || claim_binding.observation_authority_digest() != expected_observation_authority_digest
+            || claim_binding.source_binding_digest() != expected_source_binding_digest
+            || source.source_binding_digest() != expected_source_binding_digest
+            || source.verifier_id().trim().is_empty()
+        {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        let source_binding = source.binding().clone();
+        let requires_live_connection = source.requires_live_connection();
+
+        validate_desktop_independent_verification_fence(
+            &mut authority_service,
+            &project_id,
+            &mission_id,
+            &effect_id,
+            &effect,
+            &receipt,
+            &approval,
+            &scope,
+            &claim_binding,
+            &source_binding,
+            requires_live_connection,
+            expected_mission_revision,
+            &cancellation,
+            now,
+        )?;
+        let verification_binding = EffectVerificationBinding::new(
+            effect_id.as_str(),
+            expected_scope_digest.clone(),
+            expected_broker_authorization_digest.clone(),
+            expected_receipt_binding_digest.clone(),
+            expected_observation_authority_digest.clone(),
+            expected_source_binding_digest.clone(),
+        )?;
+        let (consent, record) = live_effect_consent_facts(&service, &effect, now)?;
+        let expected_effect = effect.clone();
+        let expected_receipt = receipt.clone();
+        let expected_approval = approval.clone();
+        let command = VerifyRecordedReceiptAtRevision {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: effect_id.clone(),
+            expected_receipt_id: expected_receipt_id.clone(),
+            expected_receipt_accepted_at,
+            expected_receipt_request_digest,
+            expected_receipt_response_digest,
+            expected_receipt_binding_digest: expected_receipt_binding_digest.clone(),
+            expected_n15_evidence_digest: expected_n15_evidence_digest.clone(),
+            expected_observation_authority_digest: expected_observation_authority_digest.clone(),
+            expected_source_binding_digest: expected_source_binding_digest.clone(),
+            expected_scope_digest: expected_scope_digest.clone(),
+            expected_broker_authorization_digest: expected_broker_authorization_digest.clone(),
+            expected_mission_revision,
+        };
+        let result: IndependentVerificationResult =
+            map_shopify_readback_dispatch_result(dispatch_live_effect_verification(
+                &self.cordis,
+                DesktopEffectVerificationAuthorization::new(scope, verification_binding),
+                &consent,
+                record.as_ref(),
+                Some(&approval),
+                now,
+                |permit| {
+                    if permit.binding().effect_id() != effect_id.as_str()
+                        || permit.binding().approval_scope_digest()
+                            != expected_scope_digest.as_str()
+                        || permit.binding().broker_authorization_digest()
+                            != expected_broker_authorization_digest.as_str()
+                        || permit.binding().receipt_binding_digest()
+                            != expected_receipt_binding_digest.as_str()
+                        || permit.binding().observation_authority_digest()
+                            != expected_observation_authority_digest.as_str()
+                        || permit.binding().source_binding_digest()
+                            != expected_source_binding_digest.as_str()
+                    {
+                        return Err(CordisError::EffectVerificationPermitMismatch.into());
+                    }
+                    let mut bound_source = DesktopBoundShopifyVerificationSource {
+                        delegate: source,
+                        authority_service: &mut authority_service,
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        effect_id: effect_id.clone(),
+                        expected_effect: expected_effect.clone(),
+                        expected_receipt: expected_receipt.clone(),
+                        expected_approval: expected_approval.clone(),
+                        expected_scope: permit.scope().clone(),
+                        claim_binding: claim_binding.clone(),
+                        readback_binding: source_binding.clone(),
+                        requires_live_connection,
+                        expected_mission_revision,
+                        cancellation: cancellation.clone(),
+                        now,
+                    };
+                    let (projected_mission, result) = service
+                        .verify_recorded_receipt_at_revision(
+                            broker,
+                            &command,
+                            &claim_binding,
+                            &mut bound_source,
+                            now,
+                        )
+                        .map_err(DesktopShopifyReadbackError::from)?;
+                    let projected_effect = projected_mission
+                        .effect(&effect_id)
+                        .map_err(ApplicationError::from)?;
+                    let expected_status = match result.verification.status {
+                        VerificationStatus::Confirmed => EffectStatus::Verified,
+                        VerificationStatus::Rejected => EffectStatus::Failed,
+                        VerificationStatus::Inconclusive => EffectStatus::VerificationRequired,
+                    };
+                    if projected_effect.receipt.as_ref() != Some(&result.receipt)
+                        || projected_effect.verification.as_ref() != Some(&result.verification)
+                        || projected_effect.status != expected_status
+                    {
+                        return Err(DesktopShopifyReadbackError::BindingMismatch);
+                    }
+                    Ok(result)
+                },
+            ))?;
+        let snapshot = self
+            .build_snapshot(
+                &service,
+                secret_store,
+                runtime_reconciliation,
+                load_product_evidence(now)?,
+                now,
+            )
+            .map_err(DesktopShopifyReadbackError::Desktop)?;
+        let authority_sequence = result.completion().sequence();
+        Ok(DesktopShopifyIndependentVerification {
+            snapshot,
+            receipt_id: result.receipt.id.clone(),
+            verification_id: result.verification.id.clone(),
+            verification_status: result.verification.status.clone(),
+            verification_independent: result.verification.independent,
+            authority_sequence,
+        })
+    }
+
     fn dispatch_shopify_readback_admission<S, Observe>(
         &self,
         secret_store: &S,
@@ -5410,6 +5906,112 @@ impl DesktopDataPlane {
     fn database_key_reference(&self) -> &SecretReference {
         &self.database_key_reference
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_desktop_independent_verification_fence(
+    authority_service: &mut ApplicationService,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+    effect_id: &EffectId,
+    expected_effect: &Effect,
+    expected_receipt: &Receipt,
+    expected_approval: &Approval,
+    expected_scope: &AuthorityScope,
+    binding: &ReceiptVerificationClaimBinding,
+    readback_binding: &ShopifyReadbackCredentialBinding,
+    requires_live_connection: bool,
+    expected_mission_revision: u64,
+    cancellation: &ShopifyReadbackCancellation,
+    now: DateTime<Utc>,
+) -> Result<(), DesktopShopifyReadbackError> {
+    let expected_receipt_binding_digest =
+        hartevo_effect_broker::receipt_binding_digest(expected_receipt);
+    if cancellation.is_cancelled() {
+        return Err(ShopifyReadbackBridgeError::Transport(
+            ShopifyNativeReadbackError::CancelledBeforeDispatch,
+        )
+        .into());
+    }
+    let mission = authority_service.load_mission(project_id, mission_id)?;
+    let current_effect = mission.effect(effect_id).map_err(ApplicationError::from)?;
+    if mission.project_id != *project_id
+        || mission.id != *mission_id
+        || current_effect.id != *effect_id
+        || expected_effect.project_id != *project_id
+        || expected_effect.mission_id != *mission_id
+        || expected_effect.id != *effect_id
+        || expected_effect.tenant_id != mission.tenant_id
+    {
+        return Err(DesktopShopifyReadbackError::BindingMismatch);
+    }
+    if mission.revision != expected_mission_revision || current_effect != expected_effect {
+        return Err(DesktopShopifyReadbackError::BindingMismatch);
+    }
+    let current_scope = authority_scope_for_mission(&mission, project_id, mission_id)?;
+    if current_scope.tenant_id() != expected_scope.tenant_id()
+        || current_scope.project_id() != expected_scope.project_id()
+        || current_scope.mission_id() != expected_scope.mission_id()
+        || current_scope.mission_revision() != expected_mission_revision
+    {
+        return Err(DesktopShopifyReadbackError::BindingMismatch);
+    }
+    if expected_approval.decision != ApprovalDecision::Approved
+        || expected_approval.scope_digest != expected_effect.approval_digest()
+        || expected_effect.approval.as_ref() != Some(expected_approval)
+        || current_effect.approval.as_ref() != Some(expected_approval)
+        || expected_receipt.provider != expected_effect.provider
+        || expected_receipt.request_digest != expected_effect.approval_digest()
+        || current_effect.receipt.as_ref() != Some(expected_receipt)
+        || binding.approval_scope_digest() != expected_approval.scope_digest
+        || binding.broker_authorization_digest() != expected_approval.permission_digest
+        || binding.receipt_binding_digest() != expected_receipt_binding_digest
+    {
+        return Err(DesktopShopifyReadbackError::BindingMismatch);
+    }
+
+    // Terminal local replay intentionally performs no live Connection
+    // validation. The load remains a second-authority read when possible, but
+    // rotation/revocation after a durable commit must not block projection.
+    let connection_id = expected_effect.connection_id.as_ref();
+    match connection_id {
+        Some(connection_id) => match authority_service.load_connection(project_id, connection_id) {
+            Ok(connection) if requires_live_connection => {
+                let account_id = expected_effect
+                    .account_id
+                    .as_ref()
+                    .ok_or(DesktopShopifyReadbackError::BindingMismatch)?;
+                if connection.tenant_id() != &expected_effect.tenant_id
+                    || connection.project_id() != project_id
+                    || connection.provider() != SHOPIFY_PROVIDER_ID
+                    || connection.id() != connection_id
+                    || connection.account_id() != account_id
+                    || readback_binding.scope().account_id() != account_id
+                {
+                    return Err(DesktopShopifyReadbackError::BindingMismatch);
+                }
+                if connection.revision() != readback_binding.credential_revision()
+                    || !connection.permits_scopes(&expected_effect.required_scopes, now)
+                    || connection.snapshot().expected_external_account_id
+                        != readback_binding.shop().as_str()
+                    || connection.last_probe().is_none_or(|probe| {
+                        probe.observed_external_account_id != readback_binding.shop().as_str()
+                    })
+                {
+                    return Err(DesktopShopifyReadbackError::BindingMismatch);
+                }
+            }
+            Err(_) if requires_live_connection => {
+                return Err(DesktopShopifyReadbackError::BindingMismatch);
+            }
+            Ok(_) | Err(_) => {}
+        },
+        None if requires_live_connection => {
+            return Err(DesktopShopifyReadbackError::BindingMismatch);
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn mission_authority_scope(

@@ -2,8 +2,9 @@
 //!
 //! The private approved draft is stored only through encrypted project
 //! Context-Material CAS. SQLCipher stores a content-free exact binding and a
-//! monotonic recovery state. This module never obtains a production provider,
-//! credential, network transport, or Effect authority.
+//! monotonic recovery state. Capsule reopening and all pre-claim
+//! authentication remain provider-free; the N16 source obtains a fresh
+//! Secret/transport only after its dedicated Broker claim.
 
 use std::fmt;
 
@@ -22,22 +23,26 @@ use hartevo_commerce_connector::shopify_effect_reconcile::{
 };
 use hartevo_commerce_connector::shopify_transport::{
     ShopifyExpectedFulfillmentIdentity, ShopifyFulfillmentReadbackRequest,
-    ShopifyNativeReadbackError,
+    ShopifyNativeReadbackError, ShopifyReadbackCancellation,
 };
 pub use hartevo_connector_sdk::ConnectorScope;
 use hartevo_connector_sdk::{
     EffectExecutionContext, PreparedEffect, ProviderCapabilityKey, ProviderProvenanceClass,
 };
 use hartevo_domain_kernel::{
-    ApprovalDecision, Connection, ConnectionSnapshot, Effect, EffectStatus,
+    ApprovalDecision, Connection, ConnectionSnapshot, Effect, EffectStatus, Verification,
+    VerificationStatus,
 };
 use hartevo_effect_broker::{
-    DurableReceiptReconciliation, EffectPermissionResolver, EffectPolicy, PermissionEvidence,
-    ReceiptRecoveryFence, StagedReceiptFound,
+    DurableReceiptReconciliation, EffectPermissionResolver, EffectPolicy,
+    IndependentVerificationObservation, PermissionEvidence, ReceiptRecoveryFence,
+    ReceiptVerificationClaimBinding, ReceiptVerificationSource, SecretBrokerConsumer,
+    SecretBrokerError, SecretBrokerService, SecretBrokerServiceDefinition, SecretScope,
+    StagedReceiptFound, VerificationSourceError, receipt_binding_digest,
 };
 use hartevo_storage::{
     ContextMaterialStoreError, ProjectStore, ProviderRecoveryBinding, ProviderRecoveryCapsule,
-    ProviderRecoveryHead, ProviderRecoveryState, StorageError,
+    ProviderRecoveryHead, ProviderRecoveryState, SecretStore, SecretStoreError, StorageError,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,13 +52,21 @@ use super::shopify::{
     SHOPIFY_APPLICATION_ADAPTER_ID, ShopifyAdapterError, ShopifyEffectAdapter,
     validate_controlled_recovery_effect,
 };
-use super::shopify_readback::{ShopifyBrokeredReadback, approved_line_item_binding_digest};
+use super::shopify_readback::{
+    SHOPIFY_INDEPENDENT_VERIFICATION_REGISTRY_VERSION, ShopifyBrokeredReadback,
+    ShopifyReadbackBridgeError, ShopifyReadbackCredentialBinding, ShopifySecretReadbackProvider,
+    UreqShopifyAdminReadbackTransport, approved_line_item_binding_digest,
+    dispatch_shopify_readback_with_registry, shopify_independent_verification_adapter_identity,
+    shopify_readback_registry_for,
+};
 use crate::{ApplicationService, ProjectContextMaterialSession};
 
 const SHOPIFY_RECOVERY_CAPSULE_SCHEMA: &str = "hartevo-shopify-recovery-capsule/v1";
 const SHOPIFY_RECEIPT_FOUND_EVIDENCE_SCHEMA: &str = "hartevo-shopify-receipt-found-evidence/v1";
 const SHOPIFY_RECOVERY_CAPSULE_REVISION: u64 = 1;
 const SHOPIFY_APPLICATION_ADAPTER_VERSION: u64 = 1;
+const SHOPIFY_INDEPENDENT_VERIFICATION_EVIDENCE_SCHEMA: &str =
+    "hartevo-shopify-independent-verification-evidence/v1";
 
 /// Content-free handle safe for ordinary durable projections and UI status.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -408,6 +421,85 @@ impl ReopenedShopifyReconciliation {
     }
 }
 
+/// Read-only reopening for the N16 independent verification route. The
+/// original InFlight/Uncertain reference remains immutable; `head` is the
+/// current ReceiptObserved/terminal recovery head. No execution adapter is
+/// carried by this value.
+pub struct ReopenedShopifyVerification {
+    approved: ShopifyApprovedDraftFulfillment,
+    effect: Effect,
+    head: ProviderRecoveryHead,
+    original_reference: ShopifyRecoveryCapsuleRef,
+    current_mission_revision: u64,
+    connection: Option<ConnectionSnapshot>,
+}
+
+impl fmt::Debug for ReopenedShopifyVerification {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReopenedShopifyVerification")
+            .field("effect_id", &self.effect.id)
+            .field("current_mission_revision", &self.current_mission_revision)
+            .field("recovery_state", &self.head.state)
+            .field("recovery_revision", &self.head.revision)
+            .field("has_live_connection", &self.connection.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReopenedShopifyVerification {
+    fn bind_exact_readback(
+        &self,
+        request: &ShopifyFulfillmentReadbackRequest,
+        authority_digest: &str,
+    ) -> Result<ShopifyFulfillmentReadbackRequest, ShopifyNativeReadbackError> {
+        let draft = self.approved.draft();
+        if self
+            .original_reference
+            .readback_authority_digest(request)?
+            .as_str()
+            != authority_digest
+            || request.expected_identity().is_some()
+            || draft.api_version() != request.api_version()
+            || draft.tenant_scope().shop() != request.shop()
+        {
+            return Err(ShopifyNativeReadbackError::InvalidRequest);
+        }
+        let expected = ShopifyExpectedFulfillmentIdentity::new(
+            draft.order_gid().clone(),
+            draft.fulfillment_order_gid().clone(),
+            draft.line_items().to_vec(),
+            self.effect
+                .approval
+                .as_ref()
+                .map(|approval| approval.decided_at.max(self.head.prepared_at))
+                .ok_or(ShopifyNativeReadbackError::InvalidRequest)?,
+        )?;
+        ShopifyFulfillmentReadbackRequest::new_exact(
+            request.shop().clone(),
+            request.api_version().clone(),
+            request.fulfillment_id().clone(),
+            expected,
+        )
+    }
+
+    pub fn effect(&self) -> &Effect {
+        &self.effect
+    }
+
+    pub fn head(&self) -> &ProviderRecoveryHead {
+        &self.head
+    }
+
+    pub const fn current_mission_revision(&self) -> u64 {
+        self.current_mission_revision
+    }
+
+    pub fn original_reference(&self) -> &ShopifyRecoveryCapsuleRef {
+        &self.original_reference
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredShopifyReceiptFoundEvidence {
@@ -442,6 +534,753 @@ struct StoredShopifyReceiptFoundEvidence {
     provenance_class: ProviderProvenanceClass,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredShopifyVerificationEvidence {
+    schema: String,
+    effect_id: String,
+    receipt_id: String,
+    receipt_response_digest: String,
+    receipt_binding_digest: String,
+    n15_evidence_digest: String,
+    recovery_binding_digest: String,
+    recovery_capsule_content_digest: String,
+    recovery_capsule_key_version: u64,
+    recovery_capsule_object_revision: u64,
+    recovery_head_revision: u64,
+    recovery_head_state: ProviderRecoveryState,
+    credential_revision: u64,
+    selector_digest: String,
+    observation_authority_digest: String,
+    source_binding_digest: String,
+    adapter_id: String,
+    adapter_version: u32,
+    registry_version: String,
+    shop: String,
+    api_version: String,
+    fulfillment_id: String,
+    fulfillment_status: String,
+    order_id: String,
+    fulfillment_order_id: String,
+    line_item_binding_digest: String,
+    native_response_digest: String,
+    native_evidence_digest: String,
+    native_request_id_digest: Option<String>,
+    secret_broker_use_digest: String,
+    provider_created_at: DateTime<Utc>,
+    provider_updated_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    provenance_class: ProviderProvenanceClass,
+}
+
+/// Fresh, production-shaped Shopify source for the N16 route. The source is
+/// deliberately lazy: construction binds only content-free selector and
+/// recovery metadata. Secret Broker/provider objects are created inside
+/// `observe` after local N15 evidence and cancellation fences pass.
+pub struct ShopifyIndependentVerificationSource<'a, S, T> {
+    secret_store: &'a S,
+    material: &'a ProjectContextMaterialSession,
+    approved: ShopifyApprovedDraftFulfillment,
+    effect: Effect,
+    head: ProviderRecoveryHead,
+    original_reference: ShopifyRecoveryCapsuleRef,
+    connection: Option<ConnectionSnapshot>,
+    selector: ShopifyFulfillmentReadbackRequest,
+    exact_request: ShopifyFulfillmentReadbackRequest,
+    binding: ShopifyReadbackCredentialBinding,
+    observation_authority_digest: String,
+    source_binding_digest: String,
+    verifier_id: String,
+    cancellation: ShopifyReadbackCancellation,
+    transport: Option<T>,
+    expected_provenance: ProviderProvenanceClass,
+}
+
+impl<S, T> fmt::Debug for ShopifyIndependentVerificationSource<'_, S, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShopifyIndependentVerificationSource")
+            .field("effect_id", &self.effect.id)
+            .field("selector_digest", &self.selector.selector_digest())
+            .field("source_binding_digest", &"[DIGEST]")
+            .field("verifier_id", &self.verifier_id)
+            .field("has_transport", &self.transport.is_some())
+            .field("has_live_connection", &self.connection.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, S, T> ShopifyIndependentVerificationSource<'a, S, T>
+where
+    S: SecretStore,
+    T: hartevo_commerce_connector::shopify_transport::ShopifyAdminReadbackTransport,
+{
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn new_with_provenance(
+        secret_store: &'a S,
+        material: &'a ProjectContextMaterialSession,
+        reopened: ReopenedShopifyVerification,
+        selector: ShopifyFulfillmentReadbackRequest,
+        observation_authority_digest: impl Into<String>,
+        cancellation: ShopifyReadbackCancellation,
+        transport: T,
+        expected_provenance: ProviderProvenanceClass,
+    ) -> Result<Self, ShopifyRecoveryError> {
+        let observation_authority_digest = observation_authority_digest.into();
+        let exact_request = reopened
+            .bind_exact_readback(&selector, &observation_authority_digest)
+            .map_err(|_| ShopifyRecoveryError::BindingMismatch)?;
+        let receipt = reopened
+            .effect
+            .receipt
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        if material.project_id() != &reopened.effect.project_id
+            || material.keyring_revision() != reopened.head.binding.keyring_revision
+            || !material
+                .readable_key_versions()
+                .contains(&reopened.head.capsule.key_version)
+            || !is_sha256(&observation_authority_digest)
+            || !matches!(
+                reopened.head.state,
+                ProviderRecoveryState::ReceiptObserved
+                    | ProviderRecoveryState::Verified
+                    | ProviderRecoveryState::FailedClosed
+            )
+            || reopened.head.readback_content_digest.as_deref()
+                != Some(receipt.response_digest.as_str())
+            || reopened.head.receipt_evidence_digest.as_deref()
+                != Some(receipt.response_digest.as_str())
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let adapter = shopify_independent_verification_adapter_identity()
+            .map_err(|_| ShopifyRecoveryError::BindingMismatch)?;
+        let binding = ShopifyReadbackCredentialBinding::new_with_adapter(
+            SecretScope::new(
+                reopened.effect.tenant_id.clone(),
+                reopened.effect.project_id.clone(),
+                reopened.effect.mission_id.clone(),
+                SHOPIFY_PROVIDER_ID,
+                reopened
+                    .effect
+                    .account_id
+                    .clone()
+                    .ok_or(ShopifyRecoveryError::BindingMismatch)?,
+                SHOPIFY_FULFILLMENT_CAPABILITY,
+            )
+            .map_err(|_| ShopifyRecoveryError::BindingMismatch)?,
+            selector.shop().clone(),
+            reopened.head.binding.credential_revision,
+            adapter.clone(),
+        )
+        .map_err(|_| ShopifyRecoveryError::BindingMismatch)?;
+        let verifier_id = "shopify.independent-verification".to_owned();
+        let source_binding_digest = canonical_digest(&[
+            "hartevo-shopify-independent-verification-source/v1".to_owned(),
+            reopened.effect.id.to_string(),
+            reopened.effect.provider.clone(),
+            reopened.effect.capability.clone(),
+            receipt_binding_digest(receipt),
+            reopened.head.binding.binding_digest.clone(),
+            reopened.head.capsule.content_digest.clone(),
+            reopened.head.capsule.key_version.to_string(),
+            reopened.head.capsule.object_revision.to_string(),
+            reopened.original_reference.head_revision.to_string(),
+            recovery_state_name(reopened.original_reference.state).to_owned(),
+            reopened
+                .original_reference
+                .head_revision
+                .checked_add(1)
+                .ok_or(ShopifyRecoveryError::BindingMismatch)?
+                .to_string(),
+            selector.selector_digest(),
+            exact_request.selector_digest(),
+            observation_authority_digest.clone(),
+            adapter.adapter_id().to_owned(),
+            adapter.adapter_version().to_string(),
+            SHOPIFY_INDEPENDENT_VERIFICATION_REGISTRY_VERSION.to_owned(),
+            reopened.head.binding.plugin_revision.to_string(),
+            reopened.head.binding.provider_generation.to_string(),
+            reopened.head.binding.credential_revision.to_string(),
+        ]);
+        let source = Self {
+            secret_store,
+            material,
+            approved: reopened.approved,
+            effect: reopened.effect,
+            head: reopened.head,
+            original_reference: reopened.original_reference,
+            connection: reopened.connection,
+            selector,
+            exact_request,
+            binding,
+            observation_authority_digest,
+            source_binding_digest,
+            verifier_id,
+            cancellation,
+            transport: Some(transport),
+            expected_provenance,
+        };
+        // Authenticate the immutable N15 receipt/evidence capsule before the
+        // Broker can insert a verification claim. The source repeats this
+        // check in `observe` and `validate_recovered`; this first check closes
+        // the pre-claim missing/corrupt/swapped-evidence window without any
+        // Secret Broker or provider access.
+        let receipt = source
+            .effect
+            .receipt
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        source
+            .validate_n15_receipt_material_inner(receipt, None)
+            .map_err(|_| ShopifyRecoveryError::InvalidReceiptEvidence)?;
+        Ok(source)
+    }
+
+    pub fn binding(&self) -> &ShopifyReadbackCredentialBinding {
+        &self.binding
+    }
+
+    pub fn selector(&self) -> &ShopifyFulfillmentReadbackRequest {
+        &self.selector
+    }
+
+    pub fn observation_authority_digest(&self) -> &str {
+        &self.observation_authority_digest
+    }
+
+    pub fn source_binding_digest(&self) -> &str {
+        &self.source_binding_digest
+    }
+
+    pub fn verifier_id(&self) -> &str {
+        &self.verifier_id
+    }
+
+    /// Whether this source was reopened against a live Connection for an
+    /// initial provider read. Terminal replay deliberately has no live
+    /// Connection requirement so credential rotation cannot block local
+    /// durable recovery.
+    #[must_use]
+    pub const fn requires_live_connection(&self) -> bool {
+        self.connection.is_some()
+    }
+
+    #[must_use]
+    pub const fn credential_revision(&self) -> u64 {
+        self.head.binding.credential_revision
+    }
+
+    pub fn claim_binding(&self) -> Result<ReceiptVerificationClaimBinding, ShopifyRecoveryError> {
+        let receipt = self
+            .effect
+            .receipt
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        ReceiptVerificationClaimBinding::new(
+            self.effect.approval_digest(),
+            self.effect
+                .approval
+                .as_ref()
+                .ok_or(ShopifyRecoveryError::BindingMismatch)?
+                .permission_digest
+                .clone(),
+            receipt_binding_digest(receipt),
+            self.observation_authority_digest.clone(),
+            self.source_binding_digest.clone(),
+        )
+        .map_err(|_| ShopifyRecoveryError::BindingMismatch)
+    }
+
+    fn load_material(&self, storage_ref: &str) -> Result<String, VerificationSourceError> {
+        match self.material.load_text(storage_ref) {
+            Ok(Some(value)) => Ok(value.as_str().to_owned()),
+            Ok(None) => Err(VerificationSourceError::Rejected),
+            Err(_) => Err(VerificationSourceError::Unavailable),
+        }
+    }
+
+    fn validate_n15_receipt_material(
+        &self,
+        subject: &hartevo_effect_broker::ReceiptVerificationSubject,
+    ) -> Result<DateTime<Utc>, VerificationSourceError> {
+        let approval = self
+            .effect
+            .approval
+            .as_ref()
+            .ok_or(VerificationSourceError::Rejected)?;
+        if subject.effect_id() != &self.effect.id
+            || subject.provider() != self.effect.provider
+            || subject.capability() != self.effect.capability
+            || subject.approval_scope_digest() != self.effect.approval_digest()
+            || subject.broker_authorization_digest() != approval.permission_digest
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        self.validate_n15_receipt_material_inner(
+            subject.receipt(),
+            Some(subject.execution_started_at()),
+        )
+    }
+
+    fn validate_n15_receipt_material_inner(
+        &self,
+        receipt: &hartevo_domain_kernel::Receipt,
+        execution_started_at: Option<DateTime<Utc>>,
+    ) -> Result<DateTime<Utc>, VerificationSourceError> {
+        let approval = self
+            .effect
+            .approval
+            .as_ref()
+            .ok_or(VerificationSourceError::Rejected)?;
+        if receipt.provider != self.effect.provider
+            || receipt.request_digest != self.effect.approval_digest()
+            || !is_sha256(&receipt.response_digest)
+            || execution_started_at.is_some_and(|started_at| receipt.accepted_at < started_at)
+            || self.head.readback_storage_ref.as_deref()
+                != Some(format!("cas://{}", receipt.response_digest).as_str())
+            || self.head.readback_content_digest.as_deref()
+                != Some(receipt.response_digest.as_str())
+            || self.head.receipt_evidence_digest.as_deref()
+                != Some(receipt.response_digest.as_str())
+            || !matches!(
+                self.head.state,
+                ProviderRecoveryState::ReceiptObserved
+                    | ProviderRecoveryState::Verified
+                    | ProviderRecoveryState::FailedClosed
+            )
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        let storage_ref = self
+            .head
+            .readback_storage_ref
+            .as_deref()
+            .ok_or(VerificationSourceError::Rejected)?;
+        let resolved = self.load_material(storage_ref)?;
+        if sha256(resolved.as_bytes()) != receipt.response_digest {
+            return Err(VerificationSourceError::Rejected);
+        }
+        let evidence: StoredShopifyReceiptFoundEvidence =
+            serde_json::from_str(&resolved).map_err(|_| VerificationSourceError::Rejected)?;
+        let draft = self.approved.draft();
+        let expected_receipt_head_revision = self
+            .original_reference
+            .head_revision
+            .checked_add(1)
+            .ok_or(VerificationSourceError::Rejected)?;
+        let expected_current_head_revision = match self.head.state {
+            ProviderRecoveryState::ReceiptObserved => expected_receipt_head_revision,
+            ProviderRecoveryState::Verified | ProviderRecoveryState::FailedClosed => {
+                expected_receipt_head_revision
+                    .checked_add(1)
+                    .ok_or(VerificationSourceError::Rejected)?
+            }
+            _ => return Err(VerificationSourceError::Rejected),
+        };
+        if evidence.schema != SHOPIFY_RECEIPT_FOUND_EVIDENCE_SCHEMA
+            || evidence.effect_id != self.effect.id.as_str()
+            || evidence.effect_approval_digest != approval.scope_digest
+            || evidence.broker_authorization_digest != approval.permission_digest
+            || execution_started_at
+                .is_some_and(|started_at| evidence.original_execution_started_at != started_at)
+            || evidence.recovery_binding_digest != self.head.binding.binding_digest
+            || evidence.recovery_capsule_content_digest != self.head.capsule.content_digest
+            || evidence.recovery_capsule_key_version != self.head.capsule.key_version
+            || evidence.recovery_capsule_object_revision != self.head.capsule.object_revision
+            || evidence.recovery_head_revision != self.original_reference.head_revision
+            || evidence.recovery_head_state != self.original_reference.state
+            || self.head.revision != expected_current_head_revision
+            || evidence.credential_revision != self.head.binding.credential_revision
+            || evidence.selector_digest != self.selector.selector_digest()
+            || evidence.observation_authority_digest != self.observation_authority_digest
+            || evidence.shop != self.selector.shop().as_str()
+            || evidence.shop != draft.tenant_scope().shop().as_str()
+            || evidence.api_version != self.selector.api_version().as_str()
+            || evidence.api_version != draft.api_version().as_str()
+            || evidence.fulfillment_id != self.selector.fulfillment_id().as_str()
+            || evidence.order_id != draft.order_gid().as_str()
+            || evidence.fulfillment_order_id != draft.fulfillment_order_gid().as_str()
+            || evidence.line_item_binding_digest
+                != approved_line_item_binding_digest(draft.line_items())
+            || evidence.fulfillment_status.trim().is_empty()
+            || evidence.original_execution_started_at > receipt.accepted_at
+            || evidence.provider_created_at != receipt.accepted_at
+            || evidence.provider_created_at < evidence.original_execution_started_at
+            || execution_started_at
+                .is_some_and(|started_at| evidence.provider_created_at < started_at)
+            || evidence.provider_updated_at < evidence.provider_created_at
+            || evidence.observed_at < evidence.provider_updated_at
+            || evidence.observed_at > self.head.updated_at
+            || evidence.provenance_class != ProviderProvenanceClass::ProductionProvider
+            || receipt.external_id != recovered_shopify_external_id(&evidence.fulfillment_id)
+            || !is_sha256(&evidence.secret_broker_use_digest)
+            || !is_sha256(&evidence.line_item_binding_digest)
+            || !is_sha256(&evidence.native_response_digest)
+            || !is_sha256(&evidence.native_evidence_digest)
+            || evidence
+                .native_request_id_digest
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        Ok(evidence.provider_updated_at)
+    }
+
+    fn validate_connection(&self, at: DateTime<Utc>) -> Result<(), VerificationSourceError> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or(VerificationSourceError::Rejected)
+            .and_then(|snapshot| {
+                Connection::restore(snapshot.clone()).map_err(|_| VerificationSourceError::Rejected)
+            })?;
+        if connection.tenant_id() != &self.effect.tenant_id
+            || connection.project_id() != &self.effect.project_id
+            || connection.provider() != self.effect.provider
+            || self.effect.connection_id.as_ref() != Some(connection.id())
+            || self.effect.account_id.as_ref() != Some(connection.account_id())
+            || connection.last_probe().is_none_or(|probe| {
+                probe.observed_external_account_id
+                    != self.approved.draft().tenant_scope().shop().as_str()
+            })
+            || connection.snapshot().expected_external_account_id
+                != self.approved.draft().tenant_scope().shop().as_str()
+            || connection.revision() != self.head.binding.credential_revision
+            || !connection.permits_scopes(&self.effect.required_scopes, at)
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        Ok(())
+    }
+
+    fn map_bridge_error(error: &ShopifyReadbackBridgeError) -> VerificationSourceError {
+        match error {
+            ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::CancelledBeforeDispatch
+                | ShopifyNativeReadbackError::CancelledAfterDispatch,
+            ) => VerificationSourceError::Cancelled,
+            ShopifyReadbackBridgeError::SecretStore(SecretStoreError::BackendUnavailable)
+            | ShopifyReadbackBridgeError::SecretBroker(SecretBrokerError::Crashed)
+            | ShopifyReadbackBridgeError::Transport(
+                ShopifyNativeReadbackError::TimedOut
+                | ShopifyNativeReadbackError::RateLimited
+                | ShopifyNativeReadbackError::TransportUnavailable,
+            ) => VerificationSourceError::Unavailable,
+            ShopifyReadbackBridgeError::BindingMismatch
+            | ShopifyReadbackBridgeError::MissingProviderOutcome
+            | ShopifyReadbackBridgeError::MissingReceiptIdentity
+            | ShopifyReadbackBridgeError::InvalidReceiptIdentity
+            | ShopifyReadbackBridgeError::ProviderContract(_)
+            | ShopifyReadbackBridgeError::SecretBroker(_)
+            | ShopifyReadbackBridgeError::SecretStore(_)
+            | ShopifyReadbackBridgeError::Transport(_) => VerificationSourceError::Rejected,
+        }
+    }
+
+    fn verification_status(status: &str) -> VerificationStatus {
+        match status {
+            "SUCCESS" => VerificationStatus::Confirmed,
+            "CANCELLED" | "FAILED" | "FAILURE" | "REJECTED" | "ERROR" => {
+                VerificationStatus::Rejected
+            }
+            _ => VerificationStatus::Inconclusive,
+        }
+    }
+
+    fn validate_verification_material(
+        &self,
+        subject: &hartevo_effect_broker::ReceiptVerificationSubject,
+        verification: &Verification,
+    ) -> Result<(), VerificationSourceError> {
+        let n15_provider_updated_at = self.validate_n15_receipt_material(subject)?;
+        if verification.receipt_id != subject.receipt().id
+            || !verification.independent
+            || verification.verifier != self.verifier_id
+            || verification.observed_at < subject.receipt().accepted_at
+            || verification.observed_at > Utc::now()
+            || !is_sha256(&verification.evidence_digest)
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        let storage_ref = format!("cas://{}", verification.evidence_digest);
+        let resolved = self.load_material(&storage_ref)?;
+        let evidence: StoredShopifyVerificationEvidence =
+            serde_json::from_str(&resolved).map_err(|_| VerificationSourceError::Rejected)?;
+        let receipt = subject.receipt();
+        let expected_receipt_head_revision = self
+            .original_reference
+            .head_revision
+            .checked_add(1)
+            .ok_or(VerificationSourceError::Rejected)?;
+        if sha256(resolved.as_bytes()) != verification.evidence_digest
+            || evidence.schema != SHOPIFY_INDEPENDENT_VERIFICATION_EVIDENCE_SCHEMA
+            || evidence.effect_id != self.effect.id.as_str()
+            || evidence.receipt_id != receipt.id.as_str()
+            || evidence.receipt_response_digest != receipt.response_digest
+            || evidence.receipt_binding_digest != receipt_binding_digest(receipt)
+            || evidence.n15_evidence_digest != receipt.response_digest
+            || evidence.recovery_binding_digest != self.head.binding.binding_digest
+            || evidence.recovery_capsule_content_digest != self.head.capsule.content_digest
+            || evidence.recovery_capsule_key_version != self.head.capsule.key_version
+            || evidence.recovery_capsule_object_revision != self.head.capsule.object_revision
+            || evidence.recovery_head_revision != expected_receipt_head_revision
+            || evidence.recovery_head_state != ProviderRecoveryState::ReceiptObserved
+            || evidence.credential_revision != self.head.binding.credential_revision
+            || evidence.selector_digest != self.selector.selector_digest()
+            || evidence.observation_authority_digest != self.observation_authority_digest
+            || evidence.source_binding_digest != self.source_binding_digest
+            || evidence.adapter_id != self.binding.adapter().adapter_id()
+            || evidence.adapter_version != self.binding.adapter().adapter_version()
+            || evidence.registry_version != SHOPIFY_INDEPENDENT_VERIFICATION_REGISTRY_VERSION
+            || evidence.shop != self.selector.shop().as_str()
+            || evidence.api_version != self.selector.api_version().as_str()
+            || evidence.fulfillment_id != self.selector.fulfillment_id().as_str()
+            || evidence.order_id != self.approved.draft().order_gid().as_str()
+            || evidence.fulfillment_order_id
+                != self.approved.draft().fulfillment_order_gid().as_str()
+            || evidence.line_item_binding_digest
+                != approved_line_item_binding_digest(self.approved.draft().line_items())
+            || evidence.fulfillment_status.trim().is_empty()
+            || Self::verification_status(&evidence.fulfillment_status) != verification.status
+            || evidence.provider_created_at != receipt.accepted_at
+            || evidence.provider_created_at < subject.execution_started_at()
+            || evidence.provider_created_at > evidence.provider_updated_at
+            || evidence.provider_updated_at < n15_provider_updated_at
+            || evidence.provider_updated_at > evidence.observed_at
+            || evidence.observed_at != verification.observed_at
+            || evidence.observed_at > Utc::now()
+            || evidence.provenance_class != ProviderProvenanceClass::ProductionProvider
+            || !is_sha256(&evidence.n15_evidence_digest)
+            || !is_sha256(&evidence.native_response_digest)
+            || !is_sha256(&evidence.native_evidence_digest)
+            || !is_sha256(&evidence.secret_broker_use_digest)
+            || !is_sha256(&evidence.line_item_binding_digest)
+            || evidence
+                .native_request_id_digest
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        Ok(())
+    }
+}
+
+impl<'a, S> ShopifyIndependentVerificationSource<'a, S, UreqShopifyAdminReadbackTransport>
+where
+    S: SecretStore,
+{
+    pub fn new_native(
+        secret_store: &'a S,
+        material: &'a ProjectContextMaterialSession,
+        reopened: ReopenedShopifyVerification,
+        selector: ShopifyFulfillmentReadbackRequest,
+        observation_authority_digest: impl Into<String>,
+        cancellation: ShopifyReadbackCancellation,
+        transport: UreqShopifyAdminReadbackTransport,
+    ) -> Result<Self, ShopifyRecoveryError> {
+        Self::new_with_provenance(
+            secret_store,
+            material,
+            reopened,
+            selector,
+            observation_authority_digest,
+            cancellation,
+            transport,
+            ProviderProvenanceClass::ProductionProvider,
+        )
+    }
+}
+
+impl<S, T> ReceiptVerificationSource for ShopifyIndependentVerificationSource<'_, S, T>
+where
+    S: SecretStore,
+    T: hartevo_commerce_connector::shopify_transport::ShopifyAdminReadbackTransport,
+{
+    fn verifier_id(&self) -> &str {
+        &self.verifier_id
+    }
+
+    fn source_binding_digest(&self) -> String {
+        self.source_binding_digest.clone()
+    }
+
+    // The fresh read, post-read fences, evidence sealing, and classification
+    // intentionally remain adjacent so their security order is auditable.
+    #[allow(clippy::too_many_lines)]
+    fn observe(
+        &mut self,
+        subject: &hartevo_effect_broker::ReceiptVerificationSubject,
+    ) -> Result<IndependentVerificationObservation, VerificationSourceError> {
+        let n15_provider_updated_at = self.validate_n15_receipt_material(subject)?;
+        if self.cancellation.is_cancelled() {
+            return Err(VerificationSourceError::Cancelled);
+        }
+        let now = Utc::now();
+        self.validate_connection(now)?;
+        let transport = self
+            .transport
+            .take()
+            .ok_or(VerificationSourceError::Unavailable)?;
+        let definition = SecretBrokerServiceDefinition::production()
+            .map_err(|_| VerificationSourceError::Unavailable)?;
+        let reference = self
+            .binding
+            .broker_reference(&definition)
+            .map_err(|_| VerificationSourceError::Rejected)?;
+        let mut service = SecretBrokerService::new(definition, reference)
+            .map_err(|_| VerificationSourceError::Unavailable)?;
+        service
+            .mount(now)
+            .map_err(|_| VerificationSourceError::Unavailable)?;
+        let consumer_id = format!(
+            "secret-consumer-shopify-independent-{}",
+            &self.source_binding_digest[..16]
+        );
+        let consumer = SecretBrokerConsumer::new(
+            consumer_id,
+            self.effect.tenant_id.clone(),
+            self.effect.project_id.clone(),
+            self.effect.mission_id.clone(),
+        )
+        .map_err(|_| VerificationSourceError::Rejected)?;
+        let identity = self.binding.adapter().clone();
+        let registry = shopify_readback_registry_for(
+            identity.clone(),
+            SHOPIFY_INDEPENDENT_VERIFICATION_REGISTRY_VERSION,
+        )
+        .map_err(|_| VerificationSourceError::Unavailable)?;
+        let mut provider = ShopifySecretReadbackProvider::new_with_identity(
+            self.secret_store,
+            self.binding.clone(),
+            self.exact_request.clone(),
+            self.cancellation.clone(),
+            transport,
+            self.expected_provenance,
+            identity,
+        )
+        .map_err(|_| VerificationSourceError::Rejected)?;
+        let brokered = dispatch_shopify_readback_with_registry(
+            &consumer,
+            &mut service,
+            &mut provider,
+            &registry,
+            now,
+        )
+        .map_err(|error| Self::map_bridge_error(&error))?;
+        if self.cancellation.is_cancelled() {
+            return Err(VerificationSourceError::Cancelled);
+        }
+        self.validate_connection(Utc::now())?;
+        let observed_at = Utc::now();
+        let metadata = brokered
+            .identity_metadata(observed_at)
+            .map_err(|error| Self::map_bridge_error(&error))?;
+        let receipt = subject.receipt();
+        let draft = self.approved.draft();
+        let identity = metadata.fulfillment_id.clone();
+        if metadata.provenance_class != self.expected_provenance
+            || metadata.fulfillment_id != *self.exact_request.fulfillment_id()
+            || metadata.api_version != *draft.api_version()
+            || metadata.order_id != *draft.order_gid()
+            || metadata.fulfillment_order_id != *draft.fulfillment_order_gid()
+            || metadata.line_item_binding_digest
+                != approved_line_item_binding_digest(draft.line_items())
+            || !metadata.lease_reclaimed
+            || brokered.credential_use().credential_revision()
+                != self.head.binding.credential_revision
+            || brokered.credential_use().used_at() < subject.execution_started_at()
+            || brokered.credential_use().used_at() > observed_at
+            || metadata.provider_created_at < subject.execution_started_at()
+            || metadata.provider_created_at != receipt.accepted_at
+            || metadata.provider_updated_at < metadata.provider_created_at
+            || metadata.provider_updated_at < n15_provider_updated_at
+            || metadata.provider_updated_at > observed_at
+            || metadata.provider_created_at >= self.effect.expires_at
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        let evidence = StoredShopifyVerificationEvidence {
+            schema: SHOPIFY_INDEPENDENT_VERIFICATION_EVIDENCE_SCHEMA.to_owned(),
+            effect_id: self.effect.id.as_str().to_owned(),
+            receipt_id: receipt.id.as_str().to_owned(),
+            receipt_response_digest: receipt.response_digest.clone(),
+            receipt_binding_digest: receipt_binding_digest(receipt),
+            n15_evidence_digest: receipt.response_digest.clone(),
+            recovery_binding_digest: self.head.binding.binding_digest.clone(),
+            recovery_capsule_content_digest: self.head.capsule.content_digest.clone(),
+            recovery_capsule_key_version: self.head.capsule.key_version,
+            recovery_capsule_object_revision: self.head.capsule.object_revision,
+            recovery_head_revision: self
+                .original_reference
+                .head_revision
+                .checked_add(1)
+                .ok_or(VerificationSourceError::Rejected)?,
+            recovery_head_state: ProviderRecoveryState::ReceiptObserved,
+            credential_revision: self.head.binding.credential_revision,
+            selector_digest: self.selector.selector_digest(),
+            observation_authority_digest: self.observation_authority_digest.clone(),
+            source_binding_digest: self.source_binding_digest.clone(),
+            adapter_id: self.binding.adapter().adapter_id().to_owned(),
+            adapter_version: self.binding.adapter().adapter_version(),
+            registry_version: SHOPIFY_INDEPENDENT_VERIFICATION_REGISTRY_VERSION.to_owned(),
+            shop: draft.tenant_scope().shop().as_str().to_owned(),
+            api_version: draft.api_version().as_str().to_owned(),
+            fulfillment_id: identity.as_str().to_owned(),
+            fulfillment_status: metadata.status.as_str().to_owned(),
+            order_id: metadata.order_id.as_str().to_owned(),
+            fulfillment_order_id: metadata.fulfillment_order_id.as_str().to_owned(),
+            line_item_binding_digest: metadata.line_item_binding_digest,
+            native_response_digest: metadata.response_digest,
+            native_evidence_digest: metadata.evidence_digest,
+            native_request_id_digest: metadata.request_id_digest,
+            secret_broker_use_digest: metadata.credential_use_digest,
+            provider_created_at: metadata.provider_created_at,
+            provider_updated_at: metadata.provider_updated_at,
+            observed_at,
+            provenance_class: metadata.provenance_class,
+        };
+        let encoded =
+            serde_json::to_string(&evidence).map_err(|_| VerificationSourceError::Rejected)?;
+        let descriptor = self
+            .material
+            .put_text(&encoded)
+            .map_err(|_| VerificationSourceError::Unavailable)?;
+        if descriptor.content_digest != sha256(encoded.as_bytes())
+            || descriptor.storage_ref != format!("cas://{}", descriptor.content_digest)
+            || descriptor.content_digest == receipt.response_digest
+        {
+            return Err(VerificationSourceError::Rejected);
+        }
+        let status = Self::verification_status(metadata.status.as_str());
+        Ok(match status {
+            VerificationStatus::Confirmed => IndependentVerificationObservation::Confirmed {
+                evidence_digest: descriptor.content_digest,
+                observed_at,
+            },
+            VerificationStatus::Rejected => IndependentVerificationObservation::Rejected {
+                evidence_digest: descriptor.content_digest,
+                observed_at,
+            },
+            VerificationStatus::Inconclusive => IndependentVerificationObservation::Inconclusive {
+                evidence_digest: descriptor.content_digest,
+                observed_at,
+            },
+        })
+    }
+
+    fn validate_recovered(
+        &self,
+        subject: &hartevo_effect_broker::ReceiptVerificationSubject,
+        verification: &Verification,
+    ) -> Result<(), VerificationSourceError> {
+        self.validate_verification_material(subject, verification)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ShopifyRecoveryError {
     #[error("Shopify recovery binding does not match current durable authority")]
@@ -460,6 +1299,8 @@ pub enum ShopifyRecoveryError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     ContextMaterial(#[from] ContextMaterialStoreError),
+    #[error(transparent)]
+    Readback(#[from] ShopifyReadbackBridgeError),
 }
 
 /// Application-owned composition over one SQLCipher project store and one
@@ -793,6 +1634,199 @@ impl<'a> ShopifySecureRecovery<'a> {
         })
     }
 
+    /// Reopens the exact N15 recovery capsule for independent verification.
+    /// The input reference must name the immutable InFlight/Uncertain head;
+    /// the current head must already carry the authenticated ReceiptObserved
+    /// readback (or one of the N16 terminal states). This method performs no
+    /// Secret Broker or provider work and does not require a live credential
+    /// for terminal replay.
+    // Reopening authenticates every immutable N15/N16 binding before any
+    // caller can construct a provider-backed source; keep that proof local.
+    #[allow(clippy::too_many_lines)]
+    pub fn reopen_verification(
+        &mut self,
+        reference: &ShopifyRecoveryCapsuleRef,
+    ) -> Result<ReopenedShopifyVerification, ShopifyRecoveryError> {
+        if !matches!(
+            reference.state,
+            ProviderRecoveryState::InFlight | ProviderRecoveryState::Uncertain
+        ) || reference.head_revision == 0
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let head = self.load_head(reference)?;
+        if head.revision <= reference.head_revision
+            || head.binding.project_id != reference.project_id
+            || head.binding.effect_id != reference.effect_id
+            || head.binding.binding_digest != reference.binding_digest
+            || head.capsule.storage_ref != reference.storage_ref
+            || head.capsule.content_digest != reference.content_digest
+            || head.capsule.key_version != reference.key_version
+            || head.capsule.object_revision != reference.object_revision
+            || !matches!(
+                head.state,
+                ProviderRecoveryState::ReceiptObserved
+                    | ProviderRecoveryState::Verified
+                    | ProviderRecoveryState::FailedClosed
+            )
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let expected_head_revision = reference
+            .head_revision
+            .checked_add(1)
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let expected_revision = match head.state {
+            ProviderRecoveryState::ReceiptObserved => expected_head_revision,
+            ProviderRecoveryState::FailedClosed | ProviderRecoveryState::Verified => {
+                expected_head_revision
+                    .checked_add(1)
+                    .ok_or(ShopifyRecoveryError::BindingMismatch)?
+            }
+            _ => return Err(ShopifyRecoveryError::BindingMismatch),
+        };
+        if head.revision != expected_revision
+            || head.readback_storage_ref.is_none()
+            || head.readback_content_digest.is_none()
+            || head.receipt_evidence_digest.is_none()
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        if self.material.project_id() != &head.binding.project_id
+            || self.material.keyring_revision() != head.binding.keyring_revision
+            || !self
+                .material
+                .readable_key_versions()
+                .contains(&head.capsule.key_version)
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let resolved = self
+            .material
+            .load_text(&head.capsule.storage_ref)?
+            .ok_or(ShopifyRecoveryError::InvalidCapsule)?;
+        if sha256(resolved.as_str().as_bytes()) != head.capsule.content_digest
+            || u64::try_from(resolved.as_str().len()).ok() != Some(head.capsule.byte_len)
+        {
+            return Err(ShopifyRecoveryError::InvalidCapsule);
+        }
+        let private: StoredShopifyRecoveryCapsule = serde_json::from_str(resolved.as_str())
+            .map_err(|_| ShopifyRecoveryError::InvalidCapsule)?;
+        if private.schema != SHOPIFY_RECOVERY_CAPSULE_SCHEMA
+            || private.binding_digest != head.binding.binding_digest
+        {
+            return Err(ShopifyRecoveryError::InvalidCapsule);
+        }
+        let project = self.store.load_project(&head.binding.project_id)?;
+        let mission = self
+            .store
+            .load_mission(&head.binding.project_id, &head.binding.mission_id)?;
+        let effect = mission
+            .effect(&head.binding.effect_id)
+            .map_err(|_| ShopifyRecoveryError::BindingMismatch)?
+            .clone();
+        let approval = effect
+            .approval
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let receipt = effect
+            .receipt
+            .as_ref()
+            .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+        let projection_shape_is_valid = match (&effect.status, &effect.verification, head.state) {
+            (
+                EffectStatus::ReceiptRecorded,
+                None,
+                ProviderRecoveryState::ReceiptObserved
+                | ProviderRecoveryState::Verified
+                | ProviderRecoveryState::FailedClosed,
+            ) => true,
+            (
+                EffectStatus::VerificationRequired,
+                Some(verification),
+                ProviderRecoveryState::ReceiptObserved,
+            ) => verification.status == VerificationStatus::Inconclusive,
+            (EffectStatus::Verified, Some(verification), ProviderRecoveryState::Verified) => {
+                verification.status == VerificationStatus::Confirmed
+            }
+            (EffectStatus::Failed, Some(verification), ProviderRecoveryState::FailedClosed) => {
+                verification.status == VerificationStatus::Rejected
+            }
+            _ => false,
+        };
+        if project.tenant_id != mission.tenant_id
+            || mission.project_id != project.id
+            || mission.revision < head.binding.mission_revision
+            || self.material.tenant_id != mission.tenant_id
+            || effect.tenant_id != head.binding.tenant_id
+            || effect.project_id != head.binding.project_id
+            || effect.mission_id != head.binding.mission_id
+            || effect.id != head.binding.effect_id
+            || effect.provider != SHOPIFY_PROVIDER_ID
+            || effect.capability != SHOPIFY_FULFILLMENT_CAPABILITY
+            || effect.effect_class != hartevo_domain_kernel::EffectClass::ExternalWrite
+            || !projection_shape_is_valid
+            || approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != effect.approval_digest()
+            || approval.permission_digest != head.binding.broker_authorization_digest
+            || receipt.provider != effect.provider
+            || receipt.response_digest != head.readback_content_digest.clone().unwrap_or_default()
+        {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let approved = rebuild_approved(
+            private.draft,
+            ShopifyPluginRevision::new(head.binding.plugin_revision)
+                .map_err(|_| ShopifyRecoveryError::BindingMismatch)?,
+            &approval.permission_digest,
+            effect.expires_at,
+        )?;
+        validate_controlled_recovery_effect(&effect, &approved)?;
+        let live_binding = recovery_binding(
+            &effect,
+            head.binding.mission_revision,
+            head.binding.credential_revision,
+            &approved,
+            self.material.keyring_revision(),
+            head.capsule.key_version,
+        )?;
+        if live_binding != head.binding {
+            return Err(ShopifyRecoveryError::BindingMismatch);
+        }
+        let connection = if head.state == ProviderRecoveryState::ReceiptObserved
+            && effect.status == EffectStatus::ReceiptRecorded
+        {
+            let connection_id = effect
+                .connection_id
+                .as_ref()
+                .ok_or(ShopifyRecoveryError::BindingMismatch)?;
+            self.store
+                .load_connection(&head.binding.project_id, connection_id)
+                .ok()
+                .filter(|connection| {
+                    connection.tenant_id() == &effect.tenant_id
+                        && connection.project_id() == &effect.project_id
+                        && connection.provider() == SHOPIFY_PROVIDER_ID
+                        && effect.account_id.as_ref() == Some(connection.account_id())
+                        && connection.revision() == head.binding.credential_revision
+                })
+                .map(|connection| connection.snapshot())
+        } else {
+            // A committed N16 result is durable truth. Replay must remain
+            // provider/Secret-free even if a credential was later rotated or
+            // revoked, so no live Connection is required here.
+            None
+        };
+        Ok(ReopenedShopifyVerification {
+            approved,
+            effect,
+            head,
+            original_reference: reference.clone(),
+            current_mission_revision: mission.revision,
+            connection,
+        })
+    }
+
     /// Authenticates the exact encrypted evidence behind a receipt already
     /// committed by Phase A. This is a local restart check only: it obtains no
     /// credential and performs no provider readback.
@@ -1084,6 +2118,50 @@ impl ApplicationService {
             durable,
         )
     }
+
+    /// Reopens the exact N16 source material without constructing a provider.
+    pub fn reopen_shopify_verification(
+        &mut self,
+        material: &ProjectContextMaterialSession,
+        reference: &ShopifyRecoveryCapsuleRef,
+    ) -> Result<ReopenedShopifyVerification, ShopifyRecoveryError> {
+        ShopifySecureRecovery::new(&mut self.store, material).reopen_verification(reference)
+    }
+
+    /// Constructs a fresh production-shaped independent source. The source
+    /// keeps Secret Broker/provider construction lazy until `observe`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_shopify_independent_verification_source<'a, S>(
+        &mut self,
+        secret_store: &'a S,
+        material: &'a ProjectContextMaterialSession,
+        reference: &ShopifyRecoveryCapsuleRef,
+        selector: ShopifyFulfillmentReadbackRequest,
+        observation_authority_digest: impl Into<String>,
+        cancellation: ShopifyReadbackCancellation,
+        transport: UreqShopifyAdminReadbackTransport,
+    ) -> Result<
+        ShopifyIndependentVerificationSource<'a, S, UreqShopifyAdminReadbackTransport>,
+        ShopifyRecoveryError,
+    >
+    where
+        S: SecretStore,
+    {
+        // The returned source borrows only the caller-owned SecretStore and
+        // Context-Material session; no borrow of Application's ProjectStore
+        // escapes this preparation call.
+        let reopened =
+            ShopifySecureRecovery::new(&mut self.store, material).reopen_verification(reference)?;
+        ShopifyIndependentVerificationSource::new_native(
+            secret_store,
+            material,
+            reopened,
+            selector,
+            observation_authority_digest,
+            cancellation,
+            transport,
+        )
+    }
 }
 
 struct CurrentShopifyAuthority {
@@ -1265,6 +2343,18 @@ fn sha256(value: &[u8]) -> String {
 
 fn recovered_shopify_external_id(fulfillment_id: &str) -> String {
     format!("shopify-fulfillment:{}", sha256(fulfillment_id.as_bytes()))
+}
+
+fn recovery_state_name(state: ProviderRecoveryState) -> &'static str {
+    match state {
+        ProviderRecoveryState::Prepared => "prepared",
+        ProviderRecoveryState::InFlight => "in_flight",
+        ProviderRecoveryState::Uncertain => "uncertain",
+        ProviderRecoveryState::NotExecuted => "not_executed",
+        ProviderRecoveryState::ReceiptObserved => "receipt_observed",
+        ProviderRecoveryState::Verified => "verified",
+        ProviderRecoveryState::FailedClosed => "failed_closed",
+    }
 }
 
 fn is_sha256(value: &str) -> bool {
