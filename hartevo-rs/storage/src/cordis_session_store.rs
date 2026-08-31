@@ -126,6 +126,14 @@ pub enum PersistedSessionEventKind {
     RequestContext {
         context: serde_json::Value,
     },
+    ToolCall {
+        turn: u64,
+        step: u64,
+        #[serde(rename = "callId")]
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
     AssistantMessage {
         turn: u64,
         step: u64,
@@ -333,45 +341,7 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
                 "event time must be non-negative",
             ));
         }
-        let (turn, step) = match &event.kind {
-            PersistedSessionEventKind::TurnStart { turn }
-            | PersistedSessionEventKind::TurnEnd { turn, .. } => (Some(*turn), None),
-            PersistedSessionEventKind::StepStart { turn, step }
-            | PersistedSessionEventKind::StepEnd { turn, step } => (Some(*turn), Some(*step)),
-            PersistedSessionEventKind::UserMessage { message, surface } => {
-                validate_message_json(message)?;
-                validate_surface_json(surface.as_ref())?;
-                (None, None)
-            }
-            PersistedSessionEventKind::AssistantChunk { turn, step, chunk } => {
-                validate_chunk_json(chunk)?;
-                (Some(*turn), Some(*step))
-            }
-            PersistedSessionEventKind::RequestHeader { request } => {
-                validate_request_json(request, "request/header payload must be a JSON object")?;
-                (None, None)
-            }
-            PersistedSessionEventKind::RequestContext { context } => {
-                validate_request_json(context, "request/context payload must be a JSON object")?;
-                (None, None)
-            }
-            PersistedSessionEventKind::AssistantMessage {
-                turn,
-                step,
-                message,
-                surface,
-            }
-            | PersistedSessionEventKind::ToolResult {
-                turn,
-                step,
-                message,
-                surface,
-            } => {
-                validate_message_json(message)?;
-                validate_surface_json(surface.as_ref())?;
-                (Some(*turn), Some(*step))
-            }
-        };
+        let (turn, step) = validate_event_payload(&event.kind)?;
         if turn == Some(0) || step == Some(0) {
             return Err(StorageError::InvalidSessionCheckpoint(
                 "turn and step numbers must be positive",
@@ -387,6 +357,64 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
     }
     sqlite_usize(checkpoint.events.len(), "event count")?;
     Ok(())
+}
+
+fn validate_event_payload(
+    kind: &PersistedSessionEventKind,
+) -> Result<(Option<u64>, Option<u64>), StorageError> {
+    Ok(match kind {
+        PersistedSessionEventKind::TurnStart { turn }
+        | PersistedSessionEventKind::TurnEnd { turn, .. } => (Some(*turn), None),
+        PersistedSessionEventKind::StepStart { turn, step }
+        | PersistedSessionEventKind::StepEnd { turn, step } => (Some(*turn), Some(*step)),
+        PersistedSessionEventKind::UserMessage { message, surface } => {
+            validate_message_json(message)?;
+            validate_surface_json(surface.as_ref())?;
+            (None, None)
+        }
+        PersistedSessionEventKind::AssistantChunk { turn, step, chunk } => {
+            validate_chunk_json(chunk)?;
+            (Some(*turn), Some(*step))
+        }
+        PersistedSessionEventKind::RequestHeader { request } => {
+            validate_request_json(request, "request/header payload must be a JSON object")?;
+            (None, None)
+        }
+        PersistedSessionEventKind::RequestContext { context } => {
+            validate_request_json(context, "request/context payload must be a JSON object")?;
+            (None, None)
+        }
+        PersistedSessionEventKind::ToolCall {
+            turn,
+            step,
+            call_id,
+            name,
+            ..
+        } => {
+            if call_id.is_empty() || name.is_empty() {
+                return Err(StorageError::InvalidSessionCheckpoint(
+                    "tool/call id and name must not be empty",
+                ));
+            }
+            (Some(*turn), Some(*step))
+        }
+        PersistedSessionEventKind::AssistantMessage {
+            turn,
+            step,
+            message,
+            surface,
+        }
+        | PersistedSessionEventKind::ToolResult {
+            turn,
+            step,
+            message,
+            surface,
+        } => {
+            validate_message_json(message)?;
+            validate_surface_json(surface.as_ref())?;
+            (Some(*turn), Some(*step))
+        }
+    })
 }
 
 fn validate_message_json(message: &serde_json::Value) -> Result<(), StorageError> {
@@ -628,6 +656,17 @@ mod tests {
             PersistedSessionEvent {
                 seq: 4,
                 time_ms: 6,
+                kind: PersistedSessionEventKind::ToolCall {
+                    turn: 1,
+                    step: 1,
+                    call_id: "call-1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 5,
+                time_ms: 7,
                 kind: PersistedSessionEventKind::ToolResult {
                     turn: 1,
                     step: 1,
@@ -636,13 +675,13 @@ mod tests {
                 },
             },
             PersistedSessionEvent {
-                seq: 5,
-                time_ms: 7,
+                seq: 6,
+                time_ms: 8,
                 kind: PersistedSessionEventKind::StepEnd { turn: 1, step: 1 },
             },
             PersistedSessionEvent {
-                seq: 6,
-                time_ms: 8,
+                seq: 7,
+                time_ms: 9,
                 kind: PersistedSessionEventKind::TurnEnd {
                     turn: 1,
                     reason: PersistedTurnEndReason::Completed,
@@ -671,7 +710,7 @@ mod tests {
         store.persist_session_checkpoint(&complete).unwrap();
 
         let mut divergent = complete.clone();
-        divergent.events[6].kind = PersistedSessionEventKind::TurnEnd {
+        divergent.events[7].kind = PersistedSessionEventKind::TurnEnd {
             turn: 1,
             reason: PersistedTurnEndReason::Error,
         };
@@ -686,7 +725,7 @@ mod tests {
     fn malformed_message_checkpoint_is_rejected_before_storage() {
         let mut store = ProjectStore::in_memory().unwrap();
         let mut invalid = checkpoint(completed_turn());
-        let PersistedSessionEventKind::ToolResult { message, .. } = &mut invalid.events[4].kind
+        let PersistedSessionEventKind::ToolResult { message, .. } = &mut invalid.events[5].kind
         else {
             panic!("fixture must contain a tool result");
         };
@@ -699,6 +738,53 @@ mod tests {
             ))
         ));
         assert!(store.load_session_checkpoints().unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_tool_call_is_rejected_before_storage() {
+        for (call_id, name) in [("", "echo"), ("call-1", "")] {
+            let mut store = ProjectStore::in_memory().unwrap();
+            let invalid = checkpoint(vec![PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: PersistedSessionEventKind::ToolCall {
+                    turn: 1,
+                    step: 1,
+                    call_id: call_id.into(),
+                    name: name.into(),
+                    arguments: "{raw".into(),
+                },
+            }]);
+            assert!(matches!(
+                store.persist_session_checkpoint(&invalid),
+                Err(StorageError::InvalidSessionCheckpoint(
+                    "tool/call id and name must not be empty"
+                ))
+            ));
+            assert!(store.load_session_checkpoints().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_call_uses_the_exact_external_call_id_shape() {
+        let event = PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::ToolCall {
+                turn: 1,
+                step: 1,
+                call_id: "call-1".into(),
+                name: "echo".into(),
+                arguments: "{raw".into(),
+            },
+        };
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["kind"]["tool_call"]["callId"], "call-1");
+        assert!(encoded["kind"]["tool_call"].get("call_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<PersistedSessionEvent>(encoded).unwrap(),
+            event
+        );
     }
 
     #[test]

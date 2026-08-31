@@ -91,7 +91,7 @@ pub use session::{
     SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
     SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurface, SessionSurfaceIntent,
-    SessionSurfaceOp, SessionTokenUsage, SessionToolSchema, TurnEndReason,
+    SessionSurfaceOp, SessionTokenUsage, SessionToolCall, SessionToolSchema, TurnEndReason,
     events as session_events,
 };
 pub use surface::{

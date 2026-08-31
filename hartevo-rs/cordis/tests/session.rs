@@ -143,6 +143,8 @@ fn message_history_derives_replays_and_detaches_from_the_log() {
     );
     log.append_assistant_message(turn, step, assistant.clone())
         .unwrap();
+    log.append_tool_call(turn, step, "call-1", "echo", "{}")
+        .unwrap();
     let tool = tool_result_message("tool-1", "call-1", "ok");
     log.append_tool_result(turn, step, tool.clone()).unwrap();
     log.finish_step(turn, step).unwrap();
@@ -160,6 +162,7 @@ fn message_history_derives_replays_and_detaches_from_the_log() {
             "user/message",
             "step/start",
             "assistant/message",
+            "tool/call",
             "tool/result",
             "step/end",
             "turn/end",
@@ -178,6 +181,87 @@ fn message_history_derives_replays_and_detaches_from_the_log() {
         restored.derive_messages()[0].content[0],
         expected[0].content[0]
     );
+}
+
+#[test]
+fn tool_calls_are_durable_ordered_log_only_and_detached() {
+    let mut log = SessionLog::new_at(SessionId::new("tool-calls").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let step = log.start_step(turn).unwrap();
+    let assistant = assistant_message(
+        "assistant-tools",
+        vec![
+            SessionContentBlock::ToolCall {
+                id: "call-1".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"/tmp/a\"}".into(),
+            },
+            SessionContentBlock::ToolCall {
+                id: "call-2".into(),
+                name: "write".into(),
+                arguments: "{not-yet-valid-json".into(),
+            },
+        ],
+    );
+    log.append_assistant_message(turn, step, assistant.clone())
+        .unwrap();
+    let first_seq = log
+        .append_tool_call(turn, step, "call-1", "read", "{\"path\":\"/tmp/a\"}")
+        .unwrap();
+    let second_seq = log
+        .append_tool_call(turn, step, "call-2", "write", "{not-yet-valid-json")
+        .unwrap();
+    log.finish_step(turn, step).unwrap();
+    log.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    let calls = log.tool_calls(turn, step);
+    assert_eq!([calls[0].seq, calls[1].seq], [first_seq, second_seq]);
+    assert_eq!(calls[0].call_id, "call-1");
+    assert_eq!(calls[0].name, "read");
+    assert_eq!(calls[0].arguments, "{\"path\":\"/tmp/a\"}");
+    assert_eq!(calls[1].call_id, "call-2");
+    assert_eq!(calls[1].name, "write");
+    assert_eq!(calls[1].arguments, "{not-yet-valid-json");
+    assert_eq!(log.surface().nodes, vec![2]);
+    assert_eq!(log.derive_messages(), vec![assistant]);
+
+    let restored = SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap();
+    assert_eq!(restored.tool_calls(turn, step), calls);
+    let mut detached = restored.tool_calls(turn, step);
+    detached[0].name = "mutated".into();
+    assert_eq!(restored.tool_calls(turn, step)[0].name, "read");
+}
+
+#[test]
+fn invalid_tool_call_fails_before_log_mutation_and_on_restore() {
+    let mut log = SessionLog::new_at(SessionId::new("tool-call-invalid").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    assert_eq!(
+        log.append_tool_call(turn, 1, "call-1", "read", "{}")
+            .unwrap_err(),
+        SessionError::NoOpenStep { turn }
+    );
+    let step = log.start_step(turn).unwrap();
+    let baseline = log.events().to_vec();
+    for (call_id, name) in [("", "read"), ("call-1", "")] {
+        assert!(matches!(
+            log.append_tool_call(turn, step, call_id, name, "{}"),
+            Err(SessionError::InvalidToolCall { .. })
+        ));
+        assert_eq!(log.events(), baseline);
+    }
+
+    log.append_tool_call(turn, step, "call-1", "read", "{}")
+        .unwrap();
+    let mut corrupt = log.events().to_vec();
+    let SessionEventKind::ToolCall { call_id, .. } = &mut corrupt[2].kind else {
+        panic!("fixture must contain tool/call");
+    };
+    call_id.clear();
+    assert!(matches!(
+        SessionLog::restore(log.header().clone(), corrupt),
+        Err(SessionError::InvalidToolCall { .. })
+    ));
 }
 
 #[test]
