@@ -1,9 +1,9 @@
 //! Minimal Rust-native Session boundary log adapted from DeepSeek Harness.
 //!
-//! This slice records and validates turn/step lifecycle and exposes the typed
-//! event/flush seam consumed by persistence plugins. A durable backend, message
-//! history, surface replacement, and the wider Harness vocabulary remain
-//! separate follow-up work.
+//! This slice records and validates turn/step lifecycle plus the three durable
+//! message events that form model history. It exposes the typed event/flush
+//! seam consumed by persistence plugins. Surface replacement and the wider
+//! Harness vocabulary remain separate follow-up work.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -110,13 +110,146 @@ pub enum TurnEndReason {
     Interrupted,
 }
 
-/// The N17 Session event vocabulary.
+/// Provider-neutral role carried by one durable Session message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMessageRole {
+    User,
+    Assistant,
+}
+
+/// Provenance required to replay one model-visible message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMessageSource {
+    User,
+    Plugin { plugin: String },
+    Model { provider: String, model: String },
+    Tool { call_id: String },
+}
+
+/// The bounded N22 content vocabulary needed for text and tool-history replay.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionContentBlock {
+    Text {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        content: Vec<Self>,
+        is_error: bool,
+    },
+}
+
+impl fmt::Debug for SessionContentBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text } => formatter
+                .debug_struct("Text")
+                .field("bytes", &text.len())
+                .finish(),
+            Self::Reasoning { text } => formatter
+                .debug_struct("Reasoning")
+                .field("bytes", &text.len())
+                .finish(),
+            Self::ToolCall {
+                id,
+                name,
+                arguments,
+            } => formatter
+                .debug_struct("ToolCall")
+                .field("id", id)
+                .field("name", name)
+                .field("argument_bytes", &arguments.len())
+                .finish(),
+            Self::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            } => formatter
+                .debug_struct("ToolResult")
+                .field("tool_call_id", tool_call_id)
+                .field("content_blocks", &content.len())
+                .field("is_error", is_error)
+                .finish(),
+        }
+    }
+}
+
+/// One identified immutable message shared by durable history and replay.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionMessage {
+    pub id: String,
+    pub role: SessionMessageRole,
+    pub content: Vec<SessionContentBlock>,
+    pub source: SessionMessageSource,
+}
+
+impl fmt::Debug for SessionMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionMessage")
+            .field("id", &self.id)
+            .field("role", &self.role)
+            .field("content_blocks", &self.content.len())
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl SessionMessage {
+    /// Encode one validated typed message for a neutral persistence adapter.
+    pub fn to_json_value(&self) -> Result<serde_json::Value, SessionError> {
+        serde_json::to_value(self).map_err(|_| SessionError::InvalidMessageEncoding)
+    }
+
+    /// Decode one neutral persistence value before Session replay validates it.
+    pub fn from_json_value(value: serde_json::Value) -> Result<Self, SessionError> {
+        serde_json::from_value(value).map_err(|_| SessionError::InvalidMessageEncoding)
+    }
+}
+
+/// The bounded Session event vocabulary through N22.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
-    TurnStart { turn: u64 },
-    TurnEnd { turn: u64, reason: TurnEndReason },
-    StepStart { turn: u64, step: u64 },
-    StepEnd { turn: u64, step: u64 },
+    TurnStart {
+        turn: u64,
+    },
+    TurnEnd {
+        turn: u64,
+        reason: TurnEndReason,
+    },
+    StepStart {
+        turn: u64,
+        step: u64,
+    },
+    StepEnd {
+        turn: u64,
+        step: u64,
+    },
+    UserMessage {
+        message: SessionMessage,
+    },
+    AssistantMessage {
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+    },
+    ToolResult {
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+    },
 }
 
 impl SessionEventKind {
@@ -127,6 +260,21 @@ impl SessionEventKind {
             Self::TurnEnd { .. } => "turn/end",
             Self::StepStart { .. } => "step/start",
             Self::StepEnd { .. } => "step/end",
+            Self::UserMessage { .. } => "user/message",
+            Self::AssistantMessage { .. } => "assistant/message",
+            Self::ToolResult { .. } => "tool/result",
+        }
+    }
+
+    fn derived_message(&self) -> Option<&SessionMessage> {
+        match self {
+            Self::UserMessage { message } | Self::ToolResult { message, .. } => Some(message),
+            Self::AssistantMessage { message, .. } if !message.content.is_empty() => Some(message),
+            Self::AssistantMessage { .. }
+            | Self::TurnStart { .. }
+            | Self::TurnEnd { .. }
+            | Self::StepStart { .. }
+            | Self::StepEnd { .. } => None,
         }
     }
 }
@@ -170,8 +318,9 @@ struct SessionState {
 
 impl SessionState {
     fn apply(&mut self, kind: &SessionEventKind) -> Result<(), SessionError> {
-        match *kind {
+        match kind {
             SessionEventKind::TurnStart { turn } => {
+                let turn = *turn;
                 if let Some(open) = self.open_turn {
                     return Err(SessionError::TurnAlreadyOpen { turn: open });
                 }
@@ -190,6 +339,7 @@ impl SessionState {
                 self.last_step = 0;
             }
             SessionEventKind::TurnEnd { turn, .. } => {
+                let turn = *turn;
                 require_turn(self.open_turn, turn)?;
                 if let Some(step) = self.open_step {
                     return Err(SessionError::StepStillOpen { turn, step });
@@ -197,6 +347,7 @@ impl SessionState {
                 self.open_turn = None;
             }
             SessionEventKind::StepStart { turn, step } => {
+                let (turn, step) = (*turn, *step);
                 require_turn(self.open_turn, turn)?;
                 if let Some(open) = self.open_step {
                     return Err(SessionError::StepAlreadyOpen { turn, step: open });
@@ -216,22 +367,97 @@ impl SessionState {
                 self.open_step = Some(step);
             }
             SessionEventKind::StepEnd { turn, step } => {
+                let (turn, step) = (*turn, *step);
                 require_turn(self.open_turn, turn)?;
-                match self.open_step {
-                    Some(open) if open == step => self.open_step = None,
-                    Some(open) => {
-                        return Err(SessionError::StepMismatch {
-                            turn,
-                            expected: open,
-                            actual: step,
-                        });
-                    }
-                    None => return Err(SessionError::NoOpenStep { turn }),
-                }
+                require_step(self.open_step, turn, step)?;
+                self.open_step = None;
             }
+            SessionEventKind::UserMessage { .. }
+            | SessionEventKind::AssistantMessage { .. }
+            | SessionEventKind::ToolResult { .. } => self.validate_message_event(kind)?,
         }
         Ok(())
     }
+
+    fn validate_message_event(&self, kind: &SessionEventKind) -> Result<(), SessionError> {
+        match kind {
+            SessionEventKind::UserMessage { message } => validate_message(
+                message,
+                SessionMessageRole::User,
+                "user/message",
+                |source| {
+                    matches!(source, SessionMessageSource::User)
+                        || matches!(
+                            source,
+                            SessionMessageSource::Plugin { plugin } if !plugin.is_empty()
+                        )
+                },
+                "user or non-empty plugin",
+            ),
+            SessionEventKind::AssistantMessage {
+                turn,
+                step,
+                message,
+            } => {
+                require_turn(self.open_turn, *turn)?;
+                require_step(self.open_step, *turn, *step)?;
+                validate_message(
+                    message,
+                    SessionMessageRole::Assistant,
+                    "assistant/message",
+                    |source| {
+                        matches!(
+                            source,
+                            SessionMessageSource::Model { provider, model }
+                                if !provider.is_empty() && !model.is_empty()
+                        )
+                    },
+                    "non-empty model provider and model",
+                )
+            }
+            SessionEventKind::ToolResult {
+                turn,
+                step,
+                message,
+            } => {
+                require_turn(self.open_turn, *turn)?;
+                require_step(self.open_step, *turn, *step)?;
+                validate_message(
+                    message,
+                    SessionMessageRole::User,
+                    "tool/result",
+                    |source| {
+                        matches!(
+                            source,
+                            SessionMessageSource::Tool { call_id } if !call_id.is_empty()
+                        )
+                    },
+                    "non-empty tool call id",
+                )?;
+                validate_tool_result_message(message)
+            }
+            SessionEventKind::TurnStart { .. }
+            | SessionEventKind::TurnEnd { .. }
+            | SessionEventKind::StepStart { .. }
+            | SessionEventKind::StepEnd { .. } => Ok(()),
+        }
+    }
+}
+
+fn validate_tool_result_message(message: &SessionMessage) -> Result<(), SessionError> {
+    let SessionMessageSource::Tool { call_id } = &message.source else {
+        return Err(SessionError::InvalidMessageSource {
+            event_type: "tool/result",
+            expected: "non-empty tool call id",
+        });
+    };
+    let [SessionContentBlock::ToolResult { tool_call_id, .. }] = message.content.as_slice() else {
+        return Err(SessionError::InvalidToolResultShape);
+    };
+    if call_id != tool_call_id {
+        return Err(SessionError::MismatchedToolCallIds);
+    }
+    Ok(())
 }
 
 fn require_turn(open_turn: Option<u64>, actual: u64) -> Result<(), SessionError> {
@@ -240,6 +466,78 @@ fn require_turn(open_turn: Option<u64>, actual: u64) -> Result<(), SessionError>
         Some(expected) => Err(SessionError::TurnMismatch { expected, actual }),
         None => Err(SessionError::NoOpenTurn),
     }
+}
+
+fn require_step(open_step: Option<u64>, turn: u64, actual: u64) -> Result<(), SessionError> {
+    match open_step {
+        Some(expected) if expected == actual => Ok(()),
+        Some(expected) => Err(SessionError::StepMismatch {
+            turn,
+            expected,
+            actual,
+        }),
+        None => Err(SessionError::NoOpenStep { turn }),
+    }
+}
+
+fn validate_message(
+    message: &SessionMessage,
+    expected_role: SessionMessageRole,
+    event_type: &'static str,
+    valid_source: impl FnOnce(&SessionMessageSource) -> bool,
+    expected_source: &'static str,
+) -> Result<(), SessionError> {
+    if message.id.is_empty() {
+        return Err(SessionError::EmptyMessageId { event_type });
+    }
+    if message.role != expected_role {
+        return Err(SessionError::UnexpectedMessageRole {
+            event_type,
+            expected: expected_role,
+            actual: message.role,
+        });
+    }
+    if !valid_source(&message.source) {
+        return Err(SessionError::InvalidMessageSource {
+            event_type,
+            expected: expected_source,
+        });
+    }
+    validate_content_blocks(&message.content, event_type)
+}
+
+fn validate_content_blocks(
+    blocks: &[SessionContentBlock],
+    event_type: &'static str,
+) -> Result<(), SessionError> {
+    let mut pending = blocks.iter().collect::<Vec<_>>();
+    while let Some(block) = pending.pop() {
+        match block {
+            SessionContentBlock::Text { .. } | SessionContentBlock::Reasoning { .. } => {}
+            SessionContentBlock::ToolCall { id, name, .. } => {
+                if id.is_empty() || name.is_empty() {
+                    return Err(SessionError::InvalidContentBlock {
+                        event_type,
+                        expected: "non-empty tool call id and name",
+                    });
+                }
+            }
+            SessionContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                if tool_call_id.is_empty() {
+                    return Err(SessionError::InvalidContentBlock {
+                        event_type,
+                        expected: "non-empty tool result call id",
+                    });
+                }
+                pending.extend(content);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validated append-only lifecycle log for one Session.
@@ -342,6 +640,51 @@ impl SessionLog {
     pub fn finish_step(&mut self, turn: u64, step: u64) -> Result<(), SessionError> {
         self.append(SessionEventKind::StepEnd { turn, step })?;
         Ok(())
+    }
+
+    pub fn append_user_message(&mut self, message: SessionMessage) -> Result<(), SessionError> {
+        self.append(SessionEventKind::UserMessage { message })?;
+        Ok(())
+    }
+
+    pub fn append_assistant_message(
+        &mut self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+    ) -> Result<(), SessionError> {
+        self.append(SessionEventKind::AssistantMessage {
+            turn,
+            step,
+            message,
+        })?;
+        Ok(())
+    }
+
+    pub fn append_tool_result(
+        &mut self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+    ) -> Result<(), SessionError> {
+        self.append(SessionEventKind::ToolResult {
+            turn,
+            step,
+            message,
+        })?;
+        Ok(())
+    }
+
+    /// Derive a detached model-history snapshot from the durable event order.
+    ///
+    /// Lifecycle events never enter history, and an empty assistant message is
+    /// retained for accounting/replay while omitted from the model transcript.
+    #[must_use]
+    pub fn derive_messages(&self) -> Vec<SessionMessage> {
+        self.events
+            .iter()
+            .filter_map(|event| event.kind.derived_message().cloned())
+            .collect()
     }
 
     /// Close a durable turn left open by a crashed process.
@@ -466,6 +809,32 @@ impl SessionHandle {
 
     pub fn finish_step(&self, turn: u64, step: u64) -> Result<(), SessionError> {
         self.commit(|log| log.finish_step(turn, step))
+    }
+
+    pub fn append_user_message(&self, message: SessionMessage) -> Result<(), SessionError> {
+        self.commit(|log| log.append_user_message(message))
+    }
+
+    pub fn append_assistant_message(
+        &self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+    ) -> Result<(), SessionError> {
+        self.commit(|log| log.append_assistant_message(turn, step, message))
+    }
+
+    pub fn append_tool_result(
+        &self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+    ) -> Result<(), SessionError> {
+        self.commit(|log| log.append_tool_result(turn, step, message))
+    }
+
+    pub fn derive_messages(&self) -> Result<Vec<SessionMessage>, SessionError> {
+        Ok(self.lock()?.derive_messages())
     }
 
     fn commit<R>(
@@ -782,6 +1151,30 @@ pub enum SessionError {
     },
     #[error("session turn {turn} cannot end while step {step} is open")]
     StepStillOpen { turn: u64, step: u64 },
+    #[error("session {event_type} message id must not be empty")]
+    EmptyMessageId { event_type: &'static str },
+    #[error("session {event_type} message role must be {expected:?}, got {actual:?}")]
+    UnexpectedMessageRole {
+        event_type: &'static str,
+        expected: SessionMessageRole,
+        actual: SessionMessageRole,
+    },
+    #[error("session {event_type} message source must be {expected}")]
+    InvalidMessageSource {
+        event_type: &'static str,
+        expected: &'static str,
+    },
+    #[error("session {event_type} content block must have {expected}")]
+    InvalidContentBlock {
+        event_type: &'static str,
+        expected: &'static str,
+    },
+    #[error("session tool/result message must contain exactly one tool-result block")]
+    InvalidToolResultShape,
+    #[error("session tool/result source and content call ids must match")]
+    MismatchedToolCallIds,
+    #[error("session message persistence encoding is invalid")]
+    InvalidMessageEncoding,
     #[error("session seed length {seed_length} exceeds event count {event_count}")]
     SeedBeyondLog { seed_length: u64, event_count: u64 },
     #[error("session `{id}` already exists")]

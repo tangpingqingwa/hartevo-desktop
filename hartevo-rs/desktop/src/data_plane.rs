@@ -7381,11 +7381,56 @@ mod tests {
         assert!(installed.shares_cordis_coordinator(&raced));
     }
 
+    fn desktop_restart_messages() -> [hartevo_cordis::SessionMessage; 3] {
+        use hartevo_cordis::{
+            SessionContentBlock, SessionMessage, SessionMessageRole, SessionMessageSource,
+        };
+
+        [
+            SessionMessage {
+                id: "desktop-user-1".into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::Text {
+                    text: "hello after restart".into(),
+                }],
+                source: SessionMessageSource::User,
+            },
+            SessionMessage {
+                id: "desktop-assistant-1".into(),
+                role: SessionMessageRole::Assistant,
+                content: vec![
+                    SessionContentBlock::Text {
+                        text: "checking".into(),
+                    },
+                    SessionContentBlock::ToolCall {
+                        id: "desktop-call-1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                source: SessionMessageSource::Model {
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                },
+            },
+            SessionMessage {
+                id: "desktop-tool-1".into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::ToolResult {
+                    tool_call_id: "desktop-call-1".into(),
+                    content: vec![SessionContentBlock::Text { text: "ok".into() }],
+                    is_error: false,
+                }],
+                source: SessionMessageSource::Tool {
+                    call_id: "desktop-call-1".into(),
+                },
+            },
+        ]
+    }
+
     #[tokio::test]
     async fn flushed_cordis_session_restores_read_only_and_resumes_after_restart() {
-        use hartevo_cordis::{
-            SessionId, SessionStore, TurnEndReason, events as cordis_events, session_events,
-        };
+        use hartevo_cordis::{SessionId, SessionStore, TurnEndReason};
 
         let directory = tempfile::tempdir().expect("directory");
         let data_root = directory.path().join("desktop-session-restart");
@@ -7395,8 +7440,8 @@ mod tests {
             .initialize_with(&secrets, observed_at())
             .expect("initialize and bind Session persistence");
 
-        let (sessions, session, expected_header, expected_events) =
-            first.with_cordis_host(|host| {
+        let (sessions, session, expected_header, expected_events, expected_messages) = first
+            .with_cordis_host(|host| {
                 let sessions = host
                     .context()
                     .sessions::<SessionStore>()
@@ -7405,14 +7450,23 @@ mod tests {
                     .create(SessionId::new("desktop-restart-session").unwrap())
                     .expect("live Session");
                 let turn = session.start_turn().expect("turn start");
+                let [user, assistant, tool] = desktop_restart_messages();
+                session.append_user_message(user).expect("user message");
                 let step = session.start_step(turn).expect("step start");
+                session
+                    .append_assistant_message(turn, step, assistant)
+                    .expect("assistant message");
+                session
+                    .append_tool_result(turn, step, tool)
+                    .expect("tool result");
                 session.finish_step(turn, step).expect("step end");
                 session
                     .finish_turn(turn, TurnEndReason::Completed)
                     .expect("turn end");
                 let header = session.header().expect("header");
                 let events = session.events().expect("events");
-                (sessions, session, header, events)
+                let messages = session.derive_messages().expect("message history");
+                (sessions, session, header, events, messages)
             });
         assert!(sessions.flush(&session).await.expect("durable flush"));
         drop(session);
@@ -7420,27 +7474,7 @@ mod tests {
         drop(first);
 
         let second = DesktopDataPlane::at_data_root(&data_root).expect("restarted Desktop plane");
-        let execution_events = Arc::new(AtomicUsize::new(0));
-        second.with_cordis_host(|host| {
-            let session_count = Arc::clone(&execution_events);
-            host.context_mut()
-                .on_emit(session_events::SESSION_EVENT, move |_| {
-                    session_count.fetch_add(1, Ordering::SeqCst);
-                })
-                .unwrap();
-            let agent_count = Arc::clone(&execution_events);
-            host.context_mut()
-                .on_emit(cordis_events::AGENT_CREATED, move |_| {
-                    agent_count.fetch_add(1, Ordering::SeqCst);
-                })
-                .unwrap();
-            let tool_count = Arc::clone(&execution_events);
-            host.context_mut()
-                .on_emit(cordis_events::TOOLS_RESULT, move |_| {
-                    tool_count.fetch_add(1, Ordering::SeqCst);
-                })
-                .unwrap();
-        });
+        let execution_events = observe_cordis_execution_events(&second);
 
         assert!(matches!(
             second.load_with(&secrets, observed_at()).unwrap(),
@@ -7463,6 +7497,7 @@ mod tests {
                 .expect("restored Session");
             assert_eq!(restored.header().unwrap(), expected_header);
             assert_eq!(restored.events().unwrap(), expected_events);
+            assert_eq!(restored.derive_messages().unwrap(), expected_messages);
             (sessions, restored)
         });
         let turn = restored.start_turn().expect("resumed turn start");
