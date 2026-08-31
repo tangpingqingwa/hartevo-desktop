@@ -223,6 +223,29 @@ fn malformed_message_replay_fails_closed() {
 }
 
 #[test]
+fn message_json_rejects_unknown_nested_fields() {
+    for invalid in [
+        serde_json::json!({
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": [{ "text": { "text": "hello", "unknown": true } }],
+            "source": { "model": { "provider": "mock", "model": "mock" } }
+        }),
+        serde_json::json!({
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": [{ "text": { "text": "hello" } }],
+            "source": { "model": { "provider": "mock", "model": "mock", "unknown": true } }
+        }),
+    ] {
+        assert_eq!(
+            SessionMessage::from_json_value(invalid).unwrap_err(),
+            SessionError::InvalidMessageEncoding
+        );
+    }
+}
+
+#[test]
 fn invalid_transition_or_corrupt_replay_is_rejected_before_mutation() {
     let mut log = SessionLog::new_at(SessionId::new("session-invalid").unwrap(), 1).unwrap();
     assert_eq!(

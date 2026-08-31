@@ -120,7 +120,7 @@ pub enum SessionMessageRole {
 
 /// Provenance required to replay one model-visible message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionMessageSource {
     User,
     Plugin { plugin: String },
@@ -130,7 +130,7 @@ pub enum SessionMessageSource {
 
 /// The bounded N22 content vocabulary needed for text and tool-history replay.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionContentBlock {
     Text {
         text: String,
