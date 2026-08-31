@@ -1,11 +1,11 @@
 //! Minimal Rust-native Session boundary log adapted from DeepSeek Harness.
 //!
-//! This slice records and validates turn/step lifecycle, raw assistant stream
-//! chunks, and the three durable message events that form model history. Its
-//! ordered surface can append or replace model-visible nodes without deleting
-//! the source log, and it exposes the typed event/flush seam consumed by
-//! persistence plugins. The wider Harness vocabulary remains separate
-//! follow-up work.
+//! This slice records and validates turn/step lifecycle, request state, raw
+//! assistant stream chunks, and the three durable message events that form
+//! model history. Its ordered surface can append or replace model-visible nodes
+//! without deleting the source log, and it exposes the typed event/flush seam
+//! consumed by persistence plugins. The wider Harness vocabulary remains
+//! separate follow-up work.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -110,6 +110,151 @@ pub enum TurnEndReason {
     Error,
     MaxTokens,
     Interrupted,
+}
+
+/// Provider-neutral call configuration retained in a request-header snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionCallConfig {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+}
+
+/// Call-config fields supplied by exact adapter resolution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionCallConfigAdapterDefaults {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_effort: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub max_tokens: bool,
+}
+
+/// Lossless JSON Schema sent for one assembled tool.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionToolSchema {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Full request state reconstructed from the latest header snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionEpochHeader {
+    pub config: SessionCallConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_defaults: Option<SessionCallConfigAdapterDefaults>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<SessionToolSchema>>,
+}
+
+impl SessionEpochHeader {
+    fn canonicalized(mut self) -> Self {
+        if self
+            .adapter_defaults
+            .as_ref()
+            .is_some_and(|defaults| !defaults.reasoning_effort && !defaults.max_tokens)
+        {
+            self.adapter_defaults = None;
+        }
+        if self.system.as_ref().is_some_and(String::is_empty) {
+            self.system = None;
+        }
+        if self.tools.as_ref().is_some_and(Vec::is_empty) {
+            self.tools = None;
+        }
+        self
+    }
+}
+
+/// Why a complete request-header snapshot was appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionRequestHeaderReason {
+    Initial,
+    Resume,
+    Change,
+    Series,
+}
+
+/// One canonical, complete request-header event payload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionRequestHeader {
+    pub header: SessionEpochHeader,
+    pub reason: SessionRequestHeaderReason,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub starts_series: bool,
+}
+
+impl SessionRequestHeader {
+    fn canonicalized(mut self) -> Self {
+        self.header = self.header.canonicalized();
+        self
+    }
+
+    /// Encode one canonical snapshot for a neutral persistence adapter.
+    pub fn to_json_value(&self) -> Result<serde_json::Value, SessionError> {
+        serde_json::to_value(self.clone().canonicalized())
+            .map_err(|_| SessionError::InvalidRequestHeaderEncoding)
+    }
+
+    /// Decode an exact current snapshot, rejecting lossy and legacy shapes.
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, SessionError> {
+        let request: Self = serde_json::from_value(value.clone())
+            .map_err(|_| SessionError::InvalidRequestHeaderEncoding)?;
+        let request = request.canonicalized();
+        if request.to_json_value()?.ne(value) {
+            return Err(SessionError::InvalidRequestHeaderEncoding);
+        }
+        validate_request_header(&request)?;
+        Ok(request)
+    }
+}
+
+/// Registered provider route metadata reconstructed from its latest event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionRequestContext {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+impl SessionRequestContext {
+    /// Encode exact route metadata for a neutral persistence adapter.
+    pub fn to_json_value(&self) -> Result<serde_json::Value, SessionError> {
+        serde_json::to_value(self).map_err(|_| SessionError::InvalidRequestContextEncoding)
+    }
+
+    /// Decode exact route metadata, rejecting unknown or non-canonical fields.
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, SessionError> {
+        let context: Self = serde_json::from_value(value.clone())
+            .map_err(|_| SessionError::InvalidRequestContextEncoding)?;
+        if context.to_json_value()?.ne(value) {
+            return Err(SessionError::InvalidRequestContextEncoding);
+        }
+        validate_request_context(&context)?;
+        Ok(context)
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicates receive references.
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Provider-neutral role carried by one durable Session message.
@@ -443,7 +588,7 @@ pub struct SessionSurface {
     pub replace_generation: u64,
 }
 
-/// The bounded Session event vocabulary through N24.
+/// The bounded Session event vocabulary through N25.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
     TurnStart {
@@ -465,6 +610,12 @@ pub enum SessionEventKind {
         turn: u64,
         step: u64,
         chunk: SessionStreamChunk,
+    },
+    RequestHeader {
+        request: SessionRequestHeader,
+    },
+    RequestContext {
+        context: SessionRequestContext,
     },
     UserMessage {
         message: SessionMessage,
@@ -493,6 +644,8 @@ impl SessionEventKind {
             Self::StepStart { .. } => "step/start",
             Self::StepEnd { .. } => "step/end",
             Self::AssistantChunk { .. } => "assistant/chunk",
+            Self::RequestHeader { .. } => "request/header",
+            Self::RequestContext { .. } => "request/context",
             Self::UserMessage { .. } => "user/message",
             Self::AssistantMessage { .. } => "assistant/message",
             Self::ToolResult { .. } => "tool/result",
@@ -508,7 +661,9 @@ impl SessionEventKind {
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
             | Self::StepEnd { .. }
-            | Self::AssistantChunk { .. } => None,
+            | Self::AssistantChunk { .. }
+            | Self::RequestHeader { .. }
+            | Self::RequestContext { .. } => None,
         }
     }
 
@@ -521,7 +676,9 @@ impl SessionEventKind {
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
             | Self::StepEnd { .. }
-            | Self::AssistantChunk { .. } => None,
+            | Self::AssistantChunk { .. }
+            | Self::RequestHeader { .. }
+            | Self::RequestContext { .. } => None,
         }
     }
 }
@@ -624,6 +781,14 @@ impl SessionState {
                 require_step(self.open_step, *turn, *step)?;
                 validate_assistant_chunk(chunk)?;
             }
+            SessionEventKind::RequestHeader { request } => {
+                require_open_turn(self.open_turn)?;
+                validate_request_header(request)?;
+            }
+            SessionEventKind::RequestContext { context } => {
+                require_open_turn(self.open_turn)?;
+                validate_request_context(context)?;
+            }
             SessionEventKind::UserMessage { .. }
             | SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::ToolResult { .. } => self.validate_message_event(kind)?,
@@ -694,9 +859,53 @@ impl SessionState {
             | SessionEventKind::TurnEnd { .. }
             | SessionEventKind::StepStart { .. }
             | SessionEventKind::StepEnd { .. }
-            | SessionEventKind::AssistantChunk { .. } => Ok(()),
+            | SessionEventKind::AssistantChunk { .. }
+            | SessionEventKind::RequestHeader { .. }
+            | SessionEventKind::RequestContext { .. } => Ok(()),
         }
     }
+}
+
+fn validate_request_header(request: &SessionRequestHeader) -> Result<(), SessionError> {
+    if request.clone().canonicalized() != *request {
+        return Err(SessionError::InvalidRequestHeader {
+            expected: "canonical absent empty system, tools, and adapter defaults",
+        });
+    }
+    let config = &request.header.config;
+    if config.provider.is_empty() || config.model.is_empty() {
+        return Err(SessionError::InvalidRequestHeader {
+            expected: "non-empty provider and model",
+        });
+    }
+    if config
+        .reasoning_effort
+        .as_ref()
+        .is_some_and(String::is_empty)
+    {
+        return Err(SessionError::InvalidRequestHeader {
+            expected: "a non-empty optional reasoning effort",
+        });
+    }
+    if let Some(defaults) = &request.header.adapter_defaults
+        && ((!defaults.reasoning_effort && !defaults.max_tokens)
+            || (defaults.reasoning_effort && config.reasoning_effort.is_none())
+            || (defaults.max_tokens && config.max_tokens.is_none()))
+    {
+        return Err(SessionError::InvalidRequestHeader {
+            expected: "adapter-default markers for present config fields",
+        });
+    }
+    Ok(())
+}
+
+fn validate_request_context(context: &SessionRequestContext) -> Result<(), SessionError> {
+    if context.provider.is_empty() || context.model.is_empty() {
+        return Err(SessionError::InvalidRequestContext {
+            expected: "non-empty provider and model",
+        });
+    }
+    Ok(())
 }
 
 fn validate_assistant_chunk(chunk: &SessionStreamChunk) -> Result<(), SessionError> {
@@ -804,6 +1013,10 @@ fn require_turn(open_turn: Option<u64>, actual: u64) -> Result<(), SessionError>
         Some(expected) => Err(SessionError::TurnMismatch { expected, actual }),
         None => Err(SessionError::NoOpenTurn),
     }
+}
+
+fn require_open_turn(open_turn: Option<u64>) -> Result<(), SessionError> {
+    open_turn.map_or(Err(SessionError::NoOpenTurn), |_| Ok(()))
 }
 
 fn require_step(open_step: Option<u64>, turn: u64, actual: u64) -> Result<(), SessionError> {
@@ -1254,6 +1467,33 @@ impl SessionLog {
             .seq)
     }
 
+    /// Append one complete canonical header snapshot inside the open turn.
+    pub fn append_request_header(
+        &mut self,
+        header: SessionEpochHeader,
+        reason: SessionRequestHeaderReason,
+        starts_series: bool,
+    ) -> Result<(), SessionError> {
+        self.append(SessionEventKind::RequestHeader {
+            request: SessionRequestHeader {
+                header,
+                reason,
+                starts_series,
+            }
+            .canonicalized(),
+        })?;
+        Ok(())
+    }
+
+    /// Append resolved route metadata inside the open turn.
+    pub fn append_request_context(
+        &mut self,
+        context: SessionRequestContext,
+    ) -> Result<(), SessionError> {
+        self.append(SessionEventKind::RequestContext { context })?;
+        Ok(())
+    }
+
     pub fn append_assistant_message(
         &mut self,
         turn: u64,
@@ -1348,6 +1588,28 @@ impl SessionLog {
                 })
             })
             .collect()
+    }
+
+    /// Reconstruct the latest complete request header independently of history.
+    #[must_use]
+    pub fn request_header(&self) -> Option<SessionEpochHeader> {
+        self.events.iter().rev().find_map(|event| {
+            let SessionEventKind::RequestHeader { request } = &event.kind else {
+                return None;
+            };
+            Some(request.header.clone())
+        })
+    }
+
+    /// Reconstruct the latest resolved route metadata independently of history.
+    #[must_use]
+    pub fn request_context(&self) -> Option<SessionRequestContext> {
+        self.events.iter().rev().find_map(|event| {
+            let SessionEventKind::RequestContext { context } = &event.kind else {
+                return None;
+            };
+            Some(context.clone())
+        })
     }
 
     /// Close a durable turn left open by a crashed process.
@@ -1501,6 +1763,22 @@ impl SessionHandle {
         self.commit(|log| log.append_assistant_chunk(turn, step, chunk))
     }
 
+    pub fn append_request_header(
+        &self,
+        header: SessionEpochHeader,
+        reason: SessionRequestHeaderReason,
+        starts_series: bool,
+    ) -> Result<(), SessionError> {
+        self.commit(|log| log.append_request_header(header, reason, starts_series))
+    }
+
+    pub fn append_request_context(
+        &self,
+        context: SessionRequestContext,
+    ) -> Result<(), SessionError> {
+        self.commit(|log| log.append_request_context(context))
+    }
+
     pub fn append_assistant_message(
         &self,
         turn: u64,
@@ -1549,6 +1827,14 @@ impl SessionHandle {
         step: u64,
     ) -> Result<Vec<SessionAssistantChunk>, SessionError> {
         Ok(self.lock()?.assistant_chunks(turn, step))
+    }
+
+    pub fn request_header(&self) -> Result<Option<SessionEpochHeader>, SessionError> {
+        Ok(self.lock()?.request_header())
+    }
+
+    pub fn request_context(&self) -> Result<Option<SessionRequestContext>, SessionError> {
+        Ok(self.lock()?.request_context())
     }
 
     fn commit<R>(
@@ -1893,6 +2179,14 @@ pub enum SessionError {
     InvalidAssistantChunkEncoding,
     #[error("session assistant chunk must have {expected}")]
     InvalidAssistantChunk { expected: &'static str },
+    #[error("session request/header persistence encoding is invalid")]
+    InvalidRequestHeaderEncoding,
+    #[error("session request/header must have {expected}")]
+    InvalidRequestHeader { expected: &'static str },
+    #[error("session request/context persistence encoding is invalid")]
+    InvalidRequestContextEncoding,
+    #[error("session request/context must have {expected}")]
+    InvalidRequestContext { expected: &'static str },
     #[error("session surface persistence encoding is invalid")]
     InvalidSurfaceEncoding,
     #[error("session {event_type} source event sequences must not be empty")]

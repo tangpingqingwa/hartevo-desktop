@@ -7461,7 +7461,11 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn flushed_cordis_session_restores_read_only_and_resumes_after_restart() {
-        use hartevo_cordis::{SessionId, SessionStore, TurnEndReason};
+        use hartevo_cordis::{
+            SessionCallConfig, SessionCallConfigAdapterDefaults, SessionEpochHeader, SessionId,
+            SessionRequestContext, SessionRequestHeaderReason, SessionStore, SessionToolSchema,
+            TurnEndReason,
+        };
 
         let directory = tempfile::tempdir().expect("directory");
         let data_root = directory.path().join("desktop-session-restart");
@@ -7479,6 +7483,8 @@ mod tests {
             expected_surface,
             expected_messages,
             expected_chunks,
+            expected_request_header,
+            expected_request_context,
         ) = first.with_cordis_host(|host| {
             let sessions = host
                 .context()
@@ -7491,6 +7497,47 @@ mod tests {
             let [user, assistant, tool, summary] = desktop_restart_messages();
             session.append_user_message(user).expect("user message");
             let step = session.start_step(turn).expect("step start");
+            let request_header = SessionEpochHeader {
+                config: SessionCallConfig {
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    reasoning_effort: Some("high".into()),
+                    temperature: Some(serde_json::Number::from_f64(0.2).unwrap()),
+                    max_tokens: Some(2_048),
+                    stop: Some(vec!["desktop-stop".into()]),
+                },
+                adapter_defaults: Some(SessionCallConfigAdapterDefaults {
+                    reasoning_effort: true,
+                    max_tokens: true,
+                }),
+                system: Some("desktop system".into()),
+                tools: Some(vec![SessionToolSchema {
+                    name: "echo".into(),
+                    description: "Echo input".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                }]),
+            };
+            let request_context = SessionRequestContext {
+                provider: "mock".into(),
+                model: "mock".into(),
+                context_window: Some(128_000),
+            };
+            session
+                .append_request_header(
+                    request_header.clone(),
+                    SessionRequestHeaderReason::Initial,
+                    false,
+                )
+                .expect("request header");
+            session
+                .append_request_context(request_context.clone())
+                .expect("request context");
             let chunks = vec![
                 hartevo_cordis::SessionStreamChunk::BlockStart {
                     index: 0,
@@ -7560,7 +7607,17 @@ mod tests {
             let chunks = session
                 .assistant_chunks(turn, step)
                 .expect("assistant chunk replay");
-            (sessions, session, header, events, surface, messages, chunks)
+            (
+                sessions,
+                session,
+                header,
+                events,
+                surface,
+                messages,
+                chunks,
+                request_header,
+                request_context,
+            )
         });
         assert!(sessions.flush(&session).await.expect("durable flush"));
         drop(session);
@@ -7594,6 +7651,14 @@ mod tests {
             assert_eq!(restored.surface().unwrap(), expected_surface);
             assert_eq!(restored.derive_messages().unwrap(), expected_messages);
             assert_eq!(restored.assistant_chunks(1, 1).unwrap(), expected_chunks);
+            assert_eq!(
+                restored.request_header().unwrap(),
+                Some(expected_request_header)
+            );
+            assert_eq!(
+                restored.request_context().unwrap(),
+                Some(expected_request_context)
+            );
             (sessions, restored)
         });
         let turn = restored.start_turn().expect("resumed turn start");

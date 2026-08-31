@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
-    KernelConsentState, SessionContentBlock, SessionError, SessionEvent, SessionEventKind,
-    SessionFinishReason, SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionReplayEnvelope, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp, SessionTokenUsage, TurnEndReason,
-    invariant_missing, session_events,
+    KernelConsentState, SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock,
+    SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
+    SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionReplayEnvelope, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
+    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+    SessionSurfaceOp, SessionTokenUsage, SessionToolSchema, TurnEndReason, invariant_missing,
+    session_events,
 };
 
 #[derive(Debug)]
@@ -71,6 +73,22 @@ fn tool_result_message(id: &str, call_id: &str, text: &str) -> SessionMessage {
         source: SessionMessageSource::Tool {
             call_id: call_id.into(),
         },
+    }
+}
+
+fn request_header(provider: &str, model: &str) -> SessionEpochHeader {
+    SessionEpochHeader {
+        config: SessionCallConfig {
+            provider: provider.into(),
+            model: model.into(),
+            reasoning_effort: None,
+            temperature: None,
+            max_tokens: None,
+            stop: None,
+        },
+        adapter_defaults: None,
+        system: None,
+        tools: None,
     }
 }
 
@@ -160,6 +178,222 @@ fn message_history_derives_replays_and_detaches_from_the_log() {
         restored.derive_messages()[0].content[0],
         expected[0].content[0]
     );
+}
+
+#[test]
+fn request_state_reconstructs_latest_canonical_detached_snapshot() {
+    let mut log = SessionLog::new_at(SessionId::new("request-state").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+
+    let mut initial = request_header("provider-a", "model-a");
+    initial.adapter_defaults = Some(SessionCallConfigAdapterDefaults {
+        reasoning_effort: false,
+        max_tokens: false,
+    });
+    initial.system = Some(String::new());
+    initial.tools = Some(vec![]);
+    log.append_request_header(initial, SessionRequestHeaderReason::Initial, false)
+        .unwrap();
+    let SessionEventKind::RequestHeader { request } = &log.events()[1].kind else {
+        panic!("second event must be request/header");
+    };
+    assert_eq!(request.header.adapter_defaults, None);
+    assert_eq!(request.header.system, None);
+    assert_eq!(request.header.tools, None);
+
+    log.append_request_context(SessionRequestContext {
+        provider: "provider-a".into(),
+        model: "model-a".into(),
+        context_window: Some(32_768),
+    })
+    .unwrap();
+    let step = log.start_step(turn).unwrap();
+
+    let latest = SessionEpochHeader {
+        config: SessionCallConfig {
+            provider: "provider-b".into(),
+            model: "model-b".into(),
+            reasoning_effort: Some("high".into()),
+            temperature: Some(serde_json::Number::from_f64(0.25).unwrap()),
+            max_tokens: Some(2_048),
+            stop: Some(vec!["done".into()]),
+        },
+        adapter_defaults: Some(SessionCallConfigAdapterDefaults {
+            reasoning_effort: true,
+            max_tokens: true,
+        }),
+        system: Some("system prompt".into()),
+        tools: Some(vec![SessionToolSchema {
+            name: "echo".into(),
+            description: "Echo input".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        }]),
+    };
+    let latest_context = SessionRequestContext {
+        provider: "provider-b".into(),
+        model: "model-b".into(),
+        context_window: None,
+    };
+    log.append_request_header(latest.clone(), SessionRequestHeaderReason::Change, true)
+        .unwrap();
+    log.append_request_context(latest_context.clone()).unwrap();
+    log.append_user_message(user_message("user-request", "hello"))
+        .unwrap();
+    log.finish_step(turn, step).unwrap();
+    log.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    assert_eq!(log.request_header(), Some(latest.clone()));
+    assert_eq!(log.request_context(), Some(latest_context.clone()));
+    assert_eq!(log.surface().nodes, vec![6]);
+    assert_eq!(log.derive_messages().len(), 1);
+
+    let restored = SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap();
+    assert_eq!(restored.request_header(), Some(latest));
+    assert_eq!(restored.request_context(), Some(latest_context));
+
+    let mut detached_header = restored.request_header().unwrap();
+    detached_header.system = Some("mutated".into());
+    let mut detached_context = restored.request_context().unwrap();
+    detached_context.provider = "mutated".into();
+    assert_eq!(
+        restored.request_header().unwrap().system.as_deref(),
+        Some("system prompt")
+    );
+    assert_eq!(restored.request_context().unwrap().provider, "provider-b");
+}
+
+#[test]
+fn invalid_request_state_fails_before_log_mutation() {
+    let mut log = SessionLog::new_at(SessionId::new("request-invalid").unwrap(), 1).unwrap();
+    assert_eq!(
+        log.append_request_context(SessionRequestContext {
+            provider: "provider".into(),
+            model: "model".into(),
+            context_window: None,
+        })
+        .unwrap_err(),
+        SessionError::NoOpenTurn
+    );
+    assert!(log.events().is_empty());
+
+    log.start_turn().unwrap();
+    let baseline = log.events().to_vec();
+    assert!(matches!(
+        log.append_request_header(
+            request_header("", "model"),
+            SessionRequestHeaderReason::Initial,
+            false,
+        ),
+        Err(SessionError::InvalidRequestHeader { .. })
+    ));
+
+    let mut invalid_defaults = request_header("provider", "model");
+    invalid_defaults.adapter_defaults = Some(SessionCallConfigAdapterDefaults {
+        reasoning_effort: true,
+        max_tokens: false,
+    });
+    assert!(matches!(
+        log.append_request_header(invalid_defaults, SessionRequestHeaderReason::Initial, false,),
+        Err(SessionError::InvalidRequestHeader { .. })
+    ));
+    assert!(matches!(
+        log.append_request_context(SessionRequestContext {
+            provider: "provider".into(),
+            model: String::new(),
+            context_window: None,
+        }),
+        Err(SessionError::InvalidRequestContext { .. })
+    ));
+    assert_eq!(log.events(), baseline);
+
+    let mut noncanonical = request_header("provider", "model");
+    noncanonical.system = Some(String::new());
+    let mut corrupt = baseline;
+    corrupt.push(SessionEvent {
+        seq: 1,
+        time_ms: 2,
+        kind: SessionEventKind::RequestHeader {
+            request: SessionRequestHeader {
+                header: noncanonical,
+                reason: SessionRequestHeaderReason::Initial,
+                starts_series: false,
+            },
+        },
+    });
+    assert!(matches!(
+        SessionLog::restore(log.header().clone(), corrupt),
+        Err(SessionError::InvalidRequestHeader { .. })
+    ));
+}
+
+#[test]
+fn request_json_rejects_unknown_legacy_or_noncanonical_shapes() {
+    let request = SessionRequestHeader {
+        header: request_header("provider", "model"),
+        reason: SessionRequestHeaderReason::Resume,
+        starts_series: true,
+    };
+    let encoded = request.to_json_value().unwrap();
+    assert_eq!(
+        SessionRequestHeader::from_json_value(&encoded).unwrap(),
+        request
+    );
+
+    for invalid in [
+        serde_json::json!({
+            "header": { "config": { "provider": "p", "model": "m" } },
+            "reason": "fallback"
+        }),
+        serde_json::json!({
+            "header": { "config": { "provider": "p", "model": "m" } },
+            "reason": "initial", "startsSeries": false
+        }),
+        serde_json::json!({
+            "header": { "config": { "provider": "p", "model": "m" }, "system": null },
+            "reason": "initial"
+        }),
+        serde_json::json!({
+            "header": {
+                "config": { "provider": "p", "model": "m" },
+                "adapterDefaults": {}
+            },
+            "reason": "initial"
+        }),
+        serde_json::json!({
+            "header": { "config": { "provider": "p", "model": "m", "unknown": true } },
+            "reason": "initial"
+        }),
+    ] {
+        assert_eq!(
+            SessionRequestHeader::from_json_value(&invalid).unwrap_err(),
+            SessionError::InvalidRequestHeaderEncoding
+        );
+    }
+
+    let context = SessionRequestContext {
+        provider: "provider".into(),
+        model: "model".into(),
+        context_window: Some(16_384),
+    };
+    assert_eq!(
+        SessionRequestContext::from_json_value(&context.to_json_value().unwrap()).unwrap(),
+        context
+    );
+    for invalid in [
+        serde_json::json!({ "provider": "p", "model": "m", "contextWindow": null }),
+        serde_json::json!({ "provider": "p", "model": "m", "unknown": true }),
+    ] {
+        assert_eq!(
+            SessionRequestContext::from_json_value(&invalid).unwrap_err(),
+            SessionError::InvalidRequestContextEncoding
+        );
+    }
 }
 
 #[test]
