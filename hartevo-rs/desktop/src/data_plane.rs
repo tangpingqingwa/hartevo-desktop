@@ -7488,6 +7488,181 @@ mod tests {
         assert_eq!(checkpoints[0].events.len(), expected_events.len() + 2);
     }
 
+    fn observe_cordis_execution_events(plane: &DesktopDataPlane) -> Arc<AtomicUsize> {
+        use hartevo_cordis::{events as cordis_events, session_events};
+
+        let execution_events = Arc::new(AtomicUsize::new(0));
+        plane.with_cordis_host(|host| {
+            let session_count = Arc::clone(&execution_events);
+            host.context_mut()
+                .on_emit(session_events::SESSION_EVENT, move |_| {
+                    session_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            let agent_count = Arc::clone(&execution_events);
+            host.context_mut()
+                .on_emit(cordis_events::AGENT_CREATED, move |_| {
+                    agent_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            let tool_count = Arc::clone(&execution_events);
+            host.context_mut()
+                .on_emit(cordis_events::TOOLS_RESULT, move |_| {
+                    tool_count.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+        });
+        execution_events
+    }
+
+    fn desktop_cordis_session(
+        plane: &DesktopDataPlane,
+        id: &str,
+    ) -> (
+        Arc<hartevo_cordis::SessionStore>,
+        hartevo_cordis::SessionHandle,
+    ) {
+        use hartevo_cordis::{SessionId, SessionStore};
+
+        plane.with_cordis_host(|host| {
+            let sessions = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("restored Session store");
+            let restored = sessions
+                .get(&SessionId::new(id).unwrap())
+                .expect("Session lookup")
+                .expect("repaired Session");
+            (sessions, restored)
+        })
+    }
+
+    fn assert_durable_crash_repair(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        event_count: usize,
+        repair_time_ms: i64,
+    ) {
+        use hartevo_storage::{PersistedSessionEventKind, PersistedTurnEndReason};
+
+        let secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let key = DatabaseKey::from_secret(&secret).expect("database key");
+        let store = ProjectStore::open(&plane.database_path, &key).expect("Session store read");
+        let checkpoints = store
+            .load_session_checkpoints()
+            .expect("durable repaired Session");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].events.len(), event_count);
+        assert_eq!(
+            checkpoints[0].events[2].kind,
+            PersistedSessionEventKind::StepEnd { turn: 1, step: 1 }
+        );
+        assert_eq!(
+            checkpoints[0].events[3].kind,
+            PersistedSessionEventKind::TurnEnd {
+                turn: 1,
+                reason: PersistedTurnEndReason::Interrupted,
+            }
+        );
+        assert_eq!(checkpoints[0].events[2].time_ms, repair_time_ms);
+        assert_eq!(checkpoints[0].events[3].time_ms, repair_time_ms);
+    }
+
+    #[tokio::test]
+    async fn crashed_cordis_session_is_repaired_durably_once_before_restore() {
+        use hartevo_cordis::{SessionEventKind, SessionId, SessionStore, TurnEndReason};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let data_root = directory.path().join("desktop-session-crash-repair");
+        let secrets = MemorySecretStore::default();
+        let first = DesktopDataPlane::at_data_root(&data_root).expect("first Desktop plane");
+        first
+            .initialize_with(&secrets, observed_at())
+            .expect("initialize and bind Session persistence");
+
+        let (sessions, session, real_events) = first.with_cordis_host(|host| {
+            let sessions = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("Cordis Session store");
+            let session = sessions
+                .create(SessionId::new("desktop-crashed-session").unwrap())
+                .expect("live Session");
+            let turn = session.start_turn().expect("turn start");
+            session.start_step(turn).expect("step start");
+            let events = session.events().expect("open events");
+            (sessions, session, events)
+        });
+        assert!(sessions.flush(&session).await.expect("durable open flush"));
+
+        assert!(matches!(
+            first.load_with(&secrets, observed_at()).unwrap(),
+            DesktopLoadState::Ready(_)
+        ));
+        assert_eq!(
+            session.events().unwrap(),
+            real_events,
+            "live rebind must not close an active Session"
+        );
+        drop(session);
+        drop(sessions);
+        drop(first);
+
+        let second = DesktopDataPlane::at_data_root(&data_root).expect("restarted Desktop plane");
+        let execution_events = observe_cordis_execution_events(&second);
+
+        assert!(matches!(
+            second.load_with(&secrets, observed_at()).unwrap(),
+            DesktopLoadState::Ready(_)
+        ));
+        assert_eq!(
+            execution_events.load(Ordering::SeqCst),
+            0,
+            "repair and restore must not execute Session, agent, or tool listeners"
+        );
+
+        let (_, restored) = desktop_cordis_session(&second, "desktop-crashed-session");
+        let repaired_events = restored.events().expect("repaired events");
+        let repair_time_ms = real_events.last().expect("last real event").time_ms;
+        assert_eq!(
+            &repaired_events[real_events.len()..],
+            [
+                hartevo_cordis::SessionEvent {
+                    seq: 2,
+                    time_ms: repair_time_ms,
+                    kind: SessionEventKind::StepEnd { turn: 1, step: 1 },
+                },
+                hartevo_cordis::SessionEvent {
+                    seq: 3,
+                    time_ms: repair_time_ms,
+                    kind: SessionEventKind::TurnEnd {
+                        turn: 1,
+                        reason: TurnEndReason::Interrupted,
+                    },
+                },
+            ]
+        );
+
+        assert_durable_crash_repair(&second, &secrets, repaired_events.len(), repair_time_ms);
+        assert_eq!(restored.start_turn().expect("next turn"), 2);
+        drop(restored);
+        drop(second);
+
+        let third = DesktopDataPlane::at_data_root(&data_root).expect("second restart");
+        assert!(matches!(
+            third.load_with(&secrets, observed_at()).unwrap(),
+            DesktopLoadState::Ready(_)
+        ));
+        let (_, restored) = desktop_cordis_session(&third, "desktop-crashed-session");
+        assert_eq!(
+            restored.events().unwrap(),
+            repaired_events,
+            "repeated startup must not append duplicate closers"
+        );
+    }
+
     fn production_preview_broker() -> EffectBroker {
         DesktopDataPlane::waiting_approval_broker()
     }

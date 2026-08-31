@@ -451,7 +451,7 @@ impl DesktopSessionPersistence {
 
     fn bind_and_restore(
         &self,
-        store: ProjectStore,
+        mut store: ProjectStore,
         sessions: &SessionStore,
     ) -> Result<usize, DesktopSessionPersistenceError> {
         let checkpoints = store
@@ -459,21 +459,36 @@ impl DesktopSessionPersistence {
             .into_iter()
             .map(decode_checkpoint)
             .collect::<Result<Vec<_>, _>>()?;
-        for (header, events) in &checkpoints {
-            SessionLog::restore(header.clone(), events.clone())?;
+        let mut prepared = Vec::with_capacity(checkpoints.len());
+        for (header, events) in checkpoints {
+            let mut log = SessionLog::restore(header.clone(), events)?;
             if let Some(live) = sessions.get(&header.id)? {
                 let live_header = live.header()?;
                 let live_events = live.events()?;
-                if live_header != *header || !live_events.starts_with(events) {
+                if live_header != header || !live_events.starts_with(log.events()) {
                     return Err(DesktopSessionPersistenceError::LiveSessionDiverged(
                         header.id.to_string(),
                     ));
                 }
+                prepared.push((header, log.events().to_vec(), true, false));
+            } else {
+                let repaired = log.repair_interrupted_tail()?;
+                prepared.push((header, log.events().to_vec(), false, repaired));
             }
         }
+
+        for (header, events, live, repaired) in &prepared {
+            if !live && *repaired {
+                store.persist_session_checkpoint(&encode_checkpoint(&SessionCheckpoint {
+                    header: header.clone(),
+                    events: events.clone(),
+                }))?;
+            }
+        }
+
         let mut restored = 0;
-        for (header, events) in checkpoints {
-            if sessions.get(&header.id)?.is_none() {
+        for (header, events, live, _) in prepared {
+            if !live {
                 sessions.restore(header, events)?;
                 restored += 1;
             }

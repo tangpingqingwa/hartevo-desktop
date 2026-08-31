@@ -344,12 +344,46 @@ impl SessionLog {
         Ok(())
     }
 
+    /// Close a durable turn left open by a crashed process.
+    ///
+    /// Synthetic closers reuse the final real event timestamp so cold-start
+    /// repair is deterministic. A balanced log is unchanged, making repeated
+    /// startup repair idempotent.
+    pub fn repair_interrupted_tail(&mut self) -> Result<bool, SessionError> {
+        let Some(turn) = self.state.open_turn else {
+            return Ok(false);
+        };
+        let time_ms = self
+            .events
+            .last()
+            .ok_or(SessionError::EventSequenceOverflow)?
+            .time_ms;
+        if let Some(step) = self.state.open_step {
+            self.append_at(SessionEventKind::StepEnd { turn, step }, time_ms)?;
+        }
+        self.append_at(
+            SessionEventKind::TurnEnd {
+                turn,
+                reason: TurnEndReason::Interrupted,
+            },
+            time_ms,
+        )?;
+        Ok(true)
+    }
+
     fn append(&mut self, kind: SessionEventKind) -> Result<&SessionEvent, SessionError> {
+        self.append_at(kind, Utc::now().timestamp_millis())
+    }
+
+    fn append_at(
+        &mut self,
+        kind: SessionEventKind,
+        time_ms: i64,
+    ) -> Result<&SessionEvent, SessionError> {
         let mut next_state = self.state;
         next_state.apply(&kind)?;
         let seq =
             u64::try_from(self.events.len()).map_err(|_| SessionError::EventSequenceOverflow)?;
-        let time_ms = Utc::now().timestamp_millis();
         if time_ms < 0 {
             return Err(SessionError::InvalidEventTime { seq, time_ms });
         }
