@@ -187,6 +187,7 @@ fn teardown_reverses_provides() {
     for key in [
         keys::TOOLS,
         keys::LLM,
+        keys::SESSIONS,
         keys::AGENTS,
         keys::DOMAIN,
         keys::EFFECT_BROKER,

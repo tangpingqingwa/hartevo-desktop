@@ -4,6 +4,7 @@
 use crate::context::{Context, CordisError, keys};
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
+use crate::session::{SessionId, SessionStore, TurnEndReason};
 use crate::surface::{
     AgentRef, AgentsSurface, DomainSurface, EffectBrokerSurface, LlmStream, LlmSurface,
     RuntimeSurface, ToolCall, ToolsSurface, events, register_agent, run_tools_pipeline, stream_llm,
@@ -14,6 +15,7 @@ pub const AGENT_LOOP_KEYS: &[&str] = &[
     keys::AGENTS,
     keys::TOOLS,
     keys::LLM,
+    keys::SESSIONS,
     keys::DOMAIN,
     keys::EFFECT_BROKER,
 ];
@@ -71,7 +73,34 @@ pub struct AgentStepResult {
 /// then read Domain facts and write externally only through Effect Broker.
 pub fn run_agent_step(ctx: &mut Context, step: AgentStep) -> Result<AgentStepResult, CordisError> {
     require_loop_surfaces(ctx)?;
-    enforce_invariants(ctx)?;
+    let sessions = ctx
+        .sessions::<SessionStore>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::SESSIONS.to_string()]))?;
+    let session = sessions.get_or_create(SessionId::new(step.id.clone())?)?;
+    let turn = session.start_turn()?;
+    if let Err(error) = enforce_invariants(ctx) {
+        session.finish_turn(turn, TurnEndReason::Blocked)?;
+        return Err(error);
+    }
+    let session_step = session.start_step(turn)?;
+
+    let result = run_ready_agent_step(ctx, step);
+    session.finish_step(turn, session_step)?;
+    session.finish_turn(
+        turn,
+        if result.is_ok() {
+            TurnEndReason::Completed
+        } else {
+            TurnEndReason::Error
+        },
+    )?;
+    result
+}
+
+fn run_ready_agent_step(
+    ctx: &mut Context,
+    step: AgentStep,
+) -> Result<AgentStepResult, CordisError> {
     // Runtime may name OpenInterpreter as an adapter plugin; it is not the loop.
     let _runtime = ctx.runtime::<RuntimeSurface>();
 
@@ -102,6 +131,9 @@ fn require_loop_surfaces(ctx: &Context) -> Result<(), CordisError> {
     }
     if ctx.llm::<LlmSurface>().is_none() {
         missing.push(keys::LLM.to_string());
+    }
+    if ctx.sessions::<SessionStore>().is_none() {
+        missing.push(keys::SESSIONS.to_string());
     }
     if ctx.domain::<DomainSurface>().is_none() {
         missing.push(keys::DOMAIN.to_string());

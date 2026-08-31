@@ -100,6 +100,7 @@ fn missing_inject_keys_are_missing_dependencies() {
             keys::AGENTS.to_string(),
             keys::TOOLS.to_string(),
             keys::LLM.to_string(),
+            keys::SESSIONS.to_string(),
             keys::DOMAIN.to_string(),
             keys::EFFECT_BROKER.to_string(),
         ])
@@ -112,6 +113,7 @@ fn missing_inject_keys_are_missing_dependencies() {
         ctx.mount(AgentLoop).unwrap_err(),
         CordisError::MissingDependencies(vec![
             keys::LLM.to_string(),
+            keys::SESSIONS.to_string(),
             keys::DOMAIN.to_string(),
             keys::EFFECT_BROKER.to_string(),
         ])
@@ -122,6 +124,7 @@ fn missing_inject_keys_are_missing_dependencies() {
             keys::AGENTS.to_string(),
             keys::TOOLS.to_string(),
             keys::LLM.to_string(),
+            keys::SESSIONS.to_string(),
             keys::DOMAIN.to_string(),
             keys::EFFECT_BROKER.to_string(),
         ])
@@ -184,6 +187,7 @@ fn teardown_undoes_agents_and_loop_listeners() {
     for key in [
         keys::TOOLS,
         keys::LLM,
+        keys::SESSIONS,
         keys::AGENTS,
         keys::DOMAIN,
         keys::EFFECT_BROKER,

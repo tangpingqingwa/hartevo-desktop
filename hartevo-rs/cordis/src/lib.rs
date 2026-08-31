@@ -27,6 +27,7 @@ mod kernel;
 mod loader;
 mod registry;
 mod service;
+mod session;
 mod surface;
 
 pub use agent::{AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, run_agent_step};
@@ -81,6 +82,10 @@ pub use service::{
     AssociatedAccessor, AssociatedAccessorHandle, CallableService, Service, ServiceAssociation,
     ServiceCall, ServiceCaller, ServiceHandle, ServiceOptions, ServiceOrigin, ServiceShadow,
     ServiceViewKind, associated_key, merge_service_config,
+};
+pub use session::{
+    SESSION_FORMAT_VERSION, SessionCancelCause, SessionError, SessionEvent, SessionEventKind,
+    SessionHandle, SessionHeader, SessionId, SessionLog, SessionStore, TurnEndReason,
 };
 pub use surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmStream,
