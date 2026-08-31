@@ -22,6 +22,7 @@ mod effect;
 mod event;
 mod fiber;
 mod host;
+mod inbox;
 mod invariants;
 mod kernel;
 mod loader;
@@ -61,6 +62,7 @@ pub use fiber::{
 pub use host::{
     CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, host_is_cordis_loop, host_plugin_ids,
 };
+pub use inbox::{AgentInbox, AgentInboxOutcome, AgentInboxTarget};
 pub use invariants::{
     InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, enforce_runtime_invariants,
     missing as invariant_missing,

@@ -82,6 +82,19 @@ pub enum PersistedSessionCancelCause {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PersistedAgentInboxTarget {
+    NextTurn,
+    NextStep,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedAgentInboxOutcome {
+    Canceled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistedTurnEndReason {
     Completed,
@@ -116,6 +129,19 @@ pub enum PersistedSessionEventKind {
     StepEnd {
         turn: u64,
         step: u64,
+    },
+    AgentInboxSpliced {
+        target: PersistedAgentInboxTarget,
+        start: u64,
+        #[serde(
+            rename = "removedCount",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        removed_count: Option<u64>,
+        inserted: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<PersistedAgentInboxOutcome>,
     },
     UserMessage {
         message: serde_json::Value,
@@ -376,6 +402,37 @@ fn validate_event_payload(
         | PersistedSessionEventKind::TurnEnd { turn, .. } => (Some(*turn), None),
         PersistedSessionEventKind::StepStart { turn, step }
         | PersistedSessionEventKind::StepEnd { turn, step } => (Some(*turn), Some(*step)),
+        PersistedSessionEventKind::AgentInboxSpliced {
+            start,
+            removed_count,
+            inserted,
+            outcome,
+            ..
+        } => {
+            if *removed_count == Some(0) {
+                return Err(StorageError::InvalidSessionCheckpoint(
+                    "agent inbox zero removed count must be omitted",
+                ));
+            }
+            if removed_count.is_none() && inserted.is_empty() {
+                return Err(StorageError::InvalidSessionCheckpoint(
+                    "agent inbox splice must insert or remove",
+                ));
+            }
+            if outcome.is_some() && removed_count.is_none() {
+                return Err(StorageError::InvalidSessionCheckpoint(
+                    "agent inbox cancellation outcome requires a removal",
+                ));
+            }
+            sqlite_u64(*start, "agent inbox splice start")?;
+            if let Some(removed_count) = removed_count {
+                sqlite_u64(*removed_count, "agent inbox removed count")?;
+            }
+            for message in inserted {
+                validate_message_json(message)?;
+            }
+            (None, None)
+        }
         PersistedSessionEventKind::UserMessage { message, surface } => {
             validate_message_json(message)?;
             validate_surface_json(surface.as_ref())?;
@@ -724,6 +781,94 @@ mod tests {
         assert!(store.persist_session_checkpoint(&complete).unwrap());
         assert!(!store.persist_session_checkpoint(&complete).unwrap());
         assert_eq!(store.load_session_checkpoints().unwrap(), vec![complete]);
+    }
+
+    #[test]
+    fn agent_inbox_splice_round_trips_with_exact_wire_fields() {
+        let event = PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::AgentInboxSpliced {
+                target: PersistedAgentInboxTarget::NextTurn,
+                start: 0,
+                removed_count: None,
+                inserted: vec![user_message()],
+                outcome: None,
+            },
+        };
+        let encoded = serde_json::to_value(&event).unwrap();
+        let splice = &encoded["kind"]["agent_inbox_spliced"];
+        assert_eq!(splice["target"], "next-turn");
+        assert!(splice.get("removedCount").is_none());
+        assert!(splice.get("removed_count").is_none());
+        assert_eq!(
+            serde_json::from_value::<PersistedSessionEvent>(encoded).unwrap(),
+            event
+        );
+
+        let durable = checkpoint(vec![event]);
+        let mut store = ProjectStore::in_memory().unwrap();
+        assert!(store.persist_session_checkpoint(&durable).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![durable]);
+    }
+
+    #[test]
+    fn malformed_agent_inbox_splice_is_rejected_before_storage() {
+        let cases = [
+            (
+                PersistedSessionEventKind::AgentInboxSpliced {
+                    target: PersistedAgentInboxTarget::NextTurn,
+                    start: 0,
+                    removed_count: Some(0),
+                    inserted: vec![user_message()],
+                    outcome: None,
+                },
+                "agent inbox zero removed count must be omitted",
+            ),
+            (
+                PersistedSessionEventKind::AgentInboxSpliced {
+                    target: PersistedAgentInboxTarget::NextTurn,
+                    start: 0,
+                    removed_count: None,
+                    inserted: vec![],
+                    outcome: None,
+                },
+                "agent inbox splice must insert or remove",
+            ),
+            (
+                PersistedSessionEventKind::AgentInboxSpliced {
+                    target: PersistedAgentInboxTarget::NextTurn,
+                    start: 0,
+                    removed_count: None,
+                    inserted: vec![user_message()],
+                    outcome: Some(PersistedAgentInboxOutcome::Canceled),
+                },
+                "agent inbox cancellation outcome requires a removal",
+            ),
+            (
+                PersistedSessionEventKind::AgentInboxSpliced {
+                    target: PersistedAgentInboxTarget::NextTurn,
+                    start: 0,
+                    removed_count: None,
+                    inserted: vec![serde_json::Value::Null],
+                    outcome: None,
+                },
+                "message payload must be a JSON object",
+            ),
+        ];
+        for (kind, expected) in cases {
+            let mut store = ProjectStore::in_memory().unwrap();
+            let invalid = checkpoint(vec![PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind,
+            }]);
+            assert!(matches!(
+                store.persist_session_checkpoint(&invalid),
+                Err(StorageError::InvalidSessionCheckpoint(actual)) if actual == expected
+            ));
+            assert!(store.load_session_checkpoints().unwrap().is_empty());
+        }
     }
 
     #[test]

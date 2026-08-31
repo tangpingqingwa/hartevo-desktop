@@ -1,0 +1,234 @@
+use std::sync::{Arc, Mutex};
+
+use hartevo_cordis::{
+    AgentInboxTarget, CordisHost, SessionContentBlock, SessionError, SessionEvent,
+    SessionEventKind, SessionHeader, SessionId, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionStore, TurnEndReason, session_events,
+};
+
+fn user_message(id: &str, text: &str) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::Text { text: text.into() }],
+        source: SessionMessageSource::User,
+    }
+}
+
+#[test]
+fn append_commits_before_projection_and_contains_reentrant_mutation() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("inbox-order").unwrap())
+        .unwrap();
+    let inbox = session.inbox();
+    let shared = session.clone().inbox();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let reentry_errors = Arc::new(Mutex::new(Vec::new()));
+
+    let callback_inbox = inbox.clone();
+    let callback_observed = Arc::clone(&observed);
+    let callback_errors = Arc::clone(&reentry_errors);
+    host.context_mut()
+        .on_emit(session_events::SESSION_EVENT, move |record| {
+            if !matches!(
+                record.event.kind,
+                SessionEventKind::AgentInboxSpliced { .. }
+            ) {
+                return;
+            }
+            callback_observed
+                .lock()
+                .unwrap()
+                .push(callback_inbox.next_turn().unwrap());
+            callback_errors.lock().unwrap().push(
+                callback_inbox
+                    .append_next_turn(user_message("nested", "nested"))
+                    .unwrap_err(),
+            );
+        })
+        .unwrap();
+
+    let outer = user_message("outer", "outer");
+    inbox.append_next_turn(outer.clone()).unwrap();
+
+    assert_eq!(*observed.lock().unwrap(), [Vec::<SessionMessage>::new()]);
+    assert_eq!(
+        shared.next_turn().unwrap().as_slice(),
+        std::slice::from_ref(&outer)
+    );
+    assert_eq!(
+        *reentry_errors.lock().unwrap(),
+        [SessionError::InboxMutationInProgress {
+            id: SessionId::new("inbox-order").unwrap(),
+        }]
+    );
+    assert_eq!(session.events().unwrap().len(), 1);
+    assert_eq!(session.derive_messages().unwrap(), []);
+    assert!(matches!(
+        &session.events().unwrap()[0].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            start: 0,
+            removed_count: None,
+            inserted,
+            outcome: None,
+        } if inserted == &[outer]
+    ));
+
+    let invalid = SessionMessage {
+        id: "assistant".into(),
+        role: SessionMessageRole::Assistant,
+        content: vec![],
+        source: SessionMessageSource::Model {
+            provider: "mock".into(),
+            model: "mock".into(),
+        },
+    };
+    assert!(matches!(
+        inbox.append_next_turn(invalid),
+        Err(SessionError::UnexpectedMessageRole {
+            event_type: "agent/inbox/spliced",
+            ..
+        })
+    ));
+    assert_eq!(session.events().unwrap().len(), 1);
+}
+
+#[test]
+fn claim_requires_the_exact_open_turn_and_removes_only_the_first_message() {
+    let host = CordisHost::boot(false).unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("inbox-claim").unwrap())
+        .unwrap();
+    let inbox = session.inbox();
+    let first = user_message("first", "first");
+    let second = user_message("second", "second");
+    inbox.append_next_turn(first.clone()).unwrap();
+    inbox.append_next_turn(second.clone()).unwrap();
+
+    assert_eq!(inbox.claim_next_turn(1), Err(SessionError::NoOpenTurn));
+    let turn = session.start_turn().unwrap();
+    assert_eq!(
+        inbox.claim_next_turn(turn + 1),
+        Err(SessionError::TurnMismatch {
+            expected: turn,
+            actual: turn + 1,
+        })
+    );
+    assert_eq!(
+        session.clone().inbox().claim_next_turn(turn).unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        inbox.next_turn().unwrap().as_slice(),
+        std::slice::from_ref(&second)
+    );
+    assert!(matches!(
+        &session.events().unwrap().last().unwrap().kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            start: 0,
+            removed_count: Some(1),
+            inserted,
+            outcome: None,
+        } if inserted.is_empty()
+    ));
+
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+    assert_eq!(inbox.claim_next_turn(turn), Err(SessionError::NoOpenTurn));
+    let turn = session.start_turn().unwrap();
+    assert_eq!(inbox.claim_next_turn(turn).unwrap(), Some(second));
+    let event_count = session.events().unwrap().len();
+    assert_eq!(inbox.claim_next_turn(turn).unwrap(), None);
+    assert_eq!(session.events().unwrap().len(), event_count);
+    assert!(!inbox.has_pending().unwrap());
+}
+
+#[test]
+fn restore_rejects_invalid_splices_and_forks_start_with_an_empty_owned_suffix() {
+    let store = SessionStore::new();
+    let parent = store
+        .create(SessionId::new("inbox-parent").unwrap())
+        .unwrap();
+    let parent_message = user_message("parent", "parent");
+    parent
+        .inbox()
+        .append_next_turn(parent_message.clone())
+        .unwrap();
+
+    let restored = SessionStore::new()
+        .restore(parent.header().unwrap(), parent.events().unwrap())
+        .unwrap();
+    assert_eq!(
+        restored.inbox().next_turn().unwrap().as_slice(),
+        std::slice::from_ref(&parent_message)
+    );
+
+    let child = store
+        .fork(parent.id(), None, SessionId::new("inbox-child").unwrap())
+        .unwrap();
+    assert_eq!(child.header().unwrap().seed_length, Some(1));
+    assert!(child.inbox().next_turn().unwrap().is_empty());
+    let child_message = user_message("child", "child");
+    child
+        .inbox()
+        .append_next_turn(child_message.clone())
+        .unwrap();
+    let cold_child = SessionStore::new()
+        .restore(child.header().unwrap(), child.events().unwrap())
+        .unwrap();
+    assert_eq!(cold_child.inbox().next_turn().unwrap(), [child_message]);
+
+    let invalid_header =
+        SessionHeader::new_at(SessionId::new("invalid-splice").unwrap(), 1).unwrap();
+    let invalid = vec![SessionEvent {
+        seq: 0,
+        time_ms: 1,
+        kind: SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            start: 1,
+            removed_count: None,
+            inserted: vec![user_message("invalid", "invalid")],
+            outcome: None,
+        },
+    }];
+    assert!(matches!(
+        SessionStore::new().restore(invalid_header, invalid),
+        Err(SessionError::InvalidPersistedInboxSplice { seq: 0 })
+    ));
+
+    let duplicate_header =
+        SessionHeader::new_at(SessionId::new("duplicate-splice").unwrap(), 1).unwrap();
+    let duplicate = user_message("duplicate", "duplicate");
+    let duplicate_events = vec![
+        SessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: SessionEventKind::AgentInboxSpliced {
+                target: AgentInboxTarget::NextTurn,
+                start: 0,
+                removed_count: None,
+                inserted: vec![duplicate.clone()],
+                outcome: None,
+            },
+        },
+        SessionEvent {
+            seq: 1,
+            time_ms: 2,
+            kind: SessionEventKind::AgentInboxSpliced {
+                target: AgentInboxTarget::NextTurn,
+                start: 1,
+                removed_count: None,
+                inserted: vec![duplicate],
+                outcome: None,
+            },
+        },
+    ];
+    assert!(matches!(
+        SessionStore::new().restore(duplicate_header, duplicate_events),
+        Err(SessionError::InvalidPersistedInboxSplice { seq: 1 })
+    ));
+}
