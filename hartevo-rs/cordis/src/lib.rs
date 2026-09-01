@@ -38,7 +38,7 @@ pub use agent::{
     admit_agent_step, build_agent_call, commit_agent_stream, commit_agent_tool_results,
     dispatch_agent_call, log_agent_call, prepare_agent_call, prepare_agent_step,
     prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream, run_agent_step,
-    schedule_agent_tool_calls,
+    run_agent_tool_batch, schedule_agent_tool_calls,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,

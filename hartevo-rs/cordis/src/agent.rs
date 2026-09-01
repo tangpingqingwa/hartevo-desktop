@@ -21,9 +21,10 @@ use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
     EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
     PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
-    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface, assemble_system_prompt, events,
-    prepare_llm_call, prepare_tool_execution, register_agent, run_tools_pipeline, stream_llm,
-    stream_llm_request, stream_prepared_llm,
+    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface, assemble_system_prompt,
+    dispatch_tool_execution, events, finalize_tool_execution, post_tool_execution,
+    prepare_llm_call, prepare_tool_execution, register_agent, run_tools_pipeline,
+    settle_denied_tool_execution, stream_llm, stream_llm_request, stream_prepared_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
@@ -282,6 +283,12 @@ pub enum AgentBuildAdmission {
 }
 
 /// Durable raw-stream outcome retained for downstream block assembly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentToolBatchState {
+    Ready,
+    Started,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecordedAgentStream {
     session_id: SessionId,
@@ -294,6 +301,7 @@ pub struct RecordedAgentStream {
     tool_calls_scheduled: bool,
     tool_result_seqs: Vec<u64>,
     tool_results_committed: bool,
+    tool_batch_state: AgentToolBatchState,
 }
 
 impl RecordedAgentStream {
@@ -347,6 +355,11 @@ impl RecordedAgentStream {
     #[must_use]
     pub const fn tool_results_committed(&self) -> bool {
         self.tool_results_committed
+    }
+
+    #[must_use]
+    pub const fn tool_batch_started(&self) -> bool {
+        matches!(self.tool_batch_state, AgentToolBatchState::Started)
     }
 }
 
@@ -613,6 +626,7 @@ pub async fn record_agent_stream(
         tool_calls_scheduled: false,
         tool_result_seqs: Vec::new(),
         tool_results_committed: false,
+        tool_batch_state: AgentToolBatchState::Ready,
     })
 }
 
@@ -949,6 +963,52 @@ pub fn commit_agent_tool_results(
     }
     recorded.tool_results_committed = true;
     Ok(planned.into_iter().map(|result| result.message).collect())
+}
+
+/// Run the exact scheduled calls through the sequential N52–N57 baseline.
+///
+/// Starting is one-shot even when a later stage fails, so a caller cannot
+/// replay a body whose durable result became uncertain.
+pub fn run_agent_tool_batch(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+) -> Result<Vec<ToolExecutionResult>, CordisError> {
+    if matches!(recorded.tool_batch_state, AgentToolBatchState::Started)
+        || recorded.tool_results_committed
+    {
+        return Err(invalid_stream_protocol(
+            "one tool batch start per recorded stream without execution replay",
+        )
+        .into());
+    }
+    let request = logged.call().request();
+    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session = agent_session(ctx, &session_id)?;
+    if !recorded.tool_result_seqs.is_empty()
+        || !durable_tool_results(&session, request.turn(), request.step())?.is_empty()
+    {
+        return Err(
+            invalid_stream_protocol("a fresh tool-result boundary before starting bodies").into(),
+        );
+    }
+    let inputs = prepare_agent_tool_calls(ctx, logged, recorded)?;
+    recorded.tool_batch_state = AgentToolBatchState::Started;
+    let mut results = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let preparation = prepare_tool_execution(ctx, input)?;
+        let result = match preparation {
+            ToolExecutionPreparation::Dispatch(prepared) => {
+                let outcome = dispatch_tool_execution(ctx, prepared)?;
+                let outcome = post_tool_execution(ctx, outcome)?;
+                finalize_tool_execution(ctx, outcome)
+            }
+            ToolExecutionPreparation::Denied(denied) => settle_denied_tool_execution(ctx, denied)?,
+        };
+        results.push(result);
+    }
+    commit_agent_tool_results(ctx, logged, recorded, &results)?;
+    Ok(results)
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -493,11 +493,30 @@ impl ToolDispatchExecution {
 }
 
 /// One call stopped before dispatch with a model-readable reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct DeniedToolExecution {
     input: ToolExecutionInput,
     reason: String,
+    result_projection: ToolResultProjection,
 }
+
+impl fmt::Debug for DeniedToolExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeniedToolExecution")
+            .field("input", &self.input)
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for DeniedToolExecution {
+    fn eq(&self, other: &Self) -> bool {
+        self.input == other.input && self.reason == other.reason
+    }
+}
+
+impl Eq for DeniedToolExecution {}
 
 impl DeniedToolExecution {
     #[must_use]
@@ -2560,8 +2579,17 @@ pub fn prepare_tool_execution(
         .tools::<ToolsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
     let Ok(registered) = tools.registration(input.name()) else {
-        return Ok(denied_tool_execution(input, "tool registry is unavailable"));
+        return Ok(denied_tool_execution(
+            input,
+            "tool registry is unavailable",
+            ToolResultProjection::default(),
+        ));
     };
+    let result_projection = registered
+        .as_ref()
+        .map_or_else(ToolResultProjection::default, |registration| {
+            registration.result_projection.clone()
+        });
     let proposal = ToolCall::from_execution_input(&input);
     let decided = ctx.waterfall(events::TOOLS_PRE_EXECUTE, proposal)?;
     if decided.call_id != input.call_id()
@@ -2572,6 +2600,7 @@ pub fn prepare_tool_execution(
         return Ok(denied_tool_execution(
             input,
             "tools/pre-execute cannot rewrite durable tool identity or arguments",
+            result_projection,
         ));
     }
     match decided.decision.as_str() {
@@ -2581,7 +2610,7 @@ pub fn prepare_tool_execution(
             } else {
                 decided.result
             };
-            return Ok(denied_tool_execution(input, reason));
+            return Ok(denied_tool_execution(input, reason, result_projection));
         }
         "ask" => {
             let reason = if decided.result.is_empty() {
@@ -2592,24 +2621,26 @@ pub fn prepare_tool_execution(
             } else {
                 decided.result
             };
-            return Ok(denied_tool_execution(input, reason));
+            return Ok(denied_tool_execution(input, reason, result_projection));
         }
         "allow" => {}
         decision => {
             return Ok(denied_tool_execution(
                 input,
                 format!("invalid tools/pre-execute decision \"{decision}\""),
+                result_projection,
             ));
         }
     }
     if let Some(reason) = tools.guard_reason(&input) {
-        return Ok(denied_tool_execution(input, reason));
+        return Ok(denied_tool_execution(input, reason, result_projection));
     }
     let Some(registered) = registered else {
         let name = input.name().to_string();
         return Ok(denied_tool_execution(
             input,
             format!("unknown tool \"{name}\""),
+            result_projection,
         ));
     };
     let mode = ToolsSurface::classify_registration(&input, &registered);
@@ -2617,6 +2648,7 @@ pub fn prepare_tool_execution(
         return Ok(denied_tool_execution(
             input,
             "tool registration changed during pre-execution",
+            result_projection,
         ));
     }
     Ok(ToolExecutionPreparation::Dispatch(PreparedToolExecution {
@@ -2630,11 +2662,29 @@ pub fn prepare_tool_execution(
 fn denied_tool_execution(
     input: ToolExecutionInput,
     reason: impl Into<String>,
+    result_projection: ToolResultProjection,
 ) -> ToolExecutionPreparation {
     ToolExecutionPreparation::Denied(DeniedToolExecution {
         input,
         reason: reason.into(),
+        result_projection,
     })
+}
+
+/// Settle one N52 policy or registry denial through canonical post/final
+/// result handling without invoking a tool body.
+pub(crate) fn settle_denied_tool_execution(
+    ctx: &mut Context,
+    denied: DeniedToolExecution,
+) -> Result<ToolExecutionResult, CordisError> {
+    let DeniedToolExecution {
+        input,
+        reason,
+        result_projection,
+    } = denied;
+    let outcome = tool_dispatch_failure(input, reason, result_projection);
+    let outcome = post_tool_execution(ctx, outcome)?;
+    Ok(finalize_tool_execution(ctx, outcome))
 }
 
 /// Consume one N52 dispatch preparation and invoke only its exact live Rust
