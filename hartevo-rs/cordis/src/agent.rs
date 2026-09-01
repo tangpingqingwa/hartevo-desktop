@@ -14,15 +14,16 @@ use crate::session::{
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
-    EffectBrokerSurface, LlmError, LlmStream, LlmSurface, PreparedLlmCall, RuntimeSurface,
-    ToolCall, ToolsSurface, events, prepare_llm_call, register_agent, run_tools_pipeline,
-    stream_llm,
+    EffectBrokerSurface, LlmError, LlmStream, LlmSurface, PreparedLlmCall, PromptAssembly,
+    RuntimeSurface, ToolCall, ToolsSurface, assemble_system_prompt, events, prepare_llm_call,
+    register_agent, run_tools_pipeline, stream_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
 pub const AGENT_LOOP_KEYS: &[&str] = &[
     keys::AGENTS,
     keys::TOOLS,
+    keys::SYSTEM_PROMPT,
     keys::LLM,
     keys::SESSIONS,
     keys::DOMAIN,
@@ -86,6 +87,7 @@ pub struct PreparedAgentRequest {
     step: u64,
     config: SessionCallConfig,
     messages: Vec<SessionMessage>,
+    assembly: PromptAssembly,
     starts_request_series: bool,
     surface_generation: u64,
 }
@@ -114,6 +116,11 @@ impl PreparedAgentRequest {
     #[must_use]
     pub fn messages(&self) -> &[SessionMessage] {
         &self.messages
+    }
+
+    #[must_use]
+    pub const fn assembly(&self) -> &PromptAssembly {
+        &self.assembly
     }
 
     #[must_use]
@@ -157,6 +164,11 @@ impl PreparedAgentCall {
     #[must_use]
     pub fn messages(&self) -> &[SessionMessage] {
         self.request.messages()
+    }
+
+    #[must_use]
+    pub fn assembly(&self) -> &PromptAssembly {
+        self.request.assembly()
     }
 
     #[must_use]
@@ -340,6 +352,7 @@ pub fn admit_agent_request(
         step,
         config: request.into_config(),
         messages,
+        assembly: admission.assembly().clone(),
         starts_request_series,
         surface_generation,
     }))
@@ -392,8 +405,8 @@ pub fn log_agent_call(
     let header = SessionEpochHeader {
         config: call.config().clone(),
         adapter_defaults: call.adapter_defaults().cloned(),
-        system: None,
-        tools: None,
+        system: call.assembly().system().map(str::to_string),
+        tools: (!call.assembly().tools().is_empty()).then(|| call.assembly().tools().to_vec()),
     };
     let context = SessionRequestContext {
         provider: call.config().provider.clone(),
@@ -469,7 +482,14 @@ fn prepare_agent_step_for_session(
     step: u64,
 ) -> Result<AgentPreStep, CordisError> {
     let claimed = session.inbox().claim(target, turn)?;
-    let proposal = AgentPreStep::enter(AgentRef::new(session.id().as_str()), turn, step, claimed);
+    let assembly = assemble_system_prompt(ctx)?;
+    let proposal = AgentPreStep::enter(
+        AgentRef::new(session.id().as_str()),
+        turn,
+        step,
+        claimed,
+        assembly,
+    );
     let proposal = ctx.waterfall(events::AGENT_PRE_STEP, proposal)?;
     if let AgentPreStepDecision::Enter { messages, .. } = proposal.decision() {
         for message in messages {
@@ -617,6 +637,12 @@ fn require_loop_surfaces(ctx: &Context) -> Result<(), CordisError> {
     }
     if ctx.tools::<ToolsSurface>().is_none() {
         missing.push(keys::TOOLS.to_string());
+    }
+    if ctx
+        .system_prompt::<crate::surface::SystemPromptSurface>()
+        .is_none()
+    {
+        missing.push(keys::SYSTEM_PROMPT.to_string());
     }
     if ctx.llm::<LlmSurface>().is_none() {
         missing.push(keys::LLM.to_string());

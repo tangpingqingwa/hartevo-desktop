@@ -15,12 +15,13 @@ use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionMessage, SessionStore,
-    events as session_events,
+    SessionToolSchema, events as session_events,
 };
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
     keys::TOOLS,
+    keys::SYSTEM_PROMPT,
     keys::LLM,
     keys::SESSIONS,
     keys::AGENTS,
@@ -34,7 +35,14 @@ pub const MAPPED_KEYS: &[&str] = &[
 pub mod events {
     use crate::event::{Emit, EventKey, EventSchemaId, Waterfall};
 
-    use super::{AgentPreStep, AgentRef, AgentRequest, LlmStream, ToolCall};
+    use super::{AgentPreStep, AgentRef, AgentRequest, LlmStream, PromptAssembly, ToolCall};
+
+    /// Replace or wrap one detached system-prompt/tool-schema assembly.
+    pub const SYSTEM_PROMPT_ASSEMBLE: EventKey<Waterfall, PromptAssembly, PromptAssembly> =
+        EventKey::new(
+            EventSchemaId::new("hartevo.system-prompt.assemble.v1"),
+            "system-prompt/assemble",
+        );
 
     /// Allow / deny / ask waterfall before a tool body runs.
     pub const TOOLS_PRE_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
@@ -98,6 +106,150 @@ impl SurfaceOwner {
             Self::Hartevo => "hartevo",
             Self::OpenInterpreter => "openinterpreter",
         }
+    }
+}
+
+/// One reversible static system-prompt contribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSection {
+    pub name: String,
+    pub order: i64,
+    pub text: String,
+}
+
+impl PromptSection {
+    #[must_use]
+    pub fn new(name: impl Into<String>, order: i64, text: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            order,
+            text: text.into(),
+        }
+    }
+}
+
+/// Frozen model-visible system text and tool schemas for one agent step.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromptAssembly {
+    system: Option<String>,
+    tools: Vec<SessionToolSchema>,
+}
+
+impl PromptAssembly {
+    #[must_use]
+    pub fn new(system: Option<String>, tools: Vec<SessionToolSchema>) -> Self {
+        Self { system, tools }
+    }
+
+    #[must_use]
+    pub fn system(&self) -> Option<&str> {
+        self.system.as_deref()
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> &[SessionToolSchema] {
+        &self.tools
+    }
+
+    #[must_use]
+    pub fn with_system(mut self, system: Option<String>) -> Self {
+        self.system = system;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<SessionToolSchema>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    fn validated(mut self) -> Result<Self, PromptError> {
+        if self.system.as_ref().is_some_and(String::is_empty) {
+            self.system = None;
+        }
+        let mut names = HashSet::new();
+        for tool in &self.tools {
+            if tool.name.is_empty() {
+                return Err(PromptError::InvalidToolName);
+            }
+            if !names.insert(tool.name.clone()) {
+                return Err(PromptError::DuplicateTool {
+                    name: tool.name.clone(),
+                });
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// Fail-closed prompt and model-visible tool registration failures.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum PromptError {
+    #[error("system prompt section name must be non-empty")]
+    InvalidSectionName,
+    #[error("system prompt section `{name}` is already registered")]
+    DuplicateSection { name: String },
+    #[error("model-visible tool name must be non-empty")]
+    InvalidToolName,
+    #[error("model-visible tool `{name}` is already registered")]
+    DuplicateTool { name: String },
+    #[error("system prompt registry mutex is poisoned")]
+    RegistryPoisoned,
+    #[error("tools registry mutex is poisoned")]
+    ToolsRegistryPoisoned,
+}
+
+/// Cordis-owned registry for deterministic prompt-section assembly.
+#[derive(Debug, Clone, Default)]
+pub struct SystemPromptSurface {
+    sections: Arc<Mutex<Vec<PromptSection>>>,
+}
+
+impl SystemPromptSurface {
+    fn register(&self, section: PromptSection) -> Result<(), PromptError> {
+        if section.name.is_empty() {
+            return Err(PromptError::InvalidSectionName);
+        }
+        let mut sections = self
+            .sections
+            .lock()
+            .map_err(|_| PromptError::RegistryPoisoned)?;
+        if sections
+            .iter()
+            .any(|existing| existing.name == section.name)
+        {
+            return Err(PromptError::DuplicateSection { name: section.name });
+        }
+        sections.push(section);
+        Ok(())
+    }
+
+    fn unregister(&self, name: &str) {
+        let mut sections = self
+            .sections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sections.retain(|section| section.name != name);
+    }
+
+    fn assemble(&self, tools: Vec<SessionToolSchema>) -> Result<PromptAssembly, PromptError> {
+        let mut sections = self
+            .sections
+            .lock()
+            .map_err(|_| PromptError::RegistryPoisoned)?
+            .clone();
+        sections.sort_by(|left, right| {
+            left.order
+                .cmp(&right.order)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let system = sections
+            .into_iter()
+            .map(|section| section.text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        PromptAssembly::new(Some(system), tools).validated()
     }
 }
 
@@ -397,6 +549,7 @@ pub struct AgentPreStep {
     turn: u64,
     step: u64,
     decision: AgentPreStepDecision,
+    assembly: PromptAssembly,
 }
 
 impl AgentPreStep {
@@ -405,6 +558,7 @@ impl AgentPreStep {
         turn: u64,
         step: u64,
         messages: Vec<SessionMessage>,
+        assembly: PromptAssembly,
     ) -> Self {
         Self {
             agent,
@@ -414,6 +568,7 @@ impl AgentPreStep {
                 messages,
                 starts_request_series: false,
             },
+            assembly,
         }
     }
 
@@ -435,6 +590,11 @@ impl AgentPreStep {
     #[must_use]
     pub const fn decision(&self) -> &AgentPreStepDecision {
         &self.decision
+    }
+
+    #[must_use]
+    pub const fn assembly(&self) -> &PromptAssembly {
+        &self.assembly
     }
 
     #[must_use]
@@ -532,32 +692,96 @@ impl AgentRequest {
 }
 
 /// Tools pipeline service provided at `ctx.tools`.
+#[derive(Debug, Default)]
+struct ToolsState {
+    names: Vec<String>,
+    schemas: Vec<SessionToolSchema>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolsSurface {
-    names: Arc<Mutex<Vec<String>>>,
+    state: Arc<Mutex<ToolsState>>,
 }
 
 impl ToolsSurface {
     fn new() -> Self {
         Self {
-            names: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(Mutex::new(ToolsState::default())),
         }
     }
 
-    pub fn register(&self, name: impl Into<String>) {
-        self.names.lock().expect("tools names").push(name.into());
+    fn register_name(&self, name: String) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .names
+            .push(name);
     }
 
-    pub fn unregister(&self, name: &str) {
-        self.names
+    fn register_schema(&self, schema: SessionToolSchema) -> Result<(), PromptError> {
+        let name = schema.name.clone();
+        if name.is_empty() {
+            return Err(PromptError::InvalidToolName);
+        }
+        let mut state = self
+            .state
             .lock()
-            .expect("tools names")
-            .retain(|registered| registered != name);
+            .map_err(|_| PromptError::ToolsRegistryPoisoned)?;
+        if state.schemas.iter().any(|existing| existing.name == name) {
+            return Err(PromptError::DuplicateTool { name });
+        }
+        state.names.push(name);
+        state.schemas.push(schema);
+        Ok(())
+    }
+
+    fn unregister_name(&self, name: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = state
+            .names
+            .iter()
+            .rposition(|registered| registered == name)
+        {
+            state.names.remove(index);
+        }
+    }
+
+    fn unregister_schema(&self, name: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = state
+            .names
+            .iter()
+            .rposition(|registered| registered == name)
+        {
+            state.names.remove(index);
+        }
+        state.schemas.retain(|schema| schema.name != name);
     }
 
     #[must_use]
     pub fn names(&self) -> Vec<String> {
-        self.names.lock().expect("tools names").clone()
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .names
+            .clone()
+    }
+
+    fn schemas(&self) -> Result<Vec<SessionToolSchema>, PromptError> {
+        let mut schemas = self
+            .state
+            .lock()
+            .map_err(|_| PromptError::ToolsRegistryPoisoned)?
+            .schemas
+            .clone();
+        schemas.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(schemas)
     }
 }
 
@@ -988,6 +1212,7 @@ pub(crate) fn map_surfaces(
 
     let session_dispatcher = ctx.event_reentry()?;
     ctx.provide(keys::TOOLS, ToolsSurface::new())?;
+    ctx.provide(keys::SYSTEM_PROMPT, SystemPromptSurface::default())?;
     ctx.provide(keys::LLM, LlmSurface::new())?;
     ctx.provide(
         keys::SESSIONS,
@@ -1002,6 +1227,7 @@ pub(crate) fn map_surfaces(
 }
 
 fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
+    validate_mapped_event(ctx, events::SYSTEM_PROMPT_ASSEMBLE)?;
     validate_mapped_event(ctx, events::TOOLS_PRE_EXECUTE)?;
     validate_mapped_event(ctx, events::TOOLS_EXECUTE)?;
     validate_mapped_event(ctx, events::TOOLS_POST_EXECUTE)?;
@@ -1049,6 +1275,7 @@ pub(crate) fn rebind_hartevo_domain(
 }
 
 fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
+    ctx.lock_event_key(events::SYSTEM_PROMPT_ASSEMBLE)?;
     ctx.lock_event_key(events::TOOLS_PRE_EXECUTE)?;
     ctx.lock_event_key(events::TOOLS_EXECUTE)?;
     ctx.lock_event_key(events::TOOLS_POST_EXECUTE)?;
@@ -1081,9 +1308,56 @@ pub fn register_tool(ctx: &mut Context, name: impl Into<String>) -> Result<(), C
         ]));
     };
     let name = name.into();
-    tools.register(name.clone());
-    ctx.effect(move || tools.unregister(&name));
+    tools.register_name(name.clone());
+    ctx.effect(move || tools.unregister_name(&name));
     Ok(())
+}
+
+/// Register one model-visible tool schema and reverse it with its Cordis owner.
+pub fn register_tool_schema(
+    ctx: &mut Context,
+    schema: SessionToolSchema,
+) -> Result<RegistrationHandle, CordisError> {
+    let Some(tools) = ctx.tools::<ToolsSurface>() else {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::TOOLS.to_string(),
+        ]));
+    };
+    let name = schema.name.clone();
+    tools.register_schema(schema)?;
+    let registered = Arc::clone(&tools);
+    Ok(ctx.effect(move || registered.unregister_schema(&name)))
+}
+
+/// Register one ordered static system-prompt section with exact teardown.
+pub fn register_prompt_section(
+    ctx: &mut Context,
+    section: PromptSection,
+) -> Result<RegistrationHandle, CordisError> {
+    let Some(prompt) = ctx.system_prompt::<SystemPromptSurface>() else {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::SYSTEM_PROMPT.to_string(),
+        ]));
+    };
+    let name = section.name.clone();
+    prompt.register(section)?;
+    let registered = Arc::clone(&prompt);
+    Ok(ctx.effect(move || registered.unregister(&name)))
+}
+
+/// Freeze current Cordis prompt and model-visible tool contributions, then run
+/// the authoritative assembly Waterfall over that detached value.
+pub fn assemble_system_prompt(ctx: &mut Context) -> Result<PromptAssembly, CordisError> {
+    let prompt = ctx
+        .system_prompt::<SystemPromptSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::SYSTEM_PROMPT.to_string()]))?;
+    let tools = ctx
+        .tools::<ToolsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let assembly = prompt.assemble(tools.schemas()?)?;
+    ctx.waterfall(events::SYSTEM_PROMPT_ASSEMBLE, assembly)?
+        .validated()
+        .map_err(Into::into)
 }
 
 /// Register a model stream on `ctx.llm` and reverse it on teardown.
@@ -1173,8 +1447,13 @@ pub fn stream_llm(ctx: &mut Context, request: LlmStream) -> Result<LlmStream, Co
 #[must_use]
 pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
     match name.as_ref() {
-        "tools/pre-execute" | "tools/execute" | "tools/post-execute" | "llm/stream"
-        | "agent/pre-step" | "agent/request" => Some(DispatchMode::Waterfall),
+        "system-prompt/assemble"
+        | "tools/pre-execute"
+        | "tools/execute"
+        | "tools/post-execute"
+        | "llm/stream"
+        | "agent/pre-step"
+        | "agent/request" => Some(DispatchMode::Waterfall),
         "tools/result" | "agent/created" | "agent/disposed" | "session/event" => {
             Some(DispatchMode::Emit)
         }
@@ -1218,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn all_nine_surface_event_descriptors_preflight_before_any_provider_mutation() {
+    fn all_ten_surface_event_descriptors_preflight_before_any_provider_mutation() {
         let mut ctx = Context::new();
         let incompatible_last_key = EventKey::<Emit, AgentRef, ()>::new(
             events::AGENT_REQUEST.schema_id(),
@@ -1242,6 +1521,7 @@ mod tests {
             Some(descriptor_before)
         );
         for name in [
+            events::SYSTEM_PROMPT_ASSEMBLE.name(),
             events::TOOLS_PRE_EXECUTE.name(),
             events::TOOLS_EXECUTE.name(),
             events::TOOLS_POST_EXECUTE.name(),

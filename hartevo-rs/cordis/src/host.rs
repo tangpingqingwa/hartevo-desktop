@@ -25,8 +25,8 @@ use crate::service::Service;
 use crate::session::SessionStore;
 use crate::surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
-    LlmSurface, RuntimeSurface, SurfaceOwner, ToolsSurface, events, map_surfaces,
-    rebind_hartevo_domain,
+    LlmSurface, RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolsSurface, events,
+    map_surfaces, rebind_hartevo_domain,
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
@@ -780,9 +780,10 @@ impl CordisHost {
     }
 
     #[must_use]
-    pub fn mounted_keys(&self) -> [&'static str; 8] {
+    pub fn mounted_keys(&self) -> [&'static str; 9] {
         [
             keys::TOOLS,
+            keys::SYSTEM_PROMPT,
             keys::LLM,
             keys::SESSIONS,
             keys::AGENTS,
@@ -904,7 +905,7 @@ fn desktop_surfaces(openinterpreter: bool) -> HartevoSurfaces {
     }
 }
 
-/// Boot-time host check: the eight keys, Hartevo ownership of Domain/Effect,
+/// Boot-time host check: the nine keys, Hartevo ownership of Domain/Effect,
 /// Receipt ≠ Verification, and local-first/sqlcipher/eval_gate.
 ///
 /// Consent and approval are *not* required here. They are step-time
@@ -918,6 +919,11 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
     if host.ctx.tools::<ToolsSurface>().is_none() {
         return Err(CordisError::MissingDependencies(vec![
             keys::TOOLS.to_string(),
+        ]));
+    }
+    if host.ctx.system_prompt::<SystemPromptSurface>().is_none() {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::SYSTEM_PROMPT.to_string(),
         ]));
     }
     if host.ctx.llm::<LlmSurface>().is_none() {

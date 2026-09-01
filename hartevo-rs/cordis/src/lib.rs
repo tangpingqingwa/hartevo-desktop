@@ -104,7 +104,9 @@ pub use session::{
 pub use surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DesktopSurface,
     DomainSurface, EffectBrokerSurface, LlmAdapter, LlmError, LlmModelReasoning, LlmResolvedModel,
-    LlmStream, LlmSurface, MAPPED_KEYS, PreparedLlmCall, RuntimeSurface, SurfaceOwner, ToolCall,
-    ToolsSurface, events, expected_mode, prepare_llm_call, register_agent, register_llm_adapter,
-    register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
+    LlmStream, LlmSurface, MAPPED_KEYS, PreparedLlmCall, PromptAssembly, PromptError,
+    PromptSection, RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolCall, ToolsSurface,
+    assemble_system_prompt, events, expected_mode, prepare_llm_call, register_agent,
+    register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
+    register_tool_schema, run_tools_pipeline, stream_llm,
 };
