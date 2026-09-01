@@ -1,13 +1,15 @@
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentRef, AgentStatus, AgentStatusChange, AgentStep, AgentsSurface, AuthorityScope,
-    CordisError, CordisHost, DomainCommandBinding, DomainCommandKind, DomainSurface,
-    EffectBrokerSurface, EffectExecutionBinding, EffectReconciliationBinding, EnvironmentOverlay,
-    HOST_PLUGIN_IDS, InvariantGate, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
-    KernelConsentState, KernelConsentStatus, LoaderContext, OPENINTERPRETER,
-    OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding, RuntimeSurface, SurfaceOwner, ToolCall,
-    enforce_invariants, events, host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
-    register_agent,
+    AgentRef, AgentStatus, AgentStatusChange, AgentStep, AgentTurnStopping, AgentsSurface,
+    AuthorityScope, BailOutcome, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
+    DomainSurface, EffectBrokerSurface, EffectExecutionBinding, EffectReconciliationBinding,
+    EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate, KernelApproval, KernelApprovalDecision,
+    KernelConsentRecord, KernelConsentState, KernelConsentStatus, LifecycleCancellation,
+    LoaderContext, NonBail, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding,
+    RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionId,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamChunk,
+    SurfaceOwner, ToolCall, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
+    host_plugin_ids, invariant_missing, keys, register_agent,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -801,6 +803,181 @@ async fn runtime_agent_status_and_when_idle_follow_the_exact_permit() {
     assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
     assert_eq!(waiter.await.unwrap(), AgentStatus::Idle);
     completion.announce().unwrap();
+    assert!(agents.list().is_empty());
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one journey keeps permit publication, exact Agent callbacks, explicit Session routing, and settlement together"
+)]
+async fn permit_bound_turn_uses_one_live_agent_and_an_explicit_session_identity() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+
+    let session_id = SessionId::new("mission-a").unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions.create(session_id.clone()).unwrap();
+    session
+        .inbox()
+        .append_next_turn(SessionMessage {
+            id: "runtime-input-a".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "run the exact live agent".into(),
+            }],
+            source: SessionMessageSource::User,
+        })
+        .unwrap();
+
+    let expected = std::sync::Arc::new(std::sync::Mutex::new(None::<AgentRef>));
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<AgentRef>::new()));
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+
+    {
+        let expected = std::sync::Arc::clone(&expected);
+        let observed = std::sync::Arc::clone(&observed);
+        let agents = std::sync::Arc::clone(&agents);
+        host.context_mut()
+            .on_waterfall(events::AGENT_PRE_STEP, move |proposal, next| {
+                let expected = expected.lock().unwrap().clone().unwrap();
+                assert!(proposal.agent().is_same_lifecycle(&expected));
+                assert_eq!(proposal.agent().status(), AgentStatus::Running);
+                assert!(
+                    agents
+                        .list()
+                        .iter()
+                        .any(|agent| agent.is_same_lifecycle(proposal.agent()))
+                );
+                observed.lock().unwrap().push(proposal.agent().clone());
+                next(proposal)
+            })
+            .unwrap();
+    }
+    {
+        let expected = std::sync::Arc::clone(&expected);
+        let observed = std::sync::Arc::clone(&observed);
+        let agents = std::sync::Arc::clone(&agents);
+        host.context_mut()
+            .on_waterfall(events::AGENT_REQUEST, move |request, next| {
+                let expected = expected.lock().unwrap().clone().unwrap();
+                assert!(request.agent().is_same_lifecycle(&expected));
+                assert_eq!(request.agent().status(), AgentStatus::Running);
+                assert!(
+                    agents
+                        .list()
+                        .iter()
+                        .any(|agent| agent.is_same_lifecycle(request.agent()))
+                );
+                observed.lock().unwrap().push(request.agent().clone());
+                next(request)
+            })
+            .unwrap();
+    }
+    {
+        let expected = std::sync::Arc::clone(&expected);
+        let observed = std::sync::Arc::clone(&observed);
+        let agents = std::sync::Arc::clone(&agents);
+        host.context_mut()
+            .on_serial(
+                events::AGENT_TURN_STOPPING,
+                move |stopping: std::sync::Arc<AgentTurnStopping>| {
+                    let expected = expected.lock().unwrap().clone().unwrap();
+                    assert!(stopping.agent().is_same_lifecycle(&expected));
+                    assert_eq!(stopping.agent().status(), AgentStatus::Running);
+                    assert!(
+                        agents
+                            .list()
+                            .iter()
+                            .any(|agent| agent.is_same_lifecycle(stopping.agent()))
+                    );
+                    observed.lock().unwrap().push(stopping.agent().clone());
+                    std::future::ready(Ok::<_, std::convert::Infallible>(BailOutcome::Continue(
+                        NonBail::Undefined,
+                    )))
+                },
+            )
+            .unwrap();
+    }
+    {
+        let session_id = session_id.clone();
+        host.context_mut()
+            .on_waterfall(events::LLM_STREAM, move |stream, _next| {
+                assert_eq!(
+                    stream.request().and_then(|request| request.session_id()),
+                    Some(&session_id)
+                );
+                stream.with_chunk_stream(Box::pin(futures_util::stream::iter([
+                    SessionStreamChunk::Finish {
+                        reason: SessionFinishReason::Stop,
+                        replay_state: None,
+                    },
+                ])))
+            })
+            .unwrap();
+    }
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    assert_ne!(permit.agent().id, session_id.as_str());
+    *expected.lock().unwrap() = Some(permit.agent().clone());
+    assert_eq!(
+        host.run_authorized_runtime_agent_turn(
+            &permit,
+            &session_id,
+            SessionCallConfig {
+                provider: "mock".into(),
+                model: "model".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+            &LifecycleCancellation::default(),
+        )
+        .await,
+        Err(CordisError::RuntimePermitMismatch)
+    );
+
+    permit.announce_started().unwrap();
+    let published = agents.list().into_iter().next().unwrap();
+    assert!(published.is_same_lifecycle(permit.agent()));
+    let outcome = host
+        .run_authorized_runtime_agent_turn(
+            &permit,
+            &session_id,
+            SessionCallConfig {
+                provider: "mock".into(),
+                model: "model".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+            &LifecycleCancellation::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(outcome.steps(), 1);
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 3);
+    assert!(
+        observed
+            .iter()
+            .all(|agent| agent.is_same_lifecycle(permit.agent()))
+    );
+    drop(observed);
+
+    host.finish_runtime(permit).unwrap().announce().unwrap();
     assert!(agents.list().is_empty());
 }
 
