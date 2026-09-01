@@ -882,6 +882,22 @@ impl EventReentry {
             .map_err(|error| into_cordis_error(key.name(), DispatchMode::Emit, error))
     }
 
+    /// Dispatch one internal Waterfall from a scheduler worker while retaining
+    /// the exact Context generation, Fiber owner, and target scope.
+    pub(crate) fn waterfall<P>(
+        &self,
+        key: EventKey<Waterfall, P, P>,
+        payload: P,
+    ) -> Result<P, CordisError>
+    where
+        P: Any + Send + 'static,
+    {
+        let _permit = self.enter()?;
+        self.events
+            .waterfall(key, payload, self.dispatch_target.as_ref())
+            .map_err(|error| into_cordis_error(key.name(), DispatchMode::Waterfall, error))
+    }
+
     /// Dispatch every matching Parallel listener and wait for all of them.
     ///
     /// The returned count is the exact callback snapshot selected for this

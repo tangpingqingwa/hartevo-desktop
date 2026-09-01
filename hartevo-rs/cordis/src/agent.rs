@@ -2,6 +2,8 @@
 //! never the loop and never the owner of Domain or Effect.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc;
 
 use futures_util::StreamExt;
 
@@ -22,10 +24,14 @@ use crate::surface::{
     EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
     PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
     ToolExecutionPreparation, ToolExecutionResult, ToolsSurface, assemble_system_prompt,
-    dispatch_tool_execution, events, finalize_tool_execution, post_tool_execution,
-    prepare_llm_call, prepare_tool_execution, register_agent, run_tools_pipeline,
-    settle_denied_tool_execution, stream_llm, stream_llm_request, stream_prepared_llm,
+    denied_tool_dispatch_outcome, dispatch_tool_execution, events, finalize_tool_execution,
+    post_tool_execution, prepare_llm_call, prepare_tool_execution, register_agent,
+    run_tools_pipeline, schedule_tool_dispatch, settle_denied_tool_execution, stream_llm,
+    stream_llm_request, stream_prepared_llm,
 };
+
+/// DeepSeek Harness-compatible default bound for overlapping tool bodies.
+pub const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 10;
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
 pub const AGENT_LOOP_KEYS: &[&str] = &[
@@ -974,6 +980,21 @@ pub fn run_agent_tool_batch(
     logged: &LoggedAgentCall,
     recorded: &mut RecordedAgentStream,
 ) -> Result<Vec<ToolExecutionResult>, CordisError> {
+    run_agent_tool_batch_with_limit(ctx, logged, recorded, DEFAULT_MAX_PARALLEL_TOOL_CALLS)
+}
+
+/// Run one exact tool batch with a bounded rolling body pool and exclusive
+/// barriers. Policy, post-processing, result observation, and durable commit
+/// remain model ordered on the driver thread.
+pub fn run_agent_tool_batch_with_limit(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+    max_parallel_tool_calls: usize,
+) -> Result<Vec<ToolExecutionResult>, CordisError> {
+    if max_parallel_tool_calls == 0 {
+        return Err(invalid_stream_protocol("a positive parallel tool-call limit").into());
+    }
     if matches!(recorded.tool_batch_state, AgentToolBatchState::Started)
         || recorded.tool_results_committed
     {
@@ -995,20 +1016,142 @@ pub fn run_agent_tool_batch(
     let inputs = prepare_agent_tool_calls(ctx, logged, recorded)?;
     recorded.tool_batch_state = AgentToolBatchState::Started;
     let mut results = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let preparation = prepare_tool_execution(ctx, input)?;
-        let result = match preparation {
-            ToolExecutionPreparation::Dispatch(prepared) => {
-                let outcome = dispatch_tool_execution(ctx, prepared)?;
-                let outcome = post_tool_execution(ctx, outcome)?;
-                finalize_tool_execution(ctx, outcome)
-            }
-            ToolExecutionPreparation::Denied(denied) => settle_denied_tool_execution(ctx, denied)?,
-        };
-        results.push(result);
+    let tools = ctx
+        .tools::<ToolsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let mut next = 0;
+    while next < inputs.len() {
+        if tools.execution_mode(&inputs[next]) == crate::surface::ToolExecutionMode::Exclusive {
+            let preparation = prepare_tool_execution(ctx, inputs[next].clone())?;
+            let result = settle_tool_preparation(ctx, preparation)?;
+            results.push(result);
+            next += 1;
+            continue;
+        }
+        let (consumed, group_results) =
+            run_parallel_tool_group(ctx, &tools, &inputs[next..], max_parallel_tool_calls)?;
+        if consumed == 0 {
+            return Err(invalid_stream_protocol("the parallel scheduler to make progress").into());
+        }
+        next += consumed;
+        results.extend(group_results);
     }
     commit_agent_tool_results(ctx, logged, recorded, &results)?;
     Ok(results)
+}
+
+fn settle_tool_preparation(
+    ctx: &mut Context,
+    preparation: ToolExecutionPreparation,
+) -> Result<ToolExecutionResult, CordisError> {
+    match preparation {
+        ToolExecutionPreparation::Dispatch(prepared) => {
+            let outcome = dispatch_tool_execution(ctx, prepared)?;
+            let outcome = post_tool_execution(ctx, outcome)?;
+            Ok(finalize_tool_execution(ctx, outcome))
+        }
+        ToolExecutionPreparation::Denied(denied) => settle_denied_tool_execution(ctx, denied),
+    }
+}
+
+fn finalize_ready_tool_slots(
+    ctx: &mut Context,
+    slots: &mut [Option<crate::surface::ToolDispatchOutcome>],
+    next_to_finalize: &mut usize,
+    results: &mut Vec<ToolExecutionResult>,
+) -> Result<(), CordisError> {
+    while let Some(outcome) = slots.get_mut(*next_to_finalize).and_then(Option::take) {
+        let outcome = post_tool_execution(ctx, outcome)?;
+        results.push(finalize_tool_execution(ctx, outcome));
+        *next_to_finalize += 1;
+    }
+    Ok(())
+}
+
+fn run_parallel_tool_group(
+    ctx: &mut Context,
+    tools: &ToolsSurface,
+    inputs: &[ToolExecutionInput],
+    max_parallel_tool_calls: usize,
+) -> Result<(usize, Vec<ToolExecutionResult>), CordisError> {
+    std::thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        let mut slots = std::iter::repeat_with(|| None)
+            .take(inputs.len())
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        let mut next_to_start = 0;
+        let mut next_to_finalize = 0;
+        let mut in_flight = 0;
+        let mut barrier_reached = false;
+        let mut pending_exclusive = None;
+
+        loop {
+            while !barrier_reached
+                && next_to_start < inputs.len()
+                && in_flight < max_parallel_tool_calls
+            {
+                if next_to_start > 0
+                    && tools.execution_mode(&inputs[next_to_start])
+                        != crate::surface::ToolExecutionMode::Parallel
+                {
+                    barrier_reached = true;
+                    break;
+                }
+                let preparation = prepare_tool_execution(ctx, inputs[next_to_start].clone())?;
+                match preparation {
+                    ToolExecutionPreparation::Denied(denied) => {
+                        slots[next_to_start] = Some(denied_tool_dispatch_outcome(denied));
+                    }
+                    ToolExecutionPreparation::Dispatch(prepared)
+                        if prepared.mode() == crate::surface::ToolExecutionMode::Exclusive =>
+                    {
+                        pending_exclusive = Some((next_to_start, prepared));
+                        barrier_reached = true;
+                    }
+                    ToolExecutionPreparation::Dispatch(prepared) => {
+                        let dispatch = schedule_tool_dispatch(ctx, prepared)?;
+                        let completion = sender.clone();
+                        let index = next_to_start;
+                        scope.spawn(move || {
+                            let outcome = catch_unwind(AssertUnwindSafe(|| dispatch.dispatch()))
+                                .unwrap_or_else(|_| {
+                                    Err(invalid_stream_protocol(
+                                        "a non-panicking tool scheduler worker",
+                                    )
+                                    .into())
+                                });
+                            let _ = completion.send((index, outcome));
+                        });
+                        in_flight += 1;
+                    }
+                }
+                next_to_start += 1;
+                finalize_ready_tool_slots(ctx, &mut slots, &mut next_to_finalize, &mut results)?;
+            }
+
+            if in_flight == 0 {
+                if let Some((index, prepared)) = pending_exclusive.take() {
+                    slots[index] = Some(dispatch_tool_execution(ctx, prepared)?);
+                    finalize_ready_tool_slots(
+                        ctx,
+                        &mut slots,
+                        &mut next_to_finalize,
+                        &mut results,
+                    )?;
+                }
+                break;
+            }
+
+            let (index, outcome) = receiver.recv().map_err(|_| {
+                invalid_stream_protocol("every started tool scheduler worker to settle")
+            })?;
+            in_flight -= 1;
+            slots[index] = Some(outcome?);
+            finalize_ready_tool_slots(ctx, &mut slots, &mut next_to_finalize, &mut results)?;
+        }
+        Ok((next_to_start, results))
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
