@@ -264,6 +264,12 @@ impl SessionRequestContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionRequestStateRecord {
+    pub header_reason: Option<SessionRequestHeaderReason>,
+    pub context_appended: bool,
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicates receive references.
 const fn is_false(value: &bool) -> bool {
     !*value
@@ -2123,6 +2129,17 @@ impl SessionHandle {
         require_step(log.open_step(), turn, step)
     }
 
+    pub(crate) fn agent_request_boundary(
+        &self,
+        turn: u64,
+        step: u64,
+    ) -> Result<(Vec<SessionMessage>, u64), SessionError> {
+        let log = self.lock()?;
+        require_turn(log.open_turn(), turn)?;
+        require_step(log.open_step(), turn, step)?;
+        Ok((log.derive_messages(), log.surface().replace_generation))
+    }
+
     pub(crate) fn append_agent_inbox_splice(
         &self,
         target: AgentInboxTarget,
@@ -2245,6 +2262,80 @@ impl SessionHandle {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn record_agent_request_state(
+        &self,
+        turn: u64,
+        step: u64,
+        header: SessionEpochHeader,
+        header_logged: bool,
+        starts_series: bool,
+        context: SessionRequestContext,
+    ) -> Result<SessionRequestStateRecord, SessionError> {
+        let header = header.canonicalized();
+        if header.config.provider != context.provider || header.config.model != context.model {
+            return Err(SessionError::InvalidRequestContext {
+                expected: "provider and model matching request/header",
+            });
+        }
+        let _permit = SessionAppendPermit::enter(&self.appending, &self.id)?;
+        let (records, recorded) = {
+            let mut log = self.lock()?;
+            require_turn(log.open_turn(), turn)?;
+            require_step(log.open_step(), turn, step)?;
+
+            let baseline = log.request_header();
+            let header_record = if !header_logged {
+                Some((
+                    if baseline.is_none() {
+                        SessionRequestHeaderReason::Initial
+                    } else {
+                        SessionRequestHeaderReason::Resume
+                    },
+                    false,
+                ))
+            } else if baseline.as_ref() != Some(&header) {
+                Some((SessionRequestHeaderReason::Change, starts_series))
+            } else if starts_series {
+                Some((SessionRequestHeaderReason::Series, false))
+            } else {
+                None
+            };
+            let context_appended = log.request_context().as_ref() != Some(&context);
+            let previous_len = log.events().len();
+            let mut candidate = log.clone();
+            if let Some((reason, starts_series)) = header_record {
+                candidate.append_request_header(header, reason, starts_series)?;
+            }
+            if context_appended {
+                candidate.append_request_context(context)?;
+            }
+            let session_header = candidate.header().clone();
+            let records = candidate.events()[previous_len..]
+                .iter()
+                .cloned()
+                .map(|event| SessionEventRecord {
+                    header: session_header.clone(),
+                    event,
+                })
+                .collect::<Vec<_>>();
+            *log = candidate;
+            (
+                records,
+                SessionRequestStateRecord {
+                    header_reason: header_record.map(|(reason, _)| reason),
+                    context_appended,
+                },
+            )
+        };
+
+        if let Some(dispatcher) = &self.event_dispatcher {
+            for record in &records {
+                let _ = dispatcher.emit_contained(events::SESSION_EVENT, record);
+            }
+        }
+        Ok(recorded)
     }
 
     pub fn append_user_message(&self, message: SessionMessage) -> Result<(), SessionError> {
@@ -2771,6 +2862,11 @@ pub enum SessionError {
     SessionAlreadyExists { id: SessionId },
     #[error("session `{id}` was not found")]
     SessionNotFound { id: SessionId },
+    #[error("agent request log state belongs to session `{expected}`, not `{actual}`")]
+    RequestLogStateSessionMismatch {
+        expected: SessionId,
+        actual: SessionId,
+    },
     #[error("session `{id}` is not live in this store")]
     SessionNotLive { id: SessionId },
     #[error("session `{id}` append is already being published")]

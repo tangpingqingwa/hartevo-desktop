@@ -3,14 +3,15 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision, AgentRef,
-    AgentRequestAdmission, AgentStep, Context, CordisError, CordisHost, DomainSurface,
-    EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
-    KernelConsentState, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
-    RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind,
-    SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
-    SessionSurfaceIntent, SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request,
-    admit_agent_step, events, keys, prepare_agent_call, prepare_agent_step, register_llm_adapter,
+    AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
+    AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, Context, CordisError,
+    CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
+    KernelApprovalDecision, KernelConsentState, LlmModelReasoning, LlmResolvedModel, LlmStream,
+    LoaderContext, LoggedAgentCall, RuntimeSurface, SessionCallConfig, SessionContentBlock,
+    SessionError, SessionEventKind, SessionHandle, SessionId, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionRequestHeaderReason, SessionStore, SessionSurfaceIntent,
+    SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
+    events, keys, log_agent_call, prepare_agent_call, prepare_agent_step, register_llm_adapter,
     run_agent_step, session_events,
 };
 
@@ -46,6 +47,18 @@ fn user_message(id: &str, text: &str) -> SessionMessage {
     }
 }
 
+fn assistant_message(id: &str, text: &str) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::Assistant,
+        content: vec![SessionContentBlock::Text { text: text.into() }],
+        source: SessionMessageSource::Model {
+            provider: "mock".into(),
+            model: "model".into(),
+        },
+    }
+}
+
 fn call_config(provider: &str, model: &str) -> SessionCallConfig {
     SessionCallConfig {
         provider: provider.into(),
@@ -55,6 +68,38 @@ fn call_config(provider: &str, model: &str) -> SessionCallConfig {
         max_tokens: None,
         stop: None,
     }
+}
+
+fn build_logged_turn(
+    ctx: &mut Context,
+    session: &SessionHandle,
+    state: &mut AgentRequestLogState,
+    message_id: &str,
+    config: SessionCallConfig,
+) -> (u64, LoggedAgentCall) {
+    session
+        .inbox()
+        .append_next_turn(user_message(message_id, message_id))
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+    let AgentBuildAdmission::Call(call) = build_agent_call(
+        ctx,
+        session.id(),
+        AgentInboxTarget::NextTurn,
+        turn,
+        1,
+        config,
+        state,
+    )
+    .unwrap() else {
+        panic!("non-empty inbox must build one logged call");
+    };
+    (turn, call)
+}
+
+fn close_logged_turn(session: &SessionHandle, turn: u64) {
+    session.finish_step(turn, 1).unwrap();
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
 }
 
 #[test]
@@ -669,6 +714,447 @@ fn agent_call_skips_adapter_on_reject_and_rechecks_step_after_preparation() {
         ),
         Err(CordisError::Session(SessionError::NoOpenStep { turn })) if turn == moved_turn
     ));
+}
+
+#[test]
+fn agent_build_logs_effective_header_context_and_deduplicates() {
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model)
+            .with_context_window(64_000)
+            .with_default_max_tokens(2_048)
+            .with_reasoning(LlmModelReasoning::new(
+                vec!["low".into()],
+                Some("low".into()),
+            )))
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("logged-agent-call").unwrap())
+        .unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+
+    let (turn, initial) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "initial",
+        call_config("mock", "model"),
+    );
+    assert_eq!(
+        initial.header_reason(),
+        Some(SessionRequestHeaderReason::Initial)
+    );
+    assert!(initial.context_appended());
+    assert_eq!(
+        initial.call().config().reasoning_effort.as_deref(),
+        Some("low")
+    );
+    assert_eq!(initial.call().config().max_tokens, Some(2_048));
+    assert_eq!(initial.call().context_window(), Some(64_000));
+    let header = session.request_header().unwrap().unwrap();
+    assert_eq!(header.config, initial.call().config().clone());
+    assert!(header.adapter_defaults.unwrap().reasoning_effort);
+    assert_eq!(header.system, None);
+    assert_eq!(header.tools, None);
+    assert_eq!(
+        session.request_context().unwrap().unwrap().context_window,
+        Some(64_000)
+    );
+    close_logged_turn(&session, turn);
+
+    let (turn, unchanged) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "unchanged",
+        call_config("mock", "model"),
+    );
+    assert_eq!(unchanged.header_reason(), None);
+    assert!(!unchanged.context_appended());
+    close_logged_turn(&session, turn);
+
+    let mut explicit = call_config("mock", "model");
+    explicit.reasoning_effort = Some("low".into());
+    explicit.max_tokens = Some(512);
+    let (turn, changed) = build_logged_turn(&mut ctx, &session, &mut state, "changed", explicit);
+    assert_eq!(
+        changed.header_reason(),
+        Some(SessionRequestHeaderReason::Change)
+    );
+    assert!(!changed.context_appended());
+    assert_eq!(
+        session.request_header().unwrap().unwrap().adapter_defaults,
+        None
+    );
+    close_logged_turn(&session, turn);
+
+    let events = session.events().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::RequestHeader { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::RequestContext { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn agent_build_preserves_series_change_and_resume_reasons() {
+    let mut ctx = mapped();
+    let pre_steps = Arc::new(AtomicUsize::new(0));
+    {
+        let pre_steps = Arc::clone(&pre_steps);
+        ctx.on_waterfall(events::AGENT_PRE_STEP, move |proposal, next| {
+            let index = pre_steps.fetch_add(1, Ordering::SeqCst);
+            let proposal = next(proposal);
+            if index == 0 {
+                proposal
+            } else {
+                proposal.with_starts_request_series()
+            }
+        })
+        .unwrap();
+    }
+    register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(
+            LlmResolvedModel::new(provider, model).with_context_window(if model == "wide" {
+                128_000
+            } else {
+                64_000
+            }),
+        )
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-reasons").unwrap())
+        .unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+    let (turn, initial) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "initial",
+        call_config("mock", "model"),
+    );
+    assert_eq!(
+        initial.header_reason(),
+        Some(SessionRequestHeaderReason::Initial)
+    );
+    close_logged_turn(&session, turn);
+
+    let (turn, series) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "series",
+        call_config("mock", "model"),
+    );
+    assert_eq!(
+        series.header_reason(),
+        Some(SessionRequestHeaderReason::Series)
+    );
+    assert!(!series.context_appended());
+    close_logged_turn(&session, turn);
+
+    let (turn, changed_series) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "wide",
+        call_config("mock", "wide"),
+    );
+    assert_eq!(
+        changed_series.header_reason(),
+        Some(SessionRequestHeaderReason::Change)
+    );
+    assert!(changed_series.context_appended());
+    assert_eq!(changed_series.call().context_window(), Some(128_000));
+    assert!(matches!(
+        session.events().unwrap().iter().rev().find_map(|event| {
+            let SessionEventKind::RequestHeader { request } = &event.kind else {
+                return None;
+            };
+            Some(request.clone())
+        }),
+        Some(request)
+            if request.reason == SessionRequestHeaderReason::Change && request.starts_series
+    ));
+    close_logged_turn(&session, turn);
+
+    let mut resumed = AgentRequestLogState::new(session.id().clone());
+    let (turn, resume) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut resumed,
+        "resume",
+        call_config("mock", "wide"),
+    );
+    assert_eq!(
+        resume.header_reason(),
+        Some(SessionRequestHeaderReason::Resume)
+    );
+    assert!(!resume.context_appended());
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn agent_build_turns_surface_replacement_into_a_series_boundary() {
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model).with_context_window(64_000))
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("surface-series").unwrap())
+        .unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+    let (turn, initial) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "before-replace",
+        call_config("mock", "model"),
+    );
+    assert_eq!(initial.call().request().surface_generation(), 0);
+    let node = session.surface().unwrap().nodes[0];
+    session
+        .append_assistant_message_with_surface(
+            turn,
+            1,
+            assistant_message("summary", "summary"),
+            SessionSurfaceIntent::replace(node, node, vec![node]),
+        )
+        .unwrap();
+    close_logged_turn(&session, turn);
+
+    let (turn, series) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "after-replace",
+        call_config("mock", "model"),
+    );
+    assert_eq!(series.call().request().surface_generation(), 1);
+    assert_eq!(
+        series.header_reason(),
+        Some(SessionRequestHeaderReason::Series)
+    );
+    assert!(!series.context_appended());
+    assert_eq!(state.surface_generation(), Some(1));
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn request_state_batch_is_atomic_and_reentry_safe() {
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model).with_context_window(64_000))
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-state-batch").unwrap())
+        .unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let complete_at_header = Arc::new(Mutex::new(false));
+    let reentry_error = Arc::new(Mutex::new(None));
+    {
+        let observed = Arc::clone(&observed);
+        let complete_at_header = Arc::clone(&complete_at_header);
+        let reentry_error = Arc::clone(&reentry_error);
+        let callback_session = session.clone();
+        ctx.on_emit(session_events::SESSION_EVENT, move |record| {
+            match &record.event.kind {
+                SessionEventKind::RequestHeader { .. } => {
+                    observed.lock().unwrap().push("header");
+                    let events = callback_session.events().unwrap();
+                    *complete_at_header.lock().unwrap() = matches!(
+                        events[events.len() - 2..],
+                        [
+                            hartevo_cordis::SessionEvent {
+                                kind: SessionEventKind::RequestHeader { .. },
+                                ..
+                            },
+                            hartevo_cordis::SessionEvent {
+                                kind: SessionEventKind::RequestContext { .. },
+                                ..
+                            },
+                        ]
+                    );
+                    *reentry_error.lock().unwrap() = Some(
+                        callback_session
+                            .append_user_message(user_message("nested", "nested"))
+                            .unwrap_err(),
+                    );
+                }
+                SessionEventKind::RequestContext { .. } => {
+                    observed.lock().unwrap().push("context");
+                }
+                _ => {}
+            }
+        })
+        .unwrap();
+    }
+    let mut state = AgentRequestLogState::new(session.id().clone());
+    let (turn, logged) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "batch",
+        call_config("mock", "model"),
+    );
+    assert_eq!(
+        logged.header_reason(),
+        Some(SessionRequestHeaderReason::Initial)
+    );
+    assert_eq!(*observed.lock().unwrap(), ["header", "context"]);
+    assert!(*complete_at_header.lock().unwrap());
+    assert_eq!(
+        *reentry_error.lock().unwrap(),
+        Some(SessionError::AppendInProgress {
+            id: session.id().clone(),
+        })
+    );
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn stale_request_state_logging_preserves_events_and_state() {
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model).with_context_window(64_000))
+    })
+    .unwrap();
+    let stale_session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-state-stale").unwrap())
+        .unwrap();
+    stale_session
+        .inbox()
+        .append_next_turn(user_message("stale", "stale"))
+        .unwrap();
+    let stale_turn = stale_session.start_turn().unwrap();
+    let AgentCallAdmission::Call(stale_call) = prepare_agent_call(
+        &mut ctx,
+        stale_session.id(),
+        AgentInboxTarget::NextTurn,
+        stale_turn,
+        1,
+        call_config("mock", "model"),
+    )
+    .unwrap() else {
+        panic!("stale fixture must prepare a call");
+    };
+    stale_session.finish_step(stale_turn, 1).unwrap();
+    let mut stale_state = AgentRequestLogState::new(stale_session.id().clone());
+    assert!(matches!(
+        log_agent_call(&ctx, &mut stale_state, stale_call),
+        Err(CordisError::Session(SessionError::NoOpenStep { turn })) if turn == stale_turn
+    ));
+    assert!(!stale_state.header_logged());
+    assert_eq!(stale_state.surface_generation(), None);
+    assert_eq!(stale_session.request_header().unwrap(), None);
+    assert_eq!(stale_session.request_context().unwrap(), None);
+}
+
+#[test]
+fn request_log_state_mismatch_and_no_call_never_touch_the_adapter_or_state() {
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let mut ctx = mapped();
+    {
+        let adapter_calls = Arc::clone(&adapter_calls);
+        register_llm_adapter(&mut ctx, ["mock"], move |provider: &str, model: &str| {
+            adapter_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LlmResolvedModel::new(provider, model))
+        })
+        .unwrap();
+    }
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-state-owner").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("mismatch", "mismatch"))
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+    let mut wrong_state = AgentRequestLogState::new(SessionId::new("different-session").unwrap());
+    assert_eq!(
+        build_agent_call(
+            &mut ctx,
+            session.id(),
+            AgentInboxTarget::NextTurn,
+            turn,
+            1,
+            call_config("mock", "model"),
+            &mut wrong_state,
+        )
+        .unwrap_err(),
+        CordisError::Session(SessionError::RequestLogStateSessionMismatch {
+            expected: SessionId::new("different-session").unwrap(),
+            actual: session.id().clone(),
+        })
+    );
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+    assert!(!wrong_state.header_logged());
+    assert!(session.inbox().has_pending().unwrap());
+    assert!(session.events().unwrap().iter().all(|event| !matches!(
+        event.kind,
+        SessionEventKind::StepStart { .. }
+            | SessionEventKind::RequestHeader { .. }
+            | SessionEventKind::RequestContext { .. }
+    )));
+
+    let mut rejected_ctx = mapped();
+    rejected_ctx
+        .on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| proposal.reject())
+        .unwrap();
+    let rejected_session = rejected_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-state-reject").unwrap())
+        .unwrap();
+    rejected_session
+        .inbox()
+        .append_next_turn(user_message("reject", "reject"))
+        .unwrap();
+    let rejected_turn = rejected_session.start_turn().unwrap();
+    let mut rejected_state = AgentRequestLogState::new(rejected_session.id().clone());
+    assert!(matches!(
+        build_agent_call(
+            &mut rejected_ctx,
+            rejected_session.id(),
+            AgentInboxTarget::NextTurn,
+            rejected_turn,
+            1,
+            call_config("missing", "model"),
+            &mut rejected_state,
+        )
+        .unwrap(),
+        AgentBuildAdmission::NoCall(proposal)
+            if proposal.decision() == &AgentPreStepDecision::Reject
+    ));
+    assert!(!rejected_state.header_logged());
+    assert_eq!(rejected_state.surface_generation(), None);
+    assert_eq!(rejected_session.request_header().unwrap(), None);
+    assert_eq!(rejected_session.request_context().unwrap(), None);
 }
 
 #[test]
