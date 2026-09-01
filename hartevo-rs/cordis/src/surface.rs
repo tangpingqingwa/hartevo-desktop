@@ -48,11 +48,14 @@ pub const MAPPED_KEYS: &[&str] = &[
 
 /// Primer event names owned by the mapped surfaces.
 pub mod events {
-    use crate::event::{BailOutcome, Emit, EventKey, EventSchemaId, Serial, Waterfall};
+    use crate::event::{
+        BailOutcome, Emit, EventKey, EventSchemaId, Serial, Waterfall, WaterfallFailure,
+    };
 
     use super::{
-        AgentPreStep, AgentRef, AgentRequest, AgentStatusChange, AgentTurnStopping, LlmStream,
-        PromptAssembly, ToolCall, ToolDispatchExecution, ToolExecutionResult, ToolPostExecution,
+        AgentPreStep, AgentRef, AgentRequest, AgentRequestError, AgentStatusChange,
+        AgentTurnStopping, LlmStream, PromptAssembly, ToolCall, ToolDispatchExecution,
+        ToolExecutionResult, ToolPostExecution,
     };
 
     /// Replace or wrap one detached system-prompt/tool-schema assembly.
@@ -126,6 +129,15 @@ pub mod events {
     pub const AGENT_REQUEST: EventKey<Waterfall, AgentRequest, AgentRequest> = EventKey::new(
         EventSchemaId::new("hartevo.agent.request.v1"),
         "agent/request",
+    );
+    /// Choose whether one normalized provider failure is terminal or retried.
+    pub const AGENT_REQUEST_ERROR: EventKey<
+        Waterfall,
+        AgentRequestError,
+        Result<AgentRequestError, WaterfallFailure>,
+    > = EventKey::new(
+        EventSchemaId::new("hartevo.agent.request-error.v1"),
+        "agent/request-error",
     );
     /// Last serial chance to queue next-step steering before a turn closes.
     pub const AGENT_TURN_STOPPING: EventKey<Serial, AgentTurnStopping, BailOutcome<()>> =
@@ -1861,6 +1873,97 @@ impl AgentRequest {
     }
 }
 
+/// Recovery action selected for one normalized provider request failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentRequestErrorAction {
+    /// Preserve the provider failure as terminal.
+    #[default]
+    Fail,
+    /// Build and dispatch a fresh request inside the same open turn and step.
+    Retry,
+}
+
+/// Immutable failed-request scope plus the replaceable recovery action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRequestError {
+    agent: AgentRef,
+    turn: u64,
+    step: u64,
+    provider: String,
+    failure: SessionLlmFailure,
+    cancellation: LifecycleCancellation,
+    action: AgentRequestErrorAction,
+}
+
+impl AgentRequestError {
+    pub(crate) fn new(
+        agent: AgentRef,
+        turn: u64,
+        step: u64,
+        provider: String,
+        failure: SessionLlmFailure,
+        cancellation: LifecycleCancellation,
+    ) -> Self {
+        Self {
+            agent,
+            turn,
+            step,
+            provider,
+            failure,
+            cancellation,
+            action: AgentRequestErrorAction::Fail,
+        }
+    }
+
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        &self.agent
+    }
+
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        self.step
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    #[must_use]
+    pub const fn failure(&self) -> &SessionLlmFailure {
+        &self.failure
+    }
+
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> AgentRequestErrorAction {
+        self.action
+    }
+
+    /// Replace only the recovery action while retaining exact failure scope.
+    #[must_use]
+    pub fn with_action(mut self, action: AgentRequestErrorAction) -> Self {
+        self.action = action;
+        self
+    }
+
+    /// Select an explicit same-step retry.
+    #[must_use]
+    pub fn retry(self) -> Self {
+        self.with_action(AgentRequestErrorAction::Retry)
+    }
+}
+
 /// Tools pipeline service provided at `ctx.tools`.
 type ToolConcurrencyClassifier =
     Arc<dyn Fn(&serde_json::Value) -> Result<bool, String> + Send + Sync>;
@@ -2692,6 +2795,7 @@ fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
     validate_mapped_event(ctx, events::AGENT_DISPOSED)?;
     validate_mapped_event(ctx, events::AGENT_PRE_STEP)?;
     validate_mapped_event(ctx, events::AGENT_REQUEST)?;
+    validate_mapped_event(ctx, events::AGENT_REQUEST_ERROR)?;
     validate_mapped_event(ctx, events::AGENT_TURN_STOPPING)?;
     validate_mapped_event(ctx, session_events::SESSION_EVENT)?;
     validate_mapped_event(ctx, session_events::SESSION_FLUSH)?;
@@ -2742,6 +2846,7 @@ fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
     ctx.lock_event_key(events::AGENT_DISPOSED)?;
     ctx.lock_event_key(events::AGENT_PRE_STEP)?;
     ctx.lock_event_key(events::AGENT_REQUEST)?;
+    ctx.lock_event_key(events::AGENT_REQUEST_ERROR)?;
     ctx.lock_event_key(events::AGENT_TURN_STOPPING)?;
     ctx.lock_event_key(session_events::SESSION_EVENT)?;
     ctx.lock_event_key(session_events::SESSION_FLUSH)?;
@@ -3610,7 +3715,8 @@ pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
         | "tools/post-execute"
         | "llm/stream"
         | "agent/pre-step"
-        | "agent/request" => Some(DispatchMode::Waterfall),
+        | "agent/request"
+        | "agent/request-error" => Some(DispatchMode::Waterfall),
         "agent/turn-stopping" => Some(DispatchMode::Serial),
         "tools/result" | "agent/created" | "agent/status" | "agent/disposed" | "session/event" => {
             Some(DispatchMode::Emit)
@@ -3655,7 +3761,7 @@ mod tests {
     }
 
     #[test]
-    fn all_fourteen_surface_event_descriptors_preflight_before_any_provider_mutation() {
+    fn all_fifteen_surface_event_descriptors_preflight_before_any_provider_mutation() {
         let mut ctx = Context::new();
         let incompatible_last_key = EventKey::<Emit, AgentTurnStopping, ()>::new(
             events::AGENT_TURN_STOPPING.schema_id(),
@@ -3690,6 +3796,7 @@ mod tests {
             events::AGENT_DISPOSED.name(),
             events::AGENT_PRE_STEP.name(),
             events::AGENT_REQUEST.name(),
+            events::AGENT_REQUEST_ERROR.name(),
         ] {
             assert_eq!(
                 ctx.event_descriptor(name),
