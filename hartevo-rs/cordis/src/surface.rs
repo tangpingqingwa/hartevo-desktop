@@ -44,7 +44,7 @@ pub mod events {
 
     use super::{
         AgentPreStep, AgentRef, AgentRequest, LlmStream, PromptAssembly, ToolCall,
-        ToolDispatchExecution,
+        ToolDispatchExecution, ToolPostExecution,
     };
 
     /// Replace or wrap one detached system-prompt/tool-schema assembly.
@@ -71,9 +71,15 @@ pub mod events {
         "hartevo/legacy-tools-execute",
     );
     /// Inspect / replace waterfall after a tool body.
-    pub const TOOLS_POST_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
-        EventSchemaId::new("hartevo.tools.post-execute.v1"),
-        "tools/post-execute",
+    pub const TOOLS_POST_EXECUTE: EventKey<Waterfall, ToolPostExecution, ToolPostExecution> =
+        EventKey::new(
+            EventSchemaId::new("hartevo.tools.post-execute.v2"),
+            "tools/post-execute",
+        );
+    /// Detached compatibility seam used only by the pre-durable fixture path.
+    pub const LEGACY_TOOLS_POST_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
+        EventSchemaId::new("hartevo.legacy-tools.post-execute.v1"),
+        "hartevo/legacy-tools-post-execute",
     );
     /// Observe-only notification of the frozen tool outcome.
     pub const TOOLS_RESULT: EventKey<Emit, ToolCall, ()> = EventKey::new(
@@ -573,7 +579,7 @@ pub enum ToolDispatchResult {
 }
 
 /// One settled tool body invocation. This is not yet a durable tool result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ToolDispatchOutcome {
     input: ToolExecutionInput,
     result: ToolDispatchResult,
@@ -593,6 +599,58 @@ impl ToolDispatchOutcome {
     #[must_use]
     pub fn into_result(self) -> ToolDispatchResult {
         self.result
+    }
+}
+
+/// Opaque post-dispatch view carried through canonical `tools/post-execute`.
+/// Input identity stays immutable while policy accepts, replaces one
+/// successful JSON value, or blocks with a typed failure.
+pub struct ToolPostExecution {
+    input: ToolExecutionInput,
+    result: ToolDispatchResult,
+}
+
+impl fmt::Debug for ToolPostExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolPostExecution")
+            .field("input", &self.input)
+            .field("result", &self.result)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolPostExecution {
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> &ToolDispatchResult {
+        &self.result
+    }
+
+    /// Replace one successful value. A failed body or around-dispatch result
+    /// cannot be converted back into success at this boundary.
+    #[must_use]
+    pub fn replace_success(mut self, value: serde_json::Value) -> Self {
+        self.result = match self.result {
+            ToolDispatchResult::Success { .. } => ToolDispatchResult::Success { value },
+            ToolDispatchResult::Failure { .. } => ToolDispatchResult::Failure {
+                message: "tools/post-execute cannot replace the value of a failed result".into(),
+            },
+        };
+        self
+    }
+
+    /// Block any settled result with corrective typed failure text.
+    #[must_use]
+    pub fn block(mut self, reason: impl Into<String>) -> Self {
+        self.result = ToolDispatchResult::Failure {
+            message: reason.into(),
+        };
+        self
     }
 }
 
@@ -2364,7 +2422,7 @@ pub fn run_tools_pipeline(ctx: &mut Context, mut call: ToolCall) -> Result<ToolC
     }
     call = ctx.waterfall(events::LEGACY_TOOLS_EXECUTE, call)?;
     call.call_id.clone_from(&call_id);
-    call = ctx.waterfall(events::TOOLS_POST_EXECUTE, call)?;
+    call = ctx.waterfall(events::LEGACY_TOOLS_POST_EXECUTE, call)?;
     call.call_id = call_id;
     ctx.emit(events::TOOLS_RESULT, &call)?;
     Ok(call)
@@ -2554,6 +2612,29 @@ fn dispatch_prepared_tool_execution(
         },
     };
     ToolDispatchOutcome { input, result }
+}
+
+/// Run one normalized N54 dispatch outcome through canonical
+/// `tools/post-execute`. Post-policy failures are typed values and never replay
+/// the already-settled body or around-dispatch waterfall.
+pub fn post_tool_execution(
+    ctx: &mut Context,
+    outcome: ToolDispatchOutcome,
+) -> Result<ToolDispatchOutcome, CordisError> {
+    let ToolDispatchOutcome { input, result } = outcome;
+    let fallback_input = input.clone();
+    let execution = ToolPostExecution { input, result };
+    let post = catch_unwind(AssertUnwindSafe(|| {
+        ctx.waterfall(events::TOOLS_POST_EXECUTE, execution)
+    }));
+    match post {
+        Ok(Ok(ToolPostExecution { input, result })) => Ok(ToolDispatchOutcome { input, result }),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(tool_dispatch_failure(
+            fallback_input,
+            "tools/post-execute listener panicked",
+        )),
+    }
 }
 
 fn tool_dispatch_failure(

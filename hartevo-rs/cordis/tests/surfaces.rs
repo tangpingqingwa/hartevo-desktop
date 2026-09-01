@@ -336,7 +336,7 @@ fn tools_pipeline_runs_on_ctx_tools_not_openinterpreter() {
     {
         let seen = Arc::clone(&seen);
         ctx.on_waterfall(
-            events::TOOLS_POST_EXECUTE,
+            events::LEGACY_TOOLS_POST_EXECUTE,
             move |mut call: ToolCall, next| {
                 seen.lock()
                     .expect("seen")
