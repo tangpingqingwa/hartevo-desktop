@@ -109,9 +109,9 @@ pub use session::{
     TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, events as session_events,
 };
 pub use surface::{
-    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentTurnStopping, AgentsSurface,
-    DeniedToolExecution, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmAdapter,
-    LlmAdapterStream, LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentStatus, AgentTurnStopping,
+    AgentsSurface, DeniedToolExecution, DesktopSurface, DomainSurface, EffectBrokerSurface,
+    LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning,
     LlmResolvedModel, LlmStream, LlmSurface, MAPPED_KEYS, PreparedLlmCall, PreparedToolExecution,
     PromptAssembly, PromptError, PromptSection, RuntimeSurface, SurfaceOwner, SystemPromptSurface,
     TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition, ToolDispatchExecution,
