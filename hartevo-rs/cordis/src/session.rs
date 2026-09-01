@@ -1028,21 +1028,9 @@ fn validate_request_header(request: &SessionRequestHeader) -> Result<(), Session
             expected: "canonical absent empty system, tools, and adapter defaults",
         });
     }
+    validate_call_config(&request.header.config)
+        .map_err(|expected| SessionError::InvalidRequestHeader { expected })?;
     let config = &request.header.config;
-    if config.provider.is_empty() || config.model.is_empty() {
-        return Err(SessionError::InvalidRequestHeader {
-            expected: "non-empty provider and model",
-        });
-    }
-    if config
-        .reasoning_effort
-        .as_ref()
-        .is_some_and(String::is_empty)
-    {
-        return Err(SessionError::InvalidRequestHeader {
-            expected: "a non-empty optional reasoning effort",
-        });
-    }
     if let Some(defaults) = &request.header.adapter_defaults
         && ((!defaults.reasoning_effort && !defaults.max_tokens)
             || (defaults.reasoning_effort && config.reasoning_effort.is_none())
@@ -1053,6 +1041,27 @@ fn validate_request_header(request: &SessionRequestHeader) -> Result<(), Session
         });
     }
     Ok(())
+}
+
+fn validate_call_config(config: &SessionCallConfig) -> Result<(), &'static str> {
+    if config.provider.is_empty() || config.model.is_empty() {
+        return Err("non-empty provider and model");
+    }
+    if config
+        .reasoning_effort
+        .as_ref()
+        .is_some_and(String::is_empty)
+    {
+        return Err("a non-empty optional reasoning effort");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_request_config(
+    config: &SessionCallConfig,
+) -> Result<(), SessionError> {
+    validate_call_config(config)
+        .map_err(|expected| SessionError::InvalidAgentRequestConfig { expected })
 }
 
 fn validate_request_context(context: &SessionRequestContext) -> Result<(), SessionError> {
@@ -2108,6 +2117,12 @@ impl SessionHandle {
         require_turn(self.lock()?.open_turn(), turn)
     }
 
+    pub(crate) fn require_open_step(&self, turn: u64, step: u64) -> Result<(), SessionError> {
+        let log = self.lock()?;
+        require_turn(log.open_turn(), turn)?;
+        require_step(log.open_step(), turn, step)
+    }
+
     pub(crate) fn append_agent_inbox_splice(
         &self,
         target: AgentInboxTarget,
@@ -2694,6 +2709,8 @@ pub enum SessionError {
     InvalidRequestHeaderEncoding,
     #[error("session request/header must have {expected}")]
     InvalidRequestHeader { expected: &'static str },
+    #[error("session agent/request config must have {expected}")]
+    InvalidAgentRequestConfig { expected: &'static str },
     #[error("session request/context persistence encoding is invalid")]
     InvalidRequestContextEncoding,
     #[error("session request/context must have {expected}")]

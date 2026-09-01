@@ -6,12 +6,12 @@ use crate::inbox::AgentInboxTarget;
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::session::{
-    SessionContentBlock, SessionError, SessionHandle, SessionId, SessionMessage,
+    SessionCallConfig, SessionContentBlock, SessionError, SessionHandle, SessionId, SessionMessage,
     SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent, TurnEndReason,
-    validate_agent_user_message,
+    validate_agent_request_config, validate_agent_user_message,
 };
 use crate::surface::{
-    AgentPreStep, AgentPreStepDecision, AgentRef, AgentsSurface, DomainSurface,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
     EffectBrokerSurface, LlmStream, LlmSurface, RuntimeSurface, ToolCall, ToolsSurface, events,
     register_agent, run_tools_pipeline, stream_llm,
 };
@@ -75,6 +75,56 @@ pub struct AgentStepResult {
     pub tool: Option<ToolCall>,
 }
 
+/// Request-ready state frozen before adapter resolution or request persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedAgentRequest {
+    agent: AgentRef,
+    turn: u64,
+    step: u64,
+    config: SessionCallConfig,
+    messages: Vec<SessionMessage>,
+    starts_request_series: bool,
+}
+
+impl PreparedAgentRequest {
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        &self.agent
+    }
+
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        self.step
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &SessionCallConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub fn messages(&self) -> &[SessionMessage] {
+        &self.messages
+    }
+
+    #[must_use]
+    pub const fn starts_request_series(&self) -> bool {
+        self.starts_request_series
+    }
+}
+
+/// Whether N42 admitted a model request for this proposed step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRequestAdmission {
+    NoRequest(AgentPreStep),
+    Request(PreparedAgentRequest),
+}
+
 /// Claim the exact inbox batch, then run the authoritative pre-step waterfall.
 ///
 /// This boundary intentionally returns before `step/start`; the future driver
@@ -111,6 +161,51 @@ pub fn admit_agent_step(
         session.enter_agent_step(turn, step, messages)?;
     }
     Ok(proposal)
+}
+
+/// Enter one accepted step and prepare its exact model-request boundary.
+///
+/// The durable message snapshot is taken before `agent/request`; that
+/// waterfall can replace only call configuration. Adapter lookup, request
+/// persistence, streaming, and step closure remain future driver work.
+pub fn admit_agent_request(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+    seed_config: SessionCallConfig,
+) -> Result<AgentRequestAdmission, CordisError> {
+    let admission = admit_agent_step(ctx, session_id, target, turn, step)?;
+    let starts_request_series = match admission.decision() {
+        AgentPreStepDecision::Reject => {
+            return Ok(AgentRequestAdmission::NoRequest(admission));
+        }
+        AgentPreStepDecision::Enter { messages, .. } if messages.is_empty() => {
+            return Ok(AgentRequestAdmission::NoRequest(admission));
+        }
+        AgentPreStepDecision::Enter {
+            starts_request_series,
+            ..
+        } => *starts_request_series,
+    };
+
+    let session = agent_session(ctx, session_id)?;
+    session.require_open_step(turn, step)?;
+    let messages = session.derive_messages()?;
+    let request = AgentRequest::new(admission.agent().clone(), turn, step, seed_config);
+    let request = ctx.waterfall(events::AGENT_REQUEST, request)?;
+    validate_agent_request_config(request.config())?;
+    session.require_open_step(turn, step)?;
+
+    Ok(AgentRequestAdmission::Request(PreparedAgentRequest {
+        agent: admission.agent().clone(),
+        turn,
+        step,
+        config: request.into_config(),
+        messages,
+        starts_request_series,
+    }))
 }
 
 fn agent_session(ctx: &Context, session_id: &SessionId) -> Result<SessionHandle, CordisError> {
