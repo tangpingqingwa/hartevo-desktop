@@ -6,9 +6,10 @@
 //! optional plugin slot; it never owns Domain, Effect, or execution authority.
 
 use std::collections::BTreeMap;
-#[cfg(test)]
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::TryLockError;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -103,6 +104,179 @@ pub(crate) struct DesktopCordisCoordinator {
     root_fiber: Fiber,
     successful_bindings: u64,
     last_binding: Option<DesktopCordisBindingState>,
+}
+
+/// Short-lock storage for the process-wide Cordis coordinator.
+///
+/// A live Runtime turn checks the coordinator out so its canonical driver can
+/// invoke Application without holding this mutex. Concurrent admissions fail
+/// fast while the same coordinator is checked out; dropping the checkout
+/// restores it even while unwinding.
+#[derive(Debug)]
+pub(crate) struct DesktopCordisSlot {
+    coordinator: Mutex<Option<DesktopCordisCoordinator>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DesktopCordisSlotError {
+    #[error("Desktop Cordis coordinator is checked out by the active Runtime turn")]
+    CheckedOut,
+    #[error("Desktop Cordis coordinator mutex is poisoned")]
+    Poisoned,
+}
+
+pub(crate) struct DesktopCordisGuard<'a> {
+    guard: MutexGuard<'a, Option<DesktopCordisCoordinator>>,
+}
+
+pub(crate) struct DesktopCordisCheckout {
+    slot: Arc<DesktopCordisSlot>,
+    coordinator: Option<DesktopCordisCoordinator>,
+}
+
+impl DesktopCordisSlot {
+    pub(crate) fn new(coordinator: DesktopCordisCoordinator) -> Self {
+        Self {
+            coordinator: Mutex::new(Some(coordinator)),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> Result<DesktopCordisGuard<'_>, DesktopCordisSlotError> {
+        let guard = self
+            .coordinator
+            .lock()
+            .map_err(|_| DesktopCordisSlotError::Poisoned)?;
+        if guard.is_none() {
+            return Err(DesktopCordisSlotError::CheckedOut);
+        }
+        Ok(DesktopCordisGuard { guard })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_lock(&self) -> Result<DesktopCordisGuard<'_>, DesktopCordisSlotError> {
+        let guard = match self.coordinator.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(_)) => return Err(DesktopCordisSlotError::Poisoned),
+            Err(TryLockError::WouldBlock) => return Err(DesktopCordisSlotError::CheckedOut),
+        };
+        if guard.is_none() {
+            return Err(DesktopCordisSlotError::CheckedOut);
+        }
+        Ok(DesktopCordisGuard { guard })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_checked_out(&self) -> bool {
+        matches!(self.coordinator.try_lock(), Ok(guard) if guard.is_none())
+    }
+
+    pub(crate) fn checkout(
+        self: &Arc<Self>,
+    ) -> Result<DesktopCordisCheckout, DesktopCordisSlotError> {
+        let coordinator = self
+            .coordinator
+            .lock()
+            .map_err(|_| DesktopCordisSlotError::Poisoned)?
+            .take()
+            .ok_or(DesktopCordisSlotError::CheckedOut)?;
+        Ok(DesktopCordisCheckout {
+            slot: Arc::clone(self),
+            coordinator: Some(coordinator),
+        })
+    }
+}
+
+impl Deref for DesktopCordisGuard<'_> {
+    type Target = DesktopCordisCoordinator;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("an active Cordis guard always contains its coordinator")
+    }
+}
+
+impl DerefMut for DesktopCordisGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("an active Cordis guard always contains its coordinator")
+    }
+}
+
+impl Deref for DesktopCordisCheckout {
+    type Target = DesktopCordisCoordinator;
+
+    fn deref(&self) -> &Self::Target {
+        self.coordinator
+            .as_ref()
+            .expect("a live Cordis checkout always contains its coordinator")
+    }
+}
+
+impl DerefMut for DesktopCordisCheckout {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.coordinator
+            .as_mut()
+            .expect("a live Cordis checkout always contains its coordinator")
+    }
+}
+
+impl Drop for DesktopCordisCheckout {
+    fn drop(&mut self) {
+        let Some(coordinator) = self.coordinator.take() else {
+            return;
+        };
+        let mut slot = self
+            .slot
+            .coordinator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(
+            slot.is_none(),
+            "Cordis checkout restored into an occupied slot"
+        );
+        if slot.is_none() {
+            *slot = Some(coordinator);
+        }
+    }
+}
+
+impl DesktopCordisSlotError {
+    const fn runtime(self) -> CordisError {
+        match self {
+            Self::CheckedOut => CordisError::RuntimeDispatchBusy,
+            Self::Poisoned => CordisError::RuntimeCoordinatorPoisoned,
+        }
+    }
+
+    const fn domain_command(self) -> CordisError {
+        match self {
+            Self::CheckedOut => CordisError::DomainCommandDispatchBusy,
+            Self::Poisoned => CordisError::DomainCommandCoordinatorPoisoned,
+        }
+    }
+
+    const fn effect_execution(self) -> CordisError {
+        match self {
+            Self::CheckedOut => CordisError::EffectExecutionDispatchBusy,
+            Self::Poisoned => CordisError::EffectExecutionCoordinatorPoisoned,
+        }
+    }
+
+    const fn effect_reconciliation(self) -> CordisError {
+        match self {
+            Self::CheckedOut => CordisError::EffectReconciliationDispatchBusy,
+            Self::Poisoned => CordisError::EffectReconciliationCoordinatorPoisoned,
+        }
+    }
+
+    const fn effect_verification(self) -> CordisError {
+        match self {
+            Self::CheckedOut => CordisError::EffectVerificationDispatchBusy,
+            Self::Poisoned => CordisError::EffectVerificationCoordinatorPoisoned,
+        }
+    }
 }
 
 /// One already-observed Application Runtime turn projected into Cordis.
@@ -1920,7 +2094,7 @@ impl DesktopEffectVerificationAuthorization {
 /// host lock, execute the real Desktop/Application adapter exactly once, and
 /// settle the lifecycle under a second short lock.
 pub(crate) fn dispatch_live_runtime<Execute, Output, AdapterError>(
-    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    cordis: &Arc<DesktopCordisSlot>,
     scope: AuthorityScope,
     consent: &ConsentState,
     record: Option<&ConsentRecord>,
@@ -1932,9 +2106,7 @@ where
     Execute: FnOnce(&RuntimeDispatchPermit) -> Result<Output, AdapterError>,
 {
     let mut permit = {
-        let mut host = cordis
-            .lock()
-            .map_err(|_| CordisError::RuntimeCoordinatorPoisoned)?;
+        let mut host = cordis.lock().map_err(DesktopCordisSlotError::runtime)?;
         host.bind_and_authorize_runtime(
             scope,
             kernel_consent_state(consent),
@@ -1955,7 +2127,7 @@ where
 
     let completion = match cordis.lock() {
         Ok(mut host) => host.finish_runtime(permit),
-        Err(_) => Err(CordisError::RuntimeCoordinatorPoisoned),
+        Err(error) => Err(error.runtime()),
     };
     let (finish, disposed) = match completion {
         Ok(completion) => (None, completion.announce().err()),
@@ -1974,7 +2146,7 @@ where
 /// coordinator lock for Application, then settle the permit under a second
 /// short lock. This path grants no Effect execution capability.
 pub(crate) fn dispatch_live_domain_command<Execute, Output, AdapterError>(
-    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    cordis: &Arc<DesktopCordisSlot>,
     authorization: DesktopDomainCommandAuthorization,
     consent: &ConsentState,
     record: Option<&ConsentRecord>,
@@ -1989,7 +2161,7 @@ where
     let permit = {
         let mut host = cordis
             .lock()
-            .map_err(|_| CordisError::DomainCommandCoordinatorPoisoned)?;
+            .map_err(DesktopCordisSlotError::domain_command)?;
         host.bind_and_authorize_domain_command(
             scope,
             kernel_consent_state(consent),
@@ -2005,7 +2177,7 @@ where
     };
     let finish = match cordis.lock() {
         Ok(mut host) => host.finish_domain_command(permit).err(),
-        Err(_) => Some(CordisError::DomainCommandCoordinatorPoisoned),
+        Err(error) => Some(error.domain_command()),
     };
     if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
         Err(error)
@@ -2020,7 +2192,7 @@ where
 /// coordinator lock for Application/Broker/provider work, then settle under a
 /// second short lock. Cordis receives no external-write capability or result.
 pub(crate) fn dispatch_live_effect_execution<Execute, Output, AdapterError>(
-    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    cordis: &Arc<DesktopCordisSlot>,
     authorization: DesktopEffectExecutionAuthorization,
     consent: &ConsentState,
     record: Option<&ConsentRecord>,
@@ -2035,7 +2207,7 @@ where
     let permit = {
         let mut host = cordis
             .lock()
-            .map_err(|_| CordisError::EffectExecutionCoordinatorPoisoned)?;
+            .map_err(DesktopCordisSlotError::effect_execution)?;
         host.bind_and_authorize_effect_execution(
             scope,
             kernel_consent_state(consent),
@@ -2051,7 +2223,7 @@ where
     };
     let finish = match cordis.lock() {
         Ok(mut host) => host.finish_effect_execution(permit).err(),
-        Err(_) => Some(CordisError::EffectExecutionCoordinatorPoisoned),
+        Err(error) => Some(error.effect_execution()),
     };
     if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
         Err(error)
@@ -2066,7 +2238,7 @@ where
 /// the coordinator lock for Application/Broker/observer/verifier work, then
 /// settle under a second short lock. No executor exists in this signature.
 pub(crate) fn dispatch_live_effect_reconciliation<Observe, Output, AdapterError>(
-    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    cordis: &Arc<DesktopCordisSlot>,
     authorization: DesktopEffectReconciliationAuthorization,
     consent: &ConsentState,
     record: Option<&ConsentRecord>,
@@ -2081,7 +2253,7 @@ where
     let permit = {
         let mut host = cordis
             .lock()
-            .map_err(|_| CordisError::EffectReconciliationCoordinatorPoisoned)?;
+            .map_err(DesktopCordisSlotError::effect_reconciliation)?;
         host.bind_and_authorize_effect_reconciliation(
             scope,
             kernel_consent_state(consent),
@@ -2098,7 +2270,7 @@ where
         };
     let finish = match cordis.lock() {
         Ok(mut host) => host.finish_effect_reconciliation(permit).err(),
-        Err(_) => Some(CordisError::EffectReconciliationCoordinatorPoisoned),
+        Err(error) => Some(error.effect_reconciliation()),
     };
     if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
         Err(error)
@@ -2116,7 +2288,7 @@ where
 /// settle under a second short lock. No executor, reconciler, or generic
 /// EffectVerifier is present in this signature.
 pub(crate) fn dispatch_live_effect_verification<Verify, Output, AdapterError>(
-    cordis: &Arc<Mutex<DesktopCordisCoordinator>>,
+    cordis: &Arc<DesktopCordisSlot>,
     authorization: DesktopEffectVerificationAuthorization,
     consent: &ConsentState,
     record: Option<&ConsentRecord>,
@@ -2131,7 +2303,7 @@ where
     let permit = {
         let mut host = cordis
             .lock()
-            .map_err(|_| CordisError::EffectVerificationCoordinatorPoisoned)?;
+            .map_err(DesktopCordisSlotError::effect_verification)?;
         host.bind_and_authorize_effect_verification(
             scope,
             kernel_consent_state(consent),
@@ -2148,7 +2320,7 @@ where
     };
     let finish = match cordis.lock() {
         Ok(mut host) => host.finish_effect_verification(permit).err(),
-        Err(_) => Some(CordisError::EffectVerificationCoordinatorPoisoned),
+        Err(error) => Some(error.effect_verification()),
     };
     if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
         Err(error)
@@ -2198,13 +2370,14 @@ mod tests {
     };
 
     use super::{
-        DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopDomainCommandAuthorization,
-        DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
-        DesktopEffectVerificationAuthorization, bind_live_domain_kernel,
-        bind_live_domain_kernel_scope, decode_event, dispatch_live_domain_command,
-        dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
-        dispatch_live_effect_verification, dispatch_live_runtime, encode_event, mount_cordis_host,
-        openinterpreter_runtime_plugin, runtime_open_turn,
+        DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisSlot,
+        DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
+        DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
+        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_event,
+        dispatch_live_domain_command, dispatch_live_effect_execution,
+        dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
+        dispatch_live_runtime, encode_event, mount_cordis_host, openinterpreter_runtime_plugin,
+        runtime_open_turn,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -2739,7 +2912,7 @@ mod tests {
 
     #[test]
     fn started_failure_is_cached_and_lifecycle_callbacks_run_after_unlock() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -2802,7 +2975,7 @@ mod tests {
 
     #[test]
     fn started_and_disposed_failures_are_combined_and_authority_is_skipped() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -2845,7 +3018,7 @@ mod tests {
 
     #[test]
     fn authority_and_disposed_failures_are_combined_without_source_loss() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -2879,7 +3052,7 @@ mod tests {
 
     #[test]
     fn desktop_runtime_adapter_releases_host_lock_and_calls_authority_once() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -2945,7 +3118,7 @@ mod tests {
 
     #[test]
     fn desktop_domain_command_releases_lock_and_calls_application_once() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3007,7 +3180,7 @@ mod tests {
 
     #[test]
     fn desktop_effect_execution_releases_lock_and_calls_application_once() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3076,7 +3249,7 @@ mod tests {
 
     #[test]
     fn desktop_effect_reconciliation_releases_lock_and_has_no_execution_authority() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3146,7 +3319,7 @@ mod tests {
 
     #[test]
     fn desktop_effect_verification_is_one_shot_exclusive_redacted_and_drop_safe() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3227,7 +3400,7 @@ mod tests {
 
     #[test]
     fn abandoned_desktop_effect_reconciliation_recovers_on_next_dispatch() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3270,7 +3443,7 @@ mod tests {
 
     #[test]
     fn abandoned_desktop_domain_command_recovers_on_next_dispatch() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3303,7 +3476,7 @@ mod tests {
 
     #[test]
     fn concurrent_same_scope_dispatch_runs_exactly_one_authority() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3367,7 +3540,7 @@ mod tests {
 
     #[test]
     fn lifecycle_observers_reenter_only_after_host_unlock() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3428,7 +3601,7 @@ mod tests {
 
     #[test]
     fn poisoned_host_fails_closed_without_calling_authority() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));
@@ -3464,7 +3637,7 @@ mod tests {
 
     #[test]
     fn authority_panic_drops_permit_and_next_dispatch_can_recover() {
-        let host = Arc::new(Mutex::new(
+        let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
         ));

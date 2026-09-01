@@ -94,7 +94,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::cordis_host::{
-    DesktopAgentTurnRequest, DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
+    DesktopAgentTurnRequest, DesktopCordisSlot, DesktopDomainCommandAuthorization,
     DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
     DesktopEffectVerificationAuthorization, DesktopRuntimeSessionTranscript,
     dispatch_live_domain_command, dispatch_live_effect_execution,
@@ -103,7 +103,7 @@ use crate::cordis_host::{
 };
 #[cfg(test)]
 use crate::cordis_host::{
-    bind_live_domain_kernel,
+    DesktopCordisGuard, bind_live_domain_kernel,
     bind_live_domain_kernel_scope_for_test as bind_host_live_domain_kernel_scope,
 };
 use crate::runtime_plane::{
@@ -1990,7 +1990,7 @@ pub struct DesktopDataPlane {
     database_path: PathBuf,
     database_key_reference: SecretReference,
     device_id: DeviceId,
-    cordis: Arc<Mutex<DesktopCordisCoordinator>>,
+    cordis: Arc<DesktopCordisSlot>,
 }
 
 impl DesktopDataPlane {
@@ -2121,7 +2121,7 @@ impl DesktopDataPlane {
             version: 1,
         };
         let device_id = DeviceId::from_stable(format!("desktop-device:{root_digest}"));
-        let cordis = Arc::new(Mutex::new(mount_cordis_host(
+        let cordis = Arc::new(DesktopCordisSlot::new(mount_cordis_host(
             &discover_runtime().projection,
         )?));
         Ok(Self {
@@ -5526,11 +5526,10 @@ impl DesktopDataPlane {
             },
         );
         let agent_result = {
-            let mut cordis = self.cordis.lock().map_err(|_| {
-                DesktopDataError::CordisSessionPersistence(
-                    "Desktop Cordis coordinator is poisoned".into(),
-                )
-            })?;
+            let mut cordis = self
+                .cordis
+                .checkout()
+                .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
             futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
                 request,
                 adapter,
@@ -6242,11 +6241,7 @@ impl DesktopDataPlane {
         let store = ProjectStore::open(&self.database_path, &database_key)?;
         self.cordis
             .lock()
-            .map_err(|_| {
-                DesktopDataError::CordisSessionPersistence(
-                    "Desktop Cordis coordinator is poisoned".into(),
-                )
-            })?
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
             .bind_session_persistence(store)
             .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
         Ok(())
@@ -6276,11 +6271,7 @@ impl DesktopDataPlane {
     ) -> Result<bool, DesktopDataError> {
         self.cordis
             .lock()
-            .map_err(|_| {
-                DesktopDataError::CordisSessionPersistence(
-                    "Desktop Cordis coordinator is poisoned".into(),
-                )
-            })?
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
             .has_committed_message_id(session_id, message_id)
             .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))
     }
@@ -6318,11 +6309,7 @@ impl DesktopDataPlane {
         });
         self.cordis
             .lock()
-            .map_err(|_| {
-                DesktopDataError::CordisSessionPersistence(
-                    "Desktop Cordis coordinator is poisoned".into(),
-                )
-            })?
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
             .record_runtime_transcript(DesktopRuntimeSessionTranscript::new(
                 mission.id.as_str(),
                 turn_id.as_str(),
@@ -6359,10 +6346,10 @@ impl DesktopDataPlane {
     }
 
     #[cfg(test)]
-    fn lock_cordis(&self) -> std::sync::MutexGuard<'_, DesktopCordisCoordinator> {
+    fn lock_cordis(&self) -> DesktopCordisGuard<'_> {
         self.cordis
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("Desktop Cordis coordinator must be available to its focused fixture")
     }
 
     #[cfg(test)]
@@ -12539,6 +12526,7 @@ sleep 30"#;
                 std::thread::sleep(StdDuration::from_millis(25));
             }
             assert!(dispatched, "Runtime fixture never reached dispatch");
+            assert!(plane.cordis.is_checked_out());
 
             let secret = secrets
                 .get(plane.database_key_reference())
