@@ -134,6 +134,24 @@ impl LlmAdapter for AgentStreamingAdapter {
 }
 
 #[derive(Clone)]
+struct PendingCancellationAdapter {
+    started: std::sync::mpsc::Sender<()>,
+    seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+}
+
+impl LlmAdapter for PendingCancellationAdapter {
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        Ok(LlmResolvedModel::new(provider, model))
+    }
+
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        self.seen.lock().expect("seen").push(request);
+        self.started.send(()).expect("cancellation trigger");
+        Ok(Box::pin(futures_util::stream::pending()))
+    }
+}
+
+#[derive(Clone)]
 struct ScriptedAgentAdapter {
     items: Vec<Result<SessionStreamChunk, SessionLlmFailure>>,
 }
@@ -771,6 +789,99 @@ fn rejected_and_pre_cancelled_turns_close_without_a_step() {
         TurnEndReason::Aborted(SessionCancelCause::Legacy)
     );
     assert_eq!(cancelled.inbox().next_turn().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn typed_cancellation_spans_agent_seams_and_interrupts_a_pending_stream() {
+    let mut ctx = mapped();
+    let cancellation = LifecycleCancellation::default();
+    let seam_count = Arc::new(AtomicUsize::new(0));
+    {
+        let expected = cancellation.clone();
+        let seam_count = Arc::clone(&seam_count);
+        ctx.on_waterfall(events::AGENT_PRE_STEP, move |proposal, next| {
+            assert!(proposal.cancellation().is_same(&expected));
+            seam_count.fetch_add(1, Ordering::SeqCst);
+            next(proposal)
+        })
+        .unwrap();
+    }
+    {
+        let expected = cancellation.clone();
+        let seam_count = Arc::clone(&seam_count);
+        ctx.on_waterfall(events::AGENT_REQUEST, move |request, next| {
+            assert!(request.cancellation().is_same(&expected));
+            seam_count.fetch_add(1, Ordering::SeqCst);
+            next(request)
+        })
+        .unwrap();
+    }
+
+    let (started, entered) = std::sync::mpsc::channel();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    register_llm_adapter(
+        &mut ctx,
+        ["mock"],
+        PendingCancellationAdapter {
+            started,
+            seen: Arc::clone(&seen),
+        },
+    )
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-typed-cancel").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("typed-cancel", "cancel pending stream"))
+        .unwrap();
+
+    let trigger = cancellation.clone();
+    let canceller = std::thread::spawn(move || {
+        entered.recv().expect("adapter entered");
+        trigger.cancel_with(SessionCancelCause::User);
+        trigger.cancel_with(SessionCancelCause::Hook);
+    });
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &cancellation,
+    )
+    .await
+    .unwrap();
+    canceller.join().unwrap();
+
+    assert_eq!(cancellation.cause(), Some(SessionCancelCause::User));
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::User)
+    );
+    assert_eq!(seam_count.load(Ordering::SeqCst), 2);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].cancellation().is_same(&cancellation));
+    drop(seen);
+    assert!(session.events().unwrap().iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::AssistantChunk {
+            chunk: SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Aborted { failure },
+                replay_state: None,
+            },
+            ..
+        } if failure.code == "ABORTED" && failure.message == "agent turn cancelled"
+    )));
+    assert!(matches!(
+        session.events().unwrap().last().map(|event| &event.kind),
+        Some(SessionEventKind::TurnEnd {
+            reason: TurnEndReason::Aborted(SessionCancelCause::User),
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -5216,14 +5327,16 @@ fn tool_scheduler_mid_pool_cancel_drains_started_calls_and_synthesizes_the_rest(
         let bodies = Arc::clone(&bodies);
         register_tool_definition(
             &mut ctx,
-            ToolDefinition::new(tool_schema(name), move |_| {
+            ToolDefinition::new_with_run_context(tool_schema(name), move |run| {
+                assert!(run.cancellation().is_same(&cancellation));
                 bodies.lock().unwrap().push(name);
                 if name == "cancel-pool-2" {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                    while !cancellation.is_cancelled() && std::time::Instant::now() < deadline {
+                    while !run.cancellation().is_cancelled() && std::time::Instant::now() < deadline
+                    {
                         std::thread::yield_now();
                     }
-                    if !cancellation.is_cancelled() {
+                    if !run.cancellation().is_cancelled() {
                         return Err("ordered first result did not cancel the batch".into());
                     }
                 }

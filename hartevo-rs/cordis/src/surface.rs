@@ -375,6 +375,7 @@ pub struct ToolExecutionInput {
 /// successful turn conclusion without mutating immutable call identity.
 pub struct ToolRunContext {
     input: ToolExecutionInput,
+    cancellation: LifecycleCancellation,
     additional_contexts: Mutex<Vec<SessionMessage>>,
     concludes_turn: AtomicBool,
 }
@@ -393,9 +394,10 @@ impl fmt::Debug for ToolRunContext {
 }
 
 impl ToolRunContext {
-    fn new(input: ToolExecutionInput) -> Self {
+    fn new(input: ToolExecutionInput, cancellation: LifecycleCancellation) -> Self {
         Self {
             input,
+            cancellation,
             additional_contexts: Mutex::new(Vec::new()),
             concludes_turn: AtomicBool::new(false),
         }
@@ -404,6 +406,12 @@ impl ToolRunContext {
     #[must_use]
     pub const fn input(&self) -> &ToolExecutionInput {
         &self.input
+    }
+
+    /// Exact caller-owned cancellation lineage shared by this Agent turn.
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
     }
 
     #[must_use]
@@ -568,6 +576,7 @@ impl PreparedToolExecution {
 /// `next` to wrap the exact body, or settle the call without invoking it.
 pub struct ToolDispatchExecution {
     input: ToolExecutionInput,
+    cancellation: LifecycleCancellation,
     prepared: Option<PreparedToolExecution>,
     result: Option<ToolDispatchResult>,
     result_projection: ToolResultProjection,
@@ -590,6 +599,13 @@ impl ToolDispatchExecution {
     #[must_use]
     pub const fn input(&self) -> &ToolExecutionInput {
         &self.input
+    }
+
+    /// Exact caller-owned cancellation lineage. Wrappers may observe it but
+    /// cannot replace or detach it from the admitted tool body.
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
     }
 
     #[must_use]
@@ -1055,6 +1071,7 @@ pub struct LlmGenerateRequest {
     system: Option<String>,
     tools: Option<Vec<SessionToolSchema>>,
     session_id: Option<SessionId>,
+    cancellation: LifecycleCancellation,
 }
 
 impl LlmGenerateRequest {
@@ -1066,6 +1083,7 @@ impl LlmGenerateRequest {
             system: None,
             tools: None,
             session_id: None,
+            cancellation: LifecycleCancellation::default(),
         }
     }
 
@@ -1094,6 +1112,12 @@ impl LlmGenerateRequest {
         self.session_id.as_ref()
     }
 
+    /// Exact caller-owned cancellation lineage for this model call.
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
+    }
+
     #[must_use]
     pub fn with_system(mut self, system: Option<String>) -> Self {
         self.system = system.filter(|value| !value.is_empty());
@@ -1109,6 +1133,12 @@ impl LlmGenerateRequest {
     #[must_use]
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
         self.session_id = Some(session_id);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: LifecycleCancellation) -> Self {
+        self.cancellation = cancellation;
         self
     }
 }
@@ -1659,6 +1689,7 @@ pub struct AgentPreStep {
     agent: AgentRef,
     turn: u64,
     step: u64,
+    cancellation: LifecycleCancellation,
     decision: AgentPreStepDecision,
     assembly: PromptAssembly,
 }
@@ -1670,11 +1701,13 @@ impl AgentPreStep {
         step: u64,
         messages: Vec<SessionMessage>,
         assembly: PromptAssembly,
+        cancellation: LifecycleCancellation,
     ) -> Self {
         Self {
             agent,
             turn,
             step,
+            cancellation,
             decision: AgentPreStepDecision::Enter {
                 messages,
                 starts_request_series: false,
@@ -1696,6 +1729,12 @@ impl AgentPreStep {
     #[must_use]
     pub const fn step(&self) -> u64 {
         self.step
+    }
+
+    /// Exact caller-owned cancellation lineage shared by this Agent turn.
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
     }
 
     #[must_use]
@@ -1756,15 +1795,23 @@ pub struct AgentRequest {
     agent: AgentRef,
     turn: u64,
     step: u64,
+    cancellation: LifecycleCancellation,
     config: SessionCallConfig,
 }
 
 impl AgentRequest {
-    pub(crate) fn new(agent: AgentRef, turn: u64, step: u64, config: SessionCallConfig) -> Self {
+    pub(crate) fn new(
+        agent: AgentRef,
+        turn: u64,
+        step: u64,
+        config: SessionCallConfig,
+        cancellation: LifecycleCancellation,
+    ) -> Self {
         Self {
             agent,
             turn,
             step,
+            cancellation,
             config,
         }
     }
@@ -1782,6 +1829,12 @@ impl AgentRequest {
     #[must_use]
     pub const fn step(&self) -> u64 {
         self.step
+    }
+
+    /// Exact caller-owned cancellation lineage shared by this Agent turn.
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
     }
 
     #[must_use]
@@ -3177,7 +3230,15 @@ pub fn dispatch_tool_execution(
     ctx: &mut Context,
     prepared: PreparedToolExecution,
 ) -> Result<ToolDispatchOutcome, CordisError> {
-    schedule_tool_dispatch(ctx, prepared)?.dispatch()
+    dispatch_tool_execution_with_cancellation(ctx, prepared, &LifecycleCancellation::default())
+}
+
+pub(crate) fn dispatch_tool_execution_with_cancellation(
+    ctx: &mut Context,
+    prepared: PreparedToolExecution,
+    cancellation: &LifecycleCancellation,
+) -> Result<ToolDispatchOutcome, CordisError> {
+    schedule_tool_dispatch(ctx, prepared, cancellation.clone())?.dispatch()
 }
 
 /// Prepare one admitted around-dispatch/body operation for execution on a
@@ -3186,6 +3247,7 @@ pub fn dispatch_tool_execution(
 pub(crate) fn schedule_tool_dispatch(
     ctx: &mut Context,
     prepared: PreparedToolExecution,
+    cancellation: LifecycleCancellation,
 ) -> Result<ScheduledToolDispatch, CordisError> {
     let tools = ctx
         .tools::<ToolsSurface>()
@@ -3207,12 +3269,13 @@ pub(crate) fn schedule_tool_dispatch(
             let Some(prepared) = execution.prepared.take() else {
                 return execution;
             };
+            let cancellation = execution.cancellation.clone();
             let ToolDispatchOutcome {
                 result,
                 additional_contexts,
                 concludes_turn,
                 ..
-            } = dispatch_prepared_tool_execution(&terminal_tools, prepared);
+            } = dispatch_prepared_tool_execution(&terminal_tools, prepared, cancellation);
             execution.result = Some(result);
             execution.additional_contexts.extend(additional_contexts);
             execution.concludes_turn |= concludes_turn;
@@ -3228,6 +3291,7 @@ pub(crate) fn schedule_tool_dispatch(
     };
     let execution = ToolDispatchExecution {
         input: input.clone(),
+        cancellation,
         prepared: Some(prepared),
         result: None,
         result_projection: result_projection.clone(),
@@ -3247,6 +3311,7 @@ pub(crate) fn schedule_tool_dispatch(
 fn dispatch_prepared_tool_execution(
     tools: &ToolsSurface,
     prepared: PreparedToolExecution,
+    cancellation: LifecycleCancellation,
 ) -> ToolDispatchOutcome {
     let PreparedToolExecution {
         input,
@@ -3286,7 +3351,7 @@ fn dispatch_prepared_tool_execution(
         };
         Arc::clone(executor)
     };
-    let run = ToolRunContext::new(input);
+    let run = ToolRunContext::new(input, cancellation);
     let result = match catch_unwind(AssertUnwindSafe(|| executor(&run))) {
         Ok(Ok(value)) => ToolDispatchResult::Success { value },
         Ok(Err(message)) => ToolDispatchResult::Failure { message },

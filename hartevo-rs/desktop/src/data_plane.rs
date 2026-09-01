@@ -56,9 +56,9 @@ use hartevo_cordis::{
     EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding,
     LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError, LlmGenerateRequest,
     LlmResolvedModel, RuntimeBinding, RuntimeDispatchPermit, RuntimeRecordBinding,
-    SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionLlmFailure,
-    SessionMessageRole, SessionMessageSource, SessionStreamBlockType, SessionStreamChunk,
-    TurnEndReason,
+    SessionCallConfig, SessionCancelCause, SessionContentBlock, SessionFinishReason,
+    SessionLlmFailure, SessionMessageRole, SessionMessageSource, SessionStreamBlockType,
+    SessionStreamChunk, TurnEndReason,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -304,6 +304,7 @@ struct DesktopRuntimeProgressFeed {
 #[derive(Clone, Debug, Default)]
 pub struct DesktopRuntimeCancellation {
     requested: Arc<AtomicBool>,
+    cordis: LifecycleCancellation,
     progress: Arc<Mutex<DesktopRuntimeProgressFeed>>,
     local_approval: Arc<Mutex<Option<DesktopHeldLocalApproval>>>,
     local_approval_decision: Arc<Mutex<Option<bool>>>,
@@ -323,12 +324,17 @@ pub struct DesktopHeldLocalApproval {
 impl DesktopRuntimeCancellation {
     pub fn request(&self) {
         if !self.requested.swap(true, Ordering::AcqRel) {
+            self.cordis.cancel_with(SessionCancelCause::User);
             self.record_progress(DesktopRuntimeProgressPhase::StopRequested);
         }
     }
 
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    fn cordis_cancellation(&self) -> LifecycleCancellation {
+        self.cordis.clone()
     }
 
     pub fn held_local_approval(&self) -> Option<DesktopHeldLocalApproval> {
@@ -1432,6 +1438,7 @@ where
                 "Desktop Application Runtime request does not match its durable Cordis input",
             ));
         }
+        let cordis_cancellation = request.cancellation().clone();
         let run = self
             .run
             .lock()
@@ -1450,6 +1457,13 @@ where
             })?;
         match run() {
             Ok((completion, chunks)) => {
+                if completion
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.status == RuntimeTurnStatus::Interrupted)
+                {
+                    cordis_cancellation.cancel_with(SessionCancelCause::User);
+                }
                 *self.completion.lock().map_err(|_| {
                     desktop_live_agent_failure(
                         "DESKTOP_RUNTIME_COMPLETION_POISONED",
@@ -5547,6 +5561,12 @@ impl DesktopDataPlane {
                 )
             },
         );
+        let cordis_cancellation = cancellation
+            .filter(|control| !control.is_requested())
+            .map_or_else(
+                LifecycleCancellation::default,
+                DesktopRuntimeCancellation::cordis_cancellation,
+            );
         let agent_result = {
             let mut cordis = self
                 .cordis
@@ -5555,7 +5575,7 @@ impl DesktopDataPlane {
             futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
                 request,
                 adapter,
-                &LifecycleCancellation::default(),
+                &cordis_cancellation,
                 permit,
             ))
         };
@@ -8359,6 +8379,17 @@ mod tests {
                 .expect("repaired Session");
             (sessions, restored)
         })
+    }
+
+    fn assert_desktop_cordis_turn_aborted_by_user(plane: &DesktopDataPlane, id: &str) {
+        let (_, session) = desktop_cordis_session(plane, id);
+        assert!(matches!(
+            session.events().unwrap().last().map(|event| &event.kind),
+            Some(hartevo_cordis::SessionEventKind::TurnEnd {
+                reason: TurnEndReason::Aborted(SessionCancelCause::User),
+                ..
+            })
+        ));
     }
 
     fn assert_durable_crash_repair(
@@ -12663,7 +12694,7 @@ sleep 30"#;
                 &events[9].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
-                    reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                    reason: TurnEndReason::Aborted(SessionCancelCause::User),
                 }
             ));
             assert_eq!(session.derive_messages().unwrap().len(), 1);
@@ -12841,7 +12872,7 @@ sleep 30"#;
                 &events[12].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
-                    reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                    reason: TurnEndReason::Aborted(SessionCancelCause::User),
                 }
             ));
         });
@@ -13563,6 +13594,7 @@ sleep 30"#;
             submission.runtime_outcome,
             DesktopMissionRuntimeOutcome::Interrupted
         );
+        assert_desktop_cordis_turn_aborted_by_user(&plane, submission.mission_id.as_str());
         let progress = cancellation.progress_since(0);
         assert!(
             progress
