@@ -998,10 +998,17 @@ impl SessionState {
 }
 
 pub(crate) fn validate_inbox_user_message(message: &SessionMessage) -> Result<(), SessionError> {
+    validate_agent_user_message(message, "agent/inbox/spliced")
+}
+
+pub(crate) fn validate_agent_user_message(
+    message: &SessionMessage,
+    event_type: &'static str,
+) -> Result<(), SessionError> {
     validate_message(
         message,
         SessionMessageRole::User,
-        "agent/inbox/spliced",
+        event_type,
         valid_user_source,
         "user or non-empty plugin",
     )

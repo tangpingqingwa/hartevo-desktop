@@ -2,15 +2,18 @@
 //! never the loop and never the owner of Domain or Effect.
 
 use crate::context::{Context, CordisError, keys};
+use crate::inbox::AgentInboxTarget;
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::session::{
-    SessionContentBlock, SessionHandle, SessionId, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionStore, SessionSurfaceIntent, TurnEndReason,
+    SessionContentBlock, SessionError, SessionHandle, SessionId, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent, TurnEndReason,
+    validate_agent_user_message,
 };
 use crate::surface::{
-    AgentRef, AgentsSurface, DomainSurface, EffectBrokerSurface, LlmStream, LlmSurface,
-    RuntimeSurface, ToolCall, ToolsSurface, events, register_agent, run_tools_pipeline, stream_llm,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentsSurface, DomainSurface,
+    EffectBrokerSurface, LlmStream, LlmSurface, RuntimeSurface, ToolCall, ToolsSurface, events,
+    register_agent, run_tools_pipeline, stream_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
@@ -70,6 +73,37 @@ pub struct AgentStepResult {
     pub id: String,
     pub plan: LlmStream,
     pub tool: Option<ToolCall>,
+}
+
+/// Claim the exact inbox batch, then run the authoritative pre-step waterfall.
+///
+/// This boundary intentionally returns before `step/start`; the future driver
+/// owns the matching reject/enter lifecycle transition.
+pub fn prepare_agent_step(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+) -> Result<AgentPreStep, CordisError> {
+    require_loop_surfaces(ctx)?;
+    let sessions = ctx
+        .sessions::<SessionStore>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::SESSIONS.to_string()]))?;
+    let session = sessions
+        .get(session_id)?
+        .ok_or_else(|| SessionError::SessionNotFound {
+            id: session_id.clone(),
+        })?;
+    let claimed = session.inbox().claim(target, turn)?;
+    let proposal = AgentPreStep::enter(AgentRef::new(session_id.as_str()), turn, step, claimed);
+    let proposal = ctx.waterfall(events::AGENT_PRE_STEP, proposal)?;
+    if let AgentPreStepDecision::Enter { messages, .. } = proposal.decision() {
+        for message in messages {
+            validate_agent_user_message(message, "agent/pre-step")?;
+        }
+    }
+    Ok(proposal)
 }
 
 /// Register the live agent, plan via `ctx.llm`, optionally execute a tool,

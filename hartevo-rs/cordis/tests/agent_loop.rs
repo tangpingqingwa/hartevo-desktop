@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentLoop, AgentRef, AgentStep, Context, CordisError, CordisHost, DomainSurface,
-    EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
-    KernelConsentState, LlmStream, LoaderContext, RuntimeSurface, SessionContentBlock,
-    SessionEventKind, SessionId, SessionMessageRole, SessionMessageSource, SessionStore,
-    SessionSurfaceIntent, SurfaceOwner, ToolCall, TurnEndReason, events, keys, run_agent_step,
+    AgentInboxTarget, AgentLoop, AgentPreStepDecision, AgentRef, AgentStep, Context, CordisError,
+    CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
+    KernelApprovalDecision, KernelConsentState, LlmStream, LoaderContext, RuntimeSurface,
+    SessionContentBlock, SessionError, SessionEventKind, SessionId, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent, SurfaceOwner,
+    ToolCall, TurnEndReason, events, keys, prepare_agent_step, run_agent_step,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -31,6 +32,193 @@ fn mapped_with_openinterpreter(openinterpreter: bool) -> Context {
 
 fn mapped() -> Context {
     mapped_with_openinterpreter(false)
+}
+
+fn user_message(id: &str, text: &str) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::Text { text: text.into() }],
+        source: SessionMessageSource::User,
+    }
+}
+
+#[test]
+fn pre_step_defaults_to_the_exact_claimed_batch_before_any_step_event() {
+    let mut ctx = mapped();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("pre-step-default").unwrap())
+        .unwrap();
+    let next_step = user_message("step-context", "context");
+    let next_turn = user_message("turn-prompt", "prompt");
+    session.inbox().append_next_step(next_step.clone()).unwrap();
+    session.inbox().append_next_turn(next_turn.clone()).unwrap();
+    let turn = session.start_turn().unwrap();
+    let before = session.events().unwrap().len();
+
+    let proposal =
+        prepare_agent_step(&mut ctx, session.id(), AgentInboxTarget::NextTurn, turn, 1).unwrap();
+
+    assert_eq!(proposal.agent(), &AgentRef::new("pre-step-default"));
+    assert_eq!(proposal.turn(), turn);
+    assert_eq!(proposal.step(), 1);
+    assert_eq!(
+        proposal.decision(),
+        &AgentPreStepDecision::Enter {
+            messages: vec![next_step, next_turn],
+            starts_request_series: false,
+        }
+    );
+    let events = session.events().unwrap();
+    assert_eq!(events.len(), before + 2);
+    assert!(matches!(
+        events[before].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextStep,
+            ..
+        }
+    ));
+    assert!(matches!(
+        events[before + 1].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            ..
+        }
+    ));
+    assert!(events[before..].iter().all(|event| !matches!(
+        event.kind,
+        SessionEventKind::StepStart { .. } | SessionEventKind::UserMessage { .. }
+    )));
+}
+
+#[test]
+fn pre_step_wrappers_replace_messages_without_losing_request_series() {
+    let mut ctx = mapped();
+    let replacement = user_message("replacement", "rewritten");
+    {
+        let replacement = replacement.clone();
+        ctx.on_waterfall(events::AGENT_PRE_STEP, move |proposal, next| {
+            next(proposal).replace_messages(vec![replacement.clone()])
+        })
+        .unwrap();
+    }
+    ctx.on_waterfall(events::AGENT_PRE_STEP, |proposal, next| {
+        next(proposal).with_starts_request_series()
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("pre-step-rewrite").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("original", "original"))
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+
+    let proposal =
+        prepare_agent_step(&mut ctx, session.id(), AgentInboxTarget::NextTurn, turn, 1).unwrap();
+
+    assert_eq!(proposal.agent(), &AgentRef::new("pre-step-rewrite"));
+    assert_eq!(proposal.turn(), turn);
+    assert_eq!(proposal.step(), 1);
+    assert_eq!(
+        proposal.into_decision(),
+        AgentPreStepDecision::Enter {
+            messages: vec![replacement],
+            starts_request_series: true,
+        }
+    );
+}
+
+#[test]
+fn pre_step_rejects_or_invalidates_after_claim_without_opening_a_step() {
+    let mut rejected_ctx = mapped();
+    rejected_ctx
+        .on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| proposal.reject())
+        .unwrap();
+    let rejected_session = rejected_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("pre-step-rejected").unwrap())
+        .unwrap();
+    rejected_session
+        .inbox()
+        .append_next_turn(user_message("rejected", "rejected"))
+        .unwrap();
+    let rejected_turn = rejected_session.start_turn().unwrap();
+    let rejected = prepare_agent_step(
+        &mut rejected_ctx,
+        rejected_session.id(),
+        AgentInboxTarget::NextTurn,
+        rejected_turn,
+        1,
+    )
+    .unwrap();
+    assert_eq!(rejected.decision(), &AgentPreStepDecision::Reject);
+    assert!(!rejected_session.inbox().has_pending().unwrap());
+    assert!(
+        !rejected_session
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event.kind,
+                SessionEventKind::StepStart { .. } | SessionEventKind::UserMessage { .. }
+            ))
+    );
+
+    let mut invalid_ctx = mapped();
+    invalid_ctx
+        .on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| {
+            proposal.replace_messages(vec![SessionMessage {
+                id: "invalid-assistant".into(),
+                role: SessionMessageRole::Assistant,
+                content: vec![SessionContentBlock::Text {
+                    text: "invalid".into(),
+                }],
+                source: SessionMessageSource::User,
+            }])
+        })
+        .unwrap();
+    let invalid_session = invalid_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("pre-step-invalid").unwrap())
+        .unwrap();
+    invalid_session
+        .inbox()
+        .append_next_turn(user_message("valid", "valid"))
+        .unwrap();
+    let invalid_turn = invalid_session.start_turn().unwrap();
+    assert_eq!(
+        prepare_agent_step(
+            &mut invalid_ctx,
+            invalid_session.id(),
+            AgentInboxTarget::NextTurn,
+            invalid_turn,
+            1,
+        ),
+        Err(CordisError::Session(SessionError::UnexpectedMessageRole {
+            event_type: "agent/pre-step",
+            expected: SessionMessageRole::User,
+            actual: SessionMessageRole::Assistant,
+        }))
+    );
+    assert!(!invalid_session.inbox().has_pending().unwrap());
+    assert!(
+        !invalid_session
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event.kind,
+                SessionEventKind::StepStart { .. } | SessionEventKind::UserMessage { .. }
+            ))
+    );
 }
 
 #[test]
