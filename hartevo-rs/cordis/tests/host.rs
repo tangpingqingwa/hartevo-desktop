@@ -1,12 +1,13 @@
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentRef, AgentStatus, AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost,
-    DomainCommandBinding, DomainCommandKind, DomainSurface, EffectBrokerSurface,
-    EffectExecutionBinding, EffectReconciliationBinding, EnvironmentOverlay, HOST_PLUGIN_IDS,
-    InvariantGate, KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
-    KernelConsentStatus, LoaderContext, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId,
-    RuntimeBinding, RuntimeSurface, SurfaceOwner, ToolCall, enforce_invariants,
-    host_is_cordis_loop, host_plugin_ids, invariant_missing, keys, register_agent,
+    AgentRef, AgentStatus, AgentStatusChange, AgentStep, AgentsSurface, AuthorityScope,
+    CordisError, CordisHost, DomainCommandBinding, DomainCommandKind, DomainSurface,
+    EffectBrokerSurface, EffectExecutionBinding, EffectReconciliationBinding, EnvironmentOverlay,
+    HOST_PLUGIN_IDS, InvariantGate, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
+    KernelConsentState, KernelConsentStatus, LoaderContext, OPENINTERPRETER,
+    OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding, RuntimeSurface, SurfaceOwner, ToolCall,
+    enforce_invariants, events, host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
+    register_agent,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -677,6 +678,91 @@ fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
     );
 }
 
+#[test]
+fn runtime_status_events_are_ordered_visible_and_non_vetoing() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    {
+        let agents = std::sync::Arc::clone(&agents);
+        let order = std::sync::Arc::clone(&order);
+        host.context_mut()
+            .on_emit(events::AGENT_CREATED, move |agent| {
+                assert_eq!(agent.status(), AgentStatus::Running);
+                assert_eq!(agents.list().as_slice(), std::slice::from_ref(agent));
+                order.lock().unwrap().push("created".to_string());
+            })
+            .unwrap();
+    }
+    host.context_mut()
+        .try_on_emit(events::AGENT_STATUS, |_: &AgentStatusChange| {
+            Err(std::io::Error::other("contained status listener"))
+        })
+        .unwrap();
+    host.context_mut()
+        .on_emit(events::AGENT_STATUS, |_: &AgentStatusChange| {
+            panic!("contained status listener panic");
+        })
+        .unwrap();
+    {
+        let agents = std::sync::Arc::clone(&agents);
+        let order = std::sync::Arc::clone(&order);
+        host.context_mut()
+            .on_emit(events::AGENT_STATUS, move |change| {
+                assert_eq!(change.agent().status(), change.status());
+                assert_eq!(
+                    agents.list().as_slice(),
+                    std::slice::from_ref(change.agent())
+                );
+                order
+                    .lock()
+                    .unwrap()
+                    .push(format!("status:{}", change.status().as_str()));
+            })
+            .unwrap();
+    }
+    {
+        let agents = std::sync::Arc::clone(&agents);
+        let order = std::sync::Arc::clone(&order);
+        host.context_mut()
+            .on_emit(events::AGENT_DISPOSED, move |agent| {
+                assert_eq!(agent.status(), AgentStatus::Idle);
+                assert!(agents.list().is_empty());
+                order.lock().unwrap().push("disposed".to_string());
+            })
+            .unwrap();
+    }
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    assert!(order.lock().unwrap().is_empty());
+    permit.announce_started().unwrap();
+    let agent = agents.list().into_iter().next().unwrap();
+    assert_eq!(*order.lock().unwrap(), ["created", "status:running"]);
+
+    let completion = host.finish_runtime(permit).unwrap();
+    assert!(host.active_runtime_scope().is_none());
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
+    completion.announce().unwrap();
+
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    assert!(agents.list().is_empty());
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["created", "status:running", "status:idle", "disposed"]
+    );
+}
+
 #[tokio::test]
 async fn runtime_agent_status_and_when_idle_follow_the_exact_permit() {
     let idle = AgentRef::new("not-yet-published");
@@ -712,9 +798,10 @@ async fn runtime_agent_status_and_when_idle_follow_the_exact_permit() {
 
     let completion = host.finish_runtime(permit).unwrap();
     assert_eq!(agent.status(), AgentStatus::Idle);
+    assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
     assert_eq!(waiter.await.unwrap(), AgentStatus::Idle);
-    assert!(agents.list().is_empty());
     completion.announce().unwrap();
+    assert!(agents.list().is_empty());
 }
 
 #[tokio::test]
@@ -763,12 +850,21 @@ fn runtime_agent_publication_collision_never_replaces_or_disposes_the_live_ident
     let agent = AgentRef::new("project-a:mission-a:2:1");
     register_agent(host.context_mut(), agent.clone()).unwrap();
     let disposed_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let status_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
         let disposed_calls = std::sync::Arc::clone(&disposed_calls);
         host.on_runtime_finished(move |_| {
             disposed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
         .unwrap();
+    }
+    {
+        let status_calls = std::sync::Arc::clone(&status_calls);
+        host.context_mut()
+            .on_emit(events::AGENT_STATUS, move |_| {
+                status_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .unwrap();
     }
 
     let mut permit = host.authorize_runtime(&scope).unwrap();
@@ -787,6 +883,7 @@ fn runtime_agent_publication_collision_never_replaces_or_disposes_the_live_ident
 
     host.finish_runtime(permit).unwrap().announce().unwrap();
     assert_eq!(disposed_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(status_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(host.active_runtime_scope().is_none());
 }
 
@@ -804,6 +901,15 @@ fn runtime_agent_publication_panic_rolls_back_before_the_caller_recovers() {
     .unwrap();
     let agents = host.context().agents::<AgentsSurface>().unwrap();
     let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let status_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let status_calls = std::sync::Arc::clone(&status_calls);
+        host.context_mut()
+            .on_emit(events::AGENT_STATUS, move |_| {
+                status_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .unwrap();
+    }
     let observed_agent = std::sync::Arc::clone(&observed);
     host.on_runtime_started(move |agent| {
         assert_eq!(agent.status(), AgentStatus::Running);
@@ -821,6 +927,7 @@ fn runtime_agent_publication_panic_rolls_back_before_the_caller_recovers() {
         observed.lock().unwrap().as_ref().unwrap().status(),
         AgentStatus::Idle
     );
+    assert_eq!(status_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     host.finish_runtime(permit).unwrap().announce().unwrap();
     assert!(host.active_runtime_scope().is_none());

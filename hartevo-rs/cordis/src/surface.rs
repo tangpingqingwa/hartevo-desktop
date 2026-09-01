@@ -51,8 +51,8 @@ pub mod events {
     use crate::event::{BailOutcome, Emit, EventKey, EventSchemaId, Serial, Waterfall};
 
     use super::{
-        AgentPreStep, AgentRef, AgentRequest, AgentTurnStopping, LlmStream, PromptAssembly,
-        ToolCall, ToolDispatchExecution, ToolExecutionResult, ToolPostExecution,
+        AgentPreStep, AgentRef, AgentRequest, AgentStatusChange, AgentTurnStopping, LlmStream,
+        PromptAssembly, ToolCall, ToolDispatchExecution, ToolExecutionResult, ToolPostExecution,
     };
 
     /// Replace or wrap one detached system-prompt/tool-schema assembly.
@@ -106,6 +106,11 @@ pub mod events {
     pub const AGENT_CREATED: EventKey<Emit, AgentRef, ()> = EventKey::new(
         EventSchemaId::new("hartevo.agent.created.v1"),
         "agent/created",
+    );
+    /// Observe-only notification of one exact Agent status transition.
+    pub const AGENT_STATUS: EventKey<Emit, AgentStatusChange, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.agent.status.v1"),
+        "agent/status",
     );
     /// Live agent left the registry.
     pub const AGENT_DISPOSED: EventKey<Emit, AgentRef, ()> = EventKey::new(
@@ -1509,6 +1514,29 @@ impl AgentStatus {
     }
 }
 
+/// Immutable destination of one exact `agent/status` transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentStatusChange {
+    agent: AgentRef,
+    status: AgentStatus,
+}
+
+impl AgentStatusChange {
+    pub(crate) const fn new(agent: AgentRef, status: AgentStatus) -> Self {
+        Self { agent, status }
+    }
+
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        &self.agent
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> AgentStatus {
+        self.status
+    }
+}
+
 #[derive(Debug)]
 struct AgentLifecycle {
     status: watch::Sender<AgentStatus>,
@@ -1551,12 +1579,12 @@ impl AgentRef {
         }
     }
 
-    fn mark_running(&self) {
-        self.lifecycle.status.send_replace(AgentStatus::Running);
+    fn mark_running(&self) -> bool {
+        self.lifecycle.status.send_replace(AgentStatus::Running) != AgentStatus::Running
     }
 
-    fn mark_idle(&self) {
-        self.lifecycle.status.send_replace(AgentStatus::Idle);
+    fn mark_idle(&self) -> bool {
+        self.lifecycle.status.send_replace(AgentStatus::Idle) != AgentStatus::Idle
     }
 
     fn is_same_lifecycle(&self, other: &Self) -> bool {
@@ -2322,8 +2350,14 @@ pub(crate) struct AgentPublicationCommit {
 
 impl Drop for AgentPublicationCommit {
     fn drop(&mut self) {
-        self.agent.mark_idle();
+        let _ = self.agent.mark_idle();
         self.registry.unregister_exact(&self.agent);
+    }
+}
+
+impl AgentPublicationCommit {
+    pub(crate) fn mark_idle(&self) -> bool {
+        self.agent.mark_idle()
     }
 }
 
@@ -2355,7 +2389,8 @@ impl AgentsSurface {
         if live.iter().any(|published| published.id == agent.id) {
             return Err(CordisError::AgentAlreadyPublished { id: agent.id });
         }
-        agent.mark_running();
+        let transitioned = agent.mark_running();
+        debug_assert!(transitioned, "an unpublished Agent starts idle");
         live.push(agent);
         Ok(())
     }
@@ -2594,6 +2629,7 @@ fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
     validate_mapped_event(ctx, events::TOOLS_RESULT)?;
     validate_mapped_event(ctx, events::LLM_STREAM)?;
     validate_mapped_event(ctx, events::AGENT_CREATED)?;
+    validate_mapped_event(ctx, events::AGENT_STATUS)?;
     validate_mapped_event(ctx, events::AGENT_DISPOSED)?;
     validate_mapped_event(ctx, events::AGENT_PRE_STEP)?;
     validate_mapped_event(ctx, events::AGENT_REQUEST)?;
@@ -2643,6 +2679,7 @@ fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
     ctx.lock_event_key(events::TOOLS_RESULT)?;
     ctx.lock_event_key(events::LLM_STREAM)?;
     ctx.lock_event_key(events::AGENT_CREATED)?;
+    ctx.lock_event_key(events::AGENT_STATUS)?;
     ctx.lock_event_key(events::AGENT_DISPOSED)?;
     ctx.lock_event_key(events::AGENT_PRE_STEP)?;
     ctx.lock_event_key(events::AGENT_REQUEST)?;
@@ -3504,7 +3541,7 @@ pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
         | "agent/pre-step"
         | "agent/request" => Some(DispatchMode::Waterfall),
         "agent/turn-stopping" => Some(DispatchMode::Serial),
-        "tools/result" | "agent/created" | "agent/disposed" | "session/event" => {
+        "tools/result" | "agent/created" | "agent/status" | "agent/disposed" | "session/event" => {
             Some(DispatchMode::Emit)
         }
         "session/flush" => Some(DispatchMode::Parallel),
@@ -3547,7 +3584,7 @@ mod tests {
     }
 
     #[test]
-    fn all_thirteen_surface_event_descriptors_preflight_before_any_provider_mutation() {
+    fn all_fourteen_surface_event_descriptors_preflight_before_any_provider_mutation() {
         let mut ctx = Context::new();
         let incompatible_last_key = EventKey::<Emit, AgentTurnStopping, ()>::new(
             events::AGENT_TURN_STOPPING.schema_id(),
@@ -3578,6 +3615,7 @@ mod tests {
             events::TOOLS_RESULT.name(),
             events::LLM_STREAM.name(),
             events::AGENT_CREATED.name(),
+            events::AGENT_STATUS.name(),
             events::AGENT_DISPOSED.name(),
             events::AGENT_PRE_STEP.name(),
             events::AGENT_REQUEST.name(),

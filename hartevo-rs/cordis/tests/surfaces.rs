@@ -168,7 +168,7 @@ fn tools_pipeline_locks_exactly_one_mode_per_event() {
 }
 
 #[test]
-fn all_thirteen_mapped_events_keep_their_exact_typed_descriptors() {
+fn all_fourteen_mapped_events_keep_their_exact_typed_descriptors() {
     let ctx = mapped();
     macro_rules! assert_mapped {
         ($key:expr, $mode:expr) => {{
@@ -185,6 +185,7 @@ fn all_thirteen_mapped_events_keep_their_exact_typed_descriptors() {
     assert_mapped!(events::TOOLS_RESULT, DispatchMode::Emit);
     assert_mapped!(events::LLM_STREAM, DispatchMode::Waterfall);
     assert_mapped!(events::AGENT_CREATED, DispatchMode::Emit);
+    assert_mapped!(events::AGENT_STATUS, DispatchMode::Emit);
     assert_mapped!(events::AGENT_DISPOSED, DispatchMode::Emit);
     assert_mapped!(events::AGENT_PRE_STEP, DispatchMode::Waterfall);
     assert_mapped!(events::AGENT_REQUEST, DispatchMode::Waterfall);
@@ -944,6 +945,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
         events::TOOLS_RESULT.name(),
         events::LLM_STREAM.name(),
         events::AGENT_CREATED.name(),
+        events::AGENT_STATUS.name(),
         events::AGENT_DISPOSED.name(),
         events::AGENT_PRE_STEP.name(),
         events::AGENT_REQUEST.name(),

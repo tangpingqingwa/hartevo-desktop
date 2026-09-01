@@ -2346,17 +2346,17 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use futures_util::stream;
     use hartevo_cordis::{
-        AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStep, AgentsSurface,
-        AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, DomainCommandBinding,
-        DomainCommandKind, DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
-        EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
-        KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
-        LlmGenerateRequest, LlmResolvedModel, LlmSurface, OPENINTERPRETER, RuntimeBinding,
-        SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind,
-        SessionFinishReason, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
-        SessionMessageSource, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-        SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner, TurnEndReason, enforce_invariants,
-        events, host_is_cordis_loop, invariant_missing, keys, session_events,
+        AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStatusChange, AgentStep,
+        AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
+        DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding,
+        EffectReconciliationBinding, EffectVerificationBinding, FiberState, KernelApproval,
+        KernelApprovalDecision, KernelConsentState, LifecycleCancellation, LlmAdapter,
+        LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, LlmSurface,
+        OPENINTERPRETER, RuntimeBinding, SessionCallConfig, SessionContentBlock, SessionError,
+        SessionEventKind, SessionFinishReason, SessionId, SessionLlmFailure, SessionMessage,
+        SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamBlockType,
+        SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner, TurnEndReason,
+        enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys, session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -2910,6 +2910,33 @@ mod tests {
         );
     }
 
+    fn record_runtime_status(host: &Arc<DesktopCordisSlot>) -> Arc<Mutex<Vec<AgentStatus>>> {
+        let status_order = Arc::new(Mutex::new(Vec::new()));
+        let status_probe = Arc::clone(host);
+        let observed_status_order = Arc::clone(&status_order);
+        host.lock()
+            .unwrap()
+            .context_mut()
+            .on_emit(events::AGENT_STATUS, move |change: &AgentStatusChange| {
+                let unlocked = status_probe
+                    .try_lock()
+                    .expect("agent/status must run without the Cordis host lock");
+                assert_eq!(change.agent().status(), change.status());
+                assert_eq!(
+                    unlocked
+                        .context()
+                        .agents::<AgentsSurface>()
+                        .unwrap()
+                        .list()
+                        .as_slice(),
+                    std::slice::from_ref(change.agent())
+                );
+                observed_status_order.lock().unwrap().push(change.status());
+            })
+            .unwrap();
+        status_order
+    }
+
     #[test]
     fn started_failure_is_cached_and_lifecycle_callbacks_run_after_unlock() {
         let host = Arc::new(DesktopCordisSlot::new(
@@ -3087,6 +3114,7 @@ mod tests {
         let observed_nested_calls = Arc::clone(&nested_calls);
         let live_agent = Arc::new(Mutex::new(None::<AgentRef>));
         let observed_agent = Arc::clone(&live_agent);
+        let status_order = record_runtime_status(&host);
 
         let output = dispatch_live_runtime(
             &host,
@@ -3133,6 +3161,10 @@ mod tests {
         assert_eq!(output, "application-runtime");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(nested_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *status_order.lock().unwrap(),
+            [AgentStatus::Running, AgentStatus::Idle]
+        );
         assert_eq!(
             live_agent.lock().unwrap().as_ref().unwrap().status(),
             AgentStatus::Idle

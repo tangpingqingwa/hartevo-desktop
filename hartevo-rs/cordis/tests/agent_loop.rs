@@ -5948,6 +5948,7 @@ fn teardown_undoes_agents_and_loop_listeners() {
         1
     );
     assert!(ctx.listener_count(events::AGENT_CREATED) >= 1);
+    assert!(ctx.listener_count(events::AGENT_STATUS) >= 1);
     assert!(ctx.listener_count(events::AGENT_DISPOSED) >= 1);
 
     ctx.teardown();
@@ -5965,8 +5966,10 @@ fn teardown_undoes_agents_and_loop_listeners() {
         assert!(!ctx.has(key), "{key} must reverse on teardown");
     }
     assert_eq!(ctx.listener_count(events::AGENT_CREATED), 0);
+    assert_eq!(ctx.listener_count(events::AGENT_STATUS), 0);
     assert_eq!(ctx.listener_count(events::AGENT_DISPOSED), 0);
     assert_eq!(ctx.event_mode(events::AGENT_CREATED), None);
+    assert_eq!(ctx.event_mode(events::AGENT_STATUS), None);
     assert_eq!(ctx.event_mode(events::AGENT_DISPOSED), None);
 
     let mut reloaded = mapped();
@@ -6011,6 +6014,7 @@ fn overlay_still_selects_surface_mapping_then_agent_loop() {
     assert!(ctx.has(keys::DOMAIN));
     assert!(ctx.has(keys::EFFECT_BROKER));
     assert_eq!(ctx.listener_count(events::AGENT_CREATED), 1);
+    assert_eq!(ctx.listener_count(events::AGENT_STATUS), 1);
     assert!(ctx.get::<&str>("openinterpreter").is_none());
 
     let out = run_agent_step(ctx, AgentStep::new("mission-overlay", "plan")).unwrap();
