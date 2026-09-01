@@ -22,10 +22,11 @@ use crate::session::{
     validate_agent_user_message, validate_content_blocks,
 };
 use crate::surface::{
-    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentStatusChange,
-    AgentTurnStopping, AgentsSurface, DomainSurface, EffectBrokerSurface, LlmChunkStream, LlmError,
-    LlmGenerateRequest, LlmStream, LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeSurface,
-    ToolCall, ToolExecutionInput, ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,
+    AgentRequestErrorAction, AgentStatusChange, AgentTurnStopping, AgentsSurface, DomainSurface,
+    EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
+    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
+    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
     aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
     dispatch_tool_execution_with_cancellation, events, finalize_tool_execution,
     post_tool_execution, prepare_llm_call, prepare_tool_execution, register_agent,
@@ -758,6 +759,63 @@ fn build_agent_turn_call(
     log_agent_call(ctx, state, call).map(AgentBuildAdmission::Call)
 }
 
+/// Rebuild one fresh provider attempt without reclaiming or reopening its step.
+fn rebuild_agent_turn_call(
+    ctx: &mut Context,
+    state: &mut AgentRequestLogState,
+    prior: &LoggedAgentCall,
+) -> Result<LoggedAgentCall, CordisError> {
+    let prior_request = prior.call().request();
+    let agent = prior_request.agent().clone();
+    let session_id = prior_request.session_id().clone();
+    let turn = prior_request.turn();
+    let step = prior_request.step();
+    let cancellation = prior_request.cancellation().clone();
+    let assembly = prior_request.assembly().clone();
+    require_request_log_state_session(state, &session_id)?;
+
+    let session = agent_session(ctx, &session_id)?;
+    session.require_open_step(turn, step)?;
+    let header = session
+        .request_header()?
+        .ok_or(LlmError::InvalidPreparedCall {
+            expected: "a durable request header before same-step retry",
+        })?;
+    let seed_config = request_proposal_from_header(header);
+    let (messages, surface_generation) = session.agent_request_boundary(turn, step)?;
+    let request = AgentRequest::new(agent.clone(), turn, step, seed_config, cancellation.clone());
+    let request = ctx.waterfall(events::AGENT_REQUEST, request)?;
+    validate_agent_request_config(request.config())?;
+    session.require_open_step(turn, step)?;
+
+    let request = PreparedAgentRequest {
+        agent,
+        session_id: session_id.clone(),
+        turn,
+        step,
+        cancellation: request.cancellation().clone(),
+        config: request.into_config(),
+        messages,
+        assembly,
+        starts_request_series: false,
+        surface_generation,
+    };
+    let call = prepare_admitted_agent_call(ctx, &session_id, turn, step, request)?;
+    log_agent_call(ctx, state, call)
+}
+
+fn request_proposal_from_header(mut header: SessionEpochHeader) -> SessionCallConfig {
+    if let Some(defaults) = header.adapter_defaults {
+        if defaults.reasoning_effort {
+            header.config.reasoning_effort = None;
+        }
+        if defaults.max_tokens {
+            header.config.max_tokens = None;
+        }
+    }
+    header.config
+}
+
 /// Run one complete durable agent turn over the canonical Cordis primitives.
 ///
 /// Cancellation is content-free at this boundary and records its immutable
@@ -924,7 +982,7 @@ async fn drive_agent_turn(
         };
         steps = step;
 
-        let step_result = run_agent_turn_step(ctx, &logged, cancellation).await;
+        let step_result = run_agent_turn_step(ctx, logged, &mut request_state, cancellation).await;
         session.finish_step(turn, step)?;
         let step_end = step_result?;
         if let Some(reason @ TurnEndReason::Aborted(_)) = step_end {
@@ -971,42 +1029,77 @@ async fn drive_agent_turn(
 
 async fn run_agent_turn_step(
     ctx: &mut Context,
-    logged: &LoggedAgentCall,
+    mut logged: LoggedAgentCall,
+    request_state: &mut AgentRequestLogState,
     cancellation: &LifecycleCancellation,
 ) -> Result<Option<TurnEndReason>, CordisError> {
-    if cancellation.is_cancelled() {
-        return Ok(Some(cancelled_turn_reason(cancellation)));
-    }
-    let mut recorded = record_agent_stream(ctx, logged).await?;
-    if cancellation.is_cancelled() {
-        return Ok(Some(cancelled_turn_reason(cancellation)));
-    }
-    let committed = commit_agent_stream(ctx, logged, &mut recorded)?;
-    match committed.finish() {
-        SessionFinishReason::Error { failure } => Err(LlmError::RequestFailed {
-            failure: failure.clone(),
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(Some(cancelled_turn_reason(cancellation)));
         }
-        .into()),
-        SessionFinishReason::Aborted { .. } => Ok(Some(cancelled_turn_reason(cancellation))),
-        SessionFinishReason::MaxTokens => Ok(Some(TurnEndReason::MaxTokens)),
-        SessionFinishReason::Stop | SessionFinishReason::ToolCalls => {
-            let calls = schedule_agent_tool_calls(ctx, logged, &mut recorded)?;
-            if calls.is_empty() {
-                return Ok(Some(TurnEndReason::Completed));
+        let mut recorded = record_agent_stream(ctx, &logged).await?;
+        if cancellation.is_cancelled() {
+            return Ok(Some(cancelled_turn_reason(cancellation)));
+        }
+        let committed = commit_agent_stream(ctx, &logged, &mut recorded)?;
+        if cancellation.is_cancelled() {
+            return Ok(Some(cancelled_turn_reason(cancellation)));
+        }
+
+        let failed = match committed.finish() {
+            SessionFinishReason::Error { failure } | SessionFinishReason::Aborted { failure } => {
+                Some(failure.clone())
             }
-            let outcome = run_agent_tool_batch_with_limit_and_cancellation_outcome(
-                ctx,
-                logged,
-                &mut recorded,
-                DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-                cancellation,
-            )?;
+            SessionFinishReason::Stop
+            | SessionFinishReason::ToolCalls
+            | SessionFinishReason::MaxTokens => None,
+        };
+        if let Some(failure) = failed {
+            let request = logged.call().request();
+            let recovery = AgentRequestError::new(
+                request.agent().clone(),
+                request.turn(),
+                request.step(),
+                logged.call().config().provider.clone(),
+                failure.clone(),
+                request.cancellation().clone(),
+            );
+            let recovery = ctx.try_waterfall(events::AGENT_REQUEST_ERROR, recovery)?;
             if cancellation.is_cancelled() {
-                Ok(Some(cancelled_turn_reason(cancellation)))
-            } else if outcome.concludes_turn() {
-                Ok(Some(TurnEndReason::Completed))
-            } else {
-                Ok(None)
+                return Ok(Some(cancelled_turn_reason(cancellation)));
+            }
+            if recovery.action() != AgentRequestErrorAction::Retry {
+                return Err(LlmError::RequestFailed { failure }.into());
+            }
+            logged = rebuild_agent_turn_call(ctx, request_state, &logged)?;
+            continue;
+        }
+
+        match committed.finish() {
+            SessionFinishReason::MaxTokens => return Ok(Some(TurnEndReason::MaxTokens)),
+            SessionFinishReason::Stop | SessionFinishReason::ToolCalls => {
+                let calls = schedule_agent_tool_calls(ctx, &logged, &mut recorded)?;
+                if calls.is_empty() {
+                    return Ok(Some(TurnEndReason::Completed));
+                }
+                let outcome = run_agent_tool_batch_with_limit_and_cancellation_outcome(
+                    ctx,
+                    &logged,
+                    &mut recorded,
+                    DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+                    cancellation,
+                )?;
+                if cancellation.is_cancelled() {
+                    return Ok(Some(cancelled_turn_reason(cancellation)));
+                }
+                return if outcome.concludes_turn() {
+                    Ok(Some(TurnEndReason::Completed))
+                } else {
+                    Ok(None)
+                };
+            }
+            SessionFinishReason::Error { .. } | SessionFinishReason::Aborted { .. } => {
+                unreachable!("provider failures return or retry above")
             }
         }
     }

@@ -7,11 +7,11 @@ use chrono::{Duration, TimeZone, Utc};
 use futures_util::FutureExt;
 use hartevo_cordis::{
     AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
-    AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, AgentTurnStopping,
-    BailOutcome, Context, CordisError, CordisHost, DomainSurface, EffectBrokerSurface,
-    EnvironmentOverlay, KernelApproval, KernelApprovalDecision, KernelConsentState,
-    LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
-    LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
+    AgentRef, AgentRequestAdmission, AgentRequestErrorAction, AgentRequestLogState, AgentStep,
+    AgentTurnStopping, BailOutcome, Context, CordisError, CordisHost, DomainSurface,
+    EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
+    KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmChunkStream,
+    LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
     LoggedAgentCall, NonBail, PromptError, PromptSection, RecordedAgentStream, RuntimeSurface,
     SessionCallConfig, SessionCancelCause, SessionContentBlock, SessionError, SessionEventKind,
     SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure, SessionMessage,
@@ -20,9 +20,9 @@ use hartevo_cordis::{
     SessionTokenUsage, SessionToolSchema, SurfaceOwner, TOOL_ABORTED_BEFORE_DISPATCH, ToolCall,
     ToolDefinition, ToolDispatchExecution, ToolDispatchResult, ToolExecutionMode,
     ToolExecutionPreparation, ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface,
-    TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
-    commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution, events,
-    finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
+    TurnEndReason, WaterfallFailure, admit_agent_request, admit_agent_step, build_agent_call,
+    commit_agent_stream, commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution,
+    events, finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
     prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
     record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
     register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
@@ -259,6 +259,83 @@ fn text_finish_chunks(text: &str, reason: SessionFinishReason) -> Vec<SessionStr
             replay_state: None,
         },
     ]
+}
+
+type ObservedRequestRecovery = (AgentRef, u64, u64, String, SessionLlmFailure);
+
+fn assert_two_same_step_recoveries(
+    recoveries: &[ObservedRequestRecovery],
+    first: &SessionLlmFailure,
+    second: &SessionLlmFailure,
+) {
+    assert_eq!(recoveries.len(), 2);
+    assert!(recoveries[1].0.is_same_lifecycle(&recoveries[0].0));
+    for recovery in recoveries {
+        assert_eq!(recovery.1, 1);
+        assert_eq!(recovery.2, 1);
+        assert_eq!(recovery.3, "mock");
+    }
+    assert_eq!(&recoveries[0].4, first);
+    assert_eq!(&recoveries[1].4, second);
+}
+
+fn assert_single_retry_turn_events(session: &SessionHandle, expected_text: &str) {
+    let events = session.events().unwrap();
+    for event_type in ["turn/start", "step/start"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind.event_type() == event_type)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::RequestHeader { .. }))
+            .count(),
+        1
+    );
+    let messages = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::AssistantMessage { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].content,
+        [SessionContentBlock::Text {
+            text: expected_text.into(),
+        }]
+    );
+}
+
+fn assert_failed_text_not_in_assistant_sources(session: &SessionHandle, failed_text: &str) {
+    let events = session.events().unwrap();
+    let failed_seq = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::AssistantChunk {
+                    chunk: SessionStreamChunk::BlockEnd {
+                        block: SessionContentBlock::Text { text },
+                        ..
+                    },
+                    ..
+                } if text == failed_text
+            )
+        })
+        .unwrap()
+        .seq;
+    let success_sources = events.iter().find_map(|event| match &event.kind {
+        SessionEventKind::AssistantMessage { surface, .. } => surface.source_event_seqs.as_ref(),
+        _ => None,
+    });
+    assert!(!success_sources.unwrap().contains(&failed_seq));
 }
 
 fn finalize_scheduled_tools(
@@ -557,6 +634,346 @@ fn generic_turn_reuses_one_agent_instance_across_live_extension_points() {
 }
 
 #[test]
+fn provider_failures_retry_inside_one_turn_and_step_before_success() {
+    let mut ctx = mapped();
+    let first_failure = SessionLlmFailure {
+        message: "busy".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: Some(25),
+        request_id: Some("retry-1".into()),
+    };
+    let second_failure = SessionLlmFailure {
+        message: "unavailable".into(),
+        code: "SERVICE_UNAVAILABLE".into(),
+        status: Some(503),
+        provider_retry_after_ms: None,
+        request_id: Some("retry-2".into()),
+    };
+    let (adapter, requests) = sequenced_adapter(vec![
+        text_finish_chunks(
+            "doomed partial",
+            SessionFinishReason::Error {
+                failure: first_failure.clone(),
+            },
+        ),
+        vec![SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Aborted {
+                failure: second_failure.clone(),
+            },
+            replay_state: None,
+        }],
+        text_finish_chunks("recovered", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let cancellation = LifecycleCancellation::default();
+    let request_events = Arc::new(AtomicUsize::new(0));
+    {
+        let request_events = Arc::clone(&request_events);
+        ctx.on_waterfall(events::AGENT_REQUEST, move |request, next| {
+            request_events.fetch_add(1, Ordering::SeqCst);
+            next(request)
+        })
+        .unwrap();
+    }
+    let recoveries = Arc::new(Mutex::new(Vec::new()));
+    {
+        let recoveries = Arc::clone(&recoveries);
+        let expected_cancellation = cancellation.clone();
+        ctx.try_on_waterfall(events::AGENT_REQUEST_ERROR, move |recovery, _next| {
+            assert_eq!(recovery.action(), AgentRequestErrorAction::Fail);
+            assert!(recovery.cancellation().is_same(&expected_cancellation));
+            recoveries.lock().unwrap().push((
+                recovery.agent().clone(),
+                recovery.turn(),
+                recovery.step(),
+                recovery.provider().to_string(),
+                recovery.failure().clone(),
+            ));
+            Ok(recovery.retry())
+        })
+        .unwrap();
+    }
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-request-retry").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("retry-input", "recover"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &cancellation,
+    )
+    .now_or_never()
+    .expect("scripted retries are immediately ready")
+    .unwrap();
+
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(request_events.load(Ordering::SeqCst), 3);
+    assert_two_same_step_recoveries(&recoveries.lock().unwrap(), &first_failure, &second_failure);
+    assert_single_retry_turn_events(&session, "recovered");
+    assert_failed_text_not_in_assistant_sources(&session, "doomed partial");
+}
+
+#[test]
+fn cancellation_wins_over_request_error_retry_action() {
+    let mut ctx = mapped();
+    let failure = SessionLlmFailure {
+        message: "busy".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: None,
+        request_id: None,
+    };
+    let (adapter, requests) = sequenced_adapter(vec![
+        vec![SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Error { failure },
+            replay_state: None,
+        }],
+        text_finish_chunks("must not dispatch", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let cancellation = LifecycleCancellation::default();
+    ctx.try_on_waterfall(events::AGENT_REQUEST_ERROR, |recovery, _next| {
+        recovery
+            .cancellation()
+            .cancel_with(SessionCancelCause::User);
+        Ok(recovery.retry())
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-request-retry-cancel").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("retry-cancel", "cancel"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &cancellation,
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::User)
+    );
+    assert!(matches!(
+        session.events().unwrap().last().map(|event| &event.kind),
+        Some(SessionEventKind::TurnEnd {
+            reason: TurnEndReason::Aborted(SessionCancelCause::User),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn request_middleware_and_recovery_listener_failures_never_retry() {
+    let mut middleware_ctx = mapped();
+    let (adapter, middleware_requests) = sequenced_adapter(vec![text_finish_chunks(
+        "unused",
+        SessionFinishReason::Stop,
+    )]);
+    register_llm_adapter(&mut middleware_ctx, ["mock"], adapter).unwrap();
+    let middleware_recoveries = Arc::new(AtomicUsize::new(0));
+    {
+        let middleware_recoveries = Arc::clone(&middleware_recoveries);
+        middleware_ctx
+            .try_on_waterfall(events::AGENT_REQUEST_ERROR, move |recovery, next| {
+                middleware_recoveries.fetch_add(1, Ordering::SeqCst);
+                next(recovery)
+            })
+            .unwrap();
+    }
+    middleware_ctx
+        .on_waterfall(events::AGENT_REQUEST, |request, _next| {
+            request.with_config(call_config("", ""))
+        })
+        .unwrap();
+    let middleware_session = middleware_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-request-middleware-failed").unwrap())
+        .unwrap();
+    middleware_session
+        .inbox()
+        .append_next_turn(user_message("middleware-failed", "go"))
+        .unwrap();
+    assert!(
+        run_agent_turn(
+            &mut middleware_ctx,
+            middleware_session.id(),
+            call_config("mock", "model"),
+            &LifecycleCancellation::default(),
+        )
+        .now_or_never()
+        .unwrap()
+        .is_err()
+    );
+    assert_eq!(middleware_recoveries.load(Ordering::SeqCst), 0);
+    assert!(middleware_requests.lock().unwrap().is_empty());
+
+    let mut recovery_ctx = mapped();
+    let failure = SessionLlmFailure {
+        message: "busy".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: None,
+        request_id: None,
+    };
+    let (adapter, recovery_requests) = sequenced_adapter(vec![
+        vec![SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Error { failure },
+            replay_state: None,
+        }],
+        text_finish_chunks("unused", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut recovery_ctx, ["mock"], adapter).unwrap();
+    recovery_ctx
+        .try_on_waterfall(events::AGENT_REQUEST_ERROR, |_recovery, _next| {
+            Err(WaterfallFailure::source(std::io::Error::other(
+                "request recovery failed",
+            )))
+        })
+        .unwrap();
+    let recovery_session = recovery_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-request-recovery-failed").unwrap())
+        .unwrap();
+    recovery_session
+        .inbox()
+        .append_next_turn(user_message("recovery-failed", "go"))
+        .unwrap();
+    assert!(
+        run_agent_turn(
+            &mut recovery_ctx,
+            recovery_session.id(),
+            call_config("mock", "model"),
+            &LifecycleCancellation::default(),
+        )
+        .now_or_never()
+        .unwrap()
+        .is_err()
+    );
+    assert_eq!(recovery_requests.lock().unwrap().len(), 1);
+    assert!(matches!(
+        recovery_session
+            .events()
+            .unwrap()
+            .last()
+            .map(|event| &event.kind),
+        Some(SessionEventKind::TurnEnd {
+            reason: TurnEndReason::Error,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn same_step_retry_rederives_a_replaced_session_surface() {
+    let mut ctx = mapped();
+    let failure = SessionLlmFailure {
+        message: "request is too large".into(),
+        code: "CONTEXT_LENGTH".into(),
+        status: Some(400),
+        provider_retry_after_ms: None,
+        request_id: None,
+    };
+    let (adapter, requests) = sequenced_adapter(vec![
+        vec![SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Error { failure },
+            replay_state: None,
+        }],
+        text_finish_chunks("compacted", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-retry-surface-replace").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("original-request", "large prompt"))
+        .unwrap();
+    {
+        let session = session.clone();
+        ctx.try_on_waterfall(events::AGENT_REQUEST_ERROR, move |recovery, _next| {
+            let node = session.surface().unwrap().nodes[0];
+            session
+                .append_user_message_with_surface(
+                    plugin_message("retry-summary", "test-compact", "summary for retry"),
+                    SessionSurfaceIntent::replace(node, node, vec![node]),
+                )
+                .unwrap();
+            Ok(recovery.retry())
+        })
+        .unwrap();
+    }
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(outcome.steps(), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages().iter().any(|message| {
+        message.id == "retry-summary"
+            && message.content
+                == [SessionContentBlock::Text {
+                    text: "summary for retry".into(),
+                }]
+    }));
+    assert!(
+        !requests[1]
+            .messages()
+            .iter()
+            .any(|message| message.id == "original-request")
+    );
+    drop(requests);
+    assert_eq!(
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::RequestHeader { request } => Some(request.reason),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [
+            SessionRequestHeaderReason::Initial,
+            SessionRequestHeaderReason::Series,
+        ]
+    );
+}
+
+#[test]
 fn turn_driver_calls_model_from_history_after_an_empty_tool_continuation() {
     let mut ctx = mapped();
     let mut first = tool_call_chunks(0, "driver-call", "driver-tool", "{}").to_vec();
@@ -737,7 +1154,7 @@ fn stopping_steering_runs_before_close_and_max_tokens_stays_sticky() {
 }
 
 #[test]
-fn provider_abort_is_terminal_and_skips_stopping_steering() {
+fn provider_abort_without_retry_is_a_structured_error_and_skips_stopping_steering() {
     let mut ctx = mapped();
     let failure = SessionLlmFailure {
         message: "provider cancelled".into(),
@@ -747,7 +1164,9 @@ fn provider_abort_is_terminal_and_skips_stopping_steering() {
         request_id: Some("request-aborted-63".into()),
     };
     let (adapter, seen) = sequenced_adapter(vec![vec![SessionStreamChunk::Finish {
-        reason: SessionFinishReason::Aborted { failure },
+        reason: SessionFinishReason::Aborted {
+            failure: failure.clone(),
+        },
         replay_state: None,
     }]]);
     register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
@@ -784,7 +1203,7 @@ fn provider_abort_is_terminal_and_skips_stopping_steering() {
         .unwrap();
     }
 
-    let outcome = run_agent_turn(
+    let error = run_agent_turn(
         &mut ctx,
         session.id(),
         call_config("mock", "model"),
@@ -792,16 +1211,19 @@ fn provider_abort_is_terminal_and_skips_stopping_steering() {
     )
     .now_or_never()
     .expect("scripted abort is immediately ready")
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(outcome.steps(), 1);
-    assert_eq!(
-        outcome.reason(),
-        TurnEndReason::Aborted(SessionCancelCause::Legacy)
-    );
+    assert_eq!(error, CordisError::Llm(LlmError::RequestFailed { failure }));
     assert_eq!(stops.load(Ordering::SeqCst), 0);
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(session.inbox().next_step().unwrap().is_empty());
+    assert!(matches!(
+        session.events().unwrap().last().map(|event| &event.kind),
+        Some(SessionEventKind::TurnEnd {
+            reason: TurnEndReason::Error,
+            ..
+        })
+    ));
 }
 
 #[test]
