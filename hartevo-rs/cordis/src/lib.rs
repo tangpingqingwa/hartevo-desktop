@@ -51,6 +51,7 @@ pub use authority::{
     EffectReconciliationBinding, EffectReconciliationPermit, EffectVerificationAuthority,
     EffectVerificationBinding, EffectVerificationPermit, RuntimeAuthority, RuntimeBinding,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
+    RuntimeStatusCompletion,
 };
 pub use config::{ConfigValue, InterpolateError};
 pub use context::{
@@ -72,7 +73,8 @@ pub use fiber::{
     ProviderFingerprint, TransitionTicket,
 };
 pub use host::{
-    CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, host_is_cordis_loop, host_plugin_ids,
+    CordisHost, CordisHostTeardown, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID,
+    host_is_cordis_loop, host_plugin_ids,
 };
 pub use inbox::{AgentInbox, AgentInboxOutcome, AgentInboxTarget};
 pub use invariants::{

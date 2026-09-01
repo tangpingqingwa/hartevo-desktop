@@ -817,16 +817,41 @@ async fn runtime_teardown_revokes_publication_while_the_permit_is_retained() {
     )
     .unwrap();
     let agents = host.context().agents::<AgentsSurface>().unwrap();
+    let statuses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    host.context_mut()
+        .on_emit(events::AGENT_STATUS, |change: &AgentStatusChange| {
+            assert_ne!(
+                change.status(),
+                AgentStatus::Idle,
+                "contained teardown status listener"
+            );
+        })
+        .unwrap();
+    {
+        let statuses = std::sync::Arc::clone(&statuses);
+        host.context_mut()
+            .on_emit(events::AGENT_STATUS, move |change: &AgentStatusChange| {
+                statuses.lock().unwrap().push(change.status());
+            })
+            .unwrap();
+    }
     let mut permit = host.authorize_runtime(&scope).unwrap();
     permit.announce_started().unwrap();
     let agent = agents.list().into_iter().next().unwrap();
     assert_eq!(agent.status(), AgentStatus::Running);
 
-    host.teardown();
+    let teardown = host.teardown();
     assert_eq!(agent.status(), AgentStatus::Idle);
     agent.when_idle().await;
-    assert!(agents.list().is_empty());
+    assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
     assert!(host.active_runtime_scope().is_none());
+    assert_eq!(*statuses.lock().unwrap(), [AgentStatus::Running]);
+    teardown.announce();
+    assert!(agents.list().is_empty());
+    assert_eq!(
+        *statuses.lock().unwrap(),
+        [AgentStatus::Running, AgentStatus::Idle]
+    );
 
     let replacement = AgentRef::new(agent.id.clone());
     agents.register(replacement.clone());
@@ -997,6 +1022,7 @@ fn abandoned_runtime_permit_releases_agent_and_active_slot() {
     assert_eq!(host.active_runtime_scope(), Some(&scope));
     drop(permit);
     assert_eq!(host.active_runtime_scope(), None);
+    assert!(host.take_deferred_runtime_status().is_empty());
     assert!(
         host.context()
             .agents::<AgentsSurface>()
@@ -1013,6 +1039,15 @@ fn abandoned_runtime_permit_releases_agent_and_active_slot() {
         now(),
     )
     .unwrap();
+    let statuses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let statuses = std::sync::Arc::clone(&statuses);
+        host.context_mut()
+            .on_emit(events::AGENT_STATUS, move |change: &AgentStatusChange| {
+                statuses.lock().unwrap().push(change.status());
+            })
+            .unwrap();
+    }
     let mut permit = host.authorize_runtime(&scope).unwrap();
     permit.announce_started().unwrap();
     let abandoned = host
@@ -1027,12 +1062,30 @@ fn abandoned_runtime_permit_releases_agent_and_active_slot() {
     drop(permit);
     assert_eq!(abandoned.status(), AgentStatus::Idle);
     assert!(host.active_runtime_scope().is_none());
+    assert_eq!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .as_slice(),
+        std::slice::from_ref(&abandoned)
+    );
+    assert_eq!(*statuses.lock().unwrap(), [AgentStatus::Running]);
+    let deferred = host.take_deferred_runtime_status();
+    assert_eq!(deferred.len(), 1);
+    for status in deferred {
+        status.announce();
+    }
     assert!(
         host.context()
             .agents::<AgentsSurface>()
             .unwrap()
             .list()
             .is_empty()
+    );
+    assert_eq!(
+        *statuses.lock().unwrap(),
+        [AgentStatus::Running, AgentStatus::Idle]
     );
 
     host.bind_domain_kernel_scope(

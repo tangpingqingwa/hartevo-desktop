@@ -988,9 +988,13 @@ impl RuntimeDispatchPermit {
         scope: AuthorityScope,
         agent_id: String,
         unpublished: UnpublishedAgent,
-        notifications: RuntimeDispatchNotifications,
+        mut notifications: RuntimeDispatchNotifications,
     ) -> (Self, Arc<RuntimeDispatchLease>) {
-        let lease = Arc::new(RuntimeDispatchLease::new());
+        let idle_status = notifications
+            .idle_status
+            .take()
+            .expect("a Runtime permit always prepares its Idle notification");
+        let lease = Arc::new(RuntimeDispatchLease::new(idle_status));
         (
             Self {
                 serial,
@@ -1055,15 +1059,9 @@ impl RuntimeDispatchPermit {
 
     pub(crate) fn complete(mut self) -> RuntimeDispatchCompletion {
         self.unpublished.take();
-        let publication = self.lease.settle();
-        let status = publication
-            .as_ref()
-            .is_some_and(AgentPublicationCommit::mark_idle)
-            .then(|| self.notifications.idle_status.take())
-            .flatten();
+        let status = self.lease.complete();
         self.settled = true;
         RuntimeDispatchCompletion {
-            publication,
             status,
             notification: self
                 .publication_committed
@@ -1091,8 +1089,27 @@ impl fmt::Debug for RuntimeDispatchPermit {
 impl Drop for RuntimeDispatchPermit {
     fn drop(&mut self) {
         if !self.settled {
-            self.lease.release();
+            self.lease.abandon();
         }
+    }
+}
+
+/// One exact contained Idle observation prepared under the Host lock and
+/// announced only after that lock is released.
+#[derive(Debug)]
+pub struct RuntimeStatusCompletion {
+    publication: Option<AgentPublicationCommit>,
+    status: Option<PreparedEmit>,
+}
+
+impl RuntimeStatusCompletion {
+    /// Announce the committed Idle transition, then remove its exact live
+    /// publication. Listener errors and panics are deliberately contained.
+    pub fn announce(mut self) {
+        if let Some(status) = self.status.take() {
+            let _ = status.dispatch_contained();
+        }
+        drop(self.publication.take());
     }
 }
 
@@ -1100,17 +1117,15 @@ impl Drop for RuntimeDispatchPermit {
 /// Dispatching it cannot run a listener while the host mutex is held.
 #[derive(Debug)]
 pub struct RuntimeDispatchCompletion {
-    publication: Option<AgentPublicationCommit>,
-    status: Option<PreparedEmit>,
+    status: Option<RuntimeStatusCompletion>,
     notification: Option<PreparedEmit>,
 }
 
 impl RuntimeDispatchCompletion {
     pub fn announce(mut self) -> Result<(), CordisError> {
         if let Some(status) = self.status.take() {
-            let _ = status.dispatch_contained();
+            status.announce();
         }
-        drop(self.publication.take());
         if let Some(notification) = self.notification.take() {
             notification.dispatch()
         } else {
@@ -1121,14 +1136,24 @@ impl RuntimeDispatchCompletion {
 
 pub(crate) struct RuntimeDispatchLease {
     active: AtomicBool,
-    publication: Mutex<Option<AgentPublicationCommit>>,
+    state: Mutex<RuntimeDispatchLeaseState>,
+}
+
+struct RuntimeDispatchLeaseState {
+    publication: Option<AgentPublicationCommit>,
+    idle_status: Option<PreparedEmit>,
+    deferred_status: Option<RuntimeStatusCompletion>,
 }
 
 impl RuntimeDispatchLease {
-    fn new() -> Self {
+    fn new(idle_status: PreparedEmit) -> Self {
         Self {
             active: AtomicBool::new(true),
-            publication: Mutex::new(None),
+            state: Mutex::new(RuntimeDispatchLeaseState {
+                publication: None,
+                idle_status: Some(idle_status),
+                deferred_status: None,
+            }),
         }
     }
 
@@ -1137,27 +1162,71 @@ impl RuntimeDispatchLease {
     }
 
     fn retain_publication(&self, publication: AgentPublicationCommit) -> Result<(), CordisError> {
-        let mut retained = self
-            .publication
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.is_active() || retained.is_some() {
+        if !self.is_active() || state.publication.is_some() {
             return Err(CordisError::RuntimePermitMismatch);
         }
-        *retained = Some(publication);
+        state.publication = Some(publication);
         Ok(())
     }
 
-    fn settle(&self) -> Option<AgentPublicationCommit> {
-        self.active.store(false, Ordering::Release);
-        self.publication
+    fn complete(&self) -> Option<RuntimeStatusCompletion> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return state.deferred_status.take();
+        }
+        Self::take_completion(&mut state)
+    }
+
+    fn abandon(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.active.swap(false, Ordering::AcqRel) {
+            state.deferred_status = Self::take_completion(&mut state);
+        }
+    }
+
+    pub(crate) fn release_for_teardown(&self) -> Option<RuntimeStatusCompletion> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.active.swap(false, Ordering::AcqRel) {
+            Self::take_completion(&mut state)
+        } else {
+            state.deferred_status.take()
+        }
+    }
+
+    pub(crate) fn take_deferred_status(&self) -> Option<RuntimeStatusCompletion> {
+        if self.is_active() {
+            return None;
+        }
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deferred_status
             .take()
     }
 
-    pub(crate) fn release(&self) {
-        drop(self.settle());
+    fn take_completion(state: &mut RuntimeDispatchLeaseState) -> Option<RuntimeStatusCompletion> {
+        let publication = state.publication.take()?;
+        let status = publication
+            .mark_idle()
+            .then(|| state.idle_status.take())
+            .flatten();
+        Some(RuntimeStatusCompletion {
+            publication: Some(publication),
+            status,
+        })
     }
 }
 
