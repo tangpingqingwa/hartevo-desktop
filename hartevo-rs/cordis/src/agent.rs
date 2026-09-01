@@ -13,17 +13,18 @@ use crate::inbox::AgentInboxTarget;
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::session::{
-    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionEpochHeader,
-    SessionError, SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestContext,
-    SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-    SessionSurfaceIntent, SessionTokenUsage, SessionToolCall, SessionToolError, TurnEndReason,
-    validate_agent_request_config, validate_agent_user_message, validate_content_blocks,
+    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionCancelCause, SessionContentBlock,
+    SessionEpochHeader, SessionError, SessionEventKind, SessionFinishReason, SessionHandle,
+    SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
+    SessionRequestContext, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage, SessionToolCall, SessionToolError,
+    TurnEndReason, validate_agent_request_config, validate_agent_user_message,
+    validate_content_blocks,
 };
 use crate::surface::{
-    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
-    EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
-    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentTurnStopping, AgentsSurface,
+    DomainSurface, EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream,
+    LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
     ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
     aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
     dispatch_tool_execution, events, finalize_tool_execution, post_tool_execution,
@@ -116,6 +117,31 @@ impl AgentToolBatchOutcome {
     #[must_use]
     pub fn into_results(self) -> Vec<ToolExecutionResult> {
         self.results
+    }
+}
+
+/// Durable terminal state produced by one complete Harness-compatible turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentTurnOutcome {
+    turn: u64,
+    steps: u64,
+    reason: TurnEndReason,
+}
+
+impl AgentTurnOutcome {
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    #[must_use]
+    pub const fn steps(&self) -> u64 {
+        self.steps
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> TurnEndReason {
+        self.reason
     }
 }
 
@@ -429,8 +455,8 @@ impl AgentStreamCommit {
 
 /// Claim the exact inbox batch, then run the authoritative pre-step waterfall.
 ///
-/// This boundary intentionally returns before `step/start`; the future driver
-/// owns the matching reject/enter lifecycle transition.
+/// This boundary intentionally returns before `step/start`; the caller owns
+/// the matching reject/enter lifecycle transition.
 pub fn prepare_agent_step(
     ctx: &mut Context,
     session_id: &SessionId,
@@ -445,7 +471,7 @@ pub fn prepare_agent_step(
 
 /// Run pre-step admission and atomically enter only a non-empty accepted step.
 ///
-/// Reject and empty Enter decisions open no step. The future driver owns the
+/// Reject and empty Enter decisions open no step. The complete driver owns the
 /// matching turn end and every request, model, tool, and step-end transition.
 pub fn admit_agent_step(
     ctx: &mut Context,
@@ -469,7 +495,7 @@ pub fn admit_agent_step(
 ///
 /// The durable message snapshot is taken before `agent/request`; that
 /// waterfall can replace only call configuration. Adapter lookup, request
-/// persistence, streaming, and step closure remain future driver work.
+/// persistence, streaming, and step closure remain caller or driver work.
 pub fn admit_agent_request(
     ctx: &mut Context,
     session_id: &SessionId,
@@ -478,12 +504,28 @@ pub fn admit_agent_request(
     step: u64,
     seed_config: SessionCallConfig,
 ) -> Result<AgentRequestAdmission, CordisError> {
-    let admission = admit_agent_step(ctx, session_id, target, turn, step)?;
+    admit_agent_request_internal(ctx, session_id, target, turn, step, seed_config, false)
+}
+
+fn admit_agent_request_internal(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+    seed_config: SessionCallConfig,
+    allow_empty_continuation: bool,
+) -> Result<AgentRequestAdmission, CordisError> {
+    require_loop_surfaces(ctx)?;
+    let session = agent_session(ctx, session_id)?;
+    let admission = prepare_agent_step_for_session(ctx, &session, target, turn, step)?;
     let starts_request_series = match admission.decision() {
         AgentPreStepDecision::Reject => {
             return Ok(AgentRequestAdmission::NoRequest(admission));
         }
-        AgentPreStepDecision::Enter { messages, .. } if messages.is_empty() => {
+        AgentPreStepDecision::Enter { messages, .. }
+            if messages.is_empty() && !allow_empty_continuation =>
+        {
             return Ok(AgentRequestAdmission::NoRequest(admission));
         }
         AgentPreStepDecision::Enter {
@@ -492,7 +534,11 @@ pub fn admit_agent_request(
         } => *starts_request_series,
     };
 
-    let session = agent_session(ctx, session_id)?;
+    let admitted_messages = match admission.decision() {
+        AgentPreStepDecision::Enter { messages, .. } => messages,
+        AgentPreStepDecision::Reject => unreachable!("reject returned before step entry"),
+    };
+    session.enter_agent_step(turn, step, admitted_messages)?;
     let (messages, surface_generation) = session.agent_request_boundary(turn, step)?;
     let request = AgentRequest::new(admission.agent().clone(), turn, step, seed_config);
     let request = ctx.waterfall(events::AGENT_REQUEST, request)?;
@@ -529,16 +575,26 @@ pub fn prepare_agent_call(
         }
         AgentRequestAdmission::Request(request) => request,
     };
+    prepare_admitted_agent_call(ctx, session_id, turn, step, request).map(AgentCallAdmission::Call)
+}
+
+fn prepare_admitted_agent_call(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    turn: u64,
+    step: u64,
+    request: PreparedAgentRequest,
+) -> Result<PreparedAgentCall, CordisError> {
     let prepared = match prepare_llm_call(ctx, request.config()) {
         Ok(prepared) => Some(prepared),
         Err(CordisError::Llm(LlmError::NoAdapter { .. })) => None,
         Err(error) => return Err(error),
     };
     agent_session(ctx, session_id)?.require_open_step(turn, step)?;
-    Ok(AgentCallAdmission::Call(PreparedAgentCall {
+    Ok(PreparedAgentCall {
         request: Box::new(request),
         prepared,
-    }))
+    })
 }
 
 /// Persist one prepared call's effective header and route metadata atomically.
@@ -598,6 +654,245 @@ pub fn build_agent_call(
         AgentCallAdmission::NoCall(admission) => Ok(AgentBuildAdmission::NoCall(admission)),
         AgentCallAdmission::Call(call) => {
             log_agent_call(ctx, state, call).map(AgentBuildAdmission::Call)
+        }
+    }
+}
+
+fn build_agent_turn_call(
+    ctx: &mut Context,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+    seed_config: SessionCallConfig,
+    state: &mut AgentRequestLogState,
+    allow_empty_continuation: bool,
+) -> Result<AgentBuildAdmission, CordisError> {
+    let session_id = state.session_id().clone();
+    let request = match admit_agent_request_internal(
+        ctx,
+        &session_id,
+        target,
+        turn,
+        step,
+        seed_config,
+        allow_empty_continuation,
+    )? {
+        AgentRequestAdmission::NoRequest(admission) => {
+            return Ok(AgentBuildAdmission::NoCall(admission));
+        }
+        AgentRequestAdmission::Request(request) => request,
+    };
+    let call = prepare_admitted_agent_call(ctx, &session_id, turn, step, request)?;
+    log_agent_call(ctx, state, call).map(AgentBuildAdmission::Call)
+}
+
+/// Run one complete durable agent turn over the canonical Cordis primitives.
+///
+/// Cancellation is content-free at this boundary and therefore records the
+/// stable legacy cancel cause. Provider request failures remain structured in
+/// the returned error while the Session always receives an `Error` turn end.
+pub async fn run_agent_turn(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    seed_config: SessionCallConfig,
+    cancellation: &LifecycleCancellation,
+) -> Result<AgentTurnOutcome, CordisError> {
+    require_loop_surfaces(ctx)?;
+    validate_agent_request_config(&seed_config)?;
+    let session = agent_session(ctx, session_id)?;
+    let turn = session.start_turn()?;
+
+    if cancellation.is_cancelled() {
+        let outcome = AgentTurnOutcome {
+            turn,
+            steps: 0,
+            reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+        };
+        session.finish_turn(turn, outcome.reason)?;
+        return Ok(outcome);
+    }
+    if let Err(error) = enforce_invariants(ctx) {
+        session.finish_turn(turn, TurnEndReason::Blocked)?;
+        return Err(error);
+    }
+
+    let mut current_step = None;
+    let result = drive_agent_turn(
+        ctx,
+        &session,
+        turn,
+        seed_config,
+        cancellation,
+        &mut current_step,
+    )
+    .await;
+    let reason = result.as_ref().map_or_else(
+        |_| {
+            if cancellation.is_cancelled() {
+                TurnEndReason::Aborted(SessionCancelCause::Legacy)
+            } else {
+                TurnEndReason::Error
+            }
+        },
+        AgentTurnOutcome::reason,
+    );
+
+    if let Some(step) = current_step {
+        match session.require_open_step(turn, step) {
+            Ok(()) => session.finish_step(turn, step)?,
+            Err(SessionError::NoOpenStep { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    session.finish_turn(turn, reason)?;
+    result
+}
+
+async fn drive_agent_turn(
+    ctx: &mut Context,
+    session: &SessionHandle,
+    turn: u64,
+    seed_config: SessionCallConfig,
+    cancellation: &LifecycleCancellation,
+    current_step: &mut Option<u64>,
+) -> Result<AgentTurnOutcome, CordisError> {
+    let mut target = AgentInboxTarget::NextTurn;
+    let mut steps = 0_u64;
+    let mut turn_end = None;
+    let mut request_state = AgentRequestLogState::new(session.id().clone());
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(AgentTurnOutcome {
+                turn,
+                steps,
+                reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+            });
+        }
+        let step = steps
+            .checked_add(1)
+            .ok_or(SessionError::StepSequenceOverflow { turn })?;
+        *current_step = Some(step);
+        let admission = build_agent_turn_call(
+            ctx,
+            target,
+            turn,
+            step,
+            seed_config.clone(),
+            &mut request_state,
+            steps > 0 && turn_end.is_none(),
+        )?;
+        let logged = match admission {
+            AgentBuildAdmission::NoCall(proposal) => match proposal.decision() {
+                AgentPreStepDecision::Reject => {
+                    return Ok(AgentTurnOutcome {
+                        turn,
+                        steps,
+                        reason: TurnEndReason::Blocked,
+                    });
+                }
+                AgentPreStepDecision::Enter { .. } => {
+                    return Ok(AgentTurnOutcome {
+                        turn,
+                        steps,
+                        reason: turn_end.unwrap_or(TurnEndReason::Completed),
+                    });
+                }
+            },
+            AgentBuildAdmission::Call(logged) => logged,
+        };
+        steps = step;
+
+        let step_result = run_agent_turn_step(ctx, &logged, cancellation).await;
+        session.finish_step(turn, step)?;
+        let step_end = step_result?;
+        if let Some(reason @ TurnEndReason::Aborted(_)) = step_end {
+            return Ok(AgentTurnOutcome {
+                turn,
+                steps,
+                reason,
+            });
+        }
+        if !matches!(turn_end, Some(TurnEndReason::MaxTokens)) {
+            turn_end = step_end;
+        }
+
+        if cancellation.is_cancelled() {
+            return Ok(AgentTurnOutcome {
+                turn,
+                steps,
+                reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+            });
+        }
+        if let Some(reason) = turn_end {
+            if session.inbox().next_step()?.is_empty() {
+                let stopping = AgentTurnStopping::new(
+                    AgentRef::new(session.id().as_str()),
+                    turn,
+                    cancellation.clone(),
+                );
+                let _ = ctx.serial(events::AGENT_TURN_STOPPING, stopping).await?;
+                if cancellation.is_cancelled() {
+                    return Ok(AgentTurnOutcome {
+                        turn,
+                        steps,
+                        reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                    });
+                }
+            }
+            if session.inbox().next_step()?.is_empty() {
+                return Ok(AgentTurnOutcome {
+                    turn,
+                    steps,
+                    reason,
+                });
+            }
+        }
+        target = AgentInboxTarget::NextStep;
+    }
+}
+
+async fn run_agent_turn_step(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    cancellation: &LifecycleCancellation,
+) -> Result<Option<TurnEndReason>, CordisError> {
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)));
+    }
+    let mut recorded = record_agent_stream(ctx, logged).await?;
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)));
+    }
+    let committed = commit_agent_stream(ctx, logged, &mut recorded)?;
+    match committed.finish() {
+        SessionFinishReason::Error { failure } => Err(LlmError::RequestFailed {
+            failure: failure.clone(),
+        }
+        .into()),
+        SessionFinishReason::Aborted { .. } => {
+            Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)))
+        }
+        SessionFinishReason::MaxTokens => Ok(Some(TurnEndReason::MaxTokens)),
+        SessionFinishReason::Stop | SessionFinishReason::ToolCalls => {
+            let calls = schedule_agent_tool_calls(ctx, logged, &mut recorded)?;
+            if calls.is_empty() {
+                return Ok(Some(TurnEndReason::Completed));
+            }
+            let outcome = run_agent_tool_batch_with_limit_and_cancellation_outcome(
+                ctx,
+                logged,
+                &mut recorded,
+                DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+                cancellation,
+            )?;
+            if cancellation.is_cancelled() {
+                Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)))
+            } else if outcome.concludes_turn() {
+                Ok(Some(TurnEndReason::Completed))
+            } else {
+                Ok(None)
+            }
         }
     }
 }
