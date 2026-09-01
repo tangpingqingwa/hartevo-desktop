@@ -34,8 +34,9 @@ mod surface;
 pub use agent::{
     AGENT_LOOP_KEYS, AgentBuildAdmission, AgentCallAdmission, AgentLoop, AgentRequestAdmission,
     AgentRequestLogState, AgentStep, AgentStepResult, LoggedAgentCall, PreparedAgentCall,
-    PreparedAgentRequest, admit_agent_request, admit_agent_step, build_agent_call,
-    dispatch_agent_call, log_agent_call, prepare_agent_call, prepare_agent_step, run_agent_step,
+    PreparedAgentRequest, RecordedAgentStream, admit_agent_request, admit_agent_step,
+    build_agent_call, dispatch_agent_call, log_agent_call, prepare_agent_call, prepare_agent_step,
+    record_agent_stream, run_agent_step,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
