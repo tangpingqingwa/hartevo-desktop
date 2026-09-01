@@ -1107,9 +1107,20 @@ fn message_json_rejects_unknown_nested_fields() {
             "content": [{ "text": { "text": "hello" } }],
             "source": { "model": { "provider": "mock", "model": "mock", "unknown": true } }
         }),
+        serde_json::json!({
+            "id": "user-1",
+            "role": "user",
+            "content": [{ "text": { "text": "hello" } }],
+            "source": {
+                "plugin": {
+                    "plugin": "watcher",
+                    "compactionId": null
+                }
+            }
+        }),
     ] {
         assert_eq!(
-            SessionMessage::from_json_value(invalid).unwrap_err(),
+            SessionMessage::from_json_value(&invalid).unwrap_err(),
             SessionError::InvalidMessageEncoding
         );
     }

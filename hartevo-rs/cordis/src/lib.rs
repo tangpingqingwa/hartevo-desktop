@@ -16,6 +16,7 @@
 
 mod agent;
 mod authority;
+mod compaction;
 mod config;
 mod context;
 mod effect;
@@ -53,6 +54,13 @@ pub use authority::{
     EffectVerificationBinding, EffectVerificationPermit, RuntimeAuthority, RuntimeBinding,
     RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
     RuntimeStatusCompletion,
+};
+pub use compaction::{
+    COMPACTION_CHECKPOINT_PLUGIN, CompactionCheckpoint, CompactionId, CompactionLease,
+    CompactionRange, CompactionRegion, CompactionResult, CompactionSummaryDraft,
+    SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+    compact_checkpoint_source, is_compact_checkpoint_source, tool_pairing_balanced_after,
+    tool_pairing_balanced_before,
 };
 pub use config::{ConfigValue, InterpolateError};
 pub use context::{
