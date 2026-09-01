@@ -7597,6 +7597,10 @@ mod tests {
         assert!(installed.shares_cordis_coordinator(&raced));
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the legacy encrypted restart oracle keeps its full arrange, execute, persist, and cold-restore sequence visible"
+    )]
     #[tokio::test]
     async fn cordis_agent_tool_transcript_survives_encrypted_desktop_restart() {
         use hartevo_cordis::{
@@ -7638,10 +7642,13 @@ mod tests {
                     })
                     .unwrap();
                 host.context_mut()
-                    .on_waterfall(cordis_events::TOOLS_EXECUTE, |mut call: ToolCall, next| {
-                        call.result = "desktop result".into();
-                        next(call)
-                    })
+                    .on_waterfall(
+                        cordis_events::LEGACY_TOOLS_EXECUTE,
+                        |mut call: ToolCall, next| {
+                            call.result = "desktop result".into();
+                            next(call)
+                        },
+                    )
                     .unwrap();
                 host.step(
                     AgentStep::new("desktop-agent-session", "inspect it").with_tool(

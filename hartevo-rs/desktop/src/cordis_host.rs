@@ -11,21 +11,24 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, stream};
 use hartevo_cordis::{
-    AgentInboxOutcome, AgentInboxTarget, AuthorityDispatchError, AuthorityScope, CordisError,
-    CordisHost, DomainCommandAuthority, DomainCommandBinding, DomainCommandPermit,
+    AgentInboxOutcome, AgentInboxTarget, AgentTurnOutcome, AuthorityDispatchError, AuthorityScope,
+    CordisError, CordisHost, DomainCommandAuthority, DomainCommandBinding, DomainCommandPermit,
     EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
     EffectReconciliationAuthority, EffectReconciliationBinding, EffectReconciliationPermit,
     EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, Fiber,
     FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
-    KernelConsentState, KernelConsentStatus, RuntimeAuthority, RuntimeDispatchCompletion,
+    KernelConsentState, KernelConsentStatus, LifecycleCancellation, LlmAdapter, LlmAdapterStream,
+    LlmError, LlmGenerateRequest, LlmResolvedModel, RuntimeAuthority, RuntimeDispatchCompletion,
     RuntimeDispatchPermit, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
     SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent, SessionEventKind,
-    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLog,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
-    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop,
-    keys, session_events,
+    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId,
+    SessionLlmFailure, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
+    TurnEndReason, host_is_cordis_loop, keys, register_llm_adapter,
+    run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -138,6 +141,155 @@ pub(crate) struct DesktopRuntimeSessionStreamFlush {
     provider: String,
     model: String,
     assistant_chunks: Vec<String>,
+}
+
+/// One exact Desktop input admitted to the complete Cordis turn driver.
+///
+/// The private user body is intentionally redacted from `Debug`; provider and
+/// model names are routing metadata, not credentials or business authority.
+#[allow(
+    dead_code,
+    reason = "N64 freezes the Desktop complete-turn input consumed by the next live Runtime adapter slice"
+)]
+pub(crate) struct DesktopAgentTurnRequest {
+    session_id: SessionId,
+    input: SessionMessage,
+    config: SessionCallConfig,
+}
+
+impl DesktopAgentTurnRequest {
+    #[allow(
+        dead_code,
+        reason = "N64 freezes the Desktop complete-turn constructor consumed by the next live Runtime adapter slice"
+    )]
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        message_id: impl Into<String>,
+        user_body: impl Into<String>,
+        config: SessionCallConfig,
+    ) -> Result<Self, SessionError> {
+        Ok(Self {
+            session_id: SessionId::new(session_id.into())?,
+            input: SessionMessage {
+                id: message_id.into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::Text {
+                    text: user_body.into(),
+                }],
+                source: SessionMessageSource::User,
+            },
+            config,
+        })
+    }
+}
+
+impl std::fmt::Debug for DesktopAgentTurnRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DesktopAgentTurnRequest")
+            .field("session_id", &self.session_id)
+            .field("message_id", &self.input.id)
+            .field("config", &self.config)
+            .field("user_body", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "N64 freezes pre-dispatch Session durability for the next live Runtime adapter slice"
+)]
+struct DesktopPersistedLlmAdapter<A> {
+    adapter: Arc<A>,
+    sessions: Arc<SessionStore>,
+}
+
+impl<A> DesktopPersistedLlmAdapter<A> {
+    #[allow(
+        dead_code,
+        reason = "N64 freezes pre-dispatch Session durability for the next live Runtime adapter slice"
+    )]
+    fn new(adapter: A, sessions: Arc<SessionStore>) -> Self {
+        Self {
+            adapter: Arc::new(adapter),
+            sessions,
+        }
+    }
+}
+
+impl<A> LlmAdapter for DesktopPersistedLlmAdapter<A>
+where
+    A: LlmAdapter,
+{
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        self.adapter.prepare_model(provider, model)
+    }
+
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        let session_id = request.session_id().cloned().ok_or_else(|| {
+            desktop_agent_failure(
+                "SESSION_ID_MISSING",
+                "Desktop Cordis model request is missing its Session identity",
+            )
+        })?;
+        let session = self
+            .sessions
+            .get(&session_id)
+            .map_err(|_| {
+                desktop_agent_failure(
+                    "SESSION_LOOKUP_FAILED",
+                    "Desktop Cordis Session lookup failed before provider dispatch",
+                )
+            })?
+            .ok_or_else(|| {
+                desktop_agent_failure(
+                    "SESSION_NOT_LIVE",
+                    "Desktop Cordis Session is not live before provider dispatch",
+                )
+            })?;
+        let sessions = self.sessions.clone();
+        let adapter = Arc::clone(&self.adapter);
+        Ok(Box::pin(
+            stream::once(async move {
+                match sessions.flush(&session).await {
+                    Ok(true) => adapter
+                        .stream(request)
+                        .unwrap_or_else(desktop_agent_failure_stream),
+                    Ok(false) => desktop_agent_failure_stream(desktop_agent_failure(
+                        "SESSION_PERSISTENCE_UNBOUND",
+                        "Desktop Cordis request prefix has no persistence listener",
+                    )),
+                    Err(_) => desktop_agent_failure_stream(desktop_agent_failure(
+                        "SESSION_FLUSH_FAILED",
+                        "Desktop Cordis request prefix could not be persisted",
+                    )),
+                }
+            })
+            .flatten(),
+        ))
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "N64 freezes redacted adapter failures for the next live Runtime adapter slice"
+)]
+fn desktop_agent_failure(code: &str, message: &str) -> SessionLlmFailure {
+    SessionLlmFailure {
+        message: message.to_owned(),
+        code: code.to_owned(),
+        status: None,
+        provider_retry_after_ms: None,
+        request_id: None,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "N64 freezes redacted adapter failures for the next live Runtime adapter slice"
+)]
+fn desktop_agent_failure_stream(failure: SessionLlmFailure) -> LlmAdapterStream {
+    Box::pin(stream::once(async move { Err(failure) }))
 }
 
 impl DesktopRuntimeSessionPreflight {
@@ -385,6 +537,90 @@ impl DesktopCordisCoordinator {
             .sessions::<SessionStore>()
             .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
         self.session_persistence.bind_and_restore(store, &sessions)
+    }
+
+    /// Run one complete Cordis turn through a request-scoped Desktop adapter.
+    ///
+    /// The queued input is durable before admission, the canonical request
+    /// prefix is durable before adapter dispatch, and the terminal turn is
+    /// durable before this method returns. The provider route exists only for
+    /// this call and is removed on both success and failure.
+    #[allow(
+        dead_code,
+        reason = "N64 freezes the complete-turn seam consumed by the next live Runtime adapter slice"
+    )]
+    pub(crate) async fn run_agent_turn<A>(
+        &mut self,
+        request: DesktopAgentTurnRequest,
+        adapter: A,
+        cancellation: &LifecycleCancellation,
+    ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
+    where
+        A: LlmAdapter,
+    {
+        self.ensure_root_fiber_active()?;
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopAgentTurnError::MissingSessionStore)?;
+        let session = sessions.get_or_create(request.session_id.clone())?;
+        if runtime_open_turn(&session.events()?).is_some()
+            || !session.inbox().next_step()?.is_empty()
+        {
+            return Err(DesktopAgentTurnError::SessionBusy(
+                request.session_id.to_string(),
+            ));
+        }
+        if session
+            .derive_messages()?
+            .iter()
+            .any(|message| message.id == request.input.id)
+        {
+            return Err(DesktopAgentTurnError::MessageAlreadyCommitted {
+                session_id: request.session_id.to_string(),
+                message_id: request.input.id,
+            });
+        }
+
+        let pending = session.inbox().next_turn()?;
+        if pending.is_empty() {
+            session.inbox().append_next_turn(request.input.clone())?;
+        } else if pending != [request.input.clone()] {
+            return Err(DesktopAgentTurnError::SessionBusy(
+                request.session_id.to_string(),
+            ));
+        }
+        if !sessions.flush(&session).await? {
+            return Err(DesktopAgentTurnError::PersistenceUnavailable);
+        }
+
+        let provider = request.config.provider.clone();
+        let registration = register_llm_adapter(
+            self.host.context_mut(),
+            [provider],
+            DesktopPersistedLlmAdapter::new(adapter, sessions.clone()),
+        )?;
+        let outcome = run_cordis_agent_turn(
+            self.host.context_mut(),
+            &request.session_id,
+            request.config,
+            cancellation,
+        )
+        .await;
+        registration.dispose();
+        let flushed = sessions.flush(&session).await;
+
+        match (outcome, flushed) {
+            (Ok(outcome), Ok(true)) => Ok(outcome),
+            (Ok(_) | Err(_), Ok(false)) => Err(DesktopAgentTurnError::PersistenceUnavailable),
+            (Ok(_), Err(flush)) => Err(flush.into()),
+            (Err(run), Ok(true)) => Err(run.into()),
+            (Err(run), Err(flush)) => Err(DesktopAgentTurnError::RunAndFlush {
+                run: Box::new(run),
+                flush,
+            }),
+        }
     }
 
     /// Persist the exact open Session prefix before Application dispatches the
@@ -1083,6 +1319,34 @@ impl DesktopSessionPersistence {
             events: session.events()?,
         })
     }
+}
+
+#[allow(
+    dead_code,
+    reason = "N64 freezes typed complete-turn failures for the next live Runtime adapter slice"
+)]
+#[derive(Debug, Error)]
+pub(crate) enum DesktopAgentTurnError {
+    #[error("Cordis did not mount its Session store")]
+    MissingSessionStore,
+    #[error("Desktop Cordis Session {0} already owns pending or open turn work")]
+    SessionBusy(String),
+    #[error("Desktop Cordis Session {session_id} already committed message identity {message_id}")]
+    MessageAlreadyCommitted {
+        session_id: String,
+        message_id: String,
+    },
+    #[error("Desktop Cordis Session persistence is unavailable")]
+    PersistenceUnavailable,
+    #[error("Cordis turn failed ({run}) and its terminal flush also failed ({flush})")]
+    RunAndFlush {
+        run: Box<CordisError>,
+        flush: SessionError,
+    },
+    #[error(transparent)]
+    Cordis(#[from] CordisError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
 }
 
 #[derive(Debug, Error)]
@@ -1986,15 +2250,19 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     use chrono::{Duration, TimeZone, Utc};
+    use futures_util::stream;
     use hartevo_cordis::{
         AgentInboxOutcome, AgentInboxTarget, AgentStep, AgentsSurface, AuthorityDispatchError,
         AuthorityScope, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
         DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
-        EffectVerificationBinding, FiberState, OPENINTERPRETER, RuntimeBinding,
-        SessionContentBlock, SessionError, SessionEventKind, SessionId, SessionMessage,
-        SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent,
-        SessionSurfaceOp, SurfaceOwner, enforce_invariants, events, host_is_cordis_loop,
-        invariant_missing, keys,
+        EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
+        KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
+        LlmGenerateRequest, LlmResolvedModel, LlmSurface, OPENINTERPRETER, RuntimeBinding,
+        SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind,
+        SessionFinishReason, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
+        SessionMessageSource, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+        SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner, TurnEndReason, enforce_invariants,
+        events, host_is_cordis_loop, invariant_missing, keys, session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -2008,12 +2276,13 @@ mod tests {
     };
 
     use super::{
-        DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
-        DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
-        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_event,
-        dispatch_live_domain_command, dispatch_live_effect_execution,
-        dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
-        dispatch_live_runtime, encode_event, mount_cordis_host, openinterpreter_runtime_plugin,
+        DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopDomainCommandAuthorization,
+        DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
+        DesktopEffectVerificationAuthorization, bind_live_domain_kernel,
+        bind_live_domain_kernel_scope, decode_event, dispatch_live_domain_command,
+        dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
+        dispatch_live_effect_verification, dispatch_live_runtime, encode_event, mount_cordis_host,
+        openinterpreter_runtime_plugin, runtime_open_turn,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -2028,6 +2297,226 @@ mod tests {
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         }
+    }
+
+    #[derive(Default)]
+    struct DesktopTurnTestProbe {
+        prepare_calls: Arc<AtomicUsize>,
+        stream_calls: Arc<AtomicUsize>,
+        observed_flushes: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+    }
+
+    #[derive(Clone)]
+    struct DesktopTurnTestAdapter {
+        probe: Arc<DesktopTurnTestProbe>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl LlmAdapter for DesktopTurnTestAdapter {
+        fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+            self.probe.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LlmResolvedModel::new(provider, model))
+        }
+
+        fn stream(
+            &self,
+            request: LlmGenerateRequest,
+        ) -> Result<LlmAdapterStream, SessionLlmFailure> {
+            self.probe.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.probe
+                .observed_flushes
+                .store(self.flushes.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.probe.seen.lock().unwrap().push(request);
+            Ok(Box::pin(stream::iter([
+                Ok(SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                }),
+                Ok(SessionStreamChunk::TextDelta {
+                    index: 0,
+                    text: "desktop response".into(),
+                }),
+                Ok(SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "desktop response".into(),
+                    },
+                }),
+                Ok(SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                }),
+            ])))
+        }
+    }
+
+    fn desktop_turn_adapter(
+        flushes: Arc<AtomicUsize>,
+    ) -> (DesktopTurnTestAdapter, Arc<DesktopTurnTestProbe>) {
+        let probe = Arc::new(DesktopTurnTestProbe::default());
+        (
+            DesktopTurnTestAdapter {
+                probe: Arc::clone(&probe),
+                flushes,
+            },
+            probe,
+        )
+    }
+
+    fn desktop_turn_request() -> DesktopAgentTurnRequest {
+        DesktopAgentTurnRequest::new(
+            "desktop-agent-session",
+            "desktop-agent-input-1",
+            "private desktop prompt",
+            SessionCallConfig {
+                provider: "desktop-runtime".into(),
+                model: "desktop-model".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn approve_agent_turn(host: &mut super::DesktopCordisCoordinator) {
+        host.bind_domain_kernel(
+            KernelConsentState::Confirmed,
+            None,
+            Some(KernelApproval {
+                decision: KernelApprovalDecision::Approved,
+                valid_until: now() + Duration::minutes(5),
+            }),
+            now(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_complete_agent_turn_flushes_before_adapter_and_restores() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        approve_agent_turn(&mut live);
+        assert_eq!(
+            live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+                .unwrap(),
+            0
+        );
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let observed_flushes = Arc::clone(&flushes);
+        live.context_mut()
+            .on_parallel(session_events::SESSION_FLUSH, move |_| {
+                let observed_flushes = Arc::clone(&observed_flushes);
+                async move {
+                    observed_flushes.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), std::convert::Infallible>(())
+                }
+            })
+            .unwrap();
+        let (adapter, probe) = desktop_turn_adapter(Arc::clone(&flushes));
+        let request = desktop_turn_request();
+        let request_debug = format!("{request:?}");
+        assert!(request_debug.contains("[REDACTED]"));
+        assert!(!request_debug.contains("private desktop prompt"));
+
+        let outcome = live
+            .run_agent_turn(request, adapter, &LifecycleCancellation::default())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps(), 1);
+        assert_eq!(outcome.reason(), TurnEndReason::Completed);
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.observed_flushes.load(Ordering::SeqCst), 2);
+        assert_eq!(flushes.load(Ordering::SeqCst), 3);
+        assert_eq!(probe.seen.lock().unwrap().len(), 1);
+        assert!(
+            live.context()
+                .llm::<LlmSurface>()
+                .unwrap()
+                .providers()
+                .unwrap()
+                .is_empty()
+        );
+
+        let session_id = SessionId::new("desktop-agent-session").unwrap();
+        let session = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let messages = session.derive_messages().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].id, "desktop-agent-input-1");
+        assert_eq!(
+            messages[1].content,
+            [SessionContentBlock::Text {
+                text: "desktop response".into()
+            }]
+        );
+        assert!(runtime_open_turn(&session.events().unwrap()).is_none());
+
+        let store = live
+            .session_persistence
+            .store
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        let mut cold =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(cold.bind_session_persistence(store).unwrap(), 1);
+        let restored = cold
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.events().unwrap(), session.events().unwrap());
+        assert_eq!(restored.derive_messages().unwrap(), messages);
+    }
+
+    #[tokio::test]
+    async fn desktop_agent_turn_stops_before_adapter_when_persistence_is_unbound() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        approve_agent_turn(&mut live);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let (adapter, probe) = desktop_turn_adapter(Arc::clone(&flushes));
+
+        let error = live
+            .run_agent_turn(
+                desktop_turn_request(),
+                adapter,
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DesktopAgentTurnError::Session(SessionError::FlushFailed { .. })
+        ));
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
+        let session = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&SessionId::new("desktop-agent-session").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.inbox().next_turn().unwrap().len(), 1);
+        assert!(runtime_open_turn(&session.events().unwrap()).is_none());
     }
 
     #[test]
