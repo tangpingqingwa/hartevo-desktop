@@ -15,12 +15,14 @@ use hartevo_cordis::{
     SessionHandle, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
-    SessionToolSchema, SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request,
-    admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call, events, keys,
-    log_agent_call, prepare_agent_call, prepare_agent_step, record_agent_stream,
-    register_llm_adapter, register_prompt_section, register_tool_schema, run_agent_step,
+    SessionToolSchema, SurfaceOwner, ToolCall, ToolExecutionMode, ToolsSurface, TurnEndReason,
+    admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
+    dispatch_agent_call, events, keys, log_agent_call, prepare_agent_call, prepare_agent_step,
+    prepare_agent_tool_calls, record_agent_stream, register_llm_adapter, register_prompt_section,
+    register_tool, register_tool_concurrency, register_tool_schema, run_agent_step,
     schedule_agent_tool_calls, session_events,
 };
+use serde_json::json;
 
 fn now() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 25, 13, 34, 33).unwrap()
@@ -144,6 +146,23 @@ fn tool_schema(name: &str) -> SessionToolSchema {
             serde_json::Value::String("object".into()),
         )]),
     }
+}
+
+fn tool_call_chunks(index: u64, id: &str, name: &str, arguments: &str) -> [SessionStreamChunk; 2] {
+    [
+        SessionStreamChunk::BlockStart {
+            index,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index,
+            block: SessionContentBlock::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        },
+    ]
 }
 
 fn build_logged_turn(
@@ -2515,6 +2534,210 @@ fn scheduling_fails_closed_without_commit_on_closed_step_or_foreign_call() {
     assert_eq!(foreign.events().unwrap(), before_foreign);
     close_logged_turn(&source, source_turn);
     close_logged_turn(&foreign, foreign_turn);
+}
+
+#[test]
+fn prepared_tool_inputs_preserve_durable_identity_and_parse_harness_arguments() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(
+        8,
+        "call-object",
+        "search",
+        r#"{"q":"rust","limit":2}"#,
+    ));
+    chunks.extend(tool_call_chunks(2, "call-empty", "empty", ""));
+    chunks.extend(tool_call_chunks(5, "call-scalar", "scalar", r#""literal""#));
+    chunks.extend(tool_call_chunks(
+        1,
+        "call-malformed",
+        "malformed",
+        "{broken",
+    ));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (ctx, session, turn, logged, mut recorded) = recorded_script("prepare-arguments", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    let scheduled = schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let before = session.events().unwrap();
+
+    let prepared = prepare_agent_tool_calls(&ctx, &logged, &recorded).unwrap();
+
+    assert_eq!(prepared.len(), 4);
+    assert_eq!(
+        prepared
+            .iter()
+            .map(hartevo_cordis::ToolExecutionInput::call_seq)
+            .collect::<Vec<_>>(),
+        scheduled.iter().map(|call| call.seq).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        prepared
+            .iter()
+            .map(hartevo_cordis::ToolExecutionInput::call_id)
+            .collect::<Vec<_>>(),
+        ["call-object", "call-empty", "call-scalar", "call-malformed"]
+    );
+    assert!(
+        prepared
+            .iter()
+            .all(|input| input.turn() == turn && input.step() == 1)
+    );
+    assert_eq!(prepared[0].name(), "search");
+    assert_eq!(prepared[0].raw_arguments(), r#"{"q":"rust","limit":2}"#);
+    assert_eq!(prepared[0].arguments(), &json!({ "q": "rust", "limit": 2 }));
+    assert_eq!(prepared[1].raw_arguments(), "");
+    assert_eq!(prepared[1].arguments(), &json!({}));
+    assert_eq!(prepared[2].raw_arguments(), r#""literal""#);
+    assert_eq!(prepared[2].arguments(), &json!("literal"));
+    assert_eq!(prepared[3].raw_arguments(), "{broken");
+    assert_eq!(prepared[3].arguments(), &json!("{broken"));
+    assert_eq!(session.events().unwrap(), before);
+    assert!(
+        before
+            .iter()
+            .all(|event| !matches!(event.kind, SessionEventKind::ToolResult { .. }))
+    );
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tool_execution_mode_is_live_argument_sensitive_and_fail_closed() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(
+        0,
+        "search-parallel",
+        "search",
+        r#"{"parallel":true}"#,
+    ));
+    chunks.extend(tool_call_chunks(
+        1,
+        "search-exclusive",
+        "search",
+        r#"{"parallel":false}"#,
+    ));
+    chunks.extend(tool_call_chunks(2, "error-call", "error-tool", "{}"));
+    chunks.extend(tool_call_chunks(
+        3,
+        "unknown-call",
+        "unknown",
+        r#"{"parallel":true}"#,
+    ));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) = recorded_script("prepare-modes", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let prepared = prepare_agent_tool_calls(&ctx, &logged, &recorded).unwrap();
+    register_tool(&mut ctx, "search").unwrap();
+    register_tool(&mut ctx, "error-tool").unwrap();
+    let tools = ctx.tools::<ToolsSurface>().unwrap();
+
+    assert_eq!(
+        tools.execution_mode(&prepared[0]),
+        ToolExecutionMode::Exclusive
+    );
+    let search_classifier = register_tool_concurrency(&mut ctx, "search", |arguments| {
+        Ok(arguments
+            .get("parallel")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+    })
+    .unwrap();
+    let _error_classifier =
+        register_tool_concurrency(&mut ctx, "error-tool", |_| Err("classifier failed".into()))
+            .unwrap();
+
+    assert_eq!(
+        tools.execution_mode(&prepared[0]),
+        ToolExecutionMode::Parallel
+    );
+    assert_eq!(
+        tools.execution_mode(&prepared[1]),
+        ToolExecutionMode::Exclusive
+    );
+    assert_eq!(
+        tools.execution_mode(&prepared[2]),
+        ToolExecutionMode::Exclusive
+    );
+    assert_eq!(
+        tools.execution_mode(&prepared[3]),
+        ToolExecutionMode::Exclusive
+    );
+    let replacement = register_tool_schema(&mut ctx, tool_schema("search")).unwrap();
+    assert_eq!(
+        tools.execution_mode(&prepared[0]),
+        ToolExecutionMode::Exclusive
+    );
+    assert!(replacement.dispose());
+    assert_eq!(
+        tools.execution_mode(&prepared[0]),
+        ToolExecutionMode::Parallel
+    );
+    assert!(search_classifier.dispose());
+    assert_eq!(
+        tools.execution_mode(&prepared[0]),
+        ToolExecutionMode::Exclusive
+    );
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tool_execution_preparation_rejects_unscheduled_foreign_and_closed_steps() {
+    let chunks = vec![SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Stop,
+        replay_state: None,
+    }];
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("prepare-boundaries", chunks.clone());
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    let before_unscheduled = session.events().unwrap();
+    assert_eq!(
+        prepare_agent_tool_calls(&ctx, &logged, &recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "durably scheduled tool calls before execution preparation",
+        }))
+    );
+    assert_eq!(session.events().unwrap(), before_unscheduled);
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    let foreign = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("prepare-foreign").unwrap())
+        .unwrap();
+    let mut foreign_state = AgentRequestLogState::new(foreign.id().clone());
+    let (foreign_turn, foreign_logged) = build_logged_turn(
+        &mut ctx,
+        &foreign,
+        &mut foreign_state,
+        "foreign-request",
+        call_config("mock", "model"),
+    );
+    let before_source = session.events().unwrap();
+    let before_foreign = foreign.events().unwrap();
+    assert_eq!(
+        prepare_agent_tool_calls(&ctx, &foreign_logged, &recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "recorded session, turn, and step to match the logged call",
+        }))
+    );
+    assert_eq!(session.events().unwrap(), before_source);
+    assert_eq!(foreign.events().unwrap(), before_foreign);
+    close_logged_turn(&foreign, foreign_turn);
+
+    session.finish_step(turn, 1).unwrap();
+    let before_closed = session.events().unwrap();
+    assert!(matches!(
+        prepare_agent_tool_calls(&ctx, &logged, &recorded),
+        Err(CordisError::Session(SessionError::NoOpenStep { turn: actual }))
+            if actual == turn
+    ));
+    assert_eq!(session.events().unwrap(), before_closed);
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
 }
 
 #[test]
