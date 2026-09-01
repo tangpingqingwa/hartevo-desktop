@@ -6,9 +6,10 @@ use crate::inbox::AgentInboxTarget;
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::session::{
-    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionError,
-    SessionHandle, SessionId, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionStore, SessionSurfaceIntent, TurnEndReason, validate_agent_request_config,
+    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionEpochHeader,
+    SessionError, SessionHandle, SessionId, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionRequestContext, SessionRequestHeaderReason, SessionStore,
+    SessionSurfaceIntent, TurnEndReason, validate_agent_request_config,
     validate_agent_user_message,
 };
 use crate::surface::{
@@ -86,6 +87,7 @@ pub struct PreparedAgentRequest {
     config: SessionCallConfig,
     messages: Vec<SessionMessage>,
     starts_request_series: bool,
+    surface_generation: u64,
 }
 
 impl PreparedAgentRequest {
@@ -117,6 +119,11 @@ impl PreparedAgentRequest {
     #[must_use]
     pub const fn starts_request_series(&self) -> bool {
         self.starts_request_series
+    }
+
+    #[must_use]
+    pub const fn surface_generation(&self) -> u64 {
+        self.surface_generation
     }
 }
 
@@ -182,6 +189,77 @@ impl PreparedAgentCall {
 pub enum AgentCallAdmission {
     NoCall(AgentPreStep),
     Call(PreparedAgentCall),
+}
+
+/// Per-loop request-log state bound to one exact Session.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentRequestLogState {
+    session_id: SessionId,
+    header_logged: bool,
+    surface_generation: Option<u64>,
+}
+
+impl AgentRequestLogState {
+    #[must_use]
+    pub const fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            header_logged: false,
+            surface_generation: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    #[must_use]
+    pub const fn header_logged(&self) -> bool {
+        self.header_logged
+    }
+
+    #[must_use]
+    pub const fn surface_generation(&self) -> Option<u64> {
+        self.surface_generation
+    }
+}
+
+/// One N44 call after its effective request state is durably logged.
+#[derive(Debug, Clone)]
+pub struct LoggedAgentCall {
+    call: PreparedAgentCall,
+    header_reason: Option<SessionRequestHeaderReason>,
+    context_appended: bool,
+}
+
+impl LoggedAgentCall {
+    #[must_use]
+    pub const fn call(&self) -> &PreparedAgentCall {
+        &self.call
+    }
+
+    #[must_use]
+    pub fn into_call(self) -> PreparedAgentCall {
+        self.call
+    }
+
+    #[must_use]
+    pub const fn header_reason(&self) -> Option<SessionRequestHeaderReason> {
+        self.header_reason
+    }
+
+    #[must_use]
+    pub const fn context_appended(&self) -> bool {
+        self.context_appended
+    }
+}
+
+/// Whether one proposed step reached durable request-state logging.
+#[derive(Debug, Clone)]
+pub enum AgentBuildAdmission {
+    NoCall(AgentPreStep),
+    Call(LoggedAgentCall),
 }
 
 /// Claim the exact inbox batch, then run the authoritative pre-step waterfall.
@@ -250,8 +328,7 @@ pub fn admit_agent_request(
     };
 
     let session = agent_session(ctx, session_id)?;
-    session.require_open_step(turn, step)?;
-    let messages = session.derive_messages()?;
+    let (messages, surface_generation) = session.agent_request_boundary(turn, step)?;
     let request = AgentRequest::new(admission.agent().clone(), turn, step, seed_config);
     let request = ctx.waterfall(events::AGENT_REQUEST, request)?;
     validate_agent_request_config(request.config())?;
@@ -264,6 +341,7 @@ pub fn admit_agent_request(
         config: request.into_config(),
         messages,
         starts_request_series,
+        surface_generation,
     }))
 }
 
@@ -295,6 +373,80 @@ pub fn prepare_agent_call(
         request: Box::new(request),
         prepared,
     }))
+}
+
+/// Persist one prepared call's effective header and route metadata atomically.
+pub fn log_agent_call(
+    ctx: &Context,
+    state: &mut AgentRequestLogState,
+    call: PreparedAgentCall,
+) -> Result<LoggedAgentCall, CordisError> {
+    let session_id = SessionId::new(call.request().agent().id.clone())?;
+    require_request_log_state_session(state, &session_id)?;
+    let session = agent_session(ctx, &session_id)?;
+    let surface_generation = call.request().surface_generation();
+    let starts_series = call.starts_request_series()
+        || state
+            .surface_generation
+            .is_some_and(|prior| prior != surface_generation);
+    let header = SessionEpochHeader {
+        config: call.config().clone(),
+        adapter_defaults: call.adapter_defaults().cloned(),
+        system: None,
+        tools: None,
+    };
+    let context = SessionRequestContext {
+        provider: call.config().provider.clone(),
+        model: call.config().model.clone(),
+        context_window: call.context_window(),
+    };
+    let recorded = session.record_agent_request_state(
+        call.request().turn(),
+        call.request().step(),
+        header,
+        state.header_logged,
+        starts_series,
+        context,
+    )?;
+    state.header_logged = true;
+    state.surface_generation = Some(surface_generation);
+    Ok(LoggedAgentCall {
+        call,
+        header_reason: recorded.header_reason,
+        context_appended: recorded.context_appended,
+    })
+}
+
+/// Compose N44 preparation with exact durable request-state logging.
+pub fn build_agent_call(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+    seed_config: SessionCallConfig,
+    state: &mut AgentRequestLogState,
+) -> Result<AgentBuildAdmission, CordisError> {
+    require_request_log_state_session(state, session_id)?;
+    match prepare_agent_call(ctx, session_id, target, turn, step, seed_config)? {
+        AgentCallAdmission::NoCall(admission) => Ok(AgentBuildAdmission::NoCall(admission)),
+        AgentCallAdmission::Call(call) => {
+            log_agent_call(ctx, state, call).map(AgentBuildAdmission::Call)
+        }
+    }
+}
+
+fn require_request_log_state_session(
+    state: &AgentRequestLogState,
+    session_id: &SessionId,
+) -> Result<(), SessionError> {
+    if state.session_id == *session_id {
+        return Ok(());
+    }
+    Err(SessionError::RequestLogStateSessionMismatch {
+        expected: state.session_id.clone(),
+        actual: session_id.clone(),
+    })
 }
 
 fn agent_session(ctx: &Context, session_id: &SessionId) -> Result<SessionHandle, CordisError> {
