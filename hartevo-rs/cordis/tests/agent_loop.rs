@@ -16,13 +16,14 @@ use hartevo_cordis::{
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
     SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, ToolDispatchExecution,
-    ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolsSurface, TurnEndReason,
-    admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
-    dispatch_agent_call, dispatch_tool_execution, events, keys, log_agent_call, prepare_agent_call,
-    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
-    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
-    register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
-    run_agent_step, schedule_agent_tool_calls, session_events,
+    ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolPostExecution,
+    ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
+    commit_agent_stream, dispatch_agent_call, dispatch_tool_execution, events, keys,
+    log_agent_call, post_tool_execution, prepare_agent_call, prepare_agent_step,
+    prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream,
+    register_llm_adapter, register_prompt_section, register_tool, register_tool_concurrency,
+    register_tool_definition, register_tool_guard, register_tool_schema, run_agent_step,
+    schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -3278,6 +3279,196 @@ fn tools_execute_short_circuit_and_wrapper_panic_never_leak_a_terminal_or_retry(
     );
     assert_eq!(body_calls.load(Ordering::SeqCst), 1);
     assert_eq!(saw_body_error.load(Ordering::SeqCst), 1);
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tools_post_execute_preserves_by_default_then_wraps_and_replaces_success() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(0, "plain-call", "plain", "{}"));
+    chunks.extend(tool_call_chunks(1, "replace-call", "replace", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-post-execute", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    for (name, value) in [("plain", "plain-body"), ("replace", "replace-body")] {
+        let order = Arc::clone(&order);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |_| {
+                order.lock().unwrap().push(value);
+                Ok(json!(value))
+            }),
+        )
+        .unwrap();
+    }
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    let mut prepared = prepared.into_iter();
+    let ToolExecutionPreparation::Dispatch(plain) = prepared.next().unwrap() else {
+        panic!("plain call must be admitted");
+    };
+    let ToolExecutionPreparation::Dispatch(replace) = prepared.next().unwrap() else {
+        panic!("replace call must be admitted");
+    };
+    let before = session.events().unwrap();
+
+    let plain = dispatch_tool_execution(&mut ctx, plain).unwrap();
+    let plain = post_tool_execution(&mut ctx, plain).unwrap();
+    assert_eq!(
+        plain.result(),
+        &ToolDispatchResult::Success {
+            value: json!("plain-body")
+        }
+    );
+    order.lock().unwrap().clear();
+    {
+        let order = Arc::clone(&order);
+        ctx.on_waterfall(
+            events::TOOLS_POST_EXECUTE,
+            move |execution: ToolPostExecution, next| {
+                order.lock().unwrap().push("outer-before");
+                let execution = next(execution);
+                assert_eq!(
+                    execution.result(),
+                    &ToolDispatchResult::Success {
+                        value: json!("post-replacement")
+                    }
+                );
+                order.lock().unwrap().push("outer-after");
+                execution
+            },
+        )
+        .unwrap();
+    }
+    {
+        let order = Arc::clone(&order);
+        ctx.on_waterfall(
+            events::TOOLS_POST_EXECUTE,
+            move |execution: ToolPostExecution, next| {
+                assert_eq!(execution.input().call_id(), "replace-call");
+                order.lock().unwrap().push("inner-before");
+                let execution = next(execution);
+                order.lock().unwrap().push("inner-after");
+                execution.replace_success(json!("post-replacement"))
+            },
+        )
+        .unwrap();
+    }
+
+    let replace = dispatch_tool_execution(&mut ctx, replace).unwrap();
+    let replace = post_tool_execution(&mut ctx, replace).unwrap();
+
+    assert_eq!(
+        replace.result(),
+        &ToolDispatchResult::Success {
+            value: json!("post-replacement")
+        }
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "replace-body",
+            "outer-before",
+            "inner-before",
+            "inner-after",
+            "outer-after"
+        ]
+    );
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tools_post_execute_blocks_failed_replacement_and_listener_panic_without_replay() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(0, "block-call", "block", "{}"));
+    chunks.extend(tool_call_chunks(1, "failed-call", "body-failure", "{}"));
+    chunks.extend(tool_call_chunks(2, "panic-call", "post-panic", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-post-failures", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let body_calls = Arc::new(AtomicUsize::new(0));
+    for name in ["block", "post-panic"] {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("body-success"))
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("body-failure"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Err("body failed".into())
+            }),
+        )
+        .unwrap();
+    }
+    ctx.on_waterfall(
+        events::TOOLS_POST_EXECUTE,
+        move |execution: ToolPostExecution, next| match execution.input().name() {
+            "block" => execution.block("blocked by post policy"),
+            "body-failure" => {
+                assert_eq!(
+                    execution.result(),
+                    &ToolDispatchResult::Failure {
+                        message: "body failed".into()
+                    }
+                );
+                execution.replace_success(json!("must-not-recover"))
+            }
+            "post-panic" => panic!("post policy broke"),
+            _ => next(execution),
+        },
+    )
+    .unwrap();
+    let before = session.events().unwrap();
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    let mut outcomes = Vec::new();
+    for preparation in prepared {
+        let ToolExecutionPreparation::Dispatch(prepared) = preparation else {
+            panic!("every registered call must be admitted");
+        };
+        let dispatched = dispatch_tool_execution(&mut ctx, prepared).unwrap();
+        outcomes.push(post_tool_execution(&mut ctx, dispatched).unwrap());
+    }
+
+    assert_eq!(
+        outcomes[0].result(),
+        &ToolDispatchResult::Failure {
+            message: "blocked by post policy".into()
+        }
+    );
+    assert_eq!(
+        outcomes[1].result(),
+        &ToolDispatchResult::Failure {
+            message: "tools/post-execute cannot replace the value of a failed result".into()
+        }
+    );
+    assert_eq!(
+        outcomes[2].result(),
+        &ToolDispatchResult::Failure {
+            message: "tools/post-execute listener panicked".into()
+        }
+    );
+    assert_eq!(body_calls.load(Ordering::SeqCst), 3);
     assert_eq!(session.events().unwrap(), before);
     close_logged_turn(&session, turn);
 }
