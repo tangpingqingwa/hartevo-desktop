@@ -32,9 +32,9 @@ mod session;
 mod surface;
 
 pub use agent::{
-    AGENT_LOOP_KEYS, AgentLoop, AgentRequestAdmission, AgentStep, AgentStepResult,
-    PreparedAgentRequest, admit_agent_request, admit_agent_step, prepare_agent_step,
-    run_agent_step,
+    AGENT_LOOP_KEYS, AgentCallAdmission, AgentLoop, AgentRequestAdmission, AgentStep,
+    AgentStepResult, PreparedAgentCall, PreparedAgentRequest, admit_agent_request,
+    admit_agent_step, prepare_agent_call, prepare_agent_step, run_agent_step,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
@@ -102,7 +102,8 @@ pub use session::{
 };
 pub use surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DesktopSurface,
-    DomainSurface, EffectBrokerSurface, LlmStream, LlmSurface, MAPPED_KEYS, RuntimeSurface,
-    SurfaceOwner, ToolCall, ToolsSurface, events, expected_mode, register_agent,
+    DomainSurface, EffectBrokerSurface, LlmAdapter, LlmError, LlmModelReasoning, LlmResolvedModel,
+    LlmStream, LlmSurface, MAPPED_KEYS, PreparedLlmCall, RuntimeSurface, SurfaceOwner, ToolCall,
+    ToolsSurface, events, expected_mode, prepare_llm_call, register_agent, register_llm_adapter,
     register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
 };
