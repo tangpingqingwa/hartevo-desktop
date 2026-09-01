@@ -32,7 +32,8 @@ mod session;
 mod surface;
 
 pub use agent::{
-    AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, prepare_agent_step, run_agent_step,
+    AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, admit_agent_step, prepare_agent_step,
+    run_agent_step,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
