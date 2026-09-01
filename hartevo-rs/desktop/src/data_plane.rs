@@ -13152,6 +13152,382 @@ sleep 30"#;
 
     #[cfg(unix)]
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one crash/restart/continuation journey proves explicit new user intent retires the ambiguous generation before a fresh Cordis turn"
+    )]
+    fn explicit_catalog_continuation_starts_fresh_generation_after_crash_fence() {
+        use hartevo_cordis::{
+            SessionContentBlock, SessionEventKind, SessionId, SessionMessageRole,
+            SessionMessageSource, SessionStore,
+        };
+        use hartevo_domain_kernel::RuntimeTurnFailureClass;
+
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let before = match plane
+            .load_with(&secrets, observed_at() + Duration::minutes(2))
+            .expect("ready Desktop state")
+        {
+            DesktopLoadState::Ready(snapshot) => snapshot.inventory.projects[0]
+                .missions
+                .iter()
+                .map(|mission| mission.mission_id.clone())
+                .collect::<BTreeSet<_>>(),
+            DesktopLoadState::Uninitialized { .. } => panic!("fixture must be initialized"),
+        };
+        let runtime_constructions = Arc::new(AtomicUsize::new(0));
+        let crash = DesktopRuntimeCancellation::default();
+        crash.request_crash_after_private_delta();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plane.start_catalog_mission_and_run_with_cancellation(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Crash-fenced social continuation".into()),
+                    goal: "Draft one bounded social decision before an explicit correction".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(counted_runtime_fixture_source(
+                    Arc::clone(&runtime_constructions),
+                    live_stream_interruptible_runtime_fixture_command,
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                Some(&crash),
+                observed_at() + Duration::minutes(3),
+            )
+        }));
+        assert!(crashed.is_err(), "the deterministic crash cut must unwind");
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 1);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let crashed_service = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("read crashed Application state");
+        let mission_id = crashed_service
+            .desktop_inventory()
+            .expect("crashed Desktop inventory")
+            .projects[0]
+            .missions
+            .iter()
+            .find(|mission| !before.contains(&mission.mission_id))
+            .expect("crashed Catalog Mission")
+            .mission_id
+            .clone();
+        let first_turn = crashed_service
+            .latest_runtime_turn_for_mission(&project_id, &mission_id)
+            .expect("first Runtime turn query")
+            .expect("first Runtime turn");
+        assert_eq!(first_turn.scope.worker_generation, 1);
+        assert_eq!(first_turn.status, RuntimeTurnStatus::Running);
+        let first_private_deltas = crashed_service
+            .runtime_turn_private_text_deltas(&project_id, &first_turn.id)
+            .expect("first private Runtime deltas");
+        assert_eq!(first_private_deltas.len(), 1);
+        drop(crashed_service);
+        drop(plane);
+
+        let data_root = directory.path().join("desktop-data");
+        let restarted =
+            DesktopDataPlane::at_data_root(&data_root).expect("restarted Desktop plane");
+        assert!(matches!(
+            restarted
+                .load_with(&secrets, observed_at() + Duration::minutes(4))
+                .expect("repair the ambiguous generation"),
+            DesktopLoadState::Ready(_)
+        ));
+        let repaired_service = restarted
+            .open_read_application_from_secret(&database_secret)
+            .expect("read repaired Application state");
+        let repaired_first_turn = repaired_service
+            .runtime_turn_attempt(&project_id, &first_turn.id)
+            .expect("repaired first Runtime turn");
+        assert_eq!(repaired_first_turn.status, RuntimeTurnStatus::Uncertain);
+        assert_eq!(
+            repaired_first_turn
+                .failures
+                .last()
+                .expect("coordinator restart failure")
+                .class,
+            RuntimeTurnFailureClass::CoordinatorRestart
+        );
+        let first_recovery = repaired_service
+            .latest_runtime_recovery_for_mission(&project_id, &mission_id)
+            .expect("first Runtime recovery query")
+            .expect("first Runtime recovery");
+        assert_eq!(first_recovery.worker_generation, 1);
+        assert_eq!(first_recovery.status, RuntimeRecoveryStatus::Attached);
+        drop(repaired_service);
+
+        let replay_handle = current_catalog_handle(&restarted, &secrets, &project_id, &mission_id);
+        let no_new_input = restarted
+            .resume_catalog_mission_runtime_with_cancellation(
+                &secrets,
+                catalog_runtime_authority(replay_handle.clone()),
+                Some(counted_runtime_fixture_source(
+                    Arc::clone(&runtime_constructions),
+                    completed_runtime_fixture_command,
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(5),
+            )
+            .expect("no-input retry remains fenced");
+        assert_eq!(
+            no_new_input.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ReplaySuppressed {
+                turn_status: RuntimeTurnStatus::Uncertain,
+            }
+        );
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 1);
+
+        let correction = "Use only the newly confirmed first-party evidence";
+        let request = DesktopMissionContinuationRequest {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            message_id: MissionConversationMessageId::from("message-after-crash-fence"),
+            kind: MissionConversationMessageKind::Correction,
+            body: correction.into(),
+            idempotency_key: "after-crash-fence:1".into(),
+            expected_conversation_revision: 1,
+        };
+        let continued = restarted
+            .continue_catalog_mission_and_run_with(
+                &secrets,
+                request.clone(),
+                catalog_runtime_authority(replay_handle.clone()),
+                Some(counted_runtime_fixture_source(
+                    Arc::clone(&runtime_constructions),
+                    completed_runtime_fixture_command,
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(6),
+            )
+            .expect("explicit continuation starts one fresh generation");
+        assert!(matches!(
+            continued.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 2);
+
+        let continued_service = restarted
+            .open_read_application_from_secret(&database_secret)
+            .expect("read continued Application state");
+        let conversation = continued_service
+            .mission_conversation(&project_id, &mission_id)
+            .expect("continued Mission Conversation");
+        assert_eq!(conversation.revision, 3);
+        assert_eq!(conversation.messages.len(), 3);
+        assert_eq!(conversation.messages[1].body, correction);
+        assert_eq!(
+            conversation.messages[2].role,
+            MissionConversationRole::Assistant
+        );
+        let second_turn = continued_service
+            .latest_runtime_turn_for_mission(&project_id, &mission_id)
+            .expect("second Runtime turn query")
+            .expect("second Runtime turn");
+        assert_ne!(second_turn.id, first_turn.id);
+        assert_eq!(second_turn.scope.worker_generation, 2);
+        assert_eq!(second_turn.status, RuntimeTurnStatus::Completed);
+        let second_recovery = continued_service
+            .latest_runtime_recovery_for_mission(&project_id, &mission_id)
+            .expect("second Runtime recovery query")
+            .expect("second Runtime recovery");
+        assert_ne!(second_recovery.id, first_recovery.id);
+        assert_eq!(second_recovery.worker_generation, 2);
+        assert_eq!(second_recovery.status, RuntimeRecoveryStatus::Attached);
+        assert_eq!(
+            continued_service
+                .runtime_turn_attempt(&project_id, &first_turn.id)
+                .expect("unchanged first Runtime turn")
+                .status,
+            RuntimeTurnStatus::Uncertain
+        );
+        assert_eq!(
+            continued_service
+                .runtime_turn_private_text_deltas(&project_id, &first_turn.id)
+                .expect("unchanged first private Runtime deltas"),
+            first_private_deltas
+        );
+        assert_eq!(
+            continued_service
+                .context_branch(&project_id, &first_turn.scope.branch_id)
+                .expect("retired first branch")
+                .status,
+            ContextBranchStatus::Abandoned
+        );
+        assert_eq!(
+            continued_service
+                .context_worker_lease(&project_id, &first_turn.scope.worker_lease_id)
+                .expect("retired first lease")
+                .status,
+            WorkerLeaseStatus::Revoked
+        );
+        assert_eq!(
+            continued_service
+                .context_capsule(&project_id, &first_turn.scope.capsule_id)
+                .expect("retired first capsule")
+                .status,
+            ContextCapsuleStatus::Cancelled
+        );
+        assert_eq!(
+            continued_service
+                .context_worker_handle(
+                    &project_id,
+                    &first_turn.scope.workspace_id,
+                    &first_turn.scope.worker_id,
+                )
+                .expect("retired first handle")
+                .status,
+            WorkerHandleStatus::Cancelled
+        );
+        let continued_mission = continued_service
+            .load_mission(&project_id, &mission_id)
+            .expect("continued Mission");
+        assert_eq!(continued_mission.work_products.len(), 1);
+        assert!(continued_mission.effects.is_empty());
+        let mission_events = continued_service
+            .mission_events(&project_id, &mission_id)
+            .expect("continued Mission events");
+        assert_eq!(
+            mission_events
+                .iter()
+                .filter(|event| event.event_type == "context.runtime_turn_authority_retired")
+                .count(),
+            1
+        );
+        drop(continued_service);
+
+        let cordis_events = restarted.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("Cordis Session store")
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .expect("Cordis Session lookup")
+                .expect("continued Cordis Session");
+            let events = session.events().expect("continued Cordis events");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.kind, SessionEventKind::TurnEnd { .. }))
+                    .count(),
+                2
+            );
+            assert!(events.iter().any(|event| matches!(
+                event.kind,
+                SessionEventKind::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Interrupted,
+                }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event.kind,
+                SessionEventKind::TurnEnd {
+                    turn: 2,
+                    reason: TurnEndReason::Completed,
+                }
+            )));
+            let messages = session
+                .derive_messages()
+                .expect("continued Cordis messages");
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages[0].role, SessionMessageRole::User);
+            assert_eq!(messages[1].role, SessionMessageRole::User);
+            assert!(matches!(
+                messages[1].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == correction
+            ));
+            assert!(matches!(
+                (&messages[2].source, messages[2].content.as_slice()),
+                (
+                    SessionMessageSource::Model { provider, model },
+                    [SessionContentBlock::Text { text }]
+                ) if provider == "fixture-provider"
+                    && model == "fixture-model"
+                    && text == "Reviewable local runtime draft; no external effect occurred."
+            ));
+            events
+        });
+
+        let replay = restarted
+            .continue_catalog_mission_and_run_with(
+                &secrets,
+                request,
+                catalog_runtime_authority(replay_handle),
+                Some(counted_runtime_fixture_source(
+                    Arc::clone(&runtime_constructions),
+                    completed_runtime_fixture_command,
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(7),
+            )
+            .expect("exact continuation replay remains idempotent");
+        assert!(matches!(
+            replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 2);
+        restarted.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .unwrap()
+                .expect("stable replayed Cordis Session");
+            assert_eq!(session.events().unwrap(), cordis_events);
+        });
+
+        drop(restarted);
+        let second_restart =
+            DesktopDataPlane::at_data_root(&data_root).expect("second restarted Desktop plane");
+        assert!(matches!(
+            second_restart
+                .load_with(&secrets, observed_at() + Duration::minutes(8))
+                .expect("stable second restart"),
+            DesktopLoadState::Ready(_)
+        ));
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 2);
+        second_restart.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .unwrap()
+                .expect("stable restarted Cordis Session");
+            assert_eq!(session.events().unwrap(), cordis_events);
+        });
+        let final_service = second_restart
+            .open_read_application_from_secret(&database_secret)
+            .expect("final Application state");
+        assert_eq!(
+            final_service
+                .mission_events(&project_id, &mission_id)
+                .expect("stable Mission events"),
+            mission_events
+        );
+        assert_eq!(
+            final_service
+                .runtime_turn_private_text_deltas(&project_id, &first_turn.id)
+                .expect("stable first private Runtime deltas"),
+            first_private_deltas
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cooperative_desktop_stop_becomes_exact_runtime_interrupt() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let cancellation = DesktopRuntimeCancellation::default();
