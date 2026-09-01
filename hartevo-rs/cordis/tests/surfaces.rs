@@ -349,7 +349,7 @@ fn tools_pipeline_runs_on_ctx_tools_not_openinterpreter() {
     }
     {
         let seen = Arc::clone(&seen);
-        ctx.on_emit(events::TOOLS_RESULT, move |call: &ToolCall| {
+        ctx.on_emit(events::LEGACY_TOOLS_RESULT, move |call: &ToolCall| {
             seen.lock()
                 .expect("seen")
                 .push(format!("result:{}:{}", call.name, call.decision));

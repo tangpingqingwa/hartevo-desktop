@@ -20,9 +20,9 @@ use crate::context::{Context, CordisError, keys};
 use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
 use crate::session::{
-    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionFinishReason, SessionId,
-    SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk, SessionToolCall,
-    SessionToolSchema, events as session_events, validate_agent_request_config,
+    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
+    SessionId, SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk,
+    SessionToolCall, SessionToolSchema, events as session_events, validate_agent_request_config,
 };
 
 /// Cordis keys this mapping provides and looks up.
@@ -44,7 +44,7 @@ pub mod events {
 
     use super::{
         AgentPreStep, AgentRef, AgentRequest, LlmStream, PromptAssembly, ToolCall,
-        ToolDispatchExecution, ToolPostExecution,
+        ToolDispatchExecution, ToolExecutionResult, ToolPostExecution,
     };
 
     /// Replace or wrap one detached system-prompt/tool-schema assembly.
@@ -81,10 +81,15 @@ pub mod events {
         EventSchemaId::new("hartevo.legacy-tools.post-execute.v1"),
         "hartevo/legacy-tools-post-execute",
     );
-    /// Observe-only notification of the frozen tool outcome.
-    pub const TOOLS_RESULT: EventKey<Emit, ToolCall, ()> = EventKey::new(
-        EventSchemaId::new("hartevo.tools.result.v1"),
+    /// Observe-only notification of the immutable finalized tool outcome.
+    pub const TOOLS_RESULT: EventKey<Emit, ToolExecutionResult, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.tools.result.v2"),
         "tools/result",
+    );
+    /// Detached compatibility seam used only by the pre-durable fixture path.
+    pub const LEGACY_TOOLS_RESULT: EventKey<Emit, ToolCall, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.legacy-tools.result.v1"),
+        "hartevo/legacy-tools-result",
     );
     /// Intercept / wrap every streaming model call.
     pub const LLM_STREAM: EventKey<Waterfall, LlmStream, LlmStream> =
@@ -419,6 +424,7 @@ pub struct PreparedToolExecution {
     input: ToolExecutionInput,
     mode: ToolExecutionMode,
     registration_identity: Arc<()>,
+    result_projection: ToolResultProjection,
 }
 
 impl fmt::Debug for PreparedToolExecution {
@@ -450,6 +456,7 @@ pub struct ToolDispatchExecution {
     input: ToolExecutionInput,
     prepared: Option<PreparedToolExecution>,
     result: Option<ToolDispatchResult>,
+    result_projection: ToolResultProjection,
     terminal_identity: Arc<()>,
 }
 
@@ -524,6 +531,25 @@ impl ToolExecutionPreparation {
 
 type ToolExecutor =
     Arc<dyn Fn(&ToolExecutionInput) -> Result<serde_json::Value, String> + Send + Sync>;
+type ToolResultRenderer = Arc<
+    dyn Fn(&serde_json::Value, &serde_json::Value) -> Result<Vec<SessionContentBlock>, String>
+        + Send
+        + Sync,
+>;
+type ToolContentFinalizer = Arc<
+    dyn Fn(
+            &ToolExecutionInput,
+            &ToolExecutionResult,
+        ) -> Result<Option<Vec<SessionContentBlock>>, String>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Default)]
+struct ToolResultProjection {
+    renderer: Option<ToolResultRenderer>,
+    finalizer: Option<ToolContentFinalizer>,
+}
 
 /// One reversible executable tool definition. Schema, concurrency policy, and
 /// body share the same opaque Cordis registration identity.
@@ -531,6 +557,7 @@ pub struct ToolDefinition {
     schema: SessionToolSchema,
     classifier: Option<ToolConcurrencyClassifier>,
     executor: ToolExecutor,
+    result_projection: ToolResultProjection,
 }
 
 impl fmt::Debug for ToolDefinition {
@@ -539,6 +566,14 @@ impl fmt::Debug for ToolDefinition {
             .debug_struct("ToolDefinition")
             .field("schema", &self.schema)
             .field("has_classifier", &self.classifier.is_some())
+            .field(
+                "has_output_renderer",
+                &self.result_projection.renderer.is_some(),
+            )
+            .field(
+                "has_content_finalizer",
+                &self.result_projection.finalizer.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -553,6 +588,7 @@ impl ToolDefinition {
             schema,
             classifier: None,
             executor: Arc::new(executor),
+            result_projection: ToolResultProjection::default(),
         }
     }
 
@@ -562,6 +598,37 @@ impl ToolDefinition {
         F: Fn(&serde_json::Value) -> Result<bool, String> + Send + Sync + 'static,
     {
         self.classifier = Some(Arc::new(classifier));
+        self
+    }
+
+    /// Attach the definition-owned projection from validated arguments and
+    /// one successful canonical JSON value to model-facing content.
+    #[must_use]
+    pub fn with_output_renderer<F>(mut self, renderer: F) -> Self
+    where
+        F: Fn(&serde_json::Value, &serde_json::Value) -> Result<Vec<SessionContentBlock>, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.result_projection.renderer = Some(Arc::new(renderer));
+        self
+    }
+
+    /// Attach the definition-owned last-mile transform. It may replace only
+    /// final model-facing content and is captured with the admitted tool.
+    #[must_use]
+    pub fn with_content_finalizer<F>(mut self, finalizer: F) -> Self
+    where
+        F: Fn(
+                &ToolExecutionInput,
+                &ToolExecutionResult,
+            ) -> Result<Option<Vec<SessionContentBlock>>, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.result_projection.finalizer = Some(Arc::new(finalizer));
         self
     }
 
@@ -579,10 +646,20 @@ pub enum ToolDispatchResult {
 }
 
 /// One settled tool body invocation. This is not yet a durable tool result.
-#[derive(Debug, PartialEq, Eq)]
 pub struct ToolDispatchOutcome {
     input: ToolExecutionInput,
     result: ToolDispatchResult,
+    result_projection: ToolResultProjection,
+}
+
+impl fmt::Debug for ToolDispatchOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolDispatchOutcome")
+            .field("input", &self.input)
+            .field("result", &self.result)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ToolDispatchOutcome {
@@ -608,6 +685,7 @@ impl ToolDispatchOutcome {
 pub struct ToolPostExecution {
     input: ToolExecutionInput,
     result: ToolDispatchResult,
+    result_projection: ToolResultProjection,
 }
 
 impl fmt::Debug for ToolPostExecution {
@@ -651,6 +729,37 @@ impl ToolPostExecution {
             message: reason.into(),
         };
         self
+    }
+}
+
+/// Immutable final outcome returned after content projection/finalization and
+/// observed once through canonical `tools/result`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ToolExecutionResult {
+    input: ToolExecutionInput,
+    result: ToolDispatchResult,
+    content: Vec<SessionContentBlock>,
+}
+
+impl ToolExecutionResult {
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> &ToolDispatchResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &[SessionContentBlock] {
+        &self.content
+    }
+
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        matches!(self.result, ToolDispatchResult::Failure { .. })
     }
 }
 
@@ -1275,6 +1384,7 @@ struct ToolRegistration {
     identity: Arc<()>,
     classifier: Option<ToolConcurrencyClassifier>,
     executor: Option<ToolExecutor>,
+    result_projection: ToolResultProjection,
 }
 
 impl fmt::Debug for ToolRegistration {
@@ -1284,6 +1394,14 @@ impl fmt::Debug for ToolRegistration {
             .field("name", &self.name)
             .field("has_classifier", &self.classifier.is_some())
             .field("has_executor", &self.executor.is_some())
+            .field(
+                "has_output_renderer",
+                &self.result_projection.renderer.is_some(),
+            )
+            .field(
+                "has_content_finalizer",
+                &self.result_projection.finalizer.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1349,12 +1467,13 @@ impl ToolsSurface {
                 identity: Arc::clone(&identity),
                 classifier,
                 executor,
+                result_projection: ToolResultProjection::default(),
             });
         identity
     }
 
     fn register_schema(&self, schema: SessionToolSchema) -> Result<Arc<()>, PromptError> {
-        self.register_schema_with_runtime(schema, None, None)
+        self.register_schema_with_runtime(schema, None, None, ToolResultProjection::default())
     }
 
     fn register_definition(&self, definition: ToolDefinition) -> Result<Arc<()>, PromptError> {
@@ -1362,6 +1481,7 @@ impl ToolsSurface {
             definition.schema,
             definition.classifier,
             Some(definition.executor),
+            definition.result_projection,
         )
     }
 
@@ -1370,6 +1490,7 @@ impl ToolsSurface {
         schema: SessionToolSchema,
         classifier: Option<ToolConcurrencyClassifier>,
         executor: Option<ToolExecutor>,
+        result_projection: ToolResultProjection,
     ) -> Result<Arc<()>, PromptError> {
         let name = schema.name.clone();
         if name.is_empty() {
@@ -1388,6 +1509,7 @@ impl ToolsSurface {
             identity: Arc::clone(&identity),
             classifier,
             executor,
+            result_projection,
         });
         state.schemas.push(schema);
         Ok(identity)
@@ -2417,14 +2539,14 @@ pub fn run_tools_pipeline(ctx: &mut Context, mut call: ToolCall) -> Result<ToolC
     call = ctx.waterfall(events::TOOLS_PRE_EXECUTE, call)?;
     call.call_id.clone_from(&call_id);
     if call.decision != "allow" {
-        ctx.emit(events::TOOLS_RESULT, &call)?;
+        ctx.emit(events::LEGACY_TOOLS_RESULT, &call)?;
         return Ok(call);
     }
     call = ctx.waterfall(events::LEGACY_TOOLS_EXECUTE, call)?;
     call.call_id.clone_from(&call_id);
     call = ctx.waterfall(events::LEGACY_TOOLS_POST_EXECUTE, call)?;
     call.call_id = call_id;
-    ctx.emit(events::TOOLS_RESULT, &call)?;
+    ctx.emit(events::LEGACY_TOOLS_RESULT, &call)?;
     Ok(call)
 }
 
@@ -2501,6 +2623,7 @@ pub fn prepare_tool_execution(
         input,
         mode,
         registration_identity: registered.identity,
+        result_projection: registered.result_projection,
     }))
 }
 
@@ -2525,6 +2648,7 @@ pub fn dispatch_tool_execution(
         .tools::<ToolsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
     let input = prepared.input().clone();
+    let result_projection = prepared.result_projection.clone();
     let terminal_identity = Arc::new(());
     let terminal_tools = Arc::clone(&tools);
     let expected_terminal = Arc::clone(&terminal_identity);
@@ -2549,6 +2673,7 @@ pub fn dispatch_tool_execution(
         input: input.clone(),
         prepared: Some(prepared),
         result: None,
+        result_projection: result_projection.clone(),
         terminal_identity,
     };
     let dispatched = catch_unwind(AssertUnwindSafe(|| {
@@ -2562,13 +2687,27 @@ pub fn dispatch_tool_execution(
             return Ok(tool_dispatch_failure(
                 input,
                 "tools/execute wrapper panicked",
+                result_projection,
             ));
         }
     };
-    let ToolDispatchExecution { input, result, .. } = execution;
+    let ToolDispatchExecution {
+        input,
+        result,
+        result_projection,
+        ..
+    } = execution;
     Ok(match result {
-        Some(result) => ToolDispatchOutcome { input, result },
-        None => tool_dispatch_failure(input, "tools/execute short-circuited without a result"),
+        Some(result) => ToolDispatchOutcome {
+            input,
+            result,
+            result_projection,
+        },
+        None => tool_dispatch_failure(
+            input,
+            "tools/execute short-circuited without a result",
+            result_projection,
+        ),
     })
 }
 
@@ -2579,27 +2718,37 @@ fn dispatch_prepared_tool_execution(
     let PreparedToolExecution {
         input,
         registration_identity,
+        result_projection,
         ..
     } = prepared;
     let executor = {
         let Ok(state) = tools.state.lock() else {
-            return tool_dispatch_failure(input, "tool registry is unavailable");
+            return tool_dispatch_failure(input, "tool registry is unavailable", result_projection);
         };
         let Some(registered) = state
             .names
             .iter()
             .rfind(|registered| registered.name == input.name())
         else {
-            return tool_dispatch_failure(input, "tool registration changed before dispatch");
+            return tool_dispatch_failure(
+                input,
+                "tool registration changed before dispatch",
+                result_projection,
+            );
         };
         if !Arc::ptr_eq(&registered.identity, &registration_identity) {
-            return tool_dispatch_failure(input, "tool registration changed before dispatch");
+            return tool_dispatch_failure(
+                input,
+                "tool registration changed before dispatch",
+                result_projection,
+            );
         }
         let Some(executor) = &registered.executor else {
             let name = input.name().to_string();
             return tool_dispatch_failure(
                 input,
                 format!("tool \"{name}\" has no registered executor"),
+                result_projection,
             );
         };
         Arc::clone(executor)
@@ -2611,7 +2760,11 @@ fn dispatch_prepared_tool_execution(
             message: format!("tool \"{}\" panicked", input.name()),
         },
     };
-    ToolDispatchOutcome { input, result }
+    ToolDispatchOutcome {
+        input,
+        result,
+        result_projection,
+    }
 }
 
 /// Run one normalized N54 dispatch outcome through canonical
@@ -2621,18 +2774,36 @@ pub fn post_tool_execution(
     ctx: &mut Context,
     outcome: ToolDispatchOutcome,
 ) -> Result<ToolDispatchOutcome, CordisError> {
-    let ToolDispatchOutcome { input, result } = outcome;
+    let ToolDispatchOutcome {
+        input,
+        result,
+        result_projection,
+    } = outcome;
     let fallback_input = input.clone();
-    let execution = ToolPostExecution { input, result };
+    let fallback_projection = result_projection.clone();
+    let execution = ToolPostExecution {
+        input,
+        result,
+        result_projection,
+    };
     let post = catch_unwind(AssertUnwindSafe(|| {
         ctx.waterfall(events::TOOLS_POST_EXECUTE, execution)
     }));
     match post {
-        Ok(Ok(ToolPostExecution { input, result })) => Ok(ToolDispatchOutcome { input, result }),
+        Ok(Ok(ToolPostExecution {
+            input,
+            result,
+            result_projection,
+        })) => Ok(ToolDispatchOutcome {
+            input,
+            result,
+            result_projection,
+        }),
         Ok(Err(error)) => Err(error),
         Err(_) => Ok(tool_dispatch_failure(
             fallback_input,
             "tools/post-execute listener panicked",
+            fallback_projection,
         )),
     }
 }
@@ -2640,12 +2811,109 @@ pub fn post_tool_execution(
 fn tool_dispatch_failure(
     input: ToolExecutionInput,
     message: impl Into<String>,
+    result_projection: ToolResultProjection,
 ) -> ToolDispatchOutcome {
     ToolDispatchOutcome {
         input,
         result: ToolDispatchResult::Failure {
             message: message.into(),
         },
+        result_projection,
+    }
+}
+
+/// Consume one N55 post-policy outcome, apply the exact admitted definition's
+/// renderer and optional content finalizer, then notify every canonical
+/// `tools/result` observer once. Projection and observer failures are
+/// contained as typed results and never replay an earlier stage.
+#[must_use]
+pub fn finalize_tool_execution(
+    ctx: &mut Context,
+    outcome: ToolDispatchOutcome,
+) -> ToolExecutionResult {
+    let ToolDispatchOutcome {
+        input,
+        result,
+        result_projection,
+    } = outcome;
+    let ToolResultProjection {
+        renderer,
+        finalizer,
+    } = result_projection;
+    let mut finalized = materialize_tool_result(input, result, renderer.as_ref());
+    if let Some(finalizer) = finalizer {
+        let replacement = catch_unwind(AssertUnwindSafe(|| {
+            finalizer(finalized.input(), &finalized)
+        }));
+        match replacement {
+            Ok(Ok(Some(content))) => finalized.content = content,
+            Ok(Ok(None)) => {}
+            Ok(Err(message)) => {
+                let name = finalized.input.name().to_string();
+                finalized = tool_final_failure(
+                    finalized.input.clone(),
+                    format!("tool \"{name}\" content finalizer failed: {message}"),
+                );
+            }
+            Err(_) => {
+                let name = finalized.input.name().to_string();
+                finalized = tool_final_failure(
+                    finalized.input.clone(),
+                    format!("tool \"{name}\" content finalizer panicked"),
+                );
+            }
+        }
+    }
+    if let Ok(dispatcher) = ctx.event_reentry() {
+        let _ = dispatcher.emit_contained(events::TOOLS_RESULT, &finalized);
+    }
+    finalized
+}
+
+fn materialize_tool_result(
+    input: ToolExecutionInput,
+    result: ToolDispatchResult,
+    renderer: Option<&ToolResultRenderer>,
+) -> ToolExecutionResult {
+    let name = input.name().to_string();
+    match result {
+        ToolDispatchResult::Success { value } => {
+            let Some(renderer) = renderer else {
+                return tool_final_failure(
+                    input,
+                    format!("tool \"{name}\" has no registered output renderer"),
+                );
+            };
+            match catch_unwind(AssertUnwindSafe(|| renderer(input.arguments(), &value))) {
+                Ok(Ok(content)) => ToolExecutionResult {
+                    input,
+                    result: ToolDispatchResult::Success { value },
+                    content,
+                },
+                Ok(Err(message)) => tool_final_failure(
+                    input,
+                    format!("tool \"{name}\" output renderer failed: {message}"),
+                ),
+                Err(_) => {
+                    tool_final_failure(input, format!("tool \"{name}\" output renderer panicked"))
+                }
+            }
+        }
+        ToolDispatchResult::Failure { message } => tool_final_failure(input, message),
+    }
+}
+
+fn tool_final_failure(
+    input: ToolExecutionInput,
+    message: impl Into<String>,
+) -> ToolExecutionResult {
+    let message = message.into();
+    ToolExecutionResult {
+        input,
+        content: vec![SessionContentBlock::Text {
+            text: format!("Error: {message}"),
+        }],
+        result: ToolDispatchResult::Failure { message },
     }
 }
 

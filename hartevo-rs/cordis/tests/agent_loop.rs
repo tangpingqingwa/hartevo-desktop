@@ -16,14 +16,14 @@ use hartevo_cordis::{
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
     SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, ToolDispatchExecution,
-    ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolPostExecution,
-    ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
-    commit_agent_stream, dispatch_agent_call, dispatch_tool_execution, events, keys,
-    log_agent_call, post_tool_execution, prepare_agent_call, prepare_agent_step,
-    prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream,
-    register_llm_adapter, register_prompt_section, register_tool, register_tool_concurrency,
-    register_tool_definition, register_tool_guard, register_tool_schema, run_agent_step,
-    schedule_agent_tool_calls, session_events,
+    ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolExecutionResult,
+    ToolPostExecution, ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step,
+    build_agent_call, commit_agent_stream, dispatch_agent_call, dispatch_tool_execution, events,
+    finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
+    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
+    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
+    register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
+    run_agent_step, schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -3469,6 +3469,372 @@ fn tools_post_execute_blocks_failed_replacement_and_listener_panic_without_repla
         }
     );
     assert_eq!(body_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the captured-definition and observer order in one fixture.
+fn tools_final_result_uses_captured_projection_and_contains_every_observer() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(
+        0,
+        "final-success-call",
+        "final-success",
+        r#"{"value":7}"#,
+    ));
+    chunks.extend(tool_call_chunks(
+        1,
+        "final-failure-call",
+        "final-failure",
+        "{}",
+    ));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-final-result", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let success_registration = {
+        let body_order = Arc::clone(&order);
+        let render_order = Arc::clone(&order);
+        let finalizer_order = Arc::clone(&order);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("final-success"), move |input| {
+                body_order.lock().unwrap().push("success-body");
+                assert_eq!(input.arguments(), &json!({ "value": 7 }));
+                Ok(json!({ "answer": 7 }))
+            })
+            .with_output_renderer(move |arguments, value| {
+                render_order.lock().unwrap().push("success-render");
+                assert_eq!(arguments, &json!({ "value": 7 }));
+                assert_eq!(value, &json!({ "answer": 7 }));
+                Ok(vec![SessionContentBlock::Text {
+                    text: "rendered success".into(),
+                }])
+            })
+            .with_content_finalizer(move |input, result| {
+                finalizer_order.lock().unwrap().push("success-finalize");
+                assert_eq!(input.call_id(), "final-success-call");
+                assert_eq!(
+                    result.result(),
+                    &ToolDispatchResult::Success {
+                        value: json!({ "answer": 7 })
+                    }
+                );
+                Ok(Some(vec![SessionContentBlock::Text {
+                    text: "finalized success".into(),
+                }]))
+            }),
+        )
+        .unwrap()
+    };
+    {
+        let body_order = Arc::clone(&order);
+        let render_order = Arc::clone(&order);
+        let finalizer_order = Arc::clone(&order);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("final-failure"), move |_| {
+                body_order.lock().unwrap().push("failure-body");
+                Err("body failed before rendering".into())
+            })
+            .with_output_renderer(move |_, _| {
+                render_order.lock().unwrap().push("failure-render");
+                Ok(Vec::new())
+            })
+            .with_content_finalizer(move |input, result| {
+                finalizer_order.lock().unwrap().push("failure-finalize");
+                assert_eq!(input.call_id(), "final-failure-call");
+                assert!(result.is_error());
+                Ok(Some(vec![SessionContentBlock::Text {
+                    text: "finalized failure".into(),
+                }]))
+            }),
+        )
+        .unwrap();
+    }
+    let before = session.events().unwrap();
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    let mut post_outcomes = Vec::new();
+    for preparation in prepared {
+        let ToolExecutionPreparation::Dispatch(prepared) = preparation else {
+            panic!("both registered calls must be admitted");
+        };
+        let dispatched = dispatch_tool_execution(&mut ctx, prepared).unwrap();
+        post_outcomes.push(post_tool_execution(&mut ctx, dispatched).unwrap());
+    }
+
+    assert!(success_registration.dispose());
+    let replacement_body_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let replacement_body_calls = Arc::clone(&replacement_body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("final-success"), move |_| {
+                replacement_body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("replacement body"))
+            })
+            .with_output_renderer(|_, _| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: "replacement renderer".into(),
+                }])
+            })
+            .with_content_finalizer(|_, _| {
+                Ok(Some(vec![SessionContentBlock::Text {
+                    text: "replacement finalizer".into(),
+                }]))
+            }),
+        )
+        .unwrap();
+    }
+
+    let observer_panics = Arc::new(AtomicUsize::new(0));
+    {
+        let observer_panics = Arc::clone(&observer_panics);
+        ctx.on_emit(events::TOOLS_RESULT, move |_: &ToolExecutionResult| {
+            observer_panics.fetch_add(1, Ordering::SeqCst);
+            panic!("result observer panic");
+        })
+        .unwrap();
+    }
+    let observer_errors = Arc::new(AtomicUsize::new(0));
+    {
+        let observer_errors = Arc::clone(&observer_errors);
+        ctx.try_on_emit(events::TOOLS_RESULT, move |_: &ToolExecutionResult| {
+            observer_errors.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("result observer error"))
+        })
+        .unwrap();
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    {
+        let observed = Arc::clone(&observed);
+        ctx.on_emit(events::TOOLS_RESULT, move |result: &ToolExecutionResult| {
+            let [SessionContentBlock::Text { text }] = result.content() else {
+                panic!("final result must have one text block");
+            };
+            observed.lock().unwrap().push((
+                result.input().call_id().to_string(),
+                result.result().clone(),
+                text.clone(),
+            ));
+        })
+        .unwrap();
+    }
+
+    let mut post_outcomes = post_outcomes.into_iter();
+    let success = finalize_tool_execution(&mut ctx, post_outcomes.next().unwrap());
+    let failure = finalize_tool_execution(&mut ctx, post_outcomes.next().unwrap());
+
+    assert_eq!(
+        success.result(),
+        &ToolDispatchResult::Success {
+            value: json!({ "answer": 7 })
+        }
+    );
+    assert_eq!(
+        success.content(),
+        [SessionContentBlock::Text {
+            text: "finalized success".into()
+        }]
+    );
+    assert_eq!(
+        failure.result(),
+        &ToolDispatchResult::Failure {
+            message: "body failed before rendering".into()
+        }
+    );
+    assert_eq!(
+        failure.content(),
+        [SessionContentBlock::Text {
+            text: "finalized failure".into()
+        }]
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "success-body",
+            "failure-body",
+            "success-render",
+            "success-finalize",
+            "failure-finalize",
+        ]
+    );
+    assert_eq!(replacement_body_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observer_panics.load(Ordering::SeqCst), 2);
+    assert_eq!(observer_errors.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            (
+                "final-success-call".into(),
+                ToolDispatchResult::Success {
+                    value: json!({ "answer": 7 })
+                },
+                "finalized success".into(),
+            ),
+            (
+                "final-failure-call".into(),
+                ToolDispatchResult::Failure {
+                    message: "body failed before rendering".into()
+                },
+                "finalized failure".into(),
+            ),
+        ]
+    );
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep every fail-closed projection class in one matrix.
+fn tools_final_result_normalizes_projection_failures_without_replay() {
+    let cases = [
+        ("missing-call", "missing-renderer"),
+        ("renderer-error-call", "renderer-error"),
+        ("renderer-panic-call", "renderer-panic"),
+        ("finalizer-error-call", "finalizer-error"),
+        ("finalizer-panic-call", "finalizer-panic"),
+    ];
+    let mut chunks = Vec::new();
+    for (index, (call_id, name)) in (0_u64..).zip(cases.iter()) {
+        chunks.extend(tool_call_chunks(index, call_id, name, "{}"));
+    }
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-final-failures", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let body_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("missing-renderer"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("missing"))
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("renderer-error"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("renderer error"))
+            })
+            .with_output_renderer(|_, _| Err("projection rejected".into())),
+        )
+        .unwrap();
+    }
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("renderer-panic"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("renderer panic"))
+            })
+            .with_output_renderer(|_, _| panic!("projection panic")),
+        )
+        .unwrap();
+    }
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("finalizer-error"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("finalizer error"))
+            })
+            .with_output_renderer(|_, _| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: "rendered".into(),
+                }])
+            })
+            .with_content_finalizer(|_, _| Err("finalization rejected".into())),
+        )
+        .unwrap();
+    }
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("finalizer-panic"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("finalizer panic"))
+            })
+            .with_output_renderer(|_, _| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: "rendered".into(),
+                }])
+            })
+            .with_content_finalizer(|_, _| panic!("finalizer panic")),
+        )
+        .unwrap();
+    }
+    let observer_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let observer_calls = Arc::clone(&observer_calls);
+        ctx.on_emit(events::TOOLS_RESULT, move |_: &ToolExecutionResult| {
+            observer_calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+    }
+    let before = session.events().unwrap();
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    let results = prepared
+        .into_iter()
+        .map(|preparation| {
+            let ToolExecutionPreparation::Dispatch(prepared) = preparation else {
+                panic!("every projection failure fixture must be admitted");
+            };
+            let dispatched = dispatch_tool_execution(&mut ctx, prepared).unwrap();
+            let post = post_tool_execution(&mut ctx, dispatched).unwrap();
+            finalize_tool_execution(&mut ctx, post)
+        })
+        .collect::<Vec<_>>();
+
+    let messages = results
+        .iter()
+        .map(|result| match result.result() {
+            ToolDispatchResult::Success { .. } => panic!("projection failures must fail closed"),
+            ToolDispatchResult::Failure { message } => message.as_str(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        [
+            "tool \"missing-renderer\" has no registered output renderer",
+            "tool \"renderer-error\" output renderer failed: projection rejected",
+            "tool \"renderer-panic\" output renderer panicked",
+            "tool \"finalizer-error\" content finalizer failed: finalization rejected",
+            "tool \"finalizer-panic\" content finalizer panicked",
+        ]
+    );
+    for result in &results {
+        let ToolDispatchResult::Failure { message } = result.result() else {
+            unreachable!();
+        };
+        assert_eq!(
+            result.content(),
+            [SessionContentBlock::Text {
+                text: format!("Error: {message}")
+            }]
+        );
+    }
+    assert_eq!(body_calls.load(Ordering::SeqCst), 5);
+    assert_eq!(observer_calls.load(Ordering::SeqCst), 5);
     assert_eq!(session.events().unwrap(), before);
     close_logged_turn(&session, turn);
 }
