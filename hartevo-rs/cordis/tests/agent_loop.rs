@@ -8,14 +8,15 @@ use hartevo_cordis::{
     AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
     AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, Context, CordisError,
     CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
-    KernelApprovalDecision, KernelConsentState, LlmAdapter, LlmAdapterStream, LlmChunkStream,
-    LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
-    LoggedAgentCall, PromptError, PromptSection, RecordedAgentStream, RuntimeSurface,
-    SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind, SessionFinishReason,
-    SessionHandle, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
-    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
-    SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, ToolDispatchExecution,
+    KernelApprovalDecision, KernelConsentState, LifecycleCancellation, LlmAdapter,
+    LlmAdapterStream, LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning,
+    LlmResolvedModel, LlmStream, LoaderContext, LoggedAgentCall, PromptError, PromptSection,
+    RecordedAgentStream, RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionError,
+    SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
+    SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+    SessionSurfaceIntent, SessionTokenUsage, SessionToolSchema, SurfaceOwner,
+    TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition, ToolDispatchExecution,
     ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolExecutionResult,
     ToolPostExecution, ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step,
     build_agent_call, commit_agent_stream, commit_agent_tool_results, dispatch_agent_call,
@@ -24,7 +25,8 @@ use hartevo_cordis::{
     prepare_agent_tool_executions, record_agent_stream, register_llm_adapter,
     register_prompt_section, register_tool, register_tool_concurrency, register_tool_definition,
     register_tool_guard, register_tool_schema, run_agent_step, run_agent_tool_batch,
-    run_agent_tool_batch_with_limit, schedule_agent_tool_calls, session_events,
+    run_agent_tool_batch_with_limit, run_agent_tool_batch_with_limit_and_cancellation,
+    schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -4581,6 +4583,274 @@ fn tool_scheduler_reclassifies_an_unstarted_call_into_an_exclusive_barrier() {
             "reclass-first-call",
             "reclass-running-call",
             "reclass-next-call",
+        ]
+    );
+    assert!(recorded.tool_results_committed());
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the zero-stage and durable-result proof together.
+fn tool_scheduler_pre_cancel_commits_canonical_results_without_running_tool_stages() {
+    let mut chunks = Vec::new();
+    for (index, name) in ["cancel-before-a", "cancel-before-b"]
+        .into_iter()
+        .enumerate()
+    {
+        chunks.extend(tool_call_chunks(
+            u64::try_from(index).unwrap(),
+            &format!("{name}-call"),
+            name,
+            "{}",
+        ));
+    }
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-scheduler-pre-cancel", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    let stages = Arc::new(AtomicUsize::new(0));
+    for name in ["cancel-before-a", "cancel-before-b"] {
+        let stages = Arc::clone(&stages);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |_| {
+                stages.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("must not run"))
+            })
+            .with_concurrency(|_| Ok(true))
+            .with_output_renderer(|_, _| Ok(Vec::new())),
+        )
+        .unwrap();
+    }
+    {
+        let stages = Arc::clone(&stages);
+        ctx.on_waterfall(events::TOOLS_PRE_EXECUTE, move |call: ToolCall, next| {
+            stages.fetch_add(1, Ordering::SeqCst);
+            next(call)
+        })
+        .unwrap();
+    }
+    {
+        let stages = Arc::clone(&stages);
+        ctx.on_waterfall(
+            events::TOOLS_POST_EXECUTE,
+            move |result: ToolPostExecution, next| {
+                stages.fetch_add(1, Ordering::SeqCst);
+                next(result)
+            },
+        )
+        .unwrap();
+    }
+    {
+        let stages = Arc::clone(&stages);
+        ctx.on_emit(events::TOOLS_RESULT, move |_: &ToolExecutionResult| {
+            stages.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+    }
+    let cancellation = LifecycleCancellation::default();
+    cancellation.cancel();
+
+    let results = run_agent_tool_batch_with_limit_and_cancellation(
+        &mut ctx,
+        &logged,
+        &mut recorded,
+        2,
+        &cancellation,
+    )
+    .unwrap();
+
+    assert_eq!(stages.load(Ordering::SeqCst), 0);
+    assert!(cancellation.is_cancelled());
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(ToolExecutionResult::is_error));
+    assert!(results.iter().all(|result| {
+        result
+            .error()
+            .map(|error| (error.name.as_str(), error.code.as_str()))
+            == Some(("AbortError", TOOL_ABORTED_BEFORE_DISPATCH))
+            && result.content()
+                == [SessionContentBlock::Text {
+                    text: "Error: tool call aborted before dispatch".into(),
+                }]
+    }));
+    let durable = session
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::ToolResult { message, error, .. } => Some((message, error)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(durable.len(), 2);
+    assert!(durable.iter().all(|(message, error)| {
+        matches!(message.source, SessionMessageSource::Tool { .. })
+            && error.as_ref().map(|error| error.code.as_str()) == Some(TOOL_ABORTED_BEFORE_DISPATCH)
+    }));
+    let after = session.events().unwrap();
+    assert!(
+        run_agent_tool_batch_with_limit_and_cancellation(
+            &mut ctx,
+            &logged,
+            &mut recorded,
+            2,
+            &cancellation,
+        )
+        .is_err()
+    );
+    assert_eq!(session.events().unwrap(), after);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep pool timing, drain, and ordered persistence together.
+fn tool_scheduler_mid_pool_cancel_drains_started_calls_and_synthesizes_the_rest() {
+    let mut chunks = Vec::new();
+    for (index, name) in [
+        "cancel-pool-1",
+        "cancel-pool-2",
+        "cancel-pool-3",
+        "cancel-pool-4",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        chunks.extend(tool_call_chunks(
+            u64::try_from(index).unwrap(),
+            &format!("{name}-call"),
+            name,
+            "{}",
+        ));
+    }
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-scheduler-mid-cancel", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    let cancellation = LifecycleCancellation::default();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    for name in [
+        "cancel-pool-1",
+        "cancel-pool-2",
+        "cancel-pool-3",
+        "cancel-pool-4",
+    ] {
+        let cancellation = cancellation.clone();
+        let bodies = Arc::clone(&bodies);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |_| {
+                bodies.lock().unwrap().push(name);
+                if name == "cancel-pool-2" {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while !cancellation.is_cancelled() && std::time::Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    if !cancellation.is_cancelled() {
+                        return Err("ordered first result did not cancel the batch".into());
+                    }
+                }
+                Ok(json!(name))
+            })
+            .with_concurrency(|_| Ok(true))
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    {
+        let cancellation = cancellation.clone();
+        let observed = Arc::clone(&observed);
+        ctx.on_emit(events::TOOLS_RESULT, move |result: &ToolExecutionResult| {
+            observed
+                .lock()
+                .unwrap()
+                .push(result.input().call_id().to_string());
+            if result.input().call_id() == "cancel-pool-1-call" {
+                cancellation.cancel();
+            }
+        })
+        .unwrap();
+    }
+
+    let results = run_agent_tool_batch_with_limit_and_cancellation(
+        &mut ctx,
+        &logged,
+        &mut recorded,
+        2,
+        &cancellation,
+    )
+    .unwrap();
+
+    let mut bodies = bodies.lock().unwrap().clone();
+    bodies.sort_unstable();
+    assert_eq!(bodies, ["cancel-pool-1", "cancel-pool-2"]);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        ["cancel-pool-1-call", "cancel-pool-2-call"]
+    );
+    assert!(cancellation.is_cancelled());
+    assert_eq!(results.len(), 4);
+    assert_eq!(
+        results
+            .iter()
+            .map(ToolExecutionResult::is_error)
+            .collect::<Vec<_>>(),
+        [false, false, true, true]
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.error().map(|error| error.code.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            None,
+            None,
+            Some(TOOL_ABORTED_BEFORE_DISPATCH),
+            Some(TOOL_ABORTED_BEFORE_DISPATCH),
+        ]
+    );
+    let durable = session
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::ToolResult { message, error, .. } => {
+                let SessionMessageSource::Tool { call_id } = message.source else {
+                    return None;
+                };
+                Some((call_id, error.map(|error| error.code)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        durable,
+        [
+            ("cancel-pool-1-call".into(), None),
+            ("cancel-pool-2-call".into(), None),
+            (
+                "cancel-pool-3-call".into(),
+                Some(TOOL_ABORTED_BEFORE_DISPATCH.into()),
+            ),
+            (
+                "cancel-pool-4-call".into(),
+                Some(TOOL_ABORTED_BEFORE_DISPATCH.into()),
+            ),
         ]
     );
     assert!(recorded.tool_results_committed());

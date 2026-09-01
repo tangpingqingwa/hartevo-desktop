@@ -1828,12 +1828,23 @@ impl SessionLog {
         message: SessionMessage,
         surface: SessionSurfaceIntent,
     ) -> Result<u64, SessionError> {
+        self.append_tool_result_with_error_and_surface(turn, step, message, None, surface)
+    }
+
+    pub fn append_tool_result_with_error_and_surface(
+        &mut self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+        error: Option<SessionToolError>,
+        surface: SessionSurfaceIntent,
+    ) -> Result<u64, SessionError> {
         Ok(self
             .append(SessionEventKind::ToolResult {
                 turn,
                 step,
                 message,
-                error: None,
+                error,
                 surface,
             })?
             .seq)
@@ -2424,6 +2435,19 @@ impl SessionHandle {
         surface: SessionSurfaceIntent,
     ) -> Result<u64, SessionError> {
         self.commit(|log| log.append_tool_result_with_surface(turn, step, message, surface))
+    }
+
+    pub fn append_tool_result_with_error_and_surface(
+        &self,
+        turn: u64,
+        step: u64,
+        message: SessionMessage,
+        error: Option<SessionToolError>,
+        surface: SessionSurfaceIntent,
+    ) -> Result<u64, SessionError> {
+        self.commit(|log| {
+            log.append_tool_result_with_error_and_surface(turn, step, message, error, surface)
+        })
     }
 
     pub fn derive_messages(&self) -> Result<Vec<SessionMessage>, SessionError> {
