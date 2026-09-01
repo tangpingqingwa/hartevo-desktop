@@ -20,9 +20,10 @@ use crate::session::{
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
     EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
-    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput, ToolsSurface,
-    assemble_system_prompt, events, prepare_llm_call, register_agent, run_tools_pipeline,
-    stream_llm, stream_llm_request, stream_prepared_llm,
+    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
+    ToolExecutionPreparation, ToolsSurface, assemble_system_prompt, events, prepare_llm_call,
+    prepare_tool_execution, register_agent, run_tools_pipeline, stream_llm, stream_llm_request,
+    stream_prepared_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
@@ -811,6 +812,20 @@ pub fn prepare_agent_tool_calls(
         .iter()
         .map(ToolExecutionInput::from_session_call)
         .collect())
+}
+
+/// Run N51's exact durable inputs through ordered pre-execution policy in
+/// model order. This stage still performs no tool body dispatch, result
+/// persistence, or step/turn closure.
+pub fn prepare_agent_tool_executions(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &RecordedAgentStream,
+) -> Result<Vec<ToolExecutionPreparation>, CordisError> {
+    prepare_agent_tool_calls(ctx, logged, recorded)?
+        .into_iter()
+        .map(|input| prepare_tool_execution(ctx, input))
+        .collect()
 }
 
 type PlannedToolCall = (String, String, String);

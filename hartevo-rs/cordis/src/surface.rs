@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -269,6 +270,7 @@ pub struct ToolCall {
     pub arguments: String,
     pub decision: String,
     pub result: String,
+    execution_input: Option<ToolExecutionInput>,
 }
 
 impl ToolCall {
@@ -284,6 +286,7 @@ impl ToolCall {
             arguments: arguments.into(),
             decision: decision.into(),
             result: String::new(),
+            execution_input: None,
         }
     }
 
@@ -292,6 +295,24 @@ impl ToolCall {
     pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
         self.call_id = call_id.into();
         self
+    }
+
+    /// Exact durable input when this call is traversing the N52 pre-execute
+    /// boundary. Legacy pipeline calls have no durable input attached.
+    #[must_use]
+    pub const fn execution_input(&self) -> Option<&ToolExecutionInput> {
+        self.execution_input.as_ref()
+    }
+
+    fn from_execution_input(input: &ToolExecutionInput) -> Self {
+        Self {
+            call_id: input.call_id().to_string(),
+            name: input.name().to_string(),
+            arguments: input.raw_arguments().to_string(),
+            decision: "allow".into(),
+            result: String::new(),
+            execution_input: Some(input.clone()),
+        }
     }
 }
 
@@ -372,6 +393,76 @@ fn parse_tool_arguments(raw: &str) -> serde_json::Value {
 pub enum ToolExecutionMode {
     Parallel,
     Exclusive,
+}
+
+/// One call admitted through ordered policy and guards for later dispatch.
+///
+/// The registration identity is intentionally opaque. A later dispatch stage
+/// must revalidate it through [`ToolsSurface::preparation_is_current`] before
+/// invoking a tool body.
+pub struct PreparedToolExecution {
+    input: ToolExecutionInput,
+    mode: ToolExecutionMode,
+    registration_identity: Arc<()>,
+}
+
+impl fmt::Debug for PreparedToolExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedToolExecution")
+            .field("input", &self.input)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedToolExecution {
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> ToolExecutionMode {
+        self.mode
+    }
+}
+
+/// One call stopped before dispatch with a model-readable reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeniedToolExecution {
+    input: ToolExecutionInput,
+    reason: String,
+}
+
+impl DeniedToolExecution {
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// Ordered pre-execution outcome. Neither variant has invoked a tool body or
+/// mutated the durable session.
+#[derive(Debug)]
+pub enum ToolExecutionPreparation {
+    Dispatch(PreparedToolExecution),
+    Denied(DeniedToolExecution),
+}
+
+impl ToolExecutionPreparation {
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        match self {
+            Self::Dispatch(prepared) => prepared.input(),
+            Self::Denied(denied) => denied.input(),
+        }
+    }
 }
 
 /// Fully assembled provider-neutral request presented to one LLM adapter.
@@ -987,6 +1078,7 @@ impl AgentRequest {
 /// Tools pipeline service provided at `ctx.tools`.
 type ToolConcurrencyClassifier =
     Arc<dyn Fn(&serde_json::Value) -> Result<bool, String> + Send + Sync>;
+type ToolExecutionGuard = Arc<dyn Fn(&ToolExecutionInput) -> Option<String> + Send + Sync>;
 
 #[derive(Clone)]
 struct ToolRegistration {
@@ -1005,10 +1097,25 @@ impl fmt::Debug for ToolRegistration {
     }
 }
 
+#[derive(Clone)]
+struct ToolGuardRegistration {
+    identity: Arc<()>,
+    guard: ToolExecutionGuard,
+}
+
+impl fmt::Debug for ToolGuardRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolGuardRegistration")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Default)]
 struct ToolsState {
     names: Vec<ToolRegistration>,
     schemas: Vec<SessionToolSchema>,
+    guards: Vec<ToolGuardRegistration>,
 }
 
 #[derive(Debug, Clone)]
@@ -1096,6 +1203,97 @@ impl ToolsSurface {
         }
     }
 
+    fn register_guard(&self, guard: ToolExecutionGuard) -> Arc<()> {
+        let identity = Arc::new(());
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .guards
+            .push(ToolGuardRegistration {
+                identity: Arc::clone(&identity),
+                guard,
+            });
+        identity
+    }
+
+    fn unregister_guard(&self, identity: &Arc<()>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = state
+            .guards
+            .iter()
+            .position(|registered| Arc::ptr_eq(&registered.identity, identity))
+        {
+            state.guards.remove(index);
+        }
+    }
+
+    fn registration(&self, name: &str) -> Result<Option<ToolRegistration>, PromptError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| PromptError::ToolsRegistryPoisoned)?
+            .names
+            .iter()
+            .rfind(|registered| registered.name == name)
+            .cloned())
+    }
+
+    fn registration_is_current(&self, name: &str, identity: &Arc<()>) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .names
+                .iter()
+                .rfind(|registered| registered.name == name)
+                .is_some_and(|registered| Arc::ptr_eq(&registered.identity, identity))
+        })
+    }
+
+    fn classify_registration(
+        input: &ToolExecutionInput,
+        registered: &ToolRegistration,
+    ) -> ToolExecutionMode {
+        let Some(classifier) = &registered.classifier else {
+            return ToolExecutionMode::Exclusive;
+        };
+        if catch_unwind(AssertUnwindSafe(|| classifier(input.arguments())))
+            .ok()
+            .and_then(Result::ok)
+            == Some(true)
+        {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Exclusive
+        }
+    }
+
+    fn guard_reason(&self, input: &ToolExecutionInput) -> Option<String> {
+        let guards = match self.state.lock() {
+            Ok(state) => state.guards.clone(),
+            Err(_) => return Some("tool registry is unavailable".into()),
+        };
+        for registered in guards {
+            let live = match self.state.lock() {
+                Ok(state) => state
+                    .guards
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(&candidate.identity, &registered.identity)),
+                Err(_) => return Some("tool registry is unavailable".into()),
+            };
+            if !live {
+                continue;
+            }
+            match catch_unwind(AssertUnwindSafe(|| (registered.guard)(input))) {
+                Ok(Some(reason)) => return Some(reason),
+                Ok(None) => {}
+                Err(_) => return Some(format!("tool guard panicked for \"{}\"", input.name())),
+            }
+        }
+        None
+    }
+
     #[must_use]
     pub fn names(&self) -> Vec<String> {
         self.state
@@ -1112,41 +1310,21 @@ impl ToolsSurface {
     /// remains an exclusive barrier.
     #[must_use]
     pub fn execution_mode(&self, input: &ToolExecutionInput) -> ToolExecutionMode {
-        let candidate = {
-            let Ok(state) = self.state.lock() else {
-                return ToolExecutionMode::Exclusive;
-            };
-            let Some(registered) = state
-                .names
-                .iter()
-                .rfind(|registered| registered.name == input.name())
-            else {
-                return ToolExecutionMode::Exclusive;
-            };
-            registered
-                .classifier
-                .as_ref()
-                .map(|classifier| (Arc::clone(&registered.identity), Arc::clone(classifier)))
-        };
-        let Some((tool_identity, classifier)) = candidate else {
+        let Ok(Some(registered)) = self.registration(input.name()) else {
             return ToolExecutionMode::Exclusive;
         };
-        if classifier(input.arguments()).ok() != Some(true) {
+        let mode = Self::classify_registration(input, &registered);
+        if !self.registration_is_current(input.name(), &registered.identity) {
             return ToolExecutionMode::Exclusive;
         }
-        let Ok(state) = self.state.lock() else {
-            return ToolExecutionMode::Exclusive;
-        };
-        if state
-            .names
-            .iter()
-            .rfind(|registered| registered.name == input.name())
-            .is_some_and(|registered| Arc::ptr_eq(&registered.identity, &tool_identity))
-        {
-            ToolExecutionMode::Parallel
-        } else {
-            ToolExecutionMode::Exclusive
-        }
+        mode
+    }
+
+    /// Revalidate that a dispatch preparation still names the exact visible
+    /// registration admitted by pre-execution policy.
+    #[must_use]
+    pub fn preparation_is_current(&self, prepared: &PreparedToolExecution) -> bool {
+        self.registration_is_current(prepared.input.name(), &prepared.registration_identity)
     }
 
     fn schemas(&self) -> Result<Vec<SessionToolSchema>, PromptError> {
@@ -1732,6 +1910,25 @@ where
     Ok(ctx.effect(move || registered.unregister_name(&identity)))
 }
 
+/// Register one monotonic pre-execution guard and reverse it with its Cordis
+/// owner. Returning any string denies the call; no guard can force-allow it.
+pub fn register_tool_guard<F>(
+    ctx: &mut Context,
+    guard: F,
+) -> Result<RegistrationHandle, CordisError>
+where
+    F: Fn(&ToolExecutionInput) -> Option<String> + Send + Sync + 'static,
+{
+    let Some(tools) = ctx.tools::<ToolsSurface>() else {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::TOOLS.to_string(),
+        ]));
+    };
+    let identity = tools.register_guard(Arc::new(guard));
+    let registered = Arc::clone(&tools);
+    Ok(ctx.effect(move || registered.unregister_guard(&identity)))
+}
+
 /// Register one ordered static system-prompt section with exact teardown.
 pub fn register_prompt_section(
     ctx: &mut Context,
@@ -1993,6 +2190,92 @@ pub fn run_tools_pipeline(ctx: &mut Context, mut call: ToolCall) -> Result<ToolC
     call.call_id = call_id;
     ctx.emit(events::TOOLS_RESULT, &call)?;
     Ok(call)
+}
+
+/// Run one immutable durable call through ordered pre-execute policy and
+/// monotonic guards without invoking a tool body or mutating the session.
+pub fn prepare_tool_execution(
+    ctx: &mut Context,
+    input: ToolExecutionInput,
+) -> Result<ToolExecutionPreparation, CordisError> {
+    let tools = ctx
+        .tools::<ToolsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let Ok(registered) = tools.registration(input.name()) else {
+        return Ok(denied_tool_execution(input, "tool registry is unavailable"));
+    };
+    let proposal = ToolCall::from_execution_input(&input);
+    let decided = ctx.waterfall(events::TOOLS_PRE_EXECUTE, proposal)?;
+    if decided.call_id != input.call_id()
+        || decided.name != input.name()
+        || decided.arguments != input.raw_arguments()
+        || decided.execution_input.as_ref() != Some(&input)
+    {
+        return Ok(denied_tool_execution(
+            input,
+            "tools/pre-execute cannot rewrite durable tool identity or arguments",
+        ));
+    }
+    match decided.decision.as_str() {
+        "deny" => {
+            let reason = if decided.result.is_empty() {
+                format!("tool \"{}\" was denied by pre-execute policy", input.name())
+            } else {
+                decided.result
+            };
+            return Ok(denied_tool_execution(input, reason));
+        }
+        "ask" => {
+            let reason = if decided.result.is_empty() {
+                format!(
+                    "tool \"{}\" requires approval, but no approval channel is available",
+                    input.name()
+                )
+            } else {
+                decided.result
+            };
+            return Ok(denied_tool_execution(input, reason));
+        }
+        "allow" => {}
+        decision => {
+            return Ok(denied_tool_execution(
+                input,
+                format!("invalid tools/pre-execute decision \"{decision}\""),
+            ));
+        }
+    }
+    if let Some(reason) = tools.guard_reason(&input) {
+        return Ok(denied_tool_execution(input, reason));
+    }
+    let Some(registered) = registered else {
+        let name = input.name().to_string();
+        return Ok(denied_tool_execution(
+            input,
+            format!("unknown tool \"{name}\""),
+        ));
+    };
+    let mode = ToolsSurface::classify_registration(&input, &registered);
+    if !tools.registration_is_current(input.name(), &registered.identity) {
+        return Ok(denied_tool_execution(
+            input,
+            "tool registration changed during pre-execution",
+        ));
+    }
+    Ok(ToolExecutionPreparation::Dispatch(PreparedToolExecution {
+        input,
+        mode,
+        registration_identity: registered.identity,
+    }))
+}
+
+fn denied_tool_execution(
+    input: ToolExecutionInput,
+    reason: impl Into<String>,
+) -> ToolExecutionPreparation {
+    ToolExecutionPreparation::Denied(DeniedToolExecution {
+        input,
+        reason: reason.into(),
+    })
 }
 
 /// Dispatch one model stream through `llm/stream`.
