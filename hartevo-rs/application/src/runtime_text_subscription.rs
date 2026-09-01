@@ -1944,6 +1944,7 @@ mod tests {
         thread_id: &str,
     ) -> RuntimeTurnScope {
         RuntimeTurnScope {
+            purpose: hartevo_domain_kernel::RuntimeTurnPurpose::Agent,
             tenant_id: handle.tenant_id.clone(),
             project_id: handle.project_id.clone(),
             mission_id: handle.mission_id.clone(),

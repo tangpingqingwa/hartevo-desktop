@@ -17,9 +17,31 @@ const MAX_PRIVATE_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const LEGACY_AGENT_MESSAGE_ITEM_DIGEST: &str =
     "b907287bacf5470d3b3c410ae6e7934f19ee7e0640b289fc41922a441bb88d5b";
 
+/// Why one managed Runtime turn exists. Auxiliary compaction remains part of
+/// the recoverable Runtime ledger but can never become a Mission draft.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTurnPurpose {
+    #[default]
+    Agent,
+    Compaction,
+}
+
+impl RuntimeTurnPurpose {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if predicates receive references"
+    )]
+    fn is_agent(&self) -> bool {
+        *self == Self::Agent
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeTurnScope {
+    #[serde(default, skip_serializing_if = "RuntimeTurnPurpose::is_agent")]
+    pub purpose: RuntimeTurnPurpose,
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub mission_id: MissionId,
@@ -84,6 +106,7 @@ impl fmt::Debug for RuntimeTurnScope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeTurnScope")
+            .field("purpose", &self.purpose)
             .field("tenant_id", &self.tenant_id)
             .field("project_id", &self.project_id)
             .field("mission_id", &self.mission_id)
@@ -1202,6 +1225,7 @@ mod tests {
     fn scope() -> RuntimeTurnScope {
         let thread = "runtime-thread-private";
         RuntimeTurnScope {
+            purpose: RuntimeTurnPurpose::Agent,
             tenant_id: TenantId::from("tenant-runtime-turn"),
             project_id: ProjectId::from("project-runtime-turn"),
             mission_id: MissionId::from("mission-runtime-turn"),
@@ -1230,6 +1254,30 @@ mod tests {
             runtime_thread_id: thread.into(),
             runtime_thread_id_digest: sha256(thread.as_bytes()),
         }
+    }
+
+    #[test]
+    fn legacy_runtime_scope_defaults_to_agent_and_compaction_changes_identity() {
+        let agent = scope();
+        let mut legacy = serde_json::to_value(&agent).expect("scope JSON");
+        assert!(legacy.get("purpose").is_none());
+        legacy
+            .as_object_mut()
+            .expect("scope object")
+            .remove("purpose");
+        let decoded: RuntimeTurnScope = serde_json::from_value(legacy).expect("legacy scope");
+        assert_eq!(decoded.purpose, RuntimeTurnPurpose::Agent);
+        assert_eq!(decoded.digest().unwrap(), agent.digest().unwrap());
+
+        let mut compaction = agent;
+        compaction.purpose = RuntimeTurnPurpose::Compaction;
+        assert_eq!(
+            serde_json::to_value(&compaction)
+                .expect("compaction scope JSON")
+                .get("purpose"),
+            Some(&serde_json::json!("compaction"))
+        );
+        assert_ne!(compaction.digest().unwrap(), decoded.digest().unwrap());
     }
 
     #[test]
