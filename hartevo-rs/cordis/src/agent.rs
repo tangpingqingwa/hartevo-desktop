@@ -95,6 +95,30 @@ pub struct AgentStepResult {
     pub tool: Option<ToolCall>,
 }
 
+/// Final results and step-control metadata settled by one exact tool batch.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentToolBatchOutcome {
+    results: Vec<ToolExecutionResult>,
+    concludes_turn: bool,
+}
+
+impl AgentToolBatchOutcome {
+    #[must_use]
+    pub fn results(&self) -> &[ToolExecutionResult] {
+        &self.results
+    }
+
+    #[must_use]
+    pub const fn concludes_turn(&self) -> bool {
+        self.concludes_turn
+    }
+
+    #[must_use]
+    pub fn into_results(self) -> Vec<ToolExecutionResult> {
+        self.results
+    }
+}
+
 /// Request-ready state frozen before adapter resolution or request persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedAgentRequest {
@@ -975,7 +999,7 @@ pub fn commit_agent_tool_results(
     Ok(planned.into_iter().map(|result| result.message).collect())
 }
 
-/// Run the exact scheduled calls through the sequential N52–N57 baseline.
+/// Run the exact scheduled calls through the canonical N52–N62 settlement.
 ///
 /// Starting is one-shot even when a later stage fails, so a caller cannot
 /// replay a body whose durable result became uncertain.
@@ -984,7 +1008,23 @@ pub fn run_agent_tool_batch(
     logged: &LoggedAgentCall,
     recorded: &mut RecordedAgentStream,
 ) -> Result<Vec<ToolExecutionResult>, CordisError> {
-    run_agent_tool_batch_with_limit(ctx, logged, recorded, DEFAULT_MAX_PARALLEL_TOOL_CALLS)
+    run_agent_tool_batch_outcome(ctx, logged, recorded).map(AgentToolBatchOutcome::into_results)
+}
+
+/// Run and settle one exact tool batch, exposing whether an authoritative
+/// successful result requested turn conclusion.
+pub fn run_agent_tool_batch_outcome(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+) -> Result<AgentToolBatchOutcome, CordisError> {
+    run_agent_tool_batch_with_limit_and_cancellation_outcome(
+        ctx,
+        logged,
+        recorded,
+        DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+        &LifecycleCancellation::default(),
+    )
 }
 
 /// Run one exact tool batch with a bounded rolling body pool and exclusive
@@ -996,16 +1036,18 @@ pub fn run_agent_tool_batch_with_limit(
     recorded: &mut RecordedAgentStream,
     max_parallel_tool_calls: usize,
 ) -> Result<Vec<ToolExecutionResult>, CordisError> {
-    run_agent_tool_batch_with_limit_and_cancellation(
+    run_agent_tool_batch_with_limit_and_cancellation_outcome(
         ctx,
         logged,
         recorded,
         max_parallel_tool_calls,
         &LifecycleCancellation::default(),
     )
+    .map(AgentToolBatchOutcome::into_results)
 }
 
-/// Run one exact tool batch with N59's bound and explicit N60 cancellation.
+/// Run one exact tool batch with N59's bound, N60 cancellation, and N62
+/// result-context inbox settlement while preserving the legacy result vector.
 ///
 /// Cancellation stops replenishment, drains already-started calls, and emits
 /// canonical synthetic results for every call that never started.
@@ -1016,6 +1058,25 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation(
     max_parallel_tool_calls: usize,
     cancellation: &LifecycleCancellation,
 ) -> Result<Vec<ToolExecutionResult>, CordisError> {
+    run_agent_tool_batch_with_limit_and_cancellation_outcome(
+        ctx,
+        logged,
+        recorded,
+        max_parallel_tool_calls,
+        cancellation,
+    )
+    .map(AgentToolBatchOutcome::into_results)
+}
+
+/// Run N59/N60 scheduling, durably commit every final result, then park all
+/// accepted result contexts in one model-ordered next-step inbox batch.
+pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+    max_parallel_tool_calls: usize,
+    cancellation: &LifecycleCancellation,
+) -> Result<AgentToolBatchOutcome, CordisError> {
     if max_parallel_tool_calls == 0 {
         return Err(invalid_stream_protocol("a positive parallel tool-call limit").into());
     }
@@ -1084,7 +1145,22 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation(
         }
     }
     commit_agent_tool_results(ctx, logged, recorded, &results)?;
-    Ok(results)
+    let concludes_turn = results
+        .iter()
+        .any(|result| !result.is_error() && result.concludes_turn());
+    let additional_contexts = results
+        .iter()
+        .flat_map(|result| result.additional_contexts().iter().cloned())
+        .collect::<Vec<_>>();
+    if !additional_contexts.is_empty() {
+        session
+            .inbox()
+            .append_next_step_batch(additional_contexts)?;
+    }
+    Ok(AgentToolBatchOutcome {
+        results,
+        concludes_turn,
+    })
 }
 
 fn settle_tool_preparation(
