@@ -717,6 +717,37 @@ async fn runtime_agent_status_and_when_idle_follow_the_exact_permit() {
     completion.announce().unwrap();
 }
 
+#[tokio::test]
+async fn runtime_teardown_revokes_publication_while_the_permit_is_retained() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let agent = agents.list().into_iter().next().unwrap();
+    assert_eq!(agent.status(), AgentStatus::Running);
+
+    host.teardown();
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    agent.when_idle().await;
+    assert!(agents.list().is_empty());
+    assert!(host.active_runtime_scope().is_none());
+
+    let replacement = AgentRef::new(agent.id.clone());
+    agents.register(replacement.clone());
+    drop(permit);
+    let published = agents.list();
+    assert_eq!(published.as_slice(), std::slice::from_ref(&replacement));
+}
+
 #[test]
 fn runtime_agent_publication_collision_never_replaces_or_disposes_the_live_identity() {
     let mut host = CordisHost::boot(false).unwrap();
