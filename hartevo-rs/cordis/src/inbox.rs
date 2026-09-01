@@ -69,6 +69,15 @@ impl AgentInbox {
         self.insert(AgentInboxTarget::NextStep, message, false)
     }
 
+    /// Durably append one ordered message batch for the next step through a
+    /// single inbox splice. An empty batch is a no-op.
+    pub fn append_next_step_batch(
+        &self,
+        messages: Vec<SessionMessage>,
+    ) -> Result<(), SessionError> {
+        self.insert_batch(AgentInboxTarget::NextStep, messages, false)
+    }
+
     /// Durably prepend one message for a future turn.
     pub fn prepend_next_turn(&self, message: SessionMessage) -> Result<(), SessionError> {
         self.insert(AgentInboxTarget::NextTurn, message, true)
@@ -85,6 +94,18 @@ impl AgentInbox {
         message: SessionMessage,
         prepend: bool,
     ) -> Result<(), SessionError> {
+        self.insert_batch(target, vec![message], prepend)
+    }
+
+    fn insert_batch(
+        &self,
+        target: AgentInboxTarget,
+        messages: Vec<SessionMessage>,
+        prepend: bool,
+    ) -> Result<(), SessionError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
         let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
         let start = {
             let state = self.lock()?;
@@ -95,10 +116,7 @@ impl AgentInbox {
                     .map_err(|_| SessionError::EventSequenceOverflow)?
             }
         };
-        if !self
-            .mutate(target, start, None, vec![message], None)?
-            .is_empty()
-        {
+        if !self.mutate(target, start, None, messages, None)?.is_empty() {
             return Err(SessionError::InboxProjectionDrift);
         }
         Ok(())

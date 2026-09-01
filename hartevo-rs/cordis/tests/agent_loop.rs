@@ -25,8 +25,10 @@ use hartevo_cordis::{
     prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream,
     register_llm_adapter, register_prompt_section, register_tool, register_tool_concurrency,
     register_tool_definition, register_tool_guard, register_tool_schema, run_agent_step,
-    run_agent_tool_batch, run_agent_tool_batch_with_limit,
-    run_agent_tool_batch_with_limit_and_cancellation, schedule_agent_tool_calls, session_events,
+    run_agent_tool_batch, run_agent_tool_batch_outcome, run_agent_tool_batch_with_limit,
+    run_agent_tool_batch_with_limit_and_cancellation,
+    run_agent_tool_batch_with_limit_and_cancellation_outcome, schedule_agent_tool_calls,
+    session_events,
 };
 use serde_json::json;
 
@@ -4667,7 +4669,7 @@ fn tool_scheduler_pre_cancel_commits_canonical_results_without_running_tool_stag
     let cancellation = LifecycleCancellation::default();
     cancellation.cancel();
 
-    let results = run_agent_tool_batch_with_limit_and_cancellation(
+    let outcome = run_agent_tool_batch_with_limit_and_cancellation_outcome(
         &mut ctx,
         &logged,
         &mut recorded,
@@ -4675,9 +4677,12 @@ fn tool_scheduler_pre_cancel_commits_canonical_results_without_running_tool_stag
         &cancellation,
     )
     .unwrap();
+    let results = outcome.results();
 
     assert_eq!(stages.load(Ordering::SeqCst), 0);
     assert!(cancellation.is_cancelled());
+    assert!(!outcome.concludes_turn());
+    assert!(session.inbox().next_step().unwrap().is_empty());
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(ToolExecutionResult::is_error));
     assert!(results.iter().all(|result| {
@@ -4973,9 +4978,11 @@ fn tool_result_contexts_preserve_order_and_only_success_may_conclude() {
         .unwrap();
     }
 
-    let results = run_agent_tool_batch(&mut ctx, &logged, &mut recorded).unwrap();
+    let outcome = run_agent_tool_batch_outcome(&mut ctx, &logged, &mut recorded).unwrap();
+    let results = outcome.results();
 
     assert_eq!(results.len(), 2);
+    assert!(outcome.concludes_turn());
     assert_eq!(
         results[0].additional_contexts(),
         [success_body.clone(), success_post.clone()]
@@ -4993,16 +5000,51 @@ fn tool_result_contexts_preserve_order_and_only_success_may_conclude() {
         [
             (
                 "context-success-call".into(),
-                vec![success_body, success_post],
+                vec![success_body.clone(), success_post.clone()],
                 true,
                 false,
             ),
-            ("context-block-call".into(), vec![blocked_post], false, true,),
+            (
+                "context-block-call".into(),
+                vec![blocked_post.clone()],
+                false,
+                true,
+            ),
         ]
     );
-    assert!(session.inbox().next_step().unwrap().is_empty());
+    let queued = vec![success_body, success_post, blocked_post];
+    assert_eq!(session.inbox().next_step().unwrap(), queued);
+    let events = session.events().unwrap();
+    let last_result = events
+        .iter()
+        .rposition(|event| matches!(&event.kind, SessionEventKind::ToolResult { .. }))
+        .unwrap();
+    let context_splice = events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::AgentInboxSpliced {
+                    target: AgentInboxTarget::NextStep,
+                    inserted,
+                    ..
+                } if inserted == &queued
+            )
+        })
+        .unwrap();
+    assert!(last_result < context_splice);
     assert!(recorded.tool_results_committed());
-    close_logged_turn(&session, turn);
+    session.finish_step(turn, 1).unwrap();
+    let next =
+        prepare_agent_step(&mut ctx, session.id(), AgentInboxTarget::NextStep, turn, 2).unwrap();
+    assert_eq!(
+        next.decision(),
+        &AgentPreStepDecision::Enter {
+            messages: queued,
+            starts_request_series: false,
+        }
+    );
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
 }
 
 #[test]
