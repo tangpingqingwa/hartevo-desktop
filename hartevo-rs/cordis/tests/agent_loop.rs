@@ -18,15 +18,15 @@ use hartevo_cordis::{
     SessionSurfaceIntent, SessionTokenUsage, SessionToolSchema, SurfaceOwner,
     TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition, ToolDispatchExecution,
     ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolExecutionResult,
-    ToolPostExecution, ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step,
-    build_agent_call, commit_agent_stream, commit_agent_tool_results, dispatch_agent_call,
-    dispatch_tool_execution, events, finalize_tool_execution, keys, log_agent_call,
-    post_tool_execution, prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls,
-    prepare_agent_tool_executions, record_agent_stream, register_llm_adapter,
-    register_prompt_section, register_tool, register_tool_concurrency, register_tool_definition,
-    register_tool_guard, register_tool_schema, run_agent_step, run_agent_tool_batch,
-    run_agent_tool_batch_with_limit, run_agent_tool_batch_with_limit_and_cancellation,
-    schedule_agent_tool_calls, session_events,
+    ToolPostExecution, ToolRunContext, ToolsSurface, TurnEndReason, admit_agent_request,
+    admit_agent_step, build_agent_call, commit_agent_stream, commit_agent_tool_results,
+    dispatch_agent_call, dispatch_tool_execution, events, finalize_tool_execution, keys,
+    log_agent_call, post_tool_execution, prepare_agent_call, prepare_agent_step,
+    prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream,
+    register_llm_adapter, register_prompt_section, register_tool, register_tool_concurrency,
+    register_tool_definition, register_tool_guard, register_tool_schema, run_agent_step,
+    run_agent_tool_batch, run_agent_tool_batch_with_limit,
+    run_agent_tool_batch_with_limit_and_cancellation, schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -59,6 +59,17 @@ fn user_message(id: &str, text: &str) -> SessionMessage {
         role: SessionMessageRole::User,
         content: vec![SessionContentBlock::Text { text: text.into() }],
         source: SessionMessageSource::User,
+    }
+}
+
+fn plugin_message(id: &str, plugin: &str, text: &str) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::Text { text: text.into() }],
+        source: SessionMessageSource::Plugin {
+            plugin: plugin.into(),
+        },
     }
 }
 
@@ -4854,6 +4865,191 @@ fn tool_scheduler_mid_pool_cancel_drains_started_calls_and_synthesizes_the_rest(
         ]
     );
     assert!(recorded.tool_results_committed());
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep body, post-policy, and final-result order together.
+fn tool_result_contexts_preserve_order_and_only_success_may_conclude() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(
+        0,
+        "context-success-call",
+        "context-success",
+        "{}",
+    ));
+    chunks.extend(tool_call_chunks(
+        1,
+        "context-block-call",
+        "context-block",
+        "{}",
+    ));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-result-contexts", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    let success_body = plugin_message("context-success-body", "success-body", "body context");
+    let success_post = plugin_message("context-success-post", "success-post", "post context");
+    let blocked_body = plugin_message("context-block-body", "block-body", "discarded context");
+    let blocked_post = plugin_message("context-block-post", "block-post", "blocking context");
+    {
+        let success_body = success_body.clone();
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new_with_run_context(
+                tool_schema("context-success"),
+                move |run: &ToolRunContext| {
+                    assert_eq!(run.call_id(), "context-success-call");
+                    run.defer_context(success_body.clone());
+                    run.conclude_turn();
+                    Ok(json!("success"))
+                },
+            )
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let blocked_body = blocked_body.clone();
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new_with_run_context(
+                tool_schema("context-block"),
+                move |run: &ToolRunContext| {
+                    run.defer_context(blocked_body.clone());
+                    run.conclude_turn();
+                    Ok(json!("blocked"))
+                },
+            )
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let success_post = success_post.clone();
+        let blocked_post = blocked_post.clone();
+        ctx.on_waterfall(
+            events::TOOLS_POST_EXECUTE,
+            move |execution: ToolPostExecution, next| {
+                let call_id = execution.input().call_id().to_string();
+                let execution = next(execution);
+                if call_id == "context-success-call" {
+                    execution
+                        .replace_success(json!("post-success"))
+                        .with_additional_context(success_post.clone())
+                } else {
+                    execution
+                        .block("blocked after body")
+                        .with_additional_context(blocked_post.clone())
+                }
+            },
+        )
+        .unwrap();
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    {
+        let observed = Arc::clone(&observed);
+        ctx.on_emit(events::TOOLS_RESULT, move |result: &ToolExecutionResult| {
+            observed.lock().unwrap().push((
+                result.input().call_id().to_string(),
+                result.additional_contexts().to_vec(),
+                result.concludes_turn(),
+                result.is_error(),
+            ));
+        })
+        .unwrap();
+    }
+
+    let results = run_agent_tool_batch(&mut ctx, &logged, &mut recorded).unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].additional_contexts(),
+        [success_body.clone(), success_post.clone()]
+    );
+    assert!(results[0].concludes_turn());
+    assert!(!results[0].is_error());
+    assert_eq!(
+        results[1].additional_contexts(),
+        std::slice::from_ref(&blocked_post)
+    );
+    assert!(!results[1].concludes_turn());
+    assert!(results[1].is_error());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            (
+                "context-success-call".into(),
+                vec![success_body, success_post],
+                true,
+                false,
+            ),
+            ("context-block-call".into(), vec![blocked_post], false, true,),
+        ]
+    );
+    assert!(session.inbox().next_step().unwrap().is_empty());
+    assert!(recorded.tool_results_committed());
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn malformed_tool_result_context_becomes_a_final_failure_without_replay() {
+    let mut chunks = tool_call_chunks(0, "invalid-context-call", "invalid-context", "{}").to_vec();
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-invalid-context", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let bodies = Arc::new(AtomicUsize::new(0));
+    {
+        let bodies = Arc::clone(&bodies);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new_with_run_context(
+                tool_schema("invalid-context"),
+                move |run: &ToolRunContext| {
+                    bodies.fetch_add(1, Ordering::SeqCst);
+                    run.defer_context(assistant_message("invalid-context-message", "invalid"));
+                    run.conclude_turn();
+                    Ok(json!("value"))
+                },
+            )
+            .with_output_renderer(|_, _| Ok(Vec::new())),
+        )
+        .unwrap();
+    }
+
+    let results = run_agent_tool_batch(&mut ctx, &logged, &mut recorded).unwrap();
+
+    assert_eq!(bodies.load(Ordering::SeqCst), 1);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error());
+    assert!(results[0].additional_contexts().is_empty());
+    assert!(!results[0].concludes_turn());
+    assert!(matches!(
+        results[0].result(),
+        ToolDispatchResult::Failure { message }
+            if message.contains("tool additional context is invalid")
+    ));
+    assert!(session.inbox().next_step().unwrap().is_empty());
+    assert!(run_agent_tool_batch(&mut ctx, &logged, &mut recorded).is_err());
+    assert_eq!(bodies.load(Ordering::SeqCst), 1);
     close_logged_turn(&session, turn);
 }
 
