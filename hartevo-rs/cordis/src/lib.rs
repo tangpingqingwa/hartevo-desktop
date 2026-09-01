@@ -66,7 +66,8 @@ pub use compaction::{
 };
 pub use compaction_automation::{
     COMPACTION_AUTOMATION_KEYS, CompactionAutomation, CompactionAutomationError,
-    ContextOverflowRecovery, compact_before_agent_step, recover_context_overflow,
+    ContextOverflowRecovery, ManualCompactionError, ManualCompactionErrorCode,
+    compact_before_agent_step, compact_now, recover_context_overflow,
 };
 pub use compaction_policy::{
     CHECKPOINT_PREAMBLE, COMPACTION_INSTRUCTION, CompactionMeasurement, CompactionNodeMeasurement,
