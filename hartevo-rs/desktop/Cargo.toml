@@ -11,6 +11,7 @@ base64 = "0.22"
 chrono.workspace = true
 dioxus.workspace = true
 dioxus-icons = "0.1"
+futures-util.workspace = true
 hartevo-application = { path = "../application" }
 hartevo-browser-adapter = { path = "../browser-adapter" }
 hartevo-catalog = { path = "../catalog" }
