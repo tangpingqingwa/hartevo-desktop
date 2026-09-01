@@ -23,8 +23,8 @@ use hartevo_cordis::{
     post_tool_execution, prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls,
     prepare_agent_tool_executions, record_agent_stream, register_llm_adapter,
     register_prompt_section, register_tool, register_tool_concurrency, register_tool_definition,
-    register_tool_guard, register_tool_schema, run_agent_step, schedule_agent_tool_calls,
-    session_events,
+    register_tool_guard, register_tool_schema, run_agent_step, run_agent_tool_batch,
+    schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -4051,6 +4051,229 @@ fn tool_result_commit_rejects_order_drift_and_resumes_an_exact_prefix() {
     );
     let derived = session.derive_messages().unwrap();
     assert_eq!(&derived[derived.len() - 2..], messages);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep execution, denial, observation, and commit order together.
+fn tool_batch_driver_settles_allowed_denied_and_unknown_calls_once_in_model_order() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(0, "batch-allow-call", "batch-allow", "{}"));
+    chunks.extend(tool_call_chunks(1, "batch-deny-call", "batch-deny", "{}"));
+    chunks.extend(tool_call_chunks(
+        2,
+        "batch-unknown-call",
+        "batch-unknown",
+        "{}",
+    ));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-batch-driver", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    {
+        let bodies = Arc::clone(&bodies);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("batch-allow"), move |_| {
+                bodies.lock().unwrap().push("allow-body");
+                Ok(json!("allowed"))
+            })
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    let late_registration = {
+        let bodies = Arc::clone(&bodies);
+        Arc::new(Mutex::new(Some(
+            register_tool_definition(
+                &mut ctx,
+                ToolDefinition::new(tool_schema("batch-unknown"), move |_| {
+                    bodies.lock().unwrap().push("late-body");
+                    Ok(json!("must not run"))
+                })
+                .with_output_renderer(|_, _| Ok(Vec::new())),
+            )
+            .unwrap(),
+        )))
+    };
+    {
+        let bodies = Arc::clone(&bodies);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("batch-deny"), move |_| {
+                bodies.lock().unwrap().push("denied-body");
+                Ok(json!("must not run"))
+            })
+            .with_content_finalizer(|input, result| {
+                assert_eq!(input.call_id(), "batch-deny-call");
+                assert!(result.is_error());
+                Ok(Some(vec![SessionContentBlock::Text {
+                    text: "denial finalized".into(),
+                }]))
+            }),
+        )
+        .unwrap();
+    }
+    ctx.on_waterfall(events::TOOLS_PRE_EXECUTE, |mut call: ToolCall, next| {
+        if call.name == "batch-deny" {
+            call.decision = "deny".into();
+            call.result = "blocked by policy".into();
+            call
+        } else {
+            next(call)
+        }
+    })
+    .unwrap();
+    let post_order = Arc::new(Mutex::new(Vec::new()));
+    {
+        let post_order = Arc::clone(&post_order);
+        ctx.on_waterfall(
+            events::TOOLS_POST_EXECUTE,
+            move |execution: ToolPostExecution, next| {
+                post_order
+                    .lock()
+                    .unwrap()
+                    .push(execution.input().call_id().to_string());
+                next(execution)
+            },
+        )
+        .unwrap();
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    {
+        let observed = Arc::clone(&observed);
+        let late_registration = Arc::clone(&late_registration);
+        ctx.on_emit(events::TOOLS_RESULT, move |result: &ToolExecutionResult| {
+            if result.input().call_id() == "batch-allow-call" {
+                assert!(late_registration.lock().unwrap().take().unwrap().dispose());
+            }
+            observed
+                .lock()
+                .unwrap()
+                .push((result.input().call_id().to_string(), result.is_error()));
+        })
+        .unwrap();
+    }
+
+    let results = run_agent_tool_batch(&mut ctx, &logged, &mut recorded).unwrap();
+
+    assert!(recorded.tool_batch_started());
+    assert!(recorded.tool_results_committed());
+    assert_eq!(*bodies.lock().unwrap(), ["allow-body"]);
+    assert_eq!(
+        *post_order.lock().unwrap(),
+        ["batch-allow-call", "batch-deny-call", "batch-unknown-call"]
+    );
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            ("batch-allow-call".into(), false),
+            ("batch-deny-call".into(), true),
+            ("batch-unknown-call".into(), true),
+        ]
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.input().call_id())
+            .collect::<Vec<_>>(),
+        ["batch-allow-call", "batch-deny-call", "batch-unknown-call"]
+    );
+    assert_eq!(
+        results[1].content(),
+        [SessionContentBlock::Text {
+            text: "denial finalized".into()
+        }]
+    );
+    assert_eq!(
+        results[2].content(),
+        [SessionContentBlock::Text {
+            text: "Error: unknown tool \"batch-unknown\"".into()
+        }]
+    );
+    let durable_order = session
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::ToolResult { message, .. } => match message.source {
+                SessionMessageSource::Tool { call_id } => Some(call_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        durable_order,
+        ["batch-allow-call", "batch-deny-call", "batch-unknown-call"]
+    );
+    let after = session.events().unwrap();
+    assert!(run_agent_tool_batch(&mut ctx, &logged, &mut recorded).is_err());
+    assert_eq!(*bodies.lock().unwrap(), ["allow-body"]);
+    assert_eq!(session.events().unwrap(), after);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tool_batch_driver_never_replays_a_call_with_a_preexisting_durable_result() {
+    let mut chunks = tool_call_chunks(0, "already-result-call", "already-result", "{}").to_vec();
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-batch-preexisting-result", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let body_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("already-result"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("must not replay"))
+            })
+            .with_output_renderer(|_, _| Ok(Vec::new())),
+        )
+        .unwrap();
+    }
+    session
+        .append_tool_result_with_surface(
+            turn,
+            1,
+            SessionMessage {
+                id: "already-result-message".into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::ToolResult {
+                    tool_call_id: "already-result-call".into(),
+                    content: vec![SessionContentBlock::Text {
+                        text: "already durable".into(),
+                    }],
+                    is_error: false,
+                }],
+                source: SessionMessageSource::Tool {
+                    call_id: "already-result-call".into(),
+                },
+            },
+            SessionSurfaceIntent::append_from(vec![recorded.tool_call_seqs()[0]]),
+        )
+        .unwrap();
+    let before = session.events().unwrap();
+
+    assert!(run_agent_tool_batch(&mut ctx, &logged, &mut recorded).is_err());
+    assert!(!recorded.tool_batch_started());
+    assert_eq!(body_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(session.events().unwrap(), before);
     close_logged_turn(&session, turn);
 }
 
