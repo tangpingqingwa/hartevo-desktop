@@ -12,9 +12,10 @@ use crate::service::Service;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionEpochHeader,
     SessionError, SessionFinishReason, SessionHandle, SessionId, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionRequestContext, SessionRequestHeaderReason,
-    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, TurnEndReason,
-    validate_agent_request_config, validate_agent_user_message,
+    SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestContext,
+    SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+    SessionSurfaceIntent, SessionTokenUsage, TurnEndReason, validate_agent_request_config,
+    validate_agent_user_message,
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
@@ -280,15 +281,22 @@ pub enum AgentBuildAdmission {
 }
 
 /// Durable raw-stream outcome retained for downstream block assembly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RecordedAgentStream {
+    session_id: SessionId,
     turn: u64,
     step: u64,
     chunk_seqs: Vec<u64>,
     finish: SessionFinishReason,
+    message_committed: bool,
 }
 
 impl RecordedAgentStream {
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     #[must_use]
     pub const fn turn(&self) -> u64 {
         self.turn
@@ -307,6 +315,43 @@ impl RecordedAgentStream {
     #[must_use]
     pub const fn finish(&self) -> &SessionFinishReason {
         &self.finish
+    }
+
+    #[must_use]
+    pub const fn message_committed(&self) -> bool {
+        self.message_committed
+    }
+}
+
+/// One recorded model attempt after N49's assistant-message boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentStreamCommit {
+    message: Option<SessionMessage>,
+    usage: Option<SessionTokenUsage>,
+    finish: SessionFinishReason,
+    replay_state: Option<SessionReplayEnvelope>,
+}
+
+impl AgentStreamCommit {
+    /// Successful provider attempts commit one message, including an empty one.
+    #[must_use]
+    pub const fn message(&self) -> Option<&SessionMessage> {
+        self.message.as_ref()
+    }
+
+    #[must_use]
+    pub const fn usage(&self) -> Option<&SessionTokenUsage> {
+        self.usage.as_ref()
+    }
+
+    #[must_use]
+    pub const fn finish(&self) -> &SessionFinishReason {
+        &self.finish
+    }
+
+    #[must_use]
+    pub const fn replay_state(&self) -> Option<&SessionReplayEnvelope> {
+        self.replay_state.as_ref()
     }
 }
 
@@ -531,11 +576,198 @@ pub async fn record_agent_stream(
     let finish = grammar.complete()?;
     session.require_open_step(turn, step)?;
     Ok(RecordedAgentStream {
+        session_id,
         turn,
         step,
         chunk_seqs,
         finish,
+        message_committed: false,
     })
+}
+
+/// Assemble one N48-recorded stream and commit its successful assistant message.
+///
+/// The exact durable chunk provenance is replayed and revalidated before any
+/// message append. Error and aborted finishes remain message-less for the
+/// later request-error/retry boundary, and the open step is never closed here.
+pub fn commit_agent_stream(
+    ctx: &Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+) -> Result<AgentStreamCommit, CordisError> {
+    let request = logged.call().request();
+    let session_id = SessionId::new(request.agent().id.clone())?;
+    let turn = request.turn();
+    let step = request.step();
+    if recorded.session_id != session_id || recorded.turn != turn || recorded.step != step {
+        return Err(invalid_stream_protocol(
+            "recorded session, turn, and step to match the logged call",
+        )
+        .into());
+    }
+    if recorded.message_committed {
+        return Err(
+            invalid_stream_protocol("one assistant-message commit per recorded stream").into(),
+        );
+    }
+
+    let session = agent_session(ctx, &session_id)?;
+    session.require_open_step(turn, step)?;
+    let available = session.assistant_chunks(turn, step)?;
+    let mut search_from = 0_usize;
+    let mut chunks = Vec::with_capacity(recorded.chunk_seqs.len());
+    for expected_seq in &recorded.chunk_seqs {
+        let Some(offset) = available[search_from..]
+            .iter()
+            .position(|record| record.seq == *expected_seq)
+        else {
+            return Err(invalid_stream_protocol(
+                "every recorded sequence to resolve to its durable assistant chunk in order",
+            )
+            .into());
+        };
+        let index = search_from + offset;
+        chunks.push(available[index].chunk.clone());
+        search_from = index + 1;
+    }
+
+    let mut grammar = AgentStreamGrammar::default();
+    let mut assembler = AgentBlockAssembler::default();
+    for chunk in &chunks {
+        grammar.accept(chunk)?;
+        assembler.push(chunk);
+    }
+    let finish = grammar.complete()?;
+    if finish != recorded.finish {
+        return Err(invalid_stream_protocol(
+            "the durable terminal finish to match the recorded outcome",
+        )
+        .into());
+    }
+    let usage = assembler.usage.clone();
+
+    if matches!(
+        finish,
+        SessionFinishReason::Error { .. } | SessionFinishReason::Aborted { .. }
+    ) {
+        return Ok(AgentStreamCommit {
+            message: None,
+            usage,
+            finish,
+            replay_state: None,
+        });
+    }
+
+    let (content, replay_state) = assembler.assemble_success(&finish)?;
+    let finish_seq = recorded.chunk_seqs.last().copied().ok_or_else(|| {
+        invalid_stream_protocol("a durable terminal finish sequence before message commit")
+    })?;
+    let message = SessionMessage {
+        id: format!(
+            "{}:turn:{turn}:step:{step}:assistant:{finish_seq}",
+            request.agent().id
+        ),
+        role: SessionMessageRole::Assistant,
+        content,
+        source: SessionMessageSource::Model {
+            provider: logged.call().config().provider.clone(),
+            model: logged.call().config().model.clone(),
+        },
+    };
+    session.append_assistant_message_with_surface(
+        turn,
+        step,
+        message.clone(),
+        SessionSurfaceIntent::append_from(recorded.chunk_seqs.clone()),
+    )?;
+    recorded.message_committed = true;
+    Ok(AgentStreamCommit {
+        message: Some(message),
+        usage,
+        finish,
+        replay_state,
+    })
+}
+
+#[derive(Default)]
+struct AgentBlockAssembler {
+    order: Vec<u64>,
+    blocks: HashMap<u64, Option<SessionContentBlock>>,
+    usage: Option<SessionTokenUsage>,
+    replay_state: Option<SessionReplayEnvelope>,
+}
+
+impl AgentBlockAssembler {
+    fn push(&mut self, chunk: &SessionStreamChunk) {
+        match chunk {
+            SessionStreamChunk::BlockStart { index, .. } => {
+                if !self.blocks.contains_key(index) {
+                    self.order.push(*index);
+                    self.blocks.insert(*index, None);
+                }
+            }
+            SessionStreamChunk::BlockEnd { index, block } => {
+                if let Some(slot) = self.blocks.get_mut(index)
+                    && slot.is_none()
+                {
+                    *slot = Some(block.clone());
+                }
+            }
+            SessionStreamChunk::Usage { usage } => self.usage = Some(usage.clone()),
+            SessionStreamChunk::Finish { replay_state, .. } => {
+                self.replay_state.clone_from(replay_state);
+            }
+            SessionStreamChunk::TextDelta { .. }
+            | SessionStreamChunk::ReasoningDelta { .. }
+            | SessionStreamChunk::ToolCallDelta { .. } => {}
+        }
+    }
+
+    fn assemble_success(
+        self,
+        finish: &SessionFinishReason,
+    ) -> Result<(Vec<SessionContentBlock>, Option<SessionReplayEnvelope>), LlmError> {
+        let mut all = Vec::with_capacity(self.order.len());
+        for index in self.order {
+            let Some(Some(block)) = self.blocks.get(&index) else {
+                return Err(invalid_stream_protocol(
+                    "every successful assembled block to have one authoritative close",
+                ));
+            };
+            all.push(block.clone());
+        }
+        let kept = all
+            .iter()
+            .map(|block| {
+                !matches!(finish, SessionFinishReason::MaxTokens)
+                    || !matches!(block, SessionContentBlock::ToolCall { .. })
+            })
+            .collect::<Vec<_>>();
+        let content = all
+            .iter()
+            .zip(&kept)
+            .filter(|(_, keep)| **keep)
+            .map(|(block, _)| block.clone())
+            .collect::<Vec<_>>();
+        let replay_state = match self.replay_state {
+            None => None,
+            Some(envelope) => match envelope.blocks {
+                None => Some(envelope),
+                Some(blocks) if blocks.len() == all.len() => Some(SessionReplayEnvelope {
+                    response: envelope.response,
+                    blocks: Some(
+                        blocks
+                            .into_iter()
+                            .zip(kept)
+                            .filter_map(|(block, keep)| keep.then_some(block))
+                            .collect(),
+                    ),
+                }),
+                Some(_) => None,
+            },
+        };
+        Ok((content, replay_state))
+    }
 }
 
 const MAX_SAFE_STREAM_INDEX: u64 = 9_007_199_254_740_991;

@@ -13,12 +13,13 @@ use hartevo_cordis::{
     LoggedAgentCall, PromptError, PromptSection, RecordedAgentStream, RuntimeSurface,
     SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind, SessionFinishReason,
     SessionHandle, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage, SessionToolSchema, SurfaceOwner,
-    ToolCall, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
-    dispatch_agent_call, events, keys, log_agent_call, prepare_agent_call, prepare_agent_step,
-    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool_schema,
-    run_agent_step, session_events,
+    SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
+    SessionToolSchema, SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request,
+    admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call, events, keys,
+    log_agent_call, prepare_agent_call, prepare_agent_step, record_agent_stream,
+    register_llm_adapter, register_prompt_section, register_tool_schema, run_agent_step,
+    session_events,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -200,6 +201,48 @@ fn record_script(
     (session, turn, result)
 }
 
+fn recorded_script(
+    session_id: &str,
+    chunks: Vec<SessionStreamChunk>,
+) -> (
+    Context,
+    SessionHandle,
+    u64,
+    LoggedAgentCall,
+    RecordedAgentStream,
+) {
+    recorded_items_script(session_id, ok_chunks(chunks))
+}
+
+fn recorded_items_script(
+    session_id: &str,
+    items: Vec<Result<SessionStreamChunk, SessionLlmFailure>>,
+) -> (
+    Context,
+    SessionHandle,
+    u64,
+    LoggedAgentCall,
+    RecordedAgentStream,
+) {
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], ScriptedAgentAdapter { items }).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new(session_id).unwrap())
+        .unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+    let (turn, logged) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "request",
+        call_config("mock", "model"),
+    );
+    let recorded = ready_record_agent_stream(&mut ctx, &logged).unwrap();
+    (ctx, session, turn, logged, recorded)
+}
+
 fn ok_chunks(
     chunks: Vec<SessionStreamChunk>,
 ) -> Vec<Result<SessionStreamChunk, SessionLlmFailure>> {
@@ -208,14 +251,30 @@ fn ok_chunks(
 
 fn usage() -> SessionStreamChunk {
     SessionStreamChunk::Usage {
-        usage: SessionTokenUsage {
-            input_tokens: 2,
-            output_tokens: 3,
-            total_tokens: Some(5),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            reasoning_tokens: Some(1),
-        },
+        usage: token_usage(),
+    }
+}
+
+fn token_usage() -> SessionTokenUsage {
+    SessionTokenUsage {
+        input_tokens: 2,
+        output_tokens: 3,
+        total_tokens: Some(5),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: Some(1),
+    }
+}
+
+fn replay_state(response_id: &str, blocks: &[&str]) -> SessionReplayEnvelope {
+    SessionReplayEnvelope {
+        response: serde_json::json!({ "responseId": response_id }),
+        blocks: Some(
+            blocks
+                .iter()
+                .map(|block| serde_json::json!(block))
+                .collect(),
+        ),
     }
 }
 
@@ -1638,6 +1697,7 @@ fn recorded_agent_stream_validates_and_persists_exact_chunk_order() {
 
     assert_eq!(recorded.turn(), turn);
     assert_eq!(recorded.step(), 1);
+    assert_eq!(recorded.session_id(), session.id());
     assert_eq!(recorded.finish(), &SessionFinishReason::ToolCalls);
     assert_eq!(
         recorded.chunk_seqs(),
@@ -1878,6 +1938,315 @@ fn recorded_agent_stream_rejects_invalid_terminal_grammar_before_append() {
         ],
         "no chunks after one terminal finish",
         1,
+    );
+}
+
+#[test]
+fn committed_agent_stream_assembles_authoritative_blocks_and_exact_provenance() {
+    let replay = replay_state("response-1", &["reasoning", "text", "tool"]);
+    let chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 9,
+            block_type: SessionStreamBlockType::Reasoning,
+        },
+        SessionStreamChunk::BlockStart {
+            index: 2,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::ReasoningDelta {
+            index: 9,
+            text: "draft plan".into(),
+        },
+        SessionStreamChunk::TextDelta {
+            index: 2,
+            text: "draft answer".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 2,
+            block: SessionContentBlock::Text {
+                text: "authoritative answer".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 7,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::ToolCallDelta {
+            index: 7,
+            id: "call-7".into(),
+            name: Some("search".into()),
+            arguments_delta: "{\"q\":\"rust\"}".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 7,
+            block: SessionContentBlock::ToolCall {
+                id: "call-7".into(),
+                name: "search".into(),
+                arguments: "{\"q\":\"rust\"}".into(),
+            },
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 9,
+            block: SessionContentBlock::Reasoning {
+                text: "authoritative plan".into(),
+            },
+        },
+        usage(),
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::ToolCalls,
+            replay_state: Some(replay.clone()),
+        },
+    ];
+    let (ctx, session, turn, logged, mut recorded) = recorded_script("commit-assembled", chunks);
+    let source_seqs = recorded.chunk_seqs().to_vec();
+
+    let committed = commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    let message = committed.message().expect("successful finish commits");
+
+    assert_eq!(
+        message.content,
+        [
+            SessionContentBlock::Reasoning {
+                text: "authoritative plan".into(),
+            },
+            SessionContentBlock::Text {
+                text: "authoritative answer".into(),
+            },
+            SessionContentBlock::ToolCall {
+                id: "call-7".into(),
+                name: "search".into(),
+                arguments: "{\"q\":\"rust\"}".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        message.source,
+        SessionMessageSource::Model {
+            provider: "mock".into(),
+            model: "model".into(),
+        }
+    );
+    assert_eq!(committed.finish(), &SessionFinishReason::ToolCalls);
+    assert_eq!(committed.replay_state(), Some(&replay));
+    assert_eq!(committed.usage(), Some(&token_usage()));
+    assert!(recorded.message_committed());
+    let events = session.events().unwrap();
+    let SessionEventKind::AssistantMessage {
+        message: durable,
+        surface,
+        ..
+    } = &events.last().expect("assistant event").kind
+    else {
+        panic!("last event must be the committed assistant message");
+    };
+    assert_eq!(durable, message);
+    assert_eq!(surface, &SessionSurfaceIntent::append_from(source_seqs));
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn max_token_commit_drops_tool_calls_and_prunes_replay_in_lockstep() {
+    let replay = replay_state("max-1", &["text-meta", "tool-meta", "reasoning-meta"]);
+    let chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Text {
+                text: "partial".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 1,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 1,
+            block: SessionContentBlock::ToolCall {
+                id: "call-1".into(),
+                name: "unsafe".into(),
+                arguments: "{\"open\":".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 2,
+            block_type: SessionStreamBlockType::Reasoning,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 2,
+            block: SessionContentBlock::Reasoning {
+                text: "tail".into(),
+            },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::MaxTokens,
+            replay_state: Some(replay),
+        },
+    ];
+    let (ctx, session, turn, logged, mut recorded) = recorded_script("commit-max", chunks);
+
+    let committed = commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+
+    assert_eq!(
+        committed.message().unwrap().content,
+        [
+            SessionContentBlock::Text {
+                text: "partial".into(),
+            },
+            SessionContentBlock::Reasoning {
+                text: "tail".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        committed.replay_state(),
+        Some(&replay_state("max-1", &["text-meta", "reasoning-meta"]))
+    );
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn empty_success_commits_once_and_stays_out_of_derived_history() {
+    let chunks = vec![SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Stop,
+        replay_state: None,
+    }];
+    let (ctx, session, turn, logged, mut recorded) = recorded_script("commit-empty", chunks);
+    let source_seqs = recorded.chunk_seqs().to_vec();
+
+    let committed = commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+
+    assert_eq!(committed.message().unwrap().content, []);
+    assert!(
+        session
+            .derive_messages()
+            .unwrap()
+            .iter()
+            .all(|message| message.id != committed.message().unwrap().id)
+    );
+    let before_repeat = session.events().unwrap();
+    assert_eq!(
+        commit_agent_stream(&ctx, &logged, &mut recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "one assistant-message commit per recorded stream",
+        }))
+    );
+    assert_eq!(session.events().unwrap(), before_repeat);
+    let SessionEventKind::AssistantMessage { surface, .. } =
+        &before_repeat.last().expect("assistant event").kind
+    else {
+        panic!("empty successful content still owns a durable assistant event");
+    };
+    assert_eq!(surface, &SessionSurfaceIntent::append_from(source_seqs));
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn failed_stream_returns_usage_without_fabricating_an_assistant_message() {
+    let failure = SessionLlmFailure {
+        message: "upstream unavailable".into(),
+        code: "UPSTREAM".into(),
+        status: Some(503),
+        provider_retry_after_ms: Some(50),
+        request_id: Some("request-failed".into()),
+    };
+    let items = vec![
+        Ok(SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        }),
+        Ok(SessionStreamChunk::TextDelta {
+            index: 0,
+            text: "partial".into(),
+        }),
+        Ok(usage()),
+        Err(failure.clone()),
+    ];
+    let (ctx, session, turn, logged, mut recorded) = recorded_items_script("commit-failure", items);
+
+    let committed = commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+
+    assert!(committed.message().is_none());
+    assert_eq!(committed.finish(), &SessionFinishReason::Error { failure });
+    assert!(committed.usage().is_some());
+    assert!(!recorded.message_committed());
+    assert!(
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+    );
+    session.finish_step(turn, 1).unwrap();
+    session.finish_turn(turn, TurnEndReason::Error).unwrap();
+}
+
+#[test]
+fn commit_omits_misaligned_replay_and_rejects_foreign_recorded_sequences() {
+    let chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Text { text: "one".into() },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 1,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 1,
+            block: SessionContentBlock::Text { text: "two".into() },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            replay_state: Some(replay_state("misaligned", &["only-one"])),
+        },
+    ];
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("commit-replay-mismatch", chunks);
+    let committed = commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    assert!(committed.replay_state().is_none());
+    assert_eq!(committed.message().unwrap().content.len(), 2);
+    close_logged_turn(&session, turn);
+
+    let foreign = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("commit-foreign").unwrap())
+        .unwrap();
+    let mut foreign_state = AgentRequestLogState::new(foreign.id().clone());
+    let (_foreign_turn, foreign_logged) = build_logged_turn(
+        &mut ctx,
+        &foreign,
+        &mut foreign_state,
+        "foreign-request",
+        call_config("mock", "model"),
+    );
+    let mut source_recorded = recorded_script(
+        "commit-source",
+        vec![SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            replay_state: None,
+        }],
+    )
+    .4;
+    assert_eq!(
+        commit_agent_stream(&ctx, &foreign_logged, &mut source_recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "recorded session, turn, and step to match the logged call",
+        }))
+    );
+    assert!(
+        foreign
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
     );
 }
 
