@@ -34,8 +34,8 @@ mod surface;
 pub use agent::{
     AGENT_LOOP_KEYS, AgentBuildAdmission, AgentCallAdmission, AgentLoop, AgentRequestAdmission,
     AgentRequestLogState, AgentStep, AgentStepResult, LoggedAgentCall, PreparedAgentCall,
-    PreparedAgentRequest, admit_agent_request, admit_agent_step, build_agent_call, log_agent_call,
-    prepare_agent_call, prepare_agent_step, run_agent_step,
+    PreparedAgentRequest, admit_agent_request, admit_agent_step, build_agent_call,
+    dispatch_agent_call, log_agent_call, prepare_agent_call, prepare_agent_step, run_agent_step,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
@@ -103,10 +103,11 @@ pub use session::{
 };
 pub use surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DesktopSurface,
-    DomainSurface, EffectBrokerSurface, LlmAdapter, LlmError, LlmModelReasoning, LlmResolvedModel,
-    LlmStream, LlmSurface, MAPPED_KEYS, PreparedLlmCall, PromptAssembly, PromptError,
-    PromptSection, RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolCall, ToolsSurface,
-    assemble_system_prompt, events, expected_mode, prepare_llm_call, register_agent,
-    register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
-    register_tool_schema, run_tools_pipeline, stream_llm,
+    DomainSurface, EffectBrokerSurface, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
+    LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LlmSurface, MAPPED_KEYS,
+    PreparedLlmCall, PromptAssembly, PromptError, PromptSection, RuntimeSurface, SurfaceOwner,
+    SystemPromptSurface, ToolCall, ToolsSurface, assemble_system_prompt, events, expected_mode,
+    prepare_llm_call, register_agent, register_llm_adapter, register_llm_stream,
+    register_prompt_section, register_tool, register_tool_schema, run_tools_pipeline, stream_llm,
+    stream_llm_request, stream_prepared_llm,
 };

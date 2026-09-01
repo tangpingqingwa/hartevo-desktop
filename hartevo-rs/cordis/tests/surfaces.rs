@@ -1,15 +1,19 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 
 use hartevo_cordis::{
     AgentRef, Context, CordisError, CordisHost, DispatchMode, DomainSurface, EffectBrokerSurface,
-    Emit, EnvironmentOverlay, EventKey, LlmError, LlmModelReasoning, LlmResolvedModel, LlmStream,
-    LoaderContext, MAPPED_KEYS, PluginId, PromptAssembly, PromptError, PromptSection,
-    RuntimeSurface, SessionCallConfig, SessionToolSchema, SurfaceOwner, SystemPromptSurface,
-    ToolCall, ToolsSurface, Waterfall, assemble_system_prompt, events, expected_mode, keys,
-    prepare_llm_call, register_agent, register_llm_adapter, register_llm_stream,
-    register_prompt_section, register_tool, register_tool_schema, run_tools_pipeline,
-    session_events, stream_llm,
+    Emit, EnvironmentOverlay, EventKey, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
+    LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext, MAPPED_KEYS,
+    PluginId, PromptAssembly, PromptError, PromptSection, RuntimeSurface, SessionCallConfig,
+    SessionContentBlock, SessionFinishReason, SessionId, SessionLlmFailure, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionStreamBlockType, SessionStreamChunk,
+    SessionToolSchema, SurfaceOwner, SystemPromptSurface, ToolCall, ToolsSurface, Waterfall,
+    assemble_system_prompt, events, expected_mode, keys, prepare_llm_call, register_agent,
+    register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
+    register_tool_schema, run_tools_pipeline, session_events, stream_llm, stream_llm_request,
+    stream_prepared_llm,
 };
 
 fn mapped() -> Context {
@@ -25,6 +29,53 @@ fn call_config(provider: &str, model: &str) -> SessionCallConfig {
         temperature: None,
         max_tokens: None,
         stop: None,
+    }
+}
+
+fn request_message(id: &str, text: &str) -> SessionMessage {
+    SessionMessage {
+        id: id.into(),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::Text { text: text.into() }],
+        source: SessionMessageSource::User,
+    }
+}
+
+fn ready_chunks(mut stream: LlmChunkStream) -> Vec<SessionStreamChunk> {
+    let waker = futures_util::task::noop_waker_ref();
+    let mut cx = TaskContext::from_waker(waker);
+    let mut chunks = Vec::new();
+    loop {
+        match stream.as_mut().poll_next(&mut cx) {
+            Poll::Ready(Some(chunk)) => chunks.push(chunk),
+            Poll::Ready(None) => return chunks,
+            Poll::Pending => panic!("test adapter streams must be immediately ready"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TestStreamingAdapter {
+    generation: &'static str,
+    seen: Arc<Mutex<Vec<(&'static str, LlmGenerateRequest)>>>,
+    setup_failure: Option<SessionLlmFailure>,
+    items: Vec<Result<SessionStreamChunk, SessionLlmFailure>>,
+}
+
+impl LlmAdapter for TestStreamingAdapter {
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        Ok(LlmResolvedModel::new(provider, model))
+    }
+
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((self.generation, request));
+        if let Some(failure) = &self.setup_failure {
+            return Err(failure.clone());
+        }
+        Ok(Box::pin(futures_util::stream::iter(self.items.clone())))
     }
 }
 
@@ -448,6 +499,286 @@ fn llm_adapter_preparation_validates_metadata_and_materializes_only_defaults() {
     assert!(matches!(
         prepare_llm_call(&ctx, &call_config("invalid", "model")),
         Err(CordisError::Llm(LlmError::InvalidModelInfo { .. }))
+    ));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture proves generation binding, one-shot use, and mismatch non-consumption"
+)]
+fn prepared_stream_is_exact_generation_one_shot_and_request_bound() {
+    let mut ctx = mapped();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let old = register_llm_adapter(
+        &mut ctx,
+        ["mock"],
+        TestStreamingAdapter {
+            generation: "old",
+            seen: Arc::clone(&seen),
+            setup_failure: None,
+            items: vec![Ok(SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                replay_state: None,
+            })],
+        },
+    )
+    .unwrap();
+    let prepared = prepare_llm_call(&ctx, &call_config("mock", "model")).unwrap();
+    assert!(old.dispose());
+    register_llm_adapter(
+        &mut ctx,
+        ["mock"],
+        TestStreamingAdapter {
+            generation: "new",
+            seen: Arc::clone(&seen),
+            setup_failure: None,
+            items: vec![Ok(SessionStreamChunk::Finish {
+                reason: SessionFinishReason::MaxTokens,
+                replay_state: None,
+            })],
+        },
+    )
+    .unwrap();
+
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let wrapped = Arc::new(AtomicUsize::new(0));
+    let middleware = {
+        let order = Arc::clone(&order);
+        let seen = Arc::clone(&seen);
+        let wrapped = Arc::clone(&wrapped);
+        ctx.on_waterfall(events::LLM_STREAM, move |stream, next| {
+            let request = stream.request().expect("generated request");
+            assert_eq!(request.config().provider, "mock");
+            assert_eq!(request.system(), Some("Be precise."));
+            assert_eq!(
+                request.session_id().map(SessionId::as_str),
+                Some("session-1")
+            );
+            assert!(seen.lock().expect("seen").is_empty());
+            order.lock().expect("order").push("waterfall");
+            let wrapped = Arc::clone(&wrapped);
+            next(stream)
+                .map_chunk_stream(move |source| {
+                    wrapped.fetch_add(1, Ordering::SeqCst);
+                    source
+                })
+                .expect("downstream stream")
+        })
+        .unwrap()
+    };
+    let request = LlmGenerateRequest::new(
+        prepared.config().clone(),
+        vec![request_message("message-1", "hello")],
+    )
+    .with_system(Some("Be precise.".into()))
+    .with_tools(vec![tool_schema("search")])
+    .with_session_id(SessionId::new("session-1").unwrap());
+    let chunks = ready_chunks(stream_prepared_llm(&mut ctx, &prepared, request.clone()).unwrap());
+    assert_eq!(
+        chunks,
+        [SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            replay_state: None,
+        }]
+    );
+    assert_eq!(*order.lock().expect("order"), ["waterfall"]);
+    assert_eq!(wrapped.load(Ordering::SeqCst), 1);
+    let calls = seen.lock().expect("seen");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "old");
+    assert_eq!(calls[0].1, request);
+    drop(calls);
+
+    let error = stream_prepared_llm(&mut ctx, &prepared, request)
+        .err()
+        .expect("prepared call must reject reuse");
+    assert_eq!(
+        error,
+        CordisError::Llm(LlmError::InvalidPreparedCall {
+            expected: "one dispatch only",
+        })
+    );
+    assert_eq!(*order.lock().expect("order"), ["waterfall"]);
+    assert!(middleware.dispose());
+
+    let current = prepare_llm_call(&ctx, &call_config("mock", "model")).unwrap();
+    let mut mismatched = current.config().clone();
+    mismatched.max_tokens = Some(7);
+    let error = stream_prepared_llm(
+        &mut ctx,
+        &current,
+        LlmGenerateRequest::new(mismatched, Vec::new()),
+    )
+    .err()
+    .expect("config mismatch must fail");
+    assert!(matches!(
+        error,
+        CordisError::Llm(ref llm) if llm.code() == "INVALID_PREPARED_CALL"
+    ));
+    let chunks = ready_chunks(
+        stream_prepared_llm(
+            &mut ctx,
+            &current,
+            LlmGenerateRequest::new(current.config().clone(), Vec::new()),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        chunks.as_slice(),
+        [SessionStreamChunk::Finish {
+            reason: SessionFinishReason::MaxTokens,
+            ..
+        }]
+    ));
+    assert_eq!(seen.lock().expect("seen").last().unwrap().0, "new");
+}
+
+#[test]
+fn llm_stream_middleware_can_serve_no_adapter_but_cannot_replace_request() {
+    let mut served = mapped();
+    served
+        .on_waterfall(events::LLM_STREAM, |stream, _next| {
+            assert_eq!(
+                stream
+                    .request()
+                    .unwrap()
+                    .session_id()
+                    .map(SessionId::as_str),
+                Some("fallback-session")
+            );
+            stream.with_chunk_stream(Box::pin(futures_util::stream::iter([
+                SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                },
+            ])))
+        })
+        .unwrap();
+    let request = LlmGenerateRequest::new(call_config("middleware", "model"), Vec::new())
+        .with_session_id(SessionId::new("fallback-session").unwrap());
+    assert!(matches!(
+        ready_chunks(stream_llm_request(&mut served, request).unwrap()).as_slice(),
+        [SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            ..
+        }]
+    ));
+
+    let mut missing = mapped();
+    let chunks = ready_chunks(
+        stream_llm_request(
+            &mut missing,
+            LlmGenerateRequest::new(call_config("missing", "model"), Vec::new()),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        chunks.as_slice(),
+        [SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Error { failure },
+            ..
+        }] if failure.code == "NO_ADAPTER"
+    ));
+
+    let mut replaced = mapped();
+    replaced
+        .on_waterfall(events::LLM_STREAM, |_stream, _next| {
+            LlmStream::new("other", "lost request")
+                .with_chunk_stream(Box::pin(futures_util::stream::empty()))
+        })
+        .unwrap();
+    let error = stream_llm_request(
+        &mut replaced,
+        LlmGenerateRequest::new(call_config("missing", "model"), Vec::new()),
+    )
+    .err()
+    .expect("middleware must retain the generated request");
+    assert!(matches!(
+        error,
+        CordisError::Llm(ref llm) if llm.code() == "INVALID_STREAM_DISPATCH"
+    ));
+}
+
+#[test]
+fn adapter_setup_and_iteration_failures_become_one_terminal_chunk() {
+    let mut ctx = mapped();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let aborted = SessionLlmFailure {
+        message: "cancelled".into(),
+        code: "ABORTED".into(),
+        status: None,
+        provider_retry_after_ms: None,
+        request_id: None,
+    };
+    register_llm_adapter(
+        &mut ctx,
+        ["iterate"],
+        TestStreamingAdapter {
+            generation: "iterate",
+            seen: Arc::clone(&seen),
+            setup_failure: None,
+            items: vec![
+                Ok(SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                }),
+                Err(aborted.clone()),
+                Ok(SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                }),
+            ],
+        },
+    )
+    .unwrap();
+    register_llm_adapter(
+        &mut ctx,
+        ["setup"],
+        TestStreamingAdapter {
+            generation: "setup",
+            seen,
+            setup_failure: Some(SessionLlmFailure {
+                message: "offline".into(),
+                code: "NETWORK".into(),
+                status: Some(503),
+                provider_retry_after_ms: None,
+                request_id: None,
+            }),
+            items: Vec::new(),
+        },
+    )
+    .unwrap();
+
+    let iterate = ready_chunks(
+        stream_llm_request(
+            &mut ctx,
+            LlmGenerateRequest::new(call_config("iterate", "model"), Vec::new()),
+        )
+        .unwrap(),
+    );
+    assert_eq!(iterate.len(), 2);
+    assert!(matches!(
+        &iterate[1],
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Aborted { failure },
+            ..
+        } if failure == &aborted
+    ));
+
+    let setup = ready_chunks(
+        stream_llm_request(
+            &mut ctx,
+            LlmGenerateRequest::new(call_config("setup", "model"), Vec::new()),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        setup.as_slice(),
+        [SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Error { failure },
+            ..
+        }] if failure.code == "NETWORK" && failure.status == Some(503)
     ));
 }
 
