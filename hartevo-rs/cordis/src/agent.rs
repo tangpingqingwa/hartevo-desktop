@@ -806,6 +806,13 @@ async fn drive_agent_turn(
         let step_result = run_agent_turn_step(ctx, &logged, cancellation).await;
         session.finish_step(turn, step)?;
         let step_end = step_result?;
+        if let Some(reason @ TurnEndReason::Aborted(_)) = step_end {
+            return Ok(AgentTurnOutcome {
+                turn,
+                steps,
+                reason,
+            });
+        }
         if !matches!(turn_end, Some(TurnEndReason::MaxTokens)) {
             turn_end = step_end;
         }

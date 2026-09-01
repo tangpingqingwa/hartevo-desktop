@@ -650,6 +650,74 @@ fn stopping_steering_runs_before_close_and_max_tokens_stays_sticky() {
 }
 
 #[test]
+fn provider_abort_is_terminal_and_skips_stopping_steering() {
+    let mut ctx = mapped();
+    let failure = SessionLlmFailure {
+        message: "provider cancelled".into(),
+        code: "PROVIDER_ABORTED".into(),
+        status: None,
+        provider_retry_after_ms: None,
+        request_id: Some("request-aborted-63".into()),
+    };
+    let (adapter, seen) = sequenced_adapter(vec![vec![SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Aborted { failure },
+        replay_state: None,
+    }]]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-provider-aborted").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("aborted-input", "run"))
+        .unwrap();
+    let stops = Arc::new(AtomicUsize::new(0));
+    {
+        let stops = Arc::clone(&stops);
+        let session = session.clone();
+        ctx.on_serial(
+            events::AGENT_TURN_STOPPING,
+            move |_: Arc<AgentTurnStopping>| {
+                stops.fetch_add(1, Ordering::SeqCst);
+                session
+                    .inbox()
+                    .append_next_step(plugin_message(
+                        "invalid-abort-steering",
+                        "stopping-hook",
+                        "must not run",
+                    ))
+                    .unwrap();
+                std::future::ready(Ok::<_, std::convert::Infallible>(BailOutcome::Continue(
+                    NonBail::Undefined,
+                )))
+            },
+        )
+        .unwrap();
+    }
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .expect("scripted abort is immediately ready")
+    .unwrap();
+
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::Legacy)
+    );
+    assert_eq!(stops.load(Ordering::SeqCst), 0);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(session.inbox().next_step().unwrap().is_empty());
+}
+
+#[test]
 fn rejected_and_pre_cancelled_turns_close_without_a_step() {
     let mut rejected_ctx = mapped();
     rejected_ctx
