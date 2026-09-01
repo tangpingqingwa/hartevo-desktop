@@ -1,16 +1,20 @@
 //! Cordis-hosted agent loop. OpenInterpreter is an optional runtime plugin,
 //! never the loop and never the owner of Domain or Effect.
 
+use std::collections::HashMap;
+
+use futures_util::StreamExt;
+
 use crate::context::{Context, CordisError, keys};
 use crate::inbox::AgentInboxTarget;
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionEpochHeader,
-    SessionError, SessionHandle, SessionId, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionRequestContext, SessionRequestHeaderReason, SessionStore,
-    SessionSurfaceIntent, TurnEndReason, validate_agent_request_config,
-    validate_agent_user_message,
+    SessionError, SessionFinishReason, SessionHandle, SessionId, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionRequestContext, SessionRequestHeaderReason,
+    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, TurnEndReason,
+    validate_agent_request_config, validate_agent_user_message,
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
@@ -275,6 +279,37 @@ pub enum AgentBuildAdmission {
     Call(LoggedAgentCall),
 }
 
+/// Durable raw-stream outcome retained for downstream block assembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedAgentStream {
+    turn: u64,
+    step: u64,
+    chunk_seqs: Vec<u64>,
+    finish: SessionFinishReason,
+}
+
+impl RecordedAgentStream {
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        self.step
+    }
+
+    #[must_use]
+    pub fn chunk_seqs(&self) -> &[u64] {
+        &self.chunk_seqs
+    }
+
+    #[must_use]
+    pub const fn finish(&self) -> &SessionFinishReason {
+        &self.finish
+    }
+}
+
 /// Claim the exact inbox batch, then run the authoritative pre-step waterfall.
 ///
 /// This boundary intentionally returns before `step/start`; the future driver
@@ -468,6 +503,147 @@ pub fn dispatch_agent_call(
         Some(prepared) => stream_prepared_llm(ctx, prepared, generated),
         None => stream_llm_request(ctx, generated),
     }
+}
+
+/// Dispatch and durably record one provider-neutral stream in exact order.
+///
+/// Each chunk is checked against the pinned Harness grammar before it is
+/// appended. An invalid item is never written, while any already-committed
+/// prefix remains durable and available for replay or recovery.
+pub async fn record_agent_stream(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+) -> Result<RecordedAgentStream, CordisError> {
+    let request = logged.call().request();
+    let session_id = SessionId::new(request.agent().id.clone())?;
+    let turn = request.turn();
+    let step = request.step();
+    let mut stream = dispatch_agent_call(ctx, logged)?;
+    let session = agent_session(ctx, &session_id)?;
+    let mut grammar = AgentStreamGrammar::default();
+    let mut chunk_seqs = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        grammar.accept(&chunk)?;
+        chunk_seqs.push(session.append_assistant_chunk(turn, step, chunk)?);
+    }
+
+    let finish = grammar.complete()?;
+    session.require_open_step(turn, step)?;
+    Ok(RecordedAgentStream {
+        turn,
+        step,
+        chunk_seqs,
+        finish,
+    })
+}
+
+const MAX_SAFE_STREAM_INDEX: u64 = 9_007_199_254_740_991;
+
+#[derive(Default)]
+struct AgentStreamGrammar {
+    open: HashMap<u64, SessionStreamBlockType>,
+    usage_seen: bool,
+    finish: Option<SessionFinishReason>,
+}
+
+impl AgentStreamGrammar {
+    fn accept(&mut self, chunk: &SessionStreamChunk) -> Result<(), LlmError> {
+        if self.finish.is_some() {
+            return Err(invalid_stream_protocol(
+                "no chunks after one terminal finish",
+            ));
+        }
+        match chunk {
+            SessionStreamChunk::BlockStart { index, block_type } => {
+                validate_stream_index(*index)?;
+                if self.open.contains_key(index) {
+                    return Err(invalid_stream_protocol("one open block per index"));
+                }
+                self.open.insert(*index, *block_type);
+            }
+            SessionStreamChunk::TextDelta { index, .. } => {
+                self.validate_delta(*index, SessionStreamBlockType::Text)?;
+            }
+            SessionStreamChunk::ReasoningDelta { index, .. } => {
+                self.validate_delta(*index, SessionStreamBlockType::Reasoning)?;
+            }
+            SessionStreamChunk::ToolCallDelta { index, .. } => {
+                self.validate_delta(*index, SessionStreamBlockType::ToolCall)?;
+            }
+            SessionStreamChunk::BlockEnd { index, block } => {
+                validate_stream_index(*index)?;
+                let Some(open_type) = self.open.get(index).copied() else {
+                    return Err(invalid_stream_protocol("block-end to target an open block"));
+                };
+                if stream_block_type(block) != Some(open_type) {
+                    return Err(invalid_stream_protocol(
+                        "block-end content to match its open block type",
+                    ));
+                }
+                self.open.remove(index);
+            }
+            SessionStreamChunk::Usage { .. } => {
+                if self.usage_seen {
+                    return Err(invalid_stream_protocol(
+                        "at most one usage chunk before finish",
+                    ));
+                }
+                self.usage_seen = true;
+            }
+            SessionStreamChunk::Finish { reason, .. } => {
+                if !self.open.is_empty()
+                    && !matches!(
+                        reason,
+                        SessionFinishReason::Error { .. } | SessionFinishReason::Aborted { .. }
+                    )
+                {
+                    return Err(invalid_stream_protocol(
+                        "successful finish to close every open block",
+                    ));
+                }
+                self.finish = Some(reason.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_delta(&self, index: u64, expected: SessionStreamBlockType) -> Result<(), LlmError> {
+        validate_stream_index(index)?;
+        if self.open.get(&index).copied() != Some(expected) {
+            return Err(invalid_stream_protocol(
+                "each delta to target an open block of its matching type",
+            ));
+        }
+        Ok(())
+    }
+
+    fn complete(self) -> Result<SessionFinishReason, LlmError> {
+        self.finish
+            .ok_or_else(|| invalid_stream_protocol("exactly one terminal finish chunk"))
+    }
+}
+
+fn validate_stream_index(index: u64) -> Result<(), LlmError> {
+    if index > MAX_SAFE_STREAM_INDEX {
+        return Err(invalid_stream_protocol(
+            "block indexes within the non-negative JavaScript safe-integer range",
+        ));
+    }
+    Ok(())
+}
+
+fn stream_block_type(block: &SessionContentBlock) -> Option<SessionStreamBlockType> {
+    match block {
+        SessionContentBlock::Text { .. } => Some(SessionStreamBlockType::Text),
+        SessionContentBlock::Reasoning { .. } => Some(SessionStreamBlockType::Reasoning),
+        SessionContentBlock::ToolCall { .. } => Some(SessionStreamBlockType::ToolCall),
+        SessionContentBlock::ToolResult { .. } => None,
+    }
+}
+
+const fn invalid_stream_protocol(expected: &'static str) -> LlmError {
+    LlmError::InvalidStreamProtocol { expected }
 }
 
 fn require_request_log_state_session(

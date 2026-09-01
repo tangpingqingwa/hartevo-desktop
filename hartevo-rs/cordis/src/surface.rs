@@ -649,6 +649,8 @@ pub enum LlmError {
     InvalidPreparedCall { expected: &'static str },
     #[error("LLM stream dispatch must retain {expected}")]
     InvalidStreamDispatch { expected: &'static str },
+    #[error("LLM stream protocol must retain {expected}")]
+    InvalidStreamProtocol { expected: &'static str },
 }
 
 impl LlmError {
@@ -665,6 +667,7 @@ impl LlmError {
             Self::UnsupportedReasoningEffort { .. } => "UNSUPPORTED_REASONING_EFFORT",
             Self::InvalidPreparedCall { .. } => "INVALID_PREPARED_CALL",
             Self::InvalidStreamDispatch { .. } => "INVALID_STREAM_DISPATCH",
+            Self::InvalidStreamProtocol { .. } => "INVALID_STREAM_PROTOCOL",
         }
     }
 }

@@ -3,20 +3,22 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use chrono::{Duration, TimeZone, Utc};
+use futures_util::FutureExt;
 use hartevo_cordis::{
     AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
     AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, Context, CordisError,
     CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
     KernelApprovalDecision, KernelConsentState, LlmAdapter, LlmAdapterStream, LlmChunkStream,
     LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
-    LoggedAgentCall, PromptError, PromptSection, RuntimeSurface, SessionCallConfig,
-    SessionContentBlock, SessionError, SessionEventKind, SessionFinishReason, SessionHandle,
-    SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionRequestHeaderReason, SessionStore, SessionStreamChunk, SessionSurfaceIntent,
-    SessionToolSchema, SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request,
-    admit_agent_step, build_agent_call, dispatch_agent_call, events, keys, log_agent_call,
-    prepare_agent_call, prepare_agent_step, register_llm_adapter, register_prompt_section,
-    register_tool_schema, run_agent_step, session_events,
+    LoggedAgentCall, PromptError, PromptSection, RecordedAgentStream, RuntimeSurface,
+    SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind, SessionFinishReason,
+    SessionHandle, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage, SessionToolSchema, SurfaceOwner,
+    ToolCall, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
+    dispatch_agent_call, events, keys, log_agent_call, prepare_agent_call, prepare_agent_step,
+    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool_schema,
+    run_agent_step, session_events,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -108,6 +110,30 @@ impl LlmAdapter for AgentStreamingAdapter {
     }
 }
 
+#[derive(Clone)]
+struct ScriptedAgentAdapter {
+    items: Vec<Result<SessionStreamChunk, SessionLlmFailure>>,
+}
+
+impl LlmAdapter for ScriptedAgentAdapter {
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        Ok(LlmResolvedModel::new(provider, model))
+    }
+
+    fn stream(&self, _request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        Ok(Box::pin(futures_util::stream::iter(self.items.clone())))
+    }
+}
+
+fn ready_record_agent_stream(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+) -> Result<RecordedAgentStream, CordisError> {
+    record_agent_stream(ctx, logged)
+        .now_or_never()
+        .expect("scripted stream must be immediately ready")
+}
+
 fn tool_schema(name: &str) -> SessionToolSchema {
     SessionToolSchema {
         name: name.into(),
@@ -149,6 +175,67 @@ fn build_logged_turn(
 fn close_logged_turn(session: &SessionHandle, turn: u64) {
     session.finish_step(turn, 1).unwrap();
     session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+}
+
+fn record_script(
+    session_id: &str,
+    items: Vec<Result<SessionStreamChunk, SessionLlmFailure>>,
+) -> (SessionHandle, u64, Result<RecordedAgentStream, CordisError>) {
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], ScriptedAgentAdapter { items }).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new(session_id).unwrap())
+        .unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+    let (turn, logged) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "request",
+        call_config("mock", "model"),
+    );
+    let result = ready_record_agent_stream(&mut ctx, &logged);
+    (session, turn, result)
+}
+
+fn ok_chunks(
+    chunks: Vec<SessionStreamChunk>,
+) -> Vec<Result<SessionStreamChunk, SessionLlmFailure>> {
+    chunks.into_iter().map(Ok).collect()
+}
+
+fn usage() -> SessionStreamChunk {
+    SessionStreamChunk::Usage {
+        usage: SessionTokenUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            total_tokens: Some(5),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: Some(1),
+        },
+    }
+}
+
+fn assert_protocol_rejected(
+    session_id: &str,
+    chunks: Vec<SessionStreamChunk>,
+    expected: &'static str,
+    persisted_prefix: usize,
+) {
+    let (session, turn, result) = record_script(session_id, ok_chunks(chunks));
+    assert_eq!(
+        result,
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected,
+        }))
+    );
+    assert_eq!(
+        session.assistant_chunks(turn, 1).unwrap().len(),
+        persisted_prefix
+    );
 }
 
 #[test]
@@ -1488,6 +1575,310 @@ fn logged_agent_call_dispatches_exact_request_without_session_writes() {
     assert_eq!(waterfall_calls.load(Ordering::SeqCst), 1);
     assert_eq!(seen.lock().expect("seen").len(), 1);
     assert_eq!(stale_session.events().unwrap(), stale_events);
+}
+
+#[test]
+fn recorded_agent_stream_validates_and_persists_exact_chunk_order() {
+    let chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Reasoning,
+        },
+        SessionStreamChunk::BlockStart {
+            index: 1,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::ReasoningDelta {
+            index: 0,
+            text: "plan".into(),
+        },
+        SessionStreamChunk::TextDelta {
+            index: 1,
+            text: "answer".into(),
+        },
+        SessionStreamChunk::BlockStart {
+            index: 2,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::ToolCallDelta {
+            index: 2,
+            id: "call-1".into(),
+            name: Some("search".into()),
+            arguments_delta: "{\"q\":\"rust\"}".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Reasoning {
+                text: "plan".into(),
+            },
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 1,
+            block: SessionContentBlock::Text {
+                text: "answer".into(),
+            },
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 2,
+            block: SessionContentBlock::ToolCall {
+                id: "call-1".into(),
+                name: "search".into(),
+                arguments: "{\"q\":\"rust\"}".into(),
+            },
+        },
+        usage(),
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::ToolCalls,
+            replay_state: None,
+        },
+    ];
+    let (session, turn, result) = record_script("record-valid-stream", ok_chunks(chunks.clone()));
+    let recorded = result.unwrap();
+    let stored = session.assistant_chunks(turn, 1).unwrap();
+
+    assert_eq!(recorded.turn(), turn);
+    assert_eq!(recorded.step(), 1);
+    assert_eq!(recorded.finish(), &SessionFinishReason::ToolCalls);
+    assert_eq!(
+        recorded.chunk_seqs(),
+        stored.iter().map(|record| record.seq).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stored
+            .iter()
+            .map(|record| record.chunk.clone())
+            .collect::<Vec<_>>(),
+        chunks
+    );
+    assert!(
+        !session
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+    );
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn normalized_terminal_failures_persist_after_valid_partial_blocks() {
+    for (session_id, failure, expected) in [
+        (
+            "record-error-stream",
+            SessionLlmFailure {
+                message: "connection reset".into(),
+                code: "NETWORK".into(),
+                status: None,
+                provider_retry_after_ms: None,
+                request_id: Some("req-error".into()),
+            },
+            "error",
+        ),
+        (
+            "record-aborted-stream",
+            SessionLlmFailure {
+                message: "cancelled".into(),
+                code: "ABORTED".into(),
+                status: None,
+                provider_retry_after_ms: None,
+                request_id: Some("req-aborted".into()),
+            },
+            "aborted",
+        ),
+    ] {
+        let (session, turn, result) = record_script(
+            session_id,
+            vec![
+                Ok(SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                }),
+                Ok(SessionStreamChunk::TextDelta {
+                    index: 0,
+                    text: "partial".into(),
+                }),
+                Err(failure.clone()),
+                Ok(SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "must not escape normalization".into(),
+                    },
+                }),
+            ],
+        );
+        let recorded = result.unwrap();
+        match (expected, recorded.finish()) {
+            ("error", SessionFinishReason::Error { failure: actual })
+            | ("aborted", SessionFinishReason::Aborted { failure: actual }) => {
+                assert_eq!(actual, &failure);
+            }
+            _ => panic!("normalized failure must keep its terminal class"),
+        }
+        let stored = session.assistant_chunks(turn, 1).unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(recorded.chunk_seqs().len(), 3);
+        assert!(matches!(
+            stored.last().map(|record| &record.chunk),
+            Some(SessionStreamChunk::Finish { .. })
+        ));
+        session.finish_step(turn, 1).unwrap();
+        session.finish_turn(turn, TurnEndReason::Error).unwrap();
+    }
+}
+
+#[test]
+fn recorded_agent_stream_rejects_invalid_block_grammar_before_append() {
+    assert_protocol_rejected(
+        "stream-index-range",
+        vec![SessionStreamChunk::BlockStart {
+            index: 9_007_199_254_740_992,
+            block_type: SessionStreamBlockType::Text,
+        }],
+        "block indexes within the non-negative JavaScript safe-integer range",
+        0,
+    );
+    assert_protocol_rejected(
+        "stream-repeat-open",
+        vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+        ],
+        "one open block per index",
+        1,
+    );
+    assert_protocol_rejected(
+        "stream-text-without-open",
+        vec![SessionStreamChunk::TextDelta {
+            index: 0,
+            text: "orphan".into(),
+        }],
+        "each delta to target an open block of its matching type",
+        0,
+    );
+    assert_protocol_rejected(
+        "stream-reasoning-mismatch",
+        vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::ReasoningDelta {
+                index: 0,
+                text: "wrong".into(),
+            },
+        ],
+        "each delta to target an open block of its matching type",
+        1,
+    );
+    assert_protocol_rejected(
+        "stream-tool-mismatch",
+        vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::ToolCallDelta {
+                index: 0,
+                id: "call-1".into(),
+                name: Some("search".into()),
+                arguments_delta: "{}".into(),
+            },
+        ],
+        "each delta to target an open block of its matching type",
+        1,
+    );
+    assert_protocol_rejected(
+        "stream-end-without-open",
+        vec![SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Text {
+                text: "orphan".into(),
+            },
+        }],
+        "block-end to target an open block",
+        0,
+    );
+    assert_protocol_rejected(
+        "stream-end-type-mismatch",
+        vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::Reasoning {
+                    text: "wrong".into(),
+                },
+            },
+        ],
+        "block-end content to match its open block type",
+        1,
+    );
+}
+
+#[test]
+fn recorded_agent_stream_rejects_invalid_terminal_grammar_before_append() {
+    assert_protocol_rejected(
+        "stream-duplicate-usage",
+        vec![usage(), usage()],
+        "at most one usage chunk before finish",
+        1,
+    );
+    assert_protocol_rejected(
+        "stream-success-with-open-block",
+        vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                replay_state: None,
+            },
+        ],
+        "successful finish to close every open block",
+        1,
+    );
+    assert_protocol_rejected(
+        "stream-missing-finish",
+        vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::TextDelta {
+                index: 0,
+                text: "complete prefix".into(),
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::Text {
+                    text: "complete prefix".into(),
+                },
+            },
+        ],
+        "exactly one terminal finish chunk",
+        3,
+    );
+    assert_protocol_rejected(
+        "stream-after-finish",
+        vec![
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                replay_state: None,
+            },
+            usage(),
+        ],
+        "no chunks after one terminal finish",
+        1,
+    );
 }
 
 #[test]
