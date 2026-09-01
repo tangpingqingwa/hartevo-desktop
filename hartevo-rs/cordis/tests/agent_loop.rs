@@ -19,7 +19,7 @@ use hartevo_cordis::{
     admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call, events, keys,
     log_agent_call, prepare_agent_call, prepare_agent_step, record_agent_stream,
     register_llm_adapter, register_prompt_section, register_tool_schema, run_agent_step,
-    session_events,
+    schedule_agent_tool_calls, session_events,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -2248,6 +2248,273 @@ fn commit_omits_misaligned_replay_and_rejects_foreign_recorded_sequences() {
             .iter()
             .all(|event| !matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
     );
+}
+
+#[test]
+fn scheduled_tool_calls_preserve_model_order_raw_arguments_and_durable_sequences() {
+    let chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 7,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 7,
+            block: SessionContentBlock::ToolCall {
+                id: "call-first".into(),
+                name: "search".into(),
+                arguments: "{broken".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 1,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 1,
+            block: SessionContentBlock::Text {
+                text: "working".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 3,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 3,
+            block: SessionContentBlock::ToolCall {
+                id: "call-second".into(),
+                name: "write".into(),
+                arguments: String::new(),
+            },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::ToolCalls,
+            replay_state: None,
+        },
+    ];
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("schedule-ordered", chunks);
+    let executions = Arc::new(AtomicUsize::new(0));
+    {
+        let executions = Arc::clone(&executions);
+        ctx.on_waterfall(events::TOOLS_EXECUTE, move |call: ToolCall, next| {
+            executions.fetch_add(1, Ordering::SeqCst);
+            next(call)
+        })
+        .unwrap();
+    }
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    let history_before = session.derive_messages().unwrap();
+
+    let scheduled = schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    assert_eq!(scheduled.len(), 2);
+    assert_eq!(scheduled[0].call_id, "call-first");
+    assert_eq!(scheduled[0].name, "search");
+    assert_eq!(scheduled[0].arguments, "{broken");
+    assert_eq!(scheduled[1].call_id, "call-second");
+    assert_eq!(scheduled[1].name, "write");
+    assert_eq!(scheduled[1].arguments, "");
+    assert_eq!(
+        recorded.tool_call_seqs(),
+        scheduled.iter().map(|call| call.seq).collect::<Vec<_>>()
+    );
+    assert!(recorded.tool_calls_scheduled());
+    assert_eq!(session.tool_calls(turn, 1).unwrap(), scheduled);
+    assert_eq!(session.derive_messages().unwrap(), history_before);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert!(
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.kind, SessionEventKind::ToolResult { .. }))
+    );
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn zero_call_scheduling_is_one_shot_without_new_session_events() {
+    let (ctx, session, turn, logged, mut recorded) = recorded_script(
+        "schedule-empty",
+        vec![SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            replay_state: None,
+        }],
+    );
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    let before = session.events().unwrap();
+
+    assert_eq!(
+        schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap(),
+        []
+    );
+    assert!(recorded.tool_calls_scheduled());
+    assert!(recorded.tool_call_seqs().is_empty());
+    assert_eq!(session.events().unwrap(), before);
+    assert_eq!(
+        schedule_agent_tool_calls(&ctx, &logged, &mut recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "one tool-call scheduling pass per recorded stream",
+        }))
+    );
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn scheduling_rejects_duplicate_ids_and_preexisting_calls_before_mutation() {
+    let duplicate_chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::ToolCall {
+                id: "duplicate".into(),
+                name: "first".into(),
+                arguments: "{}".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 1,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 1,
+            block: SessionContentBlock::ToolCall {
+                id: "duplicate".into(),
+                name: "second".into(),
+                arguments: "[]".into(),
+            },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::ToolCalls,
+            replay_state: None,
+        },
+    ];
+    let (ctx, session, turn, logged, mut recorded) =
+        recorded_script("schedule-duplicate", duplicate_chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    let before = session.events().unwrap();
+    assert_eq!(
+        schedule_agent_tool_calls(&ctx, &logged, &mut recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "unique tool-call ids within one assistant message",
+        }))
+    );
+    assert_eq!(session.events().unwrap(), before);
+    assert!(!recorded.tool_calls_scheduled());
+    assert!(recorded.tool_call_seqs().is_empty());
+    close_logged_turn(&session, turn);
+
+    let chunks = vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::ToolCall {
+                id: "model-call".into(),
+                name: "search".into(),
+                arguments: "{}".into(),
+            },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::ToolCalls,
+            replay_state: None,
+        },
+    ];
+    let (ctx, session, turn, logged, mut recorded) =
+        recorded_script("schedule-preexisting", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    session
+        .append_tool_call(turn, 1, "foreign-call", "foreign", "raw")
+        .unwrap();
+    let before = session.events().unwrap();
+    assert_eq!(
+        schedule_agent_tool_calls(&ctx, &logged, &mut recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "only this scheduling pass's exact durable tool-call prefix",
+        }))
+    );
+    assert_eq!(session.events().unwrap(), before);
+    assert!(!recorded.tool_calls_scheduled());
+    assert!(recorded.tool_call_seqs().is_empty());
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn scheduling_fails_closed_without_commit_on_closed_step_or_foreign_call() {
+    let chunks = vec![SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Stop,
+        replay_state: None,
+    }];
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("schedule-boundaries", chunks.clone());
+    let before = session.events().unwrap();
+    assert_eq!(
+        schedule_agent_tool_calls(&ctx, &logged, &mut recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "a committed assistant message before tool-call scheduling",
+        }))
+    );
+    assert_eq!(session.events().unwrap(), before);
+
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    session.finish_step(turn, 1).unwrap();
+    let before_closed = session.events().unwrap();
+    assert!(matches!(
+        schedule_agent_tool_calls(&ctx, &logged, &mut recorded),
+        Err(CordisError::Session(SessionError::NoOpenStep { turn: actual }))
+            if actual == turn
+    ));
+    assert_eq!(session.events().unwrap(), before_closed);
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    let source = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("schedule-source").unwrap())
+        .unwrap();
+    let mut source_state = AgentRequestLogState::new(source.id().clone());
+    let (source_turn, source_logged) = build_logged_turn(
+        &mut ctx,
+        &source,
+        &mut source_state,
+        "source-request",
+        call_config("mock", "model"),
+    );
+    let mut source_recorded = ready_record_agent_stream(&mut ctx, &source_logged).unwrap();
+    commit_agent_stream(&ctx, &source_logged, &mut source_recorded).unwrap();
+
+    let foreign = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("schedule-foreign").unwrap())
+        .unwrap();
+    let mut foreign_state = AgentRequestLogState::new(foreign.id().clone());
+    let (foreign_turn, foreign_logged) = build_logged_turn(
+        &mut ctx,
+        &foreign,
+        &mut foreign_state,
+        "foreign-request",
+        call_config("mock", "model"),
+    );
+    let before_source = source.events().unwrap();
+    let before_foreign = foreign.events().unwrap();
+    assert_eq!(
+        schedule_agent_tool_calls(&ctx, &foreign_logged, &mut source_recorded),
+        Err(CordisError::Llm(LlmError::InvalidStreamProtocol {
+            expected: "recorded session, turn, and step to match the logged call",
+        }))
+    );
+    assert_eq!(source.events().unwrap(), before_source);
+    assert_eq!(foreign.events().unwrap(), before_foreign);
+    close_logged_turn(&source, source_turn);
+    close_logged_turn(&foreign, foreign_turn);
 }
 
 #[test]
