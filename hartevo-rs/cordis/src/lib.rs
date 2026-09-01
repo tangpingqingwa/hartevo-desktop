@@ -36,8 +36,8 @@ pub use agent::{
     AgentRequestLogState, AgentStep, AgentStepResult, AgentStreamCommit, LoggedAgentCall,
     PreparedAgentCall, PreparedAgentRequest, RecordedAgentStream, admit_agent_request,
     admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call, log_agent_call,
-    prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls, record_agent_stream,
-    run_agent_step, schedule_agent_tool_calls,
+    prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls,
+    prepare_agent_tool_executions, record_agent_stream, run_agent_step, schedule_agent_tool_calls,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
@@ -104,13 +104,14 @@ pub use session::{
     TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, events as session_events,
 };
 pub use surface::{
-    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DesktopSurface,
-    DomainSurface, EffectBrokerSurface, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
-    LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LlmSurface, MAPPED_KEYS,
-    PreparedLlmCall, PromptAssembly, PromptError, PromptSection, RuntimeSurface, SurfaceOwner,
-    SystemPromptSurface, ToolCall, ToolExecutionInput, ToolExecutionMode, ToolsSurface,
-    assemble_system_prompt, events, expected_mode, prepare_llm_call, register_agent,
-    register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
-    register_tool_concurrency, register_tool_schema, run_tools_pipeline, stream_llm,
-    stream_llm_request, stream_prepared_llm,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DeniedToolExecution,
+    DesktopSurface, DomainSurface, EffectBrokerSurface, LlmAdapter, LlmAdapterStream,
+    LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream,
+    LlmSurface, MAPPED_KEYS, PreparedLlmCall, PreparedToolExecution, PromptAssembly, PromptError,
+    PromptSection, RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolCall, ToolExecutionInput,
+    ToolExecutionMode, ToolExecutionPreparation, ToolsSurface, assemble_system_prompt, events,
+    expected_mode, prepare_llm_call, prepare_tool_execution, register_agent, register_llm_adapter,
+    register_llm_stream, register_prompt_section, register_tool, register_tool_concurrency,
+    register_tool_guard, register_tool_schema, run_tools_pipeline, stream_llm, stream_llm_request,
+    stream_prepared_llm,
 };

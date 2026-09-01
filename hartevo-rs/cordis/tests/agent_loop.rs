@@ -15,11 +15,12 @@ use hartevo_cordis::{
     SessionHandle, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
-    SessionToolSchema, SurfaceOwner, ToolCall, ToolExecutionMode, ToolsSurface, TurnEndReason,
-    admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
-    dispatch_agent_call, events, keys, log_agent_call, prepare_agent_call, prepare_agent_step,
-    prepare_agent_tool_calls, record_agent_stream, register_llm_adapter, register_prompt_section,
-    register_tool, register_tool_concurrency, register_tool_schema, run_agent_step,
+    SessionToolSchema, SurfaceOwner, ToolCall, ToolExecutionMode, ToolExecutionPreparation,
+    ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
+    commit_agent_stream, dispatch_agent_call, events, keys, log_agent_call, prepare_agent_call,
+    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
+    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
+    register_tool_concurrency, register_tool_guard, register_tool_schema, run_agent_step,
     schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
@@ -2738,6 +2739,169 @@ fn tool_execution_preparation_rejects_unscheduled_foreign_and_closed_steps() {
     ));
     assert_eq!(session.events().unwrap(), before_closed);
     session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+}
+
+#[test]
+fn agent_tool_pre_execution_is_ordered_monotonic_and_session_read_only() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(
+        0,
+        "parallel-call",
+        "parallel",
+        r#"{"parallel":true}"#,
+    ));
+    chunks.extend(tool_call_chunks(1, "guarded-call", "guarded", "{}"));
+    chunks.extend(tool_call_chunks(2, "policy-call", "policy-denied", "{}"));
+    chunks.extend(tool_call_chunks(3, "approval-call", "approval", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("pre-execution-order", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    register_tool_concurrency(&mut ctx, "parallel", |arguments| {
+        Ok(arguments
+            .get("parallel")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+    })
+    .unwrap();
+    register_tool(&mut ctx, "guarded").unwrap();
+    register_tool(&mut ctx, "policy-denied").unwrap();
+    register_tool(&mut ctx, "approval").unwrap();
+
+    let policy_order = Arc::new(Mutex::new(Vec::new()));
+    {
+        let policy_order = Arc::clone(&policy_order);
+        ctx.on_waterfall(
+            events::TOOLS_PRE_EXECUTE,
+            move |mut call: ToolCall, next| {
+                let durable = call
+                    .execution_input()
+                    .expect("N52 policy must receive the immutable durable input");
+                assert_eq!(durable.call_id(), call.call_id);
+                if call.name == "parallel" {
+                    assert_eq!(durable.arguments(), &json!({ "parallel": true }));
+                }
+                policy_order.lock().unwrap().push(call.name.clone());
+                match call.name.as_str() {
+                    "policy-denied" => {
+                        call.decision = "deny".into();
+                        call.result = "blocked by policy".into();
+                        call
+                    }
+                    "approval" => {
+                        call.decision = "ask".into();
+                        call.result = "approval is required".into();
+                        call
+                    }
+                    _ => next(call),
+                }
+            },
+        )
+        .unwrap();
+    }
+    register_tool_guard(&mut ctx, |input| {
+        (input.name() == "guarded").then(|| "blocked by monotonic guard".into())
+    })
+    .unwrap();
+    let before = session.events().unwrap();
+
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+
+    assert_eq!(prepared.len(), 4);
+    assert_eq!(
+        *policy_order.lock().unwrap(),
+        ["parallel", "guarded", "policy-denied", "approval"]
+    );
+    let tools = ctx.tools::<ToolsSurface>().unwrap();
+    let ToolExecutionPreparation::Dispatch(parallel) = &prepared[0] else {
+        panic!("parallel call should dispatch");
+    };
+    assert_eq!(parallel.input().call_id(), "parallel-call");
+    assert_eq!(parallel.mode(), ToolExecutionMode::Parallel);
+    assert!(tools.preparation_is_current(parallel));
+    let ToolExecutionPreparation::Denied(guarded) = &prepared[1] else {
+        panic!("guarded call should be denied");
+    };
+    assert_eq!(guarded.reason(), "blocked by monotonic guard");
+    let ToolExecutionPreparation::Denied(policy) = &prepared[2] else {
+        panic!("policy call should be denied");
+    };
+    assert_eq!(policy.reason(), "blocked by policy");
+    let ToolExecutionPreparation::Denied(approval) = &prepared[3] else {
+        panic!("ask must fail closed without an approval channel");
+    };
+    assert_eq!(approval.reason(), "approval is required");
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tool_pre_execution_rejects_rewrites_stale_registrations_unknowns_and_guard_panics() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(0, "rewrite-call", "rewrite", "{}"));
+    chunks.extend(tool_call_chunks(1, "stale-call", "stale", "{}"));
+    chunks.extend(tool_call_chunks(2, "unknown-call", "unknown", "{}"));
+    chunks.extend(tool_call_chunks(3, "panic-call", "panic", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("pre-execution-fail-closed", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    register_tool(&mut ctx, "rewrite").unwrap();
+    let stale = register_tool_concurrency(&mut ctx, "stale", |_| Ok(true)).unwrap();
+    register_tool(&mut ctx, "panic").unwrap();
+    ctx.on_waterfall(events::TOOLS_PRE_EXECUTE, |mut call: ToolCall, next| {
+        if call.name == "rewrite" {
+            call.arguments = r#"{"rewritten":true}"#.into();
+        }
+        next(call)
+    })
+    .unwrap();
+    let stale = Arc::new(Mutex::new(Some(stale)));
+    {
+        let stale = Arc::clone(&stale);
+        register_tool_guard(&mut ctx, move |input| {
+            if input.name() == "stale" {
+                stale.lock().unwrap().take().unwrap().dispose();
+            }
+            None
+        })
+        .unwrap();
+    }
+    register_tool_guard(&mut ctx, |input| {
+        assert_ne!(input.name(), "panic", "guard panic must be contained");
+        None
+    })
+    .unwrap();
+    let before = session.events().unwrap();
+
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+
+    let reasons = prepared
+        .iter()
+        .map(|outcome| match outcome {
+            ToolExecutionPreparation::Dispatch(_) => panic!("every call must fail closed"),
+            ToolExecutionPreparation::Denied(denied) => denied.reason(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        [
+            "tools/pre-execute cannot rewrite durable tool identity or arguments",
+            "tool registration changed during pre-execution",
+            "unknown tool \"unknown\"",
+            "tool guard panicked for \"panic\"",
+        ]
+    );
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
 }
 
 #[test]
