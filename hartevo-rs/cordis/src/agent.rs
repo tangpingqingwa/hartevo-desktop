@@ -20,7 +20,7 @@ use crate::session::{
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
     EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
-    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolsSurface,
+    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput, ToolsSurface,
     assemble_system_prompt, events, prepare_llm_call, register_agent, run_tools_pipeline,
     stream_llm, stream_llm_request, stream_prepared_llm,
 };
@@ -764,6 +764,53 @@ pub fn schedule_agent_tool_calls(
     }
     recorded.tool_calls_scheduled = true;
     Ok(scheduled)
+}
+
+/// Materialize N50's exact durable calls for later policy and dispatch.
+///
+/// Preparation parses arguments without changing their durable raw form and
+/// performs no registry classification or session mutation. A later scheduler
+/// can therefore re-read each input's live execution mode immediately before
+/// starting it.
+pub fn prepare_agent_tool_calls(
+    ctx: &Context,
+    logged: &LoggedAgentCall,
+    recorded: &RecordedAgentStream,
+) -> Result<Vec<ToolExecutionInput>, CordisError> {
+    let request = logged.call().request();
+    let session_id = SessionId::new(request.agent().id.clone())?;
+    let turn = request.turn();
+    let step = request.step();
+    if recorded.session_id != session_id || recorded.turn != turn || recorded.step != step {
+        return Err(invalid_stream_protocol(
+            "recorded session, turn, and step to match the logged call",
+        )
+        .into());
+    }
+    if !recorded.tool_calls_scheduled {
+        return Err(invalid_stream_protocol(
+            "durably scheduled tool calls before execution preparation",
+        )
+        .into());
+    }
+
+    let session = agent_session(ctx, &session_id)?;
+    session.require_open_step(turn, step)?;
+    let message = recorded_assistant_message(&session, logged, recorded)?;
+    let planned = planned_tool_calls(&message)?;
+    let scheduled = session.tool_calls(turn, step)?;
+    if scheduled.len() != planned.len()
+        || !tool_call_prefix_matches(&scheduled, &recorded.tool_call_seqs, &planned)
+    {
+        return Err(invalid_stream_protocol(
+            "the exact durable tool-call sequence before execution preparation",
+        )
+        .into());
+    }
+    Ok(scheduled
+        .iter()
+        .map(ToolExecutionInput::from_session_call)
+        .collect())
 }
 
 type PlannedToolCall = (String, String, String);

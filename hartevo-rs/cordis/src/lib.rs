@@ -36,8 +36,8 @@ pub use agent::{
     AgentRequestLogState, AgentStep, AgentStepResult, AgentStreamCommit, LoggedAgentCall,
     PreparedAgentCall, PreparedAgentRequest, RecordedAgentStream, admit_agent_request,
     admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call, log_agent_call,
-    prepare_agent_call, prepare_agent_step, record_agent_stream, run_agent_step,
-    schedule_agent_tool_calls,
+    prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls, record_agent_stream,
+    run_agent_step, schedule_agent_tool_calls,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
@@ -108,8 +108,9 @@ pub use surface::{
     DomainSurface, EffectBrokerSurface, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
     LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LlmSurface, MAPPED_KEYS,
     PreparedLlmCall, PromptAssembly, PromptError, PromptSection, RuntimeSurface, SurfaceOwner,
-    SystemPromptSurface, ToolCall, ToolsSurface, assemble_system_prompt, events, expected_mode,
-    prepare_llm_call, register_agent, register_llm_adapter, register_llm_stream,
-    register_prompt_section, register_tool, register_tool_schema, run_tools_pipeline, stream_llm,
+    SystemPromptSurface, ToolCall, ToolExecutionInput, ToolExecutionMode, ToolsSurface,
+    assemble_system_prompt, events, expected_mode, prepare_llm_call, register_agent,
+    register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
+    register_tool_concurrency, register_tool_schema, run_tools_pipeline, stream_llm,
     stream_llm_request, stream_prepared_llm,
 };

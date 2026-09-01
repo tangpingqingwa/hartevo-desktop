@@ -20,8 +20,8 @@ use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionFinishReason, SessionId,
-    SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk, SessionToolSchema,
-    events as session_events, validate_agent_request_config,
+    SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk, SessionToolCall,
+    SessionToolSchema, events as session_events, validate_agent_request_config,
 };
 
 /// Cordis keys this mapping provides and looks up.
@@ -293,6 +293,85 @@ impl ToolCall {
         self.call_id = call_id.into();
         self
     }
+}
+
+/// One durable model tool call materialized for the execution pipeline.
+///
+/// Raw arguments remain available for exact replay while [`Self::arguments`]
+/// follows Harness parsing: empty input is `{}`, valid JSON is decoded, and
+/// malformed JSON remains its original string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionInput {
+    call_seq: u64,
+    turn: u64,
+    step: u64,
+    call_id: String,
+    name: String,
+    raw_arguments: String,
+    arguments: serde_json::Value,
+}
+
+impl ToolExecutionInput {
+    pub(crate) fn from_session_call(call: &SessionToolCall) -> Self {
+        Self {
+            call_seq: call.seq,
+            turn: call.turn,
+            step: call.step,
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            raw_arguments: call.arguments.clone(),
+            arguments: parse_tool_arguments(&call.arguments),
+        }
+    }
+
+    #[must_use]
+    pub const fn call_seq(&self) -> u64 {
+        self.call_seq
+    }
+
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        self.step
+    }
+
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn raw_arguments(&self) -> &str {
+        &self.raw_arguments
+    }
+
+    #[must_use]
+    pub const fn arguments(&self) -> &serde_json::Value {
+        &self.arguments
+    }
+}
+
+fn parse_tool_arguments(raw: &str) -> serde_json::Value {
+    if raw.is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+/// Live scheduling mode for one not-yet-started tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    Parallel,
+    Exclusive,
 }
 
 /// Fully assembled provider-neutral request presented to one LLM adapter.
@@ -906,9 +985,29 @@ impl AgentRequest {
 }
 
 /// Tools pipeline service provided at `ctx.tools`.
+type ToolConcurrencyClassifier =
+    Arc<dyn Fn(&serde_json::Value) -> Result<bool, String> + Send + Sync>;
+
+#[derive(Clone)]
+struct ToolRegistration {
+    name: String,
+    identity: Arc<()>,
+    classifier: Option<ToolConcurrencyClassifier>,
+}
+
+impl fmt::Debug for ToolRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRegistration")
+            .field("name", &self.name)
+            .field("has_classifier", &self.classifier.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Default)]
 struct ToolsState {
-    names: Vec<String>,
+    names: Vec<ToolRegistration>,
     schemas: Vec<SessionToolSchema>,
 }
 
@@ -924,15 +1023,29 @@ impl ToolsSurface {
         }
     }
 
-    fn register_name(&self, name: String) {
+    fn register_name(&self, name: String) -> Arc<()> {
+        self.register_name_with_classifier(name, None)
+    }
+
+    fn register_name_with_classifier(
+        &self,
+        name: String,
+        classifier: Option<ToolConcurrencyClassifier>,
+    ) -> Arc<()> {
+        let identity = Arc::new(());
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .names
-            .push(name);
+            .push(ToolRegistration {
+                name,
+                identity: Arc::clone(&identity),
+                classifier,
+            });
+        identity
     }
 
-    fn register_schema(&self, schema: SessionToolSchema) -> Result<(), PromptError> {
+    fn register_schema(&self, schema: SessionToolSchema) -> Result<Arc<()>, PromptError> {
         let name = schema.name.clone();
         if name.is_empty() {
             return Err(PromptError::InvalidToolName);
@@ -944,12 +1057,17 @@ impl ToolsSurface {
         if state.schemas.iter().any(|existing| existing.name == name) {
             return Err(PromptError::DuplicateTool { name });
         }
-        state.names.push(name);
+        let identity = Arc::new(());
+        state.names.push(ToolRegistration {
+            name,
+            identity: Arc::clone(&identity),
+            classifier: None,
+        });
         state.schemas.push(schema);
-        Ok(())
+        Ok(identity)
     }
 
-    fn unregister_name(&self, name: &str) {
+    fn unregister_name(&self, identity: &Arc<()>) {
         let mut state = self
             .state
             .lock()
@@ -957,13 +1075,13 @@ impl ToolsSurface {
         if let Some(index) = state
             .names
             .iter()
-            .rposition(|registered| registered == name)
+            .position(|registered| Arc::ptr_eq(&registered.identity, identity))
         {
             state.names.remove(index);
         }
     }
 
-    fn unregister_schema(&self, name: &str) {
+    fn unregister_schema(&self, identity: &Arc<()>, name: &str) {
         let mut state = self
             .state
             .lock()
@@ -971,11 +1089,11 @@ impl ToolsSurface {
         if let Some(index) = state
             .names
             .iter()
-            .rposition(|registered| registered == name)
+            .position(|registered| Arc::ptr_eq(&registered.identity, identity))
         {
             state.names.remove(index);
+            state.schemas.retain(|schema| schema.name != name);
         }
-        state.schemas.retain(|schema| schema.name != name);
     }
 
     #[must_use]
@@ -984,7 +1102,51 @@ impl ToolsSurface {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .names
-            .clone()
+            .iter()
+            .map(|registered| registered.name.clone())
+            .collect()
+    }
+
+    /// Classify one unstarted call against the current visible registry.
+    /// Only an exact successful `true` opts into overlap; every other outcome
+    /// remains an exclusive barrier.
+    #[must_use]
+    pub fn execution_mode(&self, input: &ToolExecutionInput) -> ToolExecutionMode {
+        let candidate = {
+            let Ok(state) = self.state.lock() else {
+                return ToolExecutionMode::Exclusive;
+            };
+            let Some(registered) = state
+                .names
+                .iter()
+                .rfind(|registered| registered.name == input.name())
+            else {
+                return ToolExecutionMode::Exclusive;
+            };
+            registered
+                .classifier
+                .as_ref()
+                .map(|classifier| (Arc::clone(&registered.identity), Arc::clone(classifier)))
+        };
+        let Some((tool_identity, classifier)) = candidate else {
+            return ToolExecutionMode::Exclusive;
+        };
+        if classifier(input.arguments()).ok() != Some(true) {
+            return ToolExecutionMode::Exclusive;
+        }
+        let Ok(state) = self.state.lock() else {
+            return ToolExecutionMode::Exclusive;
+        };
+        if state
+            .names
+            .iter()
+            .rfind(|registered| registered.name == input.name())
+            .is_some_and(|registered| Arc::ptr_eq(&registered.identity, &tool_identity))
+        {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Exclusive
+        }
     }
 
     fn schemas(&self) -> Result<Vec<SessionToolSchema>, PromptError> {
@@ -1528,8 +1690,8 @@ pub fn register_tool(ctx: &mut Context, name: impl Into<String>) -> Result<(), C
         ]));
     };
     let name = name.into();
-    tools.register_name(name.clone());
-    ctx.effect(move || tools.unregister_name(&name));
+    let identity = tools.register_name(name);
+    ctx.effect(move || tools.unregister_name(&identity));
     Ok(())
 }
 
@@ -1544,9 +1706,30 @@ pub fn register_tool_schema(
         ]));
     };
     let name = schema.name.clone();
-    tools.register_schema(schema)?;
+    let identity = tools.register_schema(schema)?;
     let registered = Arc::clone(&tools);
-    Ok(ctx.effect(move || registered.unregister_schema(&name)))
+    Ok(ctx.effect(move || registered.unregister_schema(&identity, &name)))
+}
+
+/// Register one visible tool with its argument-sensitive parallel-safety
+/// classifier and reverse both with the owning Cordis effect.
+pub fn register_tool_concurrency<F>(
+    ctx: &mut Context,
+    name: impl Into<String>,
+    classifier: F,
+) -> Result<RegistrationHandle, CordisError>
+where
+    F: Fn(&serde_json::Value) -> Result<bool, String> + Send + Sync + 'static,
+{
+    let Some(tools) = ctx.tools::<ToolsSurface>() else {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::TOOLS.to_string(),
+        ]));
+    };
+    let name = name.into();
+    let identity = tools.register_name_with_classifier(name, Some(Arc::new(classifier)));
+    let registered = Arc::clone(&tools);
+    Ok(ctx.effect(move || registered.unregister_name(&identity)))
 }
 
 /// Register one ordered static system-prompt section with exact teardown.
