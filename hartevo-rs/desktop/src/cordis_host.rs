@@ -15,22 +15,23 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use hartevo_cordis::{
     AgentInboxOutcome, AgentInboxTarget, AgentTurnOutcome, AuthorityDispatchError, AuthorityScope,
-    CordisError, CordisHost, DomainCommandAuthority, DomainCommandBinding, DomainCommandPermit,
-    EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
+    CompactionResult, CordisError, CordisHost, DomainCommandAuthority, DomainCommandBinding,
+    DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
     EffectReconciliationAuthority, EffectReconciliationBinding, EffectReconciliationPermit,
     EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, Fiber,
     FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
     KernelConsentState, KernelConsentStatus, LifecycleCancellation, LlmAdapter, LlmAdapterStream,
-    LlmError, LlmGenerateRequest, LlmResolvedModel, RuntimeAuthority, RuntimeDispatchCompletion,
-    RuntimeDispatchPermit, RuntimeStatusCompletion, SessionCallConfig, SessionCancelCause,
-    SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
-    SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent, SessionEventKind,
-    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId,
-    SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionRequestContext, SessionRequestHeader,
-    SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-    SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop, keys,
-    register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
+    LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError, RuntimeAuthority,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeStatusCompletion, SessionCallConfig,
+    SessionCancelCause, SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart,
+    SessionCompactionSummary, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
+    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
+    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
+    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, compact_now,
+    host_is_cordis_loop, keys, register_llm_adapter, run_agent_turn as run_cordis_agent_turn,
+    session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -742,6 +743,75 @@ impl DesktopCordisCoordinator {
             &session.events()?,
             message_id,
         ))
+    }
+
+    /// Run one idle-session manual compaction through the Desktop persistence
+    /// and request-scoped provider boundary.
+    ///
+    /// The persisted adapter flushes the standalone start marker before the
+    /// provider stream is consumed. `compact_now` owns the terminal flush and
+    /// the complete manual failure taxonomy. The temporary provider route is
+    /// removed before this method returns on every result path.
+    #[allow(
+        dead_code,
+        reason = "consumed by the following Desktop human-command slice"
+    )]
+    pub(crate) async fn compact_session<A>(
+        &mut self,
+        session_id: &str,
+        source_command_id: Option<String>,
+        adapter: A,
+        cancellation: &LifecycleCancellation,
+    ) -> Result<Option<CompactionResult>, DesktopManualCompactionError>
+    where
+        A: LlmAdapter,
+    {
+        self.ensure_root_fiber_active()?;
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopManualCompactionError::MissingSessionStore)?;
+        let session_id = SessionId::new(session_id.to_owned())?;
+        let session = sessions
+            .get(&session_id)?
+            .ok_or_else(|| DesktopManualCompactionError::SessionNotFound(session_id.to_string()))?;
+
+        if cancellation.is_cancelled() {
+            return compact_now(
+                self.host.context_mut(),
+                &session,
+                source_command_id,
+                cancellation,
+            )
+            .await
+            .map_err(Into::into);
+        }
+        // With fewer than two visible nodes the backend necessarily retains
+        // the newest node. Preserve its true no-op contract without requiring
+        // a request header or mounting a provider route.
+        if session.surface()?.nodes.len() < 2 {
+            return Ok(None);
+        }
+        let header = session.request_header()?.ok_or_else(|| {
+            DesktopManualCompactionError::MissingRequestHeader(session_id.to_string())
+        })?;
+        let provider = header.config.provider.clone();
+        let resolved_model = LlmResolvedModel::new(provider.clone(), header.config.model.clone());
+        let registration = register_llm_adapter(
+            self.host.context_mut(),
+            [provider],
+            DesktopPersistedLlmAdapter::new(adapter, Arc::clone(&sessions), resolved_model),
+        )?;
+        let outcome = compact_now(
+            self.host.context_mut(),
+            &session,
+            source_command_id,
+            cancellation,
+        )
+        .await;
+        registration.dispose();
+        outcome.map_err(Into::into)
     }
 
     /// Run one complete Cordis turn through a request-scoped Desktop adapter.
@@ -1487,6 +1557,26 @@ pub(crate) enum DesktopAgentTurnError {
         run: Box<CordisError>,
         flush: SessionError,
     },
+    #[error(transparent)]
+    Cordis(#[from] CordisError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the following Desktop human-command slice"
+)]
+#[derive(Debug, Error)]
+pub(crate) enum DesktopManualCompactionError {
+    #[error("Cordis did not mount its Session store")]
+    MissingSessionStore,
+    #[error("Desktop Cordis Session {0} does not exist")]
+    SessionNotFound(String),
+    #[error("Desktop Cordis Session {0} has no request route for summarization")]
+    MissingRequestHeader(String),
+    #[error(transparent)]
+    Manual(#[from] ManualCompactionError),
     #[error(transparent)]
     Cordis(#[from] CordisError),
     #[error(transparent)]
@@ -2456,11 +2546,11 @@ mod tests {
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, OPENINTERPRETER, RuntimeBinding,
         SessionCallConfig, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
         SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
-        SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted,
-        SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
-        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
-        SurfaceOwner, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
-        invariant_missing, keys, session_events,
+        SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
+        SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
+        SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+        SessionSurfaceOp, SurfaceOwner, TurnEndReason, enforce_invariants, events,
+        host_is_cordis_loop, invariant_missing, is_compact_checkpoint_source, keys, session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -2597,6 +2687,69 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_desktop_compaction(
+        host: &mut super::DesktopCordisCoordinator,
+        id: &str,
+    ) -> SessionHandle {
+        let session = host
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .create(SessionId::new(id).unwrap())
+            .unwrap();
+        let turn = session.start_turn().unwrap();
+        session
+            .append_request_header(
+                hartevo_cordis::SessionEpochHeader {
+                    config: SessionCallConfig {
+                        provider: "desktop-runtime".into(),
+                        model: "desktop-model".into(),
+                        reasoning_effort: None,
+                        temperature: None,
+                        max_tokens: None,
+                        stop: None,
+                    },
+                    adapter_defaults: None,
+                    system: Some("Keep durable facts.".into()),
+                    tools: None,
+                },
+                hartevo_cordis::SessionRequestHeaderReason::Initial,
+                false,
+            )
+            .unwrap();
+        let step = session.start_step(turn).unwrap();
+        session
+            .append_user_message(SessionMessage {
+                id: "desktop-compact-old".into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::Text {
+                    text: "older desktop history ".repeat(400),
+                }],
+                source: SessionMessageSource::User,
+            })
+            .unwrap();
+        session
+            .append_assistant_message(
+                turn,
+                step,
+                SessionMessage {
+                    id: "desktop-compact-recent".into(),
+                    role: SessionMessageRole::Assistant,
+                    content: vec![SessionContentBlock::Text {
+                        text: "recent desktop answer".into(),
+                    }],
+                    source: SessionMessageSource::Model {
+                        provider: "desktop-runtime".into(),
+                        model: "desktop-model".into(),
+                    },
+                },
+            )
+            .unwrap();
+        session.finish_step(turn, step).unwrap();
+        session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+        session
+    }
+
     #[tokio::test]
     async fn desktop_complete_agent_turn_flushes_before_adapter_and_restores() {
         let mut live =
@@ -2686,6 +2839,130 @@ mod tests {
             .unwrap();
         assert_eq!(restored.events().unwrap(), session.events().unwrap());
         assert_eq!(restored.derive_messages().unwrap(), messages);
+    }
+
+    #[tokio::test]
+    async fn desktop_manual_compaction_flushes_before_provider_and_restores() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(
+            live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+                .unwrap(),
+            0
+        );
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let observed_flushes = Arc::clone(&flushes);
+        live.context_mut()
+            .on_parallel(session_events::SESSION_FLUSH, move |_| {
+                let observed_flushes = Arc::clone(&observed_flushes);
+                async move {
+                    observed_flushes.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), std::convert::Infallible>(())
+                }
+            })
+            .unwrap();
+        let session = seed_desktop_compaction(&mut live, "desktop-manual-compaction");
+        let (adapter, probe) = desktop_turn_adapter(Arc::clone(&flushes));
+
+        let result = live
+            .compact_session(
+                "desktop-manual-compaction",
+                Some("desktop-command-1".into()),
+                adapter,
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            result.source_command_id.as_deref(),
+            Some("desktop-command-1")
+        );
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.observed_prepare_flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.observed_flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+        assert!(
+            live.context()
+                .llm::<LlmSurface>()
+                .unwrap()
+                .providers()
+                .unwrap()
+                .is_empty()
+        );
+        let expected_events = session.events().unwrap();
+        let expected_surface = session.surface().unwrap();
+        let expected_messages = session.derive_messages().unwrap();
+        assert!(is_compact_checkpoint_source(&expected_messages[0].source));
+
+        let store = live
+            .session_persistence
+            .store
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        let mut cold =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(cold.bind_session_persistence(store).unwrap(), 1);
+        let restored = cold
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&SessionId::new("desktop-manual-compaction").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.events().unwrap(), expected_events);
+        assert_eq!(restored.surface().unwrap(), expected_surface);
+        assert_eq!(restored.derive_messages().unwrap(), expected_messages);
+    }
+
+    #[tokio::test]
+    async fn desktop_manual_compaction_noop_mounts_no_provider_and_writes_nothing() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        live.context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .create(SessionId::new("desktop-manual-empty").unwrap())
+            .unwrap();
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let (adapter, probe) = desktop_turn_adapter(flushes);
+
+        let result = live
+            .compact_session(
+                "desktop-manual-empty",
+                Some("desktop-command-empty".into()),
+                adapter,
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
+        let session = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&SessionId::new("desktop-manual-empty").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(session.events().unwrap().is_empty());
+        assert!(
+            live.context()
+                .llm::<LlmSurface>()
+                .unwrap()
+                .providers()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
