@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context as TaskContext, Poll};
@@ -6,29 +7,29 @@ use chrono::{Duration, TimeZone, Utc};
 use futures_util::FutureExt;
 use hartevo_cordis::{
     AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
-    AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, Context, CordisError,
-    CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
-    KernelApprovalDecision, KernelConsentState, LifecycleCancellation, LlmAdapter,
-    LlmAdapterStream, LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning,
-    LlmResolvedModel, LlmStream, LoaderContext, LoggedAgentCall, PromptError, PromptSection,
-    RecordedAgentStream, RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionError,
-    SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
-    SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-    SessionSurfaceIntent, SessionTokenUsage, SessionToolSchema, SurfaceOwner,
-    TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition, ToolDispatchExecution,
-    ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolExecutionResult,
-    ToolPostExecution, ToolRunContext, ToolsSurface, TurnEndReason, admit_agent_request,
-    admit_agent_step, build_agent_call, commit_agent_stream, commit_agent_tool_results,
-    dispatch_agent_call, dispatch_tool_execution, events, finalize_tool_execution, keys,
-    log_agent_call, post_tool_execution, prepare_agent_call, prepare_agent_step,
-    prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream,
-    register_llm_adapter, register_prompt_section, register_tool, register_tool_concurrency,
-    register_tool_definition, register_tool_guard, register_tool_schema, run_agent_step,
-    run_agent_tool_batch, run_agent_tool_batch_outcome, run_agent_tool_batch_with_limit,
-    run_agent_tool_batch_with_limit_and_cancellation,
-    run_agent_tool_batch_with_limit_and_cancellation_outcome, schedule_agent_tool_calls,
-    session_events,
+    AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, AgentTurnStopping,
+    BailOutcome, Context, CordisError, CordisHost, DomainSurface, EffectBrokerSurface,
+    EnvironmentOverlay, KernelApproval, KernelApprovalDecision, KernelConsentState,
+    LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
+    LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
+    LoggedAgentCall, NonBail, PromptError, PromptSection, RecordedAgentStream, RuntimeSurface,
+    SessionCallConfig, SessionCancelCause, SessionContentBlock, SessionError, SessionEventKind,
+    SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason,
+    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+    SessionTokenUsage, SessionToolSchema, SurfaceOwner, TOOL_ABORTED_BEFORE_DISPATCH, ToolCall,
+    ToolDefinition, ToolDispatchExecution, ToolDispatchResult, ToolExecutionMode,
+    ToolExecutionPreparation, ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface,
+    TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
+    commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution, events,
+    finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
+    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
+    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
+    register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
+    run_agent_step, run_agent_tool_batch, run_agent_tool_batch_outcome,
+    run_agent_tool_batch_with_limit, run_agent_tool_batch_with_limit_and_cancellation,
+    run_agent_tool_batch_with_limit_and_cancellation_outcome, run_agent_turn,
+    schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -137,6 +138,47 @@ struct ScriptedAgentAdapter {
     items: Vec<Result<SessionStreamChunk, SessionLlmFailure>>,
 }
 
+type AgentStreamScript = Vec<Result<SessionStreamChunk, SessionLlmFailure>>;
+type AgentStreamScripts = Arc<Mutex<VecDeque<AgentStreamScript>>>;
+
+#[derive(Clone)]
+struct SequencedAgentAdapter {
+    scripts: AgentStreamScripts,
+    seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+}
+
+impl LlmAdapter for SequencedAgentAdapter {
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        Ok(LlmResolvedModel::new(provider, model))
+    }
+
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        self.seen.lock().expect("seen").push(request);
+        let script = self
+            .scripts
+            .lock()
+            .expect("scripts")
+            .pop_front()
+            .expect("one script per expected model call");
+        Ok(Box::pin(futures_util::stream::iter(script)))
+    }
+}
+
+fn sequenced_adapter(
+    scripts: Vec<Vec<SessionStreamChunk>>,
+) -> (SequencedAgentAdapter, Arc<Mutex<Vec<LlmGenerateRequest>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    (
+        SequencedAgentAdapter {
+            scripts: Arc::new(Mutex::new(
+                scripts.into_iter().map(ok_chunks).collect::<VecDeque<_>>(),
+            )),
+            seen: Arc::clone(&seen),
+        },
+        seen,
+    )
+}
+
 impl LlmAdapter for ScriptedAgentAdapter {
     fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
         Ok(LlmResolvedModel::new(provider, model))
@@ -180,6 +222,23 @@ fn tool_call_chunks(index: u64, id: &str, name: &str, arguments: &str) -> [Sessi
                 name: name.into(),
                 arguments: arguments.into(),
             },
+        },
+    ]
+}
+
+fn text_finish_chunks(text: &str, reason: SessionFinishReason) -> Vec<SessionStreamChunk> {
+    vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Text { text: text.into() },
+        },
+        SessionStreamChunk::Finish {
+            reason,
+            replay_state: None,
         },
     ]
 }
@@ -375,6 +434,330 @@ fn assert_protocol_rejected(
         session.assistant_chunks(turn, 1).unwrap().len(),
         persisted_prefix
     );
+}
+
+#[test]
+fn turn_driver_initial_empty_completes_without_opening_a_step() {
+    let mut ctx = mapped();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-empty").unwrap())
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .expect("empty turn is immediately ready")
+    .unwrap();
+
+    assert_eq!(outcome.turn(), 1);
+    assert_eq!(outcome.steps(), 0);
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(
+        session
+            .events()
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind.event_type())
+            .collect::<Vec<_>>(),
+        ["turn/start", "turn/end"]
+    );
+}
+
+#[test]
+fn turn_driver_calls_model_from_history_after_an_empty_tool_continuation() {
+    let mut ctx = mapped();
+    let mut first = tool_call_chunks(0, "driver-call", "driver-tool", "{}").to_vec();
+    first.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (adapter, seen) = sequenced_adapter(vec![
+        first,
+        text_finish_chunks("done", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    register_tool_definition(
+        &mut ctx,
+        ToolDefinition::new(tool_schema("driver-tool"), |_| Ok(json!("tool-result")))
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+    )
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-tool-followup").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("driver-input", "run"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .expect("scripted turn is immediately ready")
+    .unwrap();
+
+    assert_eq!(outcome.steps(), 2);
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].messages().iter().any(|message| {
+        matches!(message.source, SessionMessageSource::Tool { ref call_id } if call_id == "driver-call")
+    }));
+    assert_eq!(
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn concluding_tool_context_is_consumed_before_the_turn_closes() {
+    let mut ctx = mapped();
+    let mut first = tool_call_chunks(0, "conclude-call", "conclude-tool", "{}").to_vec();
+    first.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (adapter, seen) = sequenced_adapter(vec![
+        first,
+        text_finish_chunks("context accepted", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let context = plugin_message("conclude-context", "conclude-tool", "next context");
+    {
+        let context = context.clone();
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new_with_run_context(
+                tool_schema("conclude-tool"),
+                move |run: &ToolRunContext| {
+                    run.defer_context(context.clone());
+                    run.conclude_turn();
+                    Ok(json!("concluded"))
+                },
+            )
+            .with_output_renderer(|_, _| Ok(Vec::new())),
+        )
+        .unwrap();
+    }
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-conclusion-context").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("conclude-input", "run"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .expect("scripted turn is immediately ready")
+    .unwrap();
+
+    assert_eq!(outcome.steps(), 2);
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(session.events().unwrap().iter().any(|event| {
+        matches!(&event.kind, SessionEventKind::UserMessage { message, .. } if message == &context)
+    }));
+}
+
+#[test]
+fn stopping_steering_runs_before_close_and_max_tokens_stays_sticky() {
+    let mut ctx = mapped();
+    let (adapter, seen) = sequenced_adapter(vec![
+        text_finish_chunks("partial", SessionFinishReason::MaxTokens),
+        text_finish_chunks("continued", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-stopping").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("stopping-input", "run"))
+        .unwrap();
+    let stops = Arc::new(AtomicUsize::new(0));
+    {
+        let stops = Arc::clone(&stops);
+        let session = session.clone();
+        ctx.on_serial(
+            events::AGENT_TURN_STOPPING,
+            move |scope: Arc<AgentTurnStopping>| {
+                assert_eq!(scope.agent(), &AgentRef::new("turn-driver-stopping"));
+                assert_eq!(scope.turn(), 1);
+                assert!(!scope.cancellation().is_cancelled());
+                if stops.fetch_add(1, Ordering::SeqCst) == 0 {
+                    session
+                        .inbox()
+                        .append_next_step(plugin_message(
+                            "stopping-context",
+                            "stopping-hook",
+                            "continue",
+                        ))
+                        .unwrap();
+                }
+                std::future::ready(Ok::<_, std::convert::Infallible>(BailOutcome::Continue(
+                    NonBail::Undefined,
+                )))
+            },
+        )
+        .unwrap();
+    }
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .expect("scripted turn is immediately ready")
+    .unwrap();
+
+    assert_eq!(outcome.steps(), 2);
+    assert_eq!(outcome.reason(), TurnEndReason::MaxTokens);
+    assert_eq!(stops.load(Ordering::SeqCst), 2);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn rejected_and_pre_cancelled_turns_close_without_a_step() {
+    let mut rejected_ctx = mapped();
+    rejected_ctx
+        .on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| proposal.reject())
+        .unwrap();
+    let rejected = rejected_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-rejected").unwrap())
+        .unwrap();
+    rejected
+        .inbox()
+        .append_next_turn(user_message("reject", "reject"))
+        .unwrap();
+    let outcome = run_agent_turn(
+        &mut rejected_ctx,
+        rejected.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.reason(), TurnEndReason::Blocked);
+    assert_eq!(outcome.steps(), 0);
+
+    let mut cancelled_ctx = mapped();
+    let cancelled = cancelled_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-cancelled").unwrap())
+        .unwrap();
+    cancelled
+        .inbox()
+        .append_next_turn(user_message("cancel", "cancel"))
+        .unwrap();
+    let cancellation = LifecycleCancellation::default();
+    cancellation.cancel();
+    let outcome = run_agent_turn(
+        &mut cancelled_ctx,
+        cancelled.id(),
+        call_config("mock", "model"),
+        &cancellation,
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.steps(), 0);
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::Legacy)
+    );
+    assert_eq!(cancelled.inbox().next_turn().unwrap().len(), 1);
+}
+
+#[test]
+fn provider_failure_returns_structured_error_after_closing_the_turn() {
+    let mut ctx = mapped();
+    let failure = SessionLlmFailure {
+        message: "provider unavailable".into(),
+        code: "PROVIDER_UNAVAILABLE".into(),
+        status: Some(503),
+        provider_retry_after_ms: Some(100),
+        request_id: Some("request-63".into()),
+    };
+    let (adapter, _) = sequenced_adapter(vec![vec![SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Error {
+            failure: failure.clone(),
+        },
+        replay_state: None,
+    }]]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-driver-provider-error").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("error", "error"))
+        .unwrap();
+
+    let error = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap_err();
+
+    assert!(matches!(
+        &error,
+        CordisError::Llm(llm) if llm.code() == "PROVIDER_UNAVAILABLE"
+    ));
+    assert_eq!(error, CordisError::Llm(LlmError::RequestFailed { failure }));
+    assert!(matches!(
+        session.events().unwrap().last().map(|event| &event.kind),
+        Some(SessionEventKind::TurnEnd {
+            reason: TurnEndReason::Error,
+            ..
+        })
+    ));
+    let next_turn = session.start_turn().unwrap();
+    session
+        .finish_turn(next_turn, TurnEndReason::Completed)
+        .unwrap();
 }
 
 #[test]

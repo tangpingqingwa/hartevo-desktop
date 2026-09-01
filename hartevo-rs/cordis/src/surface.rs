@@ -19,6 +19,7 @@ use futures_core::Stream;
 use crate::context::{Context, CordisError, EventReentry, keys};
 use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker, ListenerHandle};
+use crate::fiber::LifecycleCancellation;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
     SessionId, SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk,
@@ -46,11 +47,11 @@ pub const MAPPED_KEYS: &[&str] = &[
 
 /// Primer event names owned by the mapped surfaces.
 pub mod events {
-    use crate::event::{Emit, EventKey, EventSchemaId, Waterfall};
+    use crate::event::{BailOutcome, Emit, EventKey, EventSchemaId, Serial, Waterfall};
 
     use super::{
-        AgentPreStep, AgentRef, AgentRequest, LlmStream, PromptAssembly, ToolCall,
-        ToolDispatchExecution, ToolExecutionResult, ToolPostExecution,
+        AgentPreStep, AgentRef, AgentRequest, AgentTurnStopping, LlmStream, PromptAssembly,
+        ToolCall, ToolDispatchExecution, ToolExecutionResult, ToolPostExecution,
     };
 
     /// Replace or wrap one detached system-prompt/tool-schema assembly.
@@ -120,6 +121,12 @@ pub mod events {
         EventSchemaId::new("hartevo.agent.request.v1"),
         "agent/request",
     );
+    /// Last serial chance to queue next-step steering before a turn closes.
+    pub const AGENT_TURN_STOPPING: EventKey<Serial, AgentTurnStopping, BailOutcome<()>> =
+        EventKey::new(
+            EventSchemaId::new("hartevo.agent.turn-stopping.v1"),
+            "agent/turn-stopping",
+        );
 }
 
 /// Who currently owns a mapped surface. OpenInterpreter never owns Mission,
@@ -1390,12 +1397,18 @@ pub enum LlmError {
     InvalidStreamDispatch { expected: &'static str },
     #[error("LLM stream protocol must retain {expected}")]
     InvalidStreamProtocol { expected: &'static str },
+    #[error(
+        "LLM request failed ({code}): {message}",
+        code = .failure.code,
+        message = .failure.message
+    )]
+    RequestFailed { failure: SessionLlmFailure },
 }
 
 impl LlmError {
     /// Stable Harness-aligned machine code for this failure class.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::InvalidAdapter { .. } => "INVALID_ADAPTER",
             Self::DuplicateAdapter { .. } => "DUPLICATE_ADAPTER",
@@ -1407,6 +1420,7 @@ impl LlmError {
             Self::InvalidPreparedCall { .. } => "INVALID_PREPARED_CALL",
             Self::InvalidStreamDispatch { .. } => "INVALID_STREAM_DISPATCH",
             Self::InvalidStreamProtocol { .. } => "INVALID_STREAM_PROTOCOL",
+            Self::RequestFailed { failure } => failure.code.as_str(),
         }
     }
 }
@@ -1482,6 +1496,39 @@ impl AgentRef {
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self { id: id.into() }
+    }
+}
+
+/// Immutable terminal-turn scope passed to `agent/turn-stopping` listeners.
+#[derive(Debug, Clone)]
+pub struct AgentTurnStopping {
+    agent: AgentRef,
+    turn: u64,
+    cancellation: LifecycleCancellation,
+}
+
+impl AgentTurnStopping {
+    pub(crate) fn new(agent: AgentRef, turn: u64, cancellation: LifecycleCancellation) -> Self {
+        Self {
+            agent,
+            turn,
+            cancellation,
+        }
+    }
+
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        &self.agent
+    }
+
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
     }
 }
 
@@ -2359,8 +2406,8 @@ impl Default for HartevoSurfaces {
 ///
 /// Tools pipeline: three waterfalls plus observe-only `tools/result`.
 /// LLM streams use `llm/stream`; agent coordination exposes created/disposed
-/// emits plus the authoritative `agent/pre-step` and `agent/request`
-/// waterfalls. Domain /
+/// emits, the authoritative `agent/pre-step` and `agent/request` waterfalls,
+/// plus serial `agent/turn-stopping`. Domain /
 /// effect_broker / runtime / desktop are Hartevo-owned lookups and never go
 /// through OpenInterpreter.
 pub(crate) fn map_surfaces(
@@ -2409,6 +2456,7 @@ fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
     validate_mapped_event(ctx, events::AGENT_DISPOSED)?;
     validate_mapped_event(ctx, events::AGENT_PRE_STEP)?;
     validate_mapped_event(ctx, events::AGENT_REQUEST)?;
+    validate_mapped_event(ctx, events::AGENT_TURN_STOPPING)?;
     validate_mapped_event(ctx, session_events::SESSION_EVENT)?;
     validate_mapped_event(ctx, session_events::SESSION_FLUSH)?;
     Ok(())
@@ -2457,6 +2505,7 @@ fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
     ctx.lock_event_key(events::AGENT_DISPOSED)?;
     ctx.lock_event_key(events::AGENT_PRE_STEP)?;
     ctx.lock_event_key(events::AGENT_REQUEST)?;
+    ctx.lock_event_key(events::AGENT_TURN_STOPPING)?;
     ctx.lock_event_key(session_events::SESSION_EVENT)?;
     ctx.lock_event_key(session_events::SESSION_FLUSH)?;
     Ok(())
@@ -3313,6 +3362,7 @@ pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
         | "llm/stream"
         | "agent/pre-step"
         | "agent/request" => Some(DispatchMode::Waterfall),
+        "agent/turn-stopping" => Some(DispatchMode::Serial),
         "tools/result" | "agent/created" | "agent/disposed" | "session/event" => {
             Some(DispatchMode::Emit)
         }
@@ -3356,27 +3406,27 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_surface_event_descriptors_preflight_before_any_provider_mutation() {
+    fn all_thirteen_surface_event_descriptors_preflight_before_any_provider_mutation() {
         let mut ctx = Context::new();
-        let incompatible_last_key = EventKey::<Emit, AgentRef, ()>::new(
-            events::AGENT_REQUEST.schema_id(),
-            events::AGENT_REQUEST.name(),
+        let incompatible_last_key = EventKey::<Emit, AgentTurnStopping, ()>::new(
+            events::AGENT_TURN_STOPPING.schema_id(),
+            events::AGENT_TURN_STOPPING.name(),
         );
         ctx.lock_event_key(incompatible_last_key).unwrap();
-        let descriptor_before = ctx.event_descriptor(events::AGENT_REQUEST).unwrap();
+        let descriptor_before = ctx.event_descriptor(events::AGENT_TURN_STOPPING).unwrap();
 
         let error = map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap_err();
 
         assert!(matches!(
             error,
             CordisError::SchemaConflict { ref name, ref locked, ref requested }
-                if name == events::AGENT_REQUEST.name()
+                if name == events::AGENT_TURN_STOPPING.name()
                     && locked == &descriptor_before
-                    && requested == &events::AGENT_REQUEST.descriptor()
+                    && requested == &events::AGENT_TURN_STOPPING.descriptor()
         ));
         assert!(MAPPED_KEYS.iter().all(|key| !ctx.has(key)));
         assert_eq!(
-            ctx.event_descriptor(events::AGENT_REQUEST),
+            ctx.event_descriptor(events::AGENT_TURN_STOPPING),
             Some(descriptor_before)
         );
         for name in [
@@ -3389,6 +3439,7 @@ mod tests {
             events::AGENT_CREATED.name(),
             events::AGENT_DISPOSED.name(),
             events::AGENT_PRE_STEP.name(),
+            events::AGENT_REQUEST.name(),
         ] {
             assert_eq!(
                 ctx.event_descriptor(name),

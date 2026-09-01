@@ -2237,9 +2237,6 @@ impl SessionHandle {
         step: u64,
         messages: &[SessionMessage],
     ) -> Result<(), SessionError> {
-        if messages.is_empty() {
-            return Ok(());
-        }
         let _permit = SessionAppendPermit::enter(&self.appending, &self.id)?;
         let records = {
             let mut log = self.lock()?;
