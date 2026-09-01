@@ -5,7 +5,10 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
+use crate::agent::{
+    AgentLoop, AgentStep, AgentStepResult, AgentTurnOutcome, run_agent_step,
+    run_authorized_runtime_agent_turn,
+};
 use crate::authority::{
     AuthorityScope, DomainCommandBinding, DomainCommandLease, DomainCommandPermit,
     EffectExecutionBinding, EffectExecutionLease, EffectExecutionPermit,
@@ -14,6 +17,7 @@ use crate::authority::{
     RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
 };
 use crate::context::{Context, CordisError, TeardownTransaction, keys};
+use crate::fiber::LifecycleCancellation;
 use crate::invariants::{InvariantGate, OPENINTERPRETER, apply_effect, enforce_runtime_invariants};
 use crate::kernel::{
     KernelApproval, KernelConsentRecord, KernelConsentState, bind_domain_kernel_facts,
@@ -22,7 +26,7 @@ use crate::loader::{
     EnvironmentOverlay, LoadReport, LoaderContext, PluginId, PluginSpec, load_plugins,
 };
 use crate::service::Service;
-use crate::session::SessionStore;
+use crate::session::{SessionCallConfig, SessionId, SessionStore};
 use crate::surface::{
     AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
     LlmSurface, RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolsSurface, events,
@@ -300,6 +304,33 @@ impl CordisHost {
             lease,
         });
         Ok(permit)
+    }
+
+    /// Drive one canonical Session turn under an exact active Runtime permit.
+    ///
+    /// Unlike the general agent entry, this uses read/plan invariants and
+    /// therefore never invents consent or approval. The caller must retain the
+    /// same one-shot permit that authorized the Application Runtime operation.
+    pub async fn run_authorized_runtime_agent_turn(
+        &mut self,
+        permit: &RuntimeDispatchPermit,
+        session_id: &SessionId,
+        seed_config: SessionCallConfig,
+        cancellation: &LifecycleCancellation,
+    ) -> Result<AgentTurnOutcome, CordisError> {
+        self.reap_abandoned_runtime();
+        let Some(active) = self.active_runtime.as_ref() else {
+            return Err(CordisError::RuntimePermitMismatch);
+        };
+        if active.serial != permit.serial()
+            || active.scope != *permit.scope()
+            || active.agent_id != permit.agent_id()
+            || !permit.owns_lease(&active.lease)
+        {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        run_authorized_runtime_agent_turn(&mut self.ctx, session_id, seed_config, cancellation)
+            .await
     }
 
     /// Settle an issued Runtime permit and return an out-of-lock lifecycle

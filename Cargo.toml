@@ -38,6 +38,7 @@ command-fds = "0.3.3"
 crossbeam-channel = "0.5.16"
 dioxus = { version = "=0.7.10", default-features = false, features = ["launch", "lib"] }
 futures-core = "0.3.34"
+futures-executor = "0.3.34"
 futures-util = "0.3.34"
 hex = "0.4"
 keyring-core = "=1.0.0"
