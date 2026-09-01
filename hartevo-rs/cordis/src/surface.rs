@@ -31,6 +31,9 @@ use crate::session::{
 /// Canonical DeepSeek Harness code for a tool call cancelled before dispatch.
 pub const TOOL_ABORTED_BEFORE_DISPATCH: &str = "ABORTED_BEFORE_DISPATCH";
 
+/// Canonical provider-neutral code for a request rejected by context capacity.
+pub const CONTEXT_WINDOW_EXCEEDED_CODE: &str = "CONTEXT_WINDOW_EXCEEDED";
+
 const TOOL_ABORTED_BEFORE_DISPATCH_MESSAGE: &str = "tool call aborted before dispatch";
 
 /// Cordis keys this mapping provides and looks up.

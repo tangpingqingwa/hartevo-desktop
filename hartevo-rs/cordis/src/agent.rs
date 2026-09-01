@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
+use crate::compaction_automation::{
+    ContextOverflowRecovery, compact_before_agent_step, recover_context_overflow,
+};
 use crate::context::{Context, CordisError, keys};
 use crate::fiber::LifecycleCancellation;
 use crate::inbox::AgentInboxTarget;
@@ -923,6 +926,10 @@ async fn run_agent_turn_with_invariants(
     result
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the durable turn driver keeps pressure maintenance, step ownership, and terminal steering in one ordered loop"
+)]
 async fn drive_agent_turn(
     ctx: &mut Context,
     agent: &AgentRef,
@@ -945,6 +952,23 @@ async fn drive_agent_turn(
                 reason: cancelled_turn_reason(cancellation),
             });
         }
+        let allow_empty_continuation = steps > 0 && turn_end.is_none();
+        if maintain_agent_step_pressure(
+            ctx,
+            session,
+            target,
+            allow_empty_continuation,
+            turn,
+            cancellation,
+        )
+        .await?
+        {
+            return Ok(AgentTurnOutcome {
+                turn,
+                steps,
+                reason: cancelled_turn_reason(cancellation),
+            });
+        }
         let step = steps
             .checked_add(1)
             .ok_or(SessionError::StepSequenceOverflow { turn })?;
@@ -959,7 +983,7 @@ async fn drive_agent_turn(
                 step,
                 seed_config: seed_config.clone(),
                 cancellation,
-                allow_empty_continuation: steps > 0 && turn_end.is_none(),
+                allow_empty_continuation,
             },
         )?;
         let logged = match admission {
@@ -1028,12 +1052,43 @@ async fn drive_agent_turn(
     }
 }
 
+async fn maintain_agent_step_pressure(
+    ctx: &mut Context,
+    session: &SessionHandle,
+    target: AgentInboxTarget,
+    allow_empty_continuation: bool,
+    turn: u64,
+    cancellation: &LifecycleCancellation,
+) -> Result<bool, SessionError> {
+    if has_agent_step_candidate(session, target, allow_empty_continuation)? {
+        // Harness pressure maintenance is best-effort: configuration or
+        // summarization failure must not block the user's turn.
+        let _ = compact_before_agent_step(ctx, session, turn, cancellation).await;
+    }
+    Ok(cancellation.is_cancelled())
+}
+
+fn has_agent_step_candidate(
+    session: &SessionHandle,
+    target: AgentInboxTarget,
+    allow_empty_continuation: bool,
+) -> Result<bool, SessionError> {
+    if allow_empty_continuation {
+        return Ok(true);
+    }
+    match target {
+        AgentInboxTarget::NextTurn => Ok(!session.inbox().next_turn()?.is_empty()),
+        AgentInboxTarget::NextStep => Ok(!session.inbox().next_step()?.is_empty()),
+    }
+}
+
 async fn run_agent_turn_step(
     ctx: &mut Context,
     mut logged: LoggedAgentCall,
     request_state: &mut AgentRequestLogState,
     cancellation: &LifecycleCancellation,
 ) -> Result<Option<TurnEndReason>, CordisError> {
+    let mut overflow_retries = 0_u64;
     loop {
         if cancellation.is_cancelled() {
             return Ok(Some(cancelled_turn_reason(cancellation)));
@@ -1057,6 +1112,25 @@ async fn run_agent_turn_step(
         };
         if let Some(failure) = failed {
             let request = logged.call().request();
+            let session = agent_session(ctx, request.session_id())?;
+            let overflow_recovery = recover_context_overflow(
+                ctx,
+                &session,
+                request.turn(),
+                overflow_retries,
+                &failure,
+                request.cancellation(),
+            )
+            .await
+            .unwrap_or(ContextOverflowRecovery::PreserveFailure);
+            if cancellation.is_cancelled() {
+                return Ok(Some(cancelled_turn_reason(cancellation)));
+            }
+            if overflow_recovery.should_retry() {
+                overflow_retries = overflow_retries.saturating_add(1);
+                logged = rebuild_agent_turn_call(ctx, request_state, &logged)?;
+                continue;
+            }
             let recovery = AgentRequestError::new(
                 request.agent().clone(),
                 request.session_id().clone(),

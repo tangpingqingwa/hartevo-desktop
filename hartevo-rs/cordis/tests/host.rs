@@ -1406,14 +1406,17 @@ fn receipt_is_not_verification_on_host_effect() {
 }
 
 #[test]
-fn overlay_boot_starts_three_host_plugins_and_can_disable_openinterpreter() {
+fn overlay_boot_starts_four_host_plugins_and_can_disable_openinterpreter() {
     let overlay = EnvironmentOverlay::new("macos-r0");
     let loader = LoaderContext::new();
     let (mut host, report) = CordisHost::boot_overlay(&overlay, &loader, false).unwrap();
 
     assert_eq!(report.started, host_plugin_ids());
     assert_eq!(report.disabled, [PluginId::new(OPENINTERPRETER_PLUGIN_ID)]);
-    assert_eq!(HOST_PLUGIN_IDS, ["surfaces", "agent-loop", "invariants"]);
+    assert_eq!(
+        HOST_PLUGIN_IDS,
+        ["surfaces", "compaction-basic", "agent-loop", "invariants"]
+    );
     assert!(host.context().get::<&str>(OPENINTERPRETER).is_none());
     host_is_cordis_loop(&host).unwrap();
     assert_eq!(
@@ -1442,6 +1445,7 @@ fn overlay_boot_may_start_openinterpreter_adapter_without_owning_domain() {
         report.started,
         [
             PluginId::new("surfaces"),
+            PluginId::new("compaction-basic"),
             PluginId::new("agent-loop"),
             PluginId::new("invariants"),
             PluginId::new(OPENINTERPRETER_PLUGIN_ID),
