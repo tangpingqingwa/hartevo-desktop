@@ -1,6 +1,6 @@
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentRef, AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost,
+    AgentRef, AgentStatus, AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost,
     DomainCommandBinding, DomainCommandKind, DomainSurface, EffectBrokerSurface,
     EffectExecutionBinding, EffectReconciliationBinding, EnvironmentOverlay, HOST_PLUGIN_IDS,
     InvariantGate, KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
@@ -635,6 +635,7 @@ fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
     let agents = host.context().agents::<AgentsSurface>().unwrap();
     let started_agents = std::sync::Arc::clone(&agents);
     host.on_runtime_started(move |agent| {
+        assert_eq!(agent.status(), AgentStatus::Running);
         assert_eq!(
             started_agents.list().as_slice(),
             std::slice::from_ref(agent)
@@ -676,6 +677,77 @@ fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
     );
 }
 
+#[tokio::test]
+async fn runtime_agent_status_and_when_idle_follow_the_exact_permit() {
+    let idle = AgentRef::new("not-yet-published");
+    assert_eq!(idle.status(), AgentStatus::Idle);
+    idle.when_idle().await;
+
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    assert!(agents.list().is_empty());
+
+    permit.announce_started().unwrap();
+    let agent = agents.list().into_iter().next().unwrap();
+    assert_eq!(agent.status(), AgentStatus::Running);
+    let waiter = tokio::spawn({
+        let agent = agent.clone();
+        async move {
+            agent.when_idle().await;
+            agent.status()
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    let completion = host.finish_runtime(permit).unwrap();
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    assert_eq!(waiter.await.unwrap(), AgentStatus::Idle);
+    assert!(agents.list().is_empty());
+    completion.announce().unwrap();
+}
+
+#[tokio::test]
+async fn runtime_teardown_revokes_publication_while_the_permit_is_retained() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let agent = agents.list().into_iter().next().unwrap();
+    assert_eq!(agent.status(), AgentStatus::Running);
+
+    host.teardown();
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    agent.when_idle().await;
+    assert!(agents.list().is_empty());
+    assert!(host.active_runtime_scope().is_none());
+
+    let replacement = AgentRef::new(agent.id.clone());
+    agents.register(replacement.clone());
+    drop(permit);
+    let published = agents.list();
+    assert_eq!(published.as_slice(), std::slice::from_ref(&replacement));
+}
+
 #[test]
 fn runtime_agent_publication_collision_never_replaces_or_disposes_the_live_identity() {
     let mut host = CordisHost::boot(false).unwrap();
@@ -709,10 +781,9 @@ fn runtime_agent_publication_collision_never_replaces_or_disposes_the_live_ident
             id: agent.id.clone()
         }
     );
-    assert_eq!(
-        host.context().agents::<AgentsSurface>().unwrap().list(),
-        [agent]
-    );
+    let published = host.context().agents::<AgentsSurface>().unwrap().list();
+    assert_eq!(published.as_slice(), std::slice::from_ref(&agent));
+    assert_eq!(agent.status(), AgentStatus::Idle);
 
     host.finish_runtime(permit).unwrap().announce().unwrap();
     assert_eq!(disposed_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -732,14 +803,24 @@ fn runtime_agent_publication_panic_rolls_back_before_the_caller_recovers() {
     )
     .unwrap();
     let agents = host.context().agents::<AgentsSurface>().unwrap();
-    host.on_runtime_started(|_| panic!("publication listener panic"))
-        .unwrap();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed_agent = std::sync::Arc::clone(&observed);
+    host.on_runtime_started(move |agent| {
+        assert_eq!(agent.status(), AgentStatus::Running);
+        *observed_agent.lock().unwrap() = Some(agent.clone());
+        panic!("publication listener panic");
+    })
+    .unwrap();
 
     let mut permit = host.authorize_runtime(&scope).unwrap();
     let panicked =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| permit.announce_started()));
     assert!(panicked.is_err());
     assert!(agents.list().is_empty());
+    assert_eq!(
+        observed.lock().unwrap().as_ref().unwrap().status(),
+        AgentStatus::Idle
+    );
 
     host.finish_runtime(permit).unwrap().announce().unwrap();
     assert!(host.active_runtime_scope().is_none());
@@ -809,6 +890,36 @@ fn abandoned_runtime_permit_releases_agent_and_active_slot() {
     assert_eq!(host.active_runtime_scope(), Some(&scope));
     drop(permit);
     assert_eq!(host.active_runtime_scope(), None);
+    assert!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .is_empty()
+    );
+
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let abandoned = host
+        .context()
+        .agents::<AgentsSurface>()
+        .unwrap()
+        .list()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(abandoned.status(), AgentStatus::Running);
+    drop(permit);
+    assert_eq!(abandoned.status(), AgentStatus::Idle);
+    assert!(host.active_runtime_scope().is_none());
     assert!(
         host.context()
             .agents::<AgentsSurface>()

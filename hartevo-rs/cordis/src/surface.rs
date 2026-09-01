@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use futures_core::Stream;
+use tokio::sync::watch;
 
 use crate::context::{Context, CordisError, EventReentry, keys};
 use crate::effect::RegistrationHandle;
@@ -1486,18 +1487,100 @@ impl fmt::Debug for PreparedLlmCall {
     }
 }
 
+/// Public lifecycle of one exact Agent instance.
+///
+/// Disposal is represented by removal from [`AgentsSurface`], not a third
+/// status. A retained [`AgentRef`] settles back to `Idle` when that exact live
+/// activity ends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentStatus {
+    #[default]
+    Idle,
+    Running,
+}
+
+impl AgentStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentLifecycle {
+    status: watch::Sender<AgentStatus>,
+}
+
 /// Live agent identity registered on `ctx.agents`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AgentRef {
     pub id: String,
+    lifecycle: Arc<AgentLifecycle>,
 }
 
 impl AgentRef {
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        let (status, _) = watch::channel(AgentStatus::Idle);
+        Self {
+            id: id.into(),
+            lifecycle: Arc::new(AgentLifecycle { status }),
+        }
+    }
+
+    /// Current public state of this exact Agent lifecycle.
+    #[must_use]
+    pub fn status(&self) -> AgentStatus {
+        *self.lifecycle.status.borrow()
+    }
+
+    /// Wait until this exact Agent lifecycle has no active Runtime work.
+    ///
+    /// This follows the shared lifecycle behind cloned handles. It deliberately
+    /// does not follow a later registry entry that happens to reuse the same id.
+    pub async fn when_idle(&self) {
+        let mut status = self.lifecycle.status.subscribe();
+        loop {
+            let is_idle = *status.borrow_and_update() == AgentStatus::Idle;
+            if is_idle || status.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn mark_running(&self) {
+        self.lifecycle.status.send_replace(AgentStatus::Running);
+    }
+
+    fn mark_idle(&self) {
+        self.lifecycle.status.send_replace(AgentStatus::Idle);
+    }
+
+    fn is_same_lifecycle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lifecycle, &other.lifecycle)
     }
 }
+
+impl fmt::Debug for AgentRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentRef")
+            .field("id", &self.id)
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for AgentRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for AgentRef {}
 
 /// Immutable terminal-turn scope passed to `agent/turn-stopping` listeners.
 #[derive(Debug, Clone)]
@@ -2226,10 +2309,7 @@ impl UnpublishedAgent {
     pub(crate) fn commit(self) -> Result<AgentPublicationCommit, CordisError> {
         let Self { registry, agent } = self;
         registry.publish_unique(agent.clone())?;
-        Ok(AgentPublicationCommit {
-            registry,
-            id: agent.id,
-        })
+        Ok(AgentPublicationCommit { registry, agent })
     }
 }
 
@@ -2237,12 +2317,13 @@ impl UnpublishedAgent {
 #[derive(Debug)]
 pub(crate) struct AgentPublicationCommit {
     registry: AgentsSurface,
-    id: String,
+    agent: AgentRef,
 }
 
 impl Drop for AgentPublicationCommit {
     fn drop(&mut self) {
-        self.registry.unregister(&self.id);
+        self.agent.mark_idle();
+        self.registry.unregister_exact(&self.agent);
     }
 }
 
@@ -2274,8 +2355,16 @@ impl AgentsSurface {
         if live.iter().any(|published| published.id == agent.id) {
             return Err(CordisError::AgentAlreadyPublished { id: agent.id });
         }
+        agent.mark_running();
         live.push(agent);
         Ok(())
+    }
+
+    fn unregister_exact(&self, agent: &AgentRef) {
+        self.live
+            .lock()
+            .expect("agents")
+            .retain(|published| !published.is_same_lifecycle(agent));
     }
 
     pub fn unregister(&self, id: &str) {

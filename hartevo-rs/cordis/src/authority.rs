@@ -6,8 +6,8 @@
 
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::CordisError;
 use crate::event::PreparedEmit;
@@ -952,7 +952,6 @@ pub struct RuntimeDispatchPermit {
     agent_id: String,
     lease: Arc<RuntimeDispatchLease>,
     unpublished: Option<UnpublishedAgent>,
-    publication: Option<AgentPublicationCommit>,
     started: Option<PreparedEmit>,
     disposed: Option<PreparedEmit>,
     started_attempted: bool,
@@ -978,7 +977,6 @@ impl RuntimeDispatchPermit {
                 agent_id,
                 lease: Arc::clone(&lease),
                 unpublished: Some(unpublished),
-                publication: None,
                 started: Some(started),
                 disposed: Some(disposed),
                 started_attempted: false,
@@ -1004,11 +1002,8 @@ impl RuntimeDispatchPermit {
             .and_then(UnpublishedAgent::commit)
             .and_then(|publication| {
                 self.publication_committed = true;
-                let result = self.started.take().map_or(Ok(()), PreparedEmit::dispatch);
-                if result.is_ok() {
-                    self.publication = Some(publication);
-                }
-                result
+                self.started.take().map_or(Ok(()), PreparedEmit::dispatch)?;
+                self.lease.retain_publication(publication)
             });
         self.started_result = Some(result.clone());
         result
@@ -1032,7 +1027,6 @@ impl RuntimeDispatchPermit {
     }
 
     pub(crate) fn complete(mut self) -> RuntimeDispatchCompletion {
-        self.publication.take();
         self.unpublished.take();
         self.lease.release();
         self.settled = true;
@@ -1087,12 +1081,14 @@ impl RuntimeDispatchCompletion {
 
 pub(crate) struct RuntimeDispatchLease {
     active: AtomicBool,
+    publication: Mutex<Option<AgentPublicationCommit>>,
 }
 
 impl RuntimeDispatchLease {
     fn new() -> Self {
         Self {
             active: AtomicBool::new(true),
+            publication: Mutex::new(None),
         }
     }
 
@@ -1100,8 +1096,24 @@ impl RuntimeDispatchLease {
         self.active.load(Ordering::Acquire)
     }
 
+    fn retain_publication(&self, publication: AgentPublicationCommit) -> Result<(), CordisError> {
+        let mut retained = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.is_active() || retained.is_some() {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        *retained = Some(publication);
+        Ok(())
+    }
+
     pub(crate) fn release(&self) {
         self.active.store(false, Ordering::Release);
+        self.publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 

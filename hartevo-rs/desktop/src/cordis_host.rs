@@ -2346,9 +2346,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use futures_util::stream;
     use hartevo_cordis::{
-        AgentInboxOutcome, AgentInboxTarget, AgentStep, AgentsSurface, AuthorityDispatchError,
-        AuthorityScope, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
-        DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
+        AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStep, AgentsSurface,
+        AuthorityDispatchError, AuthorityScope, CordisError, CordisHost, DomainCommandBinding,
+        DomainCommandKind, DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, OPENINTERPRETER, RuntimeBinding,
@@ -3085,6 +3085,8 @@ mod tests {
         let expected_scope = scope.clone();
         let nested_calls = Arc::new(AtomicUsize::new(0));
         let observed_nested_calls = Arc::clone(&nested_calls);
+        let live_agent = Arc::new(Mutex::new(None::<AgentRef>));
+        let observed_agent = Arc::clone(&live_agent);
 
         let output = dispatch_live_runtime(
             &host,
@@ -3095,10 +3097,16 @@ mod tests {
             now(),
             move |permit| {
                 assert_eq!(permit.scope(), &expected_scope);
-                assert!(
-                    probe.try_lock().is_ok(),
-                    "Application adapter must run without the Cordis host lock"
-                );
+                let agent = {
+                    let unlocked = probe
+                        .try_lock()
+                        .expect("Application adapter must run without the Cordis host lock");
+                    let agents = unlocked.context().agents::<AgentsSurface>().unwrap().list();
+                    assert_eq!(agents.len(), 1);
+                    agents.into_iter().next().unwrap()
+                };
+                assert_eq!(agent.status(), AgentStatus::Running);
+                *observed_agent.lock().unwrap() = Some(agent);
                 let nested_scope = permit.scope().clone();
                 let nested = dispatch_live_runtime(
                     &probe,
@@ -3125,6 +3133,10 @@ mod tests {
         assert_eq!(output, "application-runtime");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(nested_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            live_agent.lock().unwrap().as_ref().unwrap().status(),
+            AgentStatus::Idle
+        );
         let host = host.lock().unwrap();
         assert!(host.active_runtime_scope().is_none());
         assert!(
