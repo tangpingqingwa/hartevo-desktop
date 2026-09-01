@@ -200,44 +200,58 @@ impl AgentInbox {
         Ok(removed.pop())
     }
 
+    /// Durably claim the complete batch proposed at one agent step boundary.
+    ///
+    /// Every claim drains next-step input first. A `NextTurn` claim then takes
+    /// at most the first queued turn message. Both deletions commit under one
+    /// Session append permit before the live projection changes.
+    pub fn claim(
+        &self,
+        target: AgentInboxTarget,
+        turn: u64,
+    ) -> Result<Vec<SessionMessage>, SessionError> {
+        let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
+        let (next_step_removed_count, claim_next_turn) = {
+            let state = self.lock()?;
+            let next_step_removed_count = u64::try_from(state.next_step.len())
+                .map_err(|_| SessionError::EventSequenceOverflow)?;
+            let claim_next_turn =
+                target == AgentInboxTarget::NextTurn && !state.next_turn.is_empty();
+            if next_step_removed_count > 0 {
+                state.validate(
+                    AgentInboxTarget::NextStep,
+                    0,
+                    Some(next_step_removed_count),
+                    &[],
+                    None,
+                )?;
+            }
+            if claim_next_turn {
+                state.validate(AgentInboxTarget::NextTurn, 0, Some(1), &[], None)?;
+            }
+            (next_step_removed_count, claim_next_turn)
+        };
+        let events =
+            self.session
+                .claim_agent_inbox_batch(turn, next_step_removed_count, claim_next_turn)?;
+        let claimed = self.apply_committed_batch(&events)?;
+        let expected = next_step_removed_count
+            .checked_add(u64::from(claim_next_turn))
+            .ok_or(SessionError::EventSequenceOverflow)?;
+        if u64::try_from(claimed.len()).map_err(|_| SessionError::EventSequenceOverflow)?
+            != expected
+        {
+            return Err(SessionError::InboxProjectionDrift);
+        }
+        Ok(claimed)
+    }
+
     /// Durably claim all queued next-step input in FIFO order.
     ///
     /// The requested turn must be the exact currently open Session turn. An
     /// empty queue returns an empty batch without appending a no-op event.
     pub fn claim_next_step(&self, turn: u64) -> Result<Vec<SessionMessage>, SessionError> {
-        let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
-        let removed_count = {
-            let state = self.lock()?;
-            if state.next_step.is_empty() {
-                self.session.require_open_turn(turn)?;
-                return Ok(Vec::new());
-            }
-            let removed_count = u64::try_from(state.next_step.len())
-                .map_err(|_| SessionError::EventSequenceOverflow)?;
-            state.validate(
-                AgentInboxTarget::NextStep,
-                0,
-                Some(removed_count),
-                &[],
-                None,
-            )?;
-            removed_count
-        };
-        let event = self.session.claim_agent_inbox_splice(
-            turn,
-            AgentInboxTarget::NextStep,
-            0,
-            Some(removed_count),
-            Vec::new(),
-            None,
-        )?;
-        let removed = self.apply_committed(&event)?;
-        if u64::try_from(removed.len()).map_err(|_| SessionError::EventSequenceOverflow)?
-            != removed_count
-        {
-            return Err(SessionError::InboxProjectionDrift);
-        }
-        Ok(removed)
+        self.claim(AgentInboxTarget::NextStep, turn)
     }
 
     fn mutate(
@@ -275,6 +289,30 @@ impl AgentInbox {
             .apply(*target, *start, *removed_count, inserted, *outcome)
     }
 
+    fn apply_committed_batch(
+        &self,
+        events: &[SessionEvent],
+    ) -> Result<Vec<SessionMessage>, SessionError> {
+        let mut state = self.lock()?;
+        let mut candidate = state.clone();
+        let mut removed = Vec::new();
+        for event in events {
+            let SessionEventKind::AgentInboxSpliced {
+                target,
+                start,
+                removed_count,
+                inserted,
+                outcome,
+            } = &event.kind
+            else {
+                return Err(SessionError::InboxProjectionDrift);
+            };
+            removed.extend(candidate.apply(*target, *start, *removed_count, inserted, *outcome)?);
+        }
+        *state = candidate;
+        Ok(removed)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, AgentInboxState>, SessionError> {
         self.state
             .lock()
@@ -282,7 +320,7 @@ impl AgentInbox {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct AgentInboxState {
     next_turn: Vec<SessionMessage>,
     next_step: Vec<SessionMessage>,

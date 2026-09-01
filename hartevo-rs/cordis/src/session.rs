@@ -2129,6 +2129,56 @@ impl SessionHandle {
         })
     }
 
+    pub(crate) fn claim_agent_inbox_batch(
+        &self,
+        turn: u64,
+        next_step_removed_count: u64,
+        claim_next_turn: bool,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        let _permit = SessionAppendPermit::enter(&self.appending, &self.id)?;
+        let records = {
+            let mut log = self.lock()?;
+            require_turn(log.open_turn(), turn)?;
+
+            let mut candidate = log.clone();
+            let mut events = Vec::with_capacity(2);
+            if next_step_removed_count > 0 {
+                events.push(candidate.append_agent_inbox_splice(
+                    AgentInboxTarget::NextStep,
+                    0,
+                    Some(next_step_removed_count),
+                    Vec::new(),
+                    None,
+                )?);
+            }
+            if claim_next_turn {
+                events.push(candidate.append_agent_inbox_splice(
+                    AgentInboxTarget::NextTurn,
+                    0,
+                    Some(1),
+                    Vec::new(),
+                    None,
+                )?);
+            }
+            let header = candidate.header().clone();
+            *log = candidate;
+            events
+                .into_iter()
+                .map(|event| SessionEventRecord {
+                    header: header.clone(),
+                    event,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if let Some(dispatcher) = &self.event_dispatcher {
+            for record in &records {
+                let _ = dispatcher.emit_contained(events::SESSION_EVENT, record);
+            }
+        }
+        Ok(records.into_iter().map(|record| record.event).collect())
+    }
+
     pub fn append_user_message(&self, message: SessionMessage) -> Result<(), SessionError> {
         self.commit(|log| log.append_user_message(message))
     }

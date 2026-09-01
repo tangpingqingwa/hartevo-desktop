@@ -285,6 +285,174 @@ fn append_commits_before_projection_and_contains_reentrant_mutation() {
 }
 
 #[test]
+fn combined_claim_orders_events_replays_and_keeps_empty_claim_event_free() {
+    let host = CordisHost::boot(false).unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("inbox-combined-claim").unwrap())
+        .unwrap();
+    let inbox = session.inbox();
+    let first_turn = user_message("turn-first", "turn first");
+    let second_turn = user_message("turn-second", "turn second");
+    let first_step = user_message("step-first", "step first");
+    let second_step = user_message("step-second", "step second");
+    inbox.append_next_turn(first_turn.clone()).unwrap();
+    inbox.append_next_turn(second_turn.clone()).unwrap();
+    inbox.append_next_step(first_step.clone()).unwrap();
+    inbox.append_next_step(second_step.clone()).unwrap();
+
+    let before_turn = session.events().unwrap().len();
+    assert_eq!(
+        inbox.claim(AgentInboxTarget::NextTurn, 1),
+        Err(SessionError::NoOpenTurn)
+    );
+    assert_eq!(session.events().unwrap().len(), before_turn);
+    assert_eq!(
+        inbox.next_step().unwrap(),
+        [first_step.clone(), second_step.clone()]
+    );
+    assert_eq!(
+        inbox.next_turn().unwrap(),
+        [first_turn.clone(), second_turn.clone()]
+    );
+
+    let turn = session.start_turn().unwrap();
+    assert_eq!(
+        inbox.claim(AgentInboxTarget::NextTurn, turn + 1),
+        Err(SessionError::TurnMismatch {
+            expected: turn,
+            actual: turn + 1,
+        })
+    );
+
+    let before_claim = session.events().unwrap().len();
+    assert_eq!(
+        inbox.claim(AgentInboxTarget::NextTurn, turn).unwrap(),
+        [first_step.clone(), second_step.clone(), first_turn.clone()]
+    );
+    let events = session.events().unwrap();
+    assert_eq!(events.len(), before_claim + 2);
+    assert!(matches!(
+        &events[before_claim].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextStep,
+            start: 0,
+            removed_count: Some(2),
+            inserted,
+            outcome: None,
+        } if inserted.is_empty()
+    ));
+    assert!(matches!(
+        &events[before_claim + 1].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            start: 0,
+            removed_count: Some(1),
+            inserted,
+            outcome: None,
+        } if inserted.is_empty()
+    ));
+    assert!(inbox.next_step().unwrap().is_empty());
+    assert_eq!(
+        inbox.next_turn().unwrap().as_slice(),
+        std::slice::from_ref(&second_turn)
+    );
+
+    let restored = SessionStore::new()
+        .restore(session.header().unwrap(), events)
+        .unwrap();
+    assert!(restored.inbox().next_step().unwrap().is_empty());
+    assert_eq!(
+        restored.inbox().next_turn().unwrap().as_slice(),
+        std::slice::from_ref(&second_turn)
+    );
+
+    let before_empty = session.events().unwrap().len();
+    assert!(
+        inbox
+            .claim(AgentInboxTarget::NextStep, turn)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(session.events().unwrap().len(), before_empty);
+    session.finish_turn(turn, TurnEndReason::Completed).unwrap();
+    assert_eq!(
+        inbox.claim(AgentInboxTarget::NextStep, turn),
+        Err(SessionError::NoOpenTurn)
+    );
+}
+
+#[test]
+fn combined_claim_holds_inbox_and_session_permits_through_publication() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let id = SessionId::new("inbox-combined-permits").unwrap();
+    let session = sessions.create(id.clone()).unwrap();
+    let inbox = session.inbox();
+    let turn_message = user_message("turn", "turn");
+    let step_message = user_message("step", "step");
+    inbox.append_next_turn(turn_message.clone()).unwrap();
+    inbox.append_next_step(step_message.clone()).unwrap();
+    let turn = session.start_turn().unwrap();
+
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let callback_observations = Arc::clone(&observations);
+    let callback_inbox = inbox.clone();
+    let callback_session = session.clone();
+    host.context_mut()
+        .on_emit(session_events::SESSION_EVENT, move |record| {
+            let SessionEventKind::AgentInboxSpliced {
+                target,
+                removed_count: Some(_),
+                inserted,
+                outcome: None,
+                ..
+            } = &record.event.kind
+            else {
+                return;
+            };
+            if inserted.is_empty() {
+                callback_observations.lock().unwrap().push((
+                    *target,
+                    callback_inbox.next_step().unwrap(),
+                    callback_inbox.next_turn().unwrap(),
+                    callback_inbox
+                        .append_next_step(user_message("nested", "nested"))
+                        .unwrap_err(),
+                    callback_session
+                        .finish_turn(turn, TurnEndReason::Completed)
+                        .unwrap_err(),
+                ));
+            }
+        })
+        .unwrap();
+
+    assert_eq!(
+        inbox.claim(AgentInboxTarget::NextTurn, turn).unwrap(),
+        [step_message.clone(), turn_message.clone()]
+    );
+    assert_eq!(
+        *observations.lock().unwrap(),
+        [
+            (
+                AgentInboxTarget::NextStep,
+                vec![step_message.clone()],
+                vec![turn_message.clone()],
+                SessionError::InboxMutationInProgress { id: id.clone() },
+                SessionError::AppendInProgress { id: id.clone() },
+            ),
+            (
+                AgentInboxTarget::NextTurn,
+                vec![step_message],
+                vec![turn_message],
+                SessionError::InboxMutationInProgress { id: id.clone() },
+                SessionError::AppendInProgress { id },
+            ),
+        ]
+    );
+}
+
+#[test]
 fn next_step_claim_requires_the_exact_turn_and_drains_fifo_before_projection() {
     let mut host = CordisHost::boot(false).unwrap();
     let sessions = host.context().sessions::<SessionStore>().unwrap();
