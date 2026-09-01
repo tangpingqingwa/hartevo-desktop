@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::context::{Context, CordisError, keys};
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
-use crate::session::{SessionMessage, SessionStore, events as session_events};
+use crate::session::{SessionCallConfig, SessionMessage, SessionStore, events as session_events};
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
@@ -28,7 +28,7 @@ pub const MAPPED_KEYS: &[&str] = &[
 pub mod events {
     use crate::event::{Emit, EventKey, EventSchemaId, Waterfall};
 
-    use super::{AgentPreStep, AgentRef, LlmStream, ToolCall};
+    use super::{AgentPreStep, AgentRef, AgentRequest, LlmStream, ToolCall};
 
     /// Allow / deny / ask waterfall before a tool body runs.
     pub const TOOLS_PRE_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
@@ -67,6 +67,11 @@ pub mod events {
     pub const AGENT_PRE_STEP: EventKey<Waterfall, AgentPreStep, AgentPreStep> = EventKey::new(
         EventSchemaId::new("hartevo.agent.pre-step.v1"),
         "agent/pre-step",
+    );
+    /// Replace only the call config for one exact open agent step.
+    pub const AGENT_REQUEST: EventKey<Waterfall, AgentRequest, AgentRequest> = EventKey::new(
+        EventSchemaId::new("hartevo.agent.request.v1"),
+        "agent/request",
     );
 }
 
@@ -253,6 +258,58 @@ impl AgentPreStep {
         {
             *starts_request_series = true;
         }
+        self
+    }
+}
+
+/// Immutable agent/turn/step scope plus the replaceable model call config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRequest {
+    agent: AgentRef,
+    turn: u64,
+    step: u64,
+    config: SessionCallConfig,
+}
+
+impl AgentRequest {
+    pub(crate) fn new(agent: AgentRef, turn: u64, step: u64, config: SessionCallConfig) -> Self {
+        Self {
+            agent,
+            turn,
+            step,
+            config,
+        }
+    }
+
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        &self.agent
+    }
+
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        self.step
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &SessionCallConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub fn into_config(self) -> SessionCallConfig {
+        self.config
+    }
+
+    /// Replace only model-call configuration while retaining exact scope.
+    #[must_use]
+    pub fn with_config(mut self, config: SessionCallConfig) -> Self {
+        self.config = config;
         self
     }
 }
@@ -514,7 +571,8 @@ impl Default for HartevoSurfaces {
 ///
 /// Tools pipeline: three waterfalls plus observe-only `tools/result`.
 /// LLM streams use `llm/stream`; agent coordination exposes created/disposed
-/// emits plus the authoritative `agent/pre-step` waterfall. Domain /
+/// emits plus the authoritative `agent/pre-step` and `agent/request`
+/// waterfalls. Domain /
 /// effect_broker / runtime / desktop are Hartevo-owned lookups and never go
 /// through OpenInterpreter.
 pub(crate) fn map_surfaces(
@@ -560,6 +618,7 @@ fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
     validate_mapped_event(ctx, events::AGENT_CREATED)?;
     validate_mapped_event(ctx, events::AGENT_DISPOSED)?;
     validate_mapped_event(ctx, events::AGENT_PRE_STEP)?;
+    validate_mapped_event(ctx, events::AGENT_REQUEST)?;
     validate_mapped_event(ctx, session_events::SESSION_EVENT)?;
     validate_mapped_event(ctx, session_events::SESSION_FLUSH)?;
     Ok(())
@@ -606,6 +665,7 @@ fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
     ctx.lock_event_key(events::AGENT_CREATED)?;
     ctx.lock_event_key(events::AGENT_DISPOSED)?;
     ctx.lock_event_key(events::AGENT_PRE_STEP)?;
+    ctx.lock_event_key(events::AGENT_REQUEST)?;
     ctx.lock_event_key(session_events::SESSION_EVENT)?;
     ctx.lock_event_key(session_events::SESSION_FLUSH)?;
     Ok(())
@@ -687,7 +747,7 @@ pub fn stream_llm(ctx: &mut Context, request: LlmStream) -> Result<LlmStream, Co
 pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
     match name.as_ref() {
         "tools/pre-execute" | "tools/execute" | "tools/post-execute" | "llm/stream"
-        | "agent/pre-step" => Some(DispatchMode::Waterfall),
+        | "agent/pre-step" | "agent/request" => Some(DispatchMode::Waterfall),
         "tools/result" | "agent/created" | "agent/disposed" | "session/event" => {
             Some(DispatchMode::Emit)
         }
@@ -731,27 +791,27 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_surface_event_descriptors_preflight_before_any_provider_mutation() {
+    fn all_nine_surface_event_descriptors_preflight_before_any_provider_mutation() {
         let mut ctx = Context::new();
         let incompatible_last_key = EventKey::<Emit, AgentRef, ()>::new(
-            events::AGENT_PRE_STEP.schema_id(),
-            events::AGENT_PRE_STEP.name(),
+            events::AGENT_REQUEST.schema_id(),
+            events::AGENT_REQUEST.name(),
         );
         ctx.lock_event_key(incompatible_last_key).unwrap();
-        let descriptor_before = ctx.event_descriptor(events::AGENT_PRE_STEP).unwrap();
+        let descriptor_before = ctx.event_descriptor(events::AGENT_REQUEST).unwrap();
 
         let error = map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap_err();
 
         assert!(matches!(
             error,
             CordisError::SchemaConflict { ref name, ref locked, ref requested }
-                if name == events::AGENT_PRE_STEP.name()
+                if name == events::AGENT_REQUEST.name()
                     && locked == &descriptor_before
-                    && requested == &events::AGENT_PRE_STEP.descriptor()
+                    && requested == &events::AGENT_REQUEST.descriptor()
         ));
         assert!(MAPPED_KEYS.iter().all(|key| !ctx.has(key)));
         assert_eq!(
-            ctx.event_descriptor(events::AGENT_PRE_STEP),
+            ctx.event_descriptor(events::AGENT_REQUEST),
             Some(descriptor_before)
         );
         for name in [
@@ -762,6 +822,7 @@ mod tests {
             events::LLM_STREAM.name(),
             events::AGENT_CREATED.name(),
             events::AGENT_DISPOSED.name(),
+            events::AGENT_PRE_STEP.name(),
         ] {
             assert_eq!(
                 ctx.event_descriptor(name),

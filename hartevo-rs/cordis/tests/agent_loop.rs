@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentInboxTarget, AgentLoop, AgentPreStepDecision, AgentRef, AgentStep, Context, CordisError,
-    CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
-    KernelApprovalDecision, KernelConsentState, LlmStream, LoaderContext, RuntimeSurface,
-    SessionContentBlock, SessionError, SessionEventKind, SessionId, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent, SurfaceOwner,
-    ToolCall, TurnEndReason, admit_agent_step, events, keys, prepare_agent_step, run_agent_step,
-    session_events,
+    AgentInboxTarget, AgentLoop, AgentPreStepDecision, AgentRef, AgentRequestAdmission, AgentStep,
+    Context, CordisError, CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay,
+    KernelApproval, KernelApprovalDecision, KernelConsentState, LlmStream, LoaderContext,
+    RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind,
+    SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
+    SessionSurfaceIntent, SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request,
+    admit_agent_step, events, keys, prepare_agent_step, run_agent_step, session_events,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -41,6 +41,17 @@ fn user_message(id: &str, text: &str) -> SessionMessage {
         role: SessionMessageRole::User,
         content: vec![SessionContentBlock::Text { text: text.into() }],
         source: SessionMessageSource::User,
+    }
+}
+
+fn call_config(provider: &str, model: &str) -> SessionCallConfig {
+    SessionCallConfig {
+        provider: provider.into(),
+        model: model.into(),
+        reasoning_effort: None,
+        temperature: None,
+        max_tokens: None,
+        stop: None,
     }
 }
 
@@ -285,6 +296,220 @@ fn step_entry_publishes_the_committed_batch_in_order_and_rejects_reentry() {
         })
     );
     assert_eq!(session.derive_messages().unwrap().len(), 2);
+}
+
+#[test]
+fn request_admission_freezes_messages_before_replacing_only_config() {
+    let mut ctx = mapped();
+    ctx.on_waterfall(events::AGENT_PRE_STEP, |proposal, next| {
+        next(proposal).with_starts_request_series()
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-admission").unwrap())
+        .unwrap();
+    let prompt = user_message("prompt", "prompt");
+    let later = user_message("later", "later");
+    session.inbox().append_next_turn(prompt.clone()).unwrap();
+    let turn = session.start_turn().unwrap();
+    {
+        let callback_session = session.clone();
+        let later = later.clone();
+        ctx.on_waterfall(events::AGENT_REQUEST, move |request, next| {
+            assert_eq!(request.agent(), &AgentRef::new("request-admission"));
+            assert_eq!(request.turn(), turn);
+            assert_eq!(request.step(), 1);
+            assert_eq!(request.config(), &call_config("seed", "seed-model"));
+            callback_session.append_user_message(later.clone()).unwrap();
+            next(request.with_config(call_config("routed", "routed-model")))
+        })
+        .unwrap();
+    }
+
+    let admission = admit_agent_request(
+        &mut ctx,
+        session.id(),
+        AgentInboxTarget::NextTurn,
+        turn,
+        1,
+        call_config("seed", "seed-model"),
+    )
+    .unwrap();
+    let AgentRequestAdmission::Request(prepared) = admission else {
+        panic!("a non-empty admitted step must prepare one request");
+    };
+
+    assert_eq!(prepared.agent(), &AgentRef::new("request-admission"));
+    assert_eq!(prepared.turn(), turn);
+    assert_eq!(prepared.step(), 1);
+    assert_eq!(prepared.config(), &call_config("routed", "routed-model"));
+    assert_eq!(prepared.messages(), std::slice::from_ref(&prompt));
+    assert!(prepared.starts_request_series());
+    assert_eq!(session.derive_messages().unwrap(), [prompt, later]);
+    assert_eq!(session.request_header().unwrap(), None);
+    assert_eq!(session.request_context().unwrap(), None);
+}
+
+#[test]
+fn reject_and_empty_step_skip_request_waterfall() {
+    let request_calls = Arc::new(AtomicUsize::new(0));
+
+    let mut rejected_ctx = mapped();
+    {
+        let request_calls = Arc::clone(&request_calls);
+        rejected_ctx
+            .on_waterfall(events::AGENT_REQUEST, move |request, next| {
+                request_calls.fetch_add(1, Ordering::SeqCst);
+                next(request)
+            })
+            .unwrap();
+    }
+    rejected_ctx
+        .on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| proposal.reject())
+        .unwrap();
+    let rejected_session = rejected_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-rejected").unwrap())
+        .unwrap();
+    rejected_session
+        .inbox()
+        .append_next_turn(user_message("reject", "reject"))
+        .unwrap();
+    let rejected_turn = rejected_session.start_turn().unwrap();
+    let rejected = admit_agent_request(
+        &mut rejected_ctx,
+        rejected_session.id(),
+        AgentInboxTarget::NextTurn,
+        rejected_turn,
+        1,
+        call_config("", ""),
+    )
+    .unwrap();
+    assert!(matches!(
+        rejected,
+        AgentRequestAdmission::NoRequest(proposal)
+            if proposal.decision() == &AgentPreStepDecision::Reject
+    ));
+
+    let mut empty_ctx = mapped();
+    {
+        let request_calls = Arc::clone(&request_calls);
+        empty_ctx
+            .on_waterfall(events::AGENT_REQUEST, move |request, next| {
+                request_calls.fetch_add(1, Ordering::SeqCst);
+                next(request)
+            })
+            .unwrap();
+    }
+    empty_ctx
+        .on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| {
+            proposal.replace_messages(Vec::new())
+        })
+        .unwrap();
+    let empty_session = empty_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-empty").unwrap())
+        .unwrap();
+    empty_session
+        .inbox()
+        .append_next_turn(user_message("empty", "empty"))
+        .unwrap();
+    let empty_turn = empty_session.start_turn().unwrap();
+    let empty = admit_agent_request(
+        &mut empty_ctx,
+        empty_session.id(),
+        AgentInboxTarget::NextTurn,
+        empty_turn,
+        1,
+        call_config("", ""),
+    )
+    .unwrap();
+    assert!(matches!(
+        empty,
+        AgentRequestAdmission::NoRequest(proposal)
+            if matches!(proposal.decision(), AgentPreStepDecision::Enter { messages, .. } if messages.is_empty())
+    ));
+    assert_eq!(request_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn invalid_request_config_fails_after_step_entry_before_request_events() {
+    let mut ctx = mapped();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-invalid-config").unwrap())
+        .unwrap();
+    let prompt = user_message("prompt", "prompt");
+    session.inbox().append_next_turn(prompt.clone()).unwrap();
+    let turn = session.start_turn().unwrap();
+
+    assert_eq!(
+        admit_agent_request(
+            &mut ctx,
+            session.id(),
+            AgentInboxTarget::NextTurn,
+            turn,
+            1,
+            call_config("", ""),
+        ),
+        Err(CordisError::Session(
+            SessionError::InvalidAgentRequestConfig {
+                expected: "non-empty provider and model",
+            }
+        ))
+    );
+    assert_eq!(session.derive_messages().unwrap(), [prompt]);
+    assert_eq!(session.request_header().unwrap(), None);
+    assert_eq!(session.request_context().unwrap(), None);
+    assert!(matches!(
+        session.start_step(turn),
+        Err(SessionError::StepAlreadyOpen { turn: open_turn, step: 1 })
+            if open_turn == turn
+    ));
+}
+
+#[test]
+fn request_admission_rechecks_the_exact_open_step_after_waterfall() {
+    let mut ctx = mapped();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("request-step-moved").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("prompt", "prompt"))
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+    {
+        let callback_session = session.clone();
+        ctx.on_waterfall(events::AGENT_REQUEST, move |request, next| {
+            callback_session.finish_step(turn, 1).unwrap();
+            next(request)
+        })
+        .unwrap();
+    }
+
+    assert_eq!(
+        admit_agent_request(
+            &mut ctx,
+            session.id(),
+            AgentInboxTarget::NextTurn,
+            turn,
+            1,
+            call_config("provider", "model"),
+        ),
+        Err(CordisError::Session(SessionError::NoOpenStep { turn }))
+    );
+    assert!(matches!(
+        session.events().unwrap().last().map(|event| &event.kind),
+        Some(SessionEventKind::StepEnd { turn: end_turn, step: 1 }) if *end_turn == turn
+    ));
 }
 
 #[test]

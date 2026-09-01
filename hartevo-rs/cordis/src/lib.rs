@@ -32,7 +32,8 @@ mod session;
 mod surface;
 
 pub use agent::{
-    AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, admit_agent_step, prepare_agent_step,
+    AGENT_LOOP_KEYS, AgentLoop, AgentRequestAdmission, AgentStep, AgentStepResult,
+    PreparedAgentRequest, admit_agent_request, admit_agent_step, prepare_agent_step,
     run_agent_step,
 };
 pub use authority::{
@@ -100,8 +101,8 @@ pub use session::{
     TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, events as session_events,
 };
 pub use surface::{
-    AgentPreStep, AgentPreStepDecision, AgentRef, AgentsSurface, DesktopSurface, DomainSurface,
-    EffectBrokerSurface, LlmStream, LlmSurface, MAPPED_KEYS, RuntimeSurface, SurfaceOwner,
-    ToolCall, ToolsSurface, events, expected_mode, register_agent, register_llm_stream,
-    register_tool, run_tools_pipeline, stream_llm,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DesktopSurface,
+    DomainSurface, EffectBrokerSurface, LlmStream, LlmSurface, MAPPED_KEYS, RuntimeSurface,
+    SurfaceOwner, ToolCall, ToolsSurface, events, expected_mode, register_agent,
+    register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
 };
