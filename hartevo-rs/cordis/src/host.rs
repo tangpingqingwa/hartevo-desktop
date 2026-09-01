@@ -375,7 +375,7 @@ impl CordisHost {
         let (permit, lease) = RuntimeDispatchPermit::issue(
             serial,
             scope.clone(),
-            agent.id.clone(),
+            agent.clone(),
             unpublished,
             notifications,
         );
@@ -409,11 +409,30 @@ impl CordisHost {
             || active.scope != *permit.scope()
             || active.agent_id != permit.agent_id()
             || !permit.owns_lease(&active.lease)
+            || !permit.has_live_publication()
         {
             return Err(CordisError::RuntimePermitMismatch);
         }
-        run_authorized_runtime_agent_turn(&mut self.ctx, session_id, seed_config, cancellation)
-            .await
+        let Some(agents) = self.ctx.agents::<AgentsSurface>() else {
+            return Err(CordisError::MissingDependencies(vec![
+                keys::AGENTS.to_string(),
+            ]));
+        };
+        if !agents
+            .list()
+            .iter()
+            .any(|agent| agent.is_same_lifecycle(permit.agent()))
+        {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        run_authorized_runtime_agent_turn(
+            &mut self.ctx,
+            permit.agent(),
+            session_id,
+            seed_config,
+            cancellation,
+        )
+        .await
     }
 
     /// Settle an issued Runtime permit and return an out-of-lock lifecycle

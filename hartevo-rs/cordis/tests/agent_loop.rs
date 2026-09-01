@@ -488,6 +488,75 @@ fn turn_driver_initial_empty_completes_without_opening_a_step() {
 }
 
 #[test]
+fn generic_turn_reuses_one_agent_instance_across_live_extension_points() {
+    let mut ctx = mapped();
+    let (adapter, _) = sequenced_adapter(vec![vec![SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Stop,
+        replay_state: None,
+    }]]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::<AgentRef>::new()));
+    {
+        let observed = Arc::clone(&observed);
+        ctx.on_waterfall(events::AGENT_PRE_STEP, move |proposal, next| {
+            observed.lock().unwrap().push(proposal.agent().clone());
+            next(proposal)
+        })
+        .unwrap();
+    }
+    {
+        let observed = Arc::clone(&observed);
+        ctx.on_waterfall(events::AGENT_REQUEST, move |request, next| {
+            observed.lock().unwrap().push(request.agent().clone());
+            next(request)
+        })
+        .unwrap();
+    }
+    {
+        let observed = Arc::clone(&observed);
+        ctx.on_serial(
+            events::AGENT_TURN_STOPPING,
+            move |stopping: Arc<AgentTurnStopping>| {
+                observed.lock().unwrap().push(stopping.agent().clone());
+                std::future::ready(Ok::<_, std::convert::Infallible>(BailOutcome::Continue(
+                    NonBail::Undefined,
+                )))
+            },
+        )
+        .unwrap();
+    }
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("one-generic-agent").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("one-agent-input", "run"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 3);
+    assert_eq!(observed[0].id, session.id().as_str());
+    assert!(
+        observed[1..]
+            .iter()
+            .all(|agent| agent.is_same_lifecycle(&observed[0]))
+    );
+}
+
+#[test]
 fn turn_driver_calls_model_from_history_after_an_empty_tool_continuation() {
     let mut ctx = mapped();
     let mut first = tool_call_chunks(0, "driver-call", "driver-tool", "{}").to_vec();
@@ -1226,6 +1295,7 @@ fn request_admission_freezes_messages_before_replacing_only_config() {
     };
 
     assert_eq!(prepared.agent(), &AgentRef::new("request-admission"));
+    assert_eq!(prepared.session_id(), session.id());
     assert_eq!(prepared.turn(), turn);
     assert_eq!(prepared.step(), 1);
     assert_eq!(prepared.config(), &call_config("routed", "routed-model"));

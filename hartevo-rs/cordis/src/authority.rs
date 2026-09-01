@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::CordisError;
 use crate::event::PreparedEmit;
-use crate::surface::{AgentPublicationCommit, UnpublishedAgent};
+use crate::surface::{AgentPublicationCommit, AgentRef, UnpublishedAgent};
 
 const SHA256_HEX_LENGTH: usize = 64;
 
@@ -949,7 +949,7 @@ impl fmt::Debug for EffectExecutionLease {
 pub struct RuntimeDispatchPermit {
     serial: u64,
     scope: AuthorityScope,
-    agent_id: String,
+    agent: AgentRef,
     lease: Arc<RuntimeDispatchLease>,
     unpublished: Option<UnpublishedAgent>,
     notifications: RuntimeDispatchNotifications,
@@ -986,7 +986,7 @@ impl RuntimeDispatchPermit {
     pub(crate) fn issue(
         serial: u64,
         scope: AuthorityScope,
-        agent_id: String,
+        agent: AgentRef,
         unpublished: UnpublishedAgent,
         mut notifications: RuntimeDispatchNotifications,
     ) -> (Self, Arc<RuntimeDispatchLease>) {
@@ -999,7 +999,7 @@ impl RuntimeDispatchPermit {
             Self {
                 serial,
                 scope,
-                agent_id,
+                agent,
                 lease: Arc::clone(&lease),
                 unpublished: Some(unpublished),
                 notifications,
@@ -1045,12 +1045,25 @@ impl RuntimeDispatchPermit {
         &self.scope
     }
 
+    /// Exact Agent identity prepared and published by this permit.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        &self.agent
+    }
+
     pub(crate) const fn serial(&self) -> u64 {
         self.serial
     }
 
     pub(crate) fn agent_id(&self) -> &str {
-        &self.agent_id
+        &self.agent.id
+    }
+
+    pub(crate) fn has_live_publication(&self) -> bool {
+        self.publication_committed
+            && matches!(self.started_result.as_ref(), Some(Ok(())))
+            && self.lease.is_active()
+            && self.agent.status() == crate::surface::AgentStatus::Running
     }
 
     pub(crate) fn owns_lease(&self, lease: &Arc<RuntimeDispatchLease>) -> bool {
@@ -1077,7 +1090,7 @@ impl fmt::Debug for RuntimeDispatchPermit {
             .debug_struct("RuntimeDispatchPermit")
             .field("serial", &self.serial)
             .field("scope", &self.scope)
-            .field("agent_id", &self.agent_id)
+            .field("agent", &self.agent)
             .field("started_attempted", &self.started_attempted)
             .field("publication_committed", &self.publication_committed)
             .field("started_result", &self.started_result)

@@ -150,6 +150,7 @@ impl AgentTurnOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedAgentRequest {
     agent: AgentRef,
+    session_id: SessionId,
     turn: u64,
     step: u64,
     cancellation: LifecycleCancellation,
@@ -164,6 +165,16 @@ impl PreparedAgentRequest {
     #[must_use]
     pub const fn agent(&self) -> &AgentRef {
         &self.agent
+    }
+
+    /// Durable Session driven by this request.
+    ///
+    /// Agent and Session identities are intentionally independent: a Desktop
+    /// Runtime permit may publish a scoped live Agent while driving a
+    /// Mission-backed Session with a different id.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     #[must_use]
@@ -474,9 +485,11 @@ pub fn prepare_agent_step(
 ) -> Result<AgentPreStep, CordisError> {
     require_loop_surfaces(ctx)?;
     let session = agent_session(ctx, session_id)?;
+    let agent = AgentRef::new(session.id().as_str());
     prepare_agent_step_for_session(
         ctx,
         &session,
+        &agent,
         target,
         turn,
         step,
@@ -497,9 +510,11 @@ pub fn admit_agent_step(
 ) -> Result<AgentPreStep, CordisError> {
     require_loop_surfaces(ctx)?;
     let session = agent_session(ctx, session_id)?;
+    let agent = AgentRef::new(session.id().as_str());
     let proposal = prepare_agent_step_for_session(
         ctx,
         &session,
+        &agent,
         target,
         turn,
         step,
@@ -526,10 +541,12 @@ pub fn admit_agent_request(
     step: u64,
     seed_config: SessionCallConfig,
 ) -> Result<AgentRequestAdmission, CordisError> {
+    let agent = AgentRef::new(session_id.as_str());
     admit_agent_request_internal(
         ctx,
         session_id,
         AgentTurnRequest {
+            agent: &agent,
             target,
             turn,
             step,
@@ -541,6 +558,7 @@ pub fn admit_agent_request(
 }
 
 struct AgentTurnRequest<'a> {
+    agent: &'a AgentRef,
     target: AgentInboxTarget,
     turn: u64,
     step: u64,
@@ -555,6 +573,7 @@ fn admit_agent_request_internal(
     request: AgentTurnRequest<'_>,
 ) -> Result<AgentRequestAdmission, CordisError> {
     let AgentTurnRequest {
+        agent,
         target,
         turn,
         step,
@@ -565,7 +584,7 @@ fn admit_agent_request_internal(
     require_loop_surfaces(ctx)?;
     let session = agent_session(ctx, session_id)?;
     let admission =
-        prepare_agent_step_for_session(ctx, &session, target, turn, step, cancellation)?;
+        prepare_agent_step_for_session(ctx, &session, agent, target, turn, step, cancellation)?;
     let starts_request_series = match admission.decision() {
         AgentPreStepDecision::Reject => {
             return Ok(AgentRequestAdmission::NoRequest(admission));
@@ -601,6 +620,7 @@ fn admit_agent_request_internal(
     let cancellation = request.cancellation().clone();
     Ok(AgentRequestAdmission::Request(PreparedAgentRequest {
         agent: admission.agent().clone(),
+        session_id: session_id.clone(),
         turn,
         step,
         cancellation,
@@ -640,6 +660,13 @@ fn prepare_admitted_agent_call(
     step: u64,
     request: PreparedAgentRequest,
 ) -> Result<PreparedAgentCall, CordisError> {
+    if request.session_id() != session_id {
+        return Err(SessionError::RequestLogStateSessionMismatch {
+            expected: session_id.clone(),
+            actual: request.session_id().clone(),
+        }
+        .into());
+    }
     let prepared = match prepare_llm_call(ctx, request.config()) {
         Ok(prepared) => Some(prepared),
         Err(CordisError::Llm(LlmError::NoAdapter { .. })) => None,
@@ -658,7 +685,7 @@ pub fn log_agent_call(
     state: &mut AgentRequestLogState,
     call: PreparedAgentCall,
 ) -> Result<LoggedAgentCall, CordisError> {
-    let session_id = SessionId::new(call.request().agent().id.clone())?;
+    let session_id = call.request().session_id().clone();
     require_request_log_state_session(state, &session_id)?;
     let session = agent_session(ctx, &session_id)?;
     let surface_generation = call.request().surface_generation();
@@ -743,8 +770,10 @@ pub async fn run_agent_turn(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
 ) -> Result<AgentTurnOutcome, CordisError> {
+    let agent = AgentRef::new(session_id.as_str());
     run_agent_turn_with_invariants(
         ctx,
+        &agent,
         session_id,
         seed_config,
         cancellation,
@@ -759,12 +788,14 @@ pub async fn run_agent_turn(
 /// validating an unforgeable active Runtime permit from the same host.
 pub(crate) async fn run_authorized_runtime_agent_turn(
     ctx: &mut Context,
+    agent: &AgentRef,
     session_id: &SessionId,
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
 ) -> Result<AgentTurnOutcome, CordisError> {
     run_agent_turn_with_invariants(
         ctx,
+        agent,
         session_id,
         seed_config,
         cancellation,
@@ -775,6 +806,7 @@ pub(crate) async fn run_authorized_runtime_agent_turn(
 
 async fn run_agent_turn_with_invariants(
     ctx: &mut Context,
+    agent: &AgentRef,
     session_id: &SessionId,
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
@@ -802,6 +834,7 @@ async fn run_agent_turn_with_invariants(
     let mut current_step = None;
     let result = drive_agent_turn(
         ctx,
+        agent,
         &session,
         turn,
         seed_config,
@@ -833,6 +866,7 @@ async fn run_agent_turn_with_invariants(
 
 async fn drive_agent_turn(
     ctx: &mut Context,
+    agent: &AgentRef,
     session: &SessionHandle,
     turn: u64,
     seed_config: SessionCallConfig,
@@ -860,6 +894,7 @@ async fn drive_agent_turn(
             ctx,
             &mut request_state,
             AgentTurnRequest {
+                agent,
                 target,
                 turn,
                 step,
@@ -912,11 +947,7 @@ async fn drive_agent_turn(
         }
         if let Some(reason) = turn_end {
             if session.inbox().next_step()?.is_empty() {
-                let stopping = AgentTurnStopping::new(
-                    AgentRef::new(session.id().as_str()),
-                    turn,
-                    cancellation.clone(),
-                );
+                let stopping = AgentTurnStopping::new(agent.clone(), turn, cancellation.clone());
                 let _ = ctx.serial(events::AGENT_TURN_STOPPING, stopping).await?;
                 if cancellation.is_cancelled() {
                     return Ok(AgentTurnOutcome {
@@ -993,7 +1024,7 @@ pub fn dispatch_agent_call(
 ) -> Result<LlmChunkStream, CordisError> {
     let call = logged.call();
     let request = call.request();
-    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session_id = request.session_id().clone();
     agent_session(ctx, &session_id)?.require_open_step(request.turn(), request.step())?;
     let generated = LlmGenerateRequest::new(call.config().clone(), call.messages().to_vec())
         .with_system(call.assembly().system().map(str::to_string))
@@ -1016,7 +1047,7 @@ pub async fn record_agent_stream(
     logged: &LoggedAgentCall,
 ) -> Result<RecordedAgentStream, CordisError> {
     let request = logged.call().request();
-    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session_id = request.session_id().clone();
     let turn = request.turn();
     let step = request.step();
     let cancellation = request.cancellation().clone();
@@ -1087,7 +1118,7 @@ pub fn commit_agent_stream(
     recorded: &mut RecordedAgentStream,
 ) -> Result<AgentStreamCommit, CordisError> {
     let request = logged.call().request();
-    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session_id = request.session_id().clone();
     let turn = request.turn();
     let step = request.step();
     if recorded.session_id != session_id || recorded.turn != turn || recorded.step != step {
@@ -1191,7 +1222,7 @@ pub fn schedule_agent_tool_calls(
     recorded: &mut RecordedAgentStream,
 ) -> Result<Vec<SessionToolCall>, CordisError> {
     let request = logged.call().request();
-    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session_id = request.session_id().clone();
     let turn = request.turn();
     let step = request.step();
     if recorded.session_id != session_id || recorded.turn != turn || recorded.step != step {
@@ -1254,7 +1285,7 @@ pub fn prepare_agent_tool_calls(
     recorded: &RecordedAgentStream,
 ) -> Result<Vec<ToolExecutionInput>, CordisError> {
     let request = logged.call().request();
-    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session_id = request.session_id().clone();
     let turn = request.turn();
     let step = request.step();
     if recorded.session_id != session_id || recorded.turn != turn || recorded.step != step {
@@ -1336,7 +1367,7 @@ pub fn commit_agent_tool_results(
     }
 
     let request = logged.call().request();
-    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session_id = request.session_id().clone();
     let turn = request.turn();
     let step = request.step();
     let session = agent_session(ctx, &session_id)?;
@@ -1503,7 +1534,7 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
         .into());
     }
     let request = logged.call().request();
-    let session_id = SessionId::new(request.agent().id.clone())?;
+    let session_id = request.session_id().clone();
     let session = agent_session(ctx, &session_id)?;
     if !recorded.tool_result_seqs.is_empty()
         || !durable_tool_results(&session, request.turn(), request.step())?.is_empty()
@@ -2077,6 +2108,7 @@ fn agent_session(ctx: &Context, session_id: &SessionId) -> Result<SessionHandle,
 fn prepare_agent_step_for_session(
     ctx: &mut Context,
     session: &SessionHandle,
+    agent: &AgentRef,
     target: AgentInboxTarget,
     turn: u64,
     step: u64,
@@ -2085,7 +2117,7 @@ fn prepare_agent_step_for_session(
     let claimed = session.inbox().claim(target, turn)?;
     let assembly = assemble_system_prompt(ctx)?;
     let proposal = AgentPreStep::enter(
-        AgentRef::new(session.id().as_str()),
+        agent.clone(),
         turn,
         step,
         claimed,

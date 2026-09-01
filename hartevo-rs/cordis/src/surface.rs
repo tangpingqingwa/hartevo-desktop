@@ -1617,7 +1617,13 @@ impl AgentRef {
         self.lifecycle.status.send_replace(AgentStatus::Idle) != AgentStatus::Idle
     }
 
-    fn is_same_lifecycle(&self, other: &Self) -> bool {
+    /// Whether two handles refer to the exact same live Agent instance.
+    ///
+    /// [`PartialEq`] remains id-based for compatibility. Lifecycle-sensitive
+    /// callers use this method so a later same-id replacement cannot be
+    /// mistaken for the original Agent.
+    #[must_use]
+    pub fn is_same_lifecycle(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.lifecycle, &other.lifecycle)
     }
 }
