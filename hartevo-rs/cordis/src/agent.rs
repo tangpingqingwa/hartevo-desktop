@@ -1674,6 +1674,10 @@ fn run_parallel_tool_group(
 
             if in_flight == 0 {
                 if let Some((index, prepared)) = pending_exclusive.take() {
+                    if aborted {
+                        next_to_start = index;
+                        break;
+                    }
                     slots[index] = Some(dispatch_tool_execution_with_cancellation(
                         ctx,
                         prepared,

@@ -1345,6 +1345,7 @@ struct DesktopLiveAgentTurnCompletion {
     attempt: Option<RuntimeTurnAttempt>,
     logical_millis: i64,
     runtime_start_failed: bool,
+    user_interrupt_sent: bool,
 }
 
 type DesktopLiveAgentTurnResult = Result<DesktopLiveAgentTurnCompletion, DesktopDataError>;
@@ -1457,11 +1458,7 @@ where
             })?;
         match run() {
             Ok((completion, chunks)) => {
-                if completion
-                    .attempt
-                    .as_ref()
-                    .is_some_and(|attempt| attempt.status == RuntimeTurnStatus::Interrupted)
-                {
+                if completion.user_interrupt_sent {
                     cordis_cancellation.cancel_with(SessionCancelCause::User);
                 }
                 *self.completion.lock().map_err(|_| {
@@ -1673,6 +1670,7 @@ fn run_desktop_application_runtime_turn(
                     attempt: None,
                     logical_millis,
                     runtime_start_failed: true,
+                    user_interrupt_sent: false,
                 },
                 desktop_live_agent_abort_chunks(
                     "DESKTOP_RUNTIME_START_FAILED",
@@ -1715,6 +1713,7 @@ fn run_desktop_application_runtime_turn(
                 attempt: Some(attempt),
                 logical_millis,
                 runtime_start_failed: false,
+                user_interrupt_sent: false,
             },
             chunks,
         ));
@@ -1891,6 +1890,7 @@ fn run_desktop_application_runtime_turn(
             attempt: Some(attempt),
             logical_millis,
             runtime_start_failed: false,
+            user_interrupt_sent: cooperative_interrupt_sent,
         },
         chunks,
     ))
@@ -5598,6 +5598,7 @@ impl DesktopDataPlane {
             attempt,
             mut logical_millis,
             runtime_start_failed,
+            ..
         } = completion;
         if let Err(error) = agent_result {
             return Err(DesktopDataError::CordisSessionPersistence(
@@ -13555,6 +13556,68 @@ sleep 30"#;
                 .expect("stable first private Runtime deltas"),
             first_private_deltas
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_adapter_only_projects_an_explicit_user_interrupt_into_cordis() {
+        use hartevo_cordis::{SessionId, SessionMessage};
+
+        let (_directory, plane, secrets, _) = ready_personal_fixture();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at())
+            .expect("Application service");
+        let cancellation = LifecycleCancellation::default();
+        let (adapter, _) = DesktopApplicationLlmAdapter::new(
+            "fixture-provider".into(),
+            "fixture-model".into(),
+            "non-user-interrupt".into(),
+            "non-user-interrupt-message".into(),
+            "non-user interrupt",
+            move || {
+                Ok((
+                    DesktopLiveAgentTurnCompletion {
+                        service,
+                        attempt: None,
+                        logical_millis: 0,
+                        runtime_start_failed: false,
+                        user_interrupt_sent: false,
+                    },
+                    desktop_live_agent_abort_chunks(
+                        "DESKTOP_RUNTIME_INTERRUPTED",
+                        "Desktop Application Runtime interrupted without a user stop",
+                    ),
+                ))
+            },
+        );
+        let request = LlmGenerateRequest::new(
+            SessionCallConfig {
+                provider: "fixture-provider".into(),
+                model: "fixture-model".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+            vec![SessionMessage {
+                id: "non-user-interrupt-message".into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::Text {
+                    text: "non-user interrupt".into(),
+                }],
+                source: SessionMessageSource::User,
+            }],
+        )
+        .with_session_id(SessionId::new("non-user-interrupt").unwrap())
+        .with_cancellation(cancellation.clone());
+
+        let _stream = adapter.stream(request).unwrap();
+
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(cancellation.cause(), None);
     }
 
     #[cfg(unix)]

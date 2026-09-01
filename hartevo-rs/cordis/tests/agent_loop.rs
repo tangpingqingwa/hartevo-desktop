@@ -5165,6 +5165,88 @@ fn tool_scheduler_reclassifies_an_unstarted_call_into_an_exclusive_barrier() {
 }
 
 #[test]
+fn tool_scheduler_cancel_drops_a_dynamically_reclassified_exclusive_body() {
+    let mut chunks = Vec::new();
+    for (index, name) in ["reclass-cancel-running", "reclass-cancel-exclusive"]
+        .into_iter()
+        .enumerate()
+    {
+        chunks.extend(tool_call_chunks(
+            u64::try_from(index).unwrap(),
+            &format!("{name}-call"),
+            name,
+            "{}",
+        ));
+    }
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-scheduler-reclassify-cancel", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    register_tool_definition(
+        &mut ctx,
+        ToolDefinition::new(tool_schema("reclass-cancel-running"), |_| {
+            Ok(json!("running"))
+        })
+        .with_concurrency(|_| Ok(true))
+        .with_output_renderer(|_, _| Ok(Vec::new())),
+    )
+    .unwrap();
+    let classifications = Arc::new(AtomicUsize::new(0));
+    let exclusive_runs = Arc::new(AtomicUsize::new(0));
+    {
+        let classifications = Arc::clone(&classifications);
+        let exclusive_runs = Arc::clone(&exclusive_runs);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("reclass-cancel-exclusive"), move |_| {
+                exclusive_runs.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("must not run"))
+            })
+            .with_concurrency(move |_| Ok(classifications.fetch_add(1, Ordering::SeqCst) == 0))
+            .with_output_renderer(|_, _| Ok(Vec::new())),
+        )
+        .unwrap();
+    }
+    let cancellation = LifecycleCancellation::default();
+    {
+        let cancellation = cancellation.clone();
+        ctx.on_emit(events::TOOLS_RESULT, move |result: &ToolExecutionResult| {
+            if result.input().call_id() == "reclass-cancel-running-call" {
+                cancellation.cancel();
+            }
+        })
+        .unwrap();
+    }
+
+    let outcome = run_agent_tool_batch_with_limit_and_cancellation_outcome(
+        &mut ctx,
+        &logged,
+        &mut recorded,
+        2,
+        &cancellation,
+    )
+    .unwrap();
+
+    assert_eq!(classifications.load(Ordering::SeqCst), 2);
+    assert_eq!(exclusive_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(outcome.results().len(), 2);
+    assert!(!outcome.results()[0].is_error());
+    assert_eq!(
+        outcome.results()[1]
+            .error()
+            .map(|error| error.code.as_str()),
+        Some(TOOL_ABORTED_BEFORE_DISPATCH)
+    );
+    assert!(recorded.tool_results_committed());
+    close_logged_turn(&session, turn);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // Keep the zero-stage and durable-result proof together.
 fn tool_scheduler_pre_cancel_commits_canonical_results_without_running_tool_stages() {
     let mut chunks = Vec::new();
