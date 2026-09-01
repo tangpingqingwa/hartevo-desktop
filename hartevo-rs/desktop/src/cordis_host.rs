@@ -22,13 +22,13 @@ use hartevo_cordis::{
     FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
     KernelConsentState, KernelConsentStatus, LifecycleCancellation, LlmAdapter, LlmAdapterStream,
     LlmError, LlmGenerateRequest, LlmResolvedModel, RuntimeAuthority, RuntimeDispatchCompletion,
-    RuntimeDispatchPermit, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
-    SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent, SessionEventKind,
-    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId,
-    SessionLlmFailure, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
-    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
-    TurnEndReason, host_is_cordis_loop, keys, register_llm_adapter,
+    RuntimeDispatchPermit, RuntimeStatusCompletion, SessionCallConfig, SessionCancelCause,
+    SessionCheckpoint, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
+    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
+    SessionId, SessionLlmFailure, SessionLog, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
+    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+    SessionToolError, TurnEndReason, host_is_cordis_loop, keys, register_llm_adapter,
     run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
@@ -126,7 +126,7 @@ pub(crate) enum DesktopCordisSlotError {
 }
 
 pub(crate) struct DesktopCordisGuard<'a> {
-    guard: MutexGuard<'a, Option<DesktopCordisCoordinator>>,
+    guard: Option<MutexGuard<'a, Option<DesktopCordisCoordinator>>>,
 }
 
 pub(crate) struct DesktopCordisCheckout {
@@ -142,14 +142,23 @@ impl DesktopCordisSlot {
     }
 
     pub(crate) fn lock(&self) -> Result<DesktopCordisGuard<'_>, DesktopCordisSlotError> {
-        let guard = self
-            .coordinator
-            .lock()
-            .map_err(|_| DesktopCordisSlotError::Poisoned)?;
-        if guard.is_none() {
-            return Err(DesktopCordisSlotError::CheckedOut);
+        loop {
+            let mut guard = self
+                .coordinator
+                .lock()
+                .map_err(|_| DesktopCordisSlotError::Poisoned)?;
+            let Some(coordinator) = guard.as_mut() else {
+                return Err(DesktopCordisSlotError::CheckedOut);
+            };
+            let statuses = coordinator.take_deferred_runtime_status();
+            if statuses.is_empty() {
+                return Ok(DesktopCordisGuard { guard: Some(guard) });
+            }
+            drop(guard);
+            for status in statuses {
+                status.announce();
+            }
         }
-        Ok(DesktopCordisGuard { guard })
     }
 
     #[cfg(test)]
@@ -162,7 +171,7 @@ impl DesktopCordisSlot {
         if guard.is_none() {
             return Err(DesktopCordisSlotError::CheckedOut);
         }
-        Ok(DesktopCordisGuard { guard })
+        Ok(DesktopCordisGuard { guard: Some(guard) })
     }
 
     #[cfg(test)]
@@ -173,16 +182,27 @@ impl DesktopCordisSlot {
     pub(crate) fn checkout(
         self: &Arc<Self>,
     ) -> Result<DesktopCordisCheckout, DesktopCordisSlotError> {
-        let coordinator = self
-            .coordinator
-            .lock()
-            .map_err(|_| DesktopCordisSlotError::Poisoned)?
-            .take()
-            .ok_or(DesktopCordisSlotError::CheckedOut)?;
-        Ok(DesktopCordisCheckout {
-            slot: Arc::clone(self),
-            coordinator: Some(coordinator),
-        })
+        loop {
+            let mut slot = self
+                .coordinator
+                .lock()
+                .map_err(|_| DesktopCordisSlotError::Poisoned)?;
+            let Some(coordinator) = slot.as_mut() else {
+                return Err(DesktopCordisSlotError::CheckedOut);
+            };
+            let statuses = coordinator.take_deferred_runtime_status();
+            if statuses.is_empty() {
+                let coordinator = slot.take().expect("the coordinator was just observed");
+                return Ok(DesktopCordisCheckout {
+                    slot: Arc::clone(self),
+                    coordinator: Some(coordinator),
+                });
+            }
+            drop(slot);
+            for status in statuses {
+                status.announce();
+            }
+        }
     }
 }
 
@@ -192,6 +212,7 @@ impl Deref for DesktopCordisGuard<'_> {
     fn deref(&self) -> &Self::Target {
         self.guard
             .as_ref()
+            .and_then(|guard| guard.as_ref())
             .expect("an active Cordis guard always contains its coordinator")
     }
 }
@@ -200,7 +221,24 @@ impl DerefMut for DesktopCordisGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.guard
             .as_mut()
+            .and_then(|guard| guard.as_mut())
             .expect("an active Cordis guard always contains its coordinator")
+    }
+}
+
+impl Drop for DesktopCordisGuard<'_> {
+    fn drop(&mut self) {
+        let statuses = self
+            .guard
+            .as_mut()
+            .and_then(|guard| guard.as_mut())
+            .map_or_else(Vec::new, |coordinator| {
+                coordinator.take_deferred_runtime_status()
+            });
+        drop(self.guard.take());
+        for status in statuses {
+            status.announce();
+        }
     }
 }
 
@@ -224,9 +262,10 @@ impl DerefMut for DesktopCordisCheckout {
 
 impl Drop for DesktopCordisCheckout {
     fn drop(&mut self) {
-        let Some(coordinator) = self.coordinator.take() else {
+        let Some(mut coordinator) = self.coordinator.take() else {
             return;
         };
+        let statuses = coordinator.take_deferred_runtime_status();
         let mut slot = self
             .slot
             .coordinator
@@ -238,6 +277,10 @@ impl Drop for DesktopCordisCheckout {
         );
         if slot.is_none() {
             *slot = Some(coordinator);
+        }
+        drop(slot);
+        for status in statuses {
+            status.announce();
         }
     }
 }
@@ -1210,6 +1253,10 @@ impl DesktopCordisCoordinator {
         permit: RuntimeDispatchPermit,
     ) -> Result<RuntimeDispatchCompletion, CordisError> {
         self.host.finish_runtime(permit)
+    }
+
+    fn take_deferred_runtime_status(&mut self) -> Vec<RuntimeStatusCompletion> {
+        self.host.take_deferred_runtime_status()
     }
 
     fn finish_domain_command(&mut self, permit: DomainCommandPermit) -> Result<(), CordisError> {
@@ -3173,6 +3220,70 @@ mod tests {
         assert!(host.active_runtime_scope().is_none());
         assert!(
             host.context()
+                .agents::<AgentsSurface>()
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn abandoned_runtime_status_is_drained_only_after_desktop_unlock() {
+        let host = Arc::new(DesktopCordisSlot::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let status_order = record_runtime_status(&host);
+        let scope = runtime_scope();
+        let mut permit = {
+            let mut locked = host.lock().unwrap();
+            bind_live_domain_kernel_scope(
+                &mut locked,
+                scope.clone(),
+                &ConsentState::NotRequired,
+                None,
+                None,
+                now(),
+            )
+            .unwrap();
+            locked.authorize_runtime(&scope).unwrap()
+        };
+        permit.announce_started().unwrap();
+        let agent = host
+            .lock()
+            .unwrap()
+            .context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let locked = host.lock().unwrap();
+        drop(permit);
+        assert_eq!(agent.status(), AgentStatus::Idle);
+        assert!(locked.active_runtime_scope().is_none());
+        assert_eq!(*status_order.lock().unwrap(), [AgentStatus::Running]);
+        assert_eq!(
+            locked
+                .context()
+                .agents::<AgentsSurface>()
+                .unwrap()
+                .list()
+                .as_slice(),
+            std::slice::from_ref(&agent)
+        );
+        drop(locked);
+
+        assert_eq!(
+            *status_order.lock().unwrap(),
+            [AgentStatus::Running, AgentStatus::Idle]
+        );
+        assert!(
+            host.lock()
+                .unwrap()
+                .context()
                 .agents::<AgentsSurface>()
                 .unwrap()
                 .list()

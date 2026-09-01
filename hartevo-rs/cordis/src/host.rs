@@ -15,9 +15,9 @@ use crate::authority::{
     EffectReconciliationBinding, EffectReconciliationLease, EffectReconciliationPermit,
     EffectVerificationBinding, EffectVerificationLease, EffectVerificationPermit,
     RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchNotifications,
-    RuntimeDispatchPermit,
+    RuntimeDispatchPermit, RuntimeStatusCompletion,
 };
-use crate::context::{Context, CordisError, TeardownTransaction, keys};
+use crate::context::{Context, CordisError, TeardownPermit, TeardownTransaction, keys};
 use crate::fiber::LifecycleCancellation;
 use crate::invariants::{InvariantGate, OPENINTERPRETER, apply_effect, enforce_runtime_invariants};
 use crate::kernel::{
@@ -53,6 +53,7 @@ pub struct CordisHost {
     active_effect_verification: Option<ActiveEffectVerification>,
     next_effect_verification_serial: u64,
     active_runtime: Option<ActiveRuntimeDispatch>,
+    deferred_runtime_status: Vec<RuntimeStatusCompletion>,
     next_runtime_serial: u64,
 }
 
@@ -96,6 +97,72 @@ struct ActiveRuntimeDispatch {
     lease: std::sync::Arc<RuntimeDispatchLease>,
 }
 
+/// Owned second half of one Host teardown transaction.
+///
+/// The Host is already inert when this value is returned. Calling
+/// [`Self::announce`] outside an outer coordinator lock publishes contained
+/// Runtime Idle observations before completing teardown of the old Context.
+/// Dropping it skips callbacks but still completes all cleanup.
+pub struct CordisHostTeardown {
+    context: Option<Context>,
+    permit: Option<TeardownPermit>,
+    statuses: Vec<RuntimeStatusCompletion>,
+}
+
+impl CordisHostTeardown {
+    const fn busy() -> Self {
+        Self {
+            context: None,
+            permit: None,
+            statuses: Vec::new(),
+        }
+    }
+
+    fn new(
+        context: Context,
+        permit: TeardownPermit,
+        statuses: Vec<RuntimeStatusCompletion>,
+    ) -> Self {
+        Self {
+            context: Some(context),
+            permit: Some(permit),
+            statuses,
+        }
+    }
+
+    /// Publish exceptional Runtime Idle transitions without listener veto,
+    /// then finish teardown of the exact old Context generation.
+    pub fn announce(mut self) {
+        for status in std::mem::take(&mut self.statuses) {
+            status.announce();
+        }
+        self.complete();
+    }
+
+    fn complete(&mut self) {
+        let (Some(mut context), Some(permit)) = (self.context.take(), self.permit.take()) else {
+            return;
+        };
+        context.complete_teardown(permit);
+    }
+}
+
+impl Drop for CordisHostTeardown {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
+impl std::fmt::Debug for CordisHostTeardown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CordisHostTeardown")
+            .field("acquired", &self.context.is_some())
+            .field("pending_statuses", &self.statuses.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for CordisHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CordisHost")
@@ -128,6 +195,10 @@ impl std::fmt::Debug for CordisHost {
                 &self.next_effect_verification_serial,
             )
             .field("active_runtime", &self.active_runtime)
+            .field(
+                "deferred_runtime_status",
+                &self.deferred_runtime_status.len(),
+            )
             .field("next_runtime_serial", &self.next_runtime_serial)
             .finish()
     }
@@ -156,6 +227,7 @@ impl CordisHost {
             active_effect_verification: None,
             next_effect_verification_serial: 0,
             active_runtime: None,
+            deferred_runtime_status: Vec::new(),
             next_runtime_serial: 0,
         })
     }
@@ -200,6 +272,7 @@ impl CordisHost {
                 active_effect_verification: None,
                 next_effect_verification_serial: 0,
                 active_runtime: None,
+                deferred_runtime_status: Vec::new(),
                 next_runtime_serial: 0,
             },
             report,
@@ -835,10 +908,15 @@ impl CordisHost {
         ]
     }
 
-    pub fn teardown(&mut self) {
+    /// Make this Host inert and return the owned completion for the old
+    /// Context. Externally synchronized callers should release their Host lock
+    /// before calling [`CordisHostTeardown::announce`].
+    pub fn teardown(&mut self) -> CordisHostTeardown {
         let TeardownTransaction::Acquired(permit) = self.ctx.try_begin_teardown() else {
-            return;
+            return CordisHostTeardown::busy();
         };
+        self.reap_abandoned_runtime();
+        let mut statuses = std::mem::take(&mut self.deferred_runtime_status);
         if let Some(active) = self.active_domain_command.take() {
             active.lease.release();
         }
@@ -851,11 +929,14 @@ impl CordisHost {
         if let Some(active) = self.active_effect_verification.take() {
             active.lease.release();
         }
-        if let Some(active) = self.active_runtime.take() {
-            active.lease.release();
+        if let Some(active) = self.active_runtime.take()
+            && let Some(status) = active.lease.release_for_teardown()
+        {
+            statuses.push(status);
         }
         self.bound_scope = None;
-        self.ctx.complete_teardown(permit);
+        let context = std::mem::take(&mut self.ctx);
+        CordisHostTeardown::new(context, permit, statuses)
     }
 
     /// Register a Runtime-start observer. Notifications prepared while the
@@ -880,13 +961,26 @@ impl CordisHost {
             .map(|_| ())
     }
 
+    /// Take one-shot Idle observations left by abandoned Runtime permits.
+    /// Callers must release any outer Host lock before announcing them.
+    pub fn take_deferred_runtime_status(&mut self) -> Vec<RuntimeStatusCompletion> {
+        self.reap_abandoned_runtime();
+        std::mem::take(&mut self.deferred_runtime_status)
+    }
+
     fn reap_abandoned_runtime(&mut self) {
         if self
             .active_runtime
             .as_ref()
             .is_some_and(|active| !active.lease.is_active())
         {
-            self.active_runtime = None;
+            let active = self
+                .active_runtime
+                .take()
+                .expect("the inactive Runtime lease was just observed");
+            if let Some(status) = active.lease.take_deferred_status() {
+                self.deferred_runtime_status.push(status);
+            }
         }
     }
 
