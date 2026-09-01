@@ -48,10 +48,7 @@ impl AgentInbox {
         Ok(self.lock()?.next_turn.clone())
     }
 
-    /// Return a detached read-only snapshot of future next-step input.
-    ///
-    /// N37 does not expose next-step mutation; retaining the second projection
-    /// makes persisted vocabulary strict without granting steer/inject behavior.
+    /// Return a detached snapshot of input awaiting the next step boundary.
     pub fn next_step(&self) -> Result<Vec<SessionMessage>, SessionError> {
         Ok(self.lock()?.next_step.clone())
     }
@@ -64,22 +61,31 @@ impl AgentInbox {
 
     /// Durably append one message for a future turn, then update the live view.
     pub fn append_next_turn(&self, message: SessionMessage) -> Result<(), SessionError> {
+        self.append(AgentInboxTarget::NextTurn, message)
+    }
+
+    /// Durably append one message for the next step, then update the live view.
+    pub fn append_next_step(&self, message: SessionMessage) -> Result<(), SessionError> {
+        self.append(AgentInboxTarget::NextStep, message)
+    }
+
+    fn append(
+        &self,
+        target: AgentInboxTarget,
+        message: SessionMessage,
+    ) -> Result<(), SessionError> {
         let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
         let inserted = vec![message];
         let start = {
             let state = self.lock()?;
-            let start = u64::try_from(state.next_turn.len())
+            let start = u64::try_from(state.list(target).len())
                 .map_err(|_| SessionError::EventSequenceOverflow)?;
-            state.validate(AgentInboxTarget::NextTurn, start, None, &inserted, None)?;
+            state.validate(target, start, None, &inserted, None)?;
             start
         };
-        let event = self.session.append_agent_inbox_splice(
-            AgentInboxTarget::NextTurn,
-            start,
-            None,
-            inserted,
-            None,
-        )?;
+        let event = self
+            .session
+            .append_agent_inbox_splice(target, start, None, inserted, None)?;
         if !self.apply_committed(&event)?.is_empty() {
             return Err(SessionError::InboxProjectionDrift);
         }
@@ -113,6 +119,46 @@ impl AgentInbox {
             return Err(SessionError::InboxProjectionDrift);
         }
         Ok(removed.pop())
+    }
+
+    /// Durably claim all queued next-step input in FIFO order.
+    ///
+    /// The requested turn must be the exact currently open Session turn. An
+    /// empty queue returns an empty batch without appending a no-op event.
+    pub fn claim_next_step(&self, turn: u64) -> Result<Vec<SessionMessage>, SessionError> {
+        let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
+        let removed_count = {
+            let state = self.lock()?;
+            if state.next_step.is_empty() {
+                self.session.require_open_turn(turn)?;
+                return Ok(Vec::new());
+            }
+            let removed_count = u64::try_from(state.next_step.len())
+                .map_err(|_| SessionError::EventSequenceOverflow)?;
+            state.validate(
+                AgentInboxTarget::NextStep,
+                0,
+                Some(removed_count),
+                &[],
+                None,
+            )?;
+            removed_count
+        };
+        let event = self.session.claim_agent_inbox_splice(
+            turn,
+            AgentInboxTarget::NextStep,
+            0,
+            Some(removed_count),
+            Vec::new(),
+            None,
+        )?;
+        let removed = self.apply_committed(&event)?;
+        if u64::try_from(removed.len()).map_err(|_| SessionError::EventSequenceOverflow)?
+            != removed_count
+        {
+            return Err(SessionError::InboxProjectionDrift);
+        }
+        Ok(removed)
     }
 
     fn apply_committed(&self, event: &SessionEvent) -> Result<Vec<SessionMessage>, SessionError> {
