@@ -1075,6 +1075,13 @@ impl ToolExecutionResult {
     }
 }
 
+/// Why one provider-neutral request is being made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmRequestPurpose {
+    Agent,
+    Compaction,
+}
+
 /// Fully assembled provider-neutral request presented to one LLM adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmGenerateRequest {
@@ -1083,6 +1090,7 @@ pub struct LlmGenerateRequest {
     system: Option<String>,
     tools: Option<Vec<SessionToolSchema>>,
     session_id: Option<SessionId>,
+    purpose: LlmRequestPurpose,
     cancellation: LifecycleCancellation,
 }
 
@@ -1095,6 +1103,7 @@ impl LlmGenerateRequest {
             system: None,
             tools: None,
             session_id: None,
+            purpose: LlmRequestPurpose::Agent,
             cancellation: LifecycleCancellation::default(),
         }
     }
@@ -1124,6 +1133,11 @@ impl LlmGenerateRequest {
         self.session_id.as_ref()
     }
 
+    #[must_use]
+    pub const fn purpose(&self) -> LlmRequestPurpose {
+        self.purpose
+    }
+
     /// Exact caller-owned cancellation lineage for this model call.
     #[must_use]
     pub const fn cancellation(&self) -> &LifecycleCancellation {
@@ -1145,6 +1159,12 @@ impl LlmGenerateRequest {
     #[must_use]
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
         self.session_id = Some(session_id);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_purpose(mut self, purpose: LlmRequestPurpose) -> Self {
+        self.purpose = purpose;
         self
     }
 
