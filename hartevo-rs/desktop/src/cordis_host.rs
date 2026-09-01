@@ -25,11 +25,11 @@ use hartevo_cordis::{
     RuntimeDispatchPermit, RuntimeStatusCompletion, SessionCallConfig, SessionCancelCause,
     SessionCheckpoint, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
     SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
-    SessionId, SessionLlmFailure, SessionLog, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
-    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-    SessionToolError, TurnEndReason, host_is_cordis_loop, keys, register_llm_adapter,
-    run_agent_turn as run_cordis_agent_turn, session_events,
+    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
+    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop,
+    keys, register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -1533,6 +1533,10 @@ fn encode_checkpoint(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the Desktop persistence boundary keeps every Cordis Session event conversion exhaustive"
+)]
 fn encode_event(
     event: &SessionEvent,
 ) -> Result<PersistedSessionEvent, DesktopSessionPersistenceError> {
@@ -1592,6 +1596,14 @@ fn encode_event(
             SessionEventKind::RequestContext { context } => {
                 PersistedSessionEventKind::RequestContext {
                     context: context.to_json_value()?,
+                }
+            }
+            SessionEventKind::LlmRetry { retry } => PersistedSessionEventKind::LlmRetry {
+                retry: retry.to_json_value()?,
+            },
+            SessionEventKind::LlmRetryStarted { started } => {
+                PersistedSessionEventKind::LlmRetryStarted {
+                    started: started.to_json_value()?,
                 }
             }
             SessionEventKind::ToolCall {
@@ -1696,6 +1708,10 @@ fn decode_checkpoint(
     Ok((header, events))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the Desktop persistence boundary keeps every neutral Session event conversion exhaustive"
+)]
 fn decode_event(
     event: &PersistedSessionEvent,
 ) -> Result<SessionEvent, DesktopSessionPersistenceError> {
@@ -1743,6 +1759,14 @@ fn decode_event(
             PersistedSessionEventKind::RequestContext { context } => {
                 SessionEventKind::RequestContext {
                     context: SessionRequestContext::from_json_value(context)?,
+                }
+            }
+            PersistedSessionEventKind::LlmRetry { retry } => SessionEventKind::LlmRetry {
+                retry: SessionLlmRetry::from_json_value(retry)?,
+            },
+            PersistedSessionEventKind::LlmRetryStarted { started } => {
+                SessionEventKind::LlmRetryStarted {
+                    started: SessionLlmRetryStarted::from_json_value(started)?,
                 }
             }
             PersistedSessionEventKind::ToolCall {
@@ -2400,7 +2424,8 @@ mod tests {
         KernelApprovalDecision, KernelConsentState, LifecycleCancellation, LlmAdapter,
         LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, LlmSurface,
         OPENINTERPRETER, RuntimeBinding, SessionCallConfig, SessionContentBlock, SessionError,
-        SessionEventKind, SessionFinishReason, SessionId, SessionLlmFailure, SessionMessage,
+        SessionEvent, SessionEventKind, SessionFinishReason, SessionId, SessionLlmFailure,
+        SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionMessage,
         SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamBlockType,
         SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner, TurnEndReason,
         enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys, session_events,
@@ -2773,6 +2798,52 @@ mod tests {
             } if inserted.is_empty()
         ));
         assert_eq!(decode_event(&persisted).unwrap(), event);
+    }
+
+    #[test]
+    fn llm_retry_codec_round_trips_schedule_and_started_transition() {
+        let retry = SessionLlmRetry {
+            retry_id: "desktop-retry".into(),
+            turn: 1,
+            step: 1,
+            provider: "mock".into(),
+            mode: SessionLlmRetryMode::Normal,
+            policy_key: "normal-policy".into(),
+            retry: 1,
+            max_retries: Some(2),
+            delay_ms: 25,
+            failure: SessionLlmFailure {
+                message: "busy".into(),
+                code: "RATE_LIMIT".into(),
+                status: Some(429),
+                provider_retry_after_ms: Some(25),
+                request_id: Some("request-1".into()),
+            },
+        };
+        let events = [
+            SessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: SessionEventKind::LlmRetry { retry },
+            },
+            SessionEvent {
+                seq: 1,
+                time_ms: 2,
+                kind: SessionEventKind::LlmRetryStarted {
+                    started: SessionLlmRetryStarted {
+                        retry_id: "desktop-retry".into(),
+                        turn: 1,
+                        step: 1,
+                        retry: 1,
+                    },
+                },
+            },
+        ];
+
+        for event in events {
+            let persisted = encode_event(&event).unwrap();
+            assert_eq!(decode_event(&persisted).unwrap(), event);
+        }
     }
 
     #[test]

@@ -94,10 +94,10 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::cordis_host::{
-    DesktopAgentTurnRequest, DesktopCordisSlot, DesktopDomainCommandAuthorization,
-    DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
-    DesktopEffectVerificationAuthorization, DesktopRuntimeSessionTranscript,
-    dispatch_live_domain_command, dispatch_live_effect_execution,
+    DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisSlot,
+    DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
+    DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
+    DesktopRuntimeSessionTranscript, dispatch_live_domain_command, dispatch_live_effect_execution,
     dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
     mount_cordis_host,
 };
@@ -5601,9 +5601,36 @@ impl DesktopDataPlane {
             ..
         } = completion;
         if let Err(error) = agent_result {
-            return Err(DesktopDataError::CordisSessionPersistence(
-                error.to_string(),
-            ));
+            let expected_failure_code = if runtime_start_failed {
+                Some("DESKTOP_RUNTIME_START_FAILED")
+            } else {
+                attempt.as_ref().and_then(|attempt| match attempt.status {
+                    RuntimeTurnStatus::Completed => None,
+                    RuntimeTurnStatus::Interrupted => Some("DESKTOP_RUNTIME_INTERRUPTED"),
+                    RuntimeTurnStatus::Failed => Some("DESKTOP_RUNTIME_FAILED"),
+                    RuntimeTurnStatus::Prepared
+                    | RuntimeTurnStatus::Dispatching
+                    | RuntimeTurnStatus::Running
+                    | RuntimeTurnStatus::WaitingLocalApproval
+                    | RuntimeTurnStatus::ApprovalResponding
+                    | RuntimeTurnStatus::InterruptRequested
+                    | RuntimeTurnStatus::Uncertain => Some("DESKTOP_RUNTIME_UNCERTAIN"),
+                })
+            };
+            let is_exact_runtime_failure = matches!(
+                (&error, expected_failure_code),
+                (
+                    DesktopAgentTurnError::Cordis(CordisError::Llm(LlmError::RequestFailed {
+                        failure,
+                    })),
+                    Some(expected),
+                ) if failure.code == expected
+            );
+            if !is_exact_runtime_failure {
+                return Err(DesktopDataError::CordisSessionPersistence(
+                    error.to_string(),
+                ));
+            }
         }
         if runtime_start_failed {
             return self.finish_mission_submission(

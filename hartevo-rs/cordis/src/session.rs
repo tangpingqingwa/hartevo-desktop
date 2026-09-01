@@ -373,6 +373,73 @@ pub struct SessionLlmFailure {
     pub request_id: Option<String>,
 }
 
+/// Provider policy mode retained by one durable retry schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionLlmRetryMode {
+    Normal,
+    Always,
+}
+
+/// Non-surface record committed before one provider retry wait begins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionLlmRetry {
+    pub retry_id: String,
+    pub turn: u64,
+    pub step: u64,
+    pub provider: String,
+    pub mode: SessionLlmRetryMode,
+    pub policy_key: String,
+    pub retry: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u64>,
+    pub delay_ms: u64,
+    pub failure: SessionLlmFailure,
+}
+
+impl SessionLlmRetry {
+    pub fn to_json_value(&self) -> Result<serde_json::Value, SessionError> {
+        validate_llm_retry(self)?;
+        serde_json::to_value(self).map_err(|_| SessionError::InvalidLlmRetryEncoding)
+    }
+
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, SessionError> {
+        let retry: Self = serde_json::from_value(value.clone())
+            .map_err(|_| SessionError::InvalidLlmRetryEncoding)?;
+        if retry.to_json_value()?.ne(value) {
+            return Err(SessionError::InvalidLlmRetryEncoding);
+        }
+        Ok(retry)
+    }
+}
+
+/// Durable transition committed after a retry wait and before redispatch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionLlmRetryStarted {
+    pub retry_id: String,
+    pub turn: u64,
+    pub step: u64,
+    pub retry: u64,
+}
+
+impl SessionLlmRetryStarted {
+    pub fn to_json_value(&self) -> Result<serde_json::Value, SessionError> {
+        validate_llm_retry_started(self)?;
+        serde_json::to_value(self).map_err(|_| SessionError::InvalidLlmRetryEncoding)
+    }
+
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, SessionError> {
+        let started: Self = serde_json::from_value(value.clone())
+            .map_err(|_| SessionError::InvalidLlmRetryEncoding)?;
+        if started.to_json_value()?.ne(value) {
+            return Err(SessionError::InvalidLlmRetryEncoding);
+        }
+        Ok(started)
+    }
+}
+
 /// Why one provider stream stopped.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -663,6 +730,12 @@ pub enum SessionEventKind {
     RequestContext {
         context: SessionRequestContext,
     },
+    LlmRetry {
+        retry: SessionLlmRetry,
+    },
+    LlmRetryStarted {
+        started: SessionLlmRetryStarted,
+    },
     ToolCall {
         turn: u64,
         step: u64,
@@ -701,6 +774,8 @@ impl SessionEventKind {
             Self::AssistantChunk { .. } => "assistant/chunk",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
+            Self::LlmRetry { .. } => "llm/retry",
+            Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::ToolCall { .. } => "tool/call",
             Self::UserMessage { .. } => "user/message",
             Self::AssistantMessage { .. } => "assistant/message",
@@ -721,6 +796,8 @@ impl SessionEventKind {
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
             | Self::RequestContext { .. }
+            | Self::LlmRetry { .. }
+            | Self::LlmRetryStarted { .. }
             | Self::ToolCall { .. } => None,
         }
     }
@@ -738,6 +815,8 @@ impl SessionEventKind {
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
             | Self::RequestContext { .. }
+            | Self::LlmRetry { .. }
+            | Self::LlmRetryStarted { .. }
             | Self::ToolCall { .. } => None,
         }
     }
@@ -772,6 +851,18 @@ impl SessionCheckpoint {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRetryState {
+    turn: u64,
+    step: u64,
+    provider: String,
+    mode: SessionLlmRetryMode,
+    policy_key: String,
+    retry: u64,
+    max_retries: Option<u64>,
+    started: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionState {
     last_turn: u64,
@@ -779,9 +870,15 @@ struct SessionState {
     last_step: u64,
     open_step: Option<u64>,
     pending_tool_calls: HashSet<String>,
+    request_provider: Option<String>,
+    retry_chains: HashMap<String, SessionRetryState>,
 }
 
 impl SessionState {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the append-only Session reducer keeps every event transition exhaustive in one match"
+    )]
     fn apply(&mut self, kind: &SessionEventKind) -> Result<(), SessionError> {
         match kind {
             SessionEventKind::TurnStart { turn } => {
@@ -802,6 +899,7 @@ impl SessionState {
                 self.last_turn = turn;
                 self.open_turn = Some(turn);
                 self.last_step = 0;
+                self.retry_chains.clear();
             }
             SessionEventKind::TurnEnd { turn, .. } => {
                 let turn = *turn;
@@ -810,6 +908,7 @@ impl SessionState {
                     return Err(SessionError::StepStillOpen { turn, step });
                 }
                 self.open_turn = None;
+                self.retry_chains.clear();
             }
             SessionEventKind::StepStart { turn, step } => {
                 let (turn, step) = (*turn, *step);
@@ -830,6 +929,7 @@ impl SessionState {
                 }
                 self.last_step = step;
                 self.open_step = Some(step);
+                self.retry_chains.clear();
             }
             SessionEventKind::StepEnd { turn, step } => {
                 let (turn, step) = (*turn, *step);
@@ -837,6 +937,7 @@ impl SessionState {
                 require_step(self.open_step, turn, step)?;
                 self.pending_tool_calls.clear();
                 self.open_step = None;
+                self.retry_chains.clear();
             }
             SessionEventKind::AgentInboxSpliced {
                 removed_count,
@@ -852,10 +953,15 @@ impl SessionState {
             SessionEventKind::RequestHeader { request } => {
                 require_open_turn(self.open_turn)?;
                 validate_request_header(request)?;
+                self.request_provider = Some(request.header.config.provider.clone());
             }
             SessionEventKind::RequestContext { context } => {
                 require_open_turn(self.open_turn)?;
                 validate_request_context(context)?;
+            }
+            SessionEventKind::LlmRetry { retry } => self.apply_llm_retry(retry)?,
+            SessionEventKind::LlmRetryStarted { started } => {
+                self.apply_llm_retry_started(started)?;
             }
             SessionEventKind::ToolCall {
                 turn,
@@ -874,6 +980,79 @@ impl SessionState {
                 self.validate_message_event(kind)?;
             }
         }
+        Ok(())
+    }
+
+    fn apply_llm_retry(&mut self, retry: &SessionLlmRetry) -> Result<(), SessionError> {
+        require_turn(self.open_turn, retry.turn)?;
+        require_step(self.open_step, retry.turn, retry.step)?;
+        validate_llm_retry(retry)?;
+        if self.request_provider.as_deref() != Some(retry.provider.as_str()) {
+            return Err(SessionError::InvalidLlmRetry {
+                expected: "the request-header provider in force for the open step",
+            });
+        }
+        if let Some(chain) = self.retry_chains.get_mut(&retry.retry_id) {
+            if chain.turn != retry.turn
+                || chain.step != retry.step
+                || chain.provider != retry.provider
+                || chain.mode != retry.mode
+                || chain.policy_key != retry.policy_key
+                || chain.max_retries != retry.max_retries
+                || !chain.started
+                || chain.retry.checked_add(1) != Some(retry.retry)
+            {
+                return Err(SessionError::InvalidLlmRetry {
+                    expected: "one monotonic started chain with stable scope, provider, and policy",
+                });
+            }
+            chain.retry = retry.retry;
+            chain.started = false;
+        } else {
+            if retry.retry != 1 {
+                return Err(SessionError::InvalidLlmRetry {
+                    expected: "a new retry chain beginning at retry one",
+                });
+            }
+            self.retry_chains.insert(
+                retry.retry_id.clone(),
+                SessionRetryState {
+                    turn: retry.turn,
+                    step: retry.step,
+                    provider: retry.provider.clone(),
+                    mode: retry.mode,
+                    policy_key: retry.policy_key.clone(),
+                    retry: retry.retry,
+                    max_retries: retry.max_retries,
+                    started: false,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_llm_retry_started(
+        &mut self,
+        started: &SessionLlmRetryStarted,
+    ) -> Result<(), SessionError> {
+        require_turn(self.open_turn, started.turn)?;
+        require_step(self.open_step, started.turn, started.step)?;
+        validate_llm_retry_started(started)?;
+        let Some(chain) = self.retry_chains.get_mut(&started.retry_id) else {
+            return Err(SessionError::InvalidLlmRetry {
+                expected: "a prior matching llm/retry schedule",
+            });
+        };
+        if chain.turn != started.turn
+            || chain.step != started.step
+            || chain.retry != started.retry
+            || chain.started
+        {
+            return Err(SessionError::InvalidLlmRetry {
+                expected: "one not-yet-started matching retry schedule",
+            });
+        }
+        chain.started = true;
         Ok(())
     }
 
@@ -998,6 +1177,8 @@ impl SessionState {
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
             | SessionEventKind::RequestContext { .. }
+            | SessionEventKind::LlmRetry { .. }
+            | SessionEventKind::LlmRetryStarted { .. }
             | SessionEventKind::ToolCall { .. } => Ok(()),
         }
     }
@@ -1150,13 +1331,48 @@ fn validate_token_usage(usage: &SessionTokenUsage) -> Result<(), SessionError> {
 }
 
 fn validate_llm_failure(failure: &SessionLlmFailure) -> Result<(), SessionError> {
-    if failure.message.is_empty()
-        || failure.code.is_empty()
-        || failure.status == Some(0)
-        || failure.request_id.as_ref().is_some_and(String::is_empty)
-    {
+    if !llm_failure_is_valid(failure) {
         return Err(SessionError::InvalidAssistantChunk {
             expected: "non-empty failure message/code/request id and positive status",
+        });
+    }
+    Ok(())
+}
+
+fn llm_failure_is_valid(failure: &SessionLlmFailure) -> bool {
+    !failure.message.is_empty()
+        && !failure.code.is_empty()
+        && failure.status != Some(0)
+        && !failure.request_id.as_ref().is_some_and(String::is_empty)
+}
+
+fn validate_llm_retry(retry: &SessionLlmRetry) -> Result<(), SessionError> {
+    let mode_is_valid = match retry.mode {
+        SessionLlmRetryMode::Normal => retry
+            .max_retries
+            .is_some_and(|max_retries| max_retries >= retry.retry),
+        SessionLlmRetryMode::Always => retry.max_retries.is_none(),
+    };
+    if retry.retry_id.is_empty()
+        || retry.turn == 0
+        || retry.step == 0
+        || retry.provider.is_empty()
+        || retry.policy_key.is_empty()
+        || retry.retry == 0
+        || !mode_is_valid
+        || !llm_failure_is_valid(&retry.failure)
+    {
+        return Err(SessionError::InvalidLlmRetry {
+            expected: "canonical identity, scope, provider, policy, budget, and failure facts",
+        });
+    }
+    Ok(())
+}
+
+fn validate_llm_retry_started(started: &SessionLlmRetryStarted) -> Result<(), SessionError> {
+    if started.retry_id.is_empty() || started.turn == 0 || started.step == 0 || started.retry == 0 {
+        return Err(SessionError::InvalidLlmRetry {
+            expected: "a non-empty identity and positive matching scope/retry number",
         });
     }
     Ok(())
@@ -1246,6 +1462,8 @@ fn pending_interrupted_tool_calls(events: &[SessionEvent]) -> Vec<(String, u64, 
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
             | SessionEventKind::RequestContext { .. }
+            | SessionEventKind::LlmRetry { .. }
+            | SessionEventKind::LlmRetryStarted { .. }
             | SessionEventKind::UserMessage { .. } => {}
         }
     }
@@ -1759,6 +1977,21 @@ impl SessionLog {
     ) -> Result<(), SessionError> {
         self.append(SessionEventKind::RequestContext { context })?;
         Ok(())
+    }
+
+    /// Commit one non-surface retry schedule before its wait starts.
+    pub fn append_llm_retry(&mut self, retry: SessionLlmRetry) -> Result<u64, SessionError> {
+        Ok(self.append(SessionEventKind::LlmRetry { retry })?.seq)
+    }
+
+    /// Commit the transition immediately before a scheduled retry redispatches.
+    pub fn append_llm_retry_started(
+        &mut self,
+        started: SessionLlmRetryStarted,
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::LlmRetryStarted { started })?
+            .seq)
     }
 
     /// Append one model-requested invocation without parsing its raw arguments.
@@ -2385,6 +2618,17 @@ impl SessionHandle {
         self.commit(|log| log.append_request_context(context))
     }
 
+    pub fn append_llm_retry(&self, retry: SessionLlmRetry) -> Result<u64, SessionError> {
+        self.commit(|log| log.append_llm_retry(retry))
+    }
+
+    pub fn append_llm_retry_started(
+        &self,
+        started: SessionLlmRetryStarted,
+    ) -> Result<u64, SessionError> {
+        self.commit(|log| log.append_llm_retry_started(started))
+    }
+
     pub fn append_tool_call(
         &self,
         turn: u64,
@@ -2829,6 +3073,10 @@ pub enum SessionError {
     InvalidRequestContextEncoding,
     #[error("session request/context must have {expected}")]
     InvalidRequestContext { expected: &'static str },
+    #[error("session llm retry persistence encoding is invalid")]
+    InvalidLlmRetryEncoding,
+    #[error("session llm retry must have {expected}")]
+    InvalidLlmRetry { expected: &'static str },
     #[error("session surface persistence encoding is invalid")]
     InvalidSurfaceEncoding,
     #[error("session {event_type} source event sequences must not be empty")]

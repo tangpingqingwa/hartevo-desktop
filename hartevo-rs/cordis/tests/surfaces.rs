@@ -5,15 +5,15 @@ use std::task::{Context as TaskContext, Poll};
 use hartevo_cordis::{
     AgentRef, Context, CordisError, CordisHost, DispatchMode, DomainSurface, EffectBrokerSurface,
     Emit, EnvironmentOverlay, EventKey, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
-    LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext, MAPPED_KEYS,
-    PluginId, PromptAssembly, PromptError, PromptSection, RuntimeSurface, SessionCallConfig,
-    SessionContentBlock, SessionFinishReason, SessionId, SessionLlmFailure, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionStreamBlockType, SessionStreamChunk,
-    SessionToolSchema, SurfaceOwner, SystemPromptSurface, ToolCall, ToolsSurface, Waterfall,
-    assemble_system_prompt, events, expected_mode, keys, prepare_llm_call, register_agent,
-    register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
-    register_tool_schema, run_tools_pipeline, session_events, stream_llm, stream_llm_request,
-    stream_prepared_llm,
+    LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmRetryPolicy, LlmStream,
+    LoaderContext, MAPPED_KEYS, PluginId, PromptAssembly, PromptError, PromptSection,
+    RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionId,
+    SessionLlmFailure, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionStreamBlockType, SessionStreamChunk, SessionToolSchema, SurfaceOwner,
+    SystemPromptSurface, ToolCall, ToolsSurface, Waterfall, assemble_system_prompt, events,
+    expected_mode, keys, prepare_llm_call, register_agent, register_llm_adapter,
+    register_llm_stream, register_prompt_section, register_tool, register_tool_schema,
+    run_tools_pipeline, session_events, stream_llm, stream_llm_request, stream_prepared_llm,
 };
 
 fn mapped() -> Context {
@@ -506,6 +506,40 @@ fn llm_adapter_preparation_validates_metadata_and_materializes_only_defaults() {
         prepare_llm_call(&ctx, &call_config("invalid", "model")),
         Err(CordisError::Llm(LlmError::InvalidModelInfo { .. }))
     ));
+}
+
+#[test]
+fn resolved_retry_policy_is_explicit_validated_and_generation_bound() {
+    assert_eq!(
+        LlmRetryPolicy::normal(2, Vec::new(), 1, 10, 0.0).unwrap_err(),
+        LlmError::InvalidRetryPolicy {
+            expected: "non-empty unique retryable codes",
+        }
+    );
+    assert_eq!(
+        LlmRetryPolicy::always(10, 1, 0.0).unwrap_err(),
+        LlmError::InvalidRetryPolicy {
+            expected: "positive ordered delay bounds within the portable timer limit",
+        }
+    );
+    assert_eq!(
+        LlmRetryPolicy::always(1, 10, f64::NAN).unwrap_err(),
+        LlmError::InvalidRetryPolicy {
+            expected: "a finite jitter ratio between zero and one",
+        }
+    );
+
+    let mut ctx = mapped();
+    let policy =
+        LlmRetryPolicy::normal(2, vec!["RATE_LIMIT".into(), "SERVER".into()], 5, 50, 0.25).unwrap();
+    let expected = policy.clone();
+    register_llm_adapter(&mut ctx, ["mock"], move |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model).with_retry_policy(policy.clone()))
+    })
+    .unwrap();
+
+    let prepared = prepare_llm_call(&ctx, &call_config("mock", "model")).unwrap();
+    assert_eq!(prepared.retry_policy(), Some(&expected));
 }
 
 #[test]

@@ -11,18 +11,19 @@ use hartevo_cordis::{
     AgentTurnStopping, BailOutcome, Context, CordisError, CordisHost, DomainSurface,
     EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
     KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmChunkStream,
-    LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
-    LoggedAgentCall, NonBail, PromptError, PromptSection, RecordedAgentStream, RuntimeSurface,
-    SessionCallConfig, SessionCancelCause, SessionContentBlock, SessionError, SessionEventKind,
-    SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason,
-    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-    SessionTokenUsage, SessionToolSchema, SurfaceOwner, TOOL_ABORTED_BEFORE_DISPATCH, ToolCall,
-    ToolDefinition, ToolDispatchExecution, ToolDispatchResult, ToolExecutionMode,
-    ToolExecutionPreparation, ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface,
-    TurnEndReason, WaterfallFailure, admit_agent_request, admit_agent_step, build_agent_call,
-    commit_agent_stream, commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution,
-    events, finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
+    LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmRetry, LlmRetryPolicy,
+    LlmStream, LoaderContext, LoggedAgentCall, NonBail, PromptError, PromptSection,
+    RecordedAgentStream, RuntimeSurface, SessionCallConfig, SessionCancelCause,
+    SessionContentBlock, SessionError, SessionEventKind, SessionFinishReason, SessionHandle,
+    SessionId, SessionLlmFailure, SessionLlmRetryMode, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
+    SessionToolSchema, SurfaceOwner, TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition,
+    ToolDispatchExecution, ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation,
+    ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface, TurnEndReason,
+    WaterfallFailure, admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
+    commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution, events,
+    finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
     prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
     record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
     register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
@@ -163,11 +164,16 @@ type AgentStreamScripts = Arc<Mutex<VecDeque<AgentStreamScript>>>;
 struct SequencedAgentAdapter {
     scripts: AgentStreamScripts,
     seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+    retry_policy: Option<LlmRetryPolicy>,
 }
 
 impl LlmAdapter for SequencedAgentAdapter {
     fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
-        Ok(LlmResolvedModel::new(provider, model))
+        let model = LlmResolvedModel::new(provider, model);
+        Ok(self
+            .retry_policy
+            .clone()
+            .map_or(model.clone(), |policy| model.with_retry_policy(policy)))
     }
 
     fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
@@ -192,9 +198,19 @@ fn sequenced_adapter(
                 scripts.into_iter().map(ok_chunks).collect::<VecDeque<_>>(),
             )),
             seen: Arc::clone(&seen),
+            retry_policy: None,
         },
         seen,
     )
+}
+
+fn sequenced_retry_adapter(
+    scripts: Vec<Vec<SessionStreamChunk>>,
+    retry_policy: LlmRetryPolicy,
+) -> (SequencedAgentAdapter, Arc<Mutex<Vec<LlmGenerateRequest>>>) {
+    let (mut adapter, seen) = sequenced_adapter(scripts);
+    adapter.retry_policy = Some(retry_policy);
+    (adapter, seen)
 }
 
 impl LlmAdapter for ScriptedAgentAdapter {
@@ -721,6 +737,411 @@ fn provider_failures_retry_inside_one_turn_and_step_before_success() {
     assert_two_same_step_recoveries(&recoveries.lock().unwrap(), &first_failure, &second_failure);
     assert_single_retry_turn_events(&session, "recovered");
     assert_failed_text_not_in_assistant_sources(&session, "doomed partial");
+}
+
+#[tokio::test]
+async fn provider_retry_policy_is_durable_before_bounded_same_step_redispatch() {
+    let mut ctx = mapped();
+    ctx.mount(LlmRetry).unwrap();
+    let first_failure = SessionLlmFailure {
+        message: "busy".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: Some(3),
+        request_id: Some("policy-retry-1".into()),
+    };
+    let second_failure = SessionLlmFailure {
+        message: "still busy".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: None,
+        request_id: Some("policy-retry-2".into()),
+    };
+    let policy = LlmRetryPolicy::normal(2, vec!["RATE_LIMIT".into()], 1, 10, 0.0).unwrap();
+    let (adapter, requests) = sequenced_retry_adapter(
+        vec![
+            text_finish_chunks(
+                "failed partial",
+                SessionFinishReason::Error {
+                    failure: first_failure.clone(),
+                },
+            ),
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error {
+                    failure: second_failure.clone(),
+                },
+                replay_state: None,
+            }],
+            text_finish_chunks("recovered by policy", SessionFinishReason::Stop),
+        ],
+        policy,
+    );
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("provider-policy-retry").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("provider-policy-input", "recover"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    let events = session.events().unwrap();
+    let retries = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::LlmRetry { retry } => Some(retry.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let started = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::LlmRetryStarted { started } => Some(started.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retries.len(), 2);
+    assert_eq!(started.len(), 2);
+    assert_eq!(retries[0].retry, 1);
+    assert_eq!(retries[0].delay_ms, 3);
+    assert_eq!(retries[0].failure, first_failure);
+    assert_eq!(retries[1].retry, 2);
+    assert_eq!(retries[1].delay_ms, 2);
+    assert_eq!(retries[1].failure, second_failure);
+    assert_eq!(retries[0].retry_id, retries[1].retry_id);
+    assert_eq!(started[0].retry_id, retries[0].retry_id);
+    assert_eq!(started[1].retry_id, retries[1].retry_id);
+    drop(events);
+    assert_single_retry_turn_events(&session, "recovered by policy");
+    assert_failed_text_not_in_assistant_sources(&session, "failed partial");
+}
+
+#[tokio::test]
+async fn cancellation_during_policy_backoff_leaves_only_the_durable_schedule() {
+    let mut ctx = mapped();
+    ctx.mount(LlmRetry).unwrap();
+    let failure = SessionLlmFailure {
+        message: "busy".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: None,
+        request_id: None,
+    };
+    let policy = LlmRetryPolicy::normal(1, vec!["RATE_LIMIT".into()], 60_000, 60_000, 0.0).unwrap();
+    let (adapter, requests) = sequenced_retry_adapter(
+        vec![
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error { failure },
+                replay_state: None,
+            }],
+            text_finish_chunks("must not dispatch", SessionFinishReason::Stop),
+        ],
+        policy,
+    );
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("provider-policy-cancel").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("provider-policy-cancel-input", "recover"))
+        .unwrap();
+    let (scheduled_tx, scheduled_rx) = tokio::sync::oneshot::channel();
+    let scheduled_tx = Arc::new(Mutex::new(Some(scheduled_tx)));
+    {
+        let scheduled_tx = Arc::clone(&scheduled_tx);
+        ctx.on_emit(session_events::SESSION_EVENT, move |record| {
+            if matches!(record.event.kind, SessionEventKind::LlmRetry { .. })
+                && let Some(sender) = scheduled_tx.lock().unwrap().take()
+            {
+                let _ = sender.send(());
+            }
+        })
+        .unwrap();
+    }
+    let cancellation = LifecycleCancellation::default();
+    let run = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &cancellation,
+    );
+    tokio::pin!(run);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            observed = scheduled_rx => {
+                observed.expect("retry schedule observer must remain live");
+            }
+            result = &mut run => panic!("agent turn settled before retry backoff cancellation: {result:?}"),
+        }
+    })
+    .await
+    .expect("retry schedule must be committed before waiting");
+    cancellation.cancel_with(SessionCancelCause::User);
+    let outcome = run.await.unwrap();
+
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::User)
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let events = session.events().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::LlmRetry { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::LlmRetryStarted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn normal_retry_policy_exhaustion_preserves_the_terminal_failure() {
+    let mut ctx = mapped();
+    ctx.mount(LlmRetry).unwrap();
+    let first_failure = SessionLlmFailure {
+        message: "busy".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: None,
+        request_id: Some("budget-1".into()),
+    };
+    let terminal_failure = SessionLlmFailure {
+        message: "budget exhausted".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: None,
+        request_id: Some("budget-2".into()),
+    };
+    let policy = LlmRetryPolicy::normal(1, vec!["RATE_LIMIT".into()], 1, 1, 0.0).unwrap();
+    let (adapter, requests) = sequenced_retry_adapter(
+        vec![
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error {
+                    failure: first_failure,
+                },
+                replay_state: None,
+            }],
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error {
+                    failure: terminal_failure.clone(),
+                },
+                replay_state: None,
+            }],
+        ],
+        policy,
+    );
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("provider-policy-budget").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("provider-policy-budget-input", "recover"))
+        .unwrap();
+
+    let error = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        CordisError::Llm(LlmError::RequestFailed {
+            failure: terminal_failure,
+        })
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::LlmRetry { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn normal_policy_delegates_ineligible_and_over_limit_provider_delay() {
+    let mut ctx = mapped();
+    ctx.mount(LlmRetry).unwrap();
+    let downstream_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let downstream_calls = Arc::clone(&downstream_calls);
+        ctx.try_on_waterfall(events::AGENT_REQUEST_ERROR, move |recovery, _next| {
+            downstream_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(recovery.retry())
+        })
+        .unwrap();
+    }
+    let ineligible = SessionLlmFailure {
+        message: "permanent".into(),
+        code: "PERMANENT".into(),
+        status: Some(400),
+        provider_retry_after_ms: None,
+        request_id: None,
+    };
+    let over_limit = SessionLlmFailure {
+        message: "too long".into(),
+        code: "RATE_LIMIT".into(),
+        status: Some(429),
+        provider_retry_after_ms: Some(50),
+        request_id: None,
+    };
+    let policy = LlmRetryPolicy::normal(2, vec!["RATE_LIMIT".into()], 1, 10, 0.0).unwrap();
+    let (adapter, requests) = sequenced_retry_adapter(
+        vec![
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error {
+                    failure: ineligible,
+                },
+                replay_state: None,
+            }],
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error {
+                    failure: over_limit,
+                },
+                replay_state: None,
+            }],
+            text_finish_chunks("delegated recovery", SessionFinishReason::Stop),
+        ],
+        policy,
+    );
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("normal-policy-delegation").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("normal-policy-delegation-input", "recover"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(downstream_calls.load(Ordering::SeqCst), 2);
+    assert!(
+        !session
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::LlmRetry { .. }))
+    );
+}
+
+#[tokio::test]
+async fn always_policy_honors_downstream_retry_then_schedules_its_fallback() {
+    let mut ctx = mapped();
+    ctx.mount(LlmRetry).unwrap();
+    let downstream_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let downstream_calls = Arc::clone(&downstream_calls);
+        ctx.try_on_waterfall(events::AGENT_REQUEST_ERROR, move |recovery, _next| {
+            let call = downstream_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if call == 0 {
+                recovery.retry()
+            } else {
+                recovery
+            })
+        })
+        .unwrap();
+    }
+    let failure = || SessionLlmFailure {
+        message: "permanent but always-owned".into(),
+        code: "PERMANENT".into(),
+        status: Some(400),
+        provider_retry_after_ms: None,
+        request_id: None,
+    };
+    let (adapter, requests) = sequenced_retry_adapter(
+        vec![
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error { failure: failure() },
+                replay_state: None,
+            }],
+            vec![SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Error { failure: failure() },
+                replay_state: None,
+            }],
+            text_finish_chunks("always fallback", SessionFinishReason::Stop),
+        ],
+        LlmRetryPolicy::always(1, 1, 0.0).unwrap(),
+    );
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("always-policy-fallback").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("always-policy-fallback-input", "recover"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(downstream_calls.load(Ordering::SeqCst), 2);
+    let retries = session
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::LlmRetry { retry } => Some(retry),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].mode, SessionLlmRetryMode::Always);
+    assert_eq!(retries[0].retry, 1);
+    assert_eq!(retries[0].max_retries, None);
 }
 
 #[test]

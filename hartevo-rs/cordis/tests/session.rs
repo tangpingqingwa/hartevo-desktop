@@ -6,7 +6,8 @@ use hartevo_cordis::{
     AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
     KernelConsentState, SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock,
     SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
-    SessionHeader, SessionId, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionHeader, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
+    SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
     SessionReplayEnvelope, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
     SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
     SessionSurfaceOp, SessionTokenUsage, SessionToolError, SessionToolSchema, TOOL_NOT_STARTED,
@@ -532,6 +533,74 @@ fn request_json_rejects_unknown_legacy_or_noncanonical_shapes() {
             SessionError::InvalidRequestContextEncoding
         );
     }
+}
+
+#[test]
+fn retry_events_replay_only_as_one_scheduled_then_started_chain() {
+    let mut log = SessionLog::new_at(SessionId::new("retry-log").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let step = log.start_step(turn).unwrap();
+    log.append_request_header(
+        request_header("mock", "model"),
+        SessionRequestHeaderReason::Initial,
+        false,
+    )
+    .unwrap();
+    let retry = SessionLlmRetry {
+        retry_id: "retry-chain".into(),
+        turn,
+        step,
+        provider: "mock".into(),
+        mode: SessionLlmRetryMode::Normal,
+        policy_key: "normal-policy".into(),
+        retry: 1,
+        max_retries: Some(2),
+        delay_ms: 5,
+        failure: SessionLlmFailure {
+            message: "busy".into(),
+            code: "RATE_LIMIT".into(),
+            status: Some(429),
+            provider_retry_after_ms: Some(5),
+            request_id: Some("request-1".into()),
+        },
+    };
+    log.append_llm_retry(retry.clone()).unwrap();
+    let started = SessionLlmRetryStarted {
+        retry_id: retry.retry_id.clone(),
+        turn,
+        step,
+        retry: 1,
+    };
+    assert_eq!(log.append_llm_retry_started(started.clone()).unwrap(), 4);
+    assert!(matches!(
+        log.append_llm_retry_started(started),
+        Err(SessionError::InvalidLlmRetry { .. })
+    ));
+    assert!(log.derive_messages().is_empty());
+
+    let mut changed_policy_facts = log.clone();
+    let mut changed_retry = retry.clone();
+    changed_retry.retry = 2;
+    changed_retry.mode = SessionLlmRetryMode::Always;
+    changed_retry.max_retries = None;
+    assert!(matches!(
+        changed_policy_facts.append_llm_retry(changed_retry),
+        Err(SessionError::InvalidLlmRetry { .. })
+    ));
+
+    let header = log.header().clone();
+    let events = log.events().to_vec();
+    assert_eq!(SessionLog::restore(header.clone(), events).unwrap(), log);
+
+    let mut missing_schedule = log.events().to_vec();
+    missing_schedule.remove(2);
+    for (seq, event) in missing_schedule.iter_mut().enumerate() {
+        event.seq = u64::try_from(seq).unwrap();
+    }
+    assert!(matches!(
+        SessionLog::restore(header, missing_schedule),
+        Err(SessionError::InvalidLlmRetry { .. })
+    ));
 }
 
 #[test]

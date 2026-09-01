@@ -27,6 +27,7 @@ mod invariants;
 mod kernel;
 mod loader;
 mod registry;
+mod retry;
 mod service;
 mod session;
 mod surface;
@@ -94,6 +95,7 @@ pub use registry::{
     LifecycleContextView, LifecycleEventDispatcher, LifecycleHandle, LifecycleProviderHandle,
     LifecycleRegistry,
 };
+pub use retry::{LLM_RETRY_KEYS, LlmRetry};
 pub use service::{
     AssociatedAccessor, AssociatedAccessorHandle, CallableService, Service, ServiceAssociation,
     ServiceCall, ServiceCaller, ServiceHandle, ServiceOptions, ServiceOrigin, ServiceShadow,
@@ -103,26 +105,28 @@ pub use session::{
     SESSION_FORMAT_VERSION, SessionAssistantChunk, SessionCallConfig,
     SessionCallConfigAdapterDefaults, SessionCancelCause, SessionCheckpoint, SessionContentBlock,
     SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
-    SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure, SessionLog,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
-    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
-    SessionStreamBlockType, SessionStreamChunk, SessionSurface, SessionSurfaceIntent,
-    SessionSurfaceOp, SessionTokenUsage, SessionToolCall, SessionToolError, SessionToolSchema,
-    TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, events as session_events,
+    SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure,
+    SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionLog, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestContext,
+    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurface, SessionSurfaceIntent, SessionSurfaceOp, SessionTokenUsage,
+    SessionToolCall, SessionToolError, SessionToolSchema, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN,
+    TurnEndReason, events as session_events,
 };
 pub use surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,
-    AgentRequestErrorAction, AgentStatus, AgentStatusChange, AgentTurnStopping, AgentsSurface,
-    DeniedToolExecution, DesktopSurface, DomainSurface, EffectBrokerSurface, LlmAdapter,
-    LlmAdapterStream, LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning,
-    LlmResolvedModel, LlmStream, LlmSurface, MAPPED_KEYS, PreparedLlmCall, PreparedToolExecution,
-    PromptAssembly, PromptError, PromptSection, RuntimeSurface, SurfaceOwner, SystemPromptSurface,
-    TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition, ToolDispatchExecution,
-    ToolDispatchOutcome, ToolDispatchResult, ToolExecutionInput, ToolExecutionMode,
-    ToolExecutionPreparation, ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface,
-    assemble_system_prompt, dispatch_tool_execution, events, expected_mode,
-    finalize_tool_execution, post_tool_execution, prepare_llm_call, prepare_tool_execution,
-    register_agent, register_llm_adapter, register_llm_stream, register_prompt_section,
-    register_tool, register_tool_concurrency, register_tool_definition, register_tool_guard,
-    register_tool_schema, run_tools_pipeline, stream_llm, stream_llm_request, stream_prepared_llm,
+    AgentRequestErrorAction, AgentRetrySchedule, AgentStatus, AgentStatusChange, AgentTurnStopping,
+    AgentsSurface, DeniedToolExecution, DesktopSurface, DomainSurface, EffectBrokerSurface,
+    LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning,
+    LlmResolvedModel, LlmRetryPolicy, LlmRetryPolicyMode, LlmStream, LlmSurface, MAPPED_KEYS,
+    MAX_LLM_RETRY_DELAY_MS, PreparedLlmCall, PreparedToolExecution, PromptAssembly, PromptError,
+    PromptSection, RuntimeSurface, SurfaceOwner, SystemPromptSurface, TOOL_ABORTED_BEFORE_DISPATCH,
+    ToolCall, ToolDefinition, ToolDispatchExecution, ToolDispatchOutcome, ToolDispatchResult,
+    ToolExecutionInput, ToolExecutionMode, ToolExecutionPreparation, ToolExecutionResult,
+    ToolPostExecution, ToolRunContext, ToolsSurface, assemble_system_prompt,
+    dispatch_tool_execution, events, expected_mode, finalize_tool_execution, post_tool_execution,
+    prepare_llm_call, prepare_tool_execution, register_agent, register_llm_adapter,
+    register_llm_stream, register_prompt_section, register_tool, register_tool_concurrency,
+    register_tool_definition, register_tool_guard, register_tool_schema, run_tools_pipeline,
+    stream_llm, stream_llm_request, stream_prepared_llm,
 };

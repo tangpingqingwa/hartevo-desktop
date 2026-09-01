@@ -23,9 +23,9 @@ use crate::event::{DispatchMode, EventKey, EventModeMarker, ListenerHandle};
 use crate::fiber::LifecycleCancellation;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
-    SessionId, SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk,
-    SessionToolCall, SessionToolError, SessionToolSchema, events as session_events,
-    validate_agent_request_config, validate_agent_user_message,
+    SessionId, SessionLlmFailure, SessionLlmRetryMode, SessionMessage, SessionStore,
+    SessionStreamChunk, SessionToolCall, SessionToolError, SessionToolSchema,
+    events as session_events, validate_agent_request_config, validate_agent_user_message,
 };
 
 /// Canonical DeepSeek Harness code for a tool call cancelled before dispatch.
@@ -1317,14 +1317,163 @@ impl LlmModelReasoning {
     }
 }
 
-/// Exact provider/model metadata returned by one adapter preparation.
+/// Largest portable delay accepted by the provider-owned retry policy.
+pub const MAX_LLM_RETRY_DELAY_MS: u64 = 2_147_483_647;
+
+/// Eligibility and budget of one fully resolved provider retry policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmRetryPolicyMode {
+    Normal {
+        max_retries: u64,
+        retryable_codes: Vec<String>,
+    },
+    Always,
+}
+
+/// Immutable retry behavior captured with one exact adapter generation.
+///
+/// Core supplies no implicit production defaults. Provider adapters must
+/// resolve and validate every value before attaching the policy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmRetryPolicy {
+    mode: LlmRetryPolicyMode,
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    jitter_ratio: f64,
+}
+
+impl LlmRetryPolicy {
+    pub fn normal(
+        max_retries: u64,
+        retryable_codes: Vec<String>,
+        initial_delay_ms: u64,
+        max_delay_ms: u64,
+        jitter_ratio: f64,
+    ) -> Result<Self, LlmError> {
+        if retryable_codes.is_empty()
+            || retryable_codes.iter().any(String::is_empty)
+            || retryable_codes.iter().collect::<HashSet<_>>().len() != retryable_codes.len()
+        {
+            return Err(LlmError::InvalidRetryPolicy {
+                expected: "non-empty unique retryable codes",
+            });
+        }
+        Self::validated(
+            LlmRetryPolicyMode::Normal {
+                max_retries,
+                retryable_codes,
+            },
+            initial_delay_ms,
+            max_delay_ms,
+            jitter_ratio,
+        )
+    }
+
+    pub fn always(
+        initial_delay_ms: u64,
+        max_delay_ms: u64,
+        jitter_ratio: f64,
+    ) -> Result<Self, LlmError> {
+        Self::validated(
+            LlmRetryPolicyMode::Always,
+            initial_delay_ms,
+            max_delay_ms,
+            jitter_ratio,
+        )
+    }
+
+    fn validated(
+        mode: LlmRetryPolicyMode,
+        initial_delay_ms: u64,
+        max_delay_ms: u64,
+        mut jitter_ratio: f64,
+    ) -> Result<Self, LlmError> {
+        if initial_delay_ms == 0
+            || max_delay_ms == 0
+            || initial_delay_ms > max_delay_ms
+            || max_delay_ms > MAX_LLM_RETRY_DELAY_MS
+        {
+            return Err(LlmError::InvalidRetryPolicy {
+                expected: "positive ordered delay bounds within the portable timer limit",
+            });
+        }
+        if !jitter_ratio.is_finite() || !(0.0..=1.0).contains(&jitter_ratio) {
+            return Err(LlmError::InvalidRetryPolicy {
+                expected: "a finite jitter ratio between zero and one",
+            });
+        }
+        if jitter_ratio == 0.0 {
+            jitter_ratio = 0.0;
+        }
+        Ok(Self {
+            mode,
+            initial_delay_ms,
+            max_delay_ms,
+            jitter_ratio,
+        })
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> &LlmRetryPolicyMode {
+        &self.mode
+    }
+
+    #[must_use]
+    pub const fn initial_delay_ms(&self) -> u64 {
+        self.initial_delay_ms
+    }
+
+    #[must_use]
+    pub const fn max_delay_ms(&self) -> u64 {
+        self.max_delay_ms
+    }
+
+    #[must_use]
+    pub const fn jitter_ratio(&self) -> f64 {
+        self.jitter_ratio
+    }
+
+    pub(crate) fn policy_key(&self) -> String {
+        match &self.mode {
+            LlmRetryPolicyMode::Normal {
+                max_retries,
+                retryable_codes,
+            } => {
+                let mut codes = retryable_codes.clone();
+                codes.sort();
+                let code_count = codes.len();
+                let mut encoded_codes = String::new();
+                for code in codes {
+                    encoded_codes.push_str(&code.len().to_string());
+                    encoded_codes.push(':');
+                    encoded_codes.push_str(&code);
+                }
+                format!(
+                    "normal:{max_retries}:{code_count}:{encoded_codes}:{}:{}:{:016x}",
+                    self.initial_delay_ms,
+                    self.max_delay_ms,
+                    self.jitter_ratio.to_bits(),
+                )
+            }
+            LlmRetryPolicyMode::Always => format!(
+                "always:{}:{}:{:016x}",
+                self.initial_delay_ms,
+                self.max_delay_ms,
+                self.jitter_ratio.to_bits(),
+            ),
+        }
+    }
+}
+
+/// Exact provider/model metadata returned by one adapter preparation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LlmResolvedModel {
     provider: String,
     model: String,
     context_window: Option<u64>,
     default_max_tokens: Option<u64>,
     reasoning: Option<LlmModelReasoning>,
+    retry_policy: Option<LlmRetryPolicy>,
 }
 
 impl LlmResolvedModel {
@@ -1336,6 +1485,7 @@ impl LlmResolvedModel {
             context_window: None,
             default_max_tokens: None,
             reasoning: None,
+            retry_policy: None,
         }
     }
 
@@ -1354,6 +1504,12 @@ impl LlmResolvedModel {
     #[must_use]
     pub fn with_reasoning(mut self, reasoning: LlmModelReasoning) -> Self {
         self.reasoning = Some(reasoning);
+        self
+    }
+
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry_policy: LlmRetryPolicy) -> Self {
+        self.retry_policy = Some(retry_policy);
         self
     }
 
@@ -1380,6 +1536,11 @@ impl LlmResolvedModel {
     #[must_use]
     pub const fn reasoning(&self) -> Option<&LlmModelReasoning> {
         self.reasoning.as_ref()
+    }
+
+    #[must_use]
+    pub const fn retry_policy(&self) -> Option<&LlmRetryPolicy> {
+        self.retry_policy.as_ref()
     }
 }
 
@@ -1423,6 +1584,8 @@ pub enum LlmError {
     AdapterIdentityOverflow,
     #[error("LLM adapter registry mutex is poisoned")]
     RegistryPoisoned,
+    #[error("LLM retry policy must have {expected}")]
+    InvalidRetryPolicy { expected: &'static str },
     #[error("no LLM adapter is registered for provider `{provider}`")]
     NoAdapter { provider: String },
     #[error("LLM adapter model `{provider}/{model}` must have {expected}")]
@@ -1462,6 +1625,7 @@ impl LlmError {
             Self::DuplicateAdapter { .. } => "DUPLICATE_ADAPTER",
             Self::AdapterIdentityOverflow => "ADAPTER_IDENTITY_OVERFLOW",
             Self::RegistryPoisoned => "INVARIANT",
+            Self::InvalidRetryPolicy { .. } => "INVALID_RETRY_POLICY",
             Self::NoAdapter { .. } => "NO_ADAPTER",
             Self::InvalidModelInfo { .. } => "INVALID_MODEL_INFO",
             Self::UnsupportedReasoningEffort { .. } => "UNSUPPORTED_REASONING_EFFORT",
@@ -1496,6 +1660,7 @@ pub struct PreparedLlmCall {
     config: SessionCallConfig,
     adapter_defaults: SessionCallConfigAdapterDefaults,
     context_window: Option<u64>,
+    retry_policy: Option<LlmRetryPolicy>,
     dispatched: Arc<AtomicBool>,
 }
 
@@ -1519,6 +1684,11 @@ impl PreparedLlmCall {
     pub const fn context_window(&self) -> Option<u64> {
         self.context_window
     }
+
+    #[must_use]
+    pub const fn retry_policy(&self) -> Option<&LlmRetryPolicy> {
+        self.retry_policy.as_ref()
+    }
 }
 
 impl fmt::Debug for PreparedLlmCall {
@@ -1529,6 +1699,7 @@ impl fmt::Debug for PreparedLlmCall {
             .field("config", &self.config)
             .field("adapter_defaults", &self.adapter_defaults)
             .field("context_window", &self.context_window)
+            .field("retry_policy", &self.retry_policy)
             .field("dispatched", &self.dispatched.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
@@ -1883,41 +2054,119 @@ pub enum AgentRequestErrorAction {
     Retry,
 }
 
-/// Immutable failed-request scope plus the replaceable recovery action.
+/// Durable schedule selected by the optional provider-routed retry executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRetrySchedule {
+    retry_id: String,
+    mode: SessionLlmRetryMode,
+    policy_key: String,
+    retry: u64,
+    max_retries: Option<u64>,
+    delay_ms: u64,
+}
+
+impl AgentRetrySchedule {
+    pub(crate) fn new(
+        retry_id: String,
+        mode: SessionLlmRetryMode,
+        policy_key: String,
+        retry: u64,
+        max_retries: Option<u64>,
+        delay_ms: u64,
+    ) -> Self {
+        Self {
+            retry_id,
+            mode,
+            policy_key,
+            retry,
+            max_retries,
+            delay_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn retry_id(&self) -> &str {
+        &self.retry_id
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> SessionLlmRetryMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn policy_key(&self) -> &str {
+        &self.policy_key
+    }
+
+    #[must_use]
+    pub const fn retry(&self) -> u64 {
+        self.retry
+    }
+
+    #[must_use]
+    pub const fn max_retries(&self) -> Option<u64> {
+        self.max_retries
+    }
+
+    #[must_use]
+    pub const fn delay_ms(&self) -> u64 {
+        self.delay_ms
+    }
+}
+
+/// Immutable failed-request scope plus the replaceable recovery action.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentRequestError {
     agent: AgentRef,
+    session_id: SessionId,
     turn: u64,
     step: u64,
     provider: String,
     failure: SessionLlmFailure,
+    retry_policy: Option<LlmRetryPolicy>,
     cancellation: LifecycleCancellation,
     action: AgentRequestErrorAction,
+    retry_schedule: Option<AgentRetrySchedule>,
 }
 
 impl AgentRequestError {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor freezes one exact failed request boundary without a lossy intermediate bag"
+    )]
     pub(crate) fn new(
         agent: AgentRef,
+        session_id: SessionId,
         turn: u64,
         step: u64,
         provider: String,
         failure: SessionLlmFailure,
+        retry_policy: Option<LlmRetryPolicy>,
         cancellation: LifecycleCancellation,
     ) -> Self {
         Self {
             agent,
+            session_id,
             turn,
             step,
             provider,
             failure,
+            retry_policy,
             cancellation,
             action: AgentRequestErrorAction::Fail,
+            retry_schedule: None,
         }
     }
 
     #[must_use]
     pub const fn agent(&self) -> &AgentRef {
         &self.agent
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     #[must_use]
@@ -1941,6 +2190,11 @@ impl AgentRequestError {
     }
 
     #[must_use]
+    pub const fn retry_policy(&self) -> Option<&LlmRetryPolicy> {
+        self.retry_policy.as_ref()
+    }
+
+    #[must_use]
     pub const fn cancellation(&self) -> &LifecycleCancellation {
         &self.cancellation
     }
@@ -1950,10 +2204,16 @@ impl AgentRequestError {
         self.action
     }
 
+    #[must_use]
+    pub const fn retry_schedule(&self) -> Option<&AgentRetrySchedule> {
+        self.retry_schedule.as_ref()
+    }
+
     /// Replace only the recovery action while retaining exact failure scope.
     #[must_use]
     pub fn with_action(mut self, action: AgentRequestErrorAction) -> Self {
         self.action = action;
+        self.retry_schedule = None;
         self
     }
 
@@ -1961,6 +2221,12 @@ impl AgentRequestError {
     #[must_use]
     pub fn retry(self) -> Self {
         self.with_action(AgentRequestErrorAction::Retry)
+    }
+
+    pub(crate) fn retry_with_schedule(mut self, schedule: AgentRetrySchedule) -> Self {
+        self.action = AgentRequestErrorAction::Retry;
+        self.retry_schedule = Some(schedule);
+        self
     }
 }
 
@@ -2478,6 +2744,7 @@ fn resolve_prepared_call(
         config,
         adapter_defaults,
         context_window: model.context_window,
+        retry_policy: model.retry_policy.clone(),
         dispatched: Arc::new(AtomicBool::new(false)),
     })
 }
@@ -3730,6 +3997,17 @@ pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
 mod tests {
     use super::*;
     use crate::event::Emit;
+
+    #[test]
+    fn retry_policy_key_is_order_independent_and_collision_free() {
+        let split = LlmRetryPolicy::normal(2, vec!["b".into(), "a".into()], 1, 10, -0.0).unwrap();
+        let reordered =
+            LlmRetryPolicy::normal(2, vec!["a".into(), "b".into()], 1, 10, 0.0).unwrap();
+        let embedded = LlmRetryPolicy::normal(2, vec!["a\u{1f}b".into()], 1, 10, 0.0).unwrap();
+
+        assert_eq!(split.policy_key(), reordered.policy_key());
+        assert_ne!(split.policy_key(), embedded.policy_key());
+    }
 
     #[test]
     fn sealed_mapping_rejects_forged_owner_with_typed_error_before_mount() {
