@@ -1,12 +1,12 @@
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost, DomainCommandBinding,
-    DomainCommandKind, DomainSurface, EffectBrokerSurface, EffectExecutionBinding,
-    EffectReconciliationBinding, EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate,
-    KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
+    AgentRef, AgentStep, AgentsSurface, AuthorityScope, CordisError, CordisHost,
+    DomainCommandBinding, DomainCommandKind, DomainSurface, EffectBrokerSurface,
+    EffectExecutionBinding, EffectReconciliationBinding, EnvironmentOverlay, HOST_PLUGIN_IDS,
+    InvariantGate, KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
     KernelConsentStatus, LoaderContext, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId,
     RuntimeBinding, RuntimeSurface, SurfaceOwner, ToolCall, enforce_invariants,
-    host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
+    host_is_cordis_loop, host_plugin_ids, invariant_missing, keys, register_agent,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -632,7 +632,17 @@ fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
         CordisError::AuthorityScopeMismatch
     );
 
-    let permit = host.authorize_runtime(&scope).unwrap();
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    let started_agents = std::sync::Arc::clone(&agents);
+    host.on_runtime_started(move |agent| {
+        assert_eq!(
+            started_agents.list().as_slice(),
+            std::slice::from_ref(agent)
+        );
+    })
+    .unwrap();
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
     assert_eq!(permit.scope(), &scope);
     assert_eq!(host.active_runtime_scope(), Some(&scope));
     assert_eq!(
@@ -650,15 +660,10 @@ fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
         .unwrap_err(),
         CordisError::RuntimeDispatchBusy
     );
-    assert_eq!(
-        host.context()
-            .agents::<AgentsSurface>()
-            .unwrap()
-            .list()
-            .len(),
-        1
-    );
-    host.finish_runtime(permit).unwrap();
+    assert!(agents.list().is_empty(), "authorization stays unpublished");
+    permit.announce_started().unwrap();
+    assert_eq!(agents.list().len(), 1);
+    host.finish_runtime(permit).unwrap().announce().unwrap();
     assert_eq!(host.bound_scope(), Some(&scope));
     assert_eq!(host.active_runtime_scope(), None);
     assert!(
@@ -669,6 +674,75 @@ fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
             .is_empty(),
         "the scoped runtime agent must be disposed after the adapter returns"
     );
+}
+
+#[test]
+fn runtime_agent_publication_collision_never_replaces_or_disposes_the_live_identity() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let agent = AgentRef::new("project-a:mission-a:2:1");
+    register_agent(host.context_mut(), agent.clone()).unwrap();
+    let disposed_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let disposed_calls = std::sync::Arc::clone(&disposed_calls);
+        host.on_runtime_finished(move |_| {
+            disposed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap();
+    }
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    let first = permit.announce_started().unwrap_err();
+    let second = permit.announce_started().unwrap_err();
+    assert_eq!(first, second);
+    assert_eq!(
+        first,
+        CordisError::AgentAlreadyPublished {
+            id: agent.id.clone()
+        }
+    );
+    assert_eq!(
+        host.context().agents::<AgentsSurface>().unwrap().list(),
+        [agent]
+    );
+
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+    assert_eq!(disposed_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(host.active_runtime_scope().is_none());
+}
+
+#[test]
+fn runtime_agent_publication_panic_rolls_back_before_the_caller_recovers() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    host.on_runtime_started(|_| panic!("publication listener panic"))
+        .unwrap();
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    let panicked =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| permit.announce_started()));
+    assert!(panicked.is_err());
+    assert!(agents.list().is_empty());
+
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+    assert!(host.active_runtime_scope().is_none());
 }
 
 #[test]

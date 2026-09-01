@@ -287,15 +287,15 @@ impl CordisHost {
         let disposed = self
             .ctx
             .prepare_emit(events::AGENT_DISPOSED, agent.clone())?;
+        let unpublished = agents.prepare_publication(agent.clone());
         let (permit, lease) = RuntimeDispatchPermit::issue(
             serial,
             scope.clone(),
             agent.id.clone(),
-            std::sync::Arc::clone(&agents),
+            unpublished,
             started,
             disposed,
         );
-        agents.register(agent.clone());
         self.next_runtime_serial = serial;
         self.active_runtime = Some(ActiveRuntimeDispatch {
             serial,

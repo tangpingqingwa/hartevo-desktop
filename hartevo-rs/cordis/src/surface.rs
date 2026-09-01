@@ -2215,6 +2215,37 @@ pub struct AgentsSurface {
     live: Arc<Mutex<Vec<AgentRef>>>,
 }
 
+/// Agent identity composed outside the live registry until one exact commit.
+#[derive(Debug)]
+pub(crate) struct UnpublishedAgent {
+    registry: AgentsSurface,
+    agent: AgentRef,
+}
+
+impl UnpublishedAgent {
+    pub(crate) fn commit(self) -> Result<AgentPublicationCommit, CordisError> {
+        let Self { registry, agent } = self;
+        registry.publish_unique(agent.clone())?;
+        Ok(AgentPublicationCommit {
+            registry,
+            id: agent.id,
+        })
+    }
+}
+
+/// Live registry commitment. Dropping it reverses the exact publication.
+#[derive(Debug)]
+pub(crate) struct AgentPublicationCommit {
+    registry: AgentsSurface,
+    id: String,
+}
+
+impl Drop for AgentPublicationCommit {
+    fn drop(&mut self) {
+        self.registry.unregister(&self.id);
+    }
+}
+
 impl AgentsSurface {
     fn new() -> Self {
         Self {
@@ -2224,6 +2255,27 @@ impl AgentsSurface {
 
     pub fn register(&self, agent: AgentRef) {
         self.live.lock().expect("agents").push(agent);
+    }
+
+    /// Compose one unpublished identity. The commit rechecks uniqueness under
+    /// the registry lock, so concurrent preparations cannot both publish.
+    pub(crate) fn prepare_publication(&self, agent: AgentRef) -> UnpublishedAgent {
+        UnpublishedAgent {
+            registry: self.clone(),
+            agent,
+        }
+    }
+
+    fn publish_unique(&self, agent: AgentRef) -> Result<(), CordisError> {
+        let mut live = self
+            .live
+            .lock()
+            .map_err(|_| CordisError::AgentRegistryPoisoned)?;
+        if live.iter().any(|published| published.id == agent.id) {
+            return Err(CordisError::AgentAlreadyPublished { id: agent.id });
+        }
+        live.push(agent);
+        Ok(())
     }
 
     pub fn unregister(&self, id: &str) {
