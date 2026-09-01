@@ -15,14 +15,14 @@ use hartevo_cordis::{
     SessionHandle, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
-    SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, ToolDispatchResult,
-    ToolExecutionMode, ToolExecutionPreparation, ToolsSurface, TurnEndReason, admit_agent_request,
-    admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call,
-    dispatch_tool_execution, events, keys, log_agent_call, prepare_agent_call, prepare_agent_step,
-    prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream,
-    register_llm_adapter, register_prompt_section, register_tool, register_tool_concurrency,
-    register_tool_definition, register_tool_guard, register_tool_schema, run_agent_step,
-    schedule_agent_tool_calls, session_events,
+    SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, ToolDispatchExecution,
+    ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolsSurface, TurnEndReason,
+    admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
+    dispatch_agent_call, dispatch_tool_execution, events, keys, log_agent_call, prepare_agent_call,
+    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
+    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
+    register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
+    run_agent_step, schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -2318,10 +2318,13 @@ fn scheduled_tool_calls_preserve_model_order_raw_arguments_and_durable_sequences
     let executions = Arc::new(AtomicUsize::new(0));
     {
         let executions = Arc::clone(&executions);
-        ctx.on_waterfall(events::TOOLS_EXECUTE, move |call: ToolCall, next| {
-            executions.fetch_add(1, Ordering::SeqCst);
-            next(call)
-        })
+        ctx.on_waterfall(
+            events::TOOLS_EXECUTE,
+            move |call: ToolDispatchExecution, next| {
+                executions.fetch_add(1, Ordering::SeqCst);
+                next(call)
+            },
+        )
         .unwrap();
     }
     commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
@@ -2972,7 +2975,7 @@ fn exact_tool_dispatch_runs_each_body_once_and_normalizes_errors_without_session
         .into_iter()
         .map(|preparation| match preparation {
             ToolExecutionPreparation::Dispatch(dispatch) => {
-                dispatch_tool_execution(&ctx, dispatch).unwrap()
+                dispatch_tool_execution(&mut ctx, dispatch).unwrap()
             }
             ToolExecutionPreparation::Denied(denied) => {
                 panic!("unexpected denial: {}", denied.reason())
@@ -3056,13 +3059,15 @@ fn tool_dispatch_fences_stale_replacements_and_schema_only_registrations() {
         panic!("schema-only registration should reach typed dispatch failure");
     };
     assert_eq!(
-        dispatch_tool_execution(&ctx, stale).unwrap().result(),
+        dispatch_tool_execution(&mut ctx, stale).unwrap().result(),
         &ToolDispatchResult::Failure {
             message: "tool registration changed before dispatch".into(),
         }
     );
     assert_eq!(
-        dispatch_tool_execution(&ctx, schema_only).unwrap().result(),
+        dispatch_tool_execution(&mut ctx, schema_only)
+            .unwrap()
+            .result(),
         &ToolDispatchResult::Failure {
             message: "tool \"schema-only\" has no registered executor".into(),
         }
@@ -3075,13 +3080,204 @@ fn tool_dispatch_fences_stale_replacements_and_schema_only_registrations() {
         panic!("replacement should require and receive a fresh preparation");
     };
     assert_eq!(
-        dispatch_tool_execution(&ctx, fresh).unwrap().result(),
+        dispatch_tool_execution(&mut ctx, fresh).unwrap().result(),
         &ToolDispatchResult::Success {
             value: json!("replacement"),
         }
     );
     assert_eq!(old_calls.load(Ordering::SeqCst), 0);
     assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tools_execute_waterfall_wraps_the_exact_body_and_may_replace_its_result() {
+    let mut chunks = tool_call_chunks(0, "around-call", "around", r#"{"value":7}"#).to_vec();
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) = recorded_script("tool-around", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    {
+        let order = Arc::clone(&order);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("around"), move |input| {
+                order.lock().unwrap().push("body");
+                assert_eq!(input.arguments(), &json!({ "value": 7 }));
+                Ok(json!("body-result"))
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let order = Arc::clone(&order);
+        ctx.on_waterfall(
+            events::TOOLS_EXECUTE,
+            move |execution: ToolDispatchExecution, next| {
+                assert_eq!(execution.input().call_id(), "around-call");
+                order.lock().unwrap().push("outer-before");
+                let execution = next(execution);
+                assert_eq!(
+                    execution.result(),
+                    Some(&ToolDispatchResult::Success {
+                        value: json!("inner-result")
+                    })
+                );
+                order.lock().unwrap().push("outer-after");
+                execution
+            },
+        )
+        .unwrap();
+    }
+    {
+        let order = Arc::clone(&order);
+        ctx.on_waterfall(
+            events::TOOLS_EXECUTE,
+            move |execution: ToolDispatchExecution, next| {
+                order.lock().unwrap().push("inner-before");
+                let execution = next(execution);
+                assert_eq!(
+                    execution.result(),
+                    Some(&ToolDispatchResult::Success {
+                        value: json!("body-result")
+                    })
+                );
+                order.lock().unwrap().push("inner-after");
+                execution.complete(ToolDispatchResult::Success {
+                    value: json!("inner-result"),
+                })
+            },
+        )
+        .unwrap();
+    }
+    let before = session.events().unwrap();
+    let mut prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    let ToolExecutionPreparation::Dispatch(prepared) = prepared.remove(0) else {
+        panic!("around call must be admitted");
+    };
+
+    let outcome = dispatch_tool_execution(&mut ctx, prepared).unwrap();
+
+    assert_eq!(
+        outcome.result(),
+        &ToolDispatchResult::Success {
+            value: json!("inner-result")
+        }
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "outer-before",
+            "inner-before",
+            "body",
+            "inner-after",
+            "outer-after"
+        ]
+    );
+    assert_eq!(ctx.listener_count(events::TOOLS_EXECUTE), 2);
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tools_execute_short_circuit_and_wrapper_panic_never_leak_a_terminal_or_retry() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(0, "skip-call", "skip", "{}"));
+    chunks.extend(tool_call_chunks(1, "panic-call", "wrapper-panic", "{}"));
+    chunks.extend(tool_call_chunks(2, "error-call", "body-error", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-around-failures", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let body_calls = Arc::new(AtomicUsize::new(0));
+    for name in ["skip", "wrapper-panic"] {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("must-not-run"))
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let body_calls = Arc::clone(&body_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("body-error"), move |_| {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+                Err("body rejected".into())
+            }),
+        )
+        .unwrap();
+    }
+    let saw_body_error = Arc::new(AtomicUsize::new(0));
+    {
+        let saw_body_error = Arc::clone(&saw_body_error);
+        ctx.on_waterfall(
+            events::TOOLS_EXECUTE,
+            move |execution: ToolDispatchExecution, next| match execution.input().name() {
+                "skip" => execution.complete(ToolDispatchResult::Success {
+                    value: json!("short-circuited"),
+                }),
+                "wrapper-panic" => panic!("wrapper broke"),
+                "body-error" => {
+                    let execution = next(execution);
+                    assert_eq!(
+                        execution.result(),
+                        Some(&ToolDispatchResult::Failure {
+                            message: "body rejected".into()
+                        })
+                    );
+                    saw_body_error.fetch_add(1, Ordering::SeqCst);
+                    execution
+                }
+                _ => next(execution),
+            },
+        )
+        .unwrap();
+    }
+    let before = session.events().unwrap();
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    let mut outcomes = Vec::new();
+    for preparation in prepared {
+        let ToolExecutionPreparation::Dispatch(prepared) = preparation else {
+            panic!("every registered call must be admitted");
+        };
+        outcomes.push(dispatch_tool_execution(&mut ctx, prepared).unwrap());
+        assert_eq!(ctx.listener_count(events::TOOLS_EXECUTE), 1);
+    }
+
+    assert_eq!(
+        outcomes[0].result(),
+        &ToolDispatchResult::Success {
+            value: json!("short-circuited")
+        }
+    );
+    assert_eq!(
+        outcomes[1].result(),
+        &ToolDispatchResult::Failure {
+            message: "tools/execute wrapper panicked".into()
+        }
+    );
+    assert_eq!(
+        outcomes[2].result(),
+        &ToolDispatchResult::Failure {
+            message: "body rejected".into()
+        }
+    );
+    assert_eq!(body_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(saw_body_error.load(Ordering::SeqCst), 1);
     assert_eq!(session.events().unwrap(), before);
     close_logged_turn(&session, turn);
 }
@@ -3233,19 +3429,22 @@ fn full_step_streams_llm_runs_tool_and_registers_agent() {
     }
     {
         let sessions = ctx.sessions::<SessionStore>().unwrap();
-        ctx.on_waterfall(events::TOOLS_EXECUTE, move |mut call: ToolCall, next| {
-            let session = sessions
-                .get(&SessionId::new("mission-1").unwrap())
-                .unwrap()
-                .unwrap();
-            assert!(matches!(
-                session.events().unwrap().last().map(|event| &event.kind),
-                Some(SessionEventKind::ToolCall { call_id, .. })
-                    if call_id == "call-search-1"
-            ));
-            call.result = format!("ran:{}", call.arguments);
-            next(call)
-        })
+        ctx.on_waterfall(
+            events::LEGACY_TOOLS_EXECUTE,
+            move |mut call: ToolCall, next| {
+                let session = sessions
+                    .get(&SessionId::new("mission-1").unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    session.events().unwrap().last().map(|event| &event.kind),
+                    Some(SessionEventKind::ToolCall { call_id, .. })
+                        if call_id == "call-search-1"
+                ));
+                call.result = format!("ran:{}", call.arguments);
+                next(call)
+            },
+        )
         .unwrap();
     }
 
