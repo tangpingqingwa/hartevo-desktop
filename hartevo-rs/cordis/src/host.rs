@@ -14,7 +14,8 @@ use crate::authority::{
     EffectExecutionBinding, EffectExecutionLease, EffectExecutionPermit,
     EffectReconciliationBinding, EffectReconciliationLease, EffectReconciliationPermit,
     EffectVerificationBinding, EffectVerificationLease, EffectVerificationPermit,
-    RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchPermit,
+    RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchNotifications,
+    RuntimeDispatchPermit,
 };
 use crate::context::{Context, CordisError, TeardownTransaction, keys};
 use crate::fiber::LifecycleCancellation;
@@ -28,9 +29,9 @@ use crate::loader::{
 use crate::service::Service;
 use crate::session::{SessionCallConfig, SessionId, SessionStore};
 use crate::surface::{
-    AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
-    LlmSurface, RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolsSurface, events,
-    map_surfaces, rebind_hartevo_domain,
+    AgentRef, AgentStatus, AgentStatusChange, AgentsSurface, DesktopSurface, DomainSurface,
+    EffectBrokerSurface, HartevoSurfaces, LlmSurface, RuntimeSurface, SurfaceOwner,
+    SystemPromptSurface, ToolsSurface, events, map_surfaces, rebind_hartevo_domain,
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
@@ -284,17 +285,26 @@ impl CordisHost {
         let started = self
             .ctx
             .prepare_emit(events::AGENT_CREATED, agent.clone())?;
+        let running_status = self.ctx.prepare_emit(
+            events::AGENT_STATUS,
+            AgentStatusChange::new(agent.clone(), AgentStatus::Running),
+        )?;
+        let idle_status = self.ctx.prepare_emit(
+            events::AGENT_STATUS,
+            AgentStatusChange::new(agent.clone(), AgentStatus::Idle),
+        )?;
         let disposed = self
             .ctx
             .prepare_emit(events::AGENT_DISPOSED, agent.clone())?;
         let unpublished = agents.prepare_publication(agent.clone());
+        let notifications =
+            RuntimeDispatchNotifications::new(started, running_status, idle_status, disposed);
         let (permit, lease) = RuntimeDispatchPermit::issue(
             serial,
             scope.clone(),
             agent.id.clone(),
             unpublished,
-            started,
-            disposed,
+            notifications,
         );
         self.next_runtime_serial = serial;
         self.active_runtime = Some(ActiveRuntimeDispatch {

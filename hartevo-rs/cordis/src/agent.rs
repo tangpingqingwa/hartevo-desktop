@@ -22,10 +22,10 @@ use crate::session::{
     validate_content_blocks,
 };
 use crate::surface::{
-    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentTurnStopping, AgentsSurface,
-    DomainSurface, EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream,
-    LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
-    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
+    AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentStatusChange,
+    AgentTurnStopping, AgentsSurface, DomainSurface, EffectBrokerSurface, LlmChunkStream, LlmError,
+    LlmGenerateRequest, LlmStream, LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeSurface,
+    ToolCall, ToolExecutionInput, ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
     aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
     dispatch_tool_execution, events, finalize_tool_execution, post_tool_execution,
     prepare_llm_call, prepare_tool_execution, register_agent, run_tools_pipeline,
@@ -58,6 +58,7 @@ impl Service for AgentLoop {
 
     fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
         ctx.on_emit(events::AGENT_CREATED, |_: &AgentRef| {})?;
+        ctx.on_emit(events::AGENT_STATUS, |_: &AgentStatusChange| {})?;
         ctx.on_emit(events::AGENT_DISPOSED, |_: &AgentRef| {})?;
         Ok(())
     }

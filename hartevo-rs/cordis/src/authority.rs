@@ -952,12 +952,34 @@ pub struct RuntimeDispatchPermit {
     agent_id: String,
     lease: Arc<RuntimeDispatchLease>,
     unpublished: Option<UnpublishedAgent>,
-    started: Option<PreparedEmit>,
-    disposed: Option<PreparedEmit>,
+    notifications: RuntimeDispatchNotifications,
     started_attempted: bool,
     publication_committed: bool,
     started_result: Option<Result<(), CordisError>>,
     settled: bool,
+}
+
+pub(crate) struct RuntimeDispatchNotifications {
+    started: Option<PreparedEmit>,
+    running_status: Option<PreparedEmit>,
+    idle_status: Option<PreparedEmit>,
+    disposed: Option<PreparedEmit>,
+}
+
+impl RuntimeDispatchNotifications {
+    pub(crate) const fn new(
+        started: PreparedEmit,
+        running_status: PreparedEmit,
+        idle_status: PreparedEmit,
+        disposed: PreparedEmit,
+    ) -> Self {
+        Self {
+            started: Some(started),
+            running_status: Some(running_status),
+            idle_status: Some(idle_status),
+            disposed: Some(disposed),
+        }
+    }
 }
 
 impl RuntimeDispatchPermit {
@@ -966,8 +988,7 @@ impl RuntimeDispatchPermit {
         scope: AuthorityScope,
         agent_id: String,
         unpublished: UnpublishedAgent,
-        started: PreparedEmit,
-        disposed: PreparedEmit,
+        notifications: RuntimeDispatchNotifications,
     ) -> (Self, Arc<RuntimeDispatchLease>) {
         let lease = Arc::new(RuntimeDispatchLease::new());
         (
@@ -977,8 +998,7 @@ impl RuntimeDispatchPermit {
                 agent_id,
                 lease: Arc::clone(&lease),
                 unpublished: Some(unpublished),
-                started: Some(started),
-                disposed: Some(disposed),
+                notifications,
                 started_attempted: false,
                 publication_committed: false,
                 started_result: None,
@@ -1002,8 +1022,15 @@ impl RuntimeDispatchPermit {
             .and_then(UnpublishedAgent::commit)
             .and_then(|publication| {
                 self.publication_committed = true;
-                self.started.take().map_or(Ok(()), PreparedEmit::dispatch)?;
-                self.lease.retain_publication(publication)
+                self.notifications
+                    .started
+                    .take()
+                    .map_or(Ok(()), PreparedEmit::dispatch)?;
+                self.lease.retain_publication(publication)?;
+                if let Some(notification) = self.notifications.running_status.take() {
+                    let _ = notification.dispatch_contained();
+                }
+                Ok(())
             });
         self.started_result = Some(result.clone());
         result
@@ -1028,12 +1055,19 @@ impl RuntimeDispatchPermit {
 
     pub(crate) fn complete(mut self) -> RuntimeDispatchCompletion {
         self.unpublished.take();
-        self.lease.release();
+        let publication = self.lease.settle();
+        let status = publication
+            .as_ref()
+            .is_some_and(AgentPublicationCommit::mark_idle)
+            .then(|| self.notifications.idle_status.take())
+            .flatten();
         self.settled = true;
         RuntimeDispatchCompletion {
+            publication,
+            status,
             notification: self
                 .publication_committed
-                .then(|| self.disposed.take())
+                .then(|| self.notifications.disposed.take())
                 .flatten(),
         }
     }
@@ -1066,11 +1100,17 @@ impl Drop for RuntimeDispatchPermit {
 /// Dispatching it cannot run a listener while the host mutex is held.
 #[derive(Debug)]
 pub struct RuntimeDispatchCompletion {
+    publication: Option<AgentPublicationCommit>,
+    status: Option<PreparedEmit>,
     notification: Option<PreparedEmit>,
 }
 
 impl RuntimeDispatchCompletion {
     pub fn announce(mut self) -> Result<(), CordisError> {
+        if let Some(status) = self.status.take() {
+            let _ = status.dispatch_contained();
+        }
+        drop(self.publication.take());
         if let Some(notification) = self.notification.take() {
             notification.dispatch()
         } else {
@@ -1108,12 +1148,16 @@ impl RuntimeDispatchLease {
         Ok(())
     }
 
-    pub(crate) fn release(&self) {
+    fn settle(&self) -> Option<AgentPublicationCommit> {
         self.active.store(false, Ordering::Release);
         self.publication
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+            .take()
+    }
+
+    pub(crate) fn release(&self) {
+        drop(self.settle());
     }
 }
 

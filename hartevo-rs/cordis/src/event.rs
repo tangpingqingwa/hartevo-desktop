@@ -2226,6 +2226,14 @@ impl EventBus {
         P: Any + Send + Sync + 'static,
     {
         let snapshots = self.snapshots(key.name(), key.descriptor(), target, Some(owner))?;
+        self.run_emit_snapshots_contained(payload, snapshots)
+    }
+
+    fn run_emit_snapshots_contained(
+        &self,
+        payload: &AnyRef,
+        snapshots: Vec<Listener>,
+    ) -> Result<usize, EventBusError> {
         let listener_count = snapshots.len();
         for listener in snapshots {
             let Some(_invocation) = self.begin_invoke(&listener) else {
@@ -2676,6 +2684,12 @@ impl PreparedEmit {
     pub(crate) fn dispatch(self) -> Result<(), CordisError> {
         self.bus
             .run_emit_snapshots(self.payload.as_ref(), self.listeners)
+            .map_err(|error| into_cordis_error(self.name, DispatchMode::Emit, error))
+    }
+
+    pub(crate) fn dispatch_contained(self) -> Result<usize, CordisError> {
+        self.bus
+            .run_emit_snapshots_contained(self.payload.as_ref(), self.listeners)
             .map_err(|error| into_cordis_error(self.name, DispatchMode::Emit, error))
     }
 }
