@@ -1,17 +1,20 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
     AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, Context, CordisError,
     CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
-    KernelApprovalDecision, KernelConsentState, LlmModelReasoning, LlmResolvedModel, LlmStream,
-    LoaderContext, LoggedAgentCall, PromptError, PromptSection, RuntimeSurface, SessionCallConfig,
-    SessionContentBlock, SessionError, SessionEventKind, SessionHandle, SessionId, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionRequestHeaderReason, SessionStore,
-    SessionSurfaceIntent, SessionToolSchema, SurfaceOwner, ToolCall, TurnEndReason,
-    admit_agent_request, admit_agent_step, build_agent_call, events, keys, log_agent_call,
+    KernelApprovalDecision, KernelConsentState, LlmAdapter, LlmAdapterStream, LlmChunkStream,
+    LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
+    LoggedAgentCall, PromptError, PromptSection, RuntimeSurface, SessionCallConfig,
+    SessionContentBlock, SessionError, SessionEventKind, SessionFinishReason, SessionHandle,
+    SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionRequestHeaderReason, SessionStore, SessionStreamChunk, SessionSurfaceIntent,
+    SessionToolSchema, SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request,
+    admit_agent_step, build_agent_call, dispatch_agent_call, events, keys, log_agent_call,
     prepare_agent_call, prepare_agent_step, register_llm_adapter, register_prompt_section,
     register_tool_schema, run_agent_step, session_events,
 };
@@ -68,6 +71,40 @@ fn call_config(provider: &str, model: &str) -> SessionCallConfig {
         temperature: None,
         max_tokens: None,
         stop: None,
+    }
+}
+
+fn ready_chunks(mut stream: LlmChunkStream) -> Vec<SessionStreamChunk> {
+    let waker = futures_util::task::noop_waker_ref();
+    let mut cx = TaskContext::from_waker(waker);
+    let mut chunks = Vec::new();
+    loop {
+        match stream.as_mut().poll_next(&mut cx) {
+            Poll::Ready(Some(chunk)) => chunks.push(chunk),
+            Poll::Ready(None) => return chunks,
+            Poll::Pending => panic!("test adapter streams must be immediately ready"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AgentStreamingAdapter {
+    seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+}
+
+impl LlmAdapter for AgentStreamingAdapter {
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        Ok(LlmResolvedModel::new(provider, model).with_default_max_tokens(512))
+    }
+
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        self.seen.lock().expect("seen").push(request);
+        Ok(Box::pin(futures_util::stream::iter([Ok(
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                replay_state: None,
+            },
+        )])))
     }
 }
 
@@ -1347,6 +1384,110 @@ fn request_log_state_mismatch_and_no_call_never_touch_the_adapter_or_state() {
     assert_eq!(rejected_state.surface_generation(), None);
     assert_eq!(rejected_session.request_header().unwrap(), None);
     assert_eq!(rejected_session.request_context().unwrap(), None);
+}
+
+#[test]
+fn logged_agent_call_dispatches_exact_request_without_session_writes() {
+    let mut ctx = mapped();
+    register_prompt_section(
+        &mut ctx,
+        PromptSection::new("core", 0, "Follow the durable plan."),
+    )
+    .unwrap();
+    register_tool_schema(&mut ctx, tool_schema("search")).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    register_llm_adapter(
+        &mut ctx,
+        ["mock"],
+        AgentStreamingAdapter {
+            seen: Arc::clone(&seen),
+        },
+    )
+    .unwrap();
+    let waterfall_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let waterfall_calls = Arc::clone(&waterfall_calls);
+        ctx.on_waterfall(events::LLM_STREAM, move |stream, next| {
+            waterfall_calls.fetch_add(1, Ordering::SeqCst);
+            assert!(stream.request().is_some());
+            next(stream)
+        })
+        .unwrap();
+    }
+
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("stream-dispatch").unwrap())
+        .unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+    let (_turn, logged) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "request-1",
+        call_config("mock", "model"),
+    );
+    let before = session.events().unwrap();
+    let chunks = ready_chunks(dispatch_agent_call(&mut ctx, &logged).unwrap());
+    assert!(matches!(
+        chunks.as_slice(),
+        [SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            ..
+        }]
+    ));
+    assert_eq!(waterfall_calls.load(Ordering::SeqCst), 1);
+    let requests = seen.lock().expect("seen");
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.config().provider, "mock");
+    assert_eq!(request.config().model, "model");
+    assert_eq!(request.config().max_tokens, Some(512));
+    assert_eq!(request.messages(), [user_message("request-1", "request-1")]);
+    assert_eq!(request.system(), Some("Follow the durable plan."));
+    assert_eq!(
+        request.tools(),
+        Some(std::slice::from_ref(&tool_schema("search")))
+    );
+    assert_eq!(request.session_id(), Some(session.id()));
+    drop(requests);
+    assert_eq!(session.events().unwrap(), before);
+
+    let error = dispatch_agent_call(&mut ctx, &logged)
+        .err()
+        .expect("prepared logged call must be one-shot");
+    assert_eq!(
+        error,
+        CordisError::Llm(LlmError::InvalidPreparedCall {
+            expected: "one dispatch only",
+        })
+    );
+    assert_eq!(waterfall_calls.load(Ordering::SeqCst), 1);
+
+    let stale_session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("stale-stream-dispatch").unwrap())
+        .unwrap();
+    let mut stale_state = AgentRequestLogState::new(stale_session.id().clone());
+    let (stale_turn, stale_call) = build_logged_turn(
+        &mut ctx,
+        &stale_session,
+        &mut stale_state,
+        "stale-request",
+        call_config("mock", "model"),
+    );
+    stale_session.finish_step(stale_turn, 1).unwrap();
+    let stale_events = stale_session.events().unwrap();
+    assert!(matches!(
+        dispatch_agent_call(&mut ctx, &stale_call),
+        Err(CordisError::Session(SessionError::NoOpenStep { turn }))
+            if turn == stale_turn
+    ));
+    assert_eq!(waterfall_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.lock().expect("seen").len(), 1);
+    assert_eq!(stale_session.events().unwrap(), stale_events);
 }
 
 #[test]

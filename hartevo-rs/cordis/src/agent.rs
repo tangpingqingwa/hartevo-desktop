@@ -14,9 +14,10 @@ use crate::session::{
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
-    EffectBrokerSurface, LlmError, LlmStream, LlmSurface, PreparedLlmCall, PromptAssembly,
-    RuntimeSurface, ToolCall, ToolsSurface, assemble_system_prompt, events, prepare_llm_call,
-    register_agent, run_tools_pipeline, stream_llm,
+    EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
+    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolsSurface,
+    assemble_system_prompt, events, prepare_llm_call, register_agent, run_tools_pipeline,
+    stream_llm, stream_llm_request, stream_prepared_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
@@ -446,6 +447,26 @@ pub fn build_agent_call(
         AgentCallAdmission::Call(call) => {
             log_agent_call(ctx, state, call).map(AgentBuildAdmission::Call)
         }
+    }
+}
+
+/// Dispatch one N45-logged call into the raw provider-neutral stream boundary.
+/// The stream remains unconsumed and no assistant/session event is appended.
+pub fn dispatch_agent_call(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+) -> Result<LlmChunkStream, CordisError> {
+    let call = logged.call();
+    let request = call.request();
+    let session_id = SessionId::new(request.agent().id.clone())?;
+    agent_session(ctx, &session_id)?.require_open_step(request.turn(), request.step())?;
+    let generated = LlmGenerateRequest::new(call.config().clone(), call.messages().to_vec())
+        .with_system(call.assembly().system().map(str::to_string))
+        .with_tools(call.assembly().tools().to_vec())
+        .with_session_id(session_id);
+    match call.prepared_llm_call() {
+        Some(prepared) => stream_prepared_llm(ctx, prepared, generated),
+        None => stream_llm_request(ctx, generated),
     }
 }
 

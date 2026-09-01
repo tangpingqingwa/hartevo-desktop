@@ -8,14 +8,20 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
+
+use futures_core::Stream;
 
 use crate::context::{Context, CordisError, keys};
 use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
 use crate::session::{
-    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionMessage, SessionStore,
-    SessionToolSchema, events as session_events,
+    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionFinishReason, SessionId,
+    SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk, SessionToolSchema,
+    events as session_events, validate_agent_request_config,
 };
 
 /// Cordis keys this mapping provides and looks up.
@@ -289,12 +295,124 @@ impl ToolCall {
     }
 }
 
-/// One model stream request. Waterfall listeners may wrap [`LlmStream::body`].
+/// Fully assembled provider-neutral request presented to one LLM adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmGenerateRequest {
+    config: SessionCallConfig,
+    messages: Vec<SessionMessage>,
+    system: Option<String>,
+    tools: Option<Vec<SessionToolSchema>>,
+    session_id: Option<SessionId>,
+}
+
+impl LlmGenerateRequest {
+    #[must_use]
+    pub fn new(config: SessionCallConfig, messages: Vec<SessionMessage>) -> Self {
+        Self {
+            config,
+            messages,
+            system: None,
+            tools: None,
+            session_id: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &SessionCallConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub fn messages(&self) -> &[SessionMessage] {
+        &self.messages
+    }
+
+    #[must_use]
+    pub fn system(&self) -> Option<&str> {
+        self.system.as_deref()
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> Option<&[SessionToolSchema]> {
+        self.tools.as_deref()
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
+    #[must_use]
+    pub fn with_system(mut self, system: Option<String>) -> Self {
+        self.system = system.filter(|value| !value.is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<SessionToolSchema>) -> Self {
+        self.tools = (!tools.is_empty()).then_some(tools);
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+}
+
+/// Raw adapter stream. An item error is normalized into one terminal chunk.
+pub type LlmAdapterStream =
+    Pin<Box<dyn Stream<Item = Result<SessionStreamChunk, SessionLlmFailure>> + Send + 'static>>;
+
+/// Provider-neutral stream exposed after Cordis middleware and normalization.
+pub type LlmChunkStream = Pin<Box<dyn Stream<Item = SessionStreamChunk> + Send + 'static>>;
+
+type LlmStreamFactory = Box<dyn FnOnce() -> LlmChunkStream + Send + 'static>;
+
+#[derive(Clone, Default)]
+struct LlmStreamSource {
+    factory: Arc<Mutex<Option<LlmStreamFactory>>>,
+}
+
+impl LlmStreamSource {
+    fn new(factory: LlmStreamFactory) -> Self {
+        Self {
+            factory: Arc::new(Mutex::new(Some(factory))),
+        }
+    }
+
+    fn replace(&self, factory: LlmStreamFactory) {
+        *self
+            .factory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(factory);
+    }
+
+    fn take(&self) -> Option<LlmStreamFactory> {
+        self.factory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn is_available(&self) -> bool {
+        self.factory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+}
+
+/// One model stream dispatch. Legacy callers use the public string fields;
+/// generated calls carry an immutable request and a lazy typed chunk source.
+#[derive(Clone)]
 pub struct LlmStream {
     pub model: String,
     pub prompt: String,
     pub body: String,
+    request: Option<LlmGenerateRequest>,
+    source: LlmStreamSource,
 }
 
 impl LlmStream {
@@ -304,9 +422,79 @@ impl LlmStream {
             model: model.into(),
             prompt: prompt.into(),
             body: String::new(),
+            request: None,
+            source: LlmStreamSource::default(),
         }
     }
+
+    fn generated(request: LlmGenerateRequest, factory: LlmStreamFactory) -> Self {
+        Self {
+            model: request.config.model.clone(),
+            prompt: String::new(),
+            body: String::new(),
+            request: Some(request),
+            source: LlmStreamSource::new(factory),
+        }
+    }
+
+    /// Return the immutable generated request, or `None` for the legacy path.
+    #[must_use]
+    pub const fn request(&self) -> Option<&LlmGenerateRequest> {
+        self.request.as_ref()
+    }
+
+    /// Short-circuit downstream adapter dispatch with a middleware-owned stream.
+    #[must_use]
+    pub fn with_chunk_stream(self, stream: LlmChunkStream) -> Self {
+        self.source.replace(Box::new(move || stream));
+        self
+    }
+
+    /// Lazily wrap the downstream typed stream without starting adapter work.
+    pub fn map_chunk_stream<F>(self, wrap: F) -> Result<Self, LlmError>
+    where
+        F: FnOnce(LlmChunkStream) -> LlmChunkStream + Send + 'static,
+    {
+        let factory = self.source.take().ok_or(LlmError::InvalidStreamDispatch {
+            expected: "one unconsumed typed chunk source",
+        })?;
+        self.source.replace(Box::new(move || wrap(factory())));
+        Ok(self)
+    }
+
+    fn into_chunk_stream(self) -> Result<LlmChunkStream, LlmError> {
+        self.source
+            .take()
+            .map(|factory| factory())
+            .ok_or(LlmError::InvalidStreamDispatch {
+                expected: "one unconsumed typed chunk source",
+            })
+    }
 }
+
+impl fmt::Debug for LlmStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmStream")
+            .field("model", &self.model)
+            .field("prompt", &self.prompt)
+            .field("body", &self.body)
+            .field("request", &self.request)
+            .field("has_chunk_stream", &self.source.is_available())
+            .finish()
+    }
+}
+
+impl PartialEq for LlmStream {
+    fn eq(&self, other: &Self) -> bool {
+        self.model == other.model
+            && self.prompt == other.prompt
+            && self.body == other.body
+            && self.request == other.request
+    }
+}
+
+impl Eq for LlmStream {}
 
 /// Adapter-owned selectable reasoning metadata for one exact model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +592,21 @@ impl LlmResolvedModel {
 /// Exact-model preparation implemented by one provider adapter.
 pub trait LlmAdapter: Send + Sync + 'static {
     fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError>;
+
+    /// Start one adapter-owned stream. The default preserves preparation-only
+    /// adapters while failing closed at dispatch time.
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        Err(SessionLlmFailure {
+            message: format!(
+                "LLM adapter for `{}/{}` does not implement stream dispatch",
+                request.config.provider, request.config.model
+            ),
+            code: "NO_STREAM".into(),
+            status: None,
+            provider_retry_after_ms: None,
+            request_id: None,
+        })
+    }
 }
 
 impl<F> LlmAdapter for F
@@ -442,6 +645,10 @@ pub enum LlmError {
         model: String,
         effort: String,
     },
+    #[error("prepared LLM call must retain {expected}")]
+    InvalidPreparedCall { expected: &'static str },
+    #[error("LLM stream dispatch must retain {expected}")]
+    InvalidStreamDispatch { expected: &'static str },
 }
 
 impl LlmError {
@@ -456,6 +663,8 @@ impl LlmError {
             Self::NoAdapter { .. } => "NO_ADAPTER",
             Self::InvalidModelInfo { .. } => "INVALID_MODEL_INFO",
             Self::UnsupportedReasoningEffort { .. } => "UNSUPPORTED_REASONING_EFFORT",
+            Self::InvalidPreparedCall { .. } => "INVALID_PREPARED_CALL",
+            Self::InvalidStreamDispatch { .. } => "INVALID_STREAM_DISPATCH",
         }
     }
 }
@@ -483,6 +692,7 @@ pub struct PreparedLlmCall {
     config: SessionCallConfig,
     adapter_defaults: SessionCallConfigAdapterDefaults,
     context_window: Option<u64>,
+    dispatched: Arc<AtomicBool>,
 }
 
 impl PreparedLlmCall {
@@ -515,6 +725,7 @@ impl fmt::Debug for PreparedLlmCall {
             .field("config", &self.config)
             .field("adapter_defaults", &self.adapter_defaults)
             .field("context_window", &self.context_window)
+            .field("dispatched", &self.dispatched.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
 }
@@ -880,24 +1091,29 @@ impl LlmSurface {
     }
 
     fn prepare_call(&self, config: &SessionCallConfig) -> Result<PreparedLlmCall, LlmError> {
-        let registration = {
-            let state = self
-                .adapters
-                .lock()
-                .map_err(|_| LlmError::RegistryPoisoned)?;
-            state
-                .routes
-                .iter()
-                .find(|route| route.provider == config.provider)
-                .map(|route| Arc::clone(&route.registration))
-        }
-        .ok_or_else(|| LlmError::NoAdapter {
-            provider: config.provider.clone(),
-        })?;
+        let registration =
+            self.registration(&config.provider)?
+                .ok_or_else(|| LlmError::NoAdapter {
+                    provider: config.provider.clone(),
+                })?;
         let model = registration
             .adapter
             .prepare_model(&config.provider, &config.model)?;
         resolve_prepared_call(registration, config, &model)
+    }
+
+    fn registration(
+        &self,
+        provider: &str,
+    ) -> Result<Option<Arc<LlmAdapterRegistration>>, LlmError> {
+        Ok(self
+            .adapters
+            .lock()
+            .map_err(|_| LlmError::RegistryPoisoned)?
+            .routes
+            .iter()
+            .find(|route| route.provider == provider)
+            .map(|route| Arc::clone(&route.registration)))
     }
 }
 
@@ -987,6 +1203,7 @@ fn resolve_prepared_call(
         config,
         adapter_defaults,
         context_window: model.context_window,
+        dispatched: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -1406,6 +1623,160 @@ pub fn prepare_llm_call(
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::LLM.to_string()]))?
         .prepare_call(config)
         .map_err(Into::into)
+}
+
+/// Dispatch one full request through the exact adapter generation retained by
+/// a prepared call. The prepared handle is one-shot across all clones.
+pub fn stream_prepared_llm(
+    ctx: &mut Context,
+    prepared: &PreparedLlmCall,
+    request: LlmGenerateRequest,
+) -> Result<LlmChunkStream, CordisError> {
+    if ctx.llm::<LlmSurface>().is_none() {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::LLM.to_string(),
+        ]));
+    }
+    validate_agent_request_config(request.config())?;
+    if prepared.dispatched.load(Ordering::Acquire) {
+        return Err(LlmError::InvalidPreparedCall {
+            expected: "one dispatch only",
+        }
+        .into());
+    }
+    if request.config != prepared.config {
+        return Err(LlmError::InvalidPreparedCall {
+            expected: "the exact prepared call config",
+        }
+        .into());
+    }
+    prepared
+        .dispatched
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| LlmError::InvalidPreparedCall {
+            expected: "one dispatch only",
+        })?;
+    let registration = Arc::clone(&prepared.registration);
+    let adapter_request = request.clone();
+    dispatch_llm_stream(
+        ctx,
+        request,
+        Box::new(move || adapter_chunk_stream(&registration, adapter_request)),
+    )
+}
+
+/// Dispatch an unprepared full request. Middleware may serve an unregistered
+/// route; otherwise the missing adapter is normalized into a terminal chunk.
+pub fn stream_llm_request(
+    ctx: &mut Context,
+    request: LlmGenerateRequest,
+) -> Result<LlmChunkStream, CordisError> {
+    validate_agent_request_config(request.config())?;
+    let llm = ctx
+        .llm::<LlmSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::LLM.to_string()]))?;
+    let provider = request.config.provider.clone();
+    let adapter_request = request.clone();
+    dispatch_llm_stream(
+        ctx,
+        request,
+        Box::new(move || match llm.registration(&provider) {
+            Ok(Some(registration)) => adapter_chunk_stream(&registration, adapter_request),
+            Ok(None) => terminal_failure_stream(llm_failure(&LlmError::NoAdapter { provider })),
+            Err(error) => terminal_failure_stream(llm_failure(&error)),
+        }),
+    )
+}
+
+fn dispatch_llm_stream(
+    ctx: &mut Context,
+    request: LlmGenerateRequest,
+    factory: LlmStreamFactory,
+) -> Result<LlmChunkStream, CordisError> {
+    let expected = request.clone();
+    let dispatch = LlmStream::generated(request, factory);
+    let dispatch = ctx.waterfall(events::LLM_STREAM, dispatch)?;
+    if dispatch.request() != Some(&expected) {
+        return Err(LlmError::InvalidStreamDispatch {
+            expected: "the exact immutable generated request",
+        }
+        .into());
+    }
+    dispatch.into_chunk_stream().map_err(Into::into)
+}
+
+fn adapter_chunk_stream(
+    registration: &LlmAdapterRegistration,
+    request: LlmGenerateRequest,
+) -> LlmChunkStream {
+    match registration.adapter.stream(request) {
+        Ok(stream) => Box::pin(NormalizedAdapterStream::new(stream)),
+        Err(failure) => terminal_failure_stream(failure),
+    }
+}
+
+fn llm_failure(error: &LlmError) -> SessionLlmFailure {
+    SessionLlmFailure {
+        message: error.to_string(),
+        code: error.code().into(),
+        status: None,
+        provider_retry_after_ms: None,
+        request_id: None,
+    }
+}
+
+fn terminal_failure_stream(failure: SessionLlmFailure) -> LlmChunkStream {
+    Box::pin(futures_util::stream::once(async move {
+        terminal_failure_chunk(failure)
+    }))
+}
+
+fn terminal_failure_chunk(failure: SessionLlmFailure) -> SessionStreamChunk {
+    let reason = if failure.code == "ABORTED" {
+        SessionFinishReason::Aborted { failure }
+    } else {
+        SessionFinishReason::Error { failure }
+    };
+    SessionStreamChunk::Finish {
+        reason,
+        replay_state: None,
+    }
+}
+
+struct NormalizedAdapterStream {
+    source: LlmAdapterStream,
+    terminated: bool,
+}
+
+impl NormalizedAdapterStream {
+    const fn new(source: LlmAdapterStream) -> Self {
+        Self {
+            source,
+            terminated: false,
+        }
+    }
+}
+
+impl Stream for NormalizedAdapterStream {
+    type Item = SessionStreamChunk;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+        match self.source.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(chunk)),
+            Poll::Ready(Some(Err(failure))) => {
+                self.terminated = true;
+                Poll::Ready(Some(terminal_failure_chunk(failure)))
+            }
+            Poll::Ready(None) => {
+                self.terminated = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Register live agent coordination on `ctx.agents` and reverse it on teardown.
