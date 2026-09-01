@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 
@@ -15,11 +16,11 @@ use crate::service::Service;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionCancelCause, SessionContentBlock,
     SessionEpochHeader, SessionError, SessionEventKind, SessionFinishReason, SessionHandle,
-    SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionReplayEnvelope, SessionRequestContext, SessionRequestHeaderReason, SessionStore,
-    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
-    SessionToolCall, SessionToolError, TurnEndReason, validate_agent_request_config,
-    validate_agent_user_message, validate_content_blocks,
+    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestContext,
+    SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+    SessionSurfaceIntent, SessionTokenUsage, SessionToolCall, SessionToolError, TurnEndReason,
+    validate_agent_request_config, validate_agent_user_message, validate_content_blocks,
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,
@@ -1058,10 +1059,16 @@ async fn run_agent_turn_step(
             let request = logged.call().request();
             let recovery = AgentRequestError::new(
                 request.agent().clone(),
+                request.session_id().clone(),
                 request.turn(),
                 request.step(),
                 logged.call().config().provider.clone(),
                 failure.clone(),
+                logged
+                    .call()
+                    .prepared_llm_call()
+                    .and_then(PreparedLlmCall::retry_policy)
+                    .cloned(),
                 request.cancellation().clone(),
             );
             let recovery = ctx.try_waterfall(events::AGENT_REQUEST_ERROR, recovery)?;
@@ -1070,6 +1077,9 @@ async fn run_agent_turn_step(
             }
             if recovery.action() != AgentRequestErrorAction::Retry {
                 return Err(LlmError::RequestFailed { failure }.into());
+            }
+            if !prepare_scheduled_retry(ctx, &recovery, &failure, cancellation).await? {
+                return Ok(Some(cancelled_turn_reason(cancellation)));
             }
             logged = rebuild_agent_turn_call(ctx, request_state, &logged)?;
             continue;
@@ -1102,6 +1112,51 @@ async fn run_agent_turn_step(
                 unreachable!("provider failures return or retry above")
             }
         }
+    }
+}
+
+async fn prepare_scheduled_retry(
+    ctx: &Context,
+    recovery: &AgentRequestError,
+    failure: &SessionLlmFailure,
+    cancellation: &LifecycleCancellation,
+) -> Result<bool, CordisError> {
+    let Some(schedule) = recovery.retry_schedule() else {
+        return Ok(true);
+    };
+    let retry_session = agent_session(ctx, recovery.session_id())?;
+    retry_session.append_llm_retry(SessionLlmRetry {
+        retry_id: schedule.retry_id().to_owned(),
+        turn: recovery.turn(),
+        step: recovery.step(),
+        provider: recovery.provider().to_owned(),
+        mode: schedule.mode(),
+        policy_key: schedule.policy_key().to_owned(),
+        retry: schedule.retry(),
+        max_retries: schedule.max_retries(),
+        delay_ms: schedule.delay_ms(),
+        failure: failure.clone(),
+    })?;
+    if !wait_for_retry(schedule.delay_ms(), cancellation).await || cancellation.is_cancelled() {
+        return Ok(false);
+    }
+    retry_session.append_llm_retry_started(SessionLlmRetryStarted {
+        retry_id: schedule.retry_id().to_owned(),
+        turn: recovery.turn(),
+        step: recovery.step(),
+        retry: schedule.retry(),
+    })?;
+    Ok(!cancellation.is_cancelled())
+}
+
+async fn wait_for_retry(delay_ms: u64, cancellation: &LifecycleCancellation) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => false,
+        () = tokio::time::sleep(Duration::from_millis(delay_ms)) => !cancellation.is_cancelled(),
     }
 }
 

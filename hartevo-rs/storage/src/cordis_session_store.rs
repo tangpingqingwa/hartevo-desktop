@@ -159,6 +159,12 @@ pub enum PersistedSessionEventKind {
     RequestContext {
         context: serde_json::Value,
     },
+    LlmRetry {
+        retry: serde_json::Value,
+    },
+    LlmRetryStarted {
+        started: serde_json::Value,
+    },
     ToolCall {
         turn: u64,
         step: u64,
@@ -394,6 +400,10 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the neutral persistence validator keeps every durable event variant exhaustive in one match"
+)]
 fn validate_event_payload(
     kind: &PersistedSessionEventKind,
 ) -> Result<(Option<u64>, Option<u64>), StorageError> {
@@ -450,6 +460,18 @@ fn validate_event_payload(
             validate_request_json(context, "request/context payload must be a JSON object")?;
             (None, None)
         }
+        PersistedSessionEventKind::LlmRetry { retry } => retry_scope(
+            retry,
+            "llm/retry payload must be a JSON object",
+            "llm/retry turn must be an unsigned integer",
+            "llm/retry step must be an unsigned integer",
+        )?,
+        PersistedSessionEventKind::LlmRetryStarted { started } => retry_scope(
+            started,
+            "llm/retry-started payload must be a JSON object",
+            "llm/retry-started turn must be an unsigned integer",
+            "llm/retry-started step must be an unsigned integer",
+        )?,
         PersistedSessionEventKind::ToolCall {
             turn,
             step,
@@ -494,6 +516,24 @@ fn validate_event_payload(
             (Some(*turn), Some(*step))
         }
     })
+}
+
+fn retry_scope(
+    value: &serde_json::Value,
+    object_error: &'static str,
+    turn_error: &'static str,
+    step_error: &'static str,
+) -> Result<(Option<u64>, Option<u64>), StorageError> {
+    validate_request_json(value, object_error)?;
+    let turn = value
+        .get("turn")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(StorageError::InvalidSessionCheckpoint(turn_error))?;
+    let step = value
+        .get("step")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(StorageError::InvalidSessionCheckpoint(step_error))?;
+    Ok((Some(turn), Some(step)))
 }
 
 fn validate_message_json(message: &serde_json::Value) -> Result<(), StorageError> {
@@ -781,6 +821,69 @@ mod tests {
         assert!(store.persist_session_checkpoint(&complete).unwrap());
         assert!(!store.persist_session_checkpoint(&complete).unwrap());
         assert_eq!(store.load_session_checkpoints().unwrap(), vec![complete]);
+    }
+
+    #[test]
+    fn llm_retry_events_round_trip_through_the_neutral_store() {
+        let retry = serde_json::json!({
+            "retryId": "retry-1",
+            "turn": 1,
+            "step": 1,
+            "provider": "mock",
+            "mode": "normal",
+            "policyKey": "normal-policy",
+            "retry": 1,
+            "maxRetries": 2,
+            "delayMs": 25,
+            "failure": {
+                "message": "busy",
+                "code": "RATE_LIMIT",
+                "status": 429,
+                "providerRetryAfterMs": 25
+            }
+        });
+        let started = serde_json::json!({
+            "retryId": "retry-1", "turn": 1, "step": 1, "retry": 1
+        });
+        let durable = checkpoint(vec![
+            PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: PersistedSessionEventKind::TurnStart { turn: 1 },
+            },
+            PersistedSessionEvent {
+                seq: 1,
+                time_ms: 2,
+                kind: PersistedSessionEventKind::StepStart { turn: 1, step: 1 },
+            },
+            PersistedSessionEvent {
+                seq: 2,
+                time_ms: 3,
+                kind: PersistedSessionEventKind::LlmRetry { retry },
+            },
+            PersistedSessionEvent {
+                seq: 3,
+                time_ms: 4,
+                kind: PersistedSessionEventKind::LlmRetryStarted { started },
+            },
+            PersistedSessionEvent {
+                seq: 4,
+                time_ms: 5,
+                kind: PersistedSessionEventKind::StepEnd { turn: 1, step: 1 },
+            },
+            PersistedSessionEvent {
+                seq: 5,
+                time_ms: 6,
+                kind: PersistedSessionEventKind::TurnEnd {
+                    turn: 1,
+                    reason: PersistedTurnEndReason::Error,
+                },
+            },
+        ]);
+
+        let mut store = ProjectStore::in_memory().unwrap();
+        assert!(store.persist_session_checkpoint(&durable).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![durable]);
     }
 
     #[test]
