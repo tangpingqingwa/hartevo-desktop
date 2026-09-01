@@ -1,5 +1,5 @@
-//! Desktop-facing Cordis host. Mounts SurfaceMapping, AgentLoop, and
-//! InvariantGate, and issues typed Domain-command and Runtime permits. The
+//! Desktop-facing Cordis host. Mounts SurfaceMapping, automatic compaction,
+//! AgentLoop, and InvariantGate, and issues typed Domain-command and Runtime permits. The
 //! symbolic AgentLoop is not Desktop Runtime authority; OpenInterpreter
 //! remains an optional adapter.
 
@@ -17,6 +17,7 @@ use crate::authority::{
     RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchNotifications,
     RuntimeDispatchPermit, RuntimeStatusCompletion,
 };
+use crate::compaction_automation::CompactionAutomation;
 use crate::context::{Context, CordisError, TeardownPermit, TeardownTransaction, keys};
 use crate::fiber::LifecycleCancellation;
 use crate::invariants::{InvariantGate, OPENINTERPRETER, apply_effect, enforce_runtime_invariants};
@@ -35,7 +36,7 @@ use crate::surface::{
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
-pub const HOST_PLUGIN_IDS: &[&str] = &["surfaces", "agent-loop", "invariants"];
+pub const HOST_PLUGIN_IDS: &[&str] = &["surfaces", "compaction-basic", "agent-loop", "invariants"];
 
 /// Optional OpenInterpreter adapter plugin id. Never the loop.
 pub const OPENINTERPRETER_PLUGIN_ID: &str = OPENINTERPRETER;
@@ -205,14 +206,15 @@ impl std::fmt::Debug for CordisHost {
 }
 
 impl CordisHost {
-    /// Mount the sealed Hartevo surfaces, AgentLoop, and InvariantGate on a
-    /// fresh context.
+    /// Mount the sealed Hartevo surfaces, automatic compaction, AgentLoop, and
+    /// InvariantGate on a fresh context.
     ///
     /// `runtime_plugin` may name OpenInterpreter as an optional adapter on
     /// [`RuntimeSurface::plugin`]. Domain and Effect stay Hartevo-owned.
     pub fn boot(openinterpreter: bool) -> Result<Self, CordisError> {
         let mut ctx = Context::new();
         map_surfaces(&mut ctx, desktop_surfaces(openinterpreter))?;
+        ctx.mount(CompactionAutomation::default())?;
         ctx.mount(AgentLoop)?;
         ctx.mount(InvariantGate)?;
         Ok(Self {
@@ -232,7 +234,7 @@ impl CordisHost {
         })
     }
 
-    /// Same three services, selected by overlay rather than a crate boot list.
+    /// Same four services, selected by overlay rather than a crate boot list.
     pub fn boot_overlay(
         overlay: &EnvironmentOverlay,
         loader: &LoaderContext,
@@ -243,6 +245,10 @@ impl CordisHost {
         let mapping = PluginSpec::new("surfaces", move |_config, ctx| {
             map_surfaces(ctx, mapping_surfaces)
         });
+        let compaction = PluginSpec::new("compaction-basic", |_config, ctx| {
+            CompactionAutomation::default().apply(ctx)
+        })
+        .with_inject(CompactionAutomation::inject().iter().copied());
         let loop_plugin = PluginSpec::new("agent-loop", |_config, ctx| AgentLoop.apply(ctx))
             .with_inject(AgentLoop::inject().iter().copied());
         let gate = PluginSpec::new("invariants", |_config, ctx| InvariantGate.apply(ctx))
@@ -257,7 +263,7 @@ impl CordisHost {
             &mut ctx,
             loader,
             overlay,
-            &[mapping, loop_plugin, gate, adapter],
+            &[mapping, compaction, loop_plugin, gate, adapter],
         )?;
         Ok((
             Self {
@@ -913,13 +919,14 @@ impl CordisHost {
     }
 
     #[must_use]
-    pub fn mounted_keys(&self) -> [&'static str; 9] {
+    pub fn mounted_keys(&self) -> [&'static str; 10] {
         [
             keys::TOOLS,
             keys::SYSTEM_PROMPT,
             keys::LLM,
             keys::SESSIONS,
             keys::AGENTS,
+            keys::COMPACTION,
             keys::DOMAIN,
             keys::EFFECT_BROKER,
             keys::RUNTIME,
@@ -1059,7 +1066,7 @@ fn desktop_surfaces(openinterpreter: bool) -> HartevoSurfaces {
     }
 }
 
-/// Boot-time host check: the nine keys, Hartevo ownership of Domain/Effect,
+/// Boot-time host check: the ten keys, Hartevo ownership of Domain/Effect,
 /// Receipt ≠ Verification, and local-first/sqlcipher/eval_gate.
 ///
 /// Consent and approval are *not* required here. They are step-time
@@ -1093,6 +1100,15 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
     if host.ctx.agents::<AgentsSurface>().is_none() {
         return Err(CordisError::MissingDependencies(vec![
             keys::AGENTS.to_string(),
+        ]));
+    }
+    if host
+        .ctx
+        .get::<CompactionAutomation>(keys::COMPACTION)
+        .is_none()
+    {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::COMPACTION.to_string(),
         ]));
     }
     let Some(domain) = host.ctx.domain::<DomainSurface>() else {
@@ -1159,10 +1175,11 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
 }
 
 #[must_use]
-pub fn host_plugin_ids() -> [PluginId; 3] {
+pub fn host_plugin_ids() -> [PluginId; 4] {
     [
         PluginId::new(HOST_PLUGIN_IDS[0]),
         PluginId::new(HOST_PLUGIN_IDS[1]),
         PluginId::new(HOST_PLUGIN_IDS[2]),
+        PluginId::new(HOST_PLUGIN_IDS[3]),
     ]
 }

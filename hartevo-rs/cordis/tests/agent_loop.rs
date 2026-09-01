@@ -7094,7 +7094,7 @@ fn teardown_undoes_agents_and_loop_listeners() {
 }
 
 #[test]
-fn overlay_still_selects_surface_mapping_then_agent_loop() {
+fn overlay_selects_surface_mapping_compaction_then_agent_loop() {
     let overlay = EnvironmentOverlay::new("macos-dev");
     let loader = LoaderContext::new();
     let (mut host, report) = CordisHost::boot_overlay(&overlay, &loader, false).unwrap();
@@ -7113,6 +7113,7 @@ fn overlay_still_selects_surface_mapping_then_agent_loop() {
         report.started,
         [
             hartevo_cordis::PluginId::new("surfaces"),
+            hartevo_cordis::PluginId::new("compaction-basic"),
             hartevo_cordis::PluginId::new("agent-loop"),
             hartevo_cordis::PluginId::new("invariants"),
         ]

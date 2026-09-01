@@ -17,6 +17,7 @@
 mod agent;
 mod authority;
 mod compaction;
+mod compaction_automation;
 mod compaction_policy;
 mod config;
 mod context;
@@ -62,6 +63,10 @@ pub use compaction::{
     SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
     compact_checkpoint_source, is_compact_checkpoint_source, tool_pairing_balanced_after,
     tool_pairing_balanced_before,
+};
+pub use compaction_automation::{
+    COMPACTION_AUTOMATION_KEYS, CompactionAutomation, CompactionAutomationError,
+    ContextOverflowRecovery, compact_before_agent_step, recover_context_overflow,
 };
 pub use compaction_policy::{
     CHECKPOINT_PREAMBLE, COMPACTION_INSTRUCTION, CompactionMeasurement, CompactionNodeMeasurement,
@@ -137,17 +142,18 @@ pub use session::{
 pub use surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,
     AgentRequestErrorAction, AgentRetrySchedule, AgentStatus, AgentStatusChange, AgentTurnStopping,
-    AgentsSurface, DeniedToolExecution, DesktopSurface, DomainSurface, EffectBrokerSurface,
-    LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError, LlmGenerateRequest, LlmModelReasoning,
-    LlmRequestPurpose, LlmResolvedModel, LlmRetryPolicy, LlmRetryPolicyMode, LlmStream, LlmSurface,
-    MAPPED_KEYS, MAX_LLM_RETRY_DELAY_MS, PreparedLlmCall, PreparedToolExecution, PromptAssembly,
-    PromptError, PromptSection, RuntimeSurface, SurfaceOwner, SystemPromptSurface,
-    TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition, ToolDispatchExecution,
-    ToolDispatchOutcome, ToolDispatchResult, ToolExecutionInput, ToolExecutionMode,
-    ToolExecutionPreparation, ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface,
-    assemble_system_prompt, dispatch_tool_execution, events, expected_mode,
-    finalize_tool_execution, post_tool_execution, prepare_llm_call, prepare_tool_execution,
-    register_agent, register_llm_adapter, register_llm_stream, register_prompt_section,
-    register_tool, register_tool_concurrency, register_tool_definition, register_tool_guard,
-    register_tool_schema, run_tools_pipeline, stream_llm, stream_llm_request, stream_prepared_llm,
+    AgentsSurface, CONTEXT_WINDOW_EXCEEDED_CODE, DeniedToolExecution, DesktopSurface,
+    DomainSurface, EffectBrokerSurface, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
+    LlmGenerateRequest, LlmModelReasoning, LlmRequestPurpose, LlmResolvedModel, LlmRetryPolicy,
+    LlmRetryPolicyMode, LlmStream, LlmSurface, MAPPED_KEYS, MAX_LLM_RETRY_DELAY_MS,
+    PreparedLlmCall, PreparedToolExecution, PromptAssembly, PromptError, PromptSection,
+    RuntimeSurface, SurfaceOwner, SystemPromptSurface, TOOL_ABORTED_BEFORE_DISPATCH, ToolCall,
+    ToolDefinition, ToolDispatchExecution, ToolDispatchOutcome, ToolDispatchResult,
+    ToolExecutionInput, ToolExecutionMode, ToolExecutionPreparation, ToolExecutionResult,
+    ToolPostExecution, ToolRunContext, ToolsSurface, assemble_system_prompt,
+    dispatch_tool_execution, events, expected_mode, finalize_tool_execution, post_tool_execution,
+    prepare_llm_call, prepare_tool_execution, register_agent, register_llm_adapter,
+    register_llm_stream, register_prompt_section, register_tool, register_tool_concurrency,
+    register_tool_definition, register_tool_guard, register_tool_schema, run_tools_pipeline,
+    stream_llm, stream_llm_request, stream_prepared_llm,
 };

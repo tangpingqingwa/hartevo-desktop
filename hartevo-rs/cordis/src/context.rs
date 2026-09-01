@@ -238,6 +238,7 @@ pub mod keys {
     pub const LLM: &str = "llm";
     pub const SESSIONS: &str = "sessions";
     pub const AGENTS: &str = "agents";
+    pub const COMPACTION: &str = "compaction";
     pub const DOMAIN: &str = "domain";
     pub const EFFECT_BROKER: &str = "effect_broker";
     pub const RUNTIME: &str = "runtime";
