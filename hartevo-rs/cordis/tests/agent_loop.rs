@@ -15,12 +15,13 @@ use hartevo_cordis::{
     SessionHandle, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
-    SessionToolSchema, SurfaceOwner, ToolCall, ToolExecutionMode, ToolExecutionPreparation,
-    ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
-    commit_agent_stream, dispatch_agent_call, events, keys, log_agent_call, prepare_agent_call,
-    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
-    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
-    register_tool_concurrency, register_tool_guard, register_tool_schema, run_agent_step,
+    SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, ToolDispatchResult,
+    ToolExecutionMode, ToolExecutionPreparation, ToolsSurface, TurnEndReason, admit_agent_request,
+    admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call,
+    dispatch_tool_execution, events, keys, log_agent_call, prepare_agent_call, prepare_agent_step,
+    prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream,
+    register_llm_adapter, register_prompt_section, register_tool, register_tool_concurrency,
+    register_tool_definition, register_tool_guard, register_tool_schema, run_agent_step,
     schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
@@ -2900,6 +2901,187 @@ fn tool_pre_execution_rejects_rewrites_stale_registrations_unknowns_and_guard_pa
             "tool guard panicked for \"panic\"",
         ]
     );
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn exact_tool_dispatch_runs_each_body_once_and_normalizes_errors_without_session_writes() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(
+        0,
+        "success-call",
+        "success",
+        r#"{"value":7}"#,
+    ));
+    chunks.extend(tool_call_chunks(1, "error-call", "error", "{}"));
+    chunks.extend(tool_call_chunks(2, "panic-call", "panic", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("exact-tool-dispatch", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let body_order = Arc::new(Mutex::new(Vec::new()));
+    {
+        let body_order = Arc::clone(&body_order);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("success"), move |input| {
+                body_order.lock().unwrap().push(input.call_id().to_string());
+                assert_eq!(input.arguments(), &json!({ "value": 7 }));
+                Ok(json!({ "echo": input.arguments() }))
+            })
+            .with_concurrency(|arguments| Ok(arguments.get("value").is_some())),
+        )
+        .unwrap();
+    }
+    {
+        let body_order = Arc::clone(&body_order);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("error"), move |input| {
+                body_order.lock().unwrap().push(input.call_id().to_string());
+                Err("executor rejected the call".into())
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let body_order = Arc::clone(&body_order);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("panic"), move |input| {
+                body_order.lock().unwrap().push(input.call_id().to_string());
+                panic!("executor panic for {}", input.call_id());
+            }),
+        )
+        .unwrap();
+    }
+    let before = session.events().unwrap();
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    assert!(matches!(
+        &prepared[0],
+        ToolExecutionPreparation::Dispatch(dispatch)
+            if dispatch.mode() == ToolExecutionMode::Parallel
+    ));
+
+    let outcomes = prepared
+        .into_iter()
+        .map(|preparation| match preparation {
+            ToolExecutionPreparation::Dispatch(dispatch) => {
+                dispatch_tool_execution(&ctx, dispatch).unwrap()
+            }
+            ToolExecutionPreparation::Denied(denied) => {
+                panic!("unexpected denial: {}", denied.reason())
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        outcomes[0].result(),
+        &ToolDispatchResult::Success {
+            value: json!({ "echo": { "value": 7 } }),
+        }
+    );
+    assert_eq!(
+        outcomes[1].result(),
+        &ToolDispatchResult::Failure {
+            message: "executor rejected the call".into(),
+        }
+    );
+    assert_eq!(
+        outcomes[2].result(),
+        &ToolDispatchResult::Failure {
+            message: "tool \"panic\" panicked".into(),
+        }
+    );
+    assert_eq!(
+        *body_order.lock().unwrap(),
+        ["success-call", "error-call", "panic-call"]
+    );
+    assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tool_dispatch_fences_stale_replacements_and_schema_only_registrations() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(0, "stale-call", "replaceable", "{}"));
+    chunks.extend(tool_call_chunks(1, "schema-call", "schema-only", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("stale-tool-dispatch", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    let old_registration = {
+        let old_calls = Arc::clone(&old_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("replaceable"), move |_| {
+                old_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("old"))
+            }),
+        )
+        .unwrap()
+    };
+    register_tool_schema(&mut ctx, tool_schema("schema-only")).unwrap();
+    let before = session.events().unwrap();
+    let prepared = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    assert!(old_registration.dispose());
+    let replacement_calls = Arc::new(AtomicUsize::new(0));
+    {
+        let replacement_calls = Arc::clone(&replacement_calls);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("replaceable"), move |_| {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("replacement"))
+            }),
+        )
+        .unwrap();
+    }
+
+    let mut prepared = prepared.into_iter();
+    let ToolExecutionPreparation::Dispatch(stale) = prepared.next().unwrap() else {
+        panic!("old exact registration should prepare before replacement");
+    };
+    let ToolExecutionPreparation::Dispatch(schema_only) = prepared.next().unwrap() else {
+        panic!("schema-only registration should reach typed dispatch failure");
+    };
+    assert_eq!(
+        dispatch_tool_execution(&ctx, stale).unwrap().result(),
+        &ToolDispatchResult::Failure {
+            message: "tool registration changed before dispatch".into(),
+        }
+    );
+    assert_eq!(
+        dispatch_tool_execution(&ctx, schema_only).unwrap().result(),
+        &ToolDispatchResult::Failure {
+            message: "tool \"schema-only\" has no registered executor".into(),
+        }
+    );
+    assert_eq!(old_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_calls.load(Ordering::SeqCst), 0);
+
+    let fresh = prepare_agent_tool_executions(&mut ctx, &logged, &recorded).unwrap();
+    let ToolExecutionPreparation::Dispatch(fresh) = fresh.into_iter().next().unwrap() else {
+        panic!("replacement should require and receive a fresh preparation");
+    };
+    assert_eq!(
+        dispatch_tool_execution(&ctx, fresh).unwrap().result(),
+        &ToolDispatchResult::Success {
+            value: json!("replacement"),
+        }
+    );
+    assert_eq!(old_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
     assert_eq!(session.events().unwrap(), before);
     close_logged_turn(&session, turn);
 }

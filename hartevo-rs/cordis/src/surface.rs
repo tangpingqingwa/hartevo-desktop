@@ -465,6 +465,86 @@ impl ToolExecutionPreparation {
     }
 }
 
+type ToolExecutor =
+    Arc<dyn Fn(&ToolExecutionInput) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// One reversible executable tool definition. Schema, concurrency policy, and
+/// body share the same opaque Cordis registration identity.
+pub struct ToolDefinition {
+    schema: SessionToolSchema,
+    classifier: Option<ToolConcurrencyClassifier>,
+    executor: ToolExecutor,
+}
+
+impl fmt::Debug for ToolDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolDefinition")
+            .field("schema", &self.schema)
+            .field("has_classifier", &self.classifier.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolDefinition {
+    #[must_use]
+    pub fn new<F>(schema: SessionToolSchema, executor: F) -> Self
+    where
+        F: Fn(&ToolExecutionInput) -> Result<serde_json::Value, String> + Send + Sync + 'static,
+    {
+        Self {
+            schema,
+            classifier: None,
+            executor: Arc::new(executor),
+        }
+    }
+
+    #[must_use]
+    pub fn with_concurrency<F>(mut self, classifier: F) -> Self
+    where
+        F: Fn(&serde_json::Value) -> Result<bool, String> + Send + Sync + 'static,
+    {
+        self.classifier = Some(Arc::new(classifier));
+        self
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &SessionToolSchema {
+        &self.schema
+    }
+}
+
+/// Result of the tool-body dispatch stage before later around/post policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolDispatchResult {
+    Success { value: serde_json::Value },
+    Failure { message: String },
+}
+
+/// One settled tool body invocation. This is not yet a durable tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDispatchOutcome {
+    input: ToolExecutionInput,
+    result: ToolDispatchResult,
+}
+
+impl ToolDispatchOutcome {
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> &ToolDispatchResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub fn into_result(self) -> ToolDispatchResult {
+        self.result
+    }
+}
+
 /// Fully assembled provider-neutral request presented to one LLM adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmGenerateRequest {
@@ -1085,6 +1165,7 @@ struct ToolRegistration {
     name: String,
     identity: Arc<()>,
     classifier: Option<ToolConcurrencyClassifier>,
+    executor: Option<ToolExecutor>,
 }
 
 impl fmt::Debug for ToolRegistration {
@@ -1093,6 +1174,7 @@ impl fmt::Debug for ToolRegistration {
             .debug_struct("ToolRegistration")
             .field("name", &self.name)
             .field("has_classifier", &self.classifier.is_some())
+            .field("has_executor", &self.executor.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1131,13 +1213,22 @@ impl ToolsSurface {
     }
 
     fn register_name(&self, name: String) -> Arc<()> {
-        self.register_name_with_classifier(name, None)
+        self.register_name_with_runtime(name, None, None)
     }
 
     fn register_name_with_classifier(
         &self,
         name: String,
         classifier: Option<ToolConcurrencyClassifier>,
+    ) -> Arc<()> {
+        self.register_name_with_runtime(name, classifier, None)
+    }
+
+    fn register_name_with_runtime(
+        &self,
+        name: String,
+        classifier: Option<ToolConcurrencyClassifier>,
+        executor: Option<ToolExecutor>,
     ) -> Arc<()> {
         let identity = Arc::new(());
         self.state
@@ -1148,11 +1239,29 @@ impl ToolsSurface {
                 name,
                 identity: Arc::clone(&identity),
                 classifier,
+                executor,
             });
         identity
     }
 
     fn register_schema(&self, schema: SessionToolSchema) -> Result<Arc<()>, PromptError> {
+        self.register_schema_with_runtime(schema, None, None)
+    }
+
+    fn register_definition(&self, definition: ToolDefinition) -> Result<Arc<()>, PromptError> {
+        self.register_schema_with_runtime(
+            definition.schema,
+            definition.classifier,
+            Some(definition.executor),
+        )
+    }
+
+    fn register_schema_with_runtime(
+        &self,
+        schema: SessionToolSchema,
+        classifier: Option<ToolConcurrencyClassifier>,
+        executor: Option<ToolExecutor>,
+    ) -> Result<Arc<()>, PromptError> {
         let name = schema.name.clone();
         if name.is_empty() {
             return Err(PromptError::InvalidToolName);
@@ -1168,7 +1277,8 @@ impl ToolsSurface {
         state.names.push(ToolRegistration {
             name,
             identity: Arc::clone(&identity),
-            classifier: None,
+            classifier,
+            executor,
         });
         state.schemas.push(schema);
         Ok(identity)
@@ -1889,6 +1999,23 @@ pub fn register_tool_schema(
     Ok(ctx.effect(move || registered.unregister_schema(&identity, &name)))
 }
 
+/// Atomically register one model-visible schema, optional concurrency
+/// classifier, and exact Rust executor under one reversible Cordis identity.
+pub fn register_tool_definition(
+    ctx: &mut Context,
+    definition: ToolDefinition,
+) -> Result<RegistrationHandle, CordisError> {
+    let Some(tools) = ctx.tools::<ToolsSurface>() else {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::TOOLS.to_string(),
+        ]));
+    };
+    let name = definition.schema().name.clone();
+    let identity = tools.register_definition(definition)?;
+    let registered = Arc::clone(&tools);
+    Ok(ctx.effect(move || registered.unregister_schema(&identity, &name)))
+}
+
 /// Register one visible tool with its argument-sensitive parallel-safety
 /// classifier and reverse both with the owning Cordis effect.
 pub fn register_tool_concurrency<F>(
@@ -2276,6 +2403,72 @@ fn denied_tool_execution(
         input,
         reason: reason.into(),
     })
+}
+
+/// Consume one N52 dispatch preparation and invoke only its exact live Rust
+/// executor. Body failures are values for later post-execute policy; only a
+/// missing Cordis surface remains a structural [`CordisError`].
+pub fn dispatch_tool_execution(
+    ctx: &Context,
+    prepared: PreparedToolExecution,
+) -> Result<ToolDispatchOutcome, CordisError> {
+    let tools = ctx
+        .tools::<ToolsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let PreparedToolExecution {
+        input,
+        registration_identity,
+        ..
+    } = prepared;
+    let executor = {
+        let Ok(state) = tools.state.lock() else {
+            return Ok(tool_dispatch_failure(input, "tool registry is unavailable"));
+        };
+        let Some(registered) = state
+            .names
+            .iter()
+            .rfind(|registered| registered.name == input.name())
+        else {
+            return Ok(tool_dispatch_failure(
+                input,
+                "tool registration changed before dispatch",
+            ));
+        };
+        if !Arc::ptr_eq(&registered.identity, &registration_identity) {
+            return Ok(tool_dispatch_failure(
+                input,
+                "tool registration changed before dispatch",
+            ));
+        }
+        let Some(executor) = &registered.executor else {
+            let name = input.name().to_string();
+            return Ok(tool_dispatch_failure(
+                input,
+                format!("tool \"{name}\" has no registered executor"),
+            ));
+        };
+        Arc::clone(executor)
+    };
+    let result = match catch_unwind(AssertUnwindSafe(|| executor(&input))) {
+        Ok(Ok(value)) => ToolDispatchResult::Success { value },
+        Ok(Err(message)) => ToolDispatchResult::Failure { message },
+        Err(_) => ToolDispatchResult::Failure {
+            message: format!("tool \"{}\" panicked", input.name()),
+        },
+    };
+    Ok(ToolDispatchOutcome { input, result })
+}
+
+fn tool_dispatch_failure(
+    input: ToolExecutionInput,
+    message: impl Into<String>,
+) -> ToolDispatchOutcome {
+    ToolDispatchOutcome {
+        input,
+        result: ToolDispatchResult::Failure {
+            message: message.into(),
+        },
+    }
 }
 
 /// Dispatch one model stream through `llm/stream`.
