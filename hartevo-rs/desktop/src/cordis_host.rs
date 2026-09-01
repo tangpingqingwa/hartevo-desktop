@@ -23,13 +23,14 @@ use hartevo_cordis::{
     KernelConsentState, KernelConsentStatus, LifecycleCancellation, LlmAdapter, LlmAdapterStream,
     LlmError, LlmGenerateRequest, LlmResolvedModel, RuntimeAuthority, RuntimeDispatchCompletion,
     RuntimeDispatchPermit, RuntimeStatusCompletion, SessionCallConfig, SessionCancelCause,
-    SessionCheckpoint, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
-    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
-    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
-    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop,
-    keys, register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
+    SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+    SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent, SessionEventKind,
+    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId,
+    SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionRequestContext, SessionRequestHeader,
+    SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+    SessionSurfaceIntent, SessionToolError, TurnEndReason, host_is_cordis_loop, keys,
+    register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -1606,6 +1607,21 @@ fn encode_event(
                     started: started.to_json_value()?,
                 }
             }
+            SessionEventKind::CompactionStart { compaction } => {
+                PersistedSessionEventKind::CompactionStart {
+                    compaction: compaction.to_json_value()?,
+                }
+            }
+            SessionEventKind::CompactionSummary { compaction } => {
+                PersistedSessionEventKind::CompactionSummary {
+                    compaction: compaction.to_json_value()?,
+                }
+            }
+            SessionEventKind::CompactionEnd { compaction } => {
+                PersistedSessionEventKind::CompactionEnd {
+                    compaction: compaction.to_json_value()?,
+                }
+            }
             SessionEventKind::ToolCall {
                 turn,
                 step,
@@ -1769,6 +1785,21 @@ fn decode_event(
                     started: SessionLlmRetryStarted::from_json_value(started)?,
                 }
             }
+            PersistedSessionEventKind::CompactionStart { compaction } => {
+                SessionEventKind::CompactionStart {
+                    compaction: SessionCompactionStart::from_json_value(compaction)?,
+                }
+            }
+            PersistedSessionEventKind::CompactionSummary { compaction } => {
+                SessionEventKind::CompactionSummary {
+                    compaction: SessionCompactionSummary::from_json_value(compaction)?,
+                }
+            }
+            PersistedSessionEventKind::CompactionEnd { compaction } => {
+                SessionEventKind::CompactionEnd {
+                    compaction: SessionCompactionEnd::from_json_value(compaction)?,
+                }
+            }
             PersistedSessionEventKind::ToolCall {
                 turn,
                 step,
@@ -1790,7 +1821,7 @@ fn decode_event(
             } => SessionEventKind::AssistantMessage {
                 turn: *turn,
                 step: *step,
-                message: SessionMessage::from_json_value(message.clone())?,
+                message: SessionMessage::from_json_value(message)?,
                 surface: surface.as_ref().map_or_else(
                     || Ok(SessionSurfaceIntent::append()),
                     |value| {
@@ -1808,7 +1839,7 @@ fn decode_event(
             } => SessionEventKind::ToolResult {
                 turn: *turn,
                 step: *step,
-                message: SessionMessage::from_json_value(message.clone())?,
+                message: SessionMessage::from_json_value(message)?,
                 error: decode_tool_error(error.as_ref()),
                 surface: surface.as_ref().map_or_else(
                     || Ok(SessionSurfaceIntent::append()),
@@ -1835,7 +1866,6 @@ fn decode_inbox_splice(
         removed_count,
         inserted: inserted
             .iter()
-            .cloned()
             .map(SessionMessage::from_json_value)
             .collect::<Result<Vec<_>, _>>()?,
         outcome: outcome.map(decode_inbox_outcome),
@@ -1847,7 +1877,7 @@ fn decode_user_message(
     surface: Option<&serde_json::Value>,
 ) -> Result<SessionEventKind, DesktopSessionPersistenceError> {
     Ok(SessionEventKind::UserMessage {
-        message: SessionMessage::from_json_value(message.clone())?,
+        message: SessionMessage::from_json_value(message)?,
         // N22 rows predate surface metadata and were append-only.
         surface: surface.map_or_else(
             || Ok(SessionSurfaceIntent::append()),
@@ -2418,17 +2448,19 @@ mod tests {
     use futures_util::stream;
     use hartevo_cordis::{
         AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStatusChange, AgentStep,
-        AgentsSurface, AuthorityDispatchError, AuthorityScope, CordisError, CordisHost,
-        DomainCommandBinding, DomainCommandKind, DomainSurface, EffectExecutionBinding,
-        EffectReconciliationBinding, EffectVerificationBinding, FiberState, KernelApproval,
-        KernelApprovalDecision, KernelConsentState, LifecycleCancellation, LlmAdapter,
-        LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, LlmSurface,
-        OPENINTERPRETER, RuntimeBinding, SessionCallConfig, SessionContentBlock, SessionError,
-        SessionEvent, SessionEventKind, SessionFinishReason, SessionId, SessionLlmFailure,
-        SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionMessage,
-        SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamBlockType,
-        SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner, TurnEndReason,
-        enforce_invariants, events, host_is_cordis_loop, invariant_missing, keys, session_events,
+        AgentsSurface, AuthorityDispatchError, AuthorityScope, CompactionCheckpoint, CompactionId,
+        CompactionSummaryDraft, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
+        DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
+        EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
+        KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
+        LlmGenerateRequest, LlmResolvedModel, LlmSurface, OPENINTERPRETER, RuntimeBinding,
+        SessionCallConfig, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+        SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
+        SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted,
+        SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
+        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
+        SurfaceOwner, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
+        invariant_missing, keys, session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -2847,6 +2879,145 @@ mod tests {
     }
 
     #[test]
+    fn compaction_codec_round_trips_transaction_events() {
+        let id = hartevo_cordis::CompactionId::new("desktop-compact").unwrap();
+        let events = [
+            SessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: SessionEventKind::CompactionStart {
+                    compaction: SessionCompactionStart {
+                        compaction_id: id.clone(),
+                        source_command_id: Some("command-1".into()),
+                        turn: None,
+                    },
+                },
+            },
+            SessionEvent {
+                seq: 1,
+                time_ms: 2,
+                kind: SessionEventKind::CompactionSummary {
+                    compaction: SessionCompactionSummary {
+                        compaction_id: id.clone(),
+                        source_command_id: Some("command-1".into()),
+                        summary: vec![SessionContentBlock::Text {
+                            text: "summary".into(),
+                        }],
+                        shadowed_range: hartevo_cordis::CompactionRange { start: 4, end: 2 },
+                        shadowed_seqs: vec![4, 2],
+                        shadowed_token_count: 12,
+                        provider: "mock".into(),
+                        model: "summary".into(),
+                        max_tokens: Some(256),
+                        usage: None,
+                        raw_output: None,
+                        llm_stream_call: false,
+                    },
+                },
+            },
+            SessionEvent {
+                seq: 2,
+                time_ms: 3,
+                kind: SessionEventKind::CompactionEnd {
+                    compaction: SessionCompactionEnd {
+                        compaction_id: id,
+                        source_command_id: Some("command-1".into()),
+                        turn: None,
+                        error: None,
+                    },
+                },
+            },
+        ];
+
+        for event in events {
+            let persisted = encode_event(&event).unwrap();
+            assert_eq!(decode_event(&persisted).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn compaction_survives_desktop_session_persistence_rebind() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(
+            live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+                .unwrap(),
+            0
+        );
+        let sessions = live.context().sessions::<SessionStore>().unwrap();
+        let id = SessionId::new("persisted-compaction").unwrap();
+        let session = sessions.create(id.clone()).unwrap();
+        for (message_id, text) in [("user-1", "first"), ("user-2", "second")] {
+            session
+                .append_user_message(SessionMessage {
+                    id: message_id.into(),
+                    role: SessionMessageRole::User,
+                    content: vec![SessionContentBlock::Text { text: text.into() }],
+                    source: SessionMessageSource::User,
+                })
+                .unwrap();
+        }
+        let nodes = session.surface().unwrap().nodes;
+        let lease = session
+            .begin_compaction(
+                CompactionId::new("desktop-persisted").unwrap(),
+                None,
+                None,
+                nodes[0],
+                nodes[1],
+            )
+            .unwrap();
+        session
+            .complete_compaction(
+                &lease,
+                CompactionSummaryDraft {
+                    summary: vec![SessionContentBlock::Text {
+                        text: "raw summary".into(),
+                    }],
+                    shadowed_token_count: 10,
+                    provider: "mock".into(),
+                    model: "summary".into(),
+                    max_tokens: None,
+                    usage: None,
+                    raw_output: None,
+                    llm_stream_call: false,
+                },
+                CompactionCheckpoint {
+                    message_id: "checkpoint".into(),
+                    content: vec![SessionContentBlock::Text {
+                        text: "persisted summary".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        let expected_surface = session.surface().unwrap();
+        let expected_messages = session.derive_messages().unwrap();
+        live.session_persistence.persist_live(&session).unwrap();
+        let store = live
+            .session_persistence
+            .store
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+
+        let mut cold =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(cold.bind_session_persistence(store).unwrap(), 1);
+        let restored = cold
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.surface().unwrap(), expected_surface);
+        assert_eq!(restored.derive_messages().unwrap(), expected_messages);
+    }
+
+    #[test]
     fn agent_inbox_survives_desktop_session_persistence_rebind() {
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
@@ -2876,6 +3047,8 @@ mod tests {
             }],
             source: SessionMessageSource::Plugin {
                 plugin: "watcher".into(),
+                compaction_id: None,
+                source_command_id: None,
             },
         };
         session.inbox().append_next_turn(message.clone()).unwrap();
@@ -2891,6 +3064,8 @@ mod tests {
             }],
             source: SessionMessageSource::Plugin {
                 plugin: "watcher".into(),
+                compaction_id: None,
+                source_command_id: None,
             },
         };
         assert!(

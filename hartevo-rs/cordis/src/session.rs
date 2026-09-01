@@ -14,6 +14,12 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 
+use crate::compaction::{
+    COMPACTION_CHECKPOINT_PLUGIN, CompactionCheckpoint, CompactionId, CompactionLease,
+    CompactionRange, CompactionRegion, CompactionResult, CompactionSummaryDraft,
+    SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+    compact_checkpoint_source,
+};
 use crate::context::EventReentry;
 use crate::event::{Emit, EventKey, EventSchemaId, Parallel};
 use crate::inbox::{
@@ -288,9 +294,28 @@ pub enum SessionMessageRole {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionMessageSource {
     User,
-    Plugin { plugin: String },
-    Model { provider: String, model: String },
-    Tool { call_id: String },
+    Plugin {
+        plugin: String,
+        #[serde(
+            rename = "compactionId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        compaction_id: Option<CompactionId>,
+        #[serde(
+            rename = "sourceCommandId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_command_id: Option<String>,
+    },
+    Model {
+        provider: String,
+        model: String,
+    },
+    Tool {
+        call_id: String,
+    },
 }
 
 /// The bounded N22 content vocabulary needed for text and tool-history replay.
@@ -597,8 +622,13 @@ impl SessionMessage {
     }
 
     /// Decode one neutral persistence value before Session replay validates it.
-    pub fn from_json_value(value: serde_json::Value) -> Result<Self, SessionError> {
-        serde_json::from_value(value).map_err(|_| SessionError::InvalidMessageEncoding)
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, SessionError> {
+        let message: Self = serde_json::from_value(value.clone())
+            .map_err(|_| SessionError::InvalidMessageEncoding)?;
+        if message.to_json_value()?.ne(value) {
+            return Err(SessionError::InvalidMessageEncoding);
+        }
+        Ok(message)
     }
 }
 
@@ -694,7 +724,7 @@ pub struct SessionSurface {
     pub replace_generation: u64,
 }
 
-/// The bounded Session event vocabulary through N37.
+/// The bounded Session event vocabulary used by the Rust Cordis core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEventKind {
     TurnStart {
@@ -736,6 +766,15 @@ pub enum SessionEventKind {
     LlmRetryStarted {
         started: SessionLlmRetryStarted,
     },
+    CompactionStart {
+        compaction: SessionCompactionStart,
+    },
+    CompactionSummary {
+        compaction: SessionCompactionSummary,
+    },
+    CompactionEnd {
+        compaction: SessionCompactionEnd,
+    },
     ToolCall {
         turn: u64,
         step: u64,
@@ -776,6 +815,9 @@ impl SessionEventKind {
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
             Self::LlmRetryStarted { .. } => "llm/retry-started",
+            Self::CompactionStart { .. } => "compaction/start",
+            Self::CompactionSummary { .. } => "compaction/summary",
+            Self::CompactionEnd { .. } => "compaction/end",
             Self::ToolCall { .. } => "tool/call",
             Self::UserMessage { .. } => "user/message",
             Self::AssistantMessage { .. } => "assistant/message",
@@ -798,6 +840,9 @@ impl SessionEventKind {
             | Self::RequestContext { .. }
             | Self::LlmRetry { .. }
             | Self::LlmRetryStarted { .. }
+            | Self::CompactionStart { .. }
+            | Self::CompactionSummary { .. }
+            | Self::CompactionEnd { .. }
             | Self::ToolCall { .. } => None,
         }
     }
@@ -817,6 +862,9 @@ impl SessionEventKind {
             | Self::RequestContext { .. }
             | Self::LlmRetry { .. }
             | Self::LlmRetryStarted { .. }
+            | Self::CompactionStart { .. }
+            | Self::CompactionSummary { .. }
+            | Self::CompactionEnd { .. }
             | Self::ToolCall { .. } => None,
         }
     }
@@ -863,6 +911,25 @@ struct SessionRetryState {
     started: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionCompactionStage {
+    Started,
+    Summarized {
+        summary_seq: u64,
+        summary: Box<SessionCompactionSummary>,
+    },
+    Checkpointed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionCompactionState {
+    compaction_id: CompactionId,
+    source_command_id: Option<String>,
+    turn: Option<u64>,
+    start_seq: u64,
+    stage: SessionCompactionStage,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionState {
     last_turn: u64,
@@ -872,6 +939,7 @@ struct SessionState {
     pending_tool_calls: HashSet<String>,
     request_provider: Option<String>,
     retry_chains: HashMap<String, SessionRetryState>,
+    compaction: Option<SessionCompactionState>,
 }
 
 impl SessionState {
@@ -879,7 +947,16 @@ impl SessionState {
         clippy::too_many_lines,
         reason = "the append-only Session reducer keeps every event transition exhaustive in one match"
     )]
-    fn apply(&mut self, kind: &SessionEventKind) -> Result<(), SessionError> {
+    fn apply(&mut self, seq: u64, kind: &SessionEventKind) -> Result<(), SessionError> {
+        self.validate_compaction_adjacency(kind)?;
+        if self.compaction.is_some()
+            && matches!(
+                kind,
+                SessionEventKind::TurnStart { .. } | SessionEventKind::TurnEnd { .. }
+            )
+        {
+            return Err(SessionError::CompactionCrossesTurnBoundary);
+        }
         match kind {
             SessionEventKind::TurnStart { turn } => {
                 let turn = *turn;
@@ -963,6 +1040,15 @@ impl SessionState {
             SessionEventKind::LlmRetryStarted { started } => {
                 self.apply_llm_retry_started(started)?;
             }
+            SessionEventKind::CompactionStart { compaction } => {
+                self.apply_compaction_start(seq, compaction)?;
+            }
+            SessionEventKind::CompactionSummary { compaction } => {
+                self.apply_compaction_summary(seq, compaction)?;
+            }
+            SessionEventKind::CompactionEnd { compaction } => {
+                self.apply_compaction_end(compaction)?;
+            }
             SessionEventKind::ToolCall {
                 turn,
                 step,
@@ -976,10 +1062,198 @@ impl SessionState {
                 surface,
                 ..
             } => self.apply_tool_result(kind, message, error.as_ref(), surface)?,
-            SessionEventKind::UserMessage { .. } | SessionEventKind::AssistantMessage { .. } => {
+            SessionEventKind::UserMessage { message, surface } => {
+                self.validate_message_event(kind)?;
+                if matches!(
+                    &message.source,
+                    SessionMessageSource::Plugin { plugin, .. }
+                        if plugin == COMPACTION_CHECKPOINT_PLUGIN
+                ) {
+                    self.apply_compaction_checkpoint(message, surface)?;
+                }
+            }
+            SessionEventKind::AssistantMessage { .. } => {
                 self.validate_message_event(kind)?;
             }
         }
+        Ok(())
+    }
+
+    fn validate_compaction_adjacency(&self, kind: &SessionEventKind) -> Result<(), SessionError> {
+        let Some(compaction) = &self.compaction else {
+            return Ok(());
+        };
+        match compaction.stage {
+            SessionCompactionStage::Started => Ok(()),
+            SessionCompactionStage::Summarized { .. } => {
+                if matches!(
+                    kind,
+                    SessionEventKind::UserMessage {
+                        message: SessionMessage {
+                            source: SessionMessageSource::Plugin { plugin, .. },
+                            ..
+                        },
+                        ..
+                    } if plugin == COMPACTION_CHECKPOINT_PLUGIN
+                ) || matches!(
+                    kind,
+                    SessionEventKind::CompactionEnd {
+                        compaction: SessionCompactionEnd { error: Some(_), .. }
+                    }
+                ) {
+                    Ok(())
+                } else {
+                    Err(SessionError::CompactionCheckpointExpected {
+                        id: compaction.compaction_id.clone(),
+                    })
+                }
+            }
+            SessionCompactionStage::Checkpointed => {
+                if matches!(kind, SessionEventKind::CompactionEnd { .. }) {
+                    Ok(())
+                } else {
+                    Err(SessionError::CompactionEndExpected {
+                        id: compaction.compaction_id.clone(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn apply_compaction_start(
+        &mut self,
+        seq: u64,
+        start: &SessionCompactionStart,
+    ) -> Result<(), SessionError> {
+        start.to_json_value()?;
+        if let Some(open) = &self.compaction {
+            return Err(SessionError::CompactionAlreadyOpen {
+                id: open.compaction_id.clone(),
+            });
+        }
+        validate_compaction_owner(start.turn, self.open_turn)?;
+        self.compaction = Some(SessionCompactionState {
+            compaction_id: start.compaction_id.clone(),
+            source_command_id: start.source_command_id.clone(),
+            turn: start.turn,
+            start_seq: seq,
+            stage: SessionCompactionStage::Started,
+        });
+        Ok(())
+    }
+
+    fn apply_compaction_summary(
+        &mut self,
+        seq: u64,
+        summary: &SessionCompactionSummary,
+    ) -> Result<(), SessionError> {
+        summary.validate()?;
+        let open = self
+            .compaction
+            .as_mut()
+            .ok_or(SessionError::CompactionNotOpen)?;
+        validate_compaction_identity(
+            &open.compaction_id,
+            open.source_command_id.as_deref(),
+            &summary.compaction_id,
+            summary.source_command_id.as_deref(),
+        )?;
+        validate_compaction_owner(open.turn, self.open_turn)?;
+        if !matches!(open.stage, SessionCompactionStage::Started) {
+            return Err(SessionError::CompactionSummaryAlreadyRecorded {
+                id: open.compaction_id.clone(),
+            });
+        }
+        open.stage = SessionCompactionStage::Summarized {
+            summary_seq: seq,
+            summary: Box::new(summary.clone()),
+        };
+        Ok(())
+    }
+
+    fn apply_compaction_checkpoint(
+        &mut self,
+        message: &SessionMessage,
+        surface: &SessionSurfaceIntent,
+    ) -> Result<(), SessionError> {
+        let SessionMessageSource::Plugin {
+            plugin,
+            compaction_id: Some(checkpoint_id),
+            source_command_id,
+        } = &message.source
+        else {
+            return Err(SessionError::InvalidCompaction {
+                expected: "a typed compact checkpoint source",
+            });
+        };
+        if plugin != COMPACTION_CHECKPOINT_PLUGIN {
+            return Err(SessionError::InvalidCompaction {
+                expected: "the compact checkpoint plugin marker",
+            });
+        }
+        let open = self
+            .compaction
+            .as_mut()
+            .ok_or(SessionError::CompactionNotOpen)?;
+        validate_compaction_identity(
+            &open.compaction_id,
+            open.source_command_id.as_deref(),
+            checkpoint_id,
+            source_command_id.as_deref(),
+        )?;
+        let SessionCompactionStage::Summarized {
+            summary_seq,
+            summary,
+        } = &open.stage
+        else {
+            return Err(SessionError::CompactionSummaryExpected {
+                id: open.compaction_id.clone(),
+            });
+        };
+        if surface.surface_op
+            != (SessionSurfaceOp::Replace {
+                start: summary.shadowed_range.start,
+                end: summary.shadowed_range.end,
+            })
+        {
+            return Err(SessionError::CompactionCheckpointRangeMismatch);
+        }
+        let mut expected_sources = Vec::with_capacity(summary.shadowed_seqs.len() + 2);
+        expected_sources.push(open.start_seq);
+        expected_sources.push(*summary_seq);
+        expected_sources.extend_from_slice(&summary.shadowed_seqs);
+        if surface.source_event_seqs.as_deref() != Some(expected_sources.as_slice()) {
+            return Err(SessionError::CompactionCheckpointProvenanceMismatch);
+        }
+        open.stage = SessionCompactionStage::Checkpointed;
+        Ok(())
+    }
+
+    fn apply_compaction_end(&mut self, end: &SessionCompactionEnd) -> Result<(), SessionError> {
+        end.to_json_value()?;
+        let open = self
+            .compaction
+            .as_ref()
+            .ok_or(SessionError::CompactionNotOpen)?;
+        validate_compaction_identity(
+            &open.compaction_id,
+            open.source_command_id.as_deref(),
+            &end.compaction_id,
+            end.source_command_id.as_deref(),
+        )?;
+        if end.turn != open.turn {
+            return Err(SessionError::CompactionOwnerMismatch {
+                expected: open.turn,
+                actual: end.turn,
+            });
+        }
+        validate_compaction_owner(open.turn, self.open_turn)?;
+        if end.error.is_none() && !matches!(open.stage, SessionCompactionStage::Checkpointed) {
+            return Err(SessionError::CompactionCheckpointExpected {
+                id: open.compaction_id.clone(),
+            });
+        }
+        self.compaction = None;
         Ok(())
     }
 
@@ -1179,6 +1453,9 @@ impl SessionState {
             | SessionEventKind::RequestContext { .. }
             | SessionEventKind::LlmRetry { .. }
             | SessionEventKind::LlmRetryStarted { .. }
+            | SessionEventKind::CompactionStart { .. }
+            | SessionEventKind::CompactionSummary { .. }
+            | SessionEventKind::CompactionEnd { .. }
             | SessionEventKind::ToolCall { .. } => Ok(()),
         }
     }
@@ -1205,8 +1482,49 @@ fn valid_user_source(source: &SessionMessageSource) -> bool {
     matches!(source, SessionMessageSource::User)
         || matches!(
             source,
-            SessionMessageSource::Plugin { plugin } if !plugin.is_empty()
+            SessionMessageSource::Plugin {
+                plugin,
+                compaction_id,
+                source_command_id,
+            } if !plugin.is_empty()
+                && if plugin == COMPACTION_CHECKPOINT_PLUGIN {
+                    compaction_id.as_ref().is_some_and(|id| id.validate().is_ok())
+                        && source_command_id.as_ref().is_none_or(|id| !id.is_empty())
+                } else {
+                    compaction_id.is_none() && source_command_id.is_none()
+                }
         )
+}
+
+fn validate_compaction_owner(
+    owner: Option<u64>,
+    open_turn: Option<u64>,
+) -> Result<(), SessionError> {
+    match (owner, open_turn) {
+        (None, None) | (Some(_), Some(_)) if owner == open_turn => Ok(()),
+        (expected, actual) => Err(SessionError::CompactionOwnerMismatch { expected, actual }),
+    }
+}
+
+fn validate_compaction_identity(
+    expected_id: &CompactionId,
+    expected_source: Option<&str>,
+    actual_id: &CompactionId,
+    actual_source: Option<&str>,
+) -> Result<(), SessionError> {
+    if expected_id != actual_id {
+        return Err(SessionError::CompactionIdMismatch {
+            expected: expected_id.clone(),
+            actual: actual_id.clone(),
+        });
+    }
+    if expected_source != actual_source {
+        return Err(SessionError::CompactionSourceCommandMismatch {
+            expected: expected_source.map(str::to_owned),
+            actual: actual_source.map(str::to_owned),
+        });
+    }
+    Ok(())
 }
 
 fn validate_request_header(request: &SessionRequestHeader) -> Result<(), SessionError> {
@@ -1305,7 +1623,7 @@ fn validate_assistant_chunk(chunk: &SessionStreamChunk) -> Result<(), SessionErr
     }
 }
 
-fn validate_token_usage(usage: &SessionTokenUsage) -> Result<(), SessionError> {
+pub(crate) fn validate_token_usage(usage: &SessionTokenUsage) -> Result<(), SessionError> {
     if usage
         .reasoning_tokens
         .is_some_and(|reasoning| reasoning > usage.output_tokens)
@@ -1464,6 +1782,9 @@ fn pending_interrupted_tool_calls(events: &[SessionEvent]) -> Vec<(String, u64, 
             | SessionEventKind::RequestContext { .. }
             | SessionEventKind::LlmRetry { .. }
             | SessionEventKind::LlmRetryStarted { .. }
+            | SessionEventKind::CompactionStart { .. }
+            | SessionEventKind::CompactionSummary { .. }
+            | SessionEventKind::CompactionEnd { .. }
             | SessionEventKind::UserMessage { .. } => {}
         }
     }
@@ -1588,6 +1909,10 @@ impl SessionSurfaceState {
         kind: &SessionEventKind,
         prior_events: &[SessionEvent],
     ) -> Result<SessionSurfacePlan, SessionError> {
+        if let SessionEventKind::CompactionSummary { compaction } = kind {
+            validate_compaction_summary_surface(compaction, &self.nodes, prior_events)?;
+            return Ok(SessionSurfacePlan::None);
+        }
         let Some(intent) = kind.surface_intent() else {
             return Ok(SessionSurfacePlan::None);
         };
@@ -1612,6 +1937,14 @@ impl SessionSurfaceState {
                 }
                 let shadowed = self.nodes[start_index..=end_index].to_vec();
                 validate_surface_provenance(seq, kind, intent, &shadowed, prior_events)?;
+                validate_compaction_replacement(
+                    kind,
+                    &shadowed,
+                    &self.nodes,
+                    start_index,
+                    end_index,
+                    prior_events,
+                )?;
                 validate_tool_result_replacement(kind, &shadowed, prior_events)?;
                 let generation = self
                     .replace_generation
@@ -1642,6 +1975,200 @@ impl SessionSurfaceState {
             }
         }
     }
+}
+
+fn tool_pairing_cuts_for(
+    surface_nodes: &[u64],
+    events: &[SessionEvent],
+) -> Result<Vec<(u64, bool, bool)>, SessionError> {
+    let mut in_progress = 0_u64;
+    let mut cuts = Vec::with_capacity(surface_nodes.len());
+    for seq in surface_nodes {
+        let event = usize::try_from(*seq)
+            .ok()
+            .and_then(|index| events.get(index))
+            .filter(|event| event.seq == *seq)
+            .ok_or(SessionError::CompactionSurfaceCorrupt { seq: *seq })?;
+        let balanced_before = in_progress == 0;
+        match &event.kind {
+            SessionEventKind::AssistantMessage { message, .. } => {
+                let calls = u64::try_from(
+                    message
+                        .content
+                        .iter()
+                        .filter(|block| matches!(block, SessionContentBlock::ToolCall { .. }))
+                        .count(),
+                )
+                .map_err(|_| SessionError::EventSequenceOverflow)?;
+                in_progress = in_progress
+                    .checked_add(calls)
+                    .ok_or(SessionError::EventSequenceOverflow)?;
+            }
+            SessionEventKind::ToolResult { .. } => {
+                in_progress = in_progress
+                    .checked_sub(1)
+                    .ok_or(SessionError::CompactionToolResultWithoutCall { seq: *seq })?;
+            }
+            _ => {}
+        }
+        cuts.push((*seq, balanced_before, in_progress == 0));
+    }
+    Ok(cuts)
+}
+
+fn tool_pairing_cuts(log: &SessionLog) -> Result<Vec<(u64, bool, bool)>, SessionError> {
+    tool_pairing_cuts_for(&log.surface.nodes, &log.events)
+}
+
+fn tool_pairing_balanced_at(log: &SessionLog, seq: u64, after: bool) -> Result<bool, SessionError> {
+    tool_pairing_cuts(log)?
+        .into_iter()
+        .find_map(|(node, before, trailing)| {
+            (node == seq).then_some(if after { trailing } else { before })
+        })
+        .ok_or(SessionError::CompactionSurfaceNodeNotFound { seq })
+}
+
+fn select_compaction_region(
+    log: &SessionLog,
+    start: u64,
+    end: u64,
+) -> Result<CompactionRegion, SessionError> {
+    let start_index = log
+        .surface
+        .nodes
+        .iter()
+        .position(|node| *node == start)
+        .ok_or(SessionError::CompactionSurfaceNodeNotFound { seq: start })?;
+    let end_index = log
+        .surface
+        .nodes
+        .iter()
+        .position(|node| *node == end)
+        .ok_or(SessionError::CompactionSurfaceNodeNotFound { seq: end })?;
+    if start_index > end_index {
+        return Err(SessionError::CompactionRangeReversed { start, end });
+    }
+    if !tool_pairing_balanced_at(log, start, false)? {
+        return Err(SessionError::CompactionRangeUnbalanced {
+            edge: "start",
+            seq: start,
+        });
+    }
+    if !tool_pairing_balanced_at(log, end, true)? {
+        return Err(SessionError::CompactionRangeUnbalanced {
+            edge: "end",
+            seq: end,
+        });
+    }
+    Ok(CompactionRegion {
+        start,
+        end,
+        shadowed_seqs: log.surface.nodes[start_index..=end_index].to_vec(),
+        surface_generation: log.surface.replace_generation,
+    })
+}
+
+fn validate_compaction_replacement(
+    replacement: &SessionEventKind,
+    shadowed: &[u64],
+    surface_nodes: &[u64],
+    start_index: usize,
+    end_index: usize,
+    prior_events: &[SessionEvent],
+) -> Result<(), SessionError> {
+    let SessionEventKind::UserMessage {
+        message:
+            SessionMessage {
+                source: SessionMessageSource::Plugin { plugin, .. },
+                ..
+            },
+        ..
+    } = replacement
+    else {
+        return Ok(());
+    };
+    if plugin != COMPACTION_CHECKPOINT_PLUGIN {
+        return Ok(());
+    }
+    let Some(SessionEvent {
+        kind: SessionEventKind::CompactionSummary { compaction },
+        ..
+    }) = prior_events.last()
+    else {
+        return Err(SessionError::CompactionCheckpointProvenanceMismatch);
+    };
+    if shadowed != compaction.shadowed_seqs {
+        return Err(SessionError::CompactionCheckpointRangeMismatch);
+    }
+    let cuts = tool_pairing_cuts_for(surface_nodes, prior_events)?;
+    let (_, balanced_before, _) =
+        cuts.get(start_index)
+            .copied()
+            .ok_or(SessionError::CompactionSurfaceCorrupt {
+                seq: compaction.shadowed_range.start,
+            })?;
+    if !balanced_before {
+        return Err(SessionError::CompactionRangeUnbalanced {
+            edge: "start",
+            seq: compaction.shadowed_range.start,
+        });
+    }
+    let (_, _, balanced_after) =
+        cuts.get(end_index)
+            .copied()
+            .ok_or(SessionError::CompactionSurfaceCorrupt {
+                seq: compaction.shadowed_range.end,
+            })?;
+    if !balanced_after {
+        return Err(SessionError::CompactionRangeUnbalanced {
+            edge: "end",
+            seq: compaction.shadowed_range.end,
+        });
+    }
+    Ok(())
+}
+
+fn validate_compaction_summary_surface(
+    summary: &SessionCompactionSummary,
+    surface_nodes: &[u64],
+    prior_events: &[SessionEvent],
+) -> Result<(), SessionError> {
+    let start_index = surface_nodes
+        .iter()
+        .position(|node| *node == summary.shadowed_range.start)
+        .ok_or(SessionError::CompactionSurfaceNodeNotFound {
+            seq: summary.shadowed_range.start,
+        })?;
+    let end_index = surface_nodes
+        .iter()
+        .position(|node| *node == summary.shadowed_range.end)
+        .ok_or(SessionError::CompactionSurfaceNodeNotFound {
+            seq: summary.shadowed_range.end,
+        })?;
+    if start_index > end_index {
+        return Err(SessionError::CompactionRangeReversed {
+            start: summary.shadowed_range.start,
+            end: summary.shadowed_range.end,
+        });
+    }
+    if surface_nodes[start_index..=end_index] != summary.shadowed_seqs {
+        return Err(SessionError::CompactionRegionChanged);
+    }
+    let cuts = tool_pairing_cuts_for(surface_nodes, prior_events)?;
+    if !cuts[start_index].1 {
+        return Err(SessionError::CompactionRangeUnbalanced {
+            edge: "start",
+            seq: summary.shadowed_range.start,
+        });
+    }
+    if !cuts[end_index].2 {
+        return Err(SessionError::CompactionRangeUnbalanced {
+            edge: "end",
+            seq: summary.shadowed_range.end,
+        });
+    }
+    Ok(())
 }
 
 fn validate_surface_provenance(
@@ -1840,7 +2367,7 @@ impl SessionLog {
                     time_ms: event.time_ms,
                 });
             }
-            state.apply(&event.kind)?;
+            state.apply(event.seq, &event.kind)?;
             let plan = surface.plan(event.seq, &event.kind, &events[..index])?;
             surface.apply(plan);
         }
@@ -1992,6 +2519,160 @@ impl SessionLog {
         Ok(self
             .append(SessionEventKind::LlmRetryStarted { started })?
             .seq)
+    }
+
+    fn begin_compaction(
+        &mut self,
+        compaction_id: CompactionId,
+        source_command_id: Option<String>,
+        turn: Option<u64>,
+        start: u64,
+        end: u64,
+    ) -> Result<CompactionLease, SessionError> {
+        if let Some(open) = &self.state.compaction {
+            return Err(SessionError::CompactionAlreadyOpen {
+                id: open.compaction_id.clone(),
+            });
+        }
+        let region = select_compaction_region(self, start, end)?;
+        let start_seq = self
+            .append(SessionEventKind::CompactionStart {
+                compaction: SessionCompactionStart {
+                    compaction_id: compaction_id.clone(),
+                    source_command_id: source_command_id.clone(),
+                    turn,
+                },
+            })?
+            .seq;
+        Ok(CompactionLease {
+            session_id: self.header.id.clone(),
+            compaction_id,
+            source_command_id,
+            turn,
+            start_seq,
+            region,
+        })
+    }
+
+    fn complete_compaction(
+        &mut self,
+        lease: &CompactionLease,
+        draft: CompactionSummaryDraft,
+        checkpoint: CompactionCheckpoint,
+    ) -> Result<CompactionResult, SessionError> {
+        self.validate_compaction_lease(lease)?;
+        let current = select_compaction_region(self, lease.region.start, lease.region.end)?;
+        if current != lease.region {
+            return Err(SessionError::CompactionRegionChanged);
+        }
+        let shadowed_range = CompactionRange {
+            start: current.start,
+            end: current.end,
+        };
+        let summary = SessionCompactionSummary {
+            compaction_id: lease.compaction_id.clone(),
+            source_command_id: lease.source_command_id.clone(),
+            summary: draft.summary,
+            shadowed_range,
+            shadowed_seqs: current.shadowed_seqs.clone(),
+            shadowed_token_count: draft.shadowed_token_count,
+            provider: draft.provider,
+            model: draft.model,
+            max_tokens: draft.max_tokens,
+            usage: draft.usage,
+            raw_output: draft.raw_output,
+            llm_stream_call: draft.llm_stream_call,
+        };
+        let summary_seq = self
+            .append(SessionEventKind::CompactionSummary {
+                compaction: summary.clone(),
+            })?
+            .seq;
+        let mut source_event_seqs = Vec::with_capacity(current.shadowed_seqs.len() + 2);
+        source_event_seqs.push(lease.start_seq);
+        source_event_seqs.push(summary_seq);
+        source_event_seqs.extend_from_slice(&current.shadowed_seqs);
+        self.append(SessionEventKind::UserMessage {
+            message: SessionMessage {
+                id: checkpoint.message_id,
+                role: SessionMessageRole::User,
+                content: checkpoint.content,
+                source: compact_checkpoint_source(
+                    lease.compaction_id.clone(),
+                    lease.source_command_id.clone(),
+                ),
+            },
+            surface: SessionSurfaceIntent::replace(current.start, current.end, source_event_seqs),
+        })?;
+        let end_seq = self
+            .append(SessionEventKind::CompactionEnd {
+                compaction: SessionCompactionEnd {
+                    compaction_id: lease.compaction_id.clone(),
+                    source_command_id: lease.source_command_id.clone(),
+                    turn: lease.turn,
+                    error: None,
+                },
+            })?
+            .seq;
+        Ok(CompactionResult {
+            compaction_id: lease.compaction_id.clone(),
+            source_command_id: lease.source_command_id.clone(),
+            start_seq: lease.start_seq,
+            summary_seq,
+            end_seq,
+            summary: summary.summary,
+            shadowed_range,
+            shadowed_seqs: current.shadowed_seqs,
+            shadowed_token_count: summary.shadowed_token_count,
+        })
+    }
+
+    fn fail_compaction(
+        &mut self,
+        lease: &CompactionLease,
+        error: String,
+    ) -> Result<u64, SessionError> {
+        self.validate_compaction_lease(lease)?;
+        Ok(self
+            .append(SessionEventKind::CompactionEnd {
+                compaction: SessionCompactionEnd {
+                    compaction_id: lease.compaction_id.clone(),
+                    source_command_id: lease.source_command_id.clone(),
+                    turn: lease.turn,
+                    error: Some(error),
+                },
+            })?
+            .seq)
+    }
+
+    fn validate_compaction_lease(&self, lease: &CompactionLease) -> Result<(), SessionError> {
+        if self.header.id != lease.session_id {
+            return Err(SessionError::CompactionLeaseSessionMismatch {
+                expected: self.header.id.clone(),
+                actual: lease.session_id.clone(),
+            });
+        }
+        let open = self
+            .state
+            .compaction
+            .as_ref()
+            .ok_or(SessionError::CompactionNotOpen)?;
+        validate_compaction_identity(
+            &open.compaction_id,
+            open.source_command_id.as_deref(),
+            &lease.compaction_id,
+            lease.source_command_id.as_deref(),
+        )?;
+        if open.turn != lease.turn {
+            return Err(SessionError::CompactionOwnerMismatch {
+                expected: open.turn,
+                actual: lease.turn,
+            });
+        }
+        if open.start_seq != lease.start_seq {
+            return Err(SessionError::CompactionLeaseMismatch);
+        }
+        Ok(())
     }
 
     /// Append one model-requested invocation without parsing its raw arguments.
@@ -2191,6 +2872,15 @@ impl SessionLog {
             .time_ms;
 
         let mut repaired = self.clone();
+        if let Some(compaction) = repaired.state.compaction.as_ref() {
+            let end = SessionCompactionEnd {
+                compaction_id: compaction.compaction_id.clone(),
+                source_command_id: compaction.source_command_id.clone(),
+                turn: compaction.turn,
+                error: Some("session interrupted during compaction".into()),
+            };
+            repaired.append_at(SessionEventKind::CompactionEnd { compaction: end }, time_ms)?;
+        }
         for (call_id, step, call_seq) in pending_interrupted_tool_calls(&self.events) {
             let seq = u64::try_from(repaired.events.len())
                 .map_err(|_| SessionError::EventSequenceOverflow)?;
@@ -2262,7 +2952,7 @@ impl SessionLog {
             return Err(SessionError::InvalidEventTime { seq, time_ms });
         }
         let mut next_state = self.state.clone();
-        next_state.apply(&kind)?;
+        next_state.apply(seq, &kind)?;
         let surface_plan = self.surface.plan(seq, &kind, &self.events)?;
         self.events.push(SessionEvent { seq, time_ms, kind });
         self.state = next_state;
@@ -2691,6 +3381,38 @@ impl SessionHandle {
         })
     }
 
+    /// Validate a current surface span and durably acquire its compaction lock.
+    pub fn begin_compaction(
+        &self,
+        compaction_id: CompactionId,
+        source_command_id: Option<String>,
+        turn: Option<u64>,
+        start: u64,
+        end: u64,
+    ) -> Result<CompactionLease, SessionError> {
+        self.commit(|log| log.begin_compaction(compaction_id, source_command_id, turn, start, end))
+    }
+
+    /// Atomically append summary, correlated replacement, and successful end.
+    pub fn complete_compaction(
+        &self,
+        lease: &CompactionLease,
+        summary: CompactionSummaryDraft,
+        checkpoint: CompactionCheckpoint,
+    ) -> Result<CompactionResult, SessionError> {
+        self.commit_batch(|log| log.complete_compaction(lease, summary, checkpoint))
+    }
+
+    /// Close one acquired compaction lock with a durable failure.
+    pub fn fail_compaction(
+        &self,
+        lease: &CompactionLease,
+        error: impl Into<String>,
+    ) -> Result<u64, SessionError> {
+        let error = error.into();
+        self.commit(|log| log.fail_compaction(lease, error))
+    }
+
     pub fn derive_messages(&self) -> Result<Vec<SessionMessage>, SessionError> {
         Ok(self.lock()?.derive_messages())
     }
@@ -2713,6 +3435,15 @@ impl SessionHandle {
 
     pub fn request_context(&self) -> Result<Option<SessionRequestContext>, SessionError> {
         Ok(self.lock()?.request_context())
+    }
+
+    pub(crate) fn tool_pairing_balanced_at(
+        &self,
+        seq: u64,
+        after: bool,
+    ) -> Result<bool, SessionError> {
+        let log = self.lock()?;
+        tool_pairing_balanced_at(&log, seq, after)
     }
 
     fn commit<R>(
@@ -2746,6 +3477,40 @@ impl SessionHandle {
             // The append is authoritative. Observation failures are contained
             // here; persistence adapters report durability at the flush edge.
             let _ = dispatcher.emit_contained(events::SESSION_EVENT, &record);
+        }
+        Ok(result)
+    }
+
+    fn commit_batch<R>(
+        &self,
+        append: impl FnOnce(&mut SessionLog) -> Result<R, SessionError>,
+    ) -> Result<R, SessionError> {
+        let _permit = SessionAppendPermit::enter(&self.appending, &self.id)?;
+        let (result, records) = {
+            let mut log = self.lock()?;
+            let previous_len = log.events().len();
+            let mut candidate = log.clone();
+            let result = append(&mut candidate)?;
+            if candidate.events().len() <= previous_len {
+                return Err(SessionError::EventSequenceOverflow);
+            }
+            let header = candidate.header().clone();
+            let records = candidate.events()[previous_len..]
+                .iter()
+                .cloned()
+                .map(|event| SessionEventRecord {
+                    header: header.clone(),
+                    event,
+                })
+                .collect::<Vec<_>>();
+            *log = candidate;
+            (result, records)
+        };
+
+        if let Some(dispatcher) = &self.event_dispatcher {
+            for record in &records {
+                let _ = dispatcher.emit_contained(events::SESSION_EVENT, record);
+            }
         }
         Ok(result)
     }
@@ -3077,6 +3842,64 @@ pub enum SessionError {
     InvalidLlmRetryEncoding,
     #[error("session llm retry must have {expected}")]
     InvalidLlmRetry { expected: &'static str },
+    #[error("session compaction id must not be empty")]
+    EmptyCompactionId,
+    #[error("session compaction persistence encoding is invalid")]
+    InvalidCompactionEncoding,
+    #[error("session compaction must have {expected}")]
+    InvalidCompaction { expected: &'static str },
+    #[error("session compaction {id} is already open")]
+    CompactionAlreadyOpen { id: CompactionId },
+    #[error("session has no open compaction")]
+    CompactionNotOpen,
+    #[error("session compaction id must be {expected}, got {actual}")]
+    CompactionIdMismatch {
+        expected: CompactionId,
+        actual: CompactionId,
+    },
+    #[error("session compaction source command must be {expected:?}, got {actual:?}")]
+    CompactionSourceCommandMismatch {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+    #[error("session compaction owner must be {expected:?}, got {actual:?}")]
+    CompactionOwnerMismatch {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    #[error("session turn boundary cannot cross an open compaction")]
+    CompactionCrossesTurnBoundary,
+    #[error("session compaction {id} already recorded its summary")]
+    CompactionSummaryAlreadyRecorded { id: CompactionId },
+    #[error("session compaction {id} requires a summary before its checkpoint")]
+    CompactionSummaryExpected { id: CompactionId },
+    #[error("session compaction {id} requires its correlated checkpoint next")]
+    CompactionCheckpointExpected { id: CompactionId },
+    #[error("session compaction {id} requires its end marker next")]
+    CompactionEndExpected { id: CompactionId },
+    #[error("session compaction checkpoint range does not match its summary")]
+    CompactionCheckpointRangeMismatch,
+    #[error("session compaction checkpoint provenance does not match its transaction")]
+    CompactionCheckpointProvenanceMismatch,
+    #[error("session compaction surface seq {seq} has no matching event")]
+    CompactionSurfaceCorrupt { seq: u64 },
+    #[error("session compaction surface node {seq} was not found")]
+    CompactionSurfaceNodeNotFound { seq: u64 },
+    #[error("session compaction surface tool/result at seq {seq} has no preceding call")]
+    CompactionToolResultWithoutCall { seq: u64 },
+    #[error("session compaction range start {start} appears after end {end}")]
+    CompactionRangeReversed { start: u64, end: u64 },
+    #[error("session compaction {edge} cut at seq {seq} splits a tool call/result pair")]
+    CompactionRangeUnbalanced { edge: &'static str, seq: u64 },
+    #[error("session compaction selected surface region changed")]
+    CompactionRegionChanged,
+    #[error("session compaction lease does not match the open transaction")]
+    CompactionLeaseMismatch,
+    #[error("session compaction lease belongs to {actual}, not {expected}")]
+    CompactionLeaseSessionMismatch {
+        expected: SessionId,
+        actual: SessionId,
+    },
     #[error("session surface persistence encoding is invalid")]
     InvalidSurfaceEncoding,
     #[error("session {event_type} source event sequences must not be empty")]

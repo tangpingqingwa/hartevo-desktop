@@ -73,6 +73,8 @@ fn plugin_message(id: &str, plugin: &str, text: &str) -> SessionMessage {
         content: vec![SessionContentBlock::Text { text: text.into() }],
         source: SessionMessageSource::Plugin {
             plugin: plugin.into(),
+            compaction_id: None,
+            source_command_id: None,
         },
     }
 }

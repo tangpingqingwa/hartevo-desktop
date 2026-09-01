@@ -165,6 +165,15 @@ pub enum PersistedSessionEventKind {
     LlmRetryStarted {
         started: serde_json::Value,
     },
+    CompactionStart {
+        compaction: serde_json::Value,
+    },
+    CompactionSummary {
+        compaction: serde_json::Value,
+    },
+    CompactionEnd {
+        compaction: serde_json::Value,
+    },
     ToolCall {
         turn: u64,
         step: u64,
@@ -472,6 +481,12 @@ fn validate_event_payload(
             "llm/retry-started turn must be an unsigned integer",
             "llm/retry-started step must be an unsigned integer",
         )?,
+        PersistedSessionEventKind::CompactionStart { compaction }
+        | PersistedSessionEventKind::CompactionSummary { compaction }
+        | PersistedSessionEventKind::CompactionEnd { compaction } => {
+            validate_request_json(compaction, "compaction payload must be a JSON object")?;
+            (None, None)
+        }
         PersistedSessionEventKind::ToolCall {
             turn,
             step,
@@ -877,6 +892,49 @@ mod tests {
                 kind: PersistedSessionEventKind::TurnEnd {
                     turn: 1,
                     reason: PersistedTurnEndReason::Error,
+                },
+            },
+        ]);
+
+        let mut store = ProjectStore::in_memory().unwrap();
+        assert!(store.persist_session_checkpoint(&durable).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![durable]);
+    }
+
+    #[test]
+    fn compaction_events_round_trip_through_the_neutral_store() {
+        let durable = checkpoint(vec![
+            PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: PersistedSessionEventKind::CompactionStart {
+                    compaction: serde_json::json!({
+                        "compactionId": "compact-1", "turn": null
+                    }),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 1,
+                time_ms: 2,
+                kind: PersistedSessionEventKind::CompactionSummary {
+                    compaction: serde_json::json!({
+                        "compactionId": "compact-1",
+                        "summary": [],
+                        "shadowedRange": { "start": 4, "end": 2 },
+                        "shadowedSeqs": [4, 2],
+                        "shadowedTokenCount": 12,
+                        "provider": "mock",
+                        "model": "summary"
+                    }),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 2,
+                time_ms: 3,
+                kind: PersistedSessionEventKind::CompactionEnd {
+                    compaction: serde_json::json!({
+                        "compactionId": "compact-1", "turn": null
+                    }),
                 },
             },
         ]);
