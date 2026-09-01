@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex};
 use hartevo_cordis::{
     AgentRef, Context, CordisError, CordisHost, DispatchMode, DomainSurface, EffectBrokerSurface,
     Emit, EnvironmentOverlay, EventKey, LlmError, LlmModelReasoning, LlmResolvedModel, LlmStream,
-    LoaderContext, MAPPED_KEYS, PluginId, RuntimeSurface, SessionCallConfig, SurfaceOwner,
-    ToolCall, ToolsSurface, Waterfall, events, expected_mode, keys, prepare_llm_call,
-    register_agent, register_llm_adapter, register_llm_stream, register_tool, run_tools_pipeline,
+    LoaderContext, MAPPED_KEYS, PluginId, PromptAssembly, PromptError, PromptSection,
+    RuntimeSurface, SessionCallConfig, SessionToolSchema, SurfaceOwner, SystemPromptSurface,
+    ToolCall, ToolsSurface, Waterfall, assemble_system_prompt, events, expected_mode, keys,
+    prepare_llm_call, register_agent, register_llm_adapter, register_llm_stream,
+    register_prompt_section, register_tool, register_tool_schema, run_tools_pipeline,
     session_events, stream_llm,
 };
 
@@ -33,6 +35,7 @@ fn mapped_keys_are_provided_and_looked_up() {
         MAPPED_KEYS,
         [
             keys::TOOLS,
+            keys::SYSTEM_PROMPT,
             keys::LLM,
             keys::SESSIONS,
             keys::AGENTS,
@@ -47,6 +50,7 @@ fn mapped_keys_are_provided_and_looked_up() {
     }
 
     assert!(ctx.tools::<ToolsSurface>().is_some());
+    assert!(ctx.system_prompt::<SystemPromptSurface>().is_some());
     assert!(ctx.llm::<hartevo_cordis::LlmSurface>().is_some());
     assert!(ctx.agents::<hartevo_cordis::AgentsSurface>().is_some());
     assert!(ctx.sessions::<u32>().is_none());
@@ -113,7 +117,7 @@ fn tools_pipeline_locks_exactly_one_mode_per_event() {
 }
 
 #[test]
-fn all_eleven_mapped_events_keep_their_exact_typed_descriptors() {
+fn all_twelve_mapped_events_keep_their_exact_typed_descriptors() {
     let ctx = mapped();
     macro_rules! assert_mapped {
         ($key:expr, $mode:expr) => {{
@@ -123,6 +127,7 @@ fn all_eleven_mapped_events_keep_their_exact_typed_descriptors() {
             assert_eq!(expected_mode(key.name()), Some($mode));
         }};
     }
+    assert_mapped!(events::SYSTEM_PROMPT_ASSEMBLE, DispatchMode::Waterfall);
     assert_mapped!(events::TOOLS_PRE_EXECUTE, DispatchMode::Waterfall);
     assert_mapped!(events::TOOLS_EXECUTE, DispatchMode::Waterfall);
     assert_mapped!(events::TOOLS_POST_EXECUTE, DispatchMode::Waterfall);
@@ -134,6 +139,105 @@ fn all_eleven_mapped_events_keep_their_exact_typed_descriptors() {
     assert_mapped!(events::AGENT_REQUEST, DispatchMode::Waterfall);
     assert_mapped!(session_events::SESSION_EVENT, DispatchMode::Emit);
     assert_mapped!(session_events::SESSION_FLUSH, DispatchMode::Parallel);
+}
+
+fn tool_schema(name: &str) -> SessionToolSchema {
+    SessionToolSchema {
+        name: name.into(),
+        description: format!("{name} tool"),
+        parameters: serde_json::Map::from_iter([(
+            "type".into(),
+            serde_json::Value::String("object".into()),
+        )]),
+    }
+}
+
+#[test]
+fn prompt_and_tool_schema_assembly_is_deterministic_detached_and_reversible() {
+    let mut ctx = mapped();
+    let late = register_prompt_section(&mut ctx, PromptSection::new("zulu", 10, "Zulu.")).unwrap();
+    register_prompt_section(&mut ctx, PromptSection::new("first", 0, "First.")).unwrap();
+    register_prompt_section(&mut ctx, PromptSection::new("alpha", 10, "Alpha.")).unwrap();
+    register_prompt_section(&mut ctx, PromptSection::new("empty", 5, "")).unwrap();
+    let zulu_tool = register_tool_schema(&mut ctx, tool_schema("zulu")).unwrap();
+    register_tool_schema(&mut ctx, tool_schema("alpha")).unwrap();
+
+    let frozen = assemble_system_prompt(&mut ctx).unwrap();
+    assert_eq!(frozen.system(), Some("First.\n\nAlpha.\n\nZulu."));
+    assert_eq!(
+        frozen
+            .tools()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "zulu"]
+    );
+
+    late.dispose();
+    zulu_tool.dispose();
+    let current = assemble_system_prompt(&mut ctx).unwrap();
+    assert_eq!(current.system(), Some("First.\n\nAlpha."));
+    assert_eq!(
+        current
+            .tools()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha"]
+    );
+    assert_eq!(frozen.system(), Some("First.\n\nAlpha.\n\nZulu."));
+    assert_eq!(frozen.tools().len(), 2);
+
+    assert_eq!(
+        register_prompt_section(&mut ctx, PromptSection::new("alpha", 99, "duplicate"))
+            .unwrap_err(),
+        CordisError::Prompt(PromptError::DuplicateSection {
+            name: "alpha".into(),
+        })
+    );
+    assert_eq!(
+        register_tool_schema(&mut ctx, tool_schema("alpha")).unwrap_err(),
+        CordisError::Prompt(PromptError::DuplicateTool {
+            name: "alpha".into(),
+        })
+    );
+}
+
+#[test]
+fn prompt_assembly_waterfall_is_authoritative_and_validated() {
+    let mut ctx = mapped();
+    register_prompt_section(&mut ctx, PromptSection::new("base", 0, "Base.")).unwrap();
+    ctx.on_waterfall(events::SYSTEM_PROMPT_ASSEMBLE, |assembly, next| {
+        next(assembly).with_system(Some("Wrapped.".into()))
+    })
+    .unwrap();
+    assert_eq!(
+        assemble_system_prompt(&mut ctx).unwrap().system(),
+        Some("Wrapped.")
+    );
+
+    let mut invalid = mapped();
+    invalid
+        .on_waterfall(events::SYSTEM_PROMPT_ASSEMBLE, |assembly, _next| {
+            assembly.with_tools(vec![tool_schema("dup"), tool_schema("dup")])
+        })
+        .unwrap();
+    assert_eq!(
+        assemble_system_prompt(&mut invalid).unwrap_err(),
+        CordisError::Prompt(PromptError::DuplicateTool { name: "dup".into() })
+    );
+
+    let canonical = PromptAssembly::new(Some(String::new()), Vec::new());
+    let mut empty = mapped();
+    empty
+        .on_waterfall(events::SYSTEM_PROMPT_ASSEMBLE, move |_assembly, _next| {
+            canonical.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        assemble_system_prompt(&mut empty).unwrap(),
+        PromptAssembly::default()
+    );
 }
 
 #[test]
@@ -484,6 +588,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
     ctx.teardown();
     for key in [
         keys::TOOLS,
+        keys::SYSTEM_PROMPT,
         keys::LLM,
         keys::SESSIONS,
         keys::AGENTS,
@@ -495,6 +600,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
         assert!(!ctx.has(key), "{key} must reverse on teardown");
     }
     for name in [
+        events::SYSTEM_PROMPT_ASSEMBLE.name(),
         events::TOOLS_PRE_EXECUTE.name(),
         events::TOOLS_EXECUTE.name(),
         events::TOOLS_POST_EXECUTE.name(),
@@ -528,6 +634,14 @@ fn tool_and_llm_and_agent_register_require_mapped_keys() {
     let mut ctx = Context::new();
     assert_eq!(
         register_tool(&mut ctx, "search").unwrap_err(),
+        CordisError::MissingDependencies(vec![keys::TOOLS.to_string()])
+    );
+    assert_eq!(
+        register_prompt_section(&mut ctx, PromptSection::new("base", 0, "base")).unwrap_err(),
+        CordisError::MissingDependencies(vec![keys::SYSTEM_PROMPT.to_string()])
+    );
+    assert_eq!(
+        register_tool_schema(&mut ctx, tool_schema("search")).unwrap_err(),
         CordisError::MissingDependencies(vec![keys::TOOLS.to_string()])
     );
     assert_eq!(

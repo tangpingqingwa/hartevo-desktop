@@ -234,6 +234,7 @@ impl fmt::Debug for PendingHandle {
 /// Conventional Cordis / Hartevo service keys. Plugins look up by these names.
 pub mod keys {
     pub const TOOLS: &str = "tools";
+    pub const SYSTEM_PROMPT: &str = "systemPrompt";
     pub const LLM: &str = "llm";
     pub const SESSIONS: &str = "sessions";
     pub const AGENTS: &str = "agents";
@@ -469,6 +470,8 @@ pub enum CordisError {
     },
     #[error(transparent)]
     Interpolate(#[from] crate::config::InterpolateError),
+    #[error(transparent)]
+    Prompt(#[from] crate::surface::PromptError),
     #[error(transparent)]
     Llm(#[from] crate::surface::LlmError),
     #[error(transparent)]
@@ -1656,6 +1659,11 @@ impl Context {
     #[must_use]
     pub fn tools<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::TOOLS)
+    }
+
+    #[must_use]
+    pub fn system_prompt<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::SYSTEM_PROMPT)
     }
 
     #[must_use]
@@ -3275,6 +3283,11 @@ impl ContextView<'_> {
     #[must_use]
     pub fn tools<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::TOOLS)
+    }
+
+    #[must_use]
+    pub fn system_prompt<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::SYSTEM_PROMPT)
     }
 
     #[must_use]

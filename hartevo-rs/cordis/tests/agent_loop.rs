@@ -7,12 +7,13 @@ use hartevo_cordis::{
     AgentRef, AgentRequestAdmission, AgentRequestLogState, AgentStep, Context, CordisError,
     CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval,
     KernelApprovalDecision, KernelConsentState, LlmModelReasoning, LlmResolvedModel, LlmStream,
-    LoaderContext, LoggedAgentCall, RuntimeSurface, SessionCallConfig, SessionContentBlock,
-    SessionError, SessionEventKind, SessionHandle, SessionId, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionRequestHeaderReason, SessionStore, SessionSurfaceIntent,
-    SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request, admit_agent_step, build_agent_call,
-    events, keys, log_agent_call, prepare_agent_call, prepare_agent_step, register_llm_adapter,
-    run_agent_step, session_events,
+    LoaderContext, LoggedAgentCall, PromptError, PromptSection, RuntimeSurface, SessionCallConfig,
+    SessionContentBlock, SessionError, SessionEventKind, SessionHandle, SessionId, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionRequestHeaderReason, SessionStore,
+    SessionSurfaceIntent, SessionToolSchema, SurfaceOwner, ToolCall, TurnEndReason,
+    admit_agent_request, admit_agent_step, build_agent_call, events, keys, log_agent_call,
+    prepare_agent_call, prepare_agent_step, register_llm_adapter, register_prompt_section,
+    register_tool_schema, run_agent_step, session_events,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -67,6 +68,17 @@ fn call_config(provider: &str, model: &str) -> SessionCallConfig {
         temperature: None,
         max_tokens: None,
         stop: None,
+    }
+}
+
+fn tool_schema(name: &str) -> SessionToolSchema {
+    SessionToolSchema {
+        name: name.into(),
+        description: format!("{name} tool"),
+        parameters: serde_json::Map::from_iter([(
+            "type".into(),
+            serde_json::Value::String("object".into()),
+        )]),
     }
 }
 
@@ -959,6 +971,186 @@ fn agent_build_turns_surface_replacement_into_a_series_boundary() {
 }
 
 #[test]
+fn agent_build_freezes_and_persists_prompt_tools_in_harness_order() {
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model))
+    })
+    .unwrap();
+    register_prompt_section(&mut ctx, PromptSection::new("zulu", 10, "Zulu.")).unwrap();
+    register_prompt_section(&mut ctx, PromptSection::new("first", 0, "First.")).unwrap();
+    register_prompt_section(&mut ctx, PromptSection::new("alpha", 10, "Alpha.")).unwrap();
+    register_tool_schema(&mut ctx, tool_schema("zulu")).unwrap();
+    register_tool_schema(&mut ctx, tool_schema("alpha")).unwrap();
+
+    let order = Arc::new(Mutex::new(Vec::new()));
+    {
+        let order = Arc::clone(&order);
+        ctx.on_waterfall(events::SYSTEM_PROMPT_ASSEMBLE, move |assembly, next| {
+            order.lock().unwrap().push("assemble");
+            next(assembly)
+        })
+        .unwrap();
+    }
+    {
+        let order = Arc::clone(&order);
+        ctx.on_waterfall(events::AGENT_PRE_STEP, move |proposal, next| {
+            order.lock().unwrap().push("pre-step");
+            next(proposal)
+        })
+        .unwrap();
+    }
+    {
+        let order = Arc::clone(&order);
+        ctx.on_waterfall(events::AGENT_REQUEST, move |request, next| {
+            order.lock().unwrap().push("request");
+            next(request)
+        })
+        .unwrap();
+    }
+
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("prompt-tools").unwrap())
+        .unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+    let (turn, first) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "first-call",
+        call_config("mock", "model"),
+    );
+    assert_eq!(*order.lock().unwrap(), ["assemble", "pre-step", "request"]);
+    assert_eq!(
+        first.call().assembly().system(),
+        Some("First.\n\nAlpha.\n\nZulu.")
+    );
+    assert_eq!(
+        first
+            .call()
+            .assembly()
+            .tools()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "zulu"]
+    );
+    let first_header = session.request_header().unwrap().unwrap();
+    assert_eq!(
+        first_header.system.as_deref(),
+        Some("First.\n\nAlpha.\n\nZulu.")
+    );
+    assert_eq!(
+        first_header.tools.as_ref().unwrap(),
+        first.call().assembly().tools()
+    );
+
+    register_prompt_section(&mut ctx, PromptSection::new("later", 20, "Later.")).unwrap();
+    register_tool_schema(&mut ctx, tool_schema("later")).unwrap();
+    assert_eq!(
+        first.call().assembly().system(),
+        Some("First.\n\nAlpha.\n\nZulu.")
+    );
+    assert_eq!(first.call().assembly().tools().len(), 2);
+    close_logged_turn(&session, turn);
+
+    let (turn, changed) = build_logged_turn(
+        &mut ctx,
+        &session,
+        &mut state,
+        "changed-call",
+        call_config("mock", "model"),
+    );
+    assert_eq!(
+        changed.header_reason(),
+        Some(SessionRequestHeaderReason::Change)
+    );
+    assert_eq!(
+        changed.call().assembly().system(),
+        Some("First.\n\nAlpha.\n\nZulu.\n\nLater.")
+    );
+    assert_eq!(changed.call().assembly().tools().len(), 3);
+    assert!(!changed.context_appended());
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn invalid_prompt_assembly_stops_before_step_request_adapter_and_request_state() {
+    let mut ctx = mapped();
+    ctx.on_waterfall(events::SYSTEM_PROMPT_ASSEMBLE, |assembly, _next| {
+        assembly.with_tools(vec![tool_schema("dup"), tool_schema("dup")])
+    })
+    .unwrap();
+    let pre_steps = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let adapters = Arc::new(AtomicUsize::new(0));
+    {
+        let pre_steps = Arc::clone(&pre_steps);
+        ctx.on_waterfall(events::AGENT_PRE_STEP, move |proposal, next| {
+            pre_steps.fetch_add(1, Ordering::SeqCst);
+            next(proposal)
+        })
+        .unwrap();
+    }
+    {
+        let requests = Arc::clone(&requests);
+        ctx.on_waterfall(events::AGENT_REQUEST, move |request, next| {
+            requests.fetch_add(1, Ordering::SeqCst);
+            next(request)
+        })
+        .unwrap();
+    }
+    {
+        let adapters = Arc::clone(&adapters);
+        register_llm_adapter(&mut ctx, ["mock"], move |provider: &str, model: &str| {
+            adapters.fetch_add(1, Ordering::SeqCst);
+            Ok(LlmResolvedModel::new(provider, model))
+        })
+        .unwrap();
+    }
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("invalid-prompt").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("prompt", "prompt"))
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+    let mut state = AgentRequestLogState::new(session.id().clone());
+
+    assert_eq!(
+        build_agent_call(
+            &mut ctx,
+            session.id(),
+            AgentInboxTarget::NextTurn,
+            turn,
+            1,
+            call_config("mock", "model"),
+            &mut state,
+        )
+        .unwrap_err(),
+        CordisError::Prompt(PromptError::DuplicateTool { name: "dup".into() })
+    );
+    assert_eq!(pre_steps.load(Ordering::SeqCst), 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(adapters.load(Ordering::SeqCst), 0);
+    assert!(!state.header_logged());
+    assert_eq!(state.surface_generation(), None);
+    assert_eq!(session.request_header().unwrap(), None);
+    assert_eq!(session.request_context().unwrap(), None);
+    assert!(session.events().unwrap().iter().all(|event| !matches!(
+        event.kind,
+        SessionEventKind::StepStart { .. }
+            | SessionEventKind::RequestHeader { .. }
+            | SessionEventKind::RequestContext { .. }
+    )));
+}
+
+#[test]
 fn request_state_batch_is_atomic_and_reentry_safe() {
     let mut ctx = mapped();
     register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
@@ -1471,6 +1663,7 @@ fn missing_inject_keys_are_missing_dependencies() {
         CordisError::MissingDependencies(vec![
             keys::AGENTS.to_string(),
             keys::TOOLS.to_string(),
+            keys::SYSTEM_PROMPT.to_string(),
             keys::LLM.to_string(),
             keys::SESSIONS.to_string(),
             keys::DOMAIN.to_string(),
@@ -1484,6 +1677,7 @@ fn missing_inject_keys_are_missing_dependencies() {
     assert_eq!(
         ctx.mount(AgentLoop).unwrap_err(),
         CordisError::MissingDependencies(vec![
+            keys::SYSTEM_PROMPT.to_string(),
             keys::LLM.to_string(),
             keys::SESSIONS.to_string(),
             keys::DOMAIN.to_string(),
@@ -1495,6 +1689,7 @@ fn missing_inject_keys_are_missing_dependencies() {
         CordisError::MissingDependencies(vec![
             keys::AGENTS.to_string(),
             keys::TOOLS.to_string(),
+            keys::SYSTEM_PROMPT.to_string(),
             keys::LLM.to_string(),
             keys::SESSIONS.to_string(),
             keys::DOMAIN.to_string(),
@@ -1558,6 +1753,7 @@ fn teardown_undoes_agents_and_loop_listeners() {
     ctx.teardown();
     for key in [
         keys::TOOLS,
+        keys::SYSTEM_PROMPT,
         keys::LLM,
         keys::SESSIONS,
         keys::AGENTS,
