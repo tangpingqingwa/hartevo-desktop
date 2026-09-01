@@ -11,6 +11,7 @@ use std::sync::{
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
+use futures_util::stream;
 use hartevo_application::connectors::shopify_readback::{
     SHOPIFY_FULFILLMENT_CAPABILITY, SHOPIFY_PROVIDER_ID, ShopifyBrokeredReadback,
     ShopifyFulfillmentReadbackRequest, ShopifyNativeReadbackError, ShopifyReadbackBridgeError,
@@ -29,14 +30,15 @@ use hartevo_application::{
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
     KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
-    ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession,
-    ProjectEncryptionReadiness, ProposePreviewEffect, ProvisionProjectEncryption,
-    ReconcileUncertainEffect, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
-    RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
-    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
-    VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
+    ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
+    PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
+    ProposePreviewEffect, ProvisionProjectEncryption, ReconcileUncertainEffect,
+    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
+    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
+    RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
+    RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
+    StartCatalogMission, StartMission, VerifyRecordedReceiptAtRevision,
+    Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -44,13 +46,19 @@ use hartevo_browser_adapter::{
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
-use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
+use hartevo_context_fabric::{
+    ConservativeByteBudgetTokenizer, ContextAssemblyStatus, RuntimeContextEnvelope,
+};
 #[cfg(test)]
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
     AuthorityDispatchError, AuthorityScope, CordisError, DomainCommandBinding, DomainCommandKind,
-    EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding, RuntimeBinding,
-    RuntimeRecordBinding, TurnEndReason,
+    EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding,
+    LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError, LlmGenerateRequest,
+    LlmResolvedModel, RuntimeBinding, RuntimeDispatchPermit, RuntimeRecordBinding,
+    SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionLlmFailure,
+    SessionMessageRole, SessionMessageSource, SessionStreamBlockType, SessionStreamChunk,
+    TurnEndReason,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -86,10 +94,9 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::cordis_host::{
-    DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
+    DesktopAgentTurnRequest, DesktopCordisCoordinator, DesktopDomainCommandAuthorization,
     DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
-    DesktopEffectVerificationAuthorization, DesktopRuntimeSessionPreflight,
-    DesktopRuntimeSessionStreamFlush, DesktopRuntimeSessionTranscript,
+    DesktopEffectVerificationAuthorization, DesktopRuntimeSessionTranscript,
     dispatch_live_domain_command, dispatch_live_effect_execution,
     dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
     mount_cordis_host,
@@ -1311,6 +1318,548 @@ pub struct DesktopReviewCreatorDeliverableRequest {
 #[cfg(any(test, feature = "native-journey"))]
 pub(crate) type DesktopRuntimeCommandBuilder = Box<dyn FnOnce(&Path, &Path) -> RuntimeCommand>;
 
+struct DesktopLiveAgentTurnCompletion {
+    service: ApplicationService,
+    attempt: Option<RuntimeTurnAttempt>,
+    logical_millis: i64,
+    runtime_start_failed: bool,
+}
+
+type DesktopLiveAgentTurnResult = Result<DesktopLiveAgentTurnCompletion, DesktopDataError>;
+type DesktopLiveAgentTurnSlot = Arc<Mutex<Option<DesktopLiveAgentTurnResult>>>;
+
+struct DesktopApplicationLlmAdapter<Run> {
+    provider: String,
+    model: String,
+    session_id: String,
+    message_id: String,
+    user_body_digest: String,
+    run: Mutex<Option<Run>>,
+    completion: DesktopLiveAgentTurnSlot,
+}
+
+impl<Run> DesktopApplicationLlmAdapter<Run> {
+    fn new(
+        provider: String,
+        model: String,
+        session_id: String,
+        message_id: String,
+        user_body: &str,
+        run: Run,
+    ) -> (Self, DesktopLiveAgentTurnSlot) {
+        let completion = Arc::new(Mutex::new(None));
+        (
+            Self {
+                provider,
+                model,
+                session_id,
+                message_id,
+                user_body_digest: format!("{:x}", Sha256::digest(user_body.as_bytes())),
+                run: Mutex::new(Some(run)),
+                completion: Arc::clone(&completion),
+            },
+            completion,
+        )
+    }
+
+    fn request_matches(&self, request: &LlmGenerateRequest) -> bool {
+        if request.config().provider != self.provider
+            || request.config().model != self.model
+            || request.session_id().map(hartevo_cordis::SessionId::as_str)
+                != Some(self.session_id.as_str())
+        {
+            return false;
+        }
+        let mut matching = request
+            .messages()
+            .iter()
+            .filter(|message| message.id == self.message_id);
+        let Some(message) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some()
+            || message.role != SessionMessageRole::User
+            || message.source != SessionMessageSource::User
+        {
+            return false;
+        }
+        let [SessionContentBlock::Text { text }] = message.content.as_slice() else {
+            return false;
+        };
+        format!("{:x}", Sha256::digest(text.as_bytes())) == self.user_body_digest
+    }
+}
+
+impl<Run> LlmAdapter for DesktopApplicationLlmAdapter<Run>
+where
+    Run: FnOnce() -> Result<
+            (DesktopLiveAgentTurnCompletion, Vec<SessionStreamChunk>),
+            DesktopDataError,
+        > + Send
+        + 'static,
+{
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        if provider != self.provider || model != self.model {
+            return Err(LlmError::InvalidModelInfo {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+                expected: "the exact Desktop Application Runtime route",
+            });
+        }
+        Ok(LlmResolvedModel::new(provider, model))
+    }
+
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        if !self.request_matches(&request) {
+            return Err(desktop_live_agent_failure(
+                "DESKTOP_RUNTIME_REQUEST_MISMATCH",
+                "Desktop Application Runtime request does not match its durable Cordis input",
+            ));
+        }
+        let run = self
+            .run
+            .lock()
+            .map_err(|_| {
+                desktop_live_agent_failure(
+                    "DESKTOP_RUNTIME_ADAPTER_POISONED",
+                    "Desktop Application Runtime adapter state is unavailable",
+                )
+            })?
+            .take()
+            .ok_or_else(|| {
+                desktop_live_agent_failure(
+                    "DESKTOP_RUNTIME_ALREADY_DISPATCHED",
+                    "Desktop Application Runtime adapter is one-shot",
+                )
+            })?;
+        match run() {
+            Ok((completion, chunks)) => {
+                *self.completion.lock().map_err(|_| {
+                    desktop_live_agent_failure(
+                        "DESKTOP_RUNTIME_COMPLETION_POISONED",
+                        "Desktop Application Runtime completion state is unavailable",
+                    )
+                })? = Some(Ok(completion));
+                Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+            }
+            Err(error) => {
+                *self.completion.lock().map_err(|_| {
+                    desktop_live_agent_failure(
+                        "DESKTOP_RUNTIME_COMPLETION_POISONED",
+                        "Desktop Application Runtime completion state is unavailable",
+                    )
+                })? = Some(Err(error));
+                Err(desktop_live_agent_failure(
+                    "DESKTOP_RUNTIME_FAILED",
+                    "Desktop Application Runtime failed after Cordis request persistence",
+                ))
+            }
+        }
+    }
+}
+
+fn desktop_live_agent_failure(code: &str, message: &str) -> SessionLlmFailure {
+    SessionLlmFailure {
+        message: message.to_owned(),
+        code: code.to_owned(),
+        status: None,
+        provider_retry_after_ms: None,
+        request_id: None,
+    }
+}
+
+fn desktop_live_agent_abort_chunks(code: &str, message: &str) -> Vec<SessionStreamChunk> {
+    vec![SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Aborted {
+            failure: desktop_live_agent_failure(code, message),
+        },
+        replay_state: None,
+    }]
+}
+
+fn desktop_live_agent_chunks(
+    service: &ApplicationService,
+    project_id: &ProjectId,
+    turn_id: &RuntimeTurnAttemptId,
+    attempt: &RuntimeTurnAttempt,
+) -> Result<Vec<SessionStreamChunk>, DesktopDataError> {
+    let completed_message = if attempt.status == RuntimeTurnStatus::Completed {
+        service.latest_runtime_turn_private_message(project_id, turn_id)?
+    } else {
+        None
+    };
+    let durable_deltas = service.runtime_turn_private_text_deltas(project_id, turn_id)?;
+    let item_id_digest = completed_message
+        .as_ref()
+        .map(|message| message.item_id_digest.clone())
+        .or_else(|| {
+            durable_deltas
+                .last()
+                .map(|delta| delta.item_id_digest.clone())
+        });
+    let mut text = item_id_digest.map_or_else(Vec::new, |item_id_digest| {
+        durable_deltas
+            .into_iter()
+            .filter(|delta| delta.item_id_digest == item_id_digest)
+            .map(|delta| delta.delta)
+            .collect::<Vec<_>>()
+    });
+    if text.is_empty()
+        && let Some(message) = completed_message.as_ref()
+        && !message.body.is_empty()
+    {
+        text.push(message.body.clone());
+    }
+    if let Some(message) = completed_message.as_ref()
+        && text.concat() != message.body
+    {
+        return Err(DesktopDataError::CordisSessionPersistence(
+            "Application Runtime text diverged from its durable delta chain".into(),
+        ));
+    }
+
+    let mut chunks = Vec::with_capacity(text.len().saturating_add(3));
+    if !text.is_empty() {
+        chunks.push(SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        });
+        chunks.extend(
+            text.iter()
+                .cloned()
+                .map(|text| SessionStreamChunk::TextDelta { index: 0, text }),
+        );
+        chunks.push(SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Text {
+                text: text.concat(),
+            },
+        });
+    }
+    let reason = match attempt.status {
+        RuntimeTurnStatus::Completed => SessionFinishReason::Stop,
+        RuntimeTurnStatus::Interrupted => SessionFinishReason::Aborted {
+            failure: desktop_live_agent_failure(
+                "DESKTOP_RUNTIME_INTERRUPTED",
+                "Desktop Application Runtime was interrupted",
+            ),
+        },
+        RuntimeTurnStatus::Failed => SessionFinishReason::Aborted {
+            failure: desktop_live_agent_failure(
+                "DESKTOP_RUNTIME_FAILED",
+                "Desktop Application Runtime failed",
+            ),
+        },
+        RuntimeTurnStatus::Prepared
+        | RuntimeTurnStatus::Dispatching
+        | RuntimeTurnStatus::Running
+        | RuntimeTurnStatus::WaitingLocalApproval
+        | RuntimeTurnStatus::ApprovalResponding
+        | RuntimeTurnStatus::InterruptRequested
+        | RuntimeTurnStatus::Uncertain => SessionFinishReason::Aborted {
+            failure: desktop_live_agent_failure(
+                "DESKTOP_RUNTIME_UNCERTAIN",
+                "Desktop Application Runtime completion is uncertain",
+            ),
+        },
+    };
+    chunks.push(SessionStreamChunk::Finish {
+        reason,
+        replay_state: None,
+    });
+    Ok(chunks)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one request-scoped adapter owns Application process recovery, dispatch, observation, cancellation, and shutdown after the Cordis request prefix is durable"
+)]
+fn run_desktop_application_runtime_turn(
+    mut service: ApplicationService,
+    project_id: &ProjectId,
+    prepared: PreparedLocalMissionRuntimeContext,
+    envelope: &RuntimeContextEnvelope,
+    resume_plan: LocalRuntimeResumePlan,
+    runtime_command: &RuntimeCommand,
+    runtime_model: String,
+    cancellation: Option<&DesktopRuntimeCancellation>,
+    turn_id: &RuntimeTurnAttemptId,
+    now: DateTime<Utc>,
+    mut logical_millis: i64,
+) -> Result<(DesktopLiveAgentTurnCompletion, Vec<SessionStreamChunk>), DesktopDataError> {
+    let active_recovery = service.active_context_runtime_recovery(
+        project_id,
+        &prepared.ids.workspace_id,
+        &prepared.ids.worker_id,
+    )?;
+    let managed_result = if let Some(recovery) = active_recovery {
+        service.retry_context_worker_runtime(
+            RetryContextWorkerRuntime {
+                project_id: project_id.clone(),
+                recovery_id: recovery.id,
+                expected_attempt_revision: recovery.revision,
+                expected_handle_revision: prepared.handle.revision,
+                expected_mailbox_revision: prepared.mailbox.revision,
+                resume_thread_id: resume_plan.resume_thread_id.clone(),
+                model: Some(runtime_model.clone()),
+                health_timeout: StdDuration::from_secs(15),
+                thread_timeout: StdDuration::from_secs(15),
+            },
+            runtime_command,
+            now + Duration::milliseconds(logical_millis),
+        )
+    } else if prepared.handle.status == WorkerHandleStatus::Attached {
+        service.recover_context_worker_runtime(
+            RecoverContextWorkerRuntime {
+                id: hartevo_domain_kernel::RuntimeRecoveryAttemptId::new(),
+                project_id: project_id.clone(),
+                workspace_id: prepared.ids.workspace_id.clone(),
+                worker_id: prepared.ids.worker_id.clone(),
+                expected_handle_revision: prepared.handle.revision,
+                expected_mailbox_revision: prepared.mailbox.revision,
+                attachment_epoch: prepared.handle.attachment_epoch,
+                strategy: resume_plan.strategy,
+                resume_thread_id: resume_plan.resume_thread_id,
+                model: Some(runtime_model),
+                max_process_attempts: 3,
+                health_timeout: StdDuration::from_secs(15),
+                thread_timeout: StdDuration::from_secs(15),
+            },
+            runtime_command,
+            now + Duration::milliseconds(logical_millis),
+        )
+    } else {
+        return Err(DesktopDataError::Application(
+            ApplicationError::LocalRuntimeContextConflict,
+        ));
+    };
+    let mut managed = match managed_result {
+        Ok(managed) => managed,
+        Err(ApplicationError::Runtime(_)) => {
+            return Ok((
+                DesktopLiveAgentTurnCompletion {
+                    service,
+                    attempt: None,
+                    logical_millis,
+                    runtime_start_failed: true,
+                },
+                desktop_live_agent_abort_chunks(
+                    "DESKTOP_RUNTIME_START_FAILED",
+                    "Desktop Application Runtime could not start",
+                ),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    logical_millis += 1;
+    let expected_handle_revision = managed.handle.revision;
+    let expected_recovery_revision = managed.recovery.revision;
+    let attachment_epoch = managed.handle.attachment_epoch;
+    let dispatch = service.dispatch_context_runtime_turn(
+        &mut managed,
+        DispatchContextRuntimeTurn {
+            id: turn_id.clone(),
+            project_id: project_id.clone(),
+            workspace_id: prepared.ids.workspace_id,
+            assembly_id: prepared.assembly.manifest.id,
+            expected_assembly_revision: prepared.assembly.manifest.revision,
+            expected_handle_revision,
+            expected_recovery_revision,
+            attachment_epoch,
+            response_timeout: StdDuration::from_secs(15),
+        },
+        envelope,
+        now + Duration::milliseconds(logical_millis),
+    )?;
+    if dispatch.disposition != RuntimeTurnDispatchDisposition::Running {
+        let attempt = dispatch.attempt;
+        let chunks = desktop_live_agent_chunks(&service, project_id, turn_id, &attempt)?;
+        service.shutdown_managed_context_runtime(
+            managed,
+            now + Duration::milliseconds(logical_millis + 1),
+        )?;
+        return Ok((
+            DesktopLiveAgentTurnCompletion {
+                service,
+                attempt: Some(attempt),
+                logical_millis,
+                runtime_start_failed: false,
+            },
+            chunks,
+        ));
+    }
+
+    if let Some(control) = cancellation {
+        control.record_progress(DesktopRuntimeProgressPhase::Dispatched);
+    }
+    let mut attempt = dispatch.attempt;
+    let mut consecutive_timeouts = 0_u32;
+    let mut cooperative_interrupt_sent = false;
+    for _ in 0..128 {
+        if !cooperative_interrupt_sent
+            && cancellation.is_some_and(DesktopRuntimeCancellation::is_requested)
+            && matches!(
+                attempt.status,
+                RuntimeTurnStatus::Running | RuntimeTurnStatus::WaitingLocalApproval
+            )
+        {
+            logical_millis += 1;
+            attempt = service.interrupt_context_runtime_turn(
+                &mut managed,
+                &InterruptContextRuntimeTurn {
+                    project_id: project_id.clone(),
+                    id: turn_id.clone(),
+                    expected_revision: attempt.revision,
+                    response_timeout: StdDuration::from_secs(5),
+                },
+                now + Duration::milliseconds(logical_millis),
+            )?;
+            cooperative_interrupt_sent = true;
+            consecutive_timeouts = 0;
+            if let Some(control) = cancellation {
+                control.record_progress(DesktopRuntimeProgressPhase::InterruptSent);
+            }
+            continue;
+        }
+        logical_millis += 1;
+        let observation = service.observe_context_runtime_turn(
+            &mut managed,
+            &ObserveContextRuntimeTurn {
+                project_id: project_id.clone(),
+                id: turn_id.clone(),
+                expected_revision: attempt.revision,
+                event_timeout: StdDuration::from_secs(2),
+            },
+            now + Duration::milliseconds(logical_millis),
+        )?;
+        attempt = observation.attempt;
+        if let Some(control) = cancellation {
+            let phase = match &observation.kind {
+                hartevo_application::ContextRuntimeTurnObservationKind::Event(
+                    MappedTurnEventKind::TurnStarted,
+                ) => Some(DesktopRuntimeProgressPhase::TurnStarted),
+                hartevo_application::ContextRuntimeTurnObservationKind::Event(
+                    MappedTurnEventKind::ItemStarted,
+                ) => Some(DesktopRuntimeProgressPhase::ItemStarted),
+                hartevo_application::ContextRuntimeTurnObservationKind::Event(
+                    MappedTurnEventKind::ItemCompleted,
+                ) => Some(DesktopRuntimeProgressPhase::ItemCompleted),
+                hartevo_application::ContextRuntimeTurnObservationKind::Uncertain => {
+                    Some(DesktopRuntimeProgressPhase::Uncertain)
+                }
+                _ => None,
+            };
+            if let Some(phase) = phase {
+                control.record_progress(phase);
+            }
+        }
+        if let Some(request) = observation.local_approval_request {
+            let Some(control) = cancellation else {
+                return Err(DesktopDataError::RuntimeLocalApprovalUnavailable);
+            };
+            control.hold_local_approval(DesktopHeldLocalApproval {
+                project_id: project_id.clone(),
+                turn_id: turn_id.clone(),
+                expected_revision: attempt.revision,
+                request_digest: request.request_digest.clone(),
+                kind: request.kind,
+            });
+            let approved = loop {
+                if control.is_requested() {
+                    control.clear_held_local_approval();
+                    break None;
+                }
+                if let Some(decision) = control.take_local_approval_decision() {
+                    break Some(decision);
+                }
+                std::thread::sleep(StdDuration::from_millis(50));
+            };
+            let Some(approved) = approved else {
+                consecutive_timeouts = 0;
+                continue;
+            };
+            if !approved {
+                control.clear_held_local_approval();
+                consecutive_timeouts = 0;
+                continue;
+            }
+            logical_millis += 1;
+            attempt = service.respond_context_runtime_local_approval(
+                &mut managed,
+                &RespondContextRuntimeLocalApproval {
+                    project_id: project_id.clone(),
+                    id: turn_id.clone(),
+                    expected_revision: attempt.revision,
+                    request,
+                    approved: true,
+                },
+                now + Duration::milliseconds(logical_millis),
+            )?;
+            control.clear_held_local_approval();
+            control.record_progress(DesktopRuntimeProgressPhase::LocalActionApproved);
+            consecutive_timeouts = 0;
+            continue;
+        }
+        match observation.kind {
+            hartevo_application::ContextRuntimeTurnObservationKind::NoEvent => {
+                consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+            }
+            hartevo_application::ContextRuntimeTurnObservationKind::Uncertain
+            | hartevo_application::ContextRuntimeTurnObservationKind::Event(
+                MappedTurnEventKind::TurnCompleted(_),
+            ) => break,
+            hartevo_application::ContextRuntimeTurnObservationKind::Event(_) => {
+                consecutive_timeouts = 0;
+            }
+        }
+        if attempt.status.is_terminal() || attempt.status == RuntimeTurnStatus::Uncertain {
+            break;
+        }
+        if consecutive_timeouts >= 5 {
+            if attempt.status == RuntimeTurnStatus::InterruptRequested {
+                break;
+            }
+            logical_millis += 1;
+            attempt = service.interrupt_context_runtime_turn(
+                &mut managed,
+                &InterruptContextRuntimeTurn {
+                    project_id: project_id.clone(),
+                    id: turn_id.clone(),
+                    expected_revision: attempt.revision,
+                    response_timeout: StdDuration::from_secs(5),
+                },
+                now + Duration::milliseconds(logical_millis),
+            )?;
+            consecutive_timeouts = 0;
+        }
+    }
+    logical_millis += 1;
+    service
+        .shutdown_managed_context_runtime(managed, now + Duration::milliseconds(logical_millis))?;
+    if attempt.status.is_active() && attempt.status != RuntimeTurnStatus::Uncertain {
+        logical_millis += 1;
+        attempt = service.fence_orphaned_context_runtime_turn(
+            &FenceOrphanedContextRuntimeTurn {
+                project_id: project_id.clone(),
+                id: turn_id.clone(),
+                expected_revision: attempt.revision,
+            },
+            now + Duration::milliseconds(logical_millis),
+        )?;
+    }
+    let chunks = desktop_live_agent_chunks(&service, project_id, turn_id, &attempt)?;
+    Ok((
+        DesktopLiveAgentTurnCompletion {
+            service,
+            attempt: Some(attempt),
+            logical_millis,
+            runtime_start_failed: false,
+        },
+        chunks,
+    ))
+}
+
 pub(crate) enum DesktopRuntimeSource {
     Pinned(Box<DesktopRuntimeConfiguration>),
     #[cfg(any(test, feature = "native-journey"))]
@@ -2068,7 +2617,7 @@ impl DesktopDataPlane {
         let command = Self::catalog_mission_start_command(&service, request)?;
         let mission = service.start_catalog_mission(command, now)?;
         self.run_existing_mission_runtime_with_cancellation(
-            &mut service,
+            service,
             secret_store,
             runtime_reconciliation,
             &context_session,
@@ -2174,7 +2723,7 @@ impl DesktopDataPlane {
             now,
         )?;
         self.run_existing_mission_runtime_with(
-            &mut service,
+            service,
             secret_store,
             runtime_reconciliation,
             &context_session,
@@ -4287,7 +4836,7 @@ impl DesktopDataPlane {
             now,
         )?;
         self.run_existing_mission_runtime_with_cancellation(
-            &mut service,
+            service,
             secret_store,
             runtime_reconciliation,
             &context_session,
@@ -4334,7 +4883,7 @@ impl DesktopDataPlane {
         cancellation: Option<&DesktopRuntimeCancellation>,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
-        let (mut service, runtime_reconciliation, context_session) =
+        let (service, runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, project_id, now)?;
         let mission = service.load_mission(project_id, mission_id)?;
         if mission.project_id != *project_id
@@ -4344,7 +4893,7 @@ impl DesktopDataPlane {
             return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
         }
         self.run_existing_mission_runtime_with_cancellation(
-            &mut service,
+            service,
             secret_store,
             runtime_reconciliation,
             &context_session,
@@ -4375,7 +4924,7 @@ impl DesktopDataPlane {
         let (handle, cancellation) = authority.into_runtime_parts();
         let project_id = handle.project_id().clone();
         let mission_id = handle.mission_id().clone();
-        let (mut service, runtime_reconciliation, context_session) =
+        let (service, runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
         let durable_handle = service.mission_execution_handle(&project_id, &mission_id)?;
         if durable_handle != handle {
@@ -4393,7 +4942,7 @@ impl DesktopDataPlane {
             return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
         }
         self.run_existing_mission_runtime_with_cancellation(
-            &mut service,
+            service,
             secret_store,
             runtime_reconciliation,
             &context_session,
@@ -4487,7 +5036,7 @@ impl DesktopDataPlane {
     )]
     fn run_existing_mission_runtime_with(
         &self,
-        service: &mut ApplicationService,
+        service: ApplicationService,
         secret_store: &impl SecretStore,
         runtime_reconciliation: RuntimeTurnStartupReconciliation,
         context_session: &ProjectContextMaterialSession,
@@ -4518,7 +5067,7 @@ impl DesktopDataPlane {
     )]
     fn run_existing_mission_runtime_with_cancellation(
         &self,
-        service: &mut ApplicationService,
+        mut service: ApplicationService,
         secret_store: &impl SecretStore,
         runtime_reconciliation: RuntimeTurnStartupReconciliation,
         context_session: &ProjectContextMaterialSession,
@@ -4530,7 +5079,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         if let Some(submission) = self.advance_application_checkpoint_before_runtime(
-            service,
+            &mut service,
             secret_store,
             &runtime_reconciliation,
             project_id,
@@ -4539,8 +5088,8 @@ impl DesktopDataPlane {
         )? {
             return Ok(submission);
         }
-        let scope = runtime_authority_scope(service, project_id, &mission_id)?;
-        let facts = live_domain_kernel_facts(service, project_id, &mission_id, now)?;
+        let scope = runtime_authority_scope(&service, project_id, &mission_id)?;
+        let facts = live_domain_kernel_facts(&service, project_id, &mission_id, now)?;
         map_runtime_dispatch_result(dispatch_live_runtime(
             &self.cordis,
             scope,
@@ -4548,13 +5097,14 @@ impl DesktopDataPlane {
             facts.record.as_ref(),
             facts.approval.as_ref(),
             now,
-            |permit| {
-                let current_scope = runtime_authority_scope(service, project_id, &mission_id)?;
+            move |permit| {
+                let current_scope = runtime_authority_scope(&service, project_id, &mission_id)?;
                 if &current_scope != permit.scope() {
                     return Err(CordisError::AuthorityScopeMismatch.into());
                 }
                 self.run_existing_mission_runtime_authorized(
                     service,
+                    permit,
                     secret_store,
                     runtime_reconciliation,
                     context_session,
@@ -4681,7 +5231,8 @@ impl DesktopDataPlane {
     )]
     fn run_existing_mission_runtime_authorized(
         &self,
-        service: &mut ApplicationService,
+        mut service: ApplicationService,
+        permit: &RuntimeDispatchPermit,
         secret_store: &impl SecretStore,
         runtime_reconciliation: RuntimeTurnStartupReconciliation,
         context_session: &ProjectContextMaterialSession,
@@ -4715,7 +5266,7 @@ impl DesktopDataPlane {
             service.latest_runtime_recovery_for_mission(project_id, &mission_id)?;
         let latest_turn = service.latest_runtime_turn_for_mission(project_id, &mission_id)?;
         let runtime_generation = runtime_entry_generation(
-            service,
+            &service,
             &mission,
             project_id,
             &mission_id,
@@ -4738,7 +5289,7 @@ impl DesktopDataPlane {
             && turn.status.is_active()
         {
             return self.finish_mission_submission(
-                service,
+                &service,
                 secret_store,
                 runtime_reconciliation,
                 mission_id,
@@ -4756,9 +5307,13 @@ impl DesktopDataPlane {
         };
         if let (Some(turn), Some(message), Some(runtime)) =
             (current_turn, completed_message.as_ref(), runtime.as_ref())
+            && !self.runtime_session_has_committed_message_id(
+                mission.id.as_str(),
+                &format!("runtime:{}:user", turn.id.as_str()),
+            )?
         {
             self.record_runtime_session_transcript(
-                service,
+                &service,
                 &mission,
                 &turn.id,
                 runtime.provider(),
@@ -4783,7 +5338,7 @@ impl DesktopDataPlane {
                 now,
             )?;
             return self.finish_mission_submission(
-                service,
+                &service,
                 secret_store,
                 runtime_reconciliation,
                 mission_id,
@@ -4798,7 +5353,7 @@ impl DesktopDataPlane {
             && mission.definition.is_none()
         {
             return self.finish_mission_submission(
-                service,
+                &service,
                 secret_store,
                 runtime_reconciliation,
                 mission_id,
@@ -4810,7 +5365,7 @@ impl DesktopDataPlane {
         }
         let Some(runtime) = runtime else {
             return self.finish_mission_submission(
-                service,
+                &service,
                 secret_store,
                 runtime_reconciliation,
                 mission_id,
@@ -4911,7 +5466,7 @@ impl DesktopDataPlane {
         logical_millis += 1;
         let Some(envelope) = prepared.assembly.envelope.clone() else {
             return self.finish_mission_submission(
-                service,
+                &service,
                 secret_store,
                 runtime_reconciliation,
                 mission_id,
@@ -4926,334 +5481,108 @@ impl DesktopDataPlane {
             ensure_project_runtime_home(context_session.project_root(), &mission_scope_digest)?;
         let runtime_command =
             runtime.into_command(context_session.project_root(), &runtime_home)?;
-        let active_recovery = service.active_context_runtime_recovery(
-            project_id,
-            &prepared.ids.workspace_id,
-            &prepared.ids.worker_id,
-        )?;
-        let managed_result = if let Some(recovery) = active_recovery {
-            service.retry_context_worker_runtime(
-                RetryContextWorkerRuntime {
-                    project_id: project_id.clone(),
-                    recovery_id: recovery.id,
-                    expected_attempt_revision: recovery.revision,
-                    expected_handle_revision: prepared.handle.revision,
-                    expected_mailbox_revision: prepared.mailbox.revision,
-                    resume_thread_id: resume_plan.resume_thread_id.clone(),
-                    model: Some(runtime_model.clone()),
-                    health_timeout: StdDuration::from_secs(15),
-                    thread_timeout: StdDuration::from_secs(15),
-                },
-                &runtime_command,
-                now + Duration::milliseconds(logical_millis),
-            )
-        } else if prepared.handle.status == WorkerHandleStatus::Attached {
-            service.recover_context_worker_runtime(
-                RecoverContextWorkerRuntime {
-                    id: hartevo_domain_kernel::RuntimeRecoveryAttemptId::new(),
-                    project_id: project_id.clone(),
-                    workspace_id: prepared.ids.workspace_id.clone(),
-                    worker_id: prepared.ids.worker_id.clone(),
-                    expected_handle_revision: prepared.handle.revision,
-                    expected_mailbox_revision: prepared.mailbox.revision,
-                    attachment_epoch: prepared.handle.attachment_epoch,
-                    strategy: resume_plan.strategy,
-                    resume_thread_id: resume_plan.resume_thread_id,
-                    model: Some(runtime_model.clone()),
-                    max_process_attempts: 3,
-                    health_timeout: StdDuration::from_secs(15),
-                    thread_timeout: StdDuration::from_secs(15),
-                },
-                &runtime_command,
-                now + Duration::milliseconds(logical_millis),
-            )
-        } else {
-            return Err(DesktopDataError::Application(
-                ApplicationError::LocalRuntimeContextConflict,
-            ));
-        };
-        let mut managed = match managed_result {
-            Ok(managed) => managed,
-            Err(ApplicationError::Runtime(_)) => {
-                return self.finish_mission_submission(
-                    service,
-                    secret_store,
-                    runtime_reconciliation,
-                    mission_id,
-                    DesktopMissionRuntimeOutcome::RuntimeStartFailed,
-                    now + Duration::milliseconds(logical_millis + 1),
-                );
-            }
-            Err(error) => return Err(error.into()),
-        };
-        logical_millis += 1;
         let turn_id = RuntimeTurnAttemptId::new();
-        let expected_handle_revision = managed.handle.revision;
-        let expected_recovery_revision = managed.recovery.revision;
-        let attachment_epoch = managed.handle.attachment_epoch;
-        self.prepare_runtime_session_transcript(
-            service,
-            &mission,
-            &turn_id,
-            &runtime_provider,
-            &runtime_model,
-        )?;
-        let dispatch = match service.dispatch_context_runtime_turn(
-            &mut managed,
-            DispatchContextRuntimeTurn {
-                id: turn_id.clone(),
-                project_id: project_id.clone(),
-                workspace_id: prepared.ids.workspace_id,
-                assembly_id: prepared.assembly.manifest.id,
-                expected_assembly_revision: prepared.assembly.manifest.revision,
-                expected_handle_revision,
-                expected_recovery_revision,
-                attachment_epoch,
-                response_timeout: StdDuration::from_secs(15),
+        let message_id = format!("runtime:{}:user", turn_id.as_str());
+        let user_body = Self::runtime_session_user_body(&service, &mission)?;
+        let request = DesktopAgentTurnRequest::new(
+            mission.id.as_str(),
+            &message_id,
+            user_body.clone(),
+            SessionCallConfig {
+                provider: runtime_provider.clone(),
+                model: runtime_model.clone(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
             },
-            &envelope,
-            now + Duration::milliseconds(logical_millis),
-        ) {
-            Ok(dispatch) => dispatch,
-            Err(error) => {
-                self.record_runtime_session_transcript(
+        )
+        .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
+        let runtime_task_id = prepared.capsule.task_id.clone();
+        let adapter_project_id = project_id.clone();
+        let adapter_turn_id = turn_id.clone();
+        let adapter_model = runtime_model.clone();
+        let adapter_cancellation = cancellation.cloned();
+        let (adapter, completion) = DesktopApplicationLlmAdapter::new(
+            runtime_provider.clone(),
+            runtime_model.clone(),
+            mission.id.as_str().to_owned(),
+            message_id,
+            &user_body,
+            move || {
+                run_desktop_application_runtime_turn(
                     service,
-                    &mission,
-                    &turn_id,
-                    &runtime_provider,
-                    &runtime_model,
-                    None,
-                    TurnEndReason::Error,
-                )?;
-                return Err(error.into());
-            }
+                    &adapter_project_id,
+                    prepared,
+                    &envelope,
+                    resume_plan,
+                    &runtime_command,
+                    adapter_model,
+                    adapter_cancellation.as_ref(),
+                    &adapter_turn_id,
+                    now,
+                    logical_millis,
+                )
+            },
+        );
+        let agent_result = {
+            let mut cordis = self.cordis.lock().map_err(|_| {
+                DesktopDataError::CordisSessionPersistence(
+                    "Desktop Cordis coordinator is poisoned".into(),
+                )
+            })?;
+            futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
+                request,
+                adapter,
+                &LifecycleCancellation::default(),
+                permit,
+            ))
         };
-        if dispatch.disposition != RuntimeTurnDispatchDisposition::Running {
-            let outcome = if dispatch.disposition == RuntimeTurnDispatchDisposition::Failed {
-                DesktopMissionRuntimeOutcome::DispatchFailed
-            } else {
-                DesktopMissionRuntimeOutcome::Uncertain
-            };
-            self.record_runtime_session_transcript(
-                service,
-                &mission,
-                &turn_id,
-                &runtime_provider,
-                &runtime_model,
-                None,
-                TurnEndReason::Error,
-            )?;
-            service.shutdown_managed_context_runtime(
-                managed,
-                now + Duration::milliseconds(logical_millis + 1),
-            )?;
+        let completion = completion
+            .lock()
+            .map_err(|_| {
+                DesktopDataError::CordisSessionPersistence(
+                    "Desktop Application Runtime completion state is unavailable".into(),
+                )
+            })?
+            .take()
+            .ok_or_else(|| {
+                DesktopDataError::CordisSessionPersistence(agent_result.as_ref().err().map_or_else(
+                    || "Desktop Application Runtime adapter did not complete".into(),
+                    ToString::to_string,
+                ))
+            })??;
+        let DesktopLiveAgentTurnCompletion {
+            mut service,
+            attempt,
+            mut logical_millis,
+            runtime_start_failed,
+        } = completion;
+        if let Err(error) = agent_result {
+            return Err(DesktopDataError::CordisSessionPersistence(
+                error.to_string(),
+            ));
+        }
+        if runtime_start_failed {
             return self.finish_mission_submission(
-                service,
+                &service,
                 secret_store,
                 runtime_reconciliation,
                 mission_id,
-                outcome,
+                DesktopMissionRuntimeOutcome::RuntimeStartFailed,
                 now + Duration::milliseconds(logical_millis + 1),
             );
         }
-
-        if let Some(control) = cancellation {
-            control.record_progress(DesktopRuntimeProgressPhase::Dispatched);
-        }
-
-        let mut attempt = dispatch.attempt;
-        let mut consecutive_timeouts = 0_u32;
-        let mut cooperative_interrupt_sent = false;
-        for _ in 0..128 {
-            if !cooperative_interrupt_sent
-                && cancellation.is_some_and(DesktopRuntimeCancellation::is_requested)
-                && matches!(
-                    attempt.status,
-                    RuntimeTurnStatus::Running | RuntimeTurnStatus::WaitingLocalApproval
-                )
-            {
-                logical_millis += 1;
-                attempt = service.interrupt_context_runtime_turn(
-                    &mut managed,
-                    &InterruptContextRuntimeTurn {
-                        project_id: project_id.clone(),
-                        id: turn_id.clone(),
-                        expected_revision: attempt.revision,
-                        response_timeout: StdDuration::from_secs(5),
-                    },
-                    now + Duration::milliseconds(logical_millis),
-                )?;
-                cooperative_interrupt_sent = true;
-                consecutive_timeouts = 0;
-                if let Some(control) = cancellation {
-                    control.record_progress(DesktopRuntimeProgressPhase::InterruptSent);
-                }
-                continue;
-            }
-            logical_millis += 1;
-            let observation = service.observe_context_runtime_turn(
-                &mut managed,
-                &ObserveContextRuntimeTurn {
-                    project_id: project_id.clone(),
-                    id: turn_id.clone(),
-                    expected_revision: attempt.revision,
-                    event_timeout: StdDuration::from_secs(2),
-                },
-                now + Duration::milliseconds(logical_millis),
-            )?;
-            if let Some(delta) = observation.agent_message_delta.as_ref() {
-                self.flush_runtime_session_stream(
-                    service,
-                    &mission,
-                    &turn_id,
-                    &runtime_provider,
-                    &runtime_model,
-                    &delta.item_id_digest,
-                )?;
-            }
-            attempt = observation.attempt;
-            if let Some(control) = cancellation {
-                let phase = match &observation.kind {
-                    hartevo_application::ContextRuntimeTurnObservationKind::Event(
-                        MappedTurnEventKind::TurnStarted,
-                    ) => Some(DesktopRuntimeProgressPhase::TurnStarted),
-                    hartevo_application::ContextRuntimeTurnObservationKind::Event(
-                        MappedTurnEventKind::ItemStarted,
-                    ) => Some(DesktopRuntimeProgressPhase::ItemStarted),
-                    hartevo_application::ContextRuntimeTurnObservationKind::Event(
-                        MappedTurnEventKind::ItemCompleted,
-                    ) => Some(DesktopRuntimeProgressPhase::ItemCompleted),
-                    hartevo_application::ContextRuntimeTurnObservationKind::Uncertain => {
-                        Some(DesktopRuntimeProgressPhase::Uncertain)
-                    }
-                    _ => None,
-                };
-                if let Some(phase) = phase {
-                    control.record_progress(phase);
-                }
-            }
-            if let Some(request) = observation.local_approval_request {
-                let Some(control) = cancellation else {
-                    return Err(DesktopDataError::RuntimeLocalApprovalUnavailable);
-                };
-                control.hold_local_approval(DesktopHeldLocalApproval {
-                    project_id: project_id.clone(),
-                    turn_id: turn_id.clone(),
-                    expected_revision: attempt.revision,
-                    request_digest: request.request_digest.clone(),
-                    kind: request.kind,
-                });
-                let approved = loop {
-                    if control.is_requested() {
-                        control.clear_held_local_approval();
-                        break None;
-                    }
-                    if let Some(decision) = control.take_local_approval_decision() {
-                        break Some(decision);
-                    }
-                    std::thread::sleep(StdDuration::from_millis(50));
-                };
-                let Some(approved) = approved else {
-                    consecutive_timeouts = 0;
-                    continue;
-                };
-                if !approved {
-                    control.clear_held_local_approval();
-                    consecutive_timeouts = 0;
-                    continue;
-                }
-                logical_millis += 1;
-                attempt = service.respond_context_runtime_local_approval(
-                    &mut managed,
-                    &RespondContextRuntimeLocalApproval {
-                        project_id: project_id.clone(),
-                        id: turn_id.clone(),
-                        expected_revision: attempt.revision,
-                        request,
-                        approved: true,
-                    },
-                    now + Duration::milliseconds(logical_millis),
-                )?;
-                control.clear_held_local_approval();
-                control.record_progress(DesktopRuntimeProgressPhase::LocalActionApproved);
-                consecutive_timeouts = 0;
-                continue;
-            }
-            match observation.kind {
-                hartevo_application::ContextRuntimeTurnObservationKind::NoEvent => {
-                    consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                }
-                hartevo_application::ContextRuntimeTurnObservationKind::Uncertain
-                | hartevo_application::ContextRuntimeTurnObservationKind::Event(
-                    MappedTurnEventKind::TurnCompleted(_),
-                ) => break,
-                hartevo_application::ContextRuntimeTurnObservationKind::Event(_) => {
-                    consecutive_timeouts = 0;
-                }
-            }
-            if attempt.status.is_terminal() || attempt.status == RuntimeTurnStatus::Uncertain {
-                break;
-            }
-            if consecutive_timeouts >= 5 {
-                if attempt.status == RuntimeTurnStatus::InterruptRequested {
-                    break;
-                }
-                logical_millis += 1;
-                attempt = service.interrupt_context_runtime_turn(
-                    &mut managed,
-                    &InterruptContextRuntimeTurn {
-                        project_id: project_id.clone(),
-                        id: turn_id.clone(),
-                        expected_revision: attempt.revision,
-                        response_timeout: StdDuration::from_secs(5),
-                    },
-                    now + Duration::milliseconds(logical_millis),
-                )?;
-                consecutive_timeouts = 0;
-            }
-        }
-        logical_millis += 1;
-        service.shutdown_managed_context_runtime(
-            managed,
-            now + Duration::milliseconds(logical_millis),
-        )?;
-        if attempt.status.is_active() && attempt.status != RuntimeTurnStatus::Uncertain {
-            logical_millis += 1;
-            attempt = service.fence_orphaned_context_runtime_turn(
-                &FenceOrphanedContextRuntimeTurn {
-                    project_id: project_id.clone(),
-                    id: turn_id.clone(),
-                    expected_revision: attempt.revision,
-                },
-                now + Duration::milliseconds(logical_millis),
-            )?;
-        }
+        let attempt = attempt.ok_or_else(|| {
+            DesktopDataError::CordisSessionPersistence(
+                "Desktop Application Runtime completion omitted its turn attempt".into(),
+            )
+        })?;
         let completed_message = if attempt.status == RuntimeTurnStatus::Completed {
             service.latest_runtime_turn_private_message(project_id, &turn_id)?
         } else {
             None
         };
-        let session_end_reason = match attempt.status {
-            RuntimeTurnStatus::Completed => TurnEndReason::Completed,
-            RuntimeTurnStatus::Interrupted => TurnEndReason::Interrupted,
-            RuntimeTurnStatus::Prepared
-            | RuntimeTurnStatus::Dispatching
-            | RuntimeTurnStatus::Running
-            | RuntimeTurnStatus::WaitingLocalApproval
-            | RuntimeTurnStatus::ApprovalResponding
-            | RuntimeTurnStatus::InterruptRequested
-            | RuntimeTurnStatus::Failed
-            | RuntimeTurnStatus::Uncertain => TurnEndReason::Error,
-        };
-        self.record_runtime_session_transcript(
-            service,
-            &mission,
-            &turn_id,
-            &runtime_provider,
-            &runtime_model,
-            completed_message.as_ref(),
-            session_end_reason,
-        )?;
         let outcome = match attempt.status {
             RuntimeTurnStatus::Completed => {
                 if let Some(message) = completed_message {
@@ -5288,7 +5617,7 @@ impl DesktopDataPlane {
                                 body: message.body,
                                 work_product_type: "runtime_draft".into(),
                                 fact_ids: BTreeSet::new(),
-                                task_ids: BTreeSet::from([prepared.capsule.task_id]),
+                                task_ids: BTreeSet::from([runtime_task_id]),
                                 file_digest: None,
                                 preview_media_type: "text/plain".into(),
                                 preview,
@@ -5329,7 +5658,7 @@ impl DesktopDataPlane {
             control.record_progress(phase);
         }
         self.finish_mission_submission(
-            service,
+            &service,
             secret_store,
             runtime_reconciliation,
             mission_id,
@@ -5940,15 +6269,11 @@ impl DesktopDataPlane {
         }
     }
 
-    fn prepare_runtime_session_transcript(
+    fn runtime_session_has_committed_message_id(
         &self,
-        service: &ApplicationService,
-        mission: &Mission,
-        turn_id: &RuntimeTurnAttemptId,
-        provider: &str,
-        model: &str,
-    ) -> Result<(), DesktopDataError> {
-        let user_body = Self::runtime_session_user_body(service, mission)?;
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<bool, DesktopDataError> {
         self.cordis
             .lock()
             .map_err(|_| {
@@ -5956,51 +6281,7 @@ impl DesktopDataPlane {
                     "Desktop Cordis coordinator is poisoned".into(),
                 )
             })?
-            .prepare_runtime_transcript(DesktopRuntimeSessionPreflight::new(
-                mission.id.as_str(),
-                turn_id.as_str(),
-                user_body,
-                provider,
-                model,
-            ))
-            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the live flush binds one exact Application turn, route, Session, and already-durable Runtime item without another authority layer"
-    )]
-    fn flush_runtime_session_stream(
-        &self,
-        service: &ApplicationService,
-        mission: &Mission,
-        turn_id: &RuntimeTurnAttemptId,
-        provider: &str,
-        model: &str,
-        item_id_digest: &str,
-    ) -> Result<(), DesktopDataError> {
-        let user_body = Self::runtime_session_user_body(service, mission)?;
-        let assistant_chunks = service
-            .runtime_turn_private_text_deltas(&mission.project_id, turn_id)?
-            .into_iter()
-            .filter(|delta| delta.item_id_digest == item_id_digest)
-            .map(|delta| delta.delta)
-            .collect();
-        self.cordis
-            .lock()
-            .map_err(|_| {
-                DesktopDataError::CordisSessionPersistence(
-                    "Desktop Cordis coordinator is poisoned".into(),
-                )
-            })?
-            .flush_runtime_stream(DesktopRuntimeSessionStreamFlush::new(
-                mission.id.as_str(),
-                turn_id.as_str(),
-                user_body,
-                provider,
-                model,
-                assistant_chunks,
-            ))
+            .has_committed_message_id(session_id, message_id)
             .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))
     }
 
@@ -12194,13 +12475,15 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one concurrent journey observes the durable Session prefix while the real Runtime fixture is waiting, then proves the exact interrupted suffix"
+        reason = "one concurrent journey proves the canonical SQLCipher Session prefix is durable while the exact Application Runtime remains live, then verifies its closed interruption"
     )]
-    fn desktop_runtime_session_preflight_precedes_terminal_observation() {
+    fn desktop_cordis_prefix_is_durable_while_application_runtime_is_live() {
         use hartevo_cordis::{
-            SessionContentBlock, SessionEventKind, SessionId, SessionMessageRole,
-            SessionMessageSource, SessionRequestHeaderReason, SessionStore, SessionSurfaceIntent,
+            SessionCancelCause, SessionContentBlock, SessionEventKind, SessionFinishReason,
+            SessionId, SessionMessageRole, SessionMessageSource, SessionRequestHeaderReason,
+            SessionStore, SessionStreamChunk,
         };
+        use hartevo_storage::PersistedSessionEventKind;
 
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let before = match plane
@@ -12214,7 +12497,7 @@ sleep 30"#;
                 .collect::<BTreeSet<_>>(),
             DesktopLoadState::Uninitialized { .. } => panic!("fixture must be initialized"),
         };
-        let user_body = "Persist the Cordis preflight before this interruptible Runtime call";
+        let user_body = "Persist the canonical Cordis prefix while Runtime is live";
         let started = plane
             .start_mission_with(
                 &secrets,
@@ -12232,7 +12515,7 @@ sleep 30"#;
             .clone();
         let cancellation = DesktopRuntimeCancellation::default();
 
-        let submission = std::thread::scope(|scope| {
+        let (durable_prefix, submission) = std::thread::scope(|scope| {
             let runner = scope.spawn(|| {
                 plane.resume_mission_runtime_with_cancellation(
                     &secrets,
@@ -12257,98 +12540,120 @@ sleep 30"#;
             }
             assert!(dispatched, "Runtime fixture never reached dispatch");
 
-            plane.with_cordis_host(|host| {
-                let session = host
-                    .context()
-                    .sessions::<SessionStore>()
-                    .expect("Cordis Session store")
-                    .get(&SessionId::new(mission_id.as_str()).unwrap())
-                    .expect("Session lookup")
-                    .expect("preflight Session");
-                let events = session.events().expect("preflight events");
-                assert_eq!(events.len(), 5);
-                assert!(matches!(
-                    &events[0].kind,
-                    SessionEventKind::TurnStart { turn: 1 }
-                ));
-                assert!(matches!(
-                    &events[1].kind,
-                    SessionEventKind::RequestHeader { request }
-                        if request.reason == SessionRequestHeaderReason::Initial
-                            && !request.starts_series
-                            && request.header.config.provider == "fixture-provider"
-                            && request.header.config.model == "fixture-model"
-                ));
-                assert!(matches!(
-                    &events[2].kind,
-                    SessionEventKind::StepStart { turn: 1, step: 1 }
-                ));
-                assert!(matches!(
-                    &events[3].kind,
-                    SessionEventKind::UserMessage { message, surface }
-                        if message.role == SessionMessageRole::User
-                            && message.source == SessionMessageSource::User
-                            && message.content
-                                == vec![SessionContentBlock::Text {
-                                    text: user_body.into()
-                                }]
-                            && surface == &SessionSurfaceIntent::append()
-                ));
-                assert!(matches!(
-                    &events[4].kind,
-                    SessionEventKind::RequestContext { context }
-                        if context.provider == "fixture-provider"
-                            && context.model == "fixture-model"
-                            && context.context_window.is_none()
-                ));
-                assert_eq!(session.derive_messages().unwrap().len(), 1);
-            });
-
+            let secret = secrets
+                .get(plane.database_key_reference())
+                .expect("database secret");
+            let key = DatabaseKey::from_secret(&secret).expect("database key");
+            let durable_prefix = ProjectStore::open(&plane.database_path, &key)
+                .expect("concurrent Session store")
+                .load_session_checkpoints()
+                .expect("durable Session checkpoints")
+                .into_iter()
+                .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
+                .expect("durable canonical prefix");
             cancellation.request();
-            runner
+            let submission = runner
                 .join()
                 .expect("Runtime worker thread")
-                .expect("cooperative Runtime interruption")
+                .expect("cooperative Runtime interruption");
+            (durable_prefix, submission)
         });
+
+        assert_eq!(durable_prefix.events.len(), 7);
+        assert!(matches!(
+            durable_prefix.events[0].kind,
+            PersistedSessionEventKind::AgentInboxSpliced { .. }
+        ));
+        assert!(matches!(
+            durable_prefix.events[1].kind,
+            PersistedSessionEventKind::TurnStart { turn: 1 }
+        ));
+        assert!(matches!(
+            durable_prefix.events[2].kind,
+            PersistedSessionEventKind::AgentInboxSpliced { .. }
+        ));
+        assert!(matches!(
+            durable_prefix.events[3].kind,
+            PersistedSessionEventKind::StepStart { turn: 1, step: 1 }
+        ));
+        assert!(matches!(
+            durable_prefix.events[4].kind,
+            PersistedSessionEventKind::UserMessage { .. }
+        ));
+        assert!(matches!(
+            durable_prefix.events[5].kind,
+            PersistedSessionEventKind::RequestHeader { .. }
+        ));
+        assert!(matches!(
+            durable_prefix.events[6].kind,
+            PersistedSessionEventKind::RequestContext { .. }
+        ));
         assert_eq!(
             submission.runtime_outcome,
             DesktopMissionRuntimeOutcome::Interrupted
         );
+
         plane.with_cordis_host(|host| {
             let session = host
                 .context()
                 .sessions::<SessionStore>()
-                .unwrap()
+                .expect("Cordis Session store")
                 .get(&SessionId::new(mission_id.as_str()).unwrap())
-                .unwrap()
+                .expect("Session lookup")
                 .expect("closed Session");
-            let events = session.events().unwrap();
-            assert_eq!(events.len(), 7);
+            let events = session.events().expect("closed events");
+            assert_eq!(events.len(), 10);
+            assert!(matches!(
+                &events[4].kind,
+                SessionEventKind::UserMessage { message, .. }
+                    if message.role == SessionMessageRole::User
+                        && message.source == SessionMessageSource::User
+                        && message.content
+                            == vec![SessionContentBlock::Text {
+                                text: user_body.into()
+                            }]
+            ));
             assert!(matches!(
                 &events[5].kind,
+                SessionEventKind::RequestHeader { request }
+                    if request.reason == SessionRequestHeaderReason::Initial
+                        && request.header.config.provider == "fixture-provider"
+                        && request.header.config.model == "fixture-model"
+            ));
+            assert!(matches!(
+                &events[7].kind,
+                SessionEventKind::AssistantChunk {
+                    chunk: SessionStreamChunk::Finish {
+                        reason: SessionFinishReason::Aborted { failure },
+                        ..
+                    },
+                    ..
+                } if failure.code == "DESKTOP_RUNTIME_INTERRUPTED"
+            ));
+            assert!(matches!(
+                &events[8].kind,
                 SessionEventKind::StepEnd { turn: 1, step: 1 }
             ));
             assert!(matches!(
-                &events[6].kind,
+                &events[9].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
-                    reason: TurnEndReason::Interrupted,
+                    reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
                 }
             ));
             assert_eq!(session.derive_messages().unwrap().len(), 1);
         });
     }
-
     #[cfg(unix)]
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one concurrent journey proves the exact live Session and SQLCipher prefix before allowing the same Runtime attempt to terminate"
+        reason = "one concurrent journey proves Application owns the live private delta while Cordis owns one canonical closed projection after interruption"
     )]
-    fn desktop_runtime_text_delta_flushes_before_terminal_observation() {
+    fn desktop_runtime_partial_delta_commits_once_through_canonical_session() {
         use hartevo_cordis::{
-            SessionContentBlock, SessionEventKind, SessionId, SessionMessageSource, SessionStore,
-            SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+            SessionCancelCause, SessionContentBlock, SessionEventKind, SessionFinishReason,
+            SessionId, SessionStore, SessionStreamBlockType, SessionStreamChunk,
         };
         use hartevo_storage::PersistedSessionEventKind;
 
@@ -12364,7 +12669,7 @@ sleep 30"#;
                 .collect::<BTreeSet<_>>(),
             DesktopLoadState::Uninitialized { .. } => panic!("fixture must be initialized"),
         };
-        let user_body = "Flush this exact Runtime delta into the open Cordis Session";
+        let user_body = "Project one durable Application delta through canonical Cordis";
         let started = plane
             .start_mission_with(
                 &secrets,
@@ -12382,7 +12687,7 @@ sleep 30"#;
             .clone();
         let cancellation = DesktopRuntimeCancellation::default();
 
-        let (live, durable, submission) = std::thread::scope(|scope| {
+        let (durable_prefix, submission) = std::thread::scope(|scope| {
             let runner = scope.spawn(|| {
                 plane.resume_mission_runtime_with_cancellation(
                     &secrets,
@@ -12394,92 +12699,65 @@ sleep 30"#;
                     observed_at() + Duration::minutes(4),
                 )
             });
-            let mut live = None;
+            let secret = secrets
+                .get(plane.database_key_reference())
+                .expect("database secret");
+            let mut private_delta_durable = false;
             for _ in 0..200 {
-                live = plane.with_cordis_host(|host| {
-                    let sessions = host.context().sessions::<SessionStore>()?;
-                    let id = SessionId::new(mission_id.as_str()).ok()?;
-                    let session = sessions.get(&id).ok().flatten()?;
-                    let events = session.events().ok()?;
-                    let chunks = session.assistant_chunks(1, 1).ok()?;
-                    (chunks.len() == 2).then_some((events, chunks))
-                });
-                if live.is_some() {
+                private_delta_durable = plane
+                    .open_read_application_from_secret(&secret)
+                    .ok()
+                    .and_then(|service| {
+                        let turn = service
+                            .latest_runtime_turn_for_mission(&project_id, &mission_id)
+                            .ok()
+                            .flatten()?;
+                        service
+                            .runtime_turn_private_text_deltas(&project_id, &turn.id)
+                            .ok()
+                    })
+                    .is_some_and(|deltas| {
+                        deltas.len() == 1 && deltas[0].delta == "Reviewable local runtime "
+                    });
+                if private_delta_durable {
                     break;
                 }
                 std::thread::sleep(StdDuration::from_millis(25));
             }
-            let durable = live.as_ref().and_then(|_| {
-                let secret = secrets.get(plane.database_key_reference()).ok()?;
-                let key = DatabaseKey::from_secret(&secret).ok()?;
-                ProjectStore::open(&plane.database_path, &key)
-                    .ok()?
-                    .load_session_checkpoints()
-                    .ok()?
-                    .into_iter()
-                    .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
-            });
+            assert!(
+                private_delta_durable,
+                "Application never persisted the live private Runtime delta"
+            );
+
+            let key = DatabaseKey::from_secret(&secret).expect("database key");
+            let durable_prefix = ProjectStore::open(&plane.database_path, &key)
+                .expect("concurrent Session store")
+                .load_session_checkpoints()
+                .expect("durable Session checkpoints")
+                .into_iter()
+                .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
+                .expect("durable canonical prefix");
             cancellation.request();
             let submission = runner
                 .join()
                 .expect("Runtime worker thread")
                 .expect("cooperative Runtime interruption");
-            (live, durable, submission)
+            (durable_prefix, submission)
         });
 
         assert_eq!(
             submission.runtime_outcome,
             DesktopMissionRuntimeOutcome::Interrupted
         );
-        let (live_events, live_chunks) = live.expect("live Cordis stream prefix");
-        assert_eq!(live_events.len(), 7);
-        assert_eq!(
-            live_chunks
-                .iter()
-                .map(|chunk| (chunk.seq, chunk.chunk.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    5,
-                    SessionStreamChunk::BlockStart {
-                        index: 0,
-                        block_type: SessionStreamBlockType::Text,
-                    },
-                ),
-                (
-                    6,
-                    SessionStreamChunk::TextDelta {
-                        index: 0,
-                        text: "Reviewable local runtime ".into(),
-                    },
-                ),
-            ]
-        );
-        let durable = durable.expect("SQLCipher live Session prefix");
-        assert_eq!(durable.events.len(), 7);
-        let durable_chunks = durable
-            .events
-            .iter()
-            .filter_map(|event| {
-                let PersistedSessionEventKind::AssistantChunk { chunk, .. } = &event.kind else {
-                    return None;
-                };
-                SessionStreamChunk::from_json_value(chunk).ok()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            durable_chunks,
-            vec![
-                SessionStreamChunk::BlockStart {
-                    index: 0,
-                    block_type: SessionStreamBlockType::Text,
-                },
-                SessionStreamChunk::TextDelta {
-                    index: 0,
-                    text: "Reviewable local runtime ".into(),
-                },
-            ]
-        );
+        assert_eq!(durable_prefix.events.len(), 7);
+        assert!(durable_prefix.events.iter().all(|event| {
+            !matches!(
+                event.kind,
+                PersistedSessionEventKind::AssistantChunk { .. }
+                    | PersistedSessionEventKind::AssistantMessage { .. }
+                    | PersistedSessionEventKind::TurnEnd { .. }
+            )
+        }));
 
         plane.with_cordis_host(|host| {
             let session = host
@@ -12490,7 +12768,7 @@ sleep 30"#;
                 .unwrap()
                 .expect("closed Session");
             let events = session.events().unwrap();
-            assert_eq!(events.len(), 11);
+            assert_eq!(events.len(), 13);
             assert_eq!(
                 session
                     .assistant_chunks(1, 1)
@@ -12513,40 +12791,48 @@ sleep 30"#;
                             text: "Reviewable local runtime ".into(),
                         },
                     },
+                    SessionStreamChunk::Finish {
+                        reason: SessionFinishReason::Aborted {
+                            failure: desktop_live_agent_failure(
+                                "DESKTOP_RUNTIME_INTERRUPTED",
+                                "Desktop Application Runtime was interrupted",
+                            ),
+                        },
+                        replay_state: None,
+                    },
                 ]
             );
-            let messages = session.derive_messages().unwrap();
-            assert_eq!(messages.len(), 2);
+            assert_eq!(session.derive_messages().unwrap().len(), 1);
+            assert!(
+                events.iter().all(|event| {
+                    !matches!(event.kind, SessionEventKind::AssistantMessage { .. })
+                })
+            );
             assert!(matches!(
-                (&messages[1].source, messages[1].content.as_slice()),
-                (
-                    SessionMessageSource::Model { provider, model },
-                    [SessionContentBlock::Text { text }]
-                ) if provider == "fixture-provider"
-                    && model == "fixture-model"
-                    && text == "Reviewable local runtime "
-            ));
-            assert!(matches!(
-                &events[8].kind,
-                SessionEventKind::AssistantMessage {
-                    turn: 1,
-                    step: 1,
-                    surface,
-                    ..
-                } if surface == &SessionSurfaceIntent::append_from(vec![5, 6, 7])
-            ));
-            assert!(matches!(
-                &events[9].kind,
+                &events[11].kind,
                 SessionEventKind::StepEnd { turn: 1, step: 1 }
             ));
             assert!(matches!(
-                &events[10].kind,
+                &events[12].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
-                    reason: TurnEndReason::Interrupted,
+                    reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
                 }
             ));
         });
+
+        let secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let key = DatabaseKey::from_secret(&secret).expect("database key");
+        let restored = ProjectStore::open(&plane.database_path, &key)
+            .expect("final Session store")
+            .load_session_checkpoints()
+            .expect("final Session checkpoints")
+            .into_iter()
+            .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
+            .expect("closed durable Session");
+        assert_eq!(restored.events.len(), 13);
     }
 
     #[cfg(unix)]
@@ -13233,9 +13519,9 @@ sleep 30"#;
                 .expect("Runtime Session lookup")
                 .expect("real Runtime Session");
             let events = session.events().expect("real Runtime Session events");
-            assert_eq!(events.len(), 13);
+            assert_eq!(events.len(), 15);
             assert!(matches!(
-                events.get(1).map(|event| &event.kind),
+                events.get(5).map(|event| &event.kind),
                 Some(SessionEventKind::RequestHeader { request })
                     if request.reason == SessionRequestHeaderReason::Initial
                         && !request.starts_series
@@ -13305,9 +13591,9 @@ sleep 30"#;
                         .then_some(event.seq)
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(stream_source_seqs, vec![5, 6, 7, 8, 9]);
+            assert_eq!(stream_source_seqs, vec![7, 8, 9, 10, 11]);
             assert!(matches!(
-                events.get(10).map(|event| &event.kind),
+                events.get(12).map(|event| &event.kind),
                 Some(SessionEventKind::AssistantMessage { surface, .. })
                     if surface
                         == &SessionSurfaceIntent::append_from(stream_source_seqs.clone())

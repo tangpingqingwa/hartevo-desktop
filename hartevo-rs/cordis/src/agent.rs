@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use crate::context::{Context, CordisError, keys};
 use crate::fiber::LifecycleCancellation;
 use crate::inbox::AgentInboxTarget;
-use crate::invariants::enforce_invariants;
+use crate::invariants::{enforce_invariants, enforce_runtime_invariants};
 use crate::service::Service;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionCancelCause, SessionContentBlock,
@@ -697,6 +697,43 @@ pub async fn run_agent_turn(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
 ) -> Result<AgentTurnOutcome, CordisError> {
+    run_agent_turn_with_invariants(
+        ctx,
+        session_id,
+        seed_config,
+        cancellation,
+        enforce_invariants,
+    )
+    .await
+}
+
+/// Run the same durable turn grammar under the read/plan Runtime gate.
+///
+/// This stays crate-private: [`crate::CordisHost`] exposes it only after
+/// validating an unforgeable active Runtime permit from the same host.
+pub(crate) async fn run_authorized_runtime_agent_turn(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    seed_config: SessionCallConfig,
+    cancellation: &LifecycleCancellation,
+) -> Result<AgentTurnOutcome, CordisError> {
+    run_agent_turn_with_invariants(
+        ctx,
+        session_id,
+        seed_config,
+        cancellation,
+        enforce_runtime_invariants,
+    )
+    .await
+}
+
+async fn run_agent_turn_with_invariants(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    seed_config: SessionCallConfig,
+    cancellation: &LifecycleCancellation,
+    enforce: fn(&Context) -> Result<(), CordisError>,
+) -> Result<AgentTurnOutcome, CordisError> {
     require_loop_surfaces(ctx)?;
     validate_agent_request_config(&seed_config)?;
     let session = agent_session(ctx, session_id)?;
@@ -711,7 +748,7 @@ pub async fn run_agent_turn(
         session.finish_turn(turn, outcome.reason)?;
         return Ok(outcome);
     }
-    if let Err(error) = enforce_invariants(ctx) {
+    if let Err(error) = enforce(ctx) {
         session.finish_turn(turn, TurnEndReason::Blocked)?;
         return Err(error);
     }

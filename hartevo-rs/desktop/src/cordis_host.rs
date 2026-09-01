@@ -121,28 +121,6 @@ pub(crate) struct DesktopRuntimeSessionTranscript {
     end_reason: TurnEndReason,
 }
 
-/// Exact model-request facts that must be durable before Application calls the
-/// external Runtime. This does not carry or compose the private Context
-/// envelope used by Application.
-pub(crate) struct DesktopRuntimeSessionPreflight {
-    session_id: String,
-    runtime_turn_id: String,
-    user_body: String,
-    provider: String,
-    model: String,
-}
-
-/// Cumulative text deltas already persisted by Application for one exact
-/// Runtime attempt and ready for synchronous Session flush.
-pub(crate) struct DesktopRuntimeSessionStreamFlush {
-    session_id: String,
-    runtime_turn_id: String,
-    user_body: String,
-    provider: String,
-    model: String,
-    assistant_chunks: Vec<String>,
-}
-
 /// One exact Desktop input admitted to the complete Cordis turn driver.
 ///
 /// The private user body is intentionally redacted from `Debug`; provider and
@@ -319,44 +297,6 @@ fn desktop_agent_failure_stream(failure: SessionLlmFailure) -> LlmAdapterStream 
     Box::pin(stream::once(async move { Err(failure) }))
 }
 
-impl DesktopRuntimeSessionPreflight {
-    pub(crate) fn new(
-        session_id: impl Into<String>,
-        runtime_turn_id: impl Into<String>,
-        user_body: impl Into<String>,
-        provider: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
-        Self {
-            session_id: session_id.into(),
-            runtime_turn_id: runtime_turn_id.into(),
-            user_body: user_body.into(),
-            provider: provider.into(),
-            model: model.into(),
-        }
-    }
-}
-
-impl DesktopRuntimeSessionStreamFlush {
-    pub(crate) fn new(
-        session_id: impl Into<String>,
-        runtime_turn_id: impl Into<String>,
-        user_body: impl Into<String>,
-        provider: impl Into<String>,
-        model: impl Into<String>,
-        assistant_chunks: Vec<String>,
-    ) -> Self {
-        Self {
-            session_id: session_id.into(),
-            runtime_turn_id: runtime_turn_id.into(),
-            user_body: user_body.into(),
-            provider: provider.into(),
-            model: model.into(),
-            assistant_chunks,
-        }
-    }
-}
-
 impl DesktopRuntimeSessionTranscript {
     #[allow(
         clippy::too_many_arguments,
@@ -503,22 +443,6 @@ fn runtime_preflight_location(
         .then_some((turn, step))
 }
 
-fn runtime_live_chunks(chunks: Vec<String>) -> Vec<SessionStreamChunk> {
-    let mut expected = Vec::with_capacity(chunks.len().saturating_add(1));
-    if !chunks.is_empty() {
-        expected.push(SessionStreamChunk::BlockStart {
-            index: 0,
-            block_type: SessionStreamBlockType::Text,
-        });
-        expected.extend(
-            chunks
-                .into_iter()
-                .map(|text| SessionStreamChunk::TextDelta { index: 0, text }),
-        );
-    }
-    expected
-}
-
 fn runtime_open_turn(events: &[SessionEvent]) -> Option<u64> {
     events.iter().fold(None, |open, event| match &event.kind {
         SessionEventKind::TurnStart { turn } => Some(*turn),
@@ -578,6 +502,30 @@ impl DesktopCordisCoordinator {
         self.session_persistence.bind_and_restore(store, &sessions)
     }
 
+    /// Read one exact durable input identity without deriving the visible
+    /// transcript. This keeps pre-N65 bridge recovery idempotent while also
+    /// recognizing messages that a later Session surface has shadowed.
+    pub(crate) fn has_committed_message_id(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<bool, DesktopAgentTurnError> {
+        self.ensure_root_fiber_active()?;
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopAgentTurnError::MissingSessionStore)?;
+        let session_id = SessionId::new(session_id.to_owned())?;
+        let Some(session) = sessions.get(&session_id)? else {
+            return Ok(false);
+        };
+        Ok(session_history_contains_message_id(
+            &session.events()?,
+            message_id,
+        ))
+    }
+
     /// Run one complete Cordis turn through a request-scoped Desktop adapter.
     ///
     /// The queued input is durable before admission, the canonical request
@@ -586,13 +534,44 @@ impl DesktopCordisCoordinator {
     /// this call and is removed on both success and failure.
     #[allow(
         dead_code,
-        reason = "N64 freezes the complete-turn seam consumed by the next live Runtime adapter slice"
+        reason = "the full-invariant driver remains the focused contract test seam; production Runtime uses the permit-bound entry below"
     )]
     pub(crate) async fn run_agent_turn<A>(
         &mut self,
         request: DesktopAgentTurnRequest,
         adapter: A,
         cancellation: &LifecycleCancellation,
+    ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
+    where
+        A: LlmAdapter,
+    {
+        self.run_agent_turn_with_permit(request, adapter, cancellation, None)
+            .await
+    }
+
+    /// Run the Desktop turn under the same active Runtime permit that encloses
+    /// the real Application operation. This selects Cordis' read/plan gate;
+    /// ordinary agent and Effect paths retain full consent and approval gates.
+    pub(crate) async fn run_authorized_runtime_agent_turn<A>(
+        &mut self,
+        request: DesktopAgentTurnRequest,
+        adapter: A,
+        cancellation: &LifecycleCancellation,
+        permit: &RuntimeDispatchPermit,
+    ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
+    where
+        A: LlmAdapter,
+    {
+        self.run_agent_turn_with_permit(request, adapter, cancellation, Some(permit))
+            .await
+    }
+
+    async fn run_agent_turn_with_permit<A>(
+        &mut self,
+        request: DesktopAgentTurnRequest,
+        adapter: A,
+        cancellation: &LifecycleCancellation,
+        runtime_permit: Option<&RuntimeDispatchPermit>,
     ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
     where
         A: LlmAdapter,
@@ -635,13 +614,27 @@ impl DesktopCordisCoordinator {
             [provider],
             DesktopPersistedLlmAdapter::new(adapter, sessions.clone(), request.resolved_model),
         )?;
-        let outcome = run_cordis_agent_turn(
-            self.host.context_mut(),
-            &request.session_id,
-            request.config,
-            cancellation,
-        )
-        .await;
+        let outcome = match runtime_permit {
+            Some(permit) => {
+                self.host
+                    .run_authorized_runtime_agent_turn(
+                        permit,
+                        &request.session_id,
+                        request.config,
+                        cancellation,
+                    )
+                    .await
+            }
+            None => {
+                run_cordis_agent_turn(
+                    self.host.context_mut(),
+                    &request.session_id,
+                    request.config,
+                    cancellation,
+                )
+                .await
+            }
+        };
         registration.dispose();
         let flushed = sessions.flush(&session).await;
 
@@ -655,111 +648,6 @@ impl DesktopCordisCoordinator {
                 flush,
             }),
         }
-    }
-
-    /// Persist the exact open Session prefix before Application dispatches the
-    /// matching external Runtime turn.
-    pub(crate) fn prepare_runtime_transcript(
-        &mut self,
-        preflight: DesktopRuntimeSessionPreflight,
-    ) -> Result<(), DesktopSessionPersistenceError> {
-        let sessions = self
-            .host
-            .context()
-            .sessions::<SessionStore>()
-            .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
-        let session = sessions.get_or_create(SessionId::new(preflight.session_id.clone())?)?;
-        let user = runtime_user_message(&preflight.runtime_turn_id, preflight.user_body);
-        let assistant_id = format!("runtime:{}:assistant", preflight.runtime_turn_id);
-        let header = runtime_request_header(&preflight.provider, &preflight.model);
-        let context = runtime_request_context(&preflight.provider, &preflight.model);
-        let events = session.events()?;
-        let identity_exists = events.iter().any(|event| match &event.kind {
-            SessionEventKind::UserMessage { message, .. }
-            | SessionEventKind::AssistantMessage { message, .. } => {
-                message.id == user.id || message.id == assistant_id
-            }
-            _ => false,
-        });
-        if identity_exists {
-            let Some((turn, step)) = runtime_preflight_location(&events, &user, &header, &context)
-            else {
-                return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
-                    preflight.session_id,
-                ));
-            };
-            if runtime_open_turn(&events) != Some(turn)
-                || !session.assistant_chunks(turn, step)?.is_empty()
-                || events.iter().any(|event| {
-                    matches!(
-                        &event.kind,
-                        SessionEventKind::AssistantMessage { message, .. }
-                            if message.id == assistant_id
-                    )
-                })
-            {
-                return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
-                    preflight.session_id,
-                ));
-            }
-            return self.session_persistence.persist_live(&session);
-        }
-
-        append_runtime_preflight(&session, user, header, context)?;
-        self.session_persistence.persist_live(&session)
-    }
-
-    /// Extend the exact open Runtime step with the cumulative text stream that
-    /// Application has already persisted. Exact retries append nothing.
-    pub(crate) fn flush_runtime_stream(
-        &mut self,
-        stream: DesktopRuntimeSessionStreamFlush,
-    ) -> Result<(), DesktopSessionPersistenceError> {
-        if stream.assistant_chunks.is_empty() {
-            return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
-                stream.session_id,
-            ));
-        }
-        let sessions = self
-            .host
-            .context()
-            .sessions::<SessionStore>()
-            .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
-        let session = sessions.get_or_create(SessionId::new(stream.session_id.clone())?)?;
-        let user = runtime_user_message(&stream.runtime_turn_id, stream.user_body);
-        let header = runtime_request_header(&stream.provider, &stream.model);
-        let context = runtime_request_context(&stream.provider, &stream.model);
-        let events = session.events()?;
-        let Some((turn, step)) = runtime_preflight_location(&events, &user, &header, &context)
-        else {
-            return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
-                stream.session_id,
-            ));
-        };
-        let recorded_messages = session
-            .derive_messages()?
-            .into_iter()
-            .filter(|message| message.id == user.id)
-            .collect::<Vec<_>>();
-        let recorded_chunks = session.assistant_chunks(turn, step)?;
-        let recorded_values = recorded_chunks
-            .iter()
-            .map(|chunk| chunk.chunk.clone())
-            .collect::<Vec<_>>();
-        let expected_chunks = runtime_live_chunks(stream.assistant_chunks);
-        if runtime_open_turn(&events) != Some(turn)
-            || recorded_messages != vec![user]
-            || recorded_values.len() > expected_chunks.len()
-            || !expected_chunks.starts_with(&recorded_values)
-        {
-            return Err(DesktopSessionPersistenceError::RuntimeTranscriptDiverged(
-                stream.session_id,
-            ));
-        }
-        for chunk in expected_chunks.into_iter().skip(recorded_values.len()) {
-            session.append_assistant_chunk(turn, step, chunk)?;
-        }
-        self.session_persistence.persist_live(&session)
     }
 
     /// Append one closed, idempotent projection of a real Application Runtime
