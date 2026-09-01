@@ -1302,7 +1302,7 @@ fn validate_message(
     validate_content_blocks(&message.content, event_type)
 }
 
-fn validate_content_blocks(
+pub(crate) fn validate_content_blocks(
     blocks: &[SessionContentBlock],
     event_type: &'static str,
 ) -> Result<(), SessionError> {
@@ -1817,7 +1817,8 @@ impl SessionLog {
         step: u64,
         message: SessionMessage,
     ) -> Result<(), SessionError> {
-        self.append_tool_result_with_surface(turn, step, message, SessionSurfaceIntent::append())
+        self.append_tool_result_with_surface(turn, step, message, SessionSurfaceIntent::append())?;
+        Ok(())
     }
 
     pub fn append_tool_result_with_surface(
@@ -1826,15 +1827,16 @@ impl SessionLog {
         step: u64,
         message: SessionMessage,
         surface: SessionSurfaceIntent,
-    ) -> Result<(), SessionError> {
-        self.append(SessionEventKind::ToolResult {
-            turn,
-            step,
-            message,
-            error: None,
-            surface,
-        })?;
-        Ok(())
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::ToolResult {
+                turn,
+                step,
+                message,
+                error: None,
+                surface,
+            })?
+            .seq)
     }
 
     /// Derive a detached model-history snapshot from the ordered surface.
@@ -2420,7 +2422,7 @@ impl SessionHandle {
         step: u64,
         message: SessionMessage,
         surface: SessionSurfaceIntent,
-    ) -> Result<(), SessionError> {
+    ) -> Result<u64, SessionError> {
         self.commit(|log| log.append_tool_result_with_surface(turn, step, message, surface))
     }
 

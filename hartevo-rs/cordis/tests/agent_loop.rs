@@ -18,12 +18,13 @@ use hartevo_cordis::{
     SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, ToolDispatchExecution,
     ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation, ToolExecutionResult,
     ToolPostExecution, ToolsSurface, TurnEndReason, admit_agent_request, admit_agent_step,
-    build_agent_call, commit_agent_stream, dispatch_agent_call, dispatch_tool_execution, events,
-    finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
-    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
-    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
-    register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
-    run_agent_step, schedule_agent_tool_calls, session_events,
+    build_agent_call, commit_agent_stream, commit_agent_tool_results, dispatch_agent_call,
+    dispatch_tool_execution, events, finalize_tool_execution, keys, log_agent_call,
+    post_tool_execution, prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls,
+    prepare_agent_tool_executions, record_agent_stream, register_llm_adapter,
+    register_prompt_section, register_tool, register_tool_concurrency, register_tool_definition,
+    register_tool_guard, register_tool_schema, run_agent_step, schedule_agent_tool_calls,
+    session_events,
 };
 use serde_json::json;
 
@@ -166,6 +167,48 @@ fn tool_call_chunks(index: u64, id: &str, name: &str, arguments: &str) -> [Sessi
             },
         },
     ]
+}
+
+fn finalize_scheduled_tools(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &RecordedAgentStream,
+) -> Vec<ToolExecutionResult> {
+    prepare_agent_tool_executions(ctx, logged, recorded)
+        .unwrap()
+        .into_iter()
+        .map(|preparation| {
+            let ToolExecutionPreparation::Dispatch(prepared) = preparation else {
+                panic!("test tool must be admitted for dispatch");
+            };
+            let dispatched = dispatch_tool_execution(ctx, prepared).unwrap();
+            let post = post_tool_execution(ctx, dispatched).unwrap();
+            finalize_tool_execution(ctx, post)
+        })
+        .collect()
+}
+
+fn durable_tool_result_message(
+    session_id: &str,
+    turn: u64,
+    step: u64,
+    result: &ToolExecutionResult,
+) -> SessionMessage {
+    SessionMessage {
+        id: format!(
+            "{session_id}:turn:{turn}:step:{step}:tool-result:{}",
+            result.input().call_seq()
+        ),
+        role: SessionMessageRole::User,
+        content: vec![SessionContentBlock::ToolResult {
+            tool_call_id: result.input().call_id().into(),
+            content: result.content().to_vec(),
+            is_error: result.is_error(),
+        }],
+        source: SessionMessageSource::Tool {
+            call_id: result.input().call_id().into(),
+        },
+    }
 }
 
 fn build_logged_turn(
@@ -3836,6 +3879,178 @@ fn tools_final_result_normalizes_projection_failures_without_replay() {
     assert_eq!(body_calls.load(Ordering::SeqCst), 5);
     assert_eq!(observer_calls.load(Ordering::SeqCst), 5);
     assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the two-result durable ordering proof in one fixture.
+fn final_tool_results_commit_in_model_order_with_exact_call_provenance() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(
+        0,
+        "commit-success-call",
+        "commit-success",
+        "{}",
+    ));
+    chunks.extend(tool_call_chunks(
+        1,
+        "commit-failure-call",
+        "commit-failure",
+        "{}",
+    ));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-result-commit", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    register_tool_definition(
+        &mut ctx,
+        ToolDefinition::new(tool_schema("commit-success"), |_| {
+            Ok(json!({ "answer": 7 }))
+        })
+        .with_output_renderer(|_, value| {
+            assert_eq!(value, &json!({ "answer": 7 }));
+            Ok(vec![SessionContentBlock::Text {
+                text: "rendered seven".into(),
+            }])
+        }),
+    )
+    .unwrap();
+    register_tool_definition(
+        &mut ctx,
+        ToolDefinition::new(tool_schema("commit-failure"), |_| Err("body failed".into()))
+            .with_output_renderer(|_, _| unreachable!("failures do not use the renderer")),
+    )
+    .unwrap();
+    let call_seqs = recorded.tool_call_seqs().to_vec();
+    let results = finalize_scheduled_tools(&mut ctx, &logged, &recorded);
+
+    let messages = commit_agent_tool_results(&ctx, &logged, &mut recorded, &results).unwrap();
+
+    assert!(recorded.tool_results_committed());
+    assert_eq!(recorded.tool_result_seqs().len(), 2);
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| match &message.source {
+                SessionMessageSource::Tool { call_id } => call_id.as_str(),
+                _ => panic!("committed result must have tool provenance"),
+            })
+            .collect::<Vec<_>>(),
+        ["commit-success-call", "commit-failure-call"]
+    );
+    let result_events = session
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::ToolResult {
+                message,
+                error,
+                surface,
+                ..
+            } => Some((message, error, surface)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(result_events.len(), 2);
+    assert_eq!(result_events[0].0, messages[0]);
+    assert_eq!(result_events[1].0, messages[1]);
+    assert!(result_events.iter().all(|(_, error, _)| error.is_none()));
+    assert_eq!(
+        result_events[0].2,
+        SessionSurfaceIntent::append_from(vec![call_seqs[0]])
+    );
+    assert_eq!(
+        result_events[1].2,
+        SessionSurfaceIntent::append_from(vec![call_seqs[1]])
+    );
+    assert!(matches!(
+        messages[0].content.as_slice(),
+        [SessionContentBlock::ToolResult {
+            is_error: false,
+            content,
+            ..
+        }] if content == &[SessionContentBlock::Text { text: "rendered seven".into() }]
+    ));
+    assert!(matches!(
+        messages[1].content.as_slice(),
+        [SessionContentBlock::ToolResult {
+            is_error: true,
+            content,
+            ..
+        }] if content == &[SessionContentBlock::Text { text: "Error: body failed".into() }]
+    ));
+    let derived = session.derive_messages().unwrap();
+    assert_eq!(&derived[derived.len() - messages.len()..], messages);
+    let after = session.events().unwrap();
+    assert!(commit_agent_tool_results(&ctx, &logged, &mut recorded, &results).is_err());
+    assert_eq!(session.events().unwrap(), after);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn tool_result_commit_rejects_order_drift_and_resumes_an_exact_prefix() {
+    let mut chunks = Vec::new();
+    chunks.extend(tool_call_chunks(0, "prefix-a-call", "prefix-a", "{}"));
+    chunks.extend(tool_call_chunks(1, "prefix-b-call", "prefix-b", "{}"));
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-result-prefix", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    for name in ["prefix-a", "prefix-b"] {
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |_| Ok(json!(name))).with_output_renderer(
+                |_, value| {
+                    Ok(vec![SessionContentBlock::Text {
+                        text: value.as_str().unwrap().into(),
+                    }])
+                },
+            ),
+        )
+        .unwrap();
+    }
+    let mut results = finalize_scheduled_tools(&mut ctx, &logged, &recorded);
+    results.reverse();
+    let before = session.events().unwrap();
+    assert!(commit_agent_tool_results(&ctx, &logged, &mut recorded, &results).is_err());
+    assert_eq!(session.events().unwrap(), before);
+    assert!(recorded.tool_result_seqs().is_empty());
+    results.reverse();
+
+    let prefix_message = durable_tool_result_message(session.id().as_str(), turn, 1, &results[0]);
+    let prefix_seq = session
+        .append_tool_result_with_surface(
+            turn,
+            1,
+            prefix_message,
+            SessionSurfaceIntent::append_from(vec![recorded.tool_call_seqs()[0]]),
+        )
+        .unwrap();
+    let messages = commit_agent_tool_results(&ctx, &logged, &mut recorded, &results).unwrap();
+
+    assert_eq!(recorded.tool_result_seqs()[0], prefix_seq);
+    assert_eq!(recorded.tool_result_seqs().len(), 2);
+    assert!(recorded.tool_results_committed());
+    assert_eq!(
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::ToolResult { .. }))
+            .count(),
+        2
+    );
+    let derived = session.derive_messages().unwrap();
+    assert_eq!(&derived[derived.len() - 2..], messages);
     close_logged_turn(&session, turn);
 }
 
