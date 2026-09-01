@@ -2929,7 +2929,17 @@ mod tests {
             locked
                 .context_mut()
                 .try_on_emit(events::AGENT_CREATED, move |_| {
-                    assert!(started_host.try_lock().is_ok());
+                    let started_host = started_host.try_lock().unwrap();
+                    assert_eq!(
+                        started_host
+                            .context()
+                            .agents::<AgentsSurface>()
+                            .unwrap()
+                            .list()
+                            .len(),
+                        1,
+                        "agent/created observes the committed publication"
+                    );
                     started_calls.fetch_add(1, Ordering::SeqCst);
                     Err(PhaseError("started"))
                 })
@@ -2967,6 +2977,16 @@ mod tests {
         assert_emit_source(&first, "started");
         assert_eq!(started_calls.load(Ordering::SeqCst), 1);
         assert_eq!(later_started_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            host.lock()
+                .unwrap()
+                .context()
+                .agents::<AgentsSurface>()
+                .unwrap()
+                .list()
+                .is_empty(),
+            "failed publication rolls the registry entry back before returning"
+        );
         let completion = host.lock().unwrap().finish_runtime(permit).unwrap();
         completion.announce().unwrap();
         assert_eq!(disposed_calls.load(Ordering::SeqCst), 1);

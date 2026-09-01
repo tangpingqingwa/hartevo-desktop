@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::CordisError;
 use crate::event::PreparedEmit;
-use crate::surface::AgentsSurface;
+use crate::surface::{AgentPublicationCommit, UnpublishedAgent};
 
 const SHA256_HEX_LENGTH: usize = 64;
 
@@ -951,9 +951,12 @@ pub struct RuntimeDispatchPermit {
     scope: AuthorityScope,
     agent_id: String,
     lease: Arc<RuntimeDispatchLease>,
+    unpublished: Option<UnpublishedAgent>,
+    publication: Option<AgentPublicationCommit>,
     started: Option<PreparedEmit>,
     disposed: Option<PreparedEmit>,
     started_attempted: bool,
+    publication_committed: bool,
     started_result: Option<Result<(), CordisError>>,
     settled: bool,
 }
@@ -963,20 +966,23 @@ impl RuntimeDispatchPermit {
         serial: u64,
         scope: AuthorityScope,
         agent_id: String,
-        agents: Arc<AgentsSurface>,
+        unpublished: UnpublishedAgent,
         started: PreparedEmit,
         disposed: PreparedEmit,
     ) -> (Self, Arc<RuntimeDispatchLease>) {
-        let lease = Arc::new(RuntimeDispatchLease::new(agents, agent_id.clone()));
+        let lease = Arc::new(RuntimeDispatchLease::new());
         (
             Self {
                 serial,
                 scope,
                 agent_id,
                 lease: Arc::clone(&lease),
+                unpublished: Some(unpublished),
+                publication: None,
                 started: Some(started),
                 disposed: Some(disposed),
                 started_attempted: false,
+                publication_committed: false,
                 started_result: None,
                 settled: false,
             },
@@ -991,7 +997,19 @@ impl RuntimeDispatchPermit {
             return result.clone();
         }
         self.started_attempted = true;
-        let result = self.started.take().map_or(Ok(()), PreparedEmit::dispatch);
+        let result = self
+            .unpublished
+            .take()
+            .ok_or(CordisError::RuntimePermitMismatch)
+            .and_then(UnpublishedAgent::commit)
+            .and_then(|publication| {
+                self.publication_committed = true;
+                let result = self.started.take().map_or(Ok(()), PreparedEmit::dispatch);
+                if result.is_ok() {
+                    self.publication = Some(publication);
+                }
+                result
+            });
         self.started_result = Some(result.clone());
         result
     }
@@ -1014,11 +1032,13 @@ impl RuntimeDispatchPermit {
     }
 
     pub(crate) fn complete(mut self) -> RuntimeDispatchCompletion {
+        self.publication.take();
+        self.unpublished.take();
         self.lease.release();
         self.settled = true;
         RuntimeDispatchCompletion {
             notification: self
-                .started_attempted
+                .publication_committed
                 .then(|| self.disposed.take())
                 .flatten(),
         }
@@ -1033,6 +1053,7 @@ impl fmt::Debug for RuntimeDispatchPermit {
             .field("scope", &self.scope)
             .field("agent_id", &self.agent_id)
             .field("started_attempted", &self.started_attempted)
+            .field("publication_committed", &self.publication_committed)
             .field("started_result", &self.started_result)
             .field("settled", &self.settled)
             .finish_non_exhaustive()
@@ -1066,16 +1087,12 @@ impl RuntimeDispatchCompletion {
 
 pub(crate) struct RuntimeDispatchLease {
     active: AtomicBool,
-    agents: Arc<AgentsSurface>,
-    agent_id: String,
 }
 
 impl RuntimeDispatchLease {
-    fn new(agents: Arc<AgentsSurface>, agent_id: String) -> Self {
+    fn new() -> Self {
         Self {
             active: AtomicBool::new(true),
-            agents,
-            agent_id,
         }
     }
 
@@ -1084,9 +1101,7 @@ impl RuntimeDispatchLease {
     }
 
     pub(crate) fn release(&self) {
-        if self.active.swap(false, Ordering::AcqRel) {
-            self.agents.unregister(&self.agent_id);
-        }
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -1095,7 +1110,6 @@ impl fmt::Debug for RuntimeDispatchLease {
         formatter
             .debug_struct("RuntimeDispatchLease")
             .field("active", &self.is_active())
-            .field("agent_id", &self.agent_id)
             .finish_non_exhaustive()
     }
 }

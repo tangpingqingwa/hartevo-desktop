@@ -321,6 +321,10 @@ pub enum CordisError {
     RuntimePermitMismatch,
     #[error("Cordis Runtime dispatch serial overflowed")]
     RuntimeDispatchSerialOverflow,
+    #[error("Cordis Agent `{id}` is already published")]
+    AgentAlreadyPublished { id: String },
+    #[error("Cordis Agent registry mutex is poisoned")]
+    AgentRegistryPoisoned,
     #[error("Cordis Runtime coordinator mutex is poisoned")]
     RuntimeCoordinatorPoisoned,
     #[error("Cordis Domain command scope must not carry Runtime authority")]
