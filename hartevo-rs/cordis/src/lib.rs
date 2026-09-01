@@ -35,9 +35,10 @@ pub use agent::{
     AGENT_LOOP_KEYS, AgentBuildAdmission, AgentCallAdmission, AgentLoop, AgentRequestAdmission,
     AgentRequestLogState, AgentStep, AgentStepResult, AgentStreamCommit, LoggedAgentCall,
     PreparedAgentCall, PreparedAgentRequest, RecordedAgentStream, admit_agent_request,
-    admit_agent_step, build_agent_call, commit_agent_stream, dispatch_agent_call, log_agent_call,
-    prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls,
-    prepare_agent_tool_executions, record_agent_stream, run_agent_step, schedule_agent_tool_calls,
+    admit_agent_step, build_agent_call, commit_agent_stream, commit_agent_tool_results,
+    dispatch_agent_call, log_agent_call, prepare_agent_call, prepare_agent_step,
+    prepare_agent_tool_calls, prepare_agent_tool_executions, record_agent_stream, run_agent_step,
+    schedule_agent_tool_calls,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,

@@ -14,16 +14,16 @@ use crate::session::{
     SessionError, SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionMessage,
     SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestContext,
     SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-    SessionSurfaceIntent, SessionTokenUsage, SessionToolCall, TurnEndReason,
-    validate_agent_request_config, validate_agent_user_message,
+    SessionSurfaceIntent, SessionTokenUsage, SessionToolCall, SessionToolError, TurnEndReason,
+    validate_agent_request_config, validate_agent_user_message, validate_content_blocks,
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
     EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
     PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
-    ToolExecutionPreparation, ToolsSurface, assemble_system_prompt, events, prepare_llm_call,
-    prepare_tool_execution, register_agent, run_tools_pipeline, stream_llm, stream_llm_request,
-    stream_prepared_llm,
+    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface, assemble_system_prompt, events,
+    prepare_llm_call, prepare_tool_execution, register_agent, run_tools_pipeline, stream_llm,
+    stream_llm_request, stream_prepared_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
@@ -292,6 +292,8 @@ pub struct RecordedAgentStream {
     message_committed: bool,
     tool_call_seqs: Vec<u64>,
     tool_calls_scheduled: bool,
+    tool_result_seqs: Vec<u64>,
+    tool_results_committed: bool,
 }
 
 impl RecordedAgentStream {
@@ -334,6 +336,17 @@ impl RecordedAgentStream {
     #[must_use]
     pub const fn tool_calls_scheduled(&self) -> bool {
         self.tool_calls_scheduled
+    }
+
+    /// Exact durable `tool/result` prefix appended or adopted by N57.
+    #[must_use]
+    pub fn tool_result_seqs(&self) -> &[u64] {
+        &self.tool_result_seqs
+    }
+
+    #[must_use]
+    pub const fn tool_results_committed(&self) -> bool {
+        self.tool_results_committed
     }
 }
 
@@ -598,6 +611,8 @@ pub async fn record_agent_stream(
         message_committed: false,
         tool_call_seqs: Vec::new(),
         tool_calls_scheduled: false,
+        tool_result_seqs: Vec::new(),
+        tool_results_committed: false,
     })
 }
 
@@ -826,6 +841,166 @@ pub fn prepare_agent_tool_executions(
         .into_iter()
         .map(|input| prepare_tool_execution(ctx, input))
         .collect()
+}
+
+/// Commit N56's final tool results to the exact open Session in model order.
+///
+/// Every result is identity-checked before the first append. An exact durable
+/// prefix can be adopted after an interrupted caller and completed without
+/// replaying tool execution; any drift fails closed.
+pub fn commit_agent_tool_results(
+    ctx: &Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+    results: &[ToolExecutionResult],
+) -> Result<Vec<SessionMessage>, CordisError> {
+    if recorded.tool_results_committed {
+        return Err(
+            invalid_stream_protocol("one tool-result commit pass per recorded stream").into(),
+        );
+    }
+    let inputs = prepare_agent_tool_calls(ctx, logged, recorded)?;
+    if inputs.len() != results.len()
+        || inputs
+            .iter()
+            .zip(results)
+            .any(|(input, result)| input != result.input())
+    {
+        return Err(invalid_stream_protocol(
+            "one final result for every exact durable tool call in model order",
+        )
+        .into());
+    }
+    for result in results {
+        validate_content_blocks(result.content(), "tool/result")?;
+    }
+
+    let request = logged.call().request();
+    let session_id = SessionId::new(request.agent().id.clone())?;
+    let turn = request.turn();
+    let step = request.step();
+    let session = agent_session(ctx, &session_id)?;
+    session.require_open_step(turn, step)?;
+    let planned = results
+        .iter()
+        .map(|result| PlannedToolResult {
+            call_seq: result.input().call_seq(),
+            message: SessionMessage {
+                id: format!(
+                    "{}:turn:{turn}:step:{step}:tool-result:{}",
+                    request.agent().id,
+                    result.input().call_seq()
+                ),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::ToolResult {
+                    tool_call_id: result.input().call_id().to_string(),
+                    content: result.content().to_vec(),
+                    is_error: result.is_error(),
+                }],
+                source: SessionMessageSource::Tool {
+                    call_id: result.input().call_id().to_string(),
+                },
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let mut existing = durable_tool_results(&session, turn, step)?;
+    if !tool_result_prefix_matches(&existing, &planned)
+        || recorded.tool_result_seqs.len() > existing.len()
+        || recorded
+            .tool_result_seqs
+            .iter()
+            .zip(&existing)
+            .any(|(expected, actual)| *expected != actual.seq)
+    {
+        return Err(invalid_stream_protocol(
+            "only an exact durable model-order tool-result prefix",
+        )
+        .into());
+    }
+    recorded.tool_result_seqs.extend(
+        existing
+            .iter()
+            .skip(recorded.tool_result_seqs.len())
+            .map(|item| item.seq),
+    );
+
+    for result in planned.iter().skip(existing.len()) {
+        let seq = session.append_tool_result_with_surface(
+            turn,
+            step,
+            result.message.clone(),
+            SessionSurfaceIntent::append_from(vec![result.call_seq]),
+        )?;
+        recorded.tool_result_seqs.push(seq);
+    }
+    existing = durable_tool_results(&session, turn, step)?;
+    if existing.len() != planned.len()
+        || !tool_result_prefix_matches(&existing, &planned)
+        || existing
+            .iter()
+            .zip(&recorded.tool_result_seqs)
+            .any(|(actual, expected)| actual.seq != *expected)
+    {
+        return Err(invalid_stream_protocol(
+            "the durable tool results to match every final result exactly",
+        )
+        .into());
+    }
+    recorded.tool_results_committed = true;
+    Ok(planned.into_iter().map(|result| result.message).collect())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PlannedToolResult {
+    call_seq: u64,
+    message: SessionMessage,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableToolResult {
+    seq: u64,
+    message: SessionMessage,
+    error: Option<SessionToolError>,
+    surface: SessionSurfaceIntent,
+}
+
+fn durable_tool_results(
+    session: &SessionHandle,
+    turn: u64,
+    step: u64,
+) -> Result<Vec<DurableToolResult>, SessionError> {
+    Ok(session
+        .events()?
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::ToolResult {
+                turn: result_turn,
+                step: result_step,
+                message,
+                error,
+                surface,
+            } if result_turn == turn && result_step == step => Some(DurableToolResult {
+                seq: event.seq,
+                message,
+                error,
+                surface,
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+fn tool_result_prefix_matches(
+    existing: &[DurableToolResult],
+    planned: &[PlannedToolResult],
+) -> bool {
+    existing.len() <= planned.len()
+        && existing.iter().zip(planned).all(|(actual, expected)| {
+            actual.message == expected.message
+                && actual.error.is_none()
+                && actual.surface == SessionSurfaceIntent::append_from(vec![expected.call_seq])
+        })
 }
 
 type PlannedToolCall = (String, String, String);
