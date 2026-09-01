@@ -307,6 +307,8 @@ pub struct DesktopRuntimeCancellation {
     progress: Arc<Mutex<DesktopRuntimeProgressFeed>>,
     local_approval: Arc<Mutex<Option<DesktopHeldLocalApproval>>>,
     local_approval_decision: Arc<Mutex<Option<bool>>>,
+    #[cfg(test)]
+    crash_after_private_delta: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -428,6 +430,20 @@ impl DesktopRuntimeCancellation {
         while feed.events.len() > 128 {
             feed.events.pop_front();
         }
+    }
+
+    #[cfg(test)]
+    fn request_crash_after_private_delta(&self) {
+        self.crash_after_private_delta
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn crash_after_private_delta_if_requested(&self) {
+        assert!(
+            !self.crash_after_private_delta.swap(false, Ordering::AcqRel),
+            "simulated Desktop coordinator crash after durable private Runtime delta"
+        );
     }
 }
 
@@ -1734,6 +1750,12 @@ fn run_desktop_application_runtime_turn(
             now + Duration::milliseconds(logical_millis),
         )?;
         attempt = observation.attempt;
+        #[cfg(test)]
+        if observation.agent_message_delta.is_some()
+            && let Some(control) = cancellation
+        {
+            control.crash_after_private_delta_if_requested();
+        }
         if let Some(control) = cancellation {
             let phase = match &observation.kind {
                 hartevo_application::ContextRuntimeTurnObservationKind::Event(
@@ -9634,6 +9656,21 @@ sleep 30"#
     }
 
     #[cfg(unix)]
+    fn counted_runtime_fixture_source(
+        constructions: Arc<AtomicUsize>,
+        command_builder: fn(&Path, &Path) -> RuntimeCommand,
+    ) -> DesktopRuntimeSource {
+        DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(move |project_root, runtime_home| {
+                constructions.fetch_add(1, Ordering::SeqCst);
+                command_builder(project_root, runtime_home)
+            }),
+        }
+    }
+
+    #[cfg(unix)]
     fn local_write_approve_runtime_fixture_command(
         project_root: &Path,
         runtime_home: &Path,
@@ -12821,6 +12858,296 @@ sleep 30"#;
             .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
             .expect("closed durable Session");
         assert_eq!(restored.events.len(), 13);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one crash/restart journey proves the Cordis Session and Application Runtime ledgers recover together without replaying an ambiguous provider turn"
+    )]
+    fn desktop_live_turn_crash_restores_both_ledgers_without_provider_replay() {
+        use hartevo_cordis::{
+            SessionEventKind, SessionId, SessionMessageRole, SessionMessageSource, SessionStore,
+        };
+        use hartevo_domain_kernel::RuntimeTurnFailureClass;
+        use hartevo_storage::PersistedSessionEventKind;
+
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let before = match plane
+            .load_with(&secrets, observed_at() + Duration::minutes(2))
+            .expect("ready Desktop state")
+        {
+            DesktopLoadState::Ready(snapshot) => snapshot.inventory.projects[0]
+                .missions
+                .iter()
+                .map(|mission| mission.mission_id.clone())
+                .collect::<BTreeSet<_>>(),
+            DesktopLoadState::Uninitialized { .. } => panic!("fixture must be initialized"),
+        };
+        let user_body = "Fence one ambiguous live turn after a real Desktop restart";
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                user_body,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("start one exact Mission");
+        let mission_id = started.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| !before.contains(&mission.mission_id))
+            .expect("new Mission projection")
+            .mission_id
+            .clone();
+        let runtime_constructions = Arc::new(AtomicUsize::new(0));
+        let crash = DesktopRuntimeCancellation::default();
+        crash.request_crash_after_private_delta();
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plane.resume_mission_runtime_with_cancellation(
+                &secrets,
+                &project_id,
+                &mission_id,
+                Some(counted_runtime_fixture_source(
+                    Arc::clone(&runtime_constructions),
+                    live_stream_interruptible_runtime_fixture_command,
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                Some(&crash),
+                observed_at() + Duration::minutes(4),
+            )
+        }));
+        assert!(crashed.is_err(), "the deterministic crash cut must unwind");
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 1);
+        assert!(
+            crash
+                .progress_since(0)
+                .iter()
+                .any(|event| event.phase == DesktopRuntimeProgressPhase::Dispatched),
+            "the crash window must be after provider dispatch"
+        );
+        assert!(
+            !plane.cordis.is_checked_out(),
+            "RAII must restore the coordinator while the process is unwinding"
+        );
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let database_key = DatabaseKey::from_secret(&database_secret).expect("database key");
+        let open_prefix = ProjectStore::open(&plane.database_path, &database_key)
+            .expect("concurrent Session store")
+            .load_session_checkpoints()
+            .expect("durable Session checkpoints")
+            .into_iter()
+            .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
+            .expect("durable canonical request prefix");
+        assert_eq!(open_prefix.events.len(), 7);
+        assert!(open_prefix.events.iter().all(|event| {
+            !matches!(
+                event.kind,
+                PersistedSessionEventKind::AssistantChunk { .. }
+                    | PersistedSessionEventKind::AssistantMessage { .. }
+                    | PersistedSessionEventKind::TurnEnd { .. }
+            )
+        }));
+
+        let before_restart = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("read crashed Application state");
+        let crashed_turn = before_restart
+            .latest_runtime_turn_for_mission(&project_id, &mission_id)
+            .expect("latest Runtime turn")
+            .expect("crashed Runtime turn");
+        assert_eq!(crashed_turn.status, RuntimeTurnStatus::Running);
+        let crashed_deltas = before_restart
+            .runtime_turn_private_text_deltas(&project_id, &crashed_turn.id)
+            .expect("durable private Runtime delta");
+        assert_eq!(crashed_deltas.len(), 1);
+        assert_eq!(crashed_deltas[0].delta, "Reviewable local runtime ");
+        drop(before_restart);
+        drop(plane);
+
+        let data_root = directory.path().join("desktop-data");
+        let restarted =
+            DesktopDataPlane::at_data_root(&data_root).expect("restarted Desktop plane");
+        assert!(matches!(
+            restarted
+                .load_with(&secrets, observed_at() + Duration::minutes(5))
+                .expect("reconcile both durable ledgers"),
+            DesktopLoadState::Ready(_)
+        ));
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 1);
+
+        let restarted_service = restarted
+            .open_read_application_from_secret(&database_secret)
+            .expect("read reconciled Application state");
+        let fenced_turn = restarted_service
+            .latest_runtime_turn_for_mission(&project_id, &mission_id)
+            .expect("latest reconciled Runtime turn")
+            .expect("fenced Runtime turn");
+        assert_eq!(fenced_turn.id, crashed_turn.id);
+        assert_eq!(fenced_turn.status, RuntimeTurnStatus::Uncertain);
+        assert_eq!(
+            fenced_turn.failures.last().expect("restart failure").class,
+            RuntimeTurnFailureClass::CoordinatorRestart
+        );
+        assert_eq!(
+            restarted_service
+                .runtime_turn_private_text_deltas(&project_id, &fenced_turn.id)
+                .expect("preserved private Runtime delta"),
+            crashed_deltas
+        );
+        let recovery = restarted_service
+            .latest_runtime_recovery_for_mission(&project_id, &mission_id)
+            .expect("latest Runtime recovery")
+            .expect("reconciled Runtime recovery");
+        assert_eq!(recovery.status, RuntimeRecoveryStatus::Attached);
+        assert_eq!(recovery.process_attempt, 1);
+        assert!(recovery.failures.is_empty());
+        let process_claims = ProjectStore::open(&restarted.database_path, &database_key)
+            .expect("reconciled process store")
+            .list_runtime_process_claims(&project_id)
+            .expect("Runtime process claims");
+        assert_eq!(process_claims.len(), 1);
+        assert_eq!(process_claims[0].recovery_id, recovery.id);
+        assert!(process_claims[0].status.is_terminal());
+        assert_eq!(process_claims[0].cleanup_attempts.len(), 1);
+        let mission = restarted_service
+            .load_mission(&project_id, &mission_id)
+            .expect("same durable Mission");
+        assert_eq!(mission.stage, MissionStage::Running);
+        assert!(mission.work_products.is_empty());
+        assert!(mission.effects.is_empty());
+        let reconciled_mission_events = restarted_service
+            .mission_events(&project_id, &mission_id)
+            .expect("reconciled Mission events");
+        drop(restarted_service);
+
+        let repaired_session_events = restarted.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .expect("restored Cordis Session store")
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .expect("Session lookup")
+                .expect("repaired live-turn Session");
+            let events = session.events().expect("repaired Session events");
+            assert_eq!(events.len(), 9);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.kind, SessionEventKind::TurnEnd { .. }))
+                    .count(),
+                1
+            );
+            assert!(events.iter().all(|event| {
+                !matches!(
+                    event.kind,
+                    SessionEventKind::AssistantChunk { .. }
+                        | SessionEventKind::AssistantMessage { .. }
+                )
+            }));
+            assert!(matches!(
+                &events[7].kind,
+                SessionEventKind::StepEnd { turn: 1, step: 1 }
+            ));
+            assert!(matches!(
+                &events[8].kind,
+                SessionEventKind::TurnEnd {
+                    turn: 1,
+                    reason: TurnEndReason::Interrupted,
+                }
+            ));
+            let messages = session.derive_messages().expect("repaired messages");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].role, SessionMessageRole::User);
+            assert_eq!(messages[0].source, SessionMessageSource::User);
+            events
+        });
+
+        let replay = restarted
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                Some(counted_runtime_fixture_source(
+                    Arc::clone(&runtime_constructions),
+                    resumed_completed_runtime_fixture_command,
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(6),
+            )
+            .expect("fence ambiguous turn without replay");
+        assert_eq!(
+            replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ReplaySuppressed {
+                turn_status: RuntimeTurnStatus::Uncertain,
+            }
+        );
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 1);
+        restarted.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .unwrap()
+                .expect("stable repaired Session");
+            assert_eq!(session.events().unwrap(), repaired_session_events);
+        });
+        drop(restarted);
+
+        let second_restart =
+            DesktopDataPlane::at_data_root(&data_root).expect("second restarted Desktop plane");
+        assert!(matches!(
+            second_restart
+                .load_with(&secrets, observed_at() + Duration::minutes(7))
+                .expect("idempotent second reconciliation"),
+            DesktopLoadState::Ready(_)
+        ));
+        let second_replay = second_restart
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                Some(counted_runtime_fixture_source(
+                    Arc::clone(&runtime_constructions),
+                    resumed_completed_runtime_fixture_command,
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(8),
+            )
+            .expect("idempotent replay fence");
+        assert_eq!(second_replay.runtime_outcome, replay.runtime_outcome);
+        assert_eq!(runtime_constructions.load(Ordering::SeqCst), 1);
+        second_restart.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .unwrap()
+                .expect("second stable repaired Session");
+            assert_eq!(session.events().unwrap(), repaired_session_events);
+        });
+        let final_service = second_restart
+            .open_read_application_from_secret(&database_secret)
+            .expect("final Application state");
+        assert_eq!(
+            final_service
+                .mission_events(&project_id, &mission_id)
+                .expect("stable Mission events"),
+            reconciled_mission_events
+        );
+        assert_eq!(
+            final_service
+                .runtime_turn_private_text_deltas(&project_id, &crashed_turn.id)
+                .expect("stable private Runtime delta"),
+            crashed_deltas
+        );
     }
 
     #[cfg(unix)]
