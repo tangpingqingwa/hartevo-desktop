@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::config::ConfigValue;
 use crate::context::CordisError;
+use crate::session::SessionCancelCause;
 
 pub(crate) type FiberFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
@@ -236,10 +237,25 @@ impl FiberSnapshot {
 #[derive(Debug, Clone)]
 pub struct LifecycleCancellation {
     cancelled: Arc<tokio::sync::watch::Sender<bool>>,
+    cause: Arc<Mutex<Option<SessionCancelCause>>>,
 }
 
 impl LifecycleCancellation {
+    /// Cancel with the legacy cause retained by pre-N72 callers.
     pub fn cancel(&self) {
+        self.cancel_with(SessionCancelCause::Legacy);
+    }
+
+    /// Cancel once with a content-free typed cause. The first caller wins.
+    pub fn cancel_with(&self, cause: SessionCancelCause) {
+        let mut stored = self
+            .cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stored.is_some() {
+            return;
+        }
+        *stored = Some(cause);
         self.cancelled.send_replace(true);
     }
 
@@ -248,7 +264,23 @@ impl LifecycleCancellation {
         *self.cancelled.borrow()
     }
 
-    pub(crate) async fn cancelled(&self) {
+    /// Return the immutable first cancellation cause, if cancellation won.
+    #[must_use]
+    pub fn cause(&self) -> Option<SessionCancelCause> {
+        *self
+            .cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether two handles observe the exact same cancellation lineage.
+    #[must_use]
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
+    /// Wait until the exact shared cancellation lineage is cancelled.
+    pub async fn cancelled(&self) {
         let mut cancelled = self.cancelled.subscribe();
         while !*cancelled.borrow_and_update() {
             if cancelled.changed().await.is_err() {
@@ -263,9 +295,18 @@ impl Default for LifecycleCancellation {
         let (cancelled, _) = tokio::sync::watch::channel(false);
         Self {
             cancelled: Arc::new(cancelled),
+            cause: Arc::new(Mutex::new(None)),
         }
     }
 }
+
+impl PartialEq for LifecycleCancellation {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_same(other)
+    }
+}
+
+impl Eq for LifecycleCancellation {}
 
 impl TransitionTicket {
     #[must_use]

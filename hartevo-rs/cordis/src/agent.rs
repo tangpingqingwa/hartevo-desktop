@@ -15,11 +15,11 @@ use crate::service::Service;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionCancelCause, SessionContentBlock,
     SessionEpochHeader, SessionError, SessionEventKind, SessionFinishReason, SessionHandle,
-    SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
-    SessionRequestContext, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage, SessionToolCall, SessionToolError,
-    TurnEndReason, validate_agent_request_config, validate_agent_user_message,
-    validate_content_blocks,
+    SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionReplayEnvelope, SessionRequestContext, SessionRequestHeaderReason, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
+    SessionToolCall, SessionToolError, TurnEndReason, validate_agent_request_config,
+    validate_agent_user_message, validate_content_blocks,
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentStatusChange,
@@ -27,10 +27,10 @@ use crate::surface::{
     LlmGenerateRequest, LlmStream, LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeSurface,
     ToolCall, ToolExecutionInput, ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
     aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
-    dispatch_tool_execution, events, finalize_tool_execution, post_tool_execution,
-    prepare_llm_call, prepare_tool_execution, register_agent, run_tools_pipeline,
-    schedule_tool_dispatch, settle_denied_tool_execution, stream_llm, stream_llm_request,
-    stream_prepared_llm,
+    dispatch_tool_execution_with_cancellation, events, finalize_tool_execution,
+    post_tool_execution, prepare_llm_call, prepare_tool_execution, register_agent,
+    run_tools_pipeline, schedule_tool_dispatch, settle_denied_tool_execution, stream_llm,
+    stream_llm_request, stream_prepared_llm,
 };
 
 /// DeepSeek Harness-compatible default bound for overlapping tool bodies.
@@ -152,6 +152,7 @@ pub struct PreparedAgentRequest {
     agent: AgentRef,
     turn: u64,
     step: u64,
+    cancellation: LifecycleCancellation,
     config: SessionCallConfig,
     messages: Vec<SessionMessage>,
     assembly: PromptAssembly,
@@ -173,6 +174,12 @@ impl PreparedAgentRequest {
     #[must_use]
     pub const fn step(&self) -> u64 {
         self.step
+    }
+
+    /// Exact caller-owned cancellation lineage shared by this Agent turn.
+    #[must_use]
+    pub const fn cancellation(&self) -> &LifecycleCancellation {
+        &self.cancellation
     }
 
     #[must_use]
@@ -467,7 +474,14 @@ pub fn prepare_agent_step(
 ) -> Result<AgentPreStep, CordisError> {
     require_loop_surfaces(ctx)?;
     let session = agent_session(ctx, session_id)?;
-    prepare_agent_step_for_session(ctx, &session, target, turn, step)
+    prepare_agent_step_for_session(
+        ctx,
+        &session,
+        target,
+        turn,
+        step,
+        &LifecycleCancellation::default(),
+    )
 }
 
 /// Run pre-step admission and atomically enter only a non-empty accepted step.
@@ -483,7 +497,14 @@ pub fn admit_agent_step(
 ) -> Result<AgentPreStep, CordisError> {
     require_loop_surfaces(ctx)?;
     let session = agent_session(ctx, session_id)?;
-    let proposal = prepare_agent_step_for_session(ctx, &session, target, turn, step)?;
+    let proposal = prepare_agent_step_for_session(
+        ctx,
+        &session,
+        target,
+        turn,
+        step,
+        &LifecycleCancellation::default(),
+    )?;
     if let AgentPreStepDecision::Enter { messages, .. } = proposal.decision()
         && !messages.is_empty()
     {
@@ -505,21 +526,46 @@ pub fn admit_agent_request(
     step: u64,
     seed_config: SessionCallConfig,
 ) -> Result<AgentRequestAdmission, CordisError> {
-    admit_agent_request_internal(ctx, session_id, target, turn, step, seed_config, false)
+    admit_agent_request_internal(
+        ctx,
+        session_id,
+        AgentTurnRequest {
+            target,
+            turn,
+            step,
+            seed_config,
+            cancellation: &LifecycleCancellation::default(),
+            allow_empty_continuation: false,
+        },
+    )
+}
+
+struct AgentTurnRequest<'a> {
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+    seed_config: SessionCallConfig,
+    cancellation: &'a LifecycleCancellation,
+    allow_empty_continuation: bool,
 }
 
 fn admit_agent_request_internal(
     ctx: &mut Context,
     session_id: &SessionId,
-    target: AgentInboxTarget,
-    turn: u64,
-    step: u64,
-    seed_config: SessionCallConfig,
-    allow_empty_continuation: bool,
+    request: AgentTurnRequest<'_>,
 ) -> Result<AgentRequestAdmission, CordisError> {
+    let AgentTurnRequest {
+        target,
+        turn,
+        step,
+        seed_config,
+        cancellation,
+        allow_empty_continuation,
+    } = request;
     require_loop_surfaces(ctx)?;
     let session = agent_session(ctx, session_id)?;
-    let admission = prepare_agent_step_for_session(ctx, &session, target, turn, step)?;
+    let admission =
+        prepare_agent_step_for_session(ctx, &session, target, turn, step, cancellation)?;
     let starts_request_series = match admission.decision() {
         AgentPreStepDecision::Reject => {
             return Ok(AgentRequestAdmission::NoRequest(admission));
@@ -541,15 +587,23 @@ fn admit_agent_request_internal(
     };
     session.enter_agent_step(turn, step, admitted_messages)?;
     let (messages, surface_generation) = session.agent_request_boundary(turn, step)?;
-    let request = AgentRequest::new(admission.agent().clone(), turn, step, seed_config);
+    let request = AgentRequest::new(
+        admission.agent().clone(),
+        turn,
+        step,
+        seed_config,
+        cancellation.clone(),
+    );
     let request = ctx.waterfall(events::AGENT_REQUEST, request)?;
     validate_agent_request_config(request.config())?;
     session.require_open_step(turn, step)?;
 
+    let cancellation = request.cancellation().clone();
     Ok(AgentRequestAdmission::Request(PreparedAgentRequest {
         agent: admission.agent().clone(),
         turn,
         step,
+        cancellation,
         config: request.into_config(),
         messages,
         assembly: admission.assembly().clone(),
@@ -661,23 +715,13 @@ pub fn build_agent_call(
 
 fn build_agent_turn_call(
     ctx: &mut Context,
-    target: AgentInboxTarget,
-    turn: u64,
-    step: u64,
-    seed_config: SessionCallConfig,
     state: &mut AgentRequestLogState,
-    allow_empty_continuation: bool,
+    request: AgentTurnRequest<'_>,
 ) -> Result<AgentBuildAdmission, CordisError> {
     let session_id = state.session_id().clone();
-    let request = match admit_agent_request_internal(
-        ctx,
-        &session_id,
-        target,
-        turn,
-        step,
-        seed_config,
-        allow_empty_continuation,
-    )? {
+    let turn = request.turn;
+    let step = request.step;
+    let request = match admit_agent_request_internal(ctx, &session_id, request)? {
         AgentRequestAdmission::NoRequest(admission) => {
             return Ok(AgentBuildAdmission::NoCall(admission));
         }
@@ -689,9 +733,10 @@ fn build_agent_turn_call(
 
 /// Run one complete durable agent turn over the canonical Cordis primitives.
 ///
-/// Cancellation is content-free at this boundary and therefore records the
-/// stable legacy cancel cause. Provider request failures remain structured in
-/// the returned error while the Session always receives an `Error` turn end.
+/// Cancellation is content-free at this boundary and records its immutable
+/// first typed cause. Legacy callers retain the stable legacy cause. Provider
+/// request failures remain structured in the returned error while the Session
+/// always receives an `Error` turn end.
 pub async fn run_agent_turn(
     ctx: &mut Context,
     session_id: &SessionId,
@@ -744,7 +789,7 @@ async fn run_agent_turn_with_invariants(
         let outcome = AgentTurnOutcome {
             turn,
             steps: 0,
-            reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+            reason: cancelled_turn_reason(cancellation),
         };
         session.finish_turn(turn, outcome.reason)?;
         return Ok(outcome);
@@ -767,7 +812,7 @@ async fn run_agent_turn_with_invariants(
     let reason = result.as_ref().map_or_else(
         |_| {
             if cancellation.is_cancelled() {
-                TurnEndReason::Aborted(SessionCancelCause::Legacy)
+                cancelled_turn_reason(cancellation)
             } else {
                 TurnEndReason::Error
             }
@@ -804,7 +849,7 @@ async fn drive_agent_turn(
             return Ok(AgentTurnOutcome {
                 turn,
                 steps,
-                reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                reason: cancelled_turn_reason(cancellation),
             });
         }
         let step = steps
@@ -813,12 +858,15 @@ async fn drive_agent_turn(
         *current_step = Some(step);
         let admission = build_agent_turn_call(
             ctx,
-            target,
-            turn,
-            step,
-            seed_config.clone(),
             &mut request_state,
-            steps > 0 && turn_end.is_none(),
+            AgentTurnRequest {
+                target,
+                turn,
+                step,
+                seed_config: seed_config.clone(),
+                cancellation,
+                allow_empty_continuation: steps > 0 && turn_end.is_none(),
+            },
         )?;
         let logged = match admission {
             AgentBuildAdmission::NoCall(proposal) => match proposal.decision() {
@@ -859,7 +907,7 @@ async fn drive_agent_turn(
             return Ok(AgentTurnOutcome {
                 turn,
                 steps,
-                reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                reason: cancelled_turn_reason(cancellation),
             });
         }
         if let Some(reason) = turn_end {
@@ -874,7 +922,7 @@ async fn drive_agent_turn(
                     return Ok(AgentTurnOutcome {
                         turn,
                         steps,
-                        reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                        reason: cancelled_turn_reason(cancellation),
                     });
                 }
             }
@@ -896,11 +944,11 @@ async fn run_agent_turn_step(
     cancellation: &LifecycleCancellation,
 ) -> Result<Option<TurnEndReason>, CordisError> {
     if cancellation.is_cancelled() {
-        return Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)));
+        return Ok(Some(cancelled_turn_reason(cancellation)));
     }
     let mut recorded = record_agent_stream(ctx, logged).await?;
     if cancellation.is_cancelled() {
-        return Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)));
+        return Ok(Some(cancelled_turn_reason(cancellation)));
     }
     let committed = commit_agent_stream(ctx, logged, &mut recorded)?;
     match committed.finish() {
@@ -908,9 +956,7 @@ async fn run_agent_turn_step(
             failure: failure.clone(),
         }
         .into()),
-        SessionFinishReason::Aborted { .. } => {
-            Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)))
-        }
+        SessionFinishReason::Aborted { .. } => Ok(Some(cancelled_turn_reason(cancellation))),
         SessionFinishReason::MaxTokens => Ok(Some(TurnEndReason::MaxTokens)),
         SessionFinishReason::Stop | SessionFinishReason::ToolCalls => {
             let calls = schedule_agent_tool_calls(ctx, logged, &mut recorded)?;
@@ -925,7 +971,7 @@ async fn run_agent_turn_step(
                 cancellation,
             )?;
             if cancellation.is_cancelled() {
-                Ok(Some(TurnEndReason::Aborted(SessionCancelCause::Legacy)))
+                Ok(Some(cancelled_turn_reason(cancellation)))
             } else if outcome.concludes_turn() {
                 Ok(Some(TurnEndReason::Completed))
             } else {
@@ -933,6 +979,10 @@ async fn run_agent_turn_step(
             }
         }
     }
+}
+
+fn cancelled_turn_reason(cancellation: &LifecycleCancellation) -> TurnEndReason {
+    TurnEndReason::Aborted(cancellation.cause().unwrap_or(SessionCancelCause::Legacy))
 }
 
 /// Dispatch one N45-logged call into the raw provider-neutral stream boundary.
@@ -948,7 +998,8 @@ pub fn dispatch_agent_call(
     let generated = LlmGenerateRequest::new(call.config().clone(), call.messages().to_vec())
         .with_system(call.assembly().system().map(str::to_string))
         .with_tools(call.assembly().tools().to_vec())
-        .with_session_id(session_id);
+        .with_session_id(session_id)
+        .with_cancellation(request.cancellation().clone());
     match call.prepared_llm_call() {
         Some(prepared) => stream_prepared_llm(ctx, prepared, generated),
         None => stream_llm_request(ctx, generated),
@@ -968,14 +1019,29 @@ pub async fn record_agent_stream(
     let session_id = SessionId::new(request.agent().id.clone())?;
     let turn = request.turn();
     let step = request.step();
+    let cancellation = request.cancellation().clone();
     let mut stream = dispatch_agent_call(ctx, logged)?;
     let session = agent_session(ctx, &session_id)?;
     let mut grammar = AgentStreamGrammar::default();
     let mut chunk_seqs = Vec::new();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let (chunk, interrupted) = tokio::select! {
+            biased;
+            chunk = stream.next() => {
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                (chunk, false)
+            }
+            () = cancellation.cancelled() => (cancelled_stream_finish(), true),
+        };
+        let terminal = matches!(chunk, SessionStreamChunk::Finish { .. });
         grammar.accept(&chunk)?;
         chunk_seqs.push(session.append_assistant_chunk(turn, step, chunk)?);
+        if interrupted || terminal && cancellation.is_cancelled() {
+            break;
+        }
     }
 
     let finish = grammar.complete()?;
@@ -993,6 +1059,21 @@ pub async fn record_agent_stream(
         tool_results_committed: false,
         tool_batch_state: AgentToolBatchState::Ready,
     })
+}
+
+fn cancelled_stream_finish() -> SessionStreamChunk {
+    SessionStreamChunk::Finish {
+        reason: SessionFinishReason::Aborted {
+            failure: SessionLlmFailure {
+                message: "agent turn cancelled".into(),
+                code: "ABORTED".into(),
+                status: None,
+                provider_retry_after_ms: None,
+                request_id: None,
+            },
+        },
+        replay_state: None,
+    }
 }
 
 /// Assemble one N48-recorded stream and commit its successful assistant message.
@@ -1450,7 +1531,7 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
         }
         if tools.execution_mode(&inputs[next]) == crate::surface::ToolExecutionMode::Exclusive {
             let preparation = prepare_tool_execution(ctx, inputs[next].clone())?;
-            let result = settle_tool_preparation(ctx, preparation)?;
+            let result = settle_tool_preparation(ctx, preparation, cancellation)?;
             results.push(result);
             next += 1;
             continue;
@@ -1499,10 +1580,11 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
 fn settle_tool_preparation(
     ctx: &mut Context,
     preparation: ToolExecutionPreparation,
+    cancellation: &LifecycleCancellation,
 ) -> Result<ToolExecutionResult, CordisError> {
     match preparation {
         ToolExecutionPreparation::Dispatch(prepared) => {
-            let outcome = dispatch_tool_execution(ctx, prepared)?;
+            let outcome = dispatch_tool_execution_with_cancellation(ctx, prepared, cancellation)?;
             let outcome = post_tool_execution(ctx, outcome)?;
             Ok(finalize_tool_execution(ctx, outcome))
         }
@@ -1569,7 +1651,7 @@ fn run_parallel_tool_group(
                         barrier_reached = true;
                     }
                     ToolExecutionPreparation::Dispatch(prepared) => {
-                        let dispatch = schedule_tool_dispatch(ctx, prepared)?;
+                        let dispatch = schedule_tool_dispatch(ctx, prepared, cancellation.clone())?;
                         let completion = sender.clone();
                         let index = next_to_start;
                         scope.spawn(move || {
@@ -1592,7 +1674,15 @@ fn run_parallel_tool_group(
 
             if in_flight == 0 {
                 if let Some((index, prepared)) = pending_exclusive.take() {
-                    slots[index] = Some(dispatch_tool_execution(ctx, prepared)?);
+                    if aborted {
+                        next_to_start = index;
+                        break;
+                    }
+                    slots[index] = Some(dispatch_tool_execution_with_cancellation(
+                        ctx,
+                        prepared,
+                        cancellation,
+                    )?);
                     finalize_ready_tool_slots(
                         ctx,
                         &mut slots,
@@ -1990,6 +2080,7 @@ fn prepare_agent_step_for_session(
     target: AgentInboxTarget,
     turn: u64,
     step: u64,
+    cancellation: &LifecycleCancellation,
 ) -> Result<AgentPreStep, CordisError> {
     let claimed = session.inbox().claim(target, turn)?;
     let assembly = assemble_system_prompt(ctx)?;
@@ -1999,6 +2090,7 @@ fn prepare_agent_step_for_session(
         step,
         claimed,
         assembly,
+        cancellation.clone(),
     );
     let proposal = ctx.waterfall(events::AGENT_PRE_STEP, proposal)?;
     if let AgentPreStepDecision::Enter { messages, .. } = proposal.decision() {

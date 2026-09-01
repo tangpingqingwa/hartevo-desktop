@@ -56,9 +56,9 @@ use hartevo_cordis::{
     EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding,
     LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError, LlmGenerateRequest,
     LlmResolvedModel, RuntimeBinding, RuntimeDispatchPermit, RuntimeRecordBinding,
-    SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionLlmFailure,
-    SessionMessageRole, SessionMessageSource, SessionStreamBlockType, SessionStreamChunk,
-    TurnEndReason,
+    SessionCallConfig, SessionCancelCause, SessionContentBlock, SessionFinishReason,
+    SessionLlmFailure, SessionMessageRole, SessionMessageSource, SessionStreamBlockType,
+    SessionStreamChunk, TurnEndReason,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -304,6 +304,7 @@ struct DesktopRuntimeProgressFeed {
 #[derive(Clone, Debug, Default)]
 pub struct DesktopRuntimeCancellation {
     requested: Arc<AtomicBool>,
+    cordis: LifecycleCancellation,
     progress: Arc<Mutex<DesktopRuntimeProgressFeed>>,
     local_approval: Arc<Mutex<Option<DesktopHeldLocalApproval>>>,
     local_approval_decision: Arc<Mutex<Option<bool>>>,
@@ -323,12 +324,17 @@ pub struct DesktopHeldLocalApproval {
 impl DesktopRuntimeCancellation {
     pub fn request(&self) {
         if !self.requested.swap(true, Ordering::AcqRel) {
+            self.cordis.cancel_with(SessionCancelCause::User);
             self.record_progress(DesktopRuntimeProgressPhase::StopRequested);
         }
     }
 
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    fn cordis_cancellation(&self) -> LifecycleCancellation {
+        self.cordis.clone()
     }
 
     pub fn held_local_approval(&self) -> Option<DesktopHeldLocalApproval> {
@@ -1339,6 +1345,7 @@ struct DesktopLiveAgentTurnCompletion {
     attempt: Option<RuntimeTurnAttempt>,
     logical_millis: i64,
     runtime_start_failed: bool,
+    user_interrupt_sent: bool,
 }
 
 type DesktopLiveAgentTurnResult = Result<DesktopLiveAgentTurnCompletion, DesktopDataError>;
@@ -1432,6 +1439,7 @@ where
                 "Desktop Application Runtime request does not match its durable Cordis input",
             ));
         }
+        let cordis_cancellation = request.cancellation().clone();
         let run = self
             .run
             .lock()
@@ -1450,6 +1458,9 @@ where
             })?;
         match run() {
             Ok((completion, chunks)) => {
+                if completion.user_interrupt_sent {
+                    cordis_cancellation.cancel_with(SessionCancelCause::User);
+                }
                 *self.completion.lock().map_err(|_| {
                     desktop_live_agent_failure(
                         "DESKTOP_RUNTIME_COMPLETION_POISONED",
@@ -1659,6 +1670,7 @@ fn run_desktop_application_runtime_turn(
                     attempt: None,
                     logical_millis,
                     runtime_start_failed: true,
+                    user_interrupt_sent: false,
                 },
                 desktop_live_agent_abort_chunks(
                     "DESKTOP_RUNTIME_START_FAILED",
@@ -1701,6 +1713,7 @@ fn run_desktop_application_runtime_turn(
                 attempt: Some(attempt),
                 logical_millis,
                 runtime_start_failed: false,
+                user_interrupt_sent: false,
             },
             chunks,
         ));
@@ -1877,6 +1890,7 @@ fn run_desktop_application_runtime_turn(
             attempt: Some(attempt),
             logical_millis,
             runtime_start_failed: false,
+            user_interrupt_sent: cooperative_interrupt_sent,
         },
         chunks,
     ))
@@ -5547,6 +5561,12 @@ impl DesktopDataPlane {
                 )
             },
         );
+        let cordis_cancellation = cancellation
+            .filter(|control| !control.is_requested())
+            .map_or_else(
+                LifecycleCancellation::default,
+                DesktopRuntimeCancellation::cordis_cancellation,
+            );
         let agent_result = {
             let mut cordis = self
                 .cordis
@@ -5555,7 +5575,7 @@ impl DesktopDataPlane {
             futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
                 request,
                 adapter,
-                &LifecycleCancellation::default(),
+                &cordis_cancellation,
                 permit,
             ))
         };
@@ -5578,6 +5598,7 @@ impl DesktopDataPlane {
             attempt,
             mut logical_millis,
             runtime_start_failed,
+            ..
         } = completion;
         if let Err(error) = agent_result {
             return Err(DesktopDataError::CordisSessionPersistence(
@@ -8359,6 +8380,17 @@ mod tests {
                 .expect("repaired Session");
             (sessions, restored)
         })
+    }
+
+    fn assert_desktop_cordis_turn_aborted_by_user(plane: &DesktopDataPlane, id: &str) {
+        let (_, session) = desktop_cordis_session(plane, id);
+        assert!(matches!(
+            session.events().unwrap().last().map(|event| &event.kind),
+            Some(hartevo_cordis::SessionEventKind::TurnEnd {
+                reason: TurnEndReason::Aborted(SessionCancelCause::User),
+                ..
+            })
+        ));
     }
 
     fn assert_durable_crash_repair(
@@ -12663,7 +12695,7 @@ sleep 30"#;
                 &events[9].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
-                    reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                    reason: TurnEndReason::Aborted(SessionCancelCause::User),
                 }
             ));
             assert_eq!(session.derive_messages().unwrap().len(), 1);
@@ -12841,7 +12873,7 @@ sleep 30"#;
                 &events[12].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
-                    reason: TurnEndReason::Aborted(SessionCancelCause::Legacy),
+                    reason: TurnEndReason::Aborted(SessionCancelCause::User),
                 }
             ));
         });
@@ -13528,6 +13560,68 @@ sleep 30"#;
 
     #[cfg(unix)]
     #[test]
+    fn desktop_adapter_only_projects_an_explicit_user_interrupt_into_cordis() {
+        use hartevo_cordis::{SessionId, SessionMessage};
+
+        let (_directory, plane, secrets, _) = ready_personal_fixture();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at())
+            .expect("Application service");
+        let cancellation = LifecycleCancellation::default();
+        let (adapter, _) = DesktopApplicationLlmAdapter::new(
+            "fixture-provider".into(),
+            "fixture-model".into(),
+            "non-user-interrupt".into(),
+            "non-user-interrupt-message".into(),
+            "non-user interrupt",
+            move || {
+                Ok((
+                    DesktopLiveAgentTurnCompletion {
+                        service,
+                        attempt: None,
+                        logical_millis: 0,
+                        runtime_start_failed: false,
+                        user_interrupt_sent: false,
+                    },
+                    desktop_live_agent_abort_chunks(
+                        "DESKTOP_RUNTIME_INTERRUPTED",
+                        "Desktop Application Runtime interrupted without a user stop",
+                    ),
+                ))
+            },
+        );
+        let request = LlmGenerateRequest::new(
+            SessionCallConfig {
+                provider: "fixture-provider".into(),
+                model: "fixture-model".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+            vec![SessionMessage {
+                id: "non-user-interrupt-message".into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::Text {
+                    text: "non-user interrupt".into(),
+                }],
+                source: SessionMessageSource::User,
+            }],
+        )
+        .with_session_id(SessionId::new("non-user-interrupt").unwrap())
+        .with_cancellation(cancellation.clone());
+
+        let _stream = adapter.stream(request).unwrap();
+
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(cancellation.cause(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cooperative_desktop_stop_becomes_exact_runtime_interrupt() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let cancellation = DesktopRuntimeCancellation::default();
@@ -13563,6 +13657,7 @@ sleep 30"#;
             submission.runtime_outcome,
             DesktopMissionRuntimeOutcome::Interrupted
         );
+        assert_desktop_cordis_turn_aborted_by_user(&plane, submission.mission_id.as_str());
         let progress = cancellation.progress_since(0);
         assert!(
             progress
