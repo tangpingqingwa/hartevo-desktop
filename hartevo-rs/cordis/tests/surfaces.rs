@@ -321,13 +321,16 @@ fn tools_pipeline_runs_on_ctx_tools_not_openinterpreter() {
     }
     {
         let seen = Arc::clone(&seen);
-        ctx.on_waterfall(events::TOOLS_EXECUTE, move |mut call: ToolCall, next| {
-            seen.lock()
-                .expect("seen")
-                .push(format!("execute:{}", call.name));
-            call.result = format!("ran:{}", call.arguments);
-            next(call)
-        })
+        ctx.on_waterfall(
+            events::LEGACY_TOOLS_EXECUTE,
+            move |mut call: ToolCall, next| {
+                seen.lock()
+                    .expect("seen")
+                    .push(format!("execute:{}", call.name));
+                call.result = format!("ran:{}", call.arguments);
+                next(call)
+            },
+        )
         .unwrap();
     }
     {
@@ -890,8 +893,10 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
     register_tool(&mut ctx, "search").unwrap();
     register_llm_stream(&mut ctx, "hartevo-local").unwrap();
     register_agent(&mut ctx, AgentRef::new("mission-1")).unwrap();
-    ctx.on_waterfall(events::TOOLS_EXECUTE, |call: ToolCall, next| next(call))
-        .unwrap();
+    ctx.on_waterfall(events::LEGACY_TOOLS_EXECUTE, |call: ToolCall, next| {
+        next(call)
+    })
+    .unwrap();
     ctx.on_waterfall(events::LLM_STREAM, |stream: LlmStream, next| next(stream))
         .unwrap();
     ctx.on_emit(events::AGENT_CREATED, |_: &AgentRef| {})
@@ -912,7 +917,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
             .len(),
         1
     );
-    assert_eq!(ctx.listener_count(events::TOOLS_EXECUTE), 1);
+    assert_eq!(ctx.listener_count(events::LEGACY_TOOLS_EXECUTE), 1);
     assert_eq!(ctx.listener_count(events::LLM_STREAM), 1);
     assert!(ctx.listener_count(events::AGENT_CREATED) >= 2);
 

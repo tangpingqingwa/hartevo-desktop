@@ -42,7 +42,10 @@ pub const MAPPED_KEYS: &[&str] = &[
 pub mod events {
     use crate::event::{Emit, EventKey, EventSchemaId, Waterfall};
 
-    use super::{AgentPreStep, AgentRef, AgentRequest, LlmStream, PromptAssembly, ToolCall};
+    use super::{
+        AgentPreStep, AgentRef, AgentRequest, LlmStream, PromptAssembly, ToolCall,
+        ToolDispatchExecution,
+    };
 
     /// Replace or wrap one detached system-prompt/tool-schema assembly.
     pub const SYSTEM_PROMPT_ASSEMBLE: EventKey<Waterfall, PromptAssembly, PromptAssembly> =
@@ -57,9 +60,15 @@ pub mod events {
         "tools/pre-execute",
     );
     /// Around-dispatch waterfall wrapping the tool body.
-    pub const TOOLS_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
-        EventSchemaId::new("hartevo.tools.execute.v1"),
-        "tools/execute",
+    pub const TOOLS_EXECUTE: EventKey<Waterfall, ToolDispatchExecution, ToolDispatchExecution> =
+        EventKey::new(
+            EventSchemaId::new("hartevo.tools.execute.v2"),
+            "tools/execute",
+        );
+    /// Detached compatibility seam used only by the pre-durable fixture path.
+    pub const LEGACY_TOOLS_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
+        EventSchemaId::new("hartevo.legacy-tools.execute.v1"),
+        "hartevo/legacy-tools-execute",
     );
     /// Inspect / replace waterfall after a tool body.
     pub const TOOLS_POST_EXECUTE: EventKey<Waterfall, ToolCall, ToolCall> = EventKey::new(
@@ -425,6 +434,48 @@ impl PreparedToolExecution {
     #[must_use]
     pub const fn mode(&self) -> ToolExecutionMode {
         self.mode
+    }
+}
+
+/// Opaque around-dispatch view carried through the canonical `tools/execute`
+/// Cordis waterfall. Wrappers may inspect the immutable durable input, call
+/// `next` to wrap the exact body, or settle the call without invoking it.
+pub struct ToolDispatchExecution {
+    input: ToolExecutionInput,
+    prepared: Option<PreparedToolExecution>,
+    result: Option<ToolDispatchResult>,
+    terminal_identity: Arc<()>,
+}
+
+impl fmt::Debug for ToolDispatchExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolDispatchExecution")
+            .field("input", &self.input)
+            .field("settled", &self.result.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolDispatchExecution {
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> Option<&ToolDispatchResult> {
+        self.result.as_ref()
+    }
+
+    /// Settle or replace the dispatch result. Calling this before `next`
+    /// short-circuits the body; calling it on the value returned by `next`
+    /// replaces the normalized downstream result without changing input.
+    #[must_use]
+    pub fn complete(mut self, result: ToolDispatchResult) -> Self {
+        self.prepared = None;
+        self.result = Some(result);
+        self
     }
 }
 
@@ -2311,7 +2362,7 @@ pub fn run_tools_pipeline(ctx: &mut Context, mut call: ToolCall) -> Result<ToolC
         ctx.emit(events::TOOLS_RESULT, &call)?;
         return Ok(call);
     }
-    call = ctx.waterfall(events::TOOLS_EXECUTE, call)?;
+    call = ctx.waterfall(events::LEGACY_TOOLS_EXECUTE, call)?;
     call.call_id.clone_from(&call_id);
     call = ctx.waterfall(events::TOOLS_POST_EXECUTE, call)?;
     call.call_id = call_id;
@@ -2409,12 +2460,64 @@ fn denied_tool_execution(
 /// executor. Body failures are values for later post-execute policy; only a
 /// missing Cordis surface remains a structural [`CordisError`].
 pub fn dispatch_tool_execution(
-    ctx: &Context,
+    ctx: &mut Context,
     prepared: PreparedToolExecution,
 ) -> Result<ToolDispatchOutcome, CordisError> {
     let tools = ctx
         .tools::<ToolsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let input = prepared.input().clone();
+    let terminal_identity = Arc::new(());
+    let terminal_tools = Arc::clone(&tools);
+    let expected_terminal = Arc::clone(&terminal_identity);
+    let terminal = ctx.on_waterfall(
+        events::TOOLS_EXECUTE,
+        move |mut execution: ToolDispatchExecution, next| {
+            if !Arc::ptr_eq(&execution.terminal_identity, &expected_terminal) {
+                return next(execution);
+            }
+            if execution.result.is_some() {
+                return execution;
+            }
+            let Some(prepared) = execution.prepared.take() else {
+                return execution;
+            };
+            execution.result =
+                Some(dispatch_prepared_tool_execution(&terminal_tools, prepared).into_result());
+            execution
+        },
+    )?;
+    let execution = ToolDispatchExecution {
+        input: input.clone(),
+        prepared: Some(prepared),
+        result: None,
+        terminal_identity,
+    };
+    let dispatched = catch_unwind(AssertUnwindSafe(|| {
+        ctx.waterfall(events::TOOLS_EXECUTE, execution)
+    }));
+    terminal.dispose();
+    let execution = match dispatched {
+        Ok(Ok(execution)) => execution,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            return Ok(tool_dispatch_failure(
+                input,
+                "tools/execute wrapper panicked",
+            ));
+        }
+    };
+    let ToolDispatchExecution { input, result, .. } = execution;
+    Ok(match result {
+        Some(result) => ToolDispatchOutcome { input, result },
+        None => tool_dispatch_failure(input, "tools/execute short-circuited without a result"),
+    })
+}
+
+fn dispatch_prepared_tool_execution(
+    tools: &ToolsSurface,
+    prepared: PreparedToolExecution,
+) -> ToolDispatchOutcome {
     let PreparedToolExecution {
         input,
         registration_identity,
@@ -2422,30 +2525,24 @@ pub fn dispatch_tool_execution(
     } = prepared;
     let executor = {
         let Ok(state) = tools.state.lock() else {
-            return Ok(tool_dispatch_failure(input, "tool registry is unavailable"));
+            return tool_dispatch_failure(input, "tool registry is unavailable");
         };
         let Some(registered) = state
             .names
             .iter()
             .rfind(|registered| registered.name == input.name())
         else {
-            return Ok(tool_dispatch_failure(
-                input,
-                "tool registration changed before dispatch",
-            ));
+            return tool_dispatch_failure(input, "tool registration changed before dispatch");
         };
         if !Arc::ptr_eq(&registered.identity, &registration_identity) {
-            return Ok(tool_dispatch_failure(
-                input,
-                "tool registration changed before dispatch",
-            ));
+            return tool_dispatch_failure(input, "tool registration changed before dispatch");
         }
         let Some(executor) = &registered.executor else {
             let name = input.name().to_string();
-            return Ok(tool_dispatch_failure(
+            return tool_dispatch_failure(
                 input,
                 format!("tool \"{name}\" has no registered executor"),
-            ));
+            );
         };
         Arc::clone(executor)
     };
@@ -2456,7 +2553,7 @@ pub fn dispatch_tool_execution(
             message: format!("tool \"{}\" panicked", input.name()),
         },
     };
-    Ok(ToolDispatchOutcome { input, result })
+    ToolDispatchOutcome { input, result }
 }
 
 fn tool_dispatch_failure(
