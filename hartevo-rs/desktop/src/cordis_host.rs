@@ -21,17 +21,17 @@ use hartevo_cordis::{
     EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, Fiber,
     FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
     KernelConsentState, KernelConsentStatus, LifecycleCancellation, LlmAdapter, LlmAdapterStream,
-    LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError, RuntimeAuthority,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeStatusCompletion, SessionCallConfig,
-    SessionCancelCause, SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart,
-    SessionCompactionSummary, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
-    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
-    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
-    SessionRequestHeader, SessionRequestHeaderReason, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, compact_now,
-    host_is_cordis_loop, keys, register_llm_adapter, run_agent_turn as run_cordis_agent_turn,
-    session_events,
+    LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError,
+    ManualCompactionErrorCode, RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit,
+    RuntimeStatusCompletion, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
+    SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary, SessionContentBlock,
+    SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
+    SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure,
+    SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
+    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+    SessionToolError, TurnEndReason, compact_now, host_is_cordis_loop, keys, register_llm_adapter,
+    run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -338,6 +338,69 @@ pub(crate) struct DesktopRuntimeSessionTranscript {
     assistant_chunks: Vec<String>,
     assistant_body: Option<String>,
     end_reason: TurnEndReason,
+}
+
+const DESKTOP_COMPACT_COMMAND_USAGE: &str = "Usage: /compact (no arguments)";
+
+/// One Desktop-owned human command result. Command text is presentation-only;
+/// a successful compaction separately names its durable summary event.
+#[allow(
+    dead_code,
+    reason = "consumed by the following Dioxus composer and production summarizer slice"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DesktopHumanCommandResult {
+    Success {
+        text: String,
+        source_event_seq: Option<u64>,
+    },
+    Error {
+        text: String,
+    },
+}
+
+/// Whether an input belonged to the Desktop human-command surface. Unknown
+/// slash forms and ordinary messages remain available to the normal composer.
+#[allow(
+    dead_code,
+    reason = "consumed by the following Dioxus composer and production summarizer slice"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DesktopHumanCommandDispatch {
+    NotCommand,
+    Handled(DesktopHumanCommandResult),
+}
+
+fn compact_command_raw_input(line: &str) -> Option<&str> {
+    let raw_input = line.strip_prefix("/compact")?;
+    (raw_input.is_empty()
+        || raw_input
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r')))
+    .then_some(raw_input)
+}
+
+fn manual_compaction_failure_result(code: ManualCompactionErrorCode) -> DesktopHumanCommandResult {
+    let text = match code {
+        ManualCompactionErrorCode::Busy => {
+            "Compaction is unavailable because this process has an active compaction, or the agent is not idle."
+        }
+        ManualCompactionErrorCode::Cancelled => "Compaction cancelled.",
+        ManualCompactionErrorCode::Changed => {
+            "The history selected for compaction changed before it could be replaced. The conversation is unchanged; the attempt is recorded in the session log."
+        }
+        ManualCompactionErrorCode::Summary => {
+            "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."
+        }
+        ManualCompactionErrorCode::Commit => {
+            "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying."
+        }
+        ManualCompactionErrorCode::Persistence => {
+            "Compaction finished, but the session could not be saved."
+        }
+    };
+    DesktopHumanCommandResult::Error { text: text.into() }
 }
 
 /// One exact Desktop input admitted to the complete Cordis turn driver.
@@ -752,10 +815,6 @@ impl DesktopCordisCoordinator {
     /// provider stream is consumed. `compact_now` owns the terminal flush and
     /// the complete manual failure taxonomy. The temporary provider route is
     /// removed before this method returns on every result path.
-    #[allow(
-        dead_code,
-        reason = "consumed by the following Desktop human-command slice"
-    )]
     pub(crate) async fn compact_session<A>(
         &mut self,
         session_id: &str,
@@ -812,6 +871,69 @@ impl DesktopCordisCoordinator {
         .await;
         registration.dispose();
         outcome.map_err(Into::into)
+    }
+
+    /// Parse and execute the argument-free Desktop `/compact` command.
+    ///
+    /// Inputs outside this exact lowercase command fall through untouched.
+    /// Expected manual-compaction failures are stable human results; mounting,
+    /// routing, and Session failures remain typed coordinator errors.
+    #[allow(
+        dead_code,
+        reason = "consumed by the following Dioxus composer and production summarizer slice"
+    )]
+    pub(crate) async fn dispatch_human_command<A>(
+        &mut self,
+        session_id: &str,
+        command_id: String,
+        line: &str,
+        adapter: A,
+        cancellation: &LifecycleCancellation,
+    ) -> Result<DesktopHumanCommandDispatch, DesktopManualCompactionError>
+    where
+        A: LlmAdapter,
+    {
+        let Some(raw_input) = compact_command_raw_input(line) else {
+            return Ok(DesktopHumanCommandDispatch::NotCommand);
+        };
+        if !raw_input.trim().is_empty() {
+            return Ok(DesktopHumanCommandDispatch::Handled(
+                DesktopHumanCommandResult::Error {
+                    text: DESKTOP_COMPACT_COMMAND_USAGE.into(),
+                },
+            ));
+        }
+
+        match self
+            .compact_session(session_id, Some(command_id), adapter, cancellation)
+            .await
+        {
+            Ok(None) => Ok(DesktopHumanCommandDispatch::Handled(
+                DesktopHumanCommandResult::Success {
+                    text: "No compactable history yet.".into(),
+                    source_event_seq: None,
+                },
+            )),
+            Ok(Some(result)) => Ok(DesktopHumanCommandDispatch::Handled(
+                DesktopHumanCommandResult::Success {
+                    text: format!(
+                        "Compacted {} history items (~{} tokens).",
+                        result.shadowed_seqs.len(),
+                        result.shadowed_token_count
+                    ),
+                    source_event_seq: Some(result.summary_seq),
+                },
+            )),
+            Err(_) if cancellation.is_cancelled() => Ok(DesktopHumanCommandDispatch::Handled(
+                manual_compaction_failure_result(ManualCompactionErrorCode::Cancelled),
+            )),
+            Err(DesktopManualCompactionError::Manual(error)) => {
+                Ok(DesktopHumanCommandDispatch::Handled(
+                    manual_compaction_failure_result(error.code()),
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Run one complete Cordis turn through a request-scoped Desktop adapter.
@@ -1563,10 +1685,6 @@ pub(crate) enum DesktopAgentTurnError {
     Session(#[from] SessionError),
 }
 
-#[allow(
-    dead_code,
-    reason = "consumed by the following Desktop human-command slice"
-)]
 #[derive(Debug, Error)]
 pub(crate) enum DesktopManualCompactionError {
     #[error("Cordis did not mount its Session store")]
@@ -2543,8 +2661,9 @@ mod tests {
         DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
-        LlmGenerateRequest, LlmResolvedModel, LlmSurface, OPENINTERPRETER, RuntimeBinding,
-        SessionCallConfig, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+        LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
+        OPENINTERPRETER, RuntimeBinding, SessionCallConfig, SessionCancelCause,
+        SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
         SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
         SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
         SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
@@ -2567,10 +2686,11 @@ mod tests {
         DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisSlot,
         DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
         DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
-        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_event,
-        dispatch_live_domain_command, dispatch_live_effect_execution,
-        dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
-        dispatch_live_runtime, encode_event, mount_cordis_host, openinterpreter_runtime_plugin,
+        DesktopHumanCommandDispatch, DesktopHumanCommandResult, bind_live_domain_kernel,
+        bind_live_domain_kernel_scope, decode_event, dispatch_live_domain_command,
+        dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
+        dispatch_live_effect_verification, dispatch_live_runtime, encode_event,
+        manual_compaction_failure_result, mount_cordis_host, openinterpreter_runtime_plugin,
         runtime_open_turn,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
@@ -2866,20 +2986,15 @@ mod tests {
         let (adapter, probe) = desktop_turn_adapter(Arc::clone(&flushes));
 
         let result = live
-            .compact_session(
+            .dispatch_human_command(
                 "desktop-manual-compaction",
-                Some("desktop-command-1".into()),
+                "desktop-command-1".into(),
+                "/compact",
                 adapter,
                 &LifecycleCancellation::default(),
             )
             .await
-            .unwrap()
             .unwrap();
-
-        assert_eq!(
-            result.source_command_id.as_deref(),
-            Some("desktop-command-1")
-        );
         assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.observed_prepare_flushes.load(Ordering::SeqCst), 1);
@@ -2896,6 +3011,28 @@ mod tests {
         let expected_events = session.events().unwrap();
         let expected_surface = session.surface().unwrap();
         let expected_messages = session.derive_messages().unwrap();
+        let (summary_seq, summary) = expected_events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::CompactionSummary { compaction } => Some((event.seq, compaction)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            DesktopHumanCommandDispatch::Handled(DesktopHumanCommandResult::Success {
+                text: format!(
+                    "Compacted {} history items (~{} tokens).",
+                    summary.shadowed_seqs.len(),
+                    summary.shadowed_token_count
+                ),
+                source_event_seq: Some(summary_seq),
+            })
+        );
+        assert_eq!(
+            summary.source_command_id.as_deref(),
+            Some("desktop-command-1")
+        );
         assert!(is_compact_checkpoint_source(&expected_messages[0].source));
 
         let store = live
@@ -2935,16 +3072,23 @@ mod tests {
         let (adapter, probe) = desktop_turn_adapter(flushes);
 
         let result = live
-            .compact_session(
+            .dispatch_human_command(
                 "desktop-manual-empty",
-                Some("desktop-command-empty".into()),
+                "desktop-command-empty".into(),
+                "/compact\t ",
                 adapter,
                 &LifecycleCancellation::default(),
             )
             .await
             .unwrap();
 
-        assert!(result.is_none());
+        assert_eq!(
+            result,
+            DesktopHumanCommandDispatch::Handled(DesktopHumanCommandResult::Success {
+                text: "No compactable history yet.".into(),
+                source_event_seq: None,
+            })
+        );
         assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
         assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
         let session = live
@@ -2963,6 +3107,130 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_compact_command_rejects_arguments_and_preserves_fallthrough() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let (adapter, probe) = desktop_turn_adapter(Arc::clone(&flushes));
+
+        let usage = live
+            .dispatch_human_command(
+                "missing-session-is-not-read",
+                "desktop-command-usage".into(),
+                "/compact now",
+                adapter,
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            usage,
+            DesktopHumanCommandDispatch::Handled(DesktopHumanCommandResult::Error {
+                text: "Usage: /compact (no arguments)".into(),
+            })
+        );
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
+
+        for line in ["ordinary message", "/compactly", "/Compact", "/compact/"] {
+            let (adapter, probe) = desktop_turn_adapter(Arc::clone(&flushes));
+            let result = live
+                .dispatch_human_command(
+                    "missing-session-is-not-read",
+                    "desktop-command-fallthrough".into(),
+                    line,
+                    adapter,
+                    &LifecycleCancellation::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, DesktopHumanCommandDispatch::NotCommand);
+            assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn desktop_compact_command_maps_every_manual_failure_code() {
+        let expected = [
+            (
+                ManualCompactionErrorCode::Busy,
+                "Compaction is unavailable because this process has an active compaction, or the agent is not idle.",
+            ),
+            (
+                ManualCompactionErrorCode::Cancelled,
+                "Compaction cancelled.",
+            ),
+            (
+                ManualCompactionErrorCode::Changed,
+                "The history selected for compaction changed before it could be replaced. The conversation is unchanged; the attempt is recorded in the session log.",
+            ),
+            (
+                ManualCompactionErrorCode::Summary,
+                "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log.",
+            ),
+            (
+                ManualCompactionErrorCode::Commit,
+                "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying.",
+            ),
+            (
+                ManualCompactionErrorCode::Persistence,
+                "Compaction finished, but the session could not be saved.",
+            ),
+        ];
+        for (code, text) in expected {
+            assert_eq!(
+                manual_compaction_failure_result(code),
+                DesktopHumanCommandResult::Error { text: text.into() }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_compact_command_prioritizes_cancellation_without_provider_work() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        live.context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .create(SessionId::new("desktop-manual-cancelled").unwrap())
+            .unwrap();
+        let cancellation = LifecycleCancellation::default();
+        cancellation.cancel_with(SessionCancelCause::User);
+        let (adapter, probe) = desktop_turn_adapter(Arc::new(AtomicUsize::new(0)));
+
+        let result = live
+            .dispatch_human_command(
+                "desktop-manual-cancelled",
+                "desktop-command-cancelled".into(),
+                "/compact",
+                adapter,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            DesktopHumanCommandDispatch::Handled(DesktopHumanCommandResult::Error {
+                text: "Compaction cancelled.".into(),
+            })
+        );
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
+        let session = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&SessionId::new("desktop-manual-cancelled").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(session.events().unwrap().is_empty());
     }
 
     #[tokio::test]
