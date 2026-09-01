@@ -23,7 +23,7 @@ use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
     SessionId, SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk,
     SessionToolCall, SessionToolError, SessionToolSchema, events as session_events,
-    validate_agent_request_config,
+    validate_agent_request_config, validate_agent_user_message,
 };
 
 /// Canonical DeepSeek Harness code for a tool call cancelled before dispatch.
@@ -358,6 +358,101 @@ pub struct ToolExecutionInput {
     arguments: serde_json::Value,
 }
 
+/// Execution-local tool context for deferring next-step input and requesting
+/// successful turn conclusion without mutating immutable call identity.
+pub struct ToolRunContext {
+    input: ToolExecutionInput,
+    additional_contexts: Mutex<Vec<SessionMessage>>,
+    concludes_turn: AtomicBool,
+}
+
+impl fmt::Debug for ToolRunContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRunContext")
+            .field("input", &self.input)
+            .field(
+                "concludes_turn",
+                &self.concludes_turn.load(Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolRunContext {
+    fn new(input: ToolExecutionInput) -> Self {
+        Self {
+            input,
+            additional_contexts: Mutex::new(Vec::new()),
+            concludes_turn: AtomicBool::new(false),
+        }
+    }
+
+    #[must_use]
+    pub const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn call_seq(&self) -> u64 {
+        self.input.call_seq()
+    }
+
+    #[must_use]
+    pub const fn turn(&self) -> u64 {
+        self.input.turn()
+    }
+
+    #[must_use]
+    pub const fn step(&self) -> u64 {
+        self.input.step()
+    }
+
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        self.input.call_id()
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.input.name()
+    }
+
+    #[must_use]
+    pub fn raw_arguments(&self) -> &str {
+        self.input.raw_arguments()
+    }
+
+    #[must_use]
+    pub const fn arguments(&self) -> &serde_json::Value {
+        self.input.arguments()
+    }
+
+    /// Defer one typed context until the final result reaches the agent driver.
+    /// Validation occurs before final result observation.
+    pub fn defer_context(&self, context: SessionMessage) {
+        self.additional_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(context);
+    }
+
+    /// Mark this execution's successful final result as turn-concluding.
+    pub fn conclude_turn(&self) {
+        self.concludes_turn.store(true, Ordering::Release);
+    }
+
+    fn into_parts(self) -> (ToolExecutionInput, Vec<SessionMessage>, bool) {
+        (
+            self.input,
+            self.additional_contexts
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            self.concludes_turn.into_inner(),
+        )
+    }
+}
+
 impl ToolExecutionInput {
     pub(crate) fn from_session_call(call: &SessionToolCall) -> Self {
         Self {
@@ -463,6 +558,8 @@ pub struct ToolDispatchExecution {
     prepared: Option<PreparedToolExecution>,
     result: Option<ToolDispatchResult>,
     result_projection: ToolResultProjection,
+    additional_contexts: Vec<SessionMessage>,
+    concludes_turn: bool,
     terminal_identity: Arc<()>,
 }
 
@@ -485,6 +582,30 @@ impl ToolDispatchExecution {
     #[must_use]
     pub const fn result(&self) -> Option<&ToolDispatchResult> {
         self.result.as_ref()
+    }
+
+    #[must_use]
+    pub fn additional_contexts(&self) -> &[SessionMessage] {
+        &self.additional_contexts
+    }
+
+    #[must_use]
+    pub const fn concludes_turn(&self) -> bool {
+        self.concludes_turn
+    }
+
+    /// Attach one context to the result authored by an around-dispatch wrapper.
+    #[must_use]
+    pub fn with_additional_context(mut self, context: SessionMessage) -> Self {
+        self.additional_contexts.push(context);
+        self
+    }
+
+    /// Mark an around-dispatch success as turn-concluding.
+    #[must_use]
+    pub fn conclude_turn(mut self) -> Self {
+        self.concludes_turn = true;
+        self
     }
 
     /// Settle or replace the dispatch result. Calling this before `next`
@@ -554,8 +675,7 @@ impl ToolExecutionPreparation {
     }
 }
 
-type ToolExecutor =
-    Arc<dyn Fn(&ToolExecutionInput) -> Result<serde_json::Value, String> + Send + Sync>;
+type ToolExecutor = Arc<dyn Fn(&ToolRunContext) -> Result<serde_json::Value, String> + Send + Sync>;
 type ToolResultRenderer = Arc<
     dyn Fn(&serde_json::Value, &serde_json::Value) -> Result<Vec<SessionContentBlock>, String>
         + Send
@@ -608,6 +728,21 @@ impl ToolDefinition {
     pub fn new<F>(schema: SessionToolSchema, executor: F) -> Self
     where
         F: Fn(&ToolExecutionInput) -> Result<serde_json::Value, String> + Send + Sync + 'static,
+    {
+        Self {
+            schema,
+            classifier: None,
+            executor: Arc::new(move |run| executor(run.input())),
+            result_projection: ToolResultProjection::default(),
+        }
+    }
+
+    /// Register an executor that may defer next-step context and request turn
+    /// conclusion through its execution-local run context.
+    #[must_use]
+    pub fn new_with_run_context<F>(schema: SessionToolSchema, executor: F) -> Self
+    where
+        F: Fn(&ToolRunContext) -> Result<serde_json::Value, String> + Send + Sync + 'static,
     {
         Self {
             schema,
@@ -675,6 +810,8 @@ pub struct ToolDispatchOutcome {
     input: ToolExecutionInput,
     result: ToolDispatchResult,
     result_projection: ToolResultProjection,
+    additional_contexts: Vec<SessionMessage>,
+    concludes_turn: bool,
 }
 
 /// One around-dispatch/body operation detached from the driver thread.
@@ -716,6 +853,8 @@ impl ScheduledToolDispatch {
             input,
             result,
             result_projection,
+            additional_contexts,
+            concludes_turn,
             ..
         } = execution;
         Ok(match result {
@@ -723,6 +862,8 @@ impl ScheduledToolDispatch {
                 input,
                 result,
                 result_projection,
+                additional_contexts,
+                concludes_turn,
             },
             None => tool_dispatch_failure(
                 input,
@@ -758,6 +899,16 @@ impl ToolDispatchOutcome {
     pub fn into_result(self) -> ToolDispatchResult {
         self.result
     }
+
+    #[must_use]
+    pub fn additional_contexts(&self) -> &[SessionMessage] {
+        &self.additional_contexts
+    }
+
+    #[must_use]
+    pub const fn concludes_turn(&self) -> bool {
+        self.concludes_turn
+    }
 }
 
 /// Opaque post-dispatch view carried through canonical `tools/post-execute`.
@@ -767,6 +918,8 @@ pub struct ToolPostExecution {
     input: ToolExecutionInput,
     result: ToolDispatchResult,
     result_projection: ToolResultProjection,
+    additional_contexts: Vec<SessionMessage>,
+    concludes_turn: bool,
 }
 
 impl fmt::Debug for ToolPostExecution {
@@ -790,6 +943,23 @@ impl ToolPostExecution {
         &self.result
     }
 
+    #[must_use]
+    pub fn additional_contexts(&self) -> &[SessionMessage] {
+        &self.additional_contexts
+    }
+
+    #[must_use]
+    pub const fn concludes_turn(&self) -> bool {
+        self.concludes_turn
+    }
+
+    /// Append one post-policy-authored context after body-deferred context.
+    #[must_use]
+    pub fn with_additional_context(mut self, context: SessionMessage) -> Self {
+        self.additional_contexts.push(context);
+        self
+    }
+
     /// Replace one successful value. A failed body or around-dispatch result
     /// cannot be converted back into success at this boundary.
     #[must_use]
@@ -809,6 +979,8 @@ impl ToolPostExecution {
         self.result = ToolDispatchResult::Failure {
             message: reason.into(),
         };
+        self.additional_contexts.clear();
+        self.concludes_turn = false;
         self
     }
 }
@@ -821,6 +993,8 @@ pub struct ToolExecutionResult {
     result: ToolDispatchResult,
     content: Vec<SessionContentBlock>,
     error: Option<SessionToolError>,
+    additional_contexts: Vec<SessionMessage>,
+    concludes_turn: bool,
 }
 
 impl ToolExecutionResult {
@@ -842,6 +1016,16 @@ impl ToolExecutionResult {
     #[must_use]
     pub const fn error(&self) -> Option<&SessionToolError> {
         self.error.as_ref()
+    }
+
+    #[must_use]
+    pub fn additional_contexts(&self) -> &[SessionMessage] {
+        &self.additional_contexts
+    }
+
+    #[must_use]
+    pub const fn concludes_turn(&self) -> bool {
+        self.concludes_turn
     }
 
     #[must_use]
@@ -2796,8 +2980,15 @@ pub(crate) fn schedule_tool_dispatch(
             let Some(prepared) = execution.prepared.take() else {
                 return execution;
             };
-            execution.result =
-                Some(dispatch_prepared_tool_execution(&terminal_tools, prepared).into_result());
+            let ToolDispatchOutcome {
+                result,
+                additional_contexts,
+                concludes_turn,
+                ..
+            } = dispatch_prepared_tool_execution(&terminal_tools, prepared);
+            execution.result = Some(result);
+            execution.additional_contexts.extend(additional_contexts);
+            execution.concludes_turn |= concludes_turn;
             execution
         },
     )?;
@@ -2813,6 +3004,8 @@ pub(crate) fn schedule_tool_dispatch(
         prepared: Some(prepared),
         result: None,
         result_projection: result_projection.clone(),
+        additional_contexts: Vec::new(),
+        concludes_turn: false,
         terminal_identity,
     };
     Ok(ScheduledToolDispatch {
@@ -2866,17 +3059,21 @@ fn dispatch_prepared_tool_execution(
         };
         Arc::clone(executor)
     };
-    let result = match catch_unwind(AssertUnwindSafe(|| executor(&input))) {
+    let run = ToolRunContext::new(input);
+    let result = match catch_unwind(AssertUnwindSafe(|| executor(&run))) {
         Ok(Ok(value)) => ToolDispatchResult::Success { value },
         Ok(Err(message)) => ToolDispatchResult::Failure { message },
         Err(_) => ToolDispatchResult::Failure {
-            message: format!("tool \"{}\" panicked", input.name()),
+            message: format!("tool \"{}\" panicked", run.name()),
         },
     };
+    let (input, additional_contexts, concludes_turn) = run.into_parts();
     ToolDispatchOutcome {
         input,
         result,
         result_projection,
+        additional_contexts,
+        concludes_turn,
     }
 }
 
@@ -2891,6 +3088,8 @@ pub fn post_tool_execution(
         input,
         result,
         result_projection,
+        additional_contexts,
+        concludes_turn,
     } = outcome;
     let fallback_input = input.clone();
     let fallback_projection = result_projection.clone();
@@ -2898,6 +3097,8 @@ pub fn post_tool_execution(
         input,
         result,
         result_projection,
+        additional_contexts,
+        concludes_turn,
     };
     let post = catch_unwind(AssertUnwindSafe(|| {
         ctx.waterfall(events::TOOLS_POST_EXECUTE, execution)
@@ -2907,10 +3108,14 @@ pub fn post_tool_execution(
             input,
             result,
             result_projection,
+            additional_contexts,
+            concludes_turn,
         })) => Ok(ToolDispatchOutcome {
             input,
             result,
             result_projection,
+            additional_contexts,
+            concludes_turn,
         }),
         Ok(Err(error)) => Err(error),
         Err(_) => Ok(tool_dispatch_failure(
@@ -2932,6 +3137,8 @@ fn tool_dispatch_failure(
             message: message.into(),
         },
         result_projection,
+        additional_contexts: Vec::new(),
+        concludes_turn: false,
     }
 }
 
@@ -2948,12 +3155,30 @@ pub fn finalize_tool_execution(
         input,
         result,
         result_projection,
+        additional_contexts,
+        concludes_turn,
     } = outcome;
     let ToolResultProjection {
         renderer,
         finalizer,
     } = result_projection;
-    let mut finalized = materialize_tool_result(input, result, renderer.as_ref());
+    let mut finalized = if let Some(error) = additional_contexts
+        .iter()
+        .find_map(|context| validate_agent_user_message(context, "tools/result context").err())
+    {
+        tool_final_failure(
+            input,
+            format!("tool additional context is invalid: {error}"),
+        )
+    } else {
+        materialize_tool_result(
+            input,
+            result,
+            renderer.as_ref(),
+            additional_contexts,
+            concludes_turn,
+        )
+    };
     if let Some(finalizer) = finalizer {
         let replacement = catch_unwind(AssertUnwindSafe(|| {
             finalizer(finalized.input(), &finalized)
@@ -2987,14 +3212,17 @@ fn materialize_tool_result(
     input: ToolExecutionInput,
     result: ToolDispatchResult,
     renderer: Option<&ToolResultRenderer>,
+    additional_contexts: Vec<SessionMessage>,
+    concludes_turn: bool,
 ) -> ToolExecutionResult {
     let name = input.name().to_string();
     match result {
         ToolDispatchResult::Success { value } => {
             let Some(renderer) = renderer else {
-                return tool_final_failure(
+                return tool_final_failure_with_contexts(
                     input,
                     format!("tool \"{name}\" has no registered output renderer"),
+                    additional_contexts,
                 );
             };
             match catch_unwind(AssertUnwindSafe(|| renderer(input.arguments(), &value))) {
@@ -3003,23 +3231,38 @@ fn materialize_tool_result(
                     result: ToolDispatchResult::Success { value },
                     content,
                     error: None,
+                    additional_contexts,
+                    concludes_turn,
                 },
-                Ok(Err(message)) => tool_final_failure(
+                Ok(Err(message)) => tool_final_failure_with_contexts(
                     input,
                     format!("tool \"{name}\" output renderer failed: {message}"),
+                    additional_contexts,
                 ),
-                Err(_) => {
-                    tool_final_failure(input, format!("tool \"{name}\" output renderer panicked"))
-                }
+                Err(_) => tool_final_failure_with_contexts(
+                    input,
+                    format!("tool \"{name}\" output renderer panicked"),
+                    additional_contexts,
+                ),
             }
         }
-        ToolDispatchResult::Failure { message } => tool_final_failure(input, message),
+        ToolDispatchResult::Failure { message } => {
+            tool_final_failure_with_contexts(input, message, additional_contexts)
+        }
     }
 }
 
 fn tool_final_failure(
     input: ToolExecutionInput,
     message: impl Into<String>,
+) -> ToolExecutionResult {
+    tool_final_failure_with_contexts(input, message, Vec::new())
+}
+
+fn tool_final_failure_with_contexts(
+    input: ToolExecutionInput,
+    message: impl Into<String>,
+    additional_contexts: Vec<SessionMessage>,
 ) -> ToolExecutionResult {
     let message = message.into();
     ToolExecutionResult {
@@ -3029,6 +3272,8 @@ fn tool_final_failure(
         }],
         result: ToolDispatchResult::Failure { message },
         error: None,
+        additional_contexts,
+        concludes_turn: false,
     }
 }
 
@@ -3047,6 +3292,8 @@ pub(crate) fn aborted_before_dispatch_tool_result(
             name: "AbortError".into(),
             code: TOOL_ABORTED_BEFORE_DISPATCH.into(),
         }),
+        additional_contexts: Vec::new(),
+        concludes_turn: false,
     }
 }
 
