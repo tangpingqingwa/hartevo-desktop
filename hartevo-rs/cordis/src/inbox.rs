@@ -61,33 +61,112 @@ impl AgentInbox {
 
     /// Durably append one message for a future turn, then update the live view.
     pub fn append_next_turn(&self, message: SessionMessage) -> Result<(), SessionError> {
-        self.append(AgentInboxTarget::NextTurn, message)
+        self.insert(AgentInboxTarget::NextTurn, message, false)
     }
 
     /// Durably append one message for the next step, then update the live view.
     pub fn append_next_step(&self, message: SessionMessage) -> Result<(), SessionError> {
-        self.append(AgentInboxTarget::NextStep, message)
+        self.insert(AgentInboxTarget::NextStep, message, false)
     }
 
-    fn append(
+    /// Durably prepend one message for a future turn.
+    pub fn prepend_next_turn(&self, message: SessionMessage) -> Result<(), SessionError> {
+        self.insert(AgentInboxTarget::NextTurn, message, true)
+    }
+
+    /// Durably prepend one message for the next step boundary.
+    pub fn prepend_next_step(&self, message: SessionMessage) -> Result<(), SessionError> {
+        self.insert(AgentInboxTarget::NextStep, message, true)
+    }
+
+    fn insert(
         &self,
         target: AgentInboxTarget,
         message: SessionMessage,
+        prepend: bool,
     ) -> Result<(), SessionError> {
         let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
-        let inserted = vec![message];
         let start = {
             let state = self.lock()?;
-            let start = u64::try_from(state.list(target).len())
-                .map_err(|_| SessionError::EventSequenceOverflow)?;
-            state.validate(target, start, None, &inserted, None)?;
-            start
+            if prepend {
+                0
+            } else {
+                u64::try_from(state.list(target).len())
+                    .map_err(|_| SessionError::EventSequenceOverflow)?
+            }
         };
-        let event = self
-            .session
-            .append_agent_inbox_splice(target, start, None, inserted, None)?;
-        if !self.apply_committed(&event)?.is_empty() {
+        if !self
+            .mutate(target, start, None, vec![message], None)?
+            .is_empty()
+        {
             return Err(SessionError::InboxProjectionDrift);
+        }
+        Ok(())
+    }
+
+    /// Replace one still-pending message in place by exact identity.
+    pub fn replace(
+        &self,
+        message_id: &str,
+        replacement: SessionMessage,
+    ) -> Result<bool, SessionError> {
+        let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
+        let Some((target, start)) = self.lock()?.locate(message_id)? else {
+            return Ok(false);
+        };
+        let removed = self.mutate(
+            target,
+            start,
+            Some(1),
+            vec![replacement],
+            Some(AgentInboxOutcome::Canceled),
+        )?;
+        if removed.len() != 1 {
+            return Err(SessionError::InboxProjectionDrift);
+        }
+        Ok(true)
+    }
+
+    /// Remove one still-pending message by exact identity.
+    pub fn remove(&self, message_id: &str) -> Result<bool, SessionError> {
+        let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
+        let Some((target, start)) = self.lock()?.locate(message_id)? else {
+            return Ok(false);
+        };
+        let removed = self.mutate(
+            target,
+            start,
+            Some(1),
+            Vec::new(),
+            Some(AgentInboxOutcome::Canceled),
+        )?;
+        if removed.len() != 1 {
+            return Err(SessionError::InboxProjectionDrift);
+        }
+        Ok(true)
+    }
+
+    /// Durably cancel all pending input, clearing next-step before next-turn.
+    pub fn clear(&self) -> Result<(), SessionError> {
+        let _permit = AgentInboxMutationPermit::enter(&self.mutating, self.session.id())?;
+        for target in [AgentInboxTarget::NextStep, AgentInboxTarget::NextTurn] {
+            let removed_count = u64::try_from(self.lock()?.list(target).len())
+                .map_err(|_| SessionError::EventSequenceOverflow)?;
+            if removed_count == 0 {
+                continue;
+            }
+            let removed = self.mutate(
+                target,
+                0,
+                Some(removed_count),
+                Vec::new(),
+                Some(AgentInboxOutcome::Canceled),
+            )?;
+            if u64::try_from(removed.len()).map_err(|_| SessionError::EventSequenceOverflow)?
+                != removed_count
+            {
+                return Err(SessionError::InboxProjectionDrift);
+            }
         }
         Ok(())
     }
@@ -159,6 +238,26 @@ impl AgentInbox {
             return Err(SessionError::InboxProjectionDrift);
         }
         Ok(removed)
+    }
+
+    fn mutate(
+        &self,
+        target: AgentInboxTarget,
+        start: u64,
+        removed_count: Option<u64>,
+        inserted: Vec<SessionMessage>,
+        outcome: Option<AgentInboxOutcome>,
+    ) -> Result<Vec<SessionMessage>, SessionError> {
+        self.lock()?
+            .validate(target, start, removed_count, &inserted, outcome)?;
+        let event = self.session.append_agent_inbox_splice(
+            target,
+            start,
+            removed_count,
+            inserted,
+            outcome,
+        )?;
+        self.apply_committed(&event)
     }
 
     fn apply_committed(&self, event: &SessionEvent) -> Result<Vec<SessionMessage>, SessionError> {
@@ -285,6 +384,22 @@ impl AgentInboxState {
             }
         }
         Ok(())
+    }
+
+    fn locate(&self, message_id: &str) -> Result<Option<(AgentInboxTarget, u64)>, SessionError> {
+        for target in [AgentInboxTarget::NextTurn, AgentInboxTarget::NextStep] {
+            if let Some(index) = self
+                .list(target)
+                .iter()
+                .position(|message| message.id == message_id)
+            {
+                return Ok(Some((
+                    target,
+                    u64::try_from(index).map_err(|_| SessionError::EventSequenceOverflow)?,
+                )));
+            }
+        }
+        Ok(None)
     }
 
     fn list(&self, target: AgentInboxTarget) -> &[SessionMessage] {

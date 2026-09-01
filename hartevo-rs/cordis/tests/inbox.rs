@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use hartevo_cordis::{
-    AgentInboxTarget, CordisHost, SessionContentBlock, SessionError, SessionEvent,
-    SessionEventKind, SessionHeader, SessionId, SessionMessage, SessionMessageRole,
+    AgentInboxOutcome, AgentInboxTarget, CordisHost, SessionContentBlock, SessionError,
+    SessionEvent, SessionEventKind, SessionHeader, SessionId, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionStore, TurnEndReason, session_events,
 };
 
@@ -13,6 +13,189 @@ fn user_message(id: &str, text: &str) -> SessionMessage {
         content: vec![SessionContentBlock::Text { text: text.into() }],
         source: SessionMessageSource::User,
     }
+}
+
+#[test]
+fn prepend_replace_and_remove_preserve_order_identity_and_durability() {
+    let host = CordisHost::boot(false).unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("inbox-controls").unwrap())
+        .unwrap();
+    let inbox = session.inbox();
+    let turn_tail = user_message("turn-tail", "turn tail");
+    let turn_head = user_message("turn-head", "turn head");
+    let step_tail = user_message("step-tail", "step tail");
+    let step_head = user_message("step-head", "step head");
+    inbox.append_next_turn(turn_tail.clone()).unwrap();
+    inbox.prepend_next_turn(turn_head.clone()).unwrap();
+    inbox.append_next_step(step_tail.clone()).unwrap();
+    inbox.prepend_next_step(step_head.clone()).unwrap();
+    assert_eq!(
+        inbox.next_turn().unwrap(),
+        [turn_head.clone(), turn_tail.clone()]
+    );
+    assert_eq!(
+        inbox.next_step().unwrap(),
+        [step_head.clone(), step_tail.clone()]
+    );
+
+    let replacement = user_message("turn-replacement", "replacement");
+    let before_missing = session.events().unwrap().len();
+    assert!(!inbox.replace("missing", replacement.clone()).unwrap());
+    assert!(!inbox.remove("missing").unwrap());
+    assert_eq!(session.events().unwrap().len(), before_missing);
+
+    assert!(inbox.replace(&turn_tail.id, replacement.clone()).unwrap());
+    assert_eq!(
+        inbox.next_turn().unwrap(),
+        [turn_head.clone(), replacement.clone()]
+    );
+    assert!(matches!(
+        &session.events().unwrap().last().unwrap().kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            start: 1,
+            removed_count: Some(1),
+            inserted,
+            outcome: Some(AgentInboxOutcome::Canceled),
+        } if inserted.as_slice() == std::slice::from_ref(&replacement)
+    ));
+
+    let before_duplicate = session.events().unwrap().len();
+    assert_eq!(
+        inbox.replace(&step_head.id, replacement.clone()),
+        Err(SessionError::DuplicatePendingMessage {
+            id: replacement.id.clone(),
+        })
+    );
+    assert_eq!(session.events().unwrap().len(), before_duplicate);
+    assert_eq!(
+        inbox.next_step().unwrap(),
+        [step_head.clone(), step_tail.clone()]
+    );
+
+    assert!(inbox.remove(&turn_head.id).unwrap());
+    assert_eq!(
+        inbox.next_turn().unwrap().as_slice(),
+        std::slice::from_ref(&replacement)
+    );
+    assert!(matches!(
+        &session.events().unwrap().last().unwrap().kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            start: 0,
+            removed_count: Some(1),
+            inserted,
+            outcome: Some(AgentInboxOutcome::Canceled),
+        } if inserted.is_empty()
+    ));
+
+    let restored = SessionStore::new()
+        .restore(session.header().unwrap(), session.events().unwrap())
+        .unwrap();
+    assert_eq!(restored.inbox().next_turn().unwrap(), [replacement]);
+    assert_eq!(
+        restored.inbox().next_step().unwrap(),
+        [step_head, step_tail]
+    );
+    assert!(restored.derive_messages().unwrap().is_empty());
+}
+
+#[test]
+fn clear_cancels_next_step_before_next_turn_and_contains_reentry() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("inbox-clear").unwrap())
+        .unwrap();
+    let inbox = session.inbox();
+    let turn = user_message("clear-turn", "turn");
+    let step = user_message("clear-step", "step");
+    inbox.append_next_turn(turn.clone()).unwrap();
+    inbox.append_next_step(step.clone()).unwrap();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let reentry_errors = Arc::new(Mutex::new(Vec::new()));
+    let callback_inbox = inbox.clone();
+    let callback_observed = Arc::clone(&observed);
+    let callback_errors = Arc::clone(&reentry_errors);
+    host.context_mut()
+        .on_emit(session_events::SESSION_EVENT, move |record| {
+            let SessionEventKind::AgentInboxSpliced {
+                target,
+                outcome: Some(AgentInboxOutcome::Canceled),
+                ..
+            } = record.event.kind
+            else {
+                return;
+            };
+            callback_observed.lock().unwrap().push((
+                target,
+                callback_inbox.next_turn().unwrap(),
+                callback_inbox.next_step().unwrap(),
+            ));
+            callback_errors
+                .lock()
+                .unwrap()
+                .push(callback_inbox.clear().unwrap_err());
+        })
+        .unwrap();
+
+    let before_clear = session.events().unwrap().len();
+    inbox.clear().unwrap();
+    assert!(!inbox.has_pending().unwrap());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            (
+                AgentInboxTarget::NextStep,
+                vec![turn.clone()],
+                vec![step.clone()],
+            ),
+            (AgentInboxTarget::NextTurn, vec![turn], Vec::new()),
+        ]
+    );
+    assert_eq!(
+        *reentry_errors.lock().unwrap(),
+        [
+            SessionError::InboxMutationInProgress {
+                id: SessionId::new("inbox-clear").unwrap(),
+            },
+            SessionError::InboxMutationInProgress {
+                id: SessionId::new("inbox-clear").unwrap(),
+            },
+        ]
+    );
+    let events = session.events().unwrap();
+    assert!(matches!(
+        &events[before_clear].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextStep,
+            start: 0,
+            removed_count: Some(1),
+            inserted,
+            outcome: Some(AgentInboxOutcome::Canceled),
+        } if inserted.is_empty()
+    ));
+    assert!(matches!(
+        &events[before_clear + 1].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            start: 0,
+            removed_count: Some(1),
+            inserted,
+            outcome: Some(AgentInboxOutcome::Canceled),
+        } if inserted.is_empty()
+    ));
+    assert_eq!(events.len(), before_clear + 2);
+    inbox.clear().unwrap();
+    assert_eq!(session.events().unwrap().len(), before_clear + 2);
+
+    let restored = SessionStore::new()
+        .restore(session.header().unwrap(), session.events().unwrap())
+        .unwrap();
+    assert!(!restored.inbox().has_pending().unwrap());
 }
 
 #[test]

@@ -785,7 +785,7 @@ mod tests {
 
     #[test]
     fn agent_inbox_splice_round_trips_with_exact_wire_fields() {
-        let event = PersistedSessionEvent {
+        let insertion = PersistedSessionEvent {
             seq: 0,
             time_ms: 1,
             kind: PersistedSessionEventKind::AgentInboxSpliced {
@@ -796,17 +796,37 @@ mod tests {
                 outcome: None,
             },
         };
-        let encoded = serde_json::to_value(&event).unwrap();
+        let encoded = serde_json::to_value(&insertion).unwrap();
         let splice = &encoded["kind"]["agent_inbox_spliced"];
         assert_eq!(splice["target"], "next-step");
         assert!(splice.get("removedCount").is_none());
         assert!(splice.get("removed_count").is_none());
         assert_eq!(
             serde_json::from_value::<PersistedSessionEvent>(encoded).unwrap(),
-            event
+            insertion
         );
 
-        let durable = checkpoint(vec![event]);
+        let cancellation = PersistedSessionEvent {
+            seq: 1,
+            time_ms: 2,
+            kind: PersistedSessionEventKind::AgentInboxSpliced {
+                target: PersistedAgentInboxTarget::NextStep,
+                start: 0,
+                removed_count: Some(1),
+                inserted: vec![],
+                outcome: Some(PersistedAgentInboxOutcome::Canceled),
+            },
+        };
+        let encoded = serde_json::to_value(&cancellation).unwrap();
+        let splice = &encoded["kind"]["agent_inbox_spliced"];
+        assert_eq!(splice["removedCount"], 1);
+        assert_eq!(splice["outcome"], "canceled");
+        assert_eq!(
+            serde_json::from_value::<PersistedSessionEvent>(encoded).unwrap(),
+            cancellation
+        );
+
+        let durable = checkpoint(vec![insertion, cancellation]);
         let mut store = ProjectStore::in_memory().unwrap();
         assert!(store.persist_session_checkpoint(&durable).unwrap());
         assert_eq!(store.load_session_checkpoints().unwrap(), vec![durable]);
