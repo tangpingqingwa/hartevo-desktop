@@ -1049,6 +1049,7 @@ fn overlay_still_selects_plugins_instead_of_a_crate_boot_list() {
         report.started,
         [
             PluginId::new("surfaces"),
+            PluginId::new("compaction-basic"),
             PluginId::new("agent-loop"),
             PluginId::new("invariants"),
         ]
