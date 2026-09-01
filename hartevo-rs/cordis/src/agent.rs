@@ -1,7 +1,7 @@
 //! Cordis-hosted agent loop. OpenInterpreter is an optional runtime plugin,
 //! never the loop and never the owner of Domain or Effect.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures_util::StreamExt;
 
@@ -11,11 +11,11 @@ use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionEpochHeader,
-    SessionError, SessionFinishReason, SessionHandle, SessionId, SessionMessage,
+    SessionError, SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionMessage,
     SessionMessageRole, SessionMessageSource, SessionReplayEnvelope, SessionRequestContext,
     SessionRequestHeaderReason, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-    SessionSurfaceIntent, SessionTokenUsage, TurnEndReason, validate_agent_request_config,
-    validate_agent_user_message,
+    SessionSurfaceIntent, SessionTokenUsage, SessionToolCall, TurnEndReason,
+    validate_agent_request_config, validate_agent_user_message,
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
@@ -289,6 +289,8 @@ pub struct RecordedAgentStream {
     chunk_seqs: Vec<u64>,
     finish: SessionFinishReason,
     message_committed: bool,
+    tool_call_seqs: Vec<u64>,
+    tool_calls_scheduled: bool,
 }
 
 impl RecordedAgentStream {
@@ -320,6 +322,17 @@ impl RecordedAgentStream {
     #[must_use]
     pub const fn message_committed(&self) -> bool {
         self.message_committed
+    }
+
+    /// Exact durable `tool/call` prefix appended by N50.
+    #[must_use]
+    pub fn tool_call_seqs(&self) -> &[u64] {
+        &self.tool_call_seqs
+    }
+
+    #[must_use]
+    pub const fn tool_calls_scheduled(&self) -> bool {
+        self.tool_calls_scheduled
     }
 }
 
@@ -582,6 +595,8 @@ pub async fn record_agent_stream(
         chunk_seqs,
         finish,
         message_committed: false,
+        tool_call_seqs: Vec::new(),
+        tool_calls_scheduled: false,
     })
 }
 
@@ -687,6 +702,159 @@ pub fn commit_agent_stream(
         finish,
         replay_state,
     })
+}
+
+/// Durably schedule N49's committed assistant tool calls in exact model order.
+///
+/// This boundary records only log-owned `tool/call` events. It deliberately
+/// leaves argument parsing, registry classification, policy, execution,
+/// results, and step closure to later driver units.
+pub fn schedule_agent_tool_calls(
+    ctx: &Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+) -> Result<Vec<SessionToolCall>, CordisError> {
+    let request = logged.call().request();
+    let session_id = SessionId::new(request.agent().id.clone())?;
+    let turn = request.turn();
+    let step = request.step();
+    if recorded.session_id != session_id || recorded.turn != turn || recorded.step != step {
+        return Err(invalid_stream_protocol(
+            "recorded session, turn, and step to match the logged call",
+        )
+        .into());
+    }
+    if !recorded.message_committed {
+        return Err(invalid_stream_protocol(
+            "a committed assistant message before tool-call scheduling",
+        )
+        .into());
+    }
+    if recorded.tool_calls_scheduled {
+        return Err(
+            invalid_stream_protocol("one tool-call scheduling pass per recorded stream").into(),
+        );
+    }
+
+    let session = agent_session(ctx, &session_id)?;
+    session.require_open_step(turn, step)?;
+    let message = recorded_assistant_message(&session, logged, recorded)?;
+    let planned = planned_tool_calls(&message)?;
+
+    let existing = session.tool_calls(turn, step)?;
+    if !tool_call_prefix_matches(&existing, &recorded.tool_call_seqs, &planned) {
+        return Err(invalid_stream_protocol(
+            "only this scheduling pass's exact durable tool-call prefix",
+        )
+        .into());
+    }
+
+    for (id, name, arguments) in planned.iter().skip(existing.len()) {
+        let seq = session.append_tool_call(turn, step, id, name, arguments)?;
+        recorded.tool_call_seqs.push(seq);
+    }
+    let scheduled = session.tool_calls(turn, step)?;
+    if scheduled.len() != planned.len()
+        || !tool_call_prefix_matches(&scheduled, &recorded.tool_call_seqs, &planned)
+    {
+        return Err(invalid_stream_protocol(
+            "the scheduled tool calls to match the committed assistant message exactly",
+        )
+        .into());
+    }
+    recorded.tool_calls_scheduled = true;
+    Ok(scheduled)
+}
+
+type PlannedToolCall = (String, String, String);
+
+fn recorded_assistant_message(
+    session: &SessionHandle,
+    logged: &LoggedAgentCall,
+    recorded: &RecordedAgentStream,
+) -> Result<SessionMessage, CordisError> {
+    let finish_seq = recorded.chunk_seqs.last().copied().ok_or_else(|| {
+        invalid_stream_protocol("a durable terminal finish sequence before tool-call scheduling")
+    })?;
+    let expected_id = format!(
+        "{}:turn:{}:step:{}:assistant:{finish_seq}",
+        logged.call().request().agent().id,
+        recorded.turn,
+        recorded.step
+    );
+    let expected_surface = SessionSurfaceIntent::append_from(recorded.chunk_seqs.clone());
+    let expected_source = SessionMessageSource::Model {
+        provider: logged.call().config().provider.clone(),
+        model: logged.call().config().model.clone(),
+    };
+    let matching = session
+        .events()?
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::AssistantMessage {
+                turn,
+                step,
+                message,
+                surface,
+            } if turn == recorded.turn
+                && step == recorded.step
+                && message.id == expected_id
+                && message.source == expected_source
+                && surface == expected_surface =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [message] = matching.as_slice() else {
+        return Err(invalid_stream_protocol(
+            "one exact durable assistant message with complete chunk provenance",
+        )
+        .into());
+    };
+    Ok(message.clone())
+}
+
+fn planned_tool_calls(message: &SessionMessage) -> Result<Vec<PlannedToolCall>, LlmError> {
+    let planned = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            SessionContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id.clone(), name.clone(), arguments.clone())),
+            SessionContentBlock::Text { .. }
+            | SessionContentBlock::Reasoning { .. }
+            | SessionContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let mut call_ids = HashSet::with_capacity(planned.len());
+    if planned.iter().any(|(id, _, _)| !call_ids.insert(id)) {
+        return Err(invalid_stream_protocol(
+            "unique tool-call ids within one assistant message",
+        ));
+    }
+    Ok(planned)
+}
+
+fn tool_call_prefix_matches(
+    calls: &[SessionToolCall],
+    expected_seqs: &[u64],
+    planned: &[PlannedToolCall],
+) -> bool {
+    calls.len() == expected_seqs.len()
+        && calls.len() <= planned.len()
+        && calls.iter().zip(expected_seqs).zip(planned).all(
+            |((call, expected_seq), (id, name, arguments))| {
+                call.seq == *expected_seq
+                    && call.call_id == *id
+                    && call.name == *name
+                    && call.arguments == *arguments
+            },
+        )
 }
 
 #[derive(Default)]
