@@ -16,9 +16,9 @@ use std::task::{Context as TaskContext, Poll};
 
 use futures_core::Stream;
 
-use crate::context::{Context, CordisError, keys};
+use crate::context::{Context, CordisError, EventReentry, keys};
 use crate::effect::RegistrationHandle;
-use crate::event::{DispatchMode, EventKey, EventModeMarker};
+use crate::event::{DispatchMode, EventKey, EventModeMarker, ListenerHandle};
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
     SessionId, SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk,
@@ -669,6 +669,62 @@ pub struct ToolDispatchOutcome {
     input: ToolExecutionInput,
     result: ToolDispatchResult,
     result_projection: ToolResultProjection,
+}
+
+/// One around-dispatch/body operation detached from the driver thread.
+/// Pre-execute has already completed; post-execute and finalization remain on
+/// the driver thread after this operation settles.
+pub(crate) struct ScheduledToolDispatch {
+    dispatcher: EventReentry,
+    terminal: ListenerHandle,
+    execution: ToolDispatchExecution,
+    fallback_input: ToolExecutionInput,
+    fallback_projection: ToolResultProjection,
+}
+
+impl ScheduledToolDispatch {
+    pub(crate) fn dispatch(self) -> Result<ToolDispatchOutcome, CordisError> {
+        let Self {
+            dispatcher,
+            terminal,
+            execution,
+            fallback_input,
+            fallback_projection,
+        } = self;
+        let dispatched = catch_unwind(AssertUnwindSafe(|| {
+            dispatcher.waterfall(events::TOOLS_EXECUTE, execution)
+        }));
+        terminal.dispose();
+        let execution = match dispatched {
+            Ok(Ok(execution)) => execution,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Ok(tool_dispatch_failure(
+                    fallback_input,
+                    "tools/execute wrapper panicked",
+                    fallback_projection,
+                ));
+            }
+        };
+        let ToolDispatchExecution {
+            input,
+            result,
+            result_projection,
+            ..
+        } = execution;
+        Ok(match result {
+            Some(result) => ToolDispatchOutcome {
+                input,
+                result,
+                result_projection,
+            },
+            None => tool_dispatch_failure(
+                input,
+                "tools/execute short-circuited without a result",
+                result_projection,
+            ),
+        })
+    }
 }
 
 impl fmt::Debug for ToolDispatchOutcome {
@@ -2677,14 +2733,18 @@ pub(crate) fn settle_denied_tool_execution(
     ctx: &mut Context,
     denied: DeniedToolExecution,
 ) -> Result<ToolExecutionResult, CordisError> {
+    let outcome = denied_tool_dispatch_outcome(denied);
+    let outcome = post_tool_execution(ctx, outcome)?;
+    Ok(finalize_tool_execution(ctx, outcome))
+}
+
+pub(crate) fn denied_tool_dispatch_outcome(denied: DeniedToolExecution) -> ToolDispatchOutcome {
     let DeniedToolExecution {
         input,
         reason,
         result_projection,
     } = denied;
-    let outcome = tool_dispatch_failure(input, reason, result_projection);
-    let outcome = post_tool_execution(ctx, outcome)?;
-    Ok(finalize_tool_execution(ctx, outcome))
+    tool_dispatch_failure(input, reason, result_projection)
 }
 
 /// Consume one N52 dispatch preparation and invoke only its exact live Rust
@@ -2694,6 +2754,16 @@ pub fn dispatch_tool_execution(
     ctx: &mut Context,
     prepared: PreparedToolExecution,
 ) -> Result<ToolDispatchOutcome, CordisError> {
+    schedule_tool_dispatch(ctx, prepared)?.dispatch()
+}
+
+/// Prepare one admitted around-dispatch/body operation for execution on a
+/// scheduler worker. The temporary terminal listener is always removed by
+/// [`ScheduledToolDispatch::dispatch`].
+pub(crate) fn schedule_tool_dispatch(
+    ctx: &mut Context,
+    prepared: PreparedToolExecution,
+) -> Result<ScheduledToolDispatch, CordisError> {
     let tools = ctx
         .tools::<ToolsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
@@ -2719,6 +2789,13 @@ pub fn dispatch_tool_execution(
             execution
         },
     )?;
+    let dispatcher = match ctx.event_reentry() {
+        Ok(dispatcher) => dispatcher,
+        Err(error) => {
+            terminal.dispose();
+            return Err(error);
+        }
+    };
     let execution = ToolDispatchExecution {
         input: input.clone(),
         prepared: Some(prepared),
@@ -2726,38 +2803,12 @@ pub fn dispatch_tool_execution(
         result_projection: result_projection.clone(),
         terminal_identity,
     };
-    let dispatched = catch_unwind(AssertUnwindSafe(|| {
-        ctx.waterfall(events::TOOLS_EXECUTE, execution)
-    }));
-    terminal.dispose();
-    let execution = match dispatched {
-        Ok(Ok(execution)) => execution,
-        Ok(Err(error)) => return Err(error),
-        Err(_) => {
-            return Ok(tool_dispatch_failure(
-                input,
-                "tools/execute wrapper panicked",
-                result_projection,
-            ));
-        }
-    };
-    let ToolDispatchExecution {
-        input,
-        result,
-        result_projection,
-        ..
-    } = execution;
-    Ok(match result {
-        Some(result) => ToolDispatchOutcome {
-            input,
-            result,
-            result_projection,
-        },
-        None => tool_dispatch_failure(
-            input,
-            "tools/execute short-circuited without a result",
-            result_projection,
-        ),
+    Ok(ScheduledToolDispatch {
+        dispatcher,
+        terminal,
+        execution,
+        fallback_input: input,
+        fallback_projection: result_projection,
     })
 }
 

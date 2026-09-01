@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use chrono::{Duration, TimeZone, Utc};
@@ -24,7 +24,7 @@ use hartevo_cordis::{
     prepare_agent_tool_executions, record_agent_stream, register_llm_adapter,
     register_prompt_section, register_tool, register_tool_concurrency, register_tool_definition,
     register_tool_guard, register_tool_schema, run_agent_step, run_agent_tool_batch,
-    schedule_agent_tool_calls, session_events,
+    run_agent_tool_batch_with_limit, schedule_agent_tool_calls, session_events,
 };
 use serde_json::json;
 
@@ -4274,6 +4274,316 @@ fn tool_batch_driver_never_replays_a_call_with_a_preexisting_durable_result() {
     assert!(!recorded.tool_batch_started());
     assert_eq!(body_calls.load(Ordering::SeqCst), 0);
     assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep overlap, refill, barrier, and result order in one proof.
+fn tool_scheduler_bounds_a_rolling_pool_and_preserves_model_order_barriers() {
+    #[derive(Default)]
+    struct Probe {
+        active: usize,
+        max_active: usize,
+        started: Vec<&'static str>,
+        finished: Vec<&'static str>,
+        exclusive_active: Option<usize>,
+        exclusive_finished: bool,
+        after_exclusive: bool,
+    }
+
+    let mut chunks = Vec::new();
+    for (index, name) in ["pool-1", "pool-2", "pool-3", "barrier", "pool-after"]
+        .into_iter()
+        .enumerate()
+    {
+        chunks.extend(tool_call_chunks(
+            u64::try_from(index).unwrap(),
+            &format!("{name}-call"),
+            name,
+            "{}",
+        ));
+    }
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-scheduler-rolling", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    let probe = Arc::new((Mutex::new(Probe::default()), Condvar::new()));
+    for name in ["pool-1", "pool-2", "pool-3"] {
+        let probe = Arc::clone(&probe);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |_| {
+                let (state, changed) = &*probe;
+                let mut state = state.lock().unwrap();
+                state.active += 1;
+                state.max_active = state.max_active.max(state.active);
+                state.started.push(name);
+                changed.notify_all();
+                if name == "pool-1" {
+                    let (next, timeout) = changed
+                        .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                            !state.started.contains(&"pool-3")
+                        })
+                        .unwrap();
+                    state = next;
+                    if timeout.timed_out() && !state.started.contains(&"pool-3") {
+                        state.active -= 1;
+                        changed.notify_all();
+                        return Err("rolling pool did not refill".into());
+                    }
+                } else if name == "pool-3" {
+                    let (next, timeout) = changed
+                        .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                            !state.finished.contains(&"pool-1")
+                        })
+                        .unwrap();
+                    state = next;
+                    if timeout.timed_out() && !state.finished.contains(&"pool-1") {
+                        state.active -= 1;
+                        changed.notify_all();
+                        return Err("first rolling call did not settle".into());
+                    }
+                }
+                state.active -= 1;
+                state.finished.push(name);
+                changed.notify_all();
+                Ok(json!(name))
+            })
+            .with_concurrency(|_| Ok(true))
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let probe = Arc::clone(&probe);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("barrier"), move |_| {
+                let (state, _) = &*probe;
+                let mut state = state.lock().unwrap();
+                state.exclusive_active = Some(state.active);
+                state.exclusive_finished = true;
+                Ok(json!("barrier"))
+            })
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    {
+        let probe = Arc::clone(&probe);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("pool-after"), move |_| {
+                let (state, _) = &*probe;
+                let mut state = state.lock().unwrap();
+                state.after_exclusive = state.exclusive_finished;
+                Ok(json!("pool-after"))
+            })
+            .with_concurrency(|_| Ok(true))
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    {
+        let observed = Arc::clone(&observed);
+        ctx.on_emit(events::TOOLS_RESULT, move |result: &ToolExecutionResult| {
+            observed
+                .lock()
+                .unwrap()
+                .push(result.input().call_id().to_string());
+        })
+        .unwrap();
+    }
+    let around_dispatch = Arc::new(Mutex::new(Vec::new()));
+    {
+        let around_dispatch = Arc::clone(&around_dispatch);
+        ctx.on_waterfall(
+            events::TOOLS_EXECUTE,
+            move |execution: ToolDispatchExecution, next| {
+                let call_id = execution.input().call_id().to_string();
+                let execution = next(execution);
+                assert!(execution.result().is_some());
+                around_dispatch.lock().unwrap().push(call_id);
+                execution
+            },
+        )
+        .unwrap();
+    }
+
+    let results = run_agent_tool_batch_with_limit(&mut ctx, &logged, &mut recorded, 2).unwrap();
+
+    assert!(results.iter().all(|result| !result.is_error()));
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            "pool-1-call",
+            "pool-2-call",
+            "pool-3-call",
+            "barrier-call",
+            "pool-after-call",
+        ]
+    );
+    let (state, _) = &*probe;
+    let state = state.lock().unwrap();
+    assert_eq!(state.max_active, 2);
+    assert_eq!(state.exclusive_active, Some(0));
+    assert!(state.after_exclusive);
+    assert!(state.started.contains(&"pool-3"));
+    assert!(state.finished.contains(&"pool-1"));
+    drop(state);
+    let mut around_dispatch = around_dispatch.lock().unwrap().clone();
+    around_dispatch.sort();
+    assert_eq!(
+        around_dispatch,
+        [
+            "barrier-call",
+            "pool-1-call",
+            "pool-2-call",
+            "pool-3-call",
+            "pool-after-call",
+        ]
+    );
+    assert!(recorded.tool_results_committed());
+    assert_eq!(recorded.tool_result_seqs().len(), 5);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep live reclassification and barrier timing together.
+fn tool_scheduler_reclassifies_an_unstarted_call_into_an_exclusive_barrier() {
+    let mut chunks = Vec::new();
+    for (index, name) in ["reclass-first", "reclass-running", "reclass-next"]
+        .into_iter()
+        .enumerate()
+    {
+        chunks.extend(tool_call_chunks(
+            u64::try_from(index).unwrap(),
+            &format!("{name}-call"),
+            name,
+            "{}",
+        ));
+    }
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("tool-scheduler-reclassify", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let release_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    register_tool_definition(
+        &mut ctx,
+        ToolDefinition::new(tool_schema("reclass-first"), |_| Ok(json!("first")))
+            .with_concurrency(|_| Ok(true))
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+    )
+    .unwrap();
+    {
+        let active = Arc::clone(&active);
+        let release_running = Arc::clone(&release_running);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("reclass-running"), move |_| {
+                active.fetch_add(1, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !release_running.load(Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                if release_running.load(Ordering::SeqCst) {
+                    Ok(json!("running"))
+                } else {
+                    Err("ordered result observer did not release running call".into())
+                }
+            })
+            .with_concurrency(|_| Ok(true))
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    let next_saw_active = Arc::new(AtomicUsize::new(usize::MAX));
+    {
+        let active = Arc::clone(&active);
+        let next_saw_active = Arc::clone(&next_saw_active);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("reclass-next"), move |_| {
+                next_saw_active.store(active.load(Ordering::SeqCst), Ordering::SeqCst);
+                Ok(json!("next"))
+            })
+            .with_output_renderer(|_, value| {
+                Ok(vec![SessionContentBlock::Text {
+                    text: value.as_str().unwrap().into(),
+                }])
+            }),
+        )
+        .unwrap();
+    }
+    let parallel_shadow = Arc::new(Mutex::new(Some(
+        register_tool_concurrency(&mut ctx, "reclass-next", |_| Ok(true)).unwrap(),
+    )));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    {
+        let parallel_shadow = Arc::clone(&parallel_shadow);
+        let release_running = Arc::clone(&release_running);
+        let observed = Arc::clone(&observed);
+        ctx.on_emit(events::TOOLS_RESULT, move |result: &ToolExecutionResult| {
+            observed
+                .lock()
+                .unwrap()
+                .push(result.input().call_id().to_string());
+            if result.input().call_id() == "reclass-first-call" {
+                assert!(parallel_shadow.lock().unwrap().take().unwrap().dispose());
+                release_running.store(true, Ordering::SeqCst);
+            }
+        })
+        .unwrap();
+    }
+
+    let results = run_agent_tool_batch_with_limit(&mut ctx, &logged, &mut recorded, 2).unwrap();
+
+    assert!(results.iter().all(|result| !result.is_error()));
+    assert_eq!(next_saw_active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            "reclass-first-call",
+            "reclass-running-call",
+            "reclass-next-call",
+        ]
+    );
+    assert!(recorded.tool_results_committed());
     close_logged_turn(&session, turn);
 }
 
