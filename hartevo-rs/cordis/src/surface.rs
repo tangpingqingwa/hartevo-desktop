@@ -22,8 +22,14 @@ use crate::event::{DispatchMode, EventKey, EventModeMarker, ListenerHandle};
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
     SessionId, SessionLlmFailure, SessionMessage, SessionStore, SessionStreamChunk,
-    SessionToolCall, SessionToolSchema, events as session_events, validate_agent_request_config,
+    SessionToolCall, SessionToolError, SessionToolSchema, events as session_events,
+    validate_agent_request_config,
 };
+
+/// Canonical DeepSeek Harness code for a tool call cancelled before dispatch.
+pub const TOOL_ABORTED_BEFORE_DISPATCH: &str = "ABORTED_BEFORE_DISPATCH";
+
+const TOOL_ABORTED_BEFORE_DISPATCH_MESSAGE: &str = "tool call aborted before dispatch";
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
@@ -814,6 +820,7 @@ pub struct ToolExecutionResult {
     input: ToolExecutionInput,
     result: ToolDispatchResult,
     content: Vec<SessionContentBlock>,
+    error: Option<SessionToolError>,
 }
 
 impl ToolExecutionResult {
@@ -830,6 +837,11 @@ impl ToolExecutionResult {
     #[must_use]
     pub fn content(&self) -> &[SessionContentBlock] {
         &self.content
+    }
+
+    #[must_use]
+    pub const fn error(&self) -> Option<&SessionToolError> {
+        self.error.as_ref()
     }
 
     #[must_use]
@@ -2990,6 +3002,7 @@ fn materialize_tool_result(
                     input,
                     result: ToolDispatchResult::Success { value },
                     content,
+                    error: None,
                 },
                 Ok(Err(message)) => tool_final_failure(
                     input,
@@ -3015,6 +3028,25 @@ fn tool_final_failure(
             text: format!("Error: {message}"),
         }],
         result: ToolDispatchResult::Failure { message },
+        error: None,
+    }
+}
+
+pub(crate) fn aborted_before_dispatch_tool_result(
+    input: ToolExecutionInput,
+) -> ToolExecutionResult {
+    ToolExecutionResult {
+        input,
+        content: vec![SessionContentBlock::Text {
+            text: format!("Error: {TOOL_ABORTED_BEFORE_DISPATCH_MESSAGE}"),
+        }],
+        result: ToolDispatchResult::Failure {
+            message: TOOL_ABORTED_BEFORE_DISPATCH_MESSAGE.into(),
+        },
+        error: Some(SessionToolError {
+            name: "AbortError".into(),
+            code: TOOL_ABORTED_BEFORE_DISPATCH.into(),
+        }),
     }
 }
 

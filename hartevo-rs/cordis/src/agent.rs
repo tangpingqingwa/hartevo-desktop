@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use futures_util::StreamExt;
 
 use crate::context::{Context, CordisError, keys};
+use crate::fiber::LifecycleCancellation;
 use crate::inbox::AgentInboxTarget;
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
@@ -23,11 +24,12 @@ use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
     EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
     PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
-    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface, assemble_system_prompt,
-    denied_tool_dispatch_outcome, dispatch_tool_execution, events, finalize_tool_execution,
-    post_tool_execution, prepare_llm_call, prepare_tool_execution, register_agent,
-    run_tools_pipeline, schedule_tool_dispatch, settle_denied_tool_execution, stream_llm,
-    stream_llm_request, stream_prepared_llm,
+    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
+    aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
+    dispatch_tool_execution, events, finalize_tool_execution, post_tool_execution,
+    prepare_llm_call, prepare_tool_execution, register_agent, run_tools_pipeline,
+    schedule_tool_dispatch, settle_denied_tool_execution, stream_llm, stream_llm_request,
+    stream_prepared_llm,
 };
 
 /// DeepSeek Harness-compatible default bound for overlapping tool bodies.
@@ -905,6 +907,7 @@ pub fn commit_agent_tool_results(
         .iter()
         .map(|result| PlannedToolResult {
             call_seq: result.input().call_seq(),
+            error: result.error().cloned(),
             message: SessionMessage {
                 id: format!(
                     "{}:turn:{turn}:step:{step}:tool-result:{}",
@@ -946,10 +949,11 @@ pub fn commit_agent_tool_results(
     );
 
     for result in planned.iter().skip(existing.len()) {
-        let seq = session.append_tool_result_with_surface(
+        let seq = session.append_tool_result_with_error_and_surface(
             turn,
             step,
             result.message.clone(),
+            result.error.clone(),
             SessionSurfaceIntent::append_from(vec![result.call_seq]),
         )?;
         recorded.tool_result_seqs.push(seq);
@@ -992,6 +996,26 @@ pub fn run_agent_tool_batch_with_limit(
     recorded: &mut RecordedAgentStream,
     max_parallel_tool_calls: usize,
 ) -> Result<Vec<ToolExecutionResult>, CordisError> {
+    run_agent_tool_batch_with_limit_and_cancellation(
+        ctx,
+        logged,
+        recorded,
+        max_parallel_tool_calls,
+        &LifecycleCancellation::default(),
+    )
+}
+
+/// Run one exact tool batch with N59's bound and explicit N60 cancellation.
+///
+/// Cancellation stops replenishment, drains already-started calls, and emits
+/// canonical synthetic results for every call that never started.
+pub fn run_agent_tool_batch_with_limit_and_cancellation(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+    max_parallel_tool_calls: usize,
+    cancellation: &LifecycleCancellation,
+) -> Result<Vec<ToolExecutionResult>, CordisError> {
     if max_parallel_tool_calls == 0 {
         return Err(invalid_stream_protocol("a positive parallel tool-call limit").into());
     }
@@ -1021,6 +1045,15 @@ pub fn run_agent_tool_batch_with_limit(
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
     let mut next = 0;
     while next < inputs.len() {
+        if cancellation.is_cancelled() {
+            results.extend(
+                inputs[next..]
+                    .iter()
+                    .cloned()
+                    .map(aborted_before_dispatch_tool_result),
+            );
+            break;
+        }
         if tools.execution_mode(&inputs[next]) == crate::surface::ToolExecutionMode::Exclusive {
             let preparation = prepare_tool_execution(ctx, inputs[next].clone())?;
             let result = settle_tool_preparation(ctx, preparation)?;
@@ -1028,13 +1061,27 @@ pub fn run_agent_tool_batch_with_limit(
             next += 1;
             continue;
         }
-        let (consumed, group_results) =
-            run_parallel_tool_group(ctx, &tools, &inputs[next..], max_parallel_tool_calls)?;
-        if consumed == 0 {
+        let outcome = run_parallel_tool_group(
+            ctx,
+            &tools,
+            &inputs[next..],
+            max_parallel_tool_calls,
+            cancellation,
+        )?;
+        if outcome.consumed == 0 && !outcome.aborted {
             return Err(invalid_stream_protocol("the parallel scheduler to make progress").into());
         }
-        next += consumed;
-        results.extend(group_results);
+        next += outcome.consumed;
+        results.extend(outcome.results);
+        if outcome.aborted {
+            results.extend(
+                inputs[next..]
+                    .iter()
+                    .cloned()
+                    .map(aborted_before_dispatch_tool_result),
+            );
+            break;
+        }
     }
     commit_agent_tool_results(ctx, logged, recorded, &results)?;
     Ok(results)
@@ -1073,7 +1120,8 @@ fn run_parallel_tool_group(
     tools: &ToolsSurface,
     inputs: &[ToolExecutionInput],
     max_parallel_tool_calls: usize,
-) -> Result<(usize, Vec<ToolExecutionResult>), CordisError> {
+    cancellation: &LifecycleCancellation,
+) -> Result<ParallelToolGroupOutcome, CordisError> {
     std::thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel();
         let mut slots = std::iter::repeat_with(|| None)
@@ -1085,9 +1133,11 @@ fn run_parallel_tool_group(
         let mut in_flight = 0;
         let mut barrier_reached = false;
         let mut pending_exclusive = None;
+        let mut aborted = cancellation.is_cancelled();
 
         loop {
-            while !barrier_reached
+            while !aborted
+                && !barrier_reached
                 && next_to_start < inputs.len()
                 && in_flight < max_parallel_tool_calls
             {
@@ -1128,6 +1178,7 @@ fn run_parallel_tool_group(
                 }
                 next_to_start += 1;
                 finalize_ready_tool_slots(ctx, &mut slots, &mut next_to_finalize, &mut results)?;
+                aborted |= cancellation.is_cancelled();
             }
 
             if in_flight == 0 {
@@ -1139,6 +1190,7 @@ fn run_parallel_tool_group(
                         &mut next_to_finalize,
                         &mut results,
                     )?;
+                    aborted |= cancellation.is_cancelled();
                 }
                 break;
             }
@@ -1149,15 +1201,27 @@ fn run_parallel_tool_group(
             in_flight -= 1;
             slots[index] = Some(outcome?);
             finalize_ready_tool_slots(ctx, &mut slots, &mut next_to_finalize, &mut results)?;
+            aborted |= cancellation.is_cancelled();
         }
-        Ok((next_to_start, results))
+        Ok(ParallelToolGroupOutcome {
+            consumed: next_to_start,
+            results,
+            aborted,
+        })
     })
+}
+
+struct ParallelToolGroupOutcome {
+    consumed: usize,
+    results: Vec<ToolExecutionResult>,
+    aborted: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct PlannedToolResult {
     call_seq: u64,
     message: SessionMessage,
+    error: Option<SessionToolError>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1201,7 +1265,7 @@ fn tool_result_prefix_matches(
     existing.len() <= planned.len()
         && existing.iter().zip(planned).all(|(actual, expected)| {
             actual.message == expected.message
-                && actual.error.is_none()
+                && actual.error == expected.error
                 && actual.surface == SessionSurfaceIntent::append_from(vec![expected.call_seq])
         })
 }
