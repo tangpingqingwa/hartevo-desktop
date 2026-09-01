@@ -87,16 +87,53 @@ pub fn prepare_agent_step(
     step: u64,
 ) -> Result<AgentPreStep, CordisError> {
     require_loop_surfaces(ctx)?;
-    let sessions = ctx
-        .sessions::<SessionStore>()
-        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::SESSIONS.to_string()]))?;
-    let session = sessions
+    let session = agent_session(ctx, session_id)?;
+    prepare_agent_step_for_session(ctx, &session, target, turn, step)
+}
+
+/// Run pre-step admission and atomically enter only a non-empty accepted step.
+///
+/// Reject and empty Enter decisions open no step. The future driver owns the
+/// matching turn end and every request, model, tool, and step-end transition.
+pub fn admit_agent_step(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+) -> Result<AgentPreStep, CordisError> {
+    require_loop_surfaces(ctx)?;
+    let session = agent_session(ctx, session_id)?;
+    let proposal = prepare_agent_step_for_session(ctx, &session, target, turn, step)?;
+    if let AgentPreStepDecision::Enter { messages, .. } = proposal.decision()
+        && !messages.is_empty()
+    {
+        session.enter_agent_step(turn, step, messages)?;
+    }
+    Ok(proposal)
+}
+
+fn agent_session(ctx: &Context, session_id: &SessionId) -> Result<SessionHandle, CordisError> {
+    ctx.sessions::<SessionStore>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::SESSIONS.to_string()]))?
         .get(session_id)?
-        .ok_or_else(|| SessionError::SessionNotFound {
-            id: session_id.clone(),
-        })?;
+        .ok_or_else(|| {
+            SessionError::SessionNotFound {
+                id: session_id.clone(),
+            }
+            .into()
+        })
+}
+
+fn prepare_agent_step_for_session(
+    ctx: &mut Context,
+    session: &SessionHandle,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+) -> Result<AgentPreStep, CordisError> {
     let claimed = session.inbox().claim(target, turn)?;
-    let proposal = AgentPreStep::enter(AgentRef::new(session_id.as_str()), turn, step, claimed);
+    let proposal = AgentPreStep::enter(AgentRef::new(session.id().as_str()), turn, step, claimed);
     let proposal = ctx.waterfall(events::AGENT_PRE_STEP, proposal)?;
     if let AgentPreStepDecision::Enter { messages, .. } = proposal.decision() {
         for message in messages {

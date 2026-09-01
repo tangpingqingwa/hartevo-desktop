@@ -2186,6 +2186,52 @@ impl SessionHandle {
         Ok(records.into_iter().map(|record| record.event).collect())
     }
 
+    pub(crate) fn enter_agent_step(
+        &self,
+        turn: u64,
+        step: u64,
+        messages: &[SessionMessage],
+    ) -> Result<(), SessionError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let _permit = SessionAppendPermit::enter(&self.appending, &self.id)?;
+        let records = {
+            let mut log = self.lock()?;
+            let previous_len = log.events().len();
+            let mut candidate = log.clone();
+            let expected = candidate.start_step(turn)?;
+            if step != expected {
+                return Err(SessionError::UnexpectedStep {
+                    turn,
+                    expected,
+                    actual: step,
+                });
+            }
+            for message in messages {
+                candidate.append_user_message(message.clone())?;
+            }
+            let header = candidate.header().clone();
+            let records = candidate.events()[previous_len..]
+                .iter()
+                .cloned()
+                .map(|event| SessionEventRecord {
+                    header: header.clone(),
+                    event,
+                })
+                .collect::<Vec<_>>();
+            *log = candidate;
+            records
+        };
+
+        if let Some(dispatcher) = &self.event_dispatcher {
+            for record in &records {
+                let _ = dispatcher.emit_contained(events::SESSION_EVENT, record);
+            }
+        }
+        Ok(())
+    }
+
     pub fn append_user_message(&self, message: SessionMessage) -> Result<(), SessionError> {
         self.commit(|log| log.append_user_message(message))
     }

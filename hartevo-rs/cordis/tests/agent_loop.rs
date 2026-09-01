@@ -8,7 +8,8 @@ use hartevo_cordis::{
     KernelApprovalDecision, KernelConsentState, LlmStream, LoaderContext, RuntimeSurface,
     SessionContentBlock, SessionError, SessionEventKind, SessionId, SessionMessage,
     SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent, SurfaceOwner,
-    ToolCall, TurnEndReason, events, keys, prepare_agent_step, run_agent_step,
+    ToolCall, TurnEndReason, admit_agent_step, events, keys, prepare_agent_step, run_agent_step,
+    session_events,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -94,6 +95,199 @@ fn pre_step_defaults_to_the_exact_claimed_batch_before_any_step_event() {
 }
 
 #[test]
+fn admitted_step_commits_start_then_the_exact_nonempty_batch() {
+    let mut ctx = mapped();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("step-entry").unwrap())
+        .unwrap();
+    let context = user_message("step-context", "context");
+    let prompt = user_message("turn-prompt", "prompt");
+    session.inbox().append_next_step(context.clone()).unwrap();
+    session.inbox().append_next_turn(prompt.clone()).unwrap();
+    let turn = session.start_turn().unwrap();
+    let before = session.events().unwrap().len();
+
+    let admitted =
+        admit_agent_step(&mut ctx, session.id(), AgentInboxTarget::NextTurn, turn, 1).unwrap();
+
+    assert_eq!(
+        admitted.decision(),
+        &AgentPreStepDecision::Enter {
+            messages: vec![context.clone(), prompt.clone()],
+            starts_request_series: false,
+        }
+    );
+    let events = session.events().unwrap();
+    assert_eq!(events.len(), before + 5);
+    assert!(matches!(
+        events[before].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextStep,
+            ..
+        }
+    ));
+    assert!(matches!(
+        events[before + 1].kind,
+        SessionEventKind::AgentInboxSpliced {
+            target: AgentInboxTarget::NextTurn,
+            ..
+        }
+    ));
+    assert!(matches!(
+        events[before + 2].kind,
+        SessionEventKind::StepStart { turn: 1, step: 1 }
+    ));
+    assert!(matches!(
+        &events[before + 3].kind,
+        SessionEventKind::UserMessage { message, .. } if message == &context
+    ));
+    assert!(matches!(
+        &events[before + 4].kind,
+        SessionEventKind::UserMessage { message, .. } if message == &prompt
+    ));
+    assert_eq!(session.derive_messages().unwrap(), [context, prompt]);
+}
+
+#[test]
+fn empty_admission_opens_no_step_and_preserves_request_series() {
+    let mut ctx = mapped();
+    ctx.on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| {
+        proposal
+            .replace_messages(Vec::new())
+            .with_starts_request_series()
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("step-entry-empty").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("removed", "removed"))
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+
+    let admitted =
+        admit_agent_step(&mut ctx, session.id(), AgentInboxTarget::NextTurn, turn, 1).unwrap();
+
+    assert_eq!(
+        admitted.decision(),
+        &AgentPreStepDecision::Enter {
+            messages: Vec::new(),
+            starts_request_series: true,
+        }
+    );
+    assert!(!session.inbox().has_pending().unwrap());
+    assert!(session.events().unwrap().iter().all(|event| !matches!(
+        event.kind,
+        SessionEventKind::StepStart { .. } | SessionEventKind::UserMessage { .. }
+    )));
+}
+
+#[test]
+fn stale_step_fails_before_the_complete_entry_batch() {
+    let mut ctx = mapped();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("step-entry-stale").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("claimed", "claimed"))
+        .unwrap();
+    let turn = session.start_turn().unwrap();
+
+    assert_eq!(
+        admit_agent_step(&mut ctx, session.id(), AgentInboxTarget::NextTurn, turn, 2),
+        Err(CordisError::Session(SessionError::UnexpectedStep {
+            turn,
+            expected: 1,
+            actual: 2,
+        }))
+    );
+    assert!(!session.inbox().has_pending().unwrap());
+    assert!(session.events().unwrap().iter().all(|event| !matches!(
+        event.kind,
+        SessionEventKind::StepStart { .. } | SessionEventKind::UserMessage { .. }
+    )));
+}
+
+#[test]
+fn step_entry_publishes_the_committed_batch_in_order_and_rejects_reentry() {
+    let mut ctx = mapped();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("step-entry-observed").unwrap())
+        .unwrap();
+    let first = user_message("first", "first");
+    let second = user_message("second", "second");
+    session.inbox().append_next_step(first).unwrap();
+    session.inbox().append_next_turn(second).unwrap();
+    let turn = session.start_turn().unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let complete_at_start = Arc::new(Mutex::new(false));
+    let reentry_error = Arc::new(Mutex::new(None));
+    {
+        let observed = Arc::clone(&observed);
+        let complete_at_start = Arc::clone(&complete_at_start);
+        let reentry_error = Arc::clone(&reentry_error);
+        let callback_session = session.clone();
+        ctx.on_emit(session_events::SESSION_EVENT, move |record| {
+            match &record.event.kind {
+                SessionEventKind::StepStart { .. } => {
+                    observed.lock().unwrap().push("step".to_string());
+                    let events = callback_session.events().unwrap();
+                    *complete_at_start.lock().unwrap() = matches!(
+                        events[events.len() - 3..],
+                        [
+                            hartevo_cordis::SessionEvent {
+                                kind: SessionEventKind::StepStart { .. },
+                                ..
+                            },
+                            hartevo_cordis::SessionEvent {
+                                kind: SessionEventKind::UserMessage { .. },
+                                ..
+                            },
+                            hartevo_cordis::SessionEvent {
+                                kind: SessionEventKind::UserMessage { .. },
+                                ..
+                            },
+                        ]
+                    );
+                    *reentry_error.lock().unwrap() = Some(
+                        callback_session
+                            .append_user_message(user_message("nested", "nested"))
+                            .unwrap_err(),
+                    );
+                }
+                SessionEventKind::UserMessage { message, .. } => {
+                    observed.lock().unwrap().push(message.id.clone());
+                }
+                _ => {}
+            }
+        })
+        .unwrap();
+    }
+
+    admit_agent_step(&mut ctx, session.id(), AgentInboxTarget::NextTurn, turn, 1).unwrap();
+
+    assert_eq!(*observed.lock().unwrap(), ["step", "first", "second"]);
+    assert!(*complete_at_start.lock().unwrap());
+    assert_eq!(
+        *reentry_error.lock().unwrap(),
+        Some(SessionError::AppendInProgress {
+            id: session.id().clone(),
+        })
+    );
+    assert_eq!(session.derive_messages().unwrap().len(), 2);
+}
+
+#[test]
 fn pre_step_wrappers_replace_messages_without_losing_request_series() {
     let mut ctx = mapped();
     let replacement = user_message("replacement", "rewritten");
@@ -150,7 +344,7 @@ fn pre_step_rejects_or_invalidates_after_claim_without_opening_a_step() {
         .append_next_turn(user_message("rejected", "rejected"))
         .unwrap();
     let rejected_turn = rejected_session.start_turn().unwrap();
-    let rejected = prepare_agent_step(
+    let rejected = admit_agent_step(
         &mut rejected_ctx,
         rejected_session.id(),
         AgentInboxTarget::NextTurn,
@@ -195,7 +389,7 @@ fn pre_step_rejects_or_invalidates_after_claim_without_opening_a_step() {
         .unwrap();
     let invalid_turn = invalid_session.start_turn().unwrap();
     assert_eq!(
-        prepare_agent_step(
+        admit_agent_step(
             &mut invalid_ctx,
             invalid_session.id(),
             AgentInboxTarget::NextTurn,
