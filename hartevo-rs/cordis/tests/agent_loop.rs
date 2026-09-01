@@ -3,13 +3,15 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
-    AgentInboxTarget, AgentLoop, AgentPreStepDecision, AgentRef, AgentRequestAdmission, AgentStep,
-    Context, CordisError, CordisHost, DomainSurface, EffectBrokerSurface, EnvironmentOverlay,
-    KernelApproval, KernelApprovalDecision, KernelConsentState, LlmStream, LoaderContext,
+    AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision, AgentRef,
+    AgentRequestAdmission, AgentStep, Context, CordisError, CordisHost, DomainSurface,
+    EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
+    KernelConsentState, LlmModelReasoning, LlmResolvedModel, LlmStream, LoaderContext,
     RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionError, SessionEventKind,
     SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
     SessionSurfaceIntent, SurfaceOwner, ToolCall, TurnEndReason, admit_agent_request,
-    admit_agent_step, events, keys, prepare_agent_step, run_agent_step, session_events,
+    admit_agent_step, events, keys, prepare_agent_call, prepare_agent_step, register_llm_adapter,
+    run_agent_step, session_events,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -509,6 +511,163 @@ fn request_admission_rechecks_the_exact_open_step_after_waterfall() {
     assert!(matches!(
         session.events().unwrap().last().map(|event| &event.kind),
         Some(SessionEventKind::StepEnd { turn: end_turn, step: 1 }) if *end_turn == turn
+    ));
+}
+
+#[test]
+fn agent_call_preparation_resolves_adapter_or_preserves_no_adapter_fallback() {
+    let mut ctx = mapped();
+    ctx.on_waterfall(events::AGENT_PRE_STEP, |proposal, next| {
+        next(proposal).with_starts_request_series()
+    })
+    .unwrap();
+    register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model)
+            .with_context_window(64_000)
+            .with_default_max_tokens(2_048)
+            .with_reasoning(LlmModelReasoning::new(
+                vec!["high".into()],
+                Some("high".into()),
+            )))
+    })
+    .unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("prepared-agent-call").unwrap())
+        .unwrap();
+    let prompt = user_message("prompt", "prompt");
+    session.inbox().append_next_turn(prompt.clone()).unwrap();
+    let turn = session.start_turn().unwrap();
+
+    let AgentCallAdmission::Call(call) = prepare_agent_call(
+        &mut ctx,
+        session.id(),
+        AgentInboxTarget::NextTurn,
+        turn,
+        1,
+        call_config("mock", "model"),
+    )
+    .unwrap() else {
+        panic!("non-empty admission must prepare a call");
+    };
+    assert_eq!(call.messages(), std::slice::from_ref(&prompt));
+    assert_eq!(call.config().reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(call.config().max_tokens, Some(2_048));
+    assert!(call.adapter_defaults().unwrap().reasoning_effort);
+    assert!(call.adapter_defaults().unwrap().max_tokens);
+    assert_eq!(call.context_window(), Some(64_000));
+    assert!(call.starts_request_series());
+    assert!(call.prepared_llm_call().is_some());
+    assert_eq!(session.request_header().unwrap(), None);
+    assert_eq!(session.request_context().unwrap(), None);
+
+    let mut fallback_ctx = mapped();
+    let fallback_session = fallback_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("unregistered-agent-call").unwrap())
+        .unwrap();
+    fallback_session
+        .inbox()
+        .append_next_turn(user_message("fallback", "fallback"))
+        .unwrap();
+    let fallback_turn = fallback_session.start_turn().unwrap();
+    let fallback_config = call_config("middleware-route", "model");
+    let AgentCallAdmission::Call(fallback) = prepare_agent_call(
+        &mut fallback_ctx,
+        fallback_session.id(),
+        AgentInboxTarget::NextTurn,
+        fallback_turn,
+        1,
+        fallback_config.clone(),
+    )
+    .unwrap() else {
+        panic!("middleware-served route still reaches the call boundary");
+    };
+    assert_eq!(fallback.config(), &fallback_config);
+    assert!(fallback.prepared_llm_call().is_none());
+    assert!(fallback.adapter_defaults().is_none());
+    assert_eq!(fallback.context_window(), None);
+}
+
+#[test]
+fn agent_call_skips_adapter_on_reject_and_rechecks_step_after_preparation() {
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let mut rejected_ctx = mapped();
+    {
+        let adapter_calls = Arc::clone(&adapter_calls);
+        register_llm_adapter(
+            &mut rejected_ctx,
+            ["mock"],
+            move |provider: &str, model: &str| {
+                adapter_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(LlmResolvedModel::new(provider, model))
+            },
+        )
+        .unwrap();
+    }
+    rejected_ctx
+        .on_waterfall(events::AGENT_PRE_STEP, |proposal, _next| proposal.reject())
+        .unwrap();
+    let rejected_session = rejected_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("adapter-skipped").unwrap())
+        .unwrap();
+    rejected_session
+        .inbox()
+        .append_next_turn(user_message("reject", "reject"))
+        .unwrap();
+    let rejected_turn = rejected_session.start_turn().unwrap();
+    assert!(matches!(
+        prepare_agent_call(
+            &mut rejected_ctx,
+            rejected_session.id(),
+            AgentInboxTarget::NextTurn,
+            rejected_turn,
+            1,
+            call_config("mock", "model"),
+        )
+        .unwrap(),
+        AgentCallAdmission::NoCall(proposal)
+            if proposal.decision() == &AgentPreStepDecision::Reject
+    ));
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+
+    let mut moved_ctx = mapped();
+    let moved_session = moved_ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("adapter-moved-step").unwrap())
+        .unwrap();
+    moved_session
+        .inbox()
+        .append_next_turn(user_message("prompt", "prompt"))
+        .unwrap();
+    let moved_turn = moved_session.start_turn().unwrap();
+    {
+        let moved_session = moved_session.clone();
+        register_llm_adapter(
+            &mut moved_ctx,
+            ["mock"],
+            move |provider: &str, model: &str| {
+                moved_session.finish_step(moved_turn, 1).unwrap();
+                Ok(LlmResolvedModel::new(provider, model))
+            },
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        prepare_agent_call(
+            &mut moved_ctx,
+            moved_session.id(),
+            AgentInboxTarget::NextTurn,
+            moved_turn,
+            1,
+            call_config("mock", "model"),
+        ),
+        Err(CordisError::Session(SessionError::NoOpenStep { turn })) if turn == moved_turn
     ));
 }
 

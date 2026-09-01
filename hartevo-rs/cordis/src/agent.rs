@@ -6,14 +6,16 @@ use crate::inbox::AgentInboxTarget;
 use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::session::{
-    SessionCallConfig, SessionContentBlock, SessionError, SessionHandle, SessionId, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent, TurnEndReason,
-    validate_agent_request_config, validate_agent_user_message,
+    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionError,
+    SessionHandle, SessionId, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionStore, SessionSurfaceIntent, TurnEndReason, validate_agent_request_config,
+    validate_agent_user_message,
 };
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentsSurface, DomainSurface,
-    EffectBrokerSurface, LlmStream, LlmSurface, RuntimeSurface, ToolCall, ToolsSurface, events,
-    register_agent, run_tools_pipeline, stream_llm,
+    EffectBrokerSurface, LlmError, LlmStream, LlmSurface, PreparedLlmCall, RuntimeSurface,
+    ToolCall, ToolsSurface, events, prepare_llm_call, register_agent, run_tools_pipeline,
+    stream_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
@@ -125,6 +127,63 @@ pub enum AgentRequestAdmission {
     Request(PreparedAgentRequest),
 }
 
+/// N43 request state plus an optional exact adapter-generation preparation.
+#[derive(Debug, Clone)]
+pub struct PreparedAgentCall {
+    request: Box<PreparedAgentRequest>,
+    prepared: Option<PreparedLlmCall>,
+}
+
+impl PreparedAgentCall {
+    #[must_use]
+    pub fn request(&self) -> &PreparedAgentRequest {
+        self.request.as_ref()
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &SessionCallConfig {
+        self.prepared
+            .as_ref()
+            .map_or_else(|| self.request.config(), PreparedLlmCall::config)
+    }
+
+    #[must_use]
+    pub fn messages(&self) -> &[SessionMessage] {
+        self.request.messages()
+    }
+
+    #[must_use]
+    pub const fn starts_request_series(&self) -> bool {
+        self.request.starts_request_series()
+    }
+
+    #[must_use]
+    pub fn adapter_defaults(&self) -> Option<&SessionCallConfigAdapterDefaults> {
+        self.prepared
+            .as_ref()
+            .map(PreparedLlmCall::adapter_defaults)
+    }
+
+    #[must_use]
+    pub fn context_window(&self) -> Option<u64> {
+        self.prepared
+            .as_ref()
+            .and_then(PreparedLlmCall::context_window)
+    }
+
+    #[must_use]
+    pub const fn prepared_llm_call(&self) -> Option<&PreparedLlmCall> {
+        self.prepared.as_ref()
+    }
+}
+
+/// Whether one proposed step reached exact adapter preparation.
+#[derive(Debug, Clone)]
+pub enum AgentCallAdmission {
+    NoCall(AgentPreStep),
+    Call(PreparedAgentCall),
+}
+
 /// Claim the exact inbox batch, then run the authoritative pre-step waterfall.
 ///
 /// This boundary intentionally returns before `step/start`; the future driver
@@ -205,6 +264,36 @@ pub fn admit_agent_request(
         config: request.into_config(),
         messages,
         starts_request_series,
+    }))
+}
+
+/// Prepare the exact adapter generation for one N43-admitted request.
+///
+/// A missing adapter alone is retained as an unprepared call so the future
+/// generic `llm/stream` Waterfall may serve it, matching Harness behavior.
+pub fn prepare_agent_call(
+    ctx: &mut Context,
+    session_id: &SessionId,
+    target: AgentInboxTarget,
+    turn: u64,
+    step: u64,
+    seed_config: SessionCallConfig,
+) -> Result<AgentCallAdmission, CordisError> {
+    let request = match admit_agent_request(ctx, session_id, target, turn, step, seed_config)? {
+        AgentRequestAdmission::NoRequest(admission) => {
+            return Ok(AgentCallAdmission::NoCall(admission));
+        }
+        AgentRequestAdmission::Request(request) => request,
+    };
+    let prepared = match prepare_llm_call(ctx, request.config()) {
+        Ok(prepared) => Some(prepared),
+        Err(CordisError::Llm(LlmError::NoAdapter { .. })) => None,
+        Err(error) => return Err(error),
+    };
+    agent_session(ctx, session_id)?.require_open_step(turn, step)?;
+    Ok(AgentCallAdmission::Call(PreparedAgentCall {
+        request: Box::new(request),
+        prepared,
     }))
 }
 

@@ -6,11 +6,17 @@
 //! reverse through the existing `effect()` / `on()` disposer stack.
 //! OpenInterpreter is never provided on those Hartevo-owned keys.
 
+use std::collections::HashSet;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::context::{Context, CordisError, keys};
+use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker};
-use crate::session::{SessionCallConfig, SessionMessage, SessionStore, events as session_events};
+use crate::session::{
+    SessionCallConfig, SessionCallConfigAdapterDefaults, SessionMessage, SessionStore,
+    events as session_events,
+};
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
@@ -147,6 +153,217 @@ impl LlmStream {
             prompt: prompt.into(),
             body: String::new(),
         }
+    }
+}
+
+/// Adapter-owned selectable reasoning metadata for one exact model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmModelReasoning {
+    efforts: Vec<String>,
+    default_effort: Option<String>,
+}
+
+impl LlmModelReasoning {
+    #[must_use]
+    pub fn new(efforts: Vec<String>, default_effort: Option<String>) -> Self {
+        Self {
+            efforts,
+            default_effort,
+        }
+    }
+
+    #[must_use]
+    pub fn efforts(&self) -> &[String] {
+        &self.efforts
+    }
+
+    #[must_use]
+    pub fn default_effort(&self) -> Option<&str> {
+        self.default_effort.as_deref()
+    }
+}
+
+/// Exact provider/model metadata returned by one adapter preparation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmResolvedModel {
+    provider: String,
+    model: String,
+    context_window: Option<u64>,
+    default_max_tokens: Option<u64>,
+    reasoning: Option<LlmModelReasoning>,
+}
+
+impl LlmResolvedModel {
+    #[must_use]
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            context_window: None,
+            default_max_tokens: None,
+            reasoning: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: u64) -> Self {
+        self.context_window = Some(context_window);
+        self
+    }
+
+    #[must_use]
+    pub fn with_default_max_tokens(mut self, default_max_tokens: u64) -> Self {
+        self.default_max_tokens = Some(default_max_tokens);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning: LlmModelReasoning) -> Self {
+        self.reasoning = Some(reasoning);
+        self
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[must_use]
+    pub const fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
+
+    #[must_use]
+    pub const fn default_max_tokens(&self) -> Option<u64> {
+        self.default_max_tokens
+    }
+
+    #[must_use]
+    pub const fn reasoning(&self) -> Option<&LlmModelReasoning> {
+        self.reasoning.as_ref()
+    }
+}
+
+/// Exact-model preparation implemented by one provider adapter.
+pub trait LlmAdapter: Send + Sync + 'static {
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError>;
+}
+
+impl<F> LlmAdapter for F
+where
+    F: Fn(&str, &str) -> Result<LlmResolvedModel, LlmError> + Send + Sync + 'static,
+{
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        self(provider, model)
+    }
+}
+
+/// Fail-closed adapter registration and exact-model preparation errors.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum LlmError {
+    #[error("LLM adapter must have {expected}")]
+    InvalidAdapter { expected: &'static str },
+    #[error("LLM provider `{provider}` already has an adapter")]
+    DuplicateAdapter { provider: String },
+    #[error("LLM adapter registration identity overflowed")]
+    AdapterIdentityOverflow,
+    #[error("LLM adapter registry mutex is poisoned")]
+    RegistryPoisoned,
+    #[error("no LLM adapter is registered for provider `{provider}`")]
+    NoAdapter { provider: String },
+    #[error("LLM adapter model `{provider}/{model}` must have {expected}")]
+    InvalidModelInfo {
+        provider: String,
+        model: String,
+        expected: &'static str,
+    },
+    #[error(
+        "LLM provider `{provider}` model `{model}` does not support reasoning effort `{effort}`"
+    )]
+    UnsupportedReasoningEffort {
+        provider: String,
+        model: String,
+        effort: String,
+    },
+}
+
+impl LlmError {
+    /// Stable Harness-aligned machine code for this failure class.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidAdapter { .. } => "INVALID_ADAPTER",
+            Self::DuplicateAdapter { .. } => "DUPLICATE_ADAPTER",
+            Self::AdapterIdentityOverflow => "ADAPTER_IDENTITY_OVERFLOW",
+            Self::RegistryPoisoned => "INVARIANT",
+            Self::NoAdapter { .. } => "NO_ADAPTER",
+            Self::InvalidModelInfo { .. } => "INVALID_MODEL_INFO",
+            Self::UnsupportedReasoningEffort { .. } => "UNSUPPORTED_REASONING_EFFORT",
+        }
+    }
+}
+
+struct LlmAdapterRegistration {
+    id: u64,
+    adapter: Arc<dyn LlmAdapter>,
+}
+
+struct LlmAdapterRoute {
+    provider: String,
+    registration: Arc<LlmAdapterRegistration>,
+}
+
+#[derive(Default)]
+struct LlmAdapterState {
+    last_registration_id: u64,
+    routes: Vec<LlmAdapterRoute>,
+}
+
+/// One resolved call retaining the exact adapter registration generation.
+#[derive(Clone)]
+pub struct PreparedLlmCall {
+    registration: Arc<LlmAdapterRegistration>,
+    config: SessionCallConfig,
+    adapter_defaults: SessionCallConfigAdapterDefaults,
+    context_window: Option<u64>,
+}
+
+impl PreparedLlmCall {
+    #[must_use]
+    pub fn registration_id(&self) -> u64 {
+        self.registration.id
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &SessionCallConfig {
+        &self.config
+    }
+
+    #[must_use]
+    pub const fn adapter_defaults(&self) -> &SessionCallConfigAdapterDefaults {
+        &self.adapter_defaults
+    }
+
+    #[must_use]
+    pub const fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
+}
+
+impl fmt::Debug for PreparedLlmCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedLlmCall")
+            .field("registration_id", &self.registration.id)
+            .field("config", &self.config)
+            .field("adapter_defaults", &self.adapter_defaults)
+            .field("context_window", &self.context_window)
+            .finish_non_exhaustive()
     }
 }
 
@@ -345,15 +562,17 @@ impl ToolsSurface {
 }
 
 /// Model stream service provided at `ctx.llm`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmSurface {
     streams: Arc<Mutex<Vec<String>>>,
+    adapters: Arc<Mutex<LlmAdapterState>>,
 }
 
 impl LlmSurface {
     fn new() -> Self {
         Self {
             streams: Arc::new(Mutex::new(Vec::new())),
+            adapters: Arc::new(Mutex::new(LlmAdapterState::default())),
         }
     }
 
@@ -372,6 +591,179 @@ impl LlmSurface {
     pub fn streams(&self) -> Vec<String> {
         self.streams.lock().expect("llm streams").clone()
     }
+
+    fn register_adapter(
+        &self,
+        providers: Vec<String>,
+        adapter: Arc<dyn LlmAdapter>,
+    ) -> Result<u64, LlmError> {
+        if providers.is_empty() {
+            return Err(LlmError::InvalidAdapter {
+                expected: "at least one provider",
+            });
+        }
+        let mut state = self
+            .adapters
+            .lock()
+            .map_err(|_| LlmError::RegistryPoisoned)?;
+        let mut candidates = HashSet::new();
+        for provider in &providers {
+            if provider.is_empty() {
+                return Err(LlmError::InvalidAdapter {
+                    expected: "non-empty provider names",
+                });
+            }
+            if !candidates.insert(provider.as_str())
+                || state.routes.iter().any(|route| route.provider == *provider)
+            {
+                return Err(LlmError::DuplicateAdapter {
+                    provider: provider.clone(),
+                });
+            }
+        }
+        let id = state
+            .last_registration_id
+            .checked_add(1)
+            .ok_or(LlmError::AdapterIdentityOverflow)?;
+        let registration = Arc::new(LlmAdapterRegistration { id, adapter });
+        state
+            .routes
+            .extend(providers.into_iter().map(|provider| LlmAdapterRoute {
+                provider,
+                registration: Arc::clone(&registration),
+            }));
+        state.last_registration_id = id;
+        Ok(id)
+    }
+
+    fn unregister_adapter(&self, registration_id: u64) {
+        if let Ok(mut state) = self.adapters.lock() {
+            state
+                .routes
+                .retain(|route| route.registration.id != registration_id);
+        }
+    }
+
+    pub fn providers(&self) -> Result<Vec<String>, LlmError> {
+        Ok(self
+            .adapters
+            .lock()
+            .map_err(|_| LlmError::RegistryPoisoned)?
+            .routes
+            .iter()
+            .map(|route| route.provider.clone())
+            .collect())
+    }
+
+    fn prepare_call(&self, config: &SessionCallConfig) -> Result<PreparedLlmCall, LlmError> {
+        let registration = {
+            let state = self
+                .adapters
+                .lock()
+                .map_err(|_| LlmError::RegistryPoisoned)?;
+            state
+                .routes
+                .iter()
+                .find(|route| route.provider == config.provider)
+                .map(|route| Arc::clone(&route.registration))
+        }
+        .ok_or_else(|| LlmError::NoAdapter {
+            provider: config.provider.clone(),
+        })?;
+        let model = registration
+            .adapter
+            .prepare_model(&config.provider, &config.model)?;
+        resolve_prepared_call(registration, config, &model)
+    }
+}
+
+impl fmt::Debug for LlmSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("LlmSurface").finish_non_exhaustive()
+    }
+}
+
+fn resolve_prepared_call(
+    registration: Arc<LlmAdapterRegistration>,
+    proposed: &SessionCallConfig,
+    model: &LlmResolvedModel,
+) -> Result<PreparedLlmCall, LlmError> {
+    let invalid = |expected| LlmError::InvalidModelInfo {
+        provider: proposed.provider.clone(),
+        model: proposed.model.clone(),
+        expected,
+    };
+    if model.provider != proposed.provider || model.model != proposed.model {
+        return Err(invalid("the exact requested provider/model identity"));
+    }
+    if model.context_window == Some(0) {
+        return Err(invalid("a positive optional context window"));
+    }
+    if model.default_max_tokens == Some(0) {
+        return Err(invalid("a positive optional default maxTokens"));
+    }
+    if let Some(reasoning) = &model.reasoning {
+        let mut efforts = HashSet::new();
+        if reasoning.efforts.is_empty()
+            || reasoning
+                .efforts
+                .iter()
+                .any(|effort| effort.is_empty() || !efforts.insert(effort.as_str()))
+            || reasoning
+                .default_effort
+                .as_ref()
+                .is_some_and(|default| !efforts.contains(default.as_str()))
+        {
+            return Err(invalid(
+                "non-empty unique reasoning efforts and an in-set optional default",
+            ));
+        }
+    }
+
+    let mut config = proposed.clone();
+    let mut adapter_defaults = SessionCallConfigAdapterDefaults {
+        reasoning_effort: false,
+        max_tokens: false,
+    };
+    if config.max_tokens.is_none()
+        && let Some(default) = model.default_max_tokens
+    {
+        config.max_tokens = Some(default);
+        adapter_defaults.max_tokens = true;
+    }
+    match (&model.reasoning, config.reasoning_effort.as_ref()) {
+        (None, Some(effort)) => {
+            return Err(LlmError::UnsupportedReasoningEffort {
+                provider: proposed.provider.clone(),
+                model: proposed.model.clone(),
+                effort: effort.clone(),
+            });
+        }
+        (Some(reasoning), requested) => {
+            let effective = requested.or(reasoning.default_effort.as_ref());
+            if let Some(effort) = effective {
+                if !reasoning.efforts.contains(effort) {
+                    return Err(LlmError::UnsupportedReasoningEffort {
+                        provider: proposed.provider.clone(),
+                        model: proposed.model.clone(),
+                        effort: effort.clone(),
+                    });
+                }
+                if requested.is_none() {
+                    config.reasoning_effort = Some(effort.clone());
+                    adapter_defaults.reasoning_effort = true;
+                }
+            }
+        }
+        (None, None) => {}
+    }
+
+    Ok(PreparedLlmCall {
+        registration,
+        config,
+        adapter_defaults,
+        context_window: model.context_window,
+    })
 }
 
 /// Live agent coordination provided at `ctx.agents`.
@@ -705,6 +1097,41 @@ pub fn register_llm_stream(ctx: &mut Context, model: impl Into<String>) -> Resul
     llm.register_stream(model.clone());
     ctx.effect(move || llm.unregister_stream(&model));
     Ok(())
+}
+
+/// Register exact provider routes and reverse them with the current lifecycle.
+pub fn register_llm_adapter<A, I, S>(
+    ctx: &mut Context,
+    providers: I,
+    adapter: A,
+) -> Result<RegistrationHandle, CordisError>
+where
+    A: LlmAdapter,
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let Some(llm) = ctx.llm::<LlmSurface>() else {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::LLM.to_string(),
+        ]));
+    };
+    let registration_id = llm.register_adapter(
+        providers.into_iter().map(Into::into).collect(),
+        Arc::new(adapter),
+    )?;
+    let registered = Arc::clone(&llm);
+    Ok(ctx.effect(move || registered.unregister_adapter(registration_id)))
+}
+
+/// Resolve one call under the exact current provider registration.
+pub fn prepare_llm_call(
+    ctx: &Context,
+    config: &SessionCallConfig,
+) -> Result<PreparedLlmCall, CordisError> {
+    ctx.llm::<LlmSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::LLM.to_string()]))?
+        .prepare_call(config)
+        .map_err(Into::into)
 }
 
 /// Register live agent coordination on `ctx.agents` and reverse it on teardown.

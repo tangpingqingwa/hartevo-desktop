@@ -470,6 +470,8 @@ pub enum CordisError {
     #[error(transparent)]
     Interpolate(#[from] crate::config::InterpolateError),
     #[error(transparent)]
+    Llm(#[from] crate::surface::LlmError),
+    #[error(transparent)]
     Session(#[from] crate::session::SessionError),
 }
 

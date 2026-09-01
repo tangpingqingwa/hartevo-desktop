@@ -3,15 +3,27 @@ use std::sync::{Arc, Mutex};
 
 use hartevo_cordis::{
     AgentRef, Context, CordisError, CordisHost, DispatchMode, DomainSurface, EffectBrokerSurface,
-    Emit, EnvironmentOverlay, EventKey, LlmStream, LoaderContext, MAPPED_KEYS, PluginId,
-    RuntimeSurface, SurfaceOwner, ToolCall, ToolsSurface, Waterfall, events, expected_mode, keys,
-    register_agent, register_llm_stream, register_tool, run_tools_pipeline, session_events,
-    stream_llm,
+    Emit, EnvironmentOverlay, EventKey, LlmError, LlmModelReasoning, LlmResolvedModel, LlmStream,
+    LoaderContext, MAPPED_KEYS, PluginId, RuntimeSurface, SessionCallConfig, SurfaceOwner,
+    ToolCall, ToolsSurface, Waterfall, events, expected_mode, keys, prepare_llm_call,
+    register_agent, register_llm_adapter, register_llm_stream, register_tool, run_tools_pipeline,
+    session_events, stream_llm,
 };
 
 fn mapped() -> Context {
     let mut host = CordisHost::boot(false).unwrap();
     std::mem::take(host.context_mut())
+}
+
+fn call_config(provider: &str, model: &str) -> SessionCallConfig {
+    SessionCallConfig {
+        provider: provider.into(),
+        model: model.into(),
+        reasoning_effort: None,
+        temperature: None,
+        max_tokens: None,
+        stop: None,
+    }
 }
 
 #[test]
@@ -237,6 +249,105 @@ fn llm_streams_register_on_ctx_llm_and_reverse() {
 }
 
 #[test]
+fn llm_adapter_registration_is_atomic_reversible_and_generation_bound() {
+    let mut ctx = mapped();
+    let first = register_llm_adapter(
+        &mut ctx,
+        ["mock", "other"],
+        |provider: &str, model: &str| Ok(LlmResolvedModel::new(provider, model)),
+    )
+    .unwrap();
+    let llm = ctx.llm::<hartevo_cordis::LlmSurface>().unwrap();
+    assert_eq!(llm.providers().unwrap(), ["mock", "other"]);
+
+    assert_eq!(
+        register_llm_adapter(&mut ctx, ["third", ""], |provider: &str, model: &str| Ok(
+            LlmResolvedModel::new(provider, model)
+        ),)
+        .unwrap_err(),
+        CordisError::Llm(LlmError::InvalidAdapter {
+            expected: "non-empty provider names",
+        })
+    );
+    assert_eq!(
+        register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| Ok(
+            LlmResolvedModel::new(provider, model)
+        ),)
+        .unwrap_err(),
+        CordisError::Llm(LlmError::DuplicateAdapter {
+            provider: "mock".into(),
+        })
+    );
+    assert_eq!(llm.providers().unwrap(), ["mock", "other"]);
+
+    let old = prepare_llm_call(&ctx, &call_config("mock", "model")).unwrap();
+    assert!(first.dispose());
+    assert!(llm.providers().unwrap().is_empty());
+    let second = register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new(provider, model).with_default_max_tokens(32))
+    })
+    .unwrap();
+    let current = prepare_llm_call(&ctx, &call_config("mock", "model")).unwrap();
+    assert_ne!(old.registration_id(), current.registration_id());
+    assert_eq!(old.config().max_tokens, None);
+    assert_eq!(current.config().max_tokens, Some(32));
+    assert!(second.dispose());
+}
+
+#[test]
+fn llm_adapter_preparation_validates_metadata_and_materializes_only_defaults() {
+    let mut ctx = mapped();
+    let llm = ctx.llm::<hartevo_cordis::LlmSurface>().unwrap();
+    register_llm_adapter(&mut ctx, ["mock"], move |provider: &str, model: &str| {
+        assert_eq!(llm.providers().unwrap(), ["mock"]);
+        Ok(LlmResolvedModel::new(provider, model)
+            .with_context_window(128_000)
+            .with_default_max_tokens(4_096)
+            .with_reasoning(LlmModelReasoning::new(
+                vec!["low".into(), "high".into()],
+                Some("high".into()),
+            )))
+    })
+    .unwrap();
+
+    let defaulted = prepare_llm_call(&ctx, &call_config("mock", "model")).unwrap();
+    assert_eq!(defaulted.config().reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(defaulted.config().max_tokens, Some(4_096));
+    assert!(defaulted.adapter_defaults().reasoning_effort);
+    assert!(defaulted.adapter_defaults().max_tokens);
+    assert_eq!(defaulted.context_window(), Some(128_000));
+
+    let mut explicit = call_config("mock", "model");
+    explicit.reasoning_effort = Some("low".into());
+    explicit.max_tokens = Some(512);
+    let explicit = prepare_llm_call(&ctx, &explicit).unwrap();
+    assert_eq!(explicit.config().reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(explicit.config().max_tokens, Some(512));
+    assert!(!explicit.adapter_defaults().reasoning_effort);
+    assert!(!explicit.adapter_defaults().max_tokens);
+
+    let mut unsupported = call_config("mock", "model");
+    unsupported.reasoning_effort = Some("max".into());
+    assert_eq!(
+        prepare_llm_call(&ctx, &unsupported).unwrap_err(),
+        CordisError::Llm(LlmError::UnsupportedReasoningEffort {
+            provider: "mock".into(),
+            model: "model".into(),
+            effort: "max".into(),
+        })
+    );
+
+    register_llm_adapter(&mut ctx, ["invalid"], |_provider: &str, model: &str| {
+        Ok(LlmResolvedModel::new("wrong", model))
+    })
+    .unwrap();
+    assert!(matches!(
+        prepare_llm_call(&ctx, &call_config("invalid", "model")),
+        Err(CordisError::Llm(LlmError::InvalidModelInfo { .. }))
+    ));
+}
+
+#[test]
 fn agent_coordination_registers_on_ctx_agents_and_reverse() {
     let mut ctx = mapped();
     let agent = AgentRef::new("mission-1");
@@ -421,6 +532,17 @@ fn tool_and_llm_and_agent_register_require_mapped_keys() {
     );
     assert_eq!(
         register_llm_stream(&mut ctx, "hartevo-local").unwrap_err(),
+        CordisError::MissingDependencies(vec![keys::LLM.to_string()])
+    );
+    assert_eq!(
+        register_llm_adapter(&mut ctx, ["mock"], |provider: &str, model: &str| Ok(
+            LlmResolvedModel::new(provider, model)
+        ),)
+        .unwrap_err(),
+        CordisError::MissingDependencies(vec![keys::LLM.to_string()])
+    );
+    assert_eq!(
+        prepare_llm_call(&ctx, &call_config("mock", "model")).unwrap_err(),
         CordisError::MissingDependencies(vec![keys::LLM.to_string()])
     );
     assert_eq!(
