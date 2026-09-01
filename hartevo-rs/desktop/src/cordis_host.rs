@@ -1987,13 +1987,14 @@ mod tests {
 
     use chrono::{Duration, TimeZone, Utc};
     use hartevo_cordis::{
-        AgentInboxTarget, AgentStep, AgentsSurface, AuthorityDispatchError, AuthorityScope,
-        CordisError, CordisHost, DomainCommandBinding, DomainCommandKind, DomainSurface,
-        EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding, FiberState,
-        OPENINTERPRETER, RuntimeBinding, SessionContentBlock, SessionError, SessionEventKind,
-        SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
-        SessionSurfaceIntent, SessionSurfaceOp, SurfaceOwner, enforce_invariants, events,
-        host_is_cordis_loop, invariant_missing, keys,
+        AgentInboxOutcome, AgentInboxTarget, AgentStep, AgentsSurface, AuthorityDispatchError,
+        AuthorityScope, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
+        DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
+        EffectVerificationBinding, FiberState, OPENINTERPRETER, RuntimeBinding,
+        SessionContentBlock, SessionError, SessionEventKind, SessionId, SessionMessage,
+        SessionMessageRole, SessionMessageSource, SessionStore, SessionSurfaceIntent,
+        SessionSurfaceOp, SurfaceOwner, enforce_invariants, events, host_is_cordis_loop,
+        invariant_missing, keys,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -2002,7 +2003,8 @@ mod tests {
     };
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
     use hartevo_storage::{
-        PersistedAgentInboxTarget, PersistedSessionEvent, PersistedSessionEventKind, ProjectStore,
+        PersistedAgentInboxOutcome, PersistedAgentInboxTarget, PersistedSessionEvent,
+        PersistedSessionEventKind, ProjectStore,
     };
 
     use super::{
@@ -2061,23 +2063,15 @@ mod tests {
 
     #[test]
     fn agent_inbox_splice_codec_round_trips_exactly() {
-        let message = SessionMessage {
-            id: "queued-user".into(),
-            role: SessionMessageRole::User,
-            content: vec![SessionContentBlock::Text {
-                text: "queued".into(),
-            }],
-            source: SessionMessageSource::User,
-        };
         let event = hartevo_cordis::SessionEvent {
             seq: 0,
             time_ms: 1,
             kind: SessionEventKind::AgentInboxSpliced {
                 target: AgentInboxTarget::NextStep,
                 start: 0,
-                removed_count: None,
-                inserted: vec![message.clone()],
-                outcome: None,
+                removed_count: Some(1),
+                inserted: vec![],
+                outcome: Some(AgentInboxOutcome::Canceled),
             },
         };
 
@@ -2087,10 +2081,10 @@ mod tests {
             PersistedSessionEventKind::AgentInboxSpliced {
                 target: PersistedAgentInboxTarget::NextStep,
                 start: 0,
-                removed_count: None,
+                removed_count: Some(1),
                 inserted,
-                outcome: None,
-            } if inserted == &[message.to_json_value().unwrap()]
+                outcome: Some(PersistedAgentInboxOutcome::Canceled),
+            } if inserted.is_empty()
         ));
         assert_eq!(decode_event(&persisted).unwrap(), event);
     }
@@ -2132,6 +2126,23 @@ mod tests {
             .inbox()
             .append_next_step(step_message.clone())
             .unwrap();
+        let replacement = SessionMessage {
+            id: "persisted-step-replacement".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "replacement context".into(),
+            }],
+            source: SessionMessageSource::Plugin {
+                plugin: "watcher".into(),
+            },
+        };
+        assert!(
+            session
+                .inbox()
+                .replace(&step_message.id, replacement.clone())
+                .unwrap()
+        );
+        assert!(session.inbox().remove(&message.id).unwrap());
         live.session_persistence.persist_live(&session).unwrap();
         let store = live
             .session_persistence
@@ -2152,11 +2163,8 @@ mod tests {
             .get(&SessionId::new("persisted-inbox").unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(
-            restored.inbox().next_turn().unwrap().as_slice(),
-            std::slice::from_ref(&message)
-        );
-        assert_eq!(restored.inbox().next_step().unwrap(), [step_message]);
+        assert!(restored.inbox().next_turn().unwrap().is_empty());
+        assert_eq!(restored.inbox().next_step().unwrap(), [replacement]);
     }
 
     #[test]
