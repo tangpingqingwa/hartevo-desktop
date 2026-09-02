@@ -467,6 +467,77 @@ pub struct SandboxExecutionPolicy {
     call_id: Option<String>,
 }
 
+/// Cloneable handles needed to resolve and prepare sandbox work from a tool
+/// executor running outside the mutable Cordis [`Context`] thread.
+#[derive(Clone)]
+pub struct SandboxExecutionEnvironment {
+    policy: Arc<SandboxPolicyService>,
+    sessions: Option<Arc<SessionStore>>,
+    provider: Option<Arc<SandboxProviderService>>,
+}
+
+impl std::fmt::Debug for SandboxExecutionEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxExecutionEnvironment")
+            .field("has_sessions", &self.sessions.is_some())
+            .field("has_provider", &self.provider.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SandboxExecutionEnvironment {
+    /// Capture the exact root services while the owning tool registration is
+    /// mounted. The registration is disposed before its provider on teardown.
+    pub fn capture(ctx: &Context) -> Result<Self, SandboxError> {
+        let policy = ctx
+            .get::<SandboxPolicyService>(keys::SANDBOX_POLICY)
+            .ok_or(SandboxError::ServiceUnavailable {
+                key: keys::SANDBOX_POLICY,
+            })?;
+        Ok(Self {
+            policy,
+            sessions: ctx.sessions::<SessionStore>(),
+            provider: ctx.sandbox::<SandboxProviderService>(),
+        })
+    }
+
+    /// Resolve the current live handle for one durable Session identity.
+    pub fn live_session(&self, id: &SessionId) -> Result<SessionHandle, SandboxError> {
+        self.sessions
+            .as_ref()
+            .ok_or(SandboxError::ServiceUnavailable {
+                key: keys::SESSIONS,
+            })?
+            .get(id)?
+            .ok_or_else(|| SessionError::SessionNotFound { id: id.clone() }.into())
+    }
+
+    pub fn resolve(
+        &self,
+        request: SandboxPolicyRequest,
+    ) -> Result<SandboxExecutionPolicy, SandboxError> {
+        if request.session.is_none() {
+            return self.policy.resolve(request);
+        }
+        let sessions = self
+            .sessions
+            .as_ref()
+            .ok_or(SandboxError::ServiceUnavailable {
+                key: keys::SESSIONS,
+            })?;
+        resolve_sandbox_policy_with_services(&self.policy, sessions, request)
+    }
+
+    pub fn prepare(
+        &self,
+        argv: Vec<OsString>,
+        policy: SandboxExecutionPolicy,
+    ) -> Result<SandboxExecutionPlan, SandboxError> {
+        prepare_sandbox_execution_with_provider(self.provider.as_deref(), argv, policy)
+    }
+}
+
 impl SandboxExecutionPolicy {
     #[must_use]
     pub const fn mode(&self) -> SandboxMode {
@@ -570,6 +641,15 @@ pub fn prepare_sandbox_execution(
     argv: Vec<OsString>,
     policy: SandboxExecutionPolicy,
 ) -> Result<SandboxExecutionPlan, SandboxError> {
+    let provider = ctx.sandbox::<SandboxProviderService>();
+    prepare_sandbox_execution_with_provider(provider.as_deref(), argv, policy)
+}
+
+fn prepare_sandbox_execution_with_provider(
+    provider: Option<&SandboxProviderService>,
+    argv: Vec<OsString>,
+    policy: SandboxExecutionPolicy,
+) -> Result<SandboxExecutionPlan, SandboxError> {
     validate_command_argv(&argv)?;
     if policy.mode == SandboxMode::DangerFullAccess {
         return Ok(SandboxExecutionPlan::Unconfined { policy, argv });
@@ -586,14 +666,12 @@ pub fn prepare_sandbox_execution(
         session_id: policy.session_id,
         call_id: policy.call_id,
     };
-    let provider = ctx.sandbox::<SandboxProviderService>().ok_or_else(|| {
-        SandboxError::ProviderUnavailable {
-            mode: mode.as_mode(),
-            detail: format!(
-                "Cordis sandbox provider service `{}` is unavailable",
-                keys::SANDBOX
-            ),
-        }
+    let provider = provider.ok_or_else(|| SandboxError::ProviderUnavailable {
+        mode: mode.as_mode(),
+        detail: format!(
+            "Cordis sandbox provider service `{}` is unavailable",
+            keys::SANDBOX
+        ),
     })?;
     let command = provider.confine(&argv, &confined_policy).map_err(|error| {
         SandboxError::ProviderUnavailable {
@@ -701,12 +779,23 @@ pub fn resolve_sandbox_policy(
         .ok_or(SandboxError::ServiceUnavailable {
             key: keys::SANDBOX_POLICY,
         })?;
+    if request.session.is_none() {
+        return policy.resolve(request);
+    }
+    let sessions = ctx
+        .sessions::<SessionStore>()
+        .ok_or(SandboxError::ServiceUnavailable {
+            key: keys::SESSIONS,
+        })?;
+    resolve_sandbox_policy_with_services(&policy, &sessions, request)
+}
+
+fn resolve_sandbox_policy_with_services(
+    policy: &SandboxPolicyService,
+    sessions: &SessionStore,
+    request: SandboxPolicyRequest,
+) -> Result<SandboxExecutionPolicy, SandboxError> {
     if let Some(session) = request.session.as_ref() {
-        let sessions = ctx
-            .sessions::<SessionStore>()
-            .ok_or(SandboxError::ServiceUnavailable {
-                key: keys::SESSIONS,
-            })?;
         sessions.require_live(session)?;
     }
     policy.resolve(request)
