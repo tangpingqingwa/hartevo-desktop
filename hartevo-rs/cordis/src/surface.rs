@@ -17,6 +17,7 @@ use std::task::{Context as TaskContext, Poll};
 use futures_core::Stream;
 use tokio::sync::watch;
 
+use crate::approval::{ApprovalSurface, events as approval_events};
 use crate::context::{Context, CordisError, EventReentry, keys};
 use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker, ListenerHandle};
@@ -38,6 +39,7 @@ const TOOL_ABORTED_BEFORE_DISPATCH_MESSAGE: &str = "tool call aborted before dis
 
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
+    keys::APPROVAL,
     keys::TOOLS,
     keys::SYSTEM_PROMPT,
     keys::LLM,
@@ -2861,6 +2863,15 @@ impl AgentsSurface {
             .retain(|agent| agent.id != id);
     }
 
+    pub(crate) fn contains_exact(&self, agent: &AgentRef) -> Result<bool, CordisError> {
+        Ok(self
+            .live
+            .lock()
+            .map_err(|_| CordisError::AgentRegistryPoisoned)?
+            .iter()
+            .any(|published| published.is_same_lifecycle(agent)))
+    }
+
     #[must_use]
     pub fn list(&self) -> Vec<AgentRef> {
         self.live.lock().expect("agents").clone()
@@ -3059,6 +3070,7 @@ pub(crate) fn map_surfaces(
 
     let session_dispatcher = ctx.event_reentry()?;
     ctx.provide(keys::TOOLS, ToolsSurface::new())?;
+    ctx.provide(keys::APPROVAL, ApprovalSurface)?;
     ctx.provide(keys::SYSTEM_PROMPT, SystemPromptSurface::default())?;
     ctx.provide(keys::LLM, LlmSurface::new())?;
     ctx.provide(
@@ -3074,6 +3086,7 @@ pub(crate) fn map_surfaces(
 }
 
 fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
+    validate_mapped_event(ctx, approval_events::APPROVAL_REQUEST)?;
     validate_mapped_event(ctx, events::SYSTEM_PROMPT_ASSEMBLE)?;
     validate_mapped_event(ctx, events::TOOLS_PRE_EXECUTE)?;
     validate_mapped_event(ctx, events::TOOLS_EXECUTE)?;
@@ -3125,6 +3138,7 @@ pub(crate) fn rebind_hartevo_domain(
 }
 
 fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
+    ctx.lock_event_key(approval_events::APPROVAL_REQUEST)?;
     ctx.lock_event_key(events::SYSTEM_PROMPT_ASSEMBLE)?;
     ctx.lock_event_key(events::TOOLS_PRE_EXECUTE)?;
     ctx.lock_event_key(events::TOOLS_EXECUTE)?;
@@ -4007,7 +4021,7 @@ pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
         | "agent/pre-step"
         | "agent/request"
         | "agent/request-error" => Some(DispatchMode::Waterfall),
-        "agent/turn-stopping" => Some(DispatchMode::Serial),
+        "approval/request" | "agent/turn-stopping" => Some(DispatchMode::Serial),
         "tools/result" | "agent/created" | "agent/status" | "agent/disposed" | "session/event" => {
             Some(DispatchMode::Emit)
         }
@@ -4053,7 +4067,7 @@ mod tests {
         map_surfaces(&mut ctx, HartevoSurfaces::default()).unwrap();
         assert!(matches!(
             map_surfaces(&mut ctx, HartevoSurfaces::default()),
-            Err(CordisError::SurfaceAlreadyMapped { key }) if key == keys::TOOLS
+            Err(CordisError::SurfaceAlreadyMapped { key }) if key == keys::APPROVAL
         ));
         assert_eq!(
             ctx.domain::<DomainSurface>().unwrap().owner(),
@@ -4062,7 +4076,7 @@ mod tests {
     }
 
     #[test]
-    fn all_fifteen_surface_event_descriptors_preflight_before_any_provider_mutation() {
+    fn all_sixteen_surface_event_descriptors_preflight_before_any_provider_mutation() {
         let mut ctx = Context::new();
         let incompatible_last_key = EventKey::<Emit, AgentTurnStopping, ()>::new(
             events::AGENT_TURN_STOPPING.schema_id(),
@@ -4086,6 +4100,7 @@ mod tests {
             Some(descriptor_before)
         );
         for name in [
+            approval_events::APPROVAL_REQUEST.name(),
             events::SYSTEM_PROMPT_ASSEMBLE.name(),
             events::TOOLS_PRE_EXECUTE.name(),
             events::TOOLS_EXECUTE.name(),

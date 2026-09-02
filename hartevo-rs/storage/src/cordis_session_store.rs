@@ -159,6 +159,15 @@ pub enum PersistedSessionEventKind {
     RequestContext {
         context: serde_json::Value,
     },
+    ApprovalAsked {
+        approval: serde_json::Value,
+    },
+    ApprovalDecided {
+        approval: serde_json::Value,
+    },
+    ApprovalPolicy {
+        approval: serde_json::Value,
+    },
     LlmRetry {
         retry: serde_json::Value,
     },
@@ -469,6 +478,18 @@ fn validate_event_payload(
             validate_request_json(context, "request/context payload must be a JSON object")?;
             (None, None)
         }
+        PersistedSessionEventKind::ApprovalAsked { approval } => {
+            validate_approval_asked(approval)?;
+            (None, None)
+        }
+        PersistedSessionEventKind::ApprovalDecided { approval } => {
+            validate_approval_decided(approval)?;
+            (None, None)
+        }
+        PersistedSessionEventKind::ApprovalPolicy { approval } => {
+            validate_approval_policy(approval)?;
+            (None, None)
+        }
         PersistedSessionEventKind::LlmRetry { retry } => retry_scope(
             retry,
             "llm/retry payload must be a JSON object",
@@ -574,6 +595,85 @@ fn validate_request_json(
     expected: &'static str,
 ) -> Result<(), StorageError> {
     if !request.is_object() {
+        return Err(StorageError::InvalidSessionCheckpoint(expected));
+    }
+    Ok(())
+}
+
+fn validate_approval_asked(approval: &serde_json::Value) -> Result<(), StorageError> {
+    validate_request_json(approval, "approval/asked payload must be a JSON object")?;
+    require_non_empty_string(approval, "id", "approval/asked id must not be empty")?;
+    require_non_empty_string(
+        approval,
+        "toolName",
+        "approval/asked toolName must not be empty",
+    )?;
+    validate_optional_non_empty_string(
+        approval,
+        "callId",
+        "approval/asked callId must be a non-empty string",
+    )?;
+    validate_optional_non_empty_string(
+        approval,
+        "reason",
+        "approval/asked reason must be a non-empty string",
+    )
+}
+
+fn validate_approval_decided(approval: &serde_json::Value) -> Result<(), StorageError> {
+    validate_request_json(approval, "approval/decided payload must be a JSON object")?;
+    require_non_empty_string(approval, "id", "approval/decided id must not be empty")?;
+    match approval.get("outcome").and_then(serde_json::Value::as_str) {
+        Some("allowed-once" | "rejected" | "cancelled" | "unavailable") => Ok(()),
+        _ => Err(StorageError::InvalidSessionCheckpoint(
+            "approval/decided outcome is invalid",
+        )),
+    }
+}
+
+fn validate_approval_policy(approval: &serde_json::Value) -> Result<(), StorageError> {
+    validate_request_json(approval, "approval/policy payload must be a JSON object")?;
+    if !matches!(
+        approval.get("policy").and_then(serde_json::Value::as_str),
+        Some("ask" | "never")
+    ) {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "approval/policy value is invalid",
+        ));
+    }
+    match approval.get("source") {
+        None => Ok(()),
+        Some(source) if source.as_str() == Some("delegation") => Ok(()),
+        Some(_) => Err(StorageError::InvalidSessionCheckpoint(
+            "approval/policy source is invalid",
+        )),
+    }
+}
+
+fn require_non_empty_string(
+    value: &serde_json::Value,
+    field: &str,
+    expected: &'static str,
+) -> Result<(), StorageError> {
+    if value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(StorageError::InvalidSessionCheckpoint(expected));
+    }
+    Ok(())
+}
+
+fn validate_optional_non_empty_string(
+    value: &serde_json::Value,
+    field: &str,
+    expected: &'static str,
+) -> Result<(), StorageError> {
+    if value
+        .get(field)
+        .is_some_and(|field| field.as_str().is_none_or(str::is_empty))
+    {
         return Err(StorageError::InvalidSessionCheckpoint(expected));
     }
     Ok(())
@@ -1250,6 +1350,78 @@ mod tests {
                 Err(StorageError::InvalidSessionCheckpoint(actual)) if actual == expected
             ));
             assert!(store.load_session_checkpoints().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn approval_audit_round_trips_and_rejects_open_vocabulary() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        let audit = checkpoint(vec![
+            PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: PersistedSessionEventKind::ApprovalPolicy {
+                    approval: serde_json::json!({
+                        "policy": "never",
+                        "source": "delegation",
+                    }),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 1,
+                time_ms: 2,
+                kind: PersistedSessionEventKind::ApprovalAsked {
+                    approval: serde_json::json!({
+                        "id": "approval-1",
+                        "toolName": "filesystem.write",
+                        "callId": "call-1",
+                    }),
+                },
+            },
+            PersistedSessionEvent {
+                seq: 2,
+                time_ms: 3,
+                kind: PersistedSessionEventKind::ApprovalDecided {
+                    approval: serde_json::json!({
+                        "id": "approval-1",
+                        "outcome": "allowed-once",
+                    }),
+                },
+            },
+        ]);
+        assert!(store.persist_session_checkpoint(&audit).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![audit]);
+
+        for (kind, expected) in [
+            (
+                PersistedSessionEventKind::ApprovalAsked {
+                    approval: serde_json::json!({ "id": "", "toolName": "write" }),
+                },
+                "approval/asked id must not be empty",
+            ),
+            (
+                PersistedSessionEventKind::ApprovalDecided {
+                    approval: serde_json::json!({ "id": "approval-1", "outcome": "always" }),
+                },
+                "approval/decided outcome is invalid",
+            ),
+            (
+                PersistedSessionEventKind::ApprovalPolicy {
+                    approval: serde_json::json!({ "policy": "always" }),
+                },
+                "approval/policy value is invalid",
+            ),
+        ] {
+            let mut isolated = ProjectStore::in_memory().unwrap();
+            let invalid = checkpoint(vec![PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind,
+            }]);
+            assert!(matches!(
+                isolated.persist_session_checkpoint(&invalid),
+                Err(StorageError::InvalidSessionCheckpoint(actual)) if actual == expected
+            ));
         }
     }
 

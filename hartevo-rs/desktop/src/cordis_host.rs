@@ -23,14 +23,15 @@ use hartevo_cordis::{
     KernelConsentState, KernelConsentStatus, LifecycleCancellation, LlmAdapter, LlmAdapterStream,
     LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError,
     ManualCompactionErrorCode, RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit,
-    RuntimeStatusCompletion, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
-    SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary, SessionContentBlock,
-    SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
-    SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure,
-    SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
-    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-    SessionToolError, TurnEndReason, compact_now, host_is_cordis_loop, keys, register_llm_adapter,
+    RuntimeStatusCompletion, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
+    SessionCallConfig, SessionCancelCause, SessionCheckpoint, SessionCompactionEnd,
+    SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionEpochHeader,
+    SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionFinishReason,
+    SessionHandle, SessionHeader, SessionId, SessionLlmFailure, SessionLlmRetry,
+    SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
+    TurnEndReason, compact_now, host_is_cordis_loop, keys, register_llm_adapter,
     run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
@@ -1801,6 +1802,21 @@ fn encode_event(
                     context: context.to_json_value()?,
                 }
             }
+            SessionEventKind::ApprovalAsked { approval } => {
+                PersistedSessionEventKind::ApprovalAsked {
+                    approval: approval.to_json_value()?,
+                }
+            }
+            SessionEventKind::ApprovalDecided { approval } => {
+                PersistedSessionEventKind::ApprovalDecided {
+                    approval: approval.to_json_value()?,
+                }
+            }
+            SessionEventKind::ApprovalPolicy { approval } => {
+                PersistedSessionEventKind::ApprovalPolicy {
+                    approval: approval.to_json_value()?,
+                }
+            }
             SessionEventKind::LlmRetry { retry } => PersistedSessionEventKind::LlmRetry {
                 retry: retry.to_json_value()?,
             },
@@ -1977,6 +1993,21 @@ fn decode_event(
             PersistedSessionEventKind::RequestContext { context } => {
                 SessionEventKind::RequestContext {
                     context: SessionRequestContext::from_json_value(context)?,
+                }
+            }
+            PersistedSessionEventKind::ApprovalAsked { approval } => {
+                SessionEventKind::ApprovalAsked {
+                    approval: SessionApprovalAsked::from_json_value(approval)?,
+                }
+            }
+            PersistedSessionEventKind::ApprovalDecided { approval } => {
+                SessionEventKind::ApprovalDecided {
+                    approval: SessionApprovalDecided::from_json_value(approval)?,
+                }
+            }
+            PersistedSessionEventKind::ApprovalPolicy { approval } => {
+                SessionEventKind::ApprovalPolicy {
+                    approval: SessionApprovalPolicy::from_json_value(approval)?,
                 }
             }
             PersistedSessionEventKind::LlmRetry { retry } => SessionEventKind::LlmRetry {
@@ -2650,20 +2681,22 @@ mod tests {
     use futures_util::stream;
     use hartevo_cordis::{
         AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStatusChange, AgentStep,
-        AgentsSurface, AuthorityDispatchError, AuthorityScope, CompactionCheckpoint, CompactionId,
+        AgentsSurface, ApprovalOutcome, ApprovalPolicy, ApprovalPolicySource, ApprovalRequestId,
+        AuthorityDispatchError, AuthorityScope, CompactionCheckpoint, CompactionId,
         CompactionSummaryDraft, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
         DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
-        OPENINTERPRETER, RuntimeBinding, SessionCallConfig, SessionCancelCause,
-        SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
-        SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
-        SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
-        SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
-        SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-        SessionSurfaceOp, SurfaceOwner, TurnEndReason, enforce_invariants, events,
-        host_is_cordis_loop, invariant_missing, is_compact_checkpoint_source, keys, session_events,
+        OPENINTERPRETER, RuntimeBinding, SessionApprovalAsked, SessionApprovalDecided,
+        SessionApprovalPolicy, SessionCallConfig, SessionCancelCause, SessionCompactionEnd,
+        SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionError,
+        SessionEvent, SessionEventKind, SessionFinishReason, SessionHandle, SessionId,
+        SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted,
+        SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
+        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
+        SurfaceOwner, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
+        invariant_missing, is_compact_checkpoint_source, keys, session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -3373,6 +3406,48 @@ mod tests {
             } if inserted.is_empty()
         ));
         assert_eq!(decode_event(&persisted).unwrap(), event);
+    }
+
+    #[test]
+    fn approval_codec_round_trips_the_closed_audit_vocabulary() {
+        let id = ApprovalRequestId::new("desktop-approval-1").unwrap();
+        let events = [
+            SessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: SessionEventKind::ApprovalPolicy {
+                    approval: SessionApprovalPolicy::new(
+                        ApprovalPolicy::Never,
+                        Some(ApprovalPolicySource::Delegation),
+                    ),
+                },
+            },
+            SessionEvent {
+                seq: 1,
+                time_ms: 2,
+                kind: SessionEventKind::ApprovalAsked {
+                    approval: SessionApprovalAsked::new(
+                        id.clone(),
+                        "filesystem.write".into(),
+                        Some("call-1".into()),
+                        Some("requires approval".into()),
+                    )
+                    .unwrap(),
+                },
+            },
+            SessionEvent {
+                seq: 2,
+                time_ms: 3,
+                kind: SessionEventKind::ApprovalDecided {
+                    approval: SessionApprovalDecided::new(id, ApprovalOutcome::AllowedOnce),
+                },
+            },
+        ];
+
+        for event in events {
+            let persisted = encode_event(&event).unwrap();
+            assert_eq!(decode_event(&persisted).unwrap(), event);
+        }
     }
 
     #[test]

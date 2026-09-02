@@ -10,10 +10,11 @@ use hartevo_cordis::{
     RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionId,
     SessionLlmFailure, SessionMessage, SessionMessageRole, SessionMessageSource,
     SessionStreamBlockType, SessionStreamChunk, SessionToolSchema, SurfaceOwner,
-    SystemPromptSurface, ToolCall, ToolsSurface, Waterfall, assemble_system_prompt, events,
-    expected_mode, keys, prepare_llm_call, register_agent, register_llm_adapter,
-    register_llm_stream, register_prompt_section, register_tool, register_tool_schema,
-    run_tools_pipeline, session_events, stream_llm, stream_llm_request, stream_prepared_llm,
+    SystemPromptSurface, ToolCall, ToolsSurface, Waterfall, approval_events,
+    assemble_system_prompt, events, expected_mode, keys, prepare_llm_call, register_agent,
+    register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
+    register_tool_schema, run_tools_pipeline, session_events, stream_llm, stream_llm_request,
+    stream_prepared_llm,
 };
 
 fn mapped() -> Context {
@@ -85,6 +86,7 @@ fn mapped_keys_are_provided_and_looked_up() {
     assert_eq!(
         MAPPED_KEYS,
         [
+            keys::APPROVAL,
             keys::TOOLS,
             keys::SYSTEM_PROMPT,
             keys::LLM,
@@ -101,6 +103,7 @@ fn mapped_keys_are_provided_and_looked_up() {
     }
 
     assert!(ctx.tools::<ToolsSurface>().is_some());
+    assert!(ctx.approval::<hartevo_cordis::ApprovalSurface>().is_some());
     assert!(ctx.system_prompt::<SystemPromptSurface>().is_some());
     assert!(ctx.llm::<hartevo_cordis::LlmSurface>().is_some());
     assert!(ctx.agents::<hartevo_cordis::AgentsSurface>().is_some());
@@ -168,7 +171,7 @@ fn tools_pipeline_locks_exactly_one_mode_per_event() {
 }
 
 #[test]
-fn all_fifteen_mapped_events_keep_their_exact_typed_descriptors() {
+fn all_sixteen_mapped_events_keep_their_exact_typed_descriptors() {
     let ctx = mapped();
     macro_rules! assert_mapped {
         ($key:expr, $mode:expr) => {{
@@ -178,6 +181,7 @@ fn all_fifteen_mapped_events_keep_their_exact_typed_descriptors() {
             assert_eq!(expected_mode(key.name()), Some($mode));
         }};
     }
+    assert_mapped!(approval_events::APPROVAL_REQUEST, DispatchMode::Serial);
     assert_mapped!(events::SYSTEM_PROMPT_ASSEMBLE, DispatchMode::Waterfall);
     assert_mapped!(events::TOOLS_PRE_EXECUTE, DispatchMode::Waterfall);
     assert_mapped!(events::TOOLS_EXECUTE, DispatchMode::Waterfall);
@@ -960,6 +964,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
 
     ctx.teardown();
     for key in [
+        keys::APPROVAL,
         keys::TOOLS,
         keys::SYSTEM_PROMPT,
         keys::LLM,
@@ -973,6 +978,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
         assert!(!ctx.has(key), "{key} must reverse on teardown");
     }
     for name in [
+        approval_events::APPROVAL_REQUEST.name(),
         events::SYSTEM_PROMPT_ASSEMBLE.name(),
         events::TOOLS_PRE_EXECUTE.name(),
         events::TOOLS_EXECUTE.name(),
@@ -985,6 +991,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
         events::AGENT_PRE_STEP.name(),
         events::AGENT_REQUEST.name(),
         events::AGENT_REQUEST_ERROR.name(),
+        events::AGENT_TURN_STOPPING.name(),
         session_events::SESSION_EVENT.name(),
         session_events::SESSION_FLUSH.name(),
     ] {

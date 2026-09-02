@@ -7,13 +7,17 @@
 //! typed event/flush seam consumed by persistence plugins. The wider Harness
 //! vocabulary remains separate follow-up work.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 
+use crate::approval::{
+    ApprovalOutcome, ApprovalPolicy, ApprovalPolicySource, ApprovalRequestId, SessionApprovalAsked,
+    SessionApprovalDecided, SessionApprovalPolicy,
+};
 use crate::compaction::{
     COMPACTION_CHECKPOINT_PLUGIN, CompactionCheckpoint, CompactionId, CompactionLease,
     CompactionRange, CompactionRegion, CompactionResult, CompactionSummaryDraft,
@@ -760,6 +764,15 @@ pub enum SessionEventKind {
     RequestContext {
         context: SessionRequestContext,
     },
+    ApprovalAsked {
+        approval: SessionApprovalAsked,
+    },
+    ApprovalDecided {
+        approval: SessionApprovalDecided,
+    },
+    ApprovalPolicy {
+        approval: SessionApprovalPolicy,
+    },
     LlmRetry {
         retry: SessionLlmRetry,
     },
@@ -813,6 +826,9 @@ impl SessionEventKind {
             Self::AssistantChunk { .. } => "assistant/chunk",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
+            Self::ApprovalAsked { .. } => "approval/asked",
+            Self::ApprovalDecided { .. } => "approval/decided",
+            Self::ApprovalPolicy { .. } => "approval/policy",
             Self::LlmRetry { .. } => "llm/retry",
             Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::CompactionStart { .. } => "compaction/start",
@@ -838,6 +854,9 @@ impl SessionEventKind {
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
             | Self::RequestContext { .. }
+            | Self::ApprovalAsked { .. }
+            | Self::ApprovalDecided { .. }
+            | Self::ApprovalPolicy { .. }
             | Self::LlmRetry { .. }
             | Self::LlmRetryStarted { .. }
             | Self::CompactionStart { .. }
@@ -860,6 +879,9 @@ impl SessionEventKind {
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
             | Self::RequestContext { .. }
+            | Self::ApprovalAsked { .. }
+            | Self::ApprovalDecided { .. }
+            | Self::ApprovalPolicy { .. }
             | Self::LlmRetry { .. }
             | Self::LlmRetryStarted { .. }
             | Self::CompactionStart { .. }
@@ -937,6 +959,8 @@ struct SessionState {
     last_step: u64,
     open_step: Option<u64>,
     pending_tool_calls: HashSet<String>,
+    pending_approvals: BTreeSet<ApprovalRequestId>,
+    approval_policy: ApprovalPolicy,
     request_provider: Option<String>,
     retry_chains: HashMap<String, SessionRetryState>,
     compaction: Option<SessionCompactionState>,
@@ -983,6 +1007,9 @@ impl SessionState {
                 require_turn(self.open_turn, turn)?;
                 if let Some(step) = self.open_step {
                     return Err(SessionError::StepStillOpen { turn, step });
+                }
+                if let Some(id) = self.pending_approvals.iter().next() {
+                    return Err(SessionError::ApprovalStillPending { id: id.clone() });
                 }
                 self.open_turn = None;
                 self.retry_chains.clear();
@@ -1035,6 +1062,33 @@ impl SessionState {
             SessionEventKind::RequestContext { context } => {
                 require_open_turn(self.open_turn)?;
                 validate_request_context(context)?;
+            }
+            SessionEventKind::ApprovalAsked { approval } => {
+                require_open_turn(self.open_turn)?;
+                if let Some(compaction) = &self.compaction {
+                    return Err(SessionError::CompactionAlreadyOpen {
+                        id: compaction.compaction_id.clone(),
+                    });
+                }
+                approval.to_json_value()?;
+                if !self.pending_approvals.insert(approval.id().clone()) {
+                    return Err(SessionError::DuplicatePendingApproval {
+                        id: approval.id().clone(),
+                    });
+                }
+            }
+            SessionEventKind::ApprovalDecided { approval } => {
+                require_open_turn(self.open_turn)?;
+                approval.to_json_value()?;
+                if !self.pending_approvals.remove(approval.id()) {
+                    return Err(SessionError::ApprovalDecisionWithoutRequest {
+                        id: approval.id().clone(),
+                    });
+                }
+            }
+            SessionEventKind::ApprovalPolicy { approval } => {
+                approval.to_json_value()?;
+                self.approval_policy = approval.policy();
             }
             SessionEventKind::LlmRetry { retry } => self.apply_llm_retry(retry)?,
             SessionEventKind::LlmRetryStarted { started } => {
@@ -1126,6 +1180,9 @@ impl SessionState {
         start: &SessionCompactionStart,
     ) -> Result<(), SessionError> {
         start.to_json_value()?;
+        if let Some(id) = self.pending_approvals.iter().next() {
+            return Err(SessionError::ApprovalStillPending { id: id.clone() });
+        }
         if let Some(open) = &self.compaction {
             return Err(SessionError::CompactionAlreadyOpen {
                 id: open.compaction_id.clone(),
@@ -1451,6 +1508,9 @@ impl SessionState {
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
             | SessionEventKind::RequestContext { .. }
+            | SessionEventKind::ApprovalAsked { .. }
+            | SessionEventKind::ApprovalDecided { .. }
+            | SessionEventKind::ApprovalPolicy { .. }
             | SessionEventKind::LlmRetry { .. }
             | SessionEventKind::LlmRetryStarted { .. }
             | SessionEventKind::CompactionStart { .. }
@@ -1780,6 +1840,9 @@ fn pending_interrupted_tool_calls(events: &[SessionEvent]) -> Vec<(String, u64, 
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
             | SessionEventKind::RequestContext { .. }
+            | SessionEventKind::ApprovalAsked { .. }
+            | SessionEventKind::ApprovalDecided { .. }
+            | SessionEventKind::ApprovalPolicy { .. }
             | SessionEventKind::LlmRetry { .. }
             | SessionEventKind::LlmRetryStarted { .. }
             | SessionEventKind::CompactionStart { .. }
@@ -2404,6 +2467,11 @@ impl SessionLog {
         self.state.open_step
     }
 
+    #[must_use]
+    pub const fn approval_policy(&self) -> ApprovalPolicy {
+        self.state.approval_policy
+    }
+
     pub fn start_turn(&mut self) -> Result<u64, SessionError> {
         let turn = self
             .state
@@ -2504,6 +2572,45 @@ impl SessionLog {
     ) -> Result<(), SessionError> {
         self.append(SessionEventKind::RequestContext { context })?;
         Ok(())
+    }
+
+    fn begin_approval(
+        &mut self,
+        tool_name: String,
+        call_id: Option<String>,
+        reason: Option<String>,
+    ) -> Result<ApprovalRequestId, SessionError> {
+        require_open_turn(self.state.open_turn)?;
+        let seq =
+            u64::try_from(self.events.len()).map_err(|_| SessionError::EventSequenceOverflow)?;
+        let id = ApprovalRequestId::new(format!("{}:approval:{seq}", self.header.id))?;
+        let approval = SessionApprovalAsked::new(id.clone(), tool_name, call_id, reason)?;
+        self.append(SessionEventKind::ApprovalAsked { approval })?;
+        Ok(id)
+    }
+
+    fn decide_approval(
+        &mut self,
+        id: ApprovalRequestId,
+        outcome: ApprovalOutcome,
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::ApprovalDecided {
+                approval: SessionApprovalDecided::new(id, outcome),
+            })?
+            .seq)
+    }
+
+    fn append_approval_policy(
+        &mut self,
+        policy: ApprovalPolicy,
+        source: Option<ApprovalPolicySource>,
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::ApprovalPolicy {
+                approval: SessionApprovalPolicy::new(policy, source),
+            })?
+            .seq)
     }
 
     /// Commit one non-surface retry schedule before its wait starts.
@@ -2880,6 +2987,21 @@ impl SessionLog {
                 error: Some("session interrupted during compaction".into()),
             };
             repaired.append_at(SessionEventKind::CompactionEnd { compaction: end }, time_ms)?;
+        }
+        let mut approvals = repaired
+            .state
+            .pending_approvals
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        approvals.sort();
+        for id in approvals {
+            repaired.append_at(
+                SessionEventKind::ApprovalDecided {
+                    approval: SessionApprovalDecided::new(id, ApprovalOutcome::Cancelled),
+                },
+                time_ms,
+            )?;
         }
         for (call_id, step, call_seq) in pending_interrupted_tool_calls(&self.events) {
             let seq = u64::try_from(repaired.events.len())
@@ -3308,6 +3430,57 @@ impl SessionHandle {
         self.commit(|log| log.append_request_context(context))
     }
 
+    pub(crate) fn begin_approval(
+        &self,
+        tool_name: String,
+        call_id: Option<String>,
+        reason: Option<String>,
+    ) -> Result<ApprovalRequestId, SessionError> {
+        self.commit(|log| log.begin_approval(tool_name, call_id, reason))
+    }
+
+    pub(crate) fn decide_approval(
+        &self,
+        id: ApprovalRequestId,
+        outcome: ApprovalOutcome,
+    ) -> Result<u64, SessionError> {
+        self.commit(|log| log.decide_approval(id, outcome))
+    }
+
+    pub fn approval_policy(&self) -> Result<ApprovalPolicy, SessionError> {
+        Ok(self.lock()?.approval_policy())
+    }
+
+    pub(crate) fn set_approval_policy(
+        &self,
+        policy: ApprovalPolicy,
+        source: Option<ApprovalPolicySource>,
+    ) -> Result<bool, SessionError> {
+        let _permit = SessionAppendPermit::enter(&self.appending, &self.id)?;
+        let record = {
+            let mut log = self.lock()?;
+            if log.approval_policy() == policy {
+                None
+            } else {
+                let previous_len = log.events().len();
+                log.append_approval_policy(policy, source)?;
+                let event = log
+                    .events()
+                    .get(previous_len)
+                    .cloned()
+                    .ok_or(SessionError::EventSequenceOverflow)?;
+                Some(SessionEventRecord {
+                    header: log.header().clone(),
+                    event,
+                })
+            }
+        };
+        if let (Some(dispatcher), Some(record)) = (&self.event_dispatcher, &record) {
+            let _ = dispatcher.emit_contained(events::SESSION_EVENT, record);
+        }
+        Ok(record.is_some())
+    }
+
     pub fn append_llm_retry(&self, retry: SessionLlmRetry) -> Result<u64, SessionError> {
         self.commit(|log| log.append_llm_retry(retry))
     }
@@ -3720,20 +3893,23 @@ impl SessionStore {
     /// Returns `false` when no persistence listener is mounted. Listener
     /// failures are reported after the complete callback snapshot settles.
     pub async fn flush(&self, session: &SessionHandle) -> Result<bool, SessionError> {
-        {
-            let state = self.lock()?;
-            let Some(live) = state.sessions.get(session.id()) else {
-                return Err(SessionError::SessionNotLive {
-                    id: session.id().clone(),
-                });
-            };
-            if !session.same_instance(live) {
-                return Err(SessionError::SessionNotLive {
-                    id: session.id().clone(),
-                });
-            }
-        }
+        self.require_live(session)?;
         session.flush().await
+    }
+
+    pub(crate) fn require_live(&self, session: &SessionHandle) -> Result<(), SessionError> {
+        let state = self.lock()?;
+        let Some(live) = state.sessions.get(session.id()) else {
+            return Err(SessionError::SessionNotLive {
+                id: session.id().clone(),
+            });
+        };
+        if !session.same_instance(live) {
+            return Err(SessionError::SessionNotLive {
+                id: session.id().clone(),
+            });
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> Result<usize, SessionError> {
@@ -3794,6 +3970,18 @@ pub enum SessionError {
     },
     #[error("session turn {turn} cannot end while step {step} is open")]
     StepStillOpen { turn: u64, step: u64 },
+    #[error("session approval id must not be empty")]
+    EmptyApprovalId,
+    #[error("session approval persistence encoding is invalid")]
+    InvalidApprovalEncoding,
+    #[error("session approval must have {expected}")]
+    InvalidApproval { expected: &'static str },
+    #[error("session approval `{id}` is already pending")]
+    DuplicatePendingApproval { id: ApprovalRequestId },
+    #[error("session approval decision `{id}` has no pending request")]
+    ApprovalDecisionWithoutRequest { id: ApprovalRequestId },
+    #[error("session approval `{id}` is still pending")]
+    ApprovalStillPending { id: ApprovalRequestId },
     #[error("session {event_type} message id must not be empty")]
     EmptyMessageId { event_type: &'static str },
     #[error("session {event_type} message role must be {expected:?}, got {actual:?}")]

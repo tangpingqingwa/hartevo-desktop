@@ -928,6 +928,9 @@ const fn surface_message(event: &SessionEvent) -> Option<&SessionMessage> {
         | SessionEventKind::AssistantChunk { .. }
         | SessionEventKind::RequestHeader { .. }
         | SessionEventKind::RequestContext { .. }
+        | SessionEventKind::ApprovalAsked { .. }
+        | SessionEventKind::ApprovalDecided { .. }
+        | SessionEventKind::ApprovalPolicy { .. }
         | SessionEventKind::LlmRetry { .. }
         | SessionEventKind::LlmRetryStarted { .. }
         | SessionEventKind::CompactionStart { .. }
