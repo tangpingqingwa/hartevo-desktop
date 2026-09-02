@@ -3211,7 +3211,7 @@ mod tests {
                 block: SessionContentBlock::ToolCall {
                     id: "desktop-bash-call-1".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"pwd; printf n90-cordis; printf n90-stderr >&2; exit 7","description":"Exercise the N90 foreground result contract"}"#.into(),
+                    arguments: r#"{"command":"pwd; printf 'n96-env=%s\\n' \"$DSH_SHELL|$DSH_SESSION_ID\"; printf n90-cordis; printf n90-stderr >&2; exit 7","description":"Exercise the foreground result and managed Session environment contracts"}"#.into(),
                 },
             },
             SessionStreamChunk::BlockStart {
@@ -3581,6 +3581,7 @@ mod tests {
             panic!("production Cordis bash payload must be one text block");
         };
         assert!(text.contains(&workspace_root.display().to_string()));
+        assert!(text.contains("n96-env=1|desktop-agent-session"));
         assert!(text.contains("n90-cordis"));
         assert!(text.contains("[stderr]\nn90-stderr"));
         assert!(text.contains("[sandbox: read-only, full enforcement]"));
