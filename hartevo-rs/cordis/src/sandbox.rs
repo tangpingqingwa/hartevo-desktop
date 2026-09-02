@@ -1,11 +1,13 @@
 //! Durable sandbox policy and one-shot escalation adapted from DeepSeek Harness.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::approval::{ApprovalError, ApprovalOutcome, ApprovalRequest, request_approval};
-use crate::context::{Context, keys};
+use crate::context::{Context, CordisError, ProviderHandle, keys};
 use crate::fiber::LifecycleCancellation;
 use crate::session::{SessionError, SessionHandle, SessionId, SessionStore};
 use crate::surface::AgentRef;
@@ -20,6 +22,9 @@ pub const SANDBOX_MODES: &[SandboxMode] = &[
 /// Closed targets a confined call may request through one-shot escalation.
 pub const SANDBOX_ESCALATION_TARGETS: &[SandboxMode] =
     &[SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess];
+
+/// Structured error code for a confined call that cannot be enforced.
+pub const SANDBOX_UNAVAILABLE: &str = "SANDBOX_UNAVAILABLE";
 
 /// File-effect policy. Network and process visibility are separate concerns.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +62,243 @@ impl std::fmt::Display for SandboxMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// Modes that must pass through an enforcing provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfinedSandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+}
+
+impl ConfinedSandboxMode {
+    #[must_use]
+    pub const fn as_mode(self) -> SandboxMode {
+        match self {
+            Self::ReadOnly => SandboxMode::ReadOnly,
+            Self::WorkspaceWrite => SandboxMode::WorkspaceWrite,
+        }
+    }
+}
+
+/// How completely one selected backend enforces its promised file effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxEnforcement {
+    Full,
+    Partial,
+}
+
+/// Fully resolved policy supplied to one provider call.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfinedSandboxPolicy {
+    mode: ConfinedSandboxMode,
+    workspace_root: PathBuf,
+    session_id: Option<SessionId>,
+    call_id: Option<String>,
+}
+
+impl ConfinedSandboxPolicy {
+    #[must_use]
+    pub const fn mode(&self) -> ConfinedSandboxMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
+    #[must_use]
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+}
+
+/// Evidence that a sandbox runner failed before it executed the child argv.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxRunnerFailureRule {
+    allowed_exit_codes: Option<Vec<i32>>,
+    fatal_signatures: Vec<String>,
+    informational_lines: Vec<String>,
+}
+
+impl SandboxRunnerFailureRule {
+    #[must_use]
+    pub fn new<I, S>(fatal_signatures: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowed_exit_codes: None,
+            fatal_signatures: fatal_signatures.into_iter().map(Into::into).collect(),
+            informational_lines: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_allowed_exit_codes<I>(mut self, exit_codes: I) -> Self
+    where
+        I: IntoIterator<Item = i32>,
+    {
+        self.allowed_exit_codes = Some(exit_codes.into_iter().collect());
+        self
+    }
+
+    #[must_use]
+    pub fn with_informational_lines<I, S>(mut self, lines: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.informational_lines = lines.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn allowed_exit_codes(&self) -> Option<&[i32]> {
+        self.allowed_exit_codes.as_deref()
+    }
+
+    #[must_use]
+    pub fn fatal_signatures(&self) -> &[String] {
+        &self.fatal_signatures
+    }
+
+    #[must_use]
+    pub fn informational_lines(&self) -> &[String] {
+        &self.informational_lines
+    }
+}
+
+/// One provider's owned replacement argv and per-call enforcement dialect.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfinedArgv {
+    argv: Vec<OsString>,
+    enforcement: SandboxEnforcement,
+    denial_signatures: Vec<String>,
+    runner_failure_rules: Vec<SandboxRunnerFailureRule>,
+}
+
+impl ConfinedArgv {
+    #[must_use]
+    pub fn new(
+        argv: Vec<OsString>,
+        enforcement: SandboxEnforcement,
+        denial_signatures: Vec<String>,
+        runner_failure_rules: Vec<SandboxRunnerFailureRule>,
+    ) -> Self {
+        Self {
+            argv,
+            enforcement,
+            denial_signatures,
+            runner_failure_rules,
+        }
+    }
+
+    #[must_use]
+    pub fn argv(&self) -> &[OsString] {
+        &self.argv
+    }
+
+    #[must_use]
+    pub const fn enforcement(&self) -> SandboxEnforcement {
+        self.enforcement
+    }
+
+    #[must_use]
+    pub fn denial_signatures(&self) -> &[String] {
+        &self.denial_signatures
+    }
+
+    #[must_use]
+    pub fn runner_failure_rules(&self) -> &[SandboxRunnerFailureRule] {
+        &self.runner_failure_rules
+    }
+}
+
+/// Provider-owned reason a confined policy cannot be enforced on this host.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[error("{detail}")]
+pub struct SandboxProviderUnavailable {
+    detail: String,
+}
+
+impl SandboxProviderUnavailable {
+    #[must_use]
+    pub fn new(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self {
+            detail: if detail.trim().is_empty() {
+                "sandbox provider is unavailable".to_string()
+            } else {
+                detail
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+/// Same-world confinement mechanism. Policy is supplied per call.
+pub trait SandboxProvider: Send + Sync + 'static {
+    fn confine(
+        &self,
+        argv: &[OsString],
+        policy: &ConfinedSandboxPolicy,
+    ) -> Result<ConfinedArgv, SandboxProviderUnavailable>;
+}
+
+/// Type-erased Cordis service mounted at [`keys::SANDBOX`].
+#[derive(Clone)]
+pub struct SandboxProviderService {
+    provider: Arc<dyn SandboxProvider>,
+}
+
+impl SandboxProviderService {
+    #[must_use]
+    pub fn new(provider: impl SandboxProvider) -> Self {
+        Self {
+            provider: Arc::new(provider),
+        }
+    }
+
+    #[must_use]
+    pub fn from_shared(provider: Arc<dyn SandboxProvider>) -> Self {
+        Self { provider }
+    }
+
+    fn confine(
+        &self,
+        argv: &[OsString],
+        policy: &ConfinedSandboxPolicy,
+    ) -> Result<ConfinedArgv, SandboxProviderUnavailable> {
+        self.provider.confine(argv, policy)
+    }
+}
+
+impl std::fmt::Debug for SandboxProviderService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxProviderService")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Mount one Fiber-owned sandbox provider. Disposal removes the capability.
+pub fn register_sandbox_provider(
+    ctx: &mut Context,
+    provider: impl SandboxProvider,
+) -> Result<ProviderHandle, CordisError> {
+    ctx.provide(keys::SANDBOX, SandboxProviderService::new(provider))
 }
 
 /// Why one durable session override was appended.
@@ -245,6 +487,208 @@ impl SandboxExecutionPolicy {
     pub fn call_id(&self) -> Option<&str> {
         self.call_id.as_deref()
     }
+}
+
+/// Spawn plan selected from one resolved policy. Confined variants never
+/// contain the caller's argv as a fallback path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SandboxExecutionPlan {
+    Unconfined {
+        policy: SandboxExecutionPolicy,
+        argv: Vec<OsString>,
+    },
+    Confined {
+        policy: ConfinedSandboxPolicy,
+        command: ConfinedArgv,
+    },
+}
+
+impl SandboxExecutionPlan {
+    #[must_use]
+    pub fn argv(&self) -> &[OsString] {
+        match self {
+            Self::Unconfined { argv, .. } => argv,
+            Self::Confined { command, .. } => command.argv(),
+        }
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> SandboxMode {
+        match self {
+            Self::Unconfined { policy, .. } => policy.mode,
+            Self::Confined { policy, .. } => policy.mode.as_mode(),
+        }
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        match self {
+            Self::Unconfined { policy, .. } => &policy.workspace_root,
+            Self::Confined { policy, .. } => &policy.workspace_root,
+        }
+    }
+
+    #[must_use]
+    pub const fn enforcement(&self) -> Option<SandboxEnforcement> {
+        match self {
+            Self::Unconfined { .. } => None,
+            Self::Confined { command, .. } => Some(command.enforcement),
+        }
+    }
+
+    #[must_use]
+    pub const fn confined_policy(&self) -> Option<&ConfinedSandboxPolicy> {
+        match self {
+            Self::Unconfined { .. } => None,
+            Self::Confined { policy, .. } => Some(policy),
+        }
+    }
+
+    #[must_use]
+    pub const fn confined_command(&self) -> Option<&ConfinedArgv> {
+        match self {
+            Self::Unconfined { .. } => None,
+            Self::Confined { command, .. } => Some(command),
+        }
+    }
+}
+
+/// Classification of one settled process under a confined execution plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxProcessClassification {
+    Success,
+    Signalled,
+    RunnerFailure { detail: String },
+    Denied,
+    CommandFailure,
+}
+
+/// Select bypass versus confinement exactly once. Missing or unusable
+/// confinement is a structured refusal, never an unconfined fallback.
+pub fn prepare_sandbox_execution(
+    ctx: &Context,
+    argv: Vec<OsString>,
+    policy: SandboxExecutionPolicy,
+) -> Result<SandboxExecutionPlan, SandboxError> {
+    validate_command_argv(&argv)?;
+    if policy.mode == SandboxMode::DangerFullAccess {
+        return Ok(SandboxExecutionPlan::Unconfined { policy, argv });
+    }
+
+    let mode = match policy.mode {
+        SandboxMode::ReadOnly => ConfinedSandboxMode::ReadOnly,
+        SandboxMode::WorkspaceWrite => ConfinedSandboxMode::WorkspaceWrite,
+        SandboxMode::DangerFullAccess => unreachable!("handled before provider lookup"),
+    };
+    let confined_policy = ConfinedSandboxPolicy {
+        mode,
+        workspace_root: policy.workspace_root,
+        session_id: policy.session_id,
+        call_id: policy.call_id,
+    };
+    let provider = ctx.sandbox::<SandboxProviderService>().ok_or_else(|| {
+        SandboxError::ProviderUnavailable {
+            mode: mode.as_mode(),
+            detail: format!(
+                "Cordis sandbox provider service `{}` is unavailable",
+                keys::SANDBOX
+            ),
+        }
+    })?;
+    let command = provider.confine(&argv, &confined_policy).map_err(|error| {
+        SandboxError::ProviderUnavailable {
+            mode: mode.as_mode(),
+            detail: error.detail,
+        }
+    })?;
+    if let Some(detail) = unusable_argv_detail(command.argv()) {
+        return Err(SandboxError::ProviderUnavailable {
+            mode: mode.as_mode(),
+            detail: format!("sandbox provider returned unusable argv: {detail}"),
+        });
+    }
+    Ok(SandboxExecutionPlan::Confined {
+        policy: confined_policy,
+        command,
+    })
+}
+
+/// Classify settled output using only this call's selected backend dialect.
+/// Runner failure takes precedence because it proves the child never ran.
+#[must_use]
+pub fn classify_sandbox_process(
+    exit_code: Option<i32>,
+    stderr: &str,
+    command: &ConfinedArgv,
+) -> SandboxProcessClassification {
+    let Some(exit_code) = exit_code else {
+        return SandboxProcessClassification::Signalled;
+    };
+    if exit_code == 0 {
+        return SandboxProcessClassification::Success;
+    }
+
+    let lines: Vec<&str> = stderr
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    for rule in command.runner_failure_rules() {
+        if rule
+            .allowed_exit_codes()
+            .is_some_and(|codes| !codes.contains(&exit_code))
+        {
+            continue;
+        }
+        for line in &lines {
+            if rule
+                .informational_lines()
+                .iter()
+                .any(|informational| informational.eq_ignore_ascii_case(line))
+            {
+                continue;
+            }
+            if rule.fatal_signatures().iter().any(|signature| {
+                !signature.trim().is_empty() && contains_ignore_ascii_case(line, signature)
+            }) {
+                return SandboxProcessClassification::RunnerFailure {
+                    detail: (*line).to_string(),
+                };
+            }
+        }
+    }
+
+    if command.denial_signatures().iter().any(|signature| {
+        !signature.trim().is_empty() && contains_ignore_ascii_case(stderr, signature)
+    }) {
+        SandboxProcessClassification::Denied
+    } else {
+        SandboxProcessClassification::CommandFailure
+    }
+}
+
+fn validate_command_argv(argv: &[OsString]) -> Result<(), SandboxError> {
+    match unusable_argv_detail(argv) {
+        None => Ok(()),
+        Some("argv is empty") => Err(SandboxError::EmptyCommandArgv),
+        Some("program is empty") => Err(SandboxError::EmptyCommandProgram),
+        Some(_) => unreachable!("closed argv validation detail"),
+    }
+}
+
+fn unusable_argv_detail(argv: &[OsString]) -> Option<&'static str> {
+    if argv.is_empty() {
+        Some("argv is empty")
+    } else if argv[0].as_os_str() == OsStr::new("") {
+        Some("program is empty")
+    } else {
+        None
+    }
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
 /// Resolve through the mounted service and reject a stale/foreign Session handle.
@@ -486,6 +930,12 @@ fn absolute_workspace_root(path: PathBuf) -> Result<PathBuf, SandboxError> {
 pub enum SandboxError {
     #[error("Cordis sandbox policy service `{key}` is unavailable")]
     ServiceUnavailable { key: &'static str },
+    #[error("sandbox command argv must contain a program")]
+    EmptyCommandArgv,
+    #[error("sandbox command program must not be empty")]
+    EmptyCommandProgram,
+    #[error("sandbox mode `{mode}` is unavailable; refusing to run unconfined: {detail}")]
+    ProviderUnavailable { mode: SandboxMode, detail: String },
     #[error("sandbox workspace root must not be empty")]
     EmptyWorkspaceRoot,
     #[error("sandbox workspace root `{path}` is not absolute")]
@@ -525,4 +975,15 @@ pub enum SandboxError {
     Approval(#[from] ApprovalError),
     #[error(transparent)]
     Session(#[from] SessionError),
+}
+
+impl SandboxError {
+    /// Structured error identity preserved through future tool-result adapters.
+    #[must_use]
+    pub const fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::ProviderUnavailable { .. } => Some(SANDBOX_UNAVAILABLE),
+            _ => None,
+        }
+    }
 }
