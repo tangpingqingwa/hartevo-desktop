@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -26,6 +26,13 @@ const SANDBOX_PROCESS_TIMEOUT_MS: f64 = 120_000.0;
 const SANDBOX_PROCESS_MAX_TIMEOUT_MS: f64 = 600_000.0;
 const SANDBOX_PROCESS_OUTPUT_BYTES: usize = 64_000;
 const SANDBOX_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const BASH_ENVIRONMENT_OVERRIDES: [(&str, &str); 4] = [
+    ("NO_COLOR", "1"),
+    ("TERM", "dumb"),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+];
+const SENSITIVE_ENVIRONMENT_FRAGMENTS: [&str; 4] = ["KEY", "PASSWORD", "SECRET", "TOKEN"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SandboxProcessTermination {
@@ -293,6 +300,7 @@ fn run_sandboxed_process_in_environment_with_limits(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_bash_environment(&mut command, std::env::vars_os());
     let mut child = command
         .group_spawn()
         .map_err(|source| spawn_error(&plan, &working_directory, source))?;
@@ -343,6 +351,35 @@ fn run_sandboxed_process_in_environment_with_limits(
         stdout,
         stderr,
     )
+}
+
+fn configure_bash_environment(
+    command: &mut Command,
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    command.env_clear();
+    command.envs(scrubbed_parent_environment(parent));
+    command.envs(BASH_ENVIRONMENT_OVERRIDES);
+}
+
+fn scrubbed_parent_environment(
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    parent
+        .into_iter()
+        .filter(|(key, _)| !environment_key_is_sensitive_or_managed(key))
+        .collect()
+}
+
+fn environment_key_is_sensitive_or_managed(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return true;
+    };
+    let key = key.to_ascii_uppercase();
+    key.starts_with("DSH_")
+        || SENSITIVE_ENVIRONMENT_FRAGMENTS
+            .iter()
+            .any(|fragment| key.contains(fragment))
 }
 
 fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDefinition {
@@ -963,10 +1000,10 @@ mod tests {
     use super::{
         MacosSeatbeltSandboxProvider, SEATBELT_EXEC, SEATBELT_READ_ONLY_PROFILE,
         SandboxProcessError, SandboxProcessLimits, SandboxProcessTermination,
-        mount_macos_sandbox_provider, resolve_bash_timeout, resolve_bash_workdir,
-        run_sandboxed_process, run_sandboxed_process_in_environment,
+        configure_bash_environment, mount_macos_sandbox_provider, resolve_bash_timeout,
+        resolve_bash_workdir, run_sandboxed_process, run_sandboxed_process_in_environment,
         run_sandboxed_process_with_limits, sandboxed_bash_arguments, sandboxed_bash_result,
-        sandboxed_bash_schema, sbpl_string,
+        sandboxed_bash_schema, sbpl_string, scrubbed_parent_environment,
     };
 
     struct FixedProvider {
@@ -1342,6 +1379,64 @@ mod tests {
         assert_eq!(outcome.enforcement, None);
         assert_eq!(outcome.classification, None);
         assert_eq!(outcome.stdout.bytes, b"exact argument");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_environment_retains_ordinary_values_scrubs_sensitive_values_and_sets_terminal_facts() {
+        let parent = [
+            ("PATH", "/fixture/bin"),
+            ("HOME", "/fixture/home"),
+            ("HTTP_PROXY", "http://proxy.invalid"),
+            ("DSH_STALE", "fixture-value"),
+            ("dsh_lower", "fixture-value"),
+            ("SERVICE_API_KEY", "fixture-value"),
+            ("DB_PASSWORD", "fixture-value"),
+            ("CLIENT_SECRET", "fixture-value"),
+            ("AUTH_TOKEN", "fixture-value"),
+            ("TERM", "parent-term"),
+        ]
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)));
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            concat!(
+                "test \"$PATH\" = /fixture/bin && ",
+                "test \"$HOME\" = /fixture/home && ",
+                "test \"$HTTP_PROXY\" = http://proxy.invalid && ",
+                "test -z \"${DSH_STALE+x}\" && ",
+                "test -z \"${dsh_lower+x}\" && ",
+                "test -z \"${SERVICE_API_KEY+x}\" && ",
+                "test -z \"${DB_PASSWORD+x}\" && ",
+                "test -z \"${CLIENT_SECRET+x}\" && ",
+                "test -z \"${AUTH_TOKEN+x}\" && ",
+                "printf '%s' \"$NO_COLOR|$TERM|$PAGER|$GIT_PAGER\""
+            ),
+        ]);
+        configure_bash_environment(&mut command, parent);
+
+        let output = command.output().unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"1|dumb|cat|cat");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_environment_omits_non_utf8_names_that_cannot_be_audited() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let ordinary = (OsString::from("PATH"), OsString::from("/fixture/bin"));
+        let unauditable = (
+            OsString::from_vec(vec![b'N', b'9', b'5', 0xff]),
+            OsString::from("fixture-value"),
+        );
+
+        assert_eq!(
+            scrubbed_parent_environment([ordinary.clone(), unauditable]),
+            vec![ordinary]
+        );
     }
 
     #[cfg(unix)]
