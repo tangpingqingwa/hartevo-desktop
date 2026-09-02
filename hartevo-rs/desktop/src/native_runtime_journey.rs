@@ -1384,6 +1384,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::WorkProductActionStale
         | DesktopDataError::RuntimeLocalApprovalUnavailable
         | DesktopDataError::RuntimeLocalApprovalMismatch
+        | DesktopDataError::CordisToolApprovalUnavailable
+        | DesktopDataError::CordisToolApprovalMismatch
         | DesktopDataError::RuntimeDispatch(_)
         | DesktopDataError::DomainCommandDispatch(_)
         | DesktopDataError::EffectExecutionDispatch(_)

@@ -52,7 +52,7 @@ use hartevo_context_fabric::{
 #[cfg(test)]
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
-    AuthorityDispatchError, AuthorityScope, COMPACTION_INSTRUCTION, CordisError,
+    ApprovalRequestId, AuthorityDispatchError, AuthorityScope, COMPACTION_INSTRUCTION, CordisError,
     DomainCommandBinding, DomainCommandKind, EffectExecutionBinding, EffectReconciliationBinding,
     EffectVerificationBinding, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
     LlmGenerateRequest, LlmRequestPurpose, LlmResolvedModel, RuntimeBinding, RuntimeDispatchPermit,
@@ -94,12 +94,13 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::cordis_host::{
-    DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisSlot,
-    DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
-    DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
-    DesktopHumanCommandDispatch, DesktopRuntimeSessionTranscript, dispatch_live_domain_command,
-    dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
-    dispatch_live_effect_verification, dispatch_live_runtime, mount_cordis_host,
+    DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisApprovalBridge,
+    DesktopCordisApprovalDecisionError, DesktopCordisSlot, DesktopDomainCommandAuthorization,
+    DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
+    DesktopEffectVerificationAuthorization, DesktopHeldCordisApproval, DesktopHumanCommandDispatch,
+    DesktopRuntimeSessionTranscript, dispatch_live_domain_command, dispatch_live_effect_execution,
+    dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
+    mount_cordis_host,
 };
 #[cfg(test)]
 use crate::cordis_host::{
@@ -272,6 +273,8 @@ pub enum DesktopRuntimeProgressPhase {
     LocalActionDeclined,
     WaitingLocalApproval,
     LocalActionApproved,
+    WaitingCordisApproval,
+    CordisApprovalCleared,
     StopRequested,
     InterruptSent,
     Completed,
@@ -301,13 +304,14 @@ struct DesktopRuntimeProgressFeed {
     events: VecDeque<DesktopRuntimeProgressEvent>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DesktopRuntimeCancellation {
     requested: Arc<AtomicBool>,
     cordis: LifecycleCancellation,
     progress: Arc<Mutex<DesktopRuntimeProgressFeed>>,
     local_approval: Arc<Mutex<Option<DesktopHeldLocalApproval>>>,
     local_approval_decision: Arc<Mutex<Option<bool>>>,
+    cordis_approval: DesktopCordisApprovalBridge,
     #[cfg(test)]
     crash_after_private_delta: Arc<AtomicBool>,
 }
@@ -321,12 +325,39 @@ pub struct DesktopHeldLocalApproval {
     pub kind: RuntimeLocalApprovalKind,
 }
 
+impl Default for DesktopRuntimeCancellation {
+    fn default() -> Self {
+        let progress = Arc::new(Mutex::new(DesktopRuntimeProgressFeed::default()));
+        let approval_progress = Arc::clone(&progress);
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            cordis: LifecycleCancellation::default(),
+            progress,
+            local_approval: Arc::new(Mutex::new(None)),
+            local_approval_decision: Arc::new(Mutex::new(None)),
+            cordis_approval: DesktopCordisApprovalBridge::new(move |pending| {
+                record_runtime_progress(
+                    &approval_progress,
+                    if pending {
+                        DesktopRuntimeProgressPhase::WaitingCordisApproval
+                    } else {
+                        DesktopRuntimeProgressPhase::CordisApprovalCleared
+                    },
+                );
+            }),
+            #[cfg(test)]
+            crash_after_private_delta: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 impl DesktopRuntimeCancellation {
     pub fn request(&self) {
         if !self.requested.swap(true, Ordering::AcqRel) {
             self.cordis.cancel_with(SessionCancelCause::User);
             self.record_progress(DesktopRuntimeProgressPhase::StopRequested);
         }
+        self.cordis_approval.clear();
     }
 
     pub fn is_requested(&self) -> bool {
@@ -335,6 +366,32 @@ impl DesktopRuntimeCancellation {
 
     fn cordis_cancellation(&self) -> LifecycleCancellation {
         self.cordis.clone()
+    }
+
+    fn cordis_approval_bridge(&self) -> DesktopCordisApprovalBridge {
+        self.cordis_approval.clone()
+    }
+
+    pub(crate) fn held_cordis_approval(&self) -> Option<DesktopHeldCordisApproval> {
+        self.cordis_approval.pending()
+    }
+
+    pub(crate) fn allow_held_cordis_tool_once(
+        &self,
+        id: &ApprovalRequestId,
+    ) -> Result<(), DesktopDataError> {
+        self.cordis_approval
+            .allow_once(id)
+            .map_err(DesktopDataError::from)
+    }
+
+    pub(crate) fn reject_held_cordis_tool(
+        &self,
+        id: &ApprovalRequestId,
+    ) -> Result<(), DesktopDataError> {
+        self.cordis_approval
+            .reject(id)
+            .map_err(DesktopDataError::from)
     }
 
     pub fn held_local_approval(&self) -> Option<DesktopHeldLocalApproval> {
@@ -423,19 +480,7 @@ impl DesktopRuntimeCancellation {
     }
 
     fn record_progress(&self, phase: DesktopRuntimeProgressPhase) {
-        let Ok(mut feed) = self.progress.lock() else {
-            return;
-        };
-        if phase.is_terminal() && feed.events.iter().any(|event| event.phase.is_terminal()) {
-            return;
-        }
-        feed.next_sequence = feed.next_sequence.saturating_add(1);
-        let sequence = feed.next_sequence;
-        feed.events
-            .push_back(DesktopRuntimeProgressEvent { sequence, phase });
-        while feed.events.len() > 128 {
-            feed.events.pop_front();
-        }
+        record_runtime_progress(&self.progress, phase);
     }
 
     #[cfg(test)]
@@ -450,6 +495,25 @@ impl DesktopRuntimeCancellation {
             !self.crash_after_private_delta.swap(false, Ordering::AcqRel),
             "simulated Desktop coordinator crash after durable private Runtime delta"
         );
+    }
+}
+
+fn record_runtime_progress(
+    progress: &Arc<Mutex<DesktopRuntimeProgressFeed>>,
+    phase: DesktopRuntimeProgressPhase,
+) {
+    let Ok(mut feed) = progress.lock() else {
+        return;
+    };
+    if phase.is_terminal() && feed.events.iter().any(|event| event.phase.is_terminal()) {
+        return;
+    }
+    feed.next_sequence = feed.next_sequence.saturating_add(1);
+    let sequence = feed.next_sequence;
+    feed.events
+        .push_back(DesktopRuntimeProgressEvent { sequence, phase });
+    while feed.events.len() > 128 {
+        feed.events.pop_front();
     }
 }
 
@@ -5945,6 +6009,7 @@ impl DesktopDataPlane {
                 LifecycleCancellation::default,
                 DesktopRuntimeCancellation::cordis_cancellation,
             );
+        let cordis_approval = cancellation.map(DesktopRuntimeCancellation::cordis_approval_bridge);
         let agent_result = {
             let mut cordis = self
                 .cordis
@@ -5955,6 +6020,7 @@ impl DesktopDataPlane {
                 adapter,
                 &cordis_cancellation,
                 permit,
+                cordis_approval.as_ref(),
             ))
         };
         let completion = completion
@@ -8152,6 +8218,10 @@ pub enum DesktopDataError {
     RuntimeLocalApprovalUnavailable,
     #[error("Runtime local-write approval must match the exact held digest and revision")]
     RuntimeLocalApprovalMismatch,
+    #[error("no live Cordis tool approval is held for this Desktop turn")]
+    CordisToolApprovalUnavailable,
+    #[error("Cordis tool approval must match the exact held request id")]
+    CordisToolApprovalMismatch,
     #[error(transparent)]
     Cordis(#[from] CordisError),
     #[error("Cordis Runtime dispatch failed across phases: {0}")]
@@ -8172,6 +8242,15 @@ pub enum DesktopDataError {
     Application(#[from] ApplicationError),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
+}
+
+impl From<DesktopCordisApprovalDecisionError> for DesktopDataError {
+    fn from(error: DesktopCordisApprovalDecisionError) -> Self {
+        match error {
+            DesktopCordisApprovalDecisionError::Unavailable => Self::CordisToolApprovalUnavailable,
+            DesktopCordisApprovalDecisionError::Mismatch => Self::CordisToolApprovalMismatch,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
@@ -8,8 +8,8 @@ use futures_util::FutureExt;
 use hartevo_cordis::{
     AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
     AgentRef, AgentRequestAdmission, AgentRequestErrorAction, AgentRequestLogState, AgentStep,
-    AgentTurnStopping, BailOutcome, Context, CordisError, CordisHost, DomainSurface,
-    EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
+    AgentTurnStopping, ApprovalOutcome, BailOutcome, Context, CordisError, CordisHost,
+    DomainSurface, EffectBrokerSurface, EnvironmentOverlay, KernelApproval, KernelApprovalDecision,
     KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmChunkStream,
     LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmRetry, LlmRetryPolicy,
     LlmStream, LoaderContext, LoggedAgentCall, NonBail, PromptError, PromptSection,
@@ -21,13 +21,13 @@ use hartevo_cordis::{
     SessionToolSchema, SurfaceOwner, TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition,
     ToolDispatchExecution, ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation,
     ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface, TurnEndReason,
-    WaterfallFailure, admit_agent_request, admit_agent_step, build_agent_call, commit_agent_stream,
-    commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution, events,
-    finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
+    WaterfallFailure, admit_agent_request, admit_agent_step, approval_events, build_agent_call,
+    commit_agent_stream, commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution,
+    events, finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
     prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
-    record_agent_stream, register_llm_adapter, register_prompt_section, register_tool,
-    register_tool_concurrency, register_tool_definition, register_tool_guard, register_tool_schema,
-    run_agent_step, run_agent_tool_batch, run_agent_tool_batch_outcome,
+    record_agent_stream, register_agent, register_llm_adapter, register_prompt_section,
+    register_tool, register_tool_concurrency, register_tool_definition, register_tool_guard,
+    register_tool_schema, run_agent_step, run_agent_tool_batch, run_agent_tool_batch_outcome,
     run_agent_tool_batch_with_limit, run_agent_tool_batch_with_limit_and_cancellation,
     run_agent_tool_batch_with_limit_and_cancellation_outcome, run_agent_turn,
     schedule_agent_tool_calls, session_events,
@@ -648,6 +648,186 @@ fn generic_turn_reuses_one_agent_instance_across_live_extension_points() {
         observed[1..]
             .iter()
             .all(|agent| agent.is_same_lifecycle(&observed[0]))
+    );
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the focused contract keeps ordered approvals, body dispatch, and durable barrier evidence together"
+)]
+async fn turn_tool_ask_is_one_shot_ordered_and_rechecks_live_fences() {
+    let mut ctx = mapped();
+    let mut first = Vec::new();
+    first.extend(tool_call_chunks(0, "allowed-call", "allowed-tool", "{}"));
+    first.extend(tool_call_chunks(1, "rejected-call", "rejected-tool", "{}"));
+    first.extend(tool_call_chunks(2, "guarded-call", "guarded-tool", "{}"));
+    first.extend(tool_call_chunks(3, "stale-call", "stale-tool", "{}"));
+    first.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (adapter, _) = sequenced_adapter(vec![
+        first,
+        vec![SessionStreamChunk::Finish {
+            reason: SessionFinishReason::Stop,
+            replay_state: None,
+        }],
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    for name in ["allowed-tool", "rejected-tool", "guarded-tool"] {
+        let bodies = Arc::clone(&bodies);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema(name), move |run| {
+                bodies.lock().unwrap().push(run.name().to_owned());
+                Ok(json!({ "ran": run.name() }))
+            }),
+        )
+        .unwrap();
+    }
+    let stale_registration = {
+        let bodies = Arc::clone(&bodies);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("stale-tool"), move |run| {
+                bodies.lock().unwrap().push(run.name().to_owned());
+                Ok(json!({ "ran": run.name() }))
+            }),
+        )
+        .unwrap()
+    };
+    let stale_registration = Arc::new(Mutex::new(Some(stale_registration)));
+    let guard_blocked = Arc::new(AtomicBool::new(false));
+    {
+        let guard_blocked = Arc::clone(&guard_blocked);
+        register_tool_guard(&mut ctx, move |input| {
+            (input.name() == "guarded-tool" && guard_blocked.load(Ordering::SeqCst))
+                .then(|| "guard became active while approval was pending".into())
+        })
+        .unwrap();
+    }
+    ctx.on_waterfall(events::TOOLS_PRE_EXECUTE, |mut call: ToolCall, _next| {
+        call.decision = "ask".into();
+        call.result = format!("approve {}", call.name);
+        call
+    })
+    .unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    {
+        let prompts = Arc::clone(&prompts);
+        let guard_blocked = Arc::clone(&guard_blocked);
+        let stale_registration = Arc::clone(&stale_registration);
+        ctx.on_serial(approval_events::APPROVAL_REQUEST, move |prompt| {
+            let prompts = Arc::clone(&prompts);
+            let guard_blocked = Arc::clone(&guard_blocked);
+            let stale_registration = Arc::clone(&stale_registration);
+            async move {
+                prompts.lock().unwrap().push((
+                    prompt.tool_name().to_owned(),
+                    prompt.call_id().map(str::to_owned),
+                    prompt.reason().map(str::to_owned),
+                ));
+                let outcome = match prompt.tool_name() {
+                    "rejected-tool" => ApprovalOutcome::Rejected,
+                    "guarded-tool" => {
+                        guard_blocked.store(true, Ordering::SeqCst);
+                        ApprovalOutcome::AllowedOnce
+                    }
+                    "stale-tool" => {
+                        stale_registration.lock().unwrap().take().unwrap().dispose();
+                        ApprovalOutcome::AllowedOnce
+                    }
+                    _ => ApprovalOutcome::AllowedOnce,
+                };
+                Ok::<_, std::convert::Infallible>(BailOutcome::Bail(outcome))
+            }
+        })
+        .unwrap();
+    }
+    let agent = AgentRef::new("turn-tool-approval");
+    register_agent(&mut ctx, agent).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("turn-tool-approval").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("turn-tool-approval-input", "run"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(*bodies.lock().unwrap(), ["allowed-tool"]);
+    assert_eq!(
+        *prompts.lock().unwrap(),
+        [
+            (
+                "allowed-tool".into(),
+                Some("allowed-call".into()),
+                Some("approve allowed-tool".into()),
+            ),
+            (
+                "rejected-tool".into(),
+                Some("rejected-call".into()),
+                Some("approve rejected-tool".into()),
+            ),
+            (
+                "guarded-tool".into(),
+                Some("guarded-call".into()),
+                Some("approve guarded-tool".into()),
+            ),
+            (
+                "stale-tool".into(),
+                Some("stale-call".into()),
+                Some("approve stale-tool".into()),
+            ),
+        ]
+    );
+    let event_types = session
+        .events()
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind.event_type())
+        .collect::<Vec<_>>();
+    let first_result = event_types
+        .iter()
+        .position(|event| *event == "tool/result")
+        .unwrap();
+    let approval_events = event_types
+        .iter()
+        .filter(|event| matches!(**event, "approval/asked" | "approval/decided"))
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        approval_events,
+        [
+            "approval/asked",
+            "approval/decided",
+            "approval/asked",
+            "approval/decided",
+            "approval/asked",
+            "approval/decided",
+            "approval/asked",
+            "approval/decided",
+        ]
+    );
+    assert!(
+        event_types[..first_result]
+            .iter()
+            .filter(|event| **event == "approval/decided")
+            .count()
+            == 4
     );
 }
 
