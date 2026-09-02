@@ -5966,6 +5966,7 @@ impl DesktopDataPlane {
             mission.id.as_str(),
             &message_id,
             user_body.clone(),
+            context_session.project_root(),
             SessionCallConfig {
                 provider: runtime_provider.clone(),
                 model: runtime_model.clone(),

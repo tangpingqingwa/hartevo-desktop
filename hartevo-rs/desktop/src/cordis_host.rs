@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::TryLockError;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,17 +25,17 @@ use hartevo_cordis::{
     KernelConsentState, KernelConsentStatus, LifecycleCancellation, ListenerHandle, LlmAdapter,
     LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError,
     ManualCompactionErrorCode, NonBail, RuntimeAuthority, RuntimeDispatchCompletion,
-    RuntimeDispatchPermit, RuntimeStatusCompletion, SessionApprovalAsked, SessionApprovalDecided,
-    SessionApprovalPolicy, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
-    SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary, SessionContentBlock,
-    SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
-    SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure,
-    SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
-    SessionSandboxMode, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-    SessionSurfaceIntent, SessionToolError, TurnEndReason, approval_events, compact_now,
-    host_is_cordis_loop, keys, register_llm_adapter, run_agent_turn as run_cordis_agent_turn,
-    session_events,
+    RuntimeDispatchPermit, RuntimeStatusCompletion, SandboxError, SessionApprovalAsked,
+    SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig, SessionCancelCause,
+    SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+    SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent, SessionEventKind,
+    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId,
+    SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionRequestContext, SessionRequestHeader,
+    SessionRequestHeaderReason, SessionSandboxMode, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, approval_events,
+    bind_sandbox_workspace, compact_now, host_is_cordis_loop, keys, register_llm_adapter,
+    run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -638,6 +639,7 @@ fn manual_compaction_failure_result(code: ManualCompactionErrorCode) -> DesktopH
 pub(crate) struct DesktopAgentTurnRequest {
     session_id: SessionId,
     input: SessionMessage,
+    workspace_root: PathBuf,
     config: SessionCallConfig,
     resolved_model: LlmResolvedModel,
 }
@@ -651,6 +653,7 @@ impl DesktopAgentTurnRequest {
         session_id: impl Into<String>,
         message_id: impl Into<String>,
         user_body: impl Into<String>,
+        workspace_root: impl Into<PathBuf>,
         config: SessionCallConfig,
     ) -> Result<Self, SessionError> {
         let resolved_model = LlmResolvedModel::new(config.provider.clone(), config.model.clone());
@@ -664,6 +667,7 @@ impl DesktopAgentTurnRequest {
                 }],
                 source: SessionMessageSource::User,
             },
+            workspace_root: workspace_root.into(),
             config,
             resolved_model,
         })
@@ -676,6 +680,7 @@ impl std::fmt::Debug for DesktopAgentTurnRequest {
             .debug_struct("DesktopAgentTurnRequest")
             .field("session_id", &self.session_id)
             .field("message_id", &self.input.id)
+            .field("workspace_root", &"[REDACTED]")
             .field("config", &self.config)
             .field("resolved_model", &self.resolved_model)
             .field("user_body", &"[REDACTED]")
@@ -1275,6 +1280,8 @@ impl DesktopCordisCoordinator {
                 message_id: request.input.id,
             });
         }
+        let _workspace_binding =
+            bind_sandbox_workspace(self.host.context(), &session, &request.workspace_root)?;
 
         let pending = session.inbox().next_turn()?;
         if pending.is_empty() {
@@ -1978,6 +1985,8 @@ pub(crate) enum DesktopAgentTurnError {
     },
     #[error(transparent)]
     Cordis(#[from] CordisError),
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
     #[error(transparent)]
     Session(#[from] SessionError),
 }
@@ -2997,9 +3006,9 @@ mod tests {
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
-        OPENINTERPRETER, RuntimeBinding, SandboxMode, SandboxModeSource, SessionApprovalAsked,
-        SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig, SessionCancelCause,
-        SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+        OPENINTERPRETER, RuntimeBinding, SandboxError, SandboxMode, SandboxModeSource,
+        SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig,
+        SessionCancelCause, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
         SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
         SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
         SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
@@ -3202,7 +3211,7 @@ mod tests {
                 block: SessionContentBlock::ToolCall {
                     id: "desktop-bash-call-1".into(),
                     name: "bash".into(),
-                    arguments: r#"{"command":"printf n90-cordis; printf n90-stderr >&2; exit 7","description":"Exercise the N90 foreground result contract"}"#.into(),
+                    arguments: r#"{"command":"pwd; printf n90-cordis; printf n90-stderr >&2; exit 7","description":"Exercise the N90 foreground result contract"}"#.into(),
                 },
             },
             SessionStreamChunk::Finish {
@@ -3283,10 +3292,15 @@ mod tests {
     }
 
     fn desktop_turn_request() -> DesktopAgentTurnRequest {
+        desktop_turn_request_in(&std::env::current_dir().unwrap())
+    }
+
+    fn desktop_turn_request_in(workspace_root: &std::path::Path) -> DesktopAgentTurnRequest {
         DesktopAgentTurnRequest::new(
             "desktop-agent-session",
             "desktop-agent-input-1",
             "private desktop prompt",
+            workspace_root,
             SessionCallConfig {
                 provider: "desktop-runtime".into(),
                 model: "desktop-model".into(),
@@ -3469,6 +3483,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn desktop_production_bash_tool_runs_in_cordis_sandbox_and_commits_result() {
+        let scratch = tempfile::Builder::new()
+            .prefix("n92-read-only-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let workspace_root = scratch.path().canonicalize().unwrap();
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap();
@@ -3478,7 +3497,7 @@ mod tests {
 
         let outcome = live
             .run_agent_turn(
-                desktop_turn_request(),
+                desktop_turn_request_in(scratch.path()),
                 desktop_bash_turn_adapter(),
                 &LifecycleCancellation::default(),
             )
@@ -3526,6 +3545,7 @@ mod tests {
         let [SessionContentBlock::Text { text }] = content.as_slice() else {
             panic!("production Cordis bash payload must be one text block");
         };
+        assert!(text.contains(&workspace_root.display().to_string()));
         assert!(text.contains("n90-cordis"));
         assert!(text.contains("[stderr]\nn90-stderr"));
         assert!(text.contains("[sandbox: read-only, full enforcement]"));
@@ -3545,11 +3565,9 @@ mod tests {
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let marker = scratch.path().join("allowed-marker");
-        let command = format!(
-            "printf n91-approved > '{}'; cat '{}'",
-            marker.display(),
-            marker.display()
-        );
+        let workspace_root = scratch.path().canonicalize().unwrap();
+        let request_workspace_root = scratch.path().to_path_buf();
+        let command = "printf n91-approved > allowed-marker; cat allowed-marker; pwd";
         let justification = "create the N91 marker inside the current workspace";
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
@@ -3604,10 +3622,10 @@ mod tests {
                 *execution_agent_id.lock().unwrap() = Some(permit.agent().id.clone());
                 let mut coordinator = execution_slot.lock().unwrap();
                 futures_executor::block_on(coordinator.run_authorized_runtime_agent_turn(
-                    desktop_turn_request(),
+                    desktop_turn_request_in(&request_workspace_root),
                     desktop_bash_escalation_turn_adapter(
                         "desktop-bash-escalation-allow",
-                        &command,
+                        command,
                         justification,
                     ),
                     &LifecycleCancellation::default(),
@@ -3679,6 +3697,7 @@ mod tests {
             })
             .expect("approved escalation must commit one successful ToolResult");
         assert!(result_text.contains("n91-approved"));
+        assert!(result_text.contains(&workspace_root.display().to_string()));
         assert!(result_text.contains("[sandbox: workspace-write, full enforcement]"));
         assert!(runtime_open_turn(&events).is_none());
     }
@@ -3695,7 +3714,8 @@ mod tests {
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let marker = scratch.path().join("must-not-exist");
-        let command = format!("printf forbidden > '{}'", marker.display());
+        let request_workspace_root = scratch.path().to_path_buf();
+        let command = "printf forbidden > must-not-exist";
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap();
@@ -3749,10 +3769,10 @@ mod tests {
                 *execution_agent_id.lock().unwrap() = Some(permit.agent().id.clone());
                 let mut coordinator = execution_slot.lock().unwrap();
                 futures_executor::block_on(coordinator.run_authorized_runtime_agent_turn(
-                    desktop_turn_request(),
+                    desktop_turn_request_in(&request_workspace_root),
                     desktop_bash_escalation_turn_adapter(
                         "desktop-bash-escalation-reject",
-                        &command,
+                        command,
                         "write a marker that rejection must prevent",
                     ),
                     &LifecycleCancellation::default(),
@@ -4294,6 +4314,44 @@ mod tests {
             .unwrap();
         assert_eq!(session.inbox().next_turn().unwrap().len(), 1);
         assert!(runtime_open_turn(&session.events().unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    async fn desktop_agent_turn_rejects_an_unusable_workspace_before_inbox_or_adapter() {
+        let scratch = tempfile::Builder::new()
+            .prefix("n92-missing-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let missing = scratch.path().join("missing-workspace");
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        let (adapter, probe) = desktop_turn_adapter(Arc::new(AtomicUsize::new(0)));
+
+        let error = live
+            .run_agent_turn(
+                desktop_turn_request_in(&missing),
+                adapter,
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DesktopAgentTurnError::Sandbox(SandboxError::WorkspaceBindingUnavailable { .. })
+        ));
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
+        let session = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&SessionId::new("desktop-agent-session").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(session.inbox().next_turn().unwrap().is_empty());
+        assert!(session.events().unwrap().is_empty());
     }
 
     #[tokio::test]

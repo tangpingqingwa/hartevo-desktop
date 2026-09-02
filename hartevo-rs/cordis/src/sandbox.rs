@@ -1,8 +1,9 @@
 //! Durable sandbox policy and one-shot escalation adapted from DeepSeek Harness.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 
@@ -348,10 +349,58 @@ impl SessionSandboxMode {
 }
 
 /// Deployment defaults shared by every future enforcing capability.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicyService {
     default_mode: SandboxMode,
     workspace_root: PathBuf,
+    session_workspaces: Mutex<HashMap<SessionId, SandboxWorkspaceRegistration>>,
+}
+
+impl std::fmt::Debug for SandboxPolicyService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxPolicyService")
+            .field("default_mode", &self.default_mode)
+            .field("workspace_root", &self.workspace_root)
+            .finish_non_exhaustive()
+    }
+}
+
+struct SandboxWorkspaceRegistration {
+    identity: Arc<()>,
+    root: PathBuf,
+}
+
+/// One exact live Session/workspace binding removed when its Desktop turn ends.
+pub struct SandboxWorkspaceBinding {
+    policy: Weak<SandboxPolicyService>,
+    session_id: SessionId,
+    identity: Arc<()>,
+}
+
+impl std::fmt::Debug for SandboxWorkspaceBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxWorkspaceBinding")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SandboxWorkspaceBinding {
+    fn drop(&mut self) {
+        let Some(policy) = self.policy.upgrade() else {
+            return;
+        };
+        let Ok(mut workspaces) = policy.session_workspaces.lock() else {
+            return;
+        };
+        if workspaces
+            .get(&self.session_id)
+            .is_some_and(|binding| Arc::ptr_eq(&binding.identity, &self.identity))
+        {
+            workspaces.remove(&self.session_id);
+        }
+    }
 }
 
 impl SandboxPolicyService {
@@ -362,6 +411,7 @@ impl SandboxPolicyService {
         Ok(Self {
             default_mode,
             workspace_root: absolute_workspace_root(workspace_root.into())?,
+            session_workspaces: Mutex::new(HashMap::new()),
         })
     }
 
@@ -379,6 +429,49 @@ impl SandboxPolicyService {
         &self.workspace_root
     }
 
+    fn bind_workspace(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        root: PathBuf,
+    ) -> Result<SandboxWorkspaceBinding, SandboxError> {
+        let identity = Arc::new(());
+        let mut workspaces = self.session_workspaces.lock().map_err(|_| {
+            SandboxError::WorkspaceBindingUnavailable {
+                detail: "the binding store is poisoned".into(),
+            }
+        })?;
+        if workspaces.contains_key(&session_id) {
+            return Err(SandboxError::WorkspaceBindingUnavailable {
+                detail: format!("Session `{session_id}` already has a live workspace binding"),
+            });
+        }
+        workspaces.insert(
+            session_id.clone(),
+            SandboxWorkspaceRegistration {
+                identity: Arc::clone(&identity),
+                root,
+            },
+        );
+        Ok(SandboxWorkspaceBinding {
+            policy: Arc::downgrade(self),
+            session_id,
+            identity,
+        })
+    }
+
+    fn bound_workspace(&self, session_id: &SessionId) -> Result<Option<PathBuf>, SandboxError> {
+        self.session_workspaces
+            .lock()
+            .map_err(|_| SandboxError::WorkspaceBindingUnavailable {
+                detail: "the binding store is poisoned".into(),
+            })
+            .map(|workspaces| {
+                workspaces
+                    .get(session_id)
+                    .map(|binding| binding.root.clone())
+            })
+    }
+
     fn resolve(
         &self,
         request: SandboxPolicyRequest,
@@ -390,9 +483,16 @@ impl SandboxPolicyService {
             .transpose()?
             .flatten();
         let standing_mode = session_mode.unwrap_or(self.default_mode);
-        let workspace_root = request
-            .workspace_root
-            .map_or_else(|| Ok(self.workspace_root.clone()), absolute_workspace_root)?;
+        let bound_workspace = request
+            .session
+            .as_ref()
+            .map(|session| self.bound_workspace(session.id()))
+            .transpose()?
+            .flatten();
+        let workspace_root = request.workspace_root.map_or_else(
+            || Ok(bound_workspace.unwrap_or_else(|| self.workspace_root.clone())),
+            absolute_workspace_root,
+        )?;
         let mode = if let Some(grant) = request.escalation {
             let session = request
                 .session
@@ -801,6 +901,29 @@ fn resolve_sandbox_policy_with_services(
     policy.resolve(request)
 }
 
+/// Bind one validated workspace root to the exact live Session until the
+/// returned handle is dropped. The binding is runtime request identity and is
+/// deliberately not a persistent permission grant.
+pub fn bind_sandbox_workspace(
+    ctx: &Context,
+    session: &SessionHandle,
+    workspace_root: impl Into<PathBuf>,
+) -> Result<SandboxWorkspaceBinding, SandboxError> {
+    let policy = ctx
+        .get::<SandboxPolicyService>(keys::SANDBOX_POLICY)
+        .ok_or(SandboxError::ServiceUnavailable {
+            key: keys::SANDBOX_POLICY,
+        })?;
+    let sessions = ctx
+        .sessions::<SessionStore>()
+        .ok_or(SandboxError::ServiceUnavailable {
+            key: keys::SESSIONS,
+        })?;
+    sessions.require_live(session)?;
+    let workspace_root = canonical_bound_workspace_root(workspace_root.into())?;
+    policy.bind_workspace(session.id().clone(), workspace_root)
+}
+
 /// Append and flush exactly one session mode switch before returning.
 pub async fn set_sandbox_mode(
     ctx: &Context,
@@ -1108,6 +1231,26 @@ fn absolute_workspace_root(path: PathBuf) -> Result<PathBuf, SandboxError> {
     Ok(normalized)
 }
 
+fn canonical_bound_workspace_root(path: PathBuf) -> Result<PathBuf, SandboxError> {
+    let path = absolute_workspace_root(path)?;
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        SandboxError::WorkspaceBindingUnavailable {
+            detail: error.to_string(),
+        }
+    })?;
+    if !std::fs::metadata(&canonical)
+        .map_err(|error| SandboxError::WorkspaceBindingUnavailable {
+            detail: error.to_string(),
+        })?
+        .is_dir()
+    {
+        return Err(SandboxError::WorkspaceBindingUnavailable {
+            detail: "the bound workspace root is not a directory".into(),
+        });
+    }
+    Ok(canonical)
+}
+
 /// Fail-closed policy, resolution, and escalation errors.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum SandboxError {
@@ -1125,6 +1268,8 @@ pub enum SandboxError {
     WorkspaceRootNotAbsolute { path: PathBuf },
     #[error("sandbox current directory is unavailable: {detail}")]
     CurrentDirectoryUnavailable { detail: String },
+    #[error("sandbox workspace binding is unavailable: {detail}")]
+    WorkspaceBindingUnavailable { detail: String },
     #[error("sandbox escalation call id must not be empty")]
     EmptyCallId,
     #[error("sandbox escalation tool name must not be empty")]

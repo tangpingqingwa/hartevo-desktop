@@ -5,9 +5,9 @@ use hartevo_cordis::{
     LifecycleCancellation, SANDBOX_ESCALATION_TARGETS, SANDBOX_MODES, SandboxError,
     SandboxEscalationApproval, SandboxEscalationRequest, SandboxMode, SandboxModeSource,
     SandboxPolicyRequest, SandboxPolicyService, SessionEventKind, SessionId, SessionLog,
-    SessionSandboxMode, SessionStore, approval_events, approve_sandbox_escalation, register_agent,
-    resolve_sandbox_policy, session_events, set_approval_policy, set_sandbox_mode,
-    validate_sandbox_escalation_args,
+    SessionSandboxMode, SessionStore, approval_events, approve_sandbox_escalation,
+    bind_sandbox_workspace, register_agent, resolve_sandbox_policy, session_events,
+    set_approval_policy, set_sandbox_mode, validate_sandbox_escalation_args,
 };
 
 #[derive(Debug)]
@@ -154,6 +154,53 @@ async fn resolution_uses_grant_then_session_then_deployment_without_changing_app
     assert_eq!(session.approval_policy().unwrap(), ApprovalPolicy::Ask);
 }
 
+#[test]
+fn live_session_workspace_binding_is_exact_precedence_ordered_and_drop_scoped() {
+    let host = CordisHost::boot(false).unwrap();
+    let policy = host
+        .context()
+        .sandbox_policy::<SandboxPolicyService>()
+        .unwrap();
+    let session = host
+        .context()
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("sandbox-workspace-binding").unwrap())
+        .unwrap();
+    let bound_root = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let explicit_root = std::fs::canonicalize(bound_root.join("src")).unwrap();
+
+    let binding = bind_sandbox_workspace(host.context(), &session, &bound_root).unwrap();
+    let resolved =
+        resolve_sandbox_policy(host.context(), SandboxPolicyRequest::for_session(&session))
+            .unwrap();
+    assert_eq!(resolved.workspace_root(), bound_root);
+    let explicit = resolve_sandbox_policy(
+        host.context(),
+        SandboxPolicyRequest::for_session(&session).with_workspace_root(&explicit_root),
+    )
+    .unwrap();
+    assert_eq!(explicit.workspace_root(), explicit_root);
+    assert!(matches!(
+        bind_sandbox_workspace(host.context(), &session, &bound_root),
+        Err(SandboxError::WorkspaceBindingUnavailable { .. })
+    ));
+
+    drop(binding);
+    let restored =
+        resolve_sandbox_policy(host.context(), SandboxPolicyRequest::for_session(&session))
+            .unwrap();
+    assert_eq!(restored.workspace_root(), policy.workspace_root());
+    assert!(matches!(
+        bind_sandbox_workspace(
+            host.context(),
+            &session,
+            bound_root.join("missing-n92-workspace")
+        ),
+        Err(SandboxError::WorkspaceBindingUnavailable { .. })
+    ));
+}
+
 #[tokio::test]
 async fn foreign_session_handle_is_rejected_before_resolution_or_write() {
     let first = CordisHost::boot(false).unwrap();
@@ -173,6 +220,12 @@ async fn foreign_session_handle_is_rejected_before_resolution_or_write() {
 
     assert!(matches!(
         resolve_sandbox_policy(first.context(), SandboxPolicyRequest::for_session(&foreign)),
+        Err(SandboxError::Session(
+            hartevo_cordis::SessionError::SessionNotLive { .. }
+        ))
+    ));
+    assert!(matches!(
+        bind_sandbox_workspace(first.context(), &foreign, std::env::current_dir().unwrap()),
         Err(SandboxError::Session(
             hartevo_cordis::SessionError::SessionNotLive { .. }
         ))
