@@ -18,17 +18,18 @@ use hartevo_cordis::{
     SessionId, SessionLlmFailure, SessionLlmRetryMode, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionTokenUsage,
-    SessionToolSchema, SurfaceOwner, TOOL_ABORTED_BEFORE_DISPATCH, ToolCall, ToolDefinition,
-    ToolDispatchExecution, ToolDispatchResult, ToolExecutionMode, ToolExecutionPreparation,
-    ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface, TurnEndReason,
-    WaterfallFailure, admit_agent_request, admit_agent_step, approval_events, build_agent_call,
-    commit_agent_stream, commit_agent_tool_results, dispatch_agent_call, dispatch_tool_execution,
-    events, finalize_tool_execution, keys, log_agent_call, post_tool_execution, prepare_agent_call,
-    prepare_agent_step, prepare_agent_tool_calls, prepare_agent_tool_executions,
-    record_agent_stream, register_agent, register_llm_adapter, register_prompt_section,
-    register_tool, register_tool_concurrency, register_tool_definition, register_tool_guard,
-    register_tool_schema, run_agent_step, run_agent_tool_batch, run_agent_tool_batch_outcome,
-    run_agent_tool_batch_with_limit, run_agent_tool_batch_with_limit_and_cancellation,
+    SessionToolSchema, SurfaceOwner, TOOL_ABORTED_BEFORE_DISPATCH, ToolApprovalRequirement,
+    ToolCall, ToolDefinition, ToolDispatchExecution, ToolDispatchResult, ToolExecutionMode,
+    ToolExecutionPreparation, ToolExecutionResult, ToolPostExecution, ToolRunContext, ToolsSurface,
+    TurnEndReason, WaterfallFailure, admit_agent_request, admit_agent_step, approval_events,
+    build_agent_call, commit_agent_stream, commit_agent_tool_results, dispatch_agent_call,
+    dispatch_tool_execution, events, finalize_tool_execution, keys, log_agent_call,
+    post_tool_execution, prepare_agent_call, prepare_agent_step, prepare_agent_tool_calls,
+    prepare_agent_tool_executions, record_agent_stream, register_agent, register_llm_adapter,
+    register_prompt_section, register_tool, register_tool_concurrency, register_tool_definition,
+    register_tool_guard, register_tool_schema, run_agent_step, run_agent_tool_batch,
+    run_agent_tool_batch_outcome, run_agent_tool_batch_with_limit,
+    run_agent_tool_batch_with_limit_and_cancellation,
     run_agent_tool_batch_with_limit_and_cancellation_outcome, run_agent_turn,
     schedule_agent_tool_calls, session_events,
 };
@@ -4558,6 +4559,55 @@ fn agent_tool_pre_execution_is_ordered_monotonic_and_session_read_only() {
     };
     assert_eq!(approval.reason(), "approval is required");
     assert_eq!(session.events().unwrap(), before);
+    close_logged_turn(&session, turn);
+}
+
+#[test]
+fn definition_owned_approval_cannot_be_force_allowed_without_the_async_channel() {
+    let mut chunks = tool_call_chunks(0, "definition-ask-call", "definition-ask", "{}").to_vec();
+    chunks.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (mut ctx, session, turn, logged, mut recorded) =
+        recorded_script("definition-owned-approval", chunks);
+    commit_agent_stream(&ctx, &logged, &mut recorded).unwrap();
+    schedule_agent_tool_calls(&ctx, &logged, &mut recorded).unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    {
+        let runs = Arc::clone(&runs);
+        register_tool_definition(
+            &mut ctx,
+            ToolDefinition::new(tool_schema("definition-ask"), move |_| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("must not run"))
+            })
+            .with_approval_requirement(|_| {
+                Ok(Some(ToolApprovalRequirement::new(
+                    "approve the definition-owned capability",
+                    "opaque definition payload",
+                )))
+            }),
+        )
+        .unwrap();
+    }
+    ctx.on_waterfall(events::TOOLS_PRE_EXECUTE, |mut call: ToolCall, _next| {
+        call.decision = "allow".into();
+        call
+    })
+    .unwrap();
+
+    let results = run_agent_tool_batch(&mut ctx, &logged, &mut recorded).unwrap();
+
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error());
+    assert_eq!(
+        results[0].content(),
+        [SessionContentBlock::Text {
+            text: "Error: approve the definition-owned capability".into(),
+        }]
+    );
     close_logged_turn(&session, turn);
 }
 

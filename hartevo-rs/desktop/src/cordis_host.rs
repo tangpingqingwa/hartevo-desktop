@@ -3231,6 +3231,57 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn desktop_bash_escalation_turn_adapter(
+        call_id: &str,
+        command: &str,
+        justification: &str,
+    ) -> DesktopSequencedTurnAdapter {
+        let first = vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::ToolCall,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::ToolCall {
+                    id: call_id.into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({
+                        "command": command,
+                        "description": "Exercise one exact N91 sandbox escalation",
+                        "sandbox_permissions": "workspace-write",
+                        "justification": justification,
+                    })
+                    .to_string(),
+                },
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::ToolCalls,
+                replay_state: None,
+            },
+        ];
+        let second = vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::Text {
+                    text: "sandbox escalation settled".into(),
+                },
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                replay_state: None,
+            },
+        ];
+        DesktopSequencedTurnAdapter {
+            turns: Arc::new(Mutex::new(VecDeque::from([first, second]))),
+        }
+    }
+
     fn desktop_turn_request() -> DesktopAgentTurnRequest {
         DesktopAgentTurnRequest::new(
             "desktop-agent-session",
@@ -3479,6 +3530,301 @@ mod tests {
         assert!(text.contains("[stderr]\nn90-stderr"));
         assert!(text.contains("[sandbox: read-only, full enforcement]"));
         assert!(text.contains("[exit code: 7]"));
+        assert!(runtime_open_turn(&events).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused production proof keeps exact prompt identity, one-shot approval, execution, and durable settlement together"
+    )]
+    fn desktop_production_bash_escalation_asks_once_then_runs_the_exact_call() {
+        let scratch = tempfile::Builder::new()
+            .prefix("n91-approved-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let marker = scratch.path().join("allowed-marker");
+        let command = format!(
+            "printf n91-approved > '{}'; cat '{}'",
+            marker.display(),
+            marker.display()
+        );
+        let justification = "create the N91 marker inside the current workspace";
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
+        let slot = Arc::new(DesktopCordisSlot::new(live));
+        let bridge_changes = Arc::new(Mutex::new(Vec::new()));
+        let bridge = {
+            let bridge_changes = Arc::clone(&bridge_changes);
+            DesktopCordisApprovalBridge::new(move |pending| {
+                bridge_changes.lock().unwrap().push(pending);
+            })
+        };
+        let expected_agent_id = Arc::new(Mutex::new(None::<String>));
+        let answer_bridge = bridge.clone();
+        let answer_expected_agent_id = Arc::clone(&expected_agent_id);
+        let answerer = thread::spawn(move || {
+            for _ in 0..200 {
+                if let Some(held) = answer_bridge.pending() {
+                    let expected = answer_expected_agent_id.lock().unwrap().clone().unwrap();
+                    assert_eq!(held.agent_id, expected);
+                    assert_eq!(held.session_id.as_str(), "desktop-agent-session");
+                    assert_eq!(held.tool_name(), "bash");
+                    assert_eq!(held.call_id(), Some("desktop-bash-escalation-allow"));
+                    assert_eq!(
+                        held.reason(),
+                        Some(
+                            "escalate sandbox to workspace-write: create the N91 marker inside the current workspace"
+                        )
+                    );
+                    let id = held.id().clone();
+                    answer_bridge.allow_once(&id).unwrap();
+                    return held;
+                }
+                thread::sleep(StdDuration::from_millis(5));
+            }
+            panic!("Desktop never received the sandbox escalation request");
+        });
+
+        let execution_slot = Arc::clone(&slot);
+        let execution_bridge = bridge.clone();
+        let execution_agent_id = Arc::clone(&expected_agent_id);
+        let outcome = dispatch_live_runtime(
+            &slot,
+            runtime_scope(),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                *execution_agent_id.lock().unwrap() = Some(permit.agent().id.clone());
+                let mut coordinator = execution_slot.lock().unwrap();
+                futures_executor::block_on(coordinator.run_authorized_runtime_agent_turn(
+                    desktop_turn_request(),
+                    desktop_bash_escalation_turn_adapter(
+                        "desktop-bash-escalation-allow",
+                        &command,
+                        justification,
+                    ),
+                    &LifecycleCancellation::default(),
+                    permit,
+                    Some(&execution_bridge),
+                ))
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        let held = answerer.join().unwrap();
+
+        assert_eq!(outcome.steps(), 2);
+        assert_eq!(outcome.reason(), TurnEndReason::Completed);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "n91-approved");
+        assert_eq!(*bridge_changes.lock().unwrap(), [true, false]);
+        assert!(bridge.pending().is_none());
+        let session = slot
+            .lock()
+            .unwrap()
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&held.session_id)
+            .unwrap()
+            .unwrap();
+        let events = session.events().unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ApprovalAsked { approval: asked }
+                    if asked.id() == held.id()
+                        && asked.tool_name() == "bash"
+                        && asked.call_id() == Some("desktop-bash-escalation-allow")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ApprovalDecided { approval: decided }
+                    if decided.id() == held.id()
+                        && decided.outcome() == ApprovalOutcome::AllowedOnce
+            )
+        }));
+        let result_text = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolResult { message, error, .. }
+                    if error.is_none()
+                        && matches!(
+                            &message.source,
+                            SessionMessageSource::Tool { call_id }
+                                if call_id == "desktop-bash-escalation-allow"
+                        ) =>
+                {
+                    message.content.iter().find_map(|content| match content {
+                        SessionContentBlock::ToolResult {
+                            content,
+                            is_error: false,
+                            ..
+                        } => content.iter().find_map(|block| match block {
+                            SessionContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        }),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("approved escalation must commit one successful ToolResult");
+        assert!(result_text.contains("n91-approved"));
+        assert!(result_text.contains("[sandbox: workspace-write, full enforcement]"));
+        assert!(runtime_open_turn(&events).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused rejection proof keeps exact prompt identity, durable rejection, and no-spawn evidence together"
+    )]
+    fn desktop_rejected_bash_escalation_never_spawns_the_command() {
+        let scratch = tempfile::Builder::new()
+            .prefix("n91-rejected-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let marker = scratch.path().join("must-not-exist");
+        let command = format!("printf forbidden > '{}'", marker.display());
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
+        let slot = Arc::new(DesktopCordisSlot::new(live));
+        let bridge_changes = Arc::new(Mutex::new(Vec::new()));
+        let bridge = {
+            let bridge_changes = Arc::clone(&bridge_changes);
+            DesktopCordisApprovalBridge::new(move |pending| {
+                bridge_changes.lock().unwrap().push(pending);
+            })
+        };
+        let expected_agent_id = Arc::new(Mutex::new(None::<String>));
+        let answer_bridge = bridge.clone();
+        let answer_expected_agent_id = Arc::clone(&expected_agent_id);
+        let answerer = thread::spawn(move || {
+            for _ in 0..200 {
+                if let Some(held) = answer_bridge.pending() {
+                    let expected = answer_expected_agent_id.lock().unwrap().clone().unwrap();
+                    assert_eq!(held.agent_id, expected);
+                    assert_eq!(held.session_id.as_str(), "desktop-agent-session");
+                    assert_eq!(held.tool_name(), "bash");
+                    assert_eq!(held.call_id(), Some("desktop-bash-escalation-reject"));
+                    assert_eq!(
+                        held.reason(),
+                        Some(
+                            "escalate sandbox to workspace-write: write a marker that rejection must prevent"
+                        )
+                    );
+                    let id = held.id().clone();
+                    answer_bridge.reject(&id).unwrap();
+                    return held;
+                }
+                thread::sleep(StdDuration::from_millis(5));
+            }
+            panic!("Desktop never received the sandbox escalation request");
+        });
+
+        let execution_slot = Arc::clone(&slot);
+        let execution_bridge = bridge.clone();
+        let execution_agent_id = Arc::clone(&expected_agent_id);
+        let outcome = dispatch_live_runtime(
+            &slot,
+            runtime_scope(),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                *execution_agent_id.lock().unwrap() = Some(permit.agent().id.clone());
+                let mut coordinator = execution_slot.lock().unwrap();
+                futures_executor::block_on(coordinator.run_authorized_runtime_agent_turn(
+                    desktop_turn_request(),
+                    desktop_bash_escalation_turn_adapter(
+                        "desktop-bash-escalation-reject",
+                        &command,
+                        "write a marker that rejection must prevent",
+                    ),
+                    &LifecycleCancellation::default(),
+                    permit,
+                    Some(&execution_bridge),
+                ))
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        let held = answerer.join().unwrap();
+
+        assert_eq!(outcome.steps(), 2);
+        assert!(!marker.exists());
+        assert_eq!(*bridge_changes.lock().unwrap(), [true, false]);
+        assert!(bridge.pending().is_none());
+        let session = slot
+            .lock()
+            .unwrap()
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&held.session_id)
+            .unwrap()
+            .unwrap();
+        let events = session.events().unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ApprovalAsked { approval: asked }
+                    if asked.id() == held.id()
+                        && asked.tool_name() == "bash"
+                        && asked.call_id() == Some("desktop-bash-escalation-reject")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ApprovalDecided { approval: decided }
+                    if decided.id() == held.id()
+                        && decided.outcome() == ApprovalOutcome::Rejected
+            )
+        }));
+        let message = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolResult { message, .. }
+                    if matches!(
+                        &message.source,
+                        SessionMessageSource::Tool { call_id }
+                            if call_id == "desktop-bash-escalation-reject"
+                    ) =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .expect("rejected escalation must commit one error ToolResult");
+        let result_text = message.content.iter().find_map(|content| match content {
+            SessionContentBlock::ToolResult {
+                content,
+                is_error: true,
+                ..
+            } => content.iter().find_map(|block| match block {
+                SessionContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert!(
+            result_text.is_some_and(|text| { text.contains("the user rejected tool \"bash\"") })
+        );
         assert!(runtime_open_turn(&events).is_none());
     }
 
