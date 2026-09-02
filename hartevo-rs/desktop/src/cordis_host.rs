@@ -3226,6 +3226,18 @@ mod tests {
                     arguments: r#"{"command":"pwd","description":"Show the explicit working directory","workdir":"nested"}"#.into(),
                 },
             },
+            SessionStreamChunk::BlockStart {
+                index: 2,
+                block_type: SessionStreamBlockType::ToolCall,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 2,
+                block: SessionContentBlock::ToolCall {
+                    id: "desktop-bash-timeout-call".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"sleep 30","description":"Exercise the foreground timeout contract","timeoutMs":50}"#.into(),
+                },
+            },
             SessionStreamChunk::Finish {
                 reason: SessionFinishReason::ToolCalls,
                 replay_state: None,
@@ -3498,6 +3510,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused production proof keeps default cwd, explicit cwd, timeout, and durable settlement together"
+    )]
     async fn desktop_production_bash_tool_runs_in_cordis_sandbox_and_commits_result() {
         let scratch = tempfile::Builder::new()
             .prefix("n92-read-only-")
@@ -3599,6 +3615,37 @@ mod tests {
             panic!("explicit workdir result must contain one text block");
         };
         assert!(text.contains(&nested.display().to_string()));
+        assert!(text.contains("[sandbox: read-only, full enforcement]"));
+        let timeout_message = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolResult { message, error, .. }
+                    if error.is_none()
+                        && matches!(
+                            &message.source,
+                            SessionMessageSource::Tool { call_id }
+                                if call_id == "desktop-bash-timeout-call"
+                        ) =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .expect("foreground timeout result must be durable");
+        let [
+            SessionContentBlock::ToolResult {
+                content,
+                is_error: false,
+                ..
+            },
+        ] = timeout_message.content.as_slice()
+        else {
+            panic!("foreground timeout must use the canonical successful tool wrapper");
+        };
+        let [SessionContentBlock::Text { text }] = content.as_slice() else {
+            panic!("foreground timeout result must contain one text block");
+        };
+        assert!(text.contains("[timed out after 50ms]"));
         assert!(text.contains("[sandbox: read-only, full enforcement]"));
         assert!(runtime_open_turn(&events).is_none());
     }
