@@ -93,6 +93,7 @@ fn mapped_keys_are_provided_and_looked_up() {
             keys::LLM,
             keys::SESSIONS,
             keys::AGENTS,
+            keys::JOBS,
             keys::DOMAIN,
             keys::EFFECT_BROKER,
             keys::RUNTIME,
@@ -108,6 +109,7 @@ fn mapped_keys_are_provided_and_looked_up() {
     assert!(ctx.system_prompt::<SystemPromptSurface>().is_some());
     assert!(ctx.llm::<hartevo_cordis::LlmSurface>().is_some());
     assert!(ctx.agents::<hartevo_cordis::AgentsSurface>().is_some());
+    assert!(ctx.jobs::<hartevo_cordis::JobsSurface>().is_some());
     assert!(ctx.sessions::<u32>().is_none());
     assert_eq!(
         ctx.domain::<DomainSurface>().as_deref(),

@@ -14934,8 +14934,14 @@ sleep 30"#;
             },
             adapter_defaults: None,
             system: None,
-            tools: cfg!(target_os = "macos")
-                .then(|| vec![crate::sandbox_provider::sandboxed_bash_schema()]),
+            tools: cfg!(target_os = "macos").then(|| {
+                vec![
+                    crate::sandbox_provider::sandboxed_bash_schema(),
+                    crate::sandbox_provider::background_job_kill_schema(),
+                    crate::sandbox_provider::background_job_list_schema(),
+                    crate::sandbox_provider::background_job_output_schema(),
+                ]
+            }),
         };
         let (expected_session_events, expected_session_messages) = plane.with_cordis_host(|host| {
             let session = host

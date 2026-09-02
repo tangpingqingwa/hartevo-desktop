@@ -2984,6 +2984,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::error::Error;
     use std::fmt::{self, Display};
@@ -3003,20 +3005,20 @@ mod tests {
         AuthorityDispatchError, AuthorityScope, CompactionCheckpoint, CompactionId,
         CompactionSummaryDraft, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
         DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
-        EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
-        KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
-        LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
-        OPENINTERPRETER, RuntimeBinding, SandboxError, SandboxMode, SandboxModeSource,
-        SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig,
-        SessionCancelCause, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
-        SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
-        SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
-        SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
-        SessionSandboxMode, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-        SessionSurfaceIntent, SessionSurfaceOp, SessionToolSchema, SurfaceOwner, ToolCall,
-        ToolDefinition, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
-        invariant_missing, is_compact_checkpoint_source, keys, register_tool_definition,
-        session_events,
+        EffectVerificationBinding, FiberState, JobStatus, JobsSurface, KernelApproval,
+        KernelApprovalDecision, KernelConsentState, LifecycleCancellation, LlmAdapter,
+        LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, LlmSurface,
+        ManualCompactionErrorCode, OPENINTERPRETER, RuntimeBinding, SandboxError, SandboxMode,
+        SandboxModeSource, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
+        SessionCallConfig, SessionCancelCause, SessionCompactionEnd, SessionCompactionStart,
+        SessionCompactionSummary, SessionContentBlock, SessionError, SessionEvent,
+        SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure,
+        SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionMessage,
+        SessionMessageRole, SessionMessageSource, SessionSandboxMode, SessionStore,
+        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
+        SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason,
+        enforce_invariants, events, host_is_cordis_loop, invariant_missing,
+        is_compact_checkpoint_source, keys, register_tool_definition, session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -3261,6 +3263,84 @@ mod tests {
         ];
         DesktopSequencedTurnAdapter {
             turns: Arc::new(Mutex::new(VecDeque::from([first, second]))),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn desktop_single_tool_turn(id: &str, name: &str, arguments: &str) -> Vec<SessionStreamChunk> {
+        vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::ToolCall,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: arguments.into(),
+                },
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::ToolCalls,
+                replay_state: None,
+            },
+        ]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn desktop_background_bash_turn_adapter() -> DesktopSequencedTurnAdapter {
+        let turns = [
+            desktop_single_tool_turn(
+                "desktop-background-start-short",
+                "bash",
+                r#"{"command":"sleep 0.05; printf n101-background-complete","description":"Start the short background completion proof","run_in_background":true}"#,
+            ),
+            desktop_single_tool_turn(
+                "desktop-background-read-short",
+                "job_output",
+                r#"{"job_id":"bash-1","wait":true,"timeout_ms":5000}"#,
+            ),
+            desktop_single_tool_turn(
+                "desktop-background-start-long",
+                "bash",
+                r#"{"command":"sleep 30 & child=$!; printf '%s\\n' \"$child\"; wait \"$child\"","description":"Start the cancellable background process group","run_in_background":true}"#,
+            ),
+            desktop_single_tool_turn(
+                "desktop-background-probe-long",
+                "job_output",
+                r#"{"job_id":"bash-2","wait":true,"timeout_ms":150}"#,
+            ),
+            desktop_single_tool_turn("desktop-background-list", "job_list", r"{}"),
+            desktop_single_tool_turn(
+                "desktop-background-kill-long",
+                "job_kill",
+                r#"{"job_id":"bash-2","reason":"production lifecycle proof complete"}"#,
+            ),
+            desktop_single_tool_turn(
+                "desktop-background-read-long",
+                "job_output",
+                r#"{"job_id":"bash-2","wait":true,"timeout_ms":5000}"#,
+            ),
+            vec![
+                SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                },
+                SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "background jobs verified".into(),
+                    },
+                },
+                SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+        ];
+        DesktopSequencedTurnAdapter {
+            turns: Arc::new(Mutex::new(VecDeque::from(turns))),
         }
     }
 
@@ -3648,6 +3728,112 @@ mod tests {
         };
         assert!(text.contains("[timed out after 50ms]"));
         assert!(text.contains("[sandbox: read-only, full enforcement]"));
+        assert!(runtime_open_turn(&events).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn desktop_background_bash_jobs_start_collect_list_kill_and_reap() {
+        use std::process::{Command, Stdio};
+
+        let scratch = tempfile::Builder::new()
+            .prefix("n101-background-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        approve_agent_turn(&mut live);
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
+
+        let outcome = live
+            .run_agent_turn(
+                desktop_turn_request_in(scratch.path()),
+                desktop_background_bash_turn_adapter(),
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps(), 8);
+        assert_eq!(outcome.reason(), TurnEndReason::Completed);
+        let session_id = SessionId::new("desktop-agent-session").unwrap();
+        let session = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let events = session.events().unwrap();
+        let mut results = HashMap::new();
+        for event in &events {
+            let SessionEventKind::ToolResult { message, error, .. } = &event.kind else {
+                continue;
+            };
+            assert!(error.is_none());
+            let SessionMessageSource::Tool { call_id } = &message.source else {
+                continue;
+            };
+            let [
+                SessionContentBlock::ToolResult {
+                    content,
+                    is_error: false,
+                    ..
+                },
+            ] = message.content.as_slice()
+            else {
+                continue;
+            };
+            let [SessionContentBlock::Text { text }] = content.as_slice() else {
+                continue;
+            };
+            results.insert(call_id.clone(), text.clone());
+        }
+
+        assert_eq!(
+            results["desktop-background-start-short"],
+            "started background job bash-1"
+        );
+        let short = &results["desktop-background-read-short"];
+        assert!(short.contains("n101-background-complete"));
+        assert!(short.contains("[sandbox: read-only, full enforcement]"));
+        assert!(short.contains("[status: completed, exit code: 0]"));
+        assert_eq!(
+            results["desktop-background-start-long"],
+            "started background job bash-2"
+        );
+        assert!(results["desktop-background-probe-long"].contains("[status: running]"));
+        let list = &results["desktop-background-list"];
+        assert!(list.contains("bash-1 [bash] completed"));
+        assert!(list.contains("bash-2 [bash] running"));
+        assert!(
+            results["desktop-background-kill-long"]
+                .contains("requested cancellation for background job bash-2")
+        );
+        let killed = &results["desktop-background-read-long"];
+        assert!(killed.contains("[killed by signal: SIGTERM]"));
+        assert!(killed.contains("[status: killed, signal: SIGTERM]"));
+        let child_pid = killed
+            .lines()
+            .find_map(|line| line.parse::<u32>().ok())
+            .expect("background command must report its child pid before cancellation");
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", &child_pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let jobs = live.context().jobs::<JobsSurface>().unwrap();
+        let snapshots = jobs.list(&session_id);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].status(), JobStatus::Completed);
+        assert_eq!(snapshots[1].status(), JobStatus::Killed);
         assert!(runtime_open_turn(&events).is_none());
     }
 

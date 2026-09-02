@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -11,13 +12,14 @@ use command_group::{Signal, UnixChildExt as _};
 #[cfg(test)]
 use hartevo_cordis::Context;
 use hartevo_cordis::{
-    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, CordisError, CordisHost,
-    LifecycleCancellation, SandboxEnforcement, SandboxError, SandboxExecutionEnvironment,
-    SandboxExecutionPlan, SandboxMode, SandboxPolicyRequest, SandboxProcessClassification,
-    SandboxProvider, SandboxProviderUnavailable, SandboxRunnerFailureRule, SessionContentBlock,
-    SessionToolSchema, ToolDefinition, ToolRunContext, classify_sandbox_process,
-    consume_sandbox_escalation_approval, plan_sandbox_escalation_approval,
-    register_sandbox_provider, register_tool_definition, validate_sandbox_escalation_args,
+    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, CordisError, CordisHost, JobControl,
+    JobOutcome, JobSnapshot, JobTerminalStatus, JobsSurface, LifecycleCancellation,
+    SandboxEnforcement, SandboxError, SandboxExecutionEnvironment, SandboxExecutionPlan,
+    SandboxMode, SandboxPolicyRequest, SandboxProcessClassification, SandboxProvider,
+    SandboxProviderUnavailable, SandboxRunnerFailureRule, SessionContentBlock, SessionToolSchema,
+    ToolDefinition, ToolRunContext, classify_sandbox_process, consume_sandbox_escalation_approval,
+    events, plan_sandbox_escalation_approval, register_sandbox_provider, register_tool_definition,
+    validate_sandbox_escalation_args,
 };
 use thiserror::Error;
 
@@ -30,6 +32,9 @@ const SANDBOX_PROCESS_OUTPUT_BYTES: usize = 64_000;
 const SANDBOX_PROCESS_OUTPUT_SPILL_BYTES: usize = 64 * 1024 * 1024;
 const SANDBOX_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SANDBOX_PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(3);
+const BACKGROUND_JOB_WAIT_DEFAULT_MS: f64 = 30_000.0;
+const BACKGROUND_JOB_WAIT_MAX_MS: f64 = 600_000.0;
+const BACKGROUND_JOB_OWNER_TEARDOWN_WAIT: Duration = Duration::from_secs(5);
 const BASH_ENVIRONMENT_OVERRIDES: [(&str, &str); 4] = [
     ("NO_COLOR", "1"),
     ("TERM", "dumb"),
@@ -164,7 +169,7 @@ impl Default for ResolvedBashTimeout {
 
 #[derive(Clone, Copy, Debug)]
 struct SandboxProcessLimits {
-    timeout: Duration,
+    timeout: Option<Duration>,
     timeout_ms: f64,
     output_bytes: usize,
     output_spill_bytes: usize,
@@ -197,8 +202,16 @@ impl<'a> SandboxProcessIo<'a> {
 impl SandboxProcessLimits {
     fn with_timeout(timeout: ResolvedBashTimeout) -> Self {
         Self {
-            timeout: timeout.duration,
+            timeout: Some(timeout.duration),
             timeout_ms: timeout.milliseconds,
+            ..Self::default()
+        }
+    }
+
+    fn without_timeout() -> Self {
+        Self {
+            timeout: None,
+            timeout_ms: 0.0,
             ..Self::default()
         }
     }
@@ -207,7 +220,7 @@ impl SandboxProcessLimits {
 impl Default for SandboxProcessLimits {
     fn default() -> Self {
         Self {
-            timeout: ResolvedBashTimeout::default().duration,
+            timeout: Some(ResolvedBashTimeout::default().duration),
             timeout_ms: SANDBOX_PROCESS_TIMEOUT_MS,
             output_bytes: SANDBOX_PROCESS_OUTPUT_BYTES,
             output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,
@@ -254,7 +267,33 @@ pub(crate) fn mount_macos_sandboxed_bash_tool(host: &mut CordisHost) -> Result<(
             detail: error.to_string(),
         }
     })?;
-    register_tool_definition(host.context_mut(), sandboxed_bash_definition(environment)).map(|_| ())
+    let jobs = host
+        .context()
+        .jobs::<JobsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec!["jobs".into()]))?;
+    let disposed_jobs = Arc::clone(&jobs);
+    host.context_mut()
+        .on_emit(events::AGENT_DISPOSED, move |agent| {
+            let _ = disposed_jobs.dispose_agent_and_wait(agent, BACKGROUND_JOB_OWNER_TEARDOWN_WAIT);
+        })?;
+    let teardown_jobs = Arc::clone(&jobs);
+    host.context_mut().effect(move || {
+        let _ = teardown_jobs.shutdown();
+    });
+    register_tool_definition(
+        host.context_mut(),
+        sandboxed_bash_definition(environment, Arc::clone(&jobs)),
+    )?;
+    register_tool_definition(
+        host.context_mut(),
+        background_job_output_definition(Arc::clone(&jobs)),
+    )?;
+    register_tool_definition(
+        host.context_mut(),
+        background_job_list_definition(Arc::clone(&jobs)),
+    )?;
+    register_tool_definition(host.context_mut(), background_job_kill_definition(jobs))?;
+    Ok(())
 }
 
 /// Run one exact argv through the currently resolved Cordis sandbox policy.
@@ -407,9 +446,11 @@ fn run_sandboxed_process_in_environment_with_limits(
         }
     };
 
-    let deadline = Instant::now()
-        .checked_add(limits.timeout)
-        .unwrap_or_else(Instant::now);
+    let deadline = limits.timeout.map(|timeout| {
+        Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now)
+    });
     let wait = wait_for_process(
         &mut child,
         cancellation,
@@ -522,10 +563,13 @@ fn environment_key_is_sensitive_or_managed(key: &OsStr) -> bool {
             .any(|fragment| key.contains(fragment))
 }
 
-fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDefinition {
+fn sandboxed_bash_definition(
+    environment: SandboxExecutionEnvironment,
+    jobs: Arc<JobsSurface>,
+) -> ToolDefinition {
     let approval_environment = environment.clone();
     ToolDefinition::new_with_run_context(sandboxed_bash_schema(), move |run| {
-        execute_sandboxed_bash(&environment, run)
+        execute_sandboxed_bash(&environment, &jobs, run)
     })
     .with_approval_requirement(move |input| {
         let arguments = sandboxed_bash_arguments(input.arguments())?;
@@ -551,6 +595,11 @@ fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDe
         .map_err(|error| sandbox_error_message(&error))
     })
     .with_output_renderer(|_, value| {
+        if let Some(job_id) = value.get("jobId").and_then(serde_json::Value::as_str) {
+            return Ok(vec![SessionContentBlock::Text {
+                text: format!("started background job {job_id}"),
+            }]);
+        }
         let output = value
             .get("output")
             .and_then(serde_json::Value::as_str)
@@ -592,6 +641,13 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
             }),
         ),
         (
+            "run_in_background".into(),
+            serde_json::json!({
+                "type": "boolean",
+                "description": "Run without a foreground timeout and return a job id; use job_output, job_list, and job_kill to control it"
+            }),
+        ),
+        (
             "sandbox_permissions".into(),
             serde_json::json!({
                 "type": "string",
@@ -609,7 +665,7 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
     ]);
     SessionToolSchema {
         name: "bash".into(),
-        description: "Run one foreground bash command through the Desktop sandbox. Each call uses a fresh shell; workdir defaults to the session workspace and timeoutMs defaults to 120000 with a 600000 cap. Trusted current-Session facts are available through managed $DSH_* variables. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
+        description: "Run one bash command through the Desktop sandbox. Each call uses a fresh shell; foreground work defaults to a 120000ms timeout capped at 600000ms. Set run_in_background for long-running work, then use job_output, job_list, or job_kill. Trusted current-Session facts are available through managed $DSH_* variables. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
         parameters: serde_json::Map::from_iter([
             ("type".into(), serde_json::json!("object")),
             ("additionalProperties".into(), serde_json::json!(false)),
@@ -622,8 +678,304 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
     }
 }
 
+fn background_job_output_definition(jobs: Arc<JobsSurface>) -> ToolDefinition {
+    ToolDefinition::new_with_run_context(background_job_output_schema(), move |run| {
+        let arguments = background_job_output_arguments(run.arguments())?;
+        if arguments.wait {
+            jobs.wait(
+                &arguments.job_id,
+                run.session_id(),
+                arguments.timeout,
+                run.cancellation(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let read = jobs
+            .read(&arguments.job_id, run.session_id())
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            "output": read.output(),
+            "job": background_job_snapshot_json(read.snapshot()),
+        }))
+    })
+    .with_output_renderer(|_, value| {
+        let output = value
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "job_output result output is invalid".to_string())?;
+        let job = value
+            .get("job")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "job_output result job is invalid".to_string())?;
+        let body = if output.is_empty() {
+            "(no new output)".to_string()
+        } else {
+            output.trim_end_matches('\n').to_string()
+        };
+        Ok(vec![SessionContentBlock::Text {
+            text: format!("{body}\n{}", background_job_status_line(job)?),
+        }])
+    })
+}
+
+fn background_job_list_definition(jobs: Arc<JobsSurface>) -> ToolDefinition {
+    ToolDefinition::new_with_run_context(background_job_list_schema(), move |run| {
+        require_only_job_arguments(run.arguments(), &[])?;
+        Ok(serde_json::Value::Array(
+            jobs.list(run.session_id())
+                .iter()
+                .map(background_job_snapshot_json)
+                .collect(),
+        ))
+    })
+    .with_output_renderer(|_, value| {
+        let jobs = value
+            .as_array()
+            .ok_or_else(|| "job_list result is invalid".to_string())?;
+        let output = if jobs.is_empty() {
+            "(no background jobs)".to_string()
+        } else {
+            jobs.iter()
+                .map(|job| {
+                    let job = job
+                        .as_object()
+                        .ok_or_else(|| "job_list entry is invalid".to_string())?;
+                    let id = job
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "job_list entry id is invalid".to_string())?;
+                    let kind = job
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "job_list entry kind is invalid".to_string())?;
+                    let label = job
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "job_list entry label is invalid".to_string())?;
+                    let status = job
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "job_list entry status is invalid".to_string())?;
+                    Ok(format!("{id} [{kind}] {status} — {label}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .join("\n")
+        };
+        Ok(vec![SessionContentBlock::Text { text: output }])
+    })
+}
+
+fn background_job_kill_definition(jobs: Arc<JobsSurface>) -> ToolDefinition {
+    ToolDefinition::new_with_run_context(background_job_kill_schema(), move |run| {
+        let arguments = background_job_kill_arguments(run.arguments())?;
+        let outcome = jobs
+            .kill(
+                &arguments.job_id,
+                run.session_id(),
+                arguments.reason.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+        let snapshot = jobs
+            .get(&arguments.job_id, run.session_id())
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            "result": outcome.as_str(),
+            "job": background_job_snapshot_json(&snapshot),
+        }))
+    })
+    .with_output_renderer(|_, value| {
+        let result = value
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "job_kill result is invalid".to_string())?;
+        let job = value
+            .get("job")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "job_kill result job is invalid".to_string())?;
+        let id = job
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "job_kill result id is invalid".to_string())?;
+        let action = if result == "requested" {
+            format!("requested cancellation for background job {id}")
+        } else {
+            format!("background job {id} was already finished")
+        };
+        Ok(vec![SessionContentBlock::Text {
+            text: format!("{action}\n{}", background_job_status_line(job)?),
+        }])
+    })
+}
+
+pub(crate) fn background_job_output_schema() -> SessionToolSchema {
+    SessionToolSchema {
+        name: "job_output".into(),
+        description: "Read a background job. Set wait to block until it settles or the bounded timeout expires; a timed-out wait leaves the job running.".into(),
+        parameters: serde_json::Map::from_iter([
+            ("type".into(), serde_json::json!("object")),
+            ("additionalProperties".into(), serde_json::json!(false)),
+            (
+                "properties".into(),
+                serde_json::json!({
+                    "job_id": {"type": "string", "description": "Job id returned by bash"},
+                    "wait": {"type": "boolean", "description": "Wait for terminal state before reading"},
+                    "timeout_ms": {"type": "number", "description": "Wait timeout in milliseconds; defaults to 30000 and is capped at 600000"}
+                }),
+            ),
+            ("required".into(), serde_json::json!(["job_id"])),
+        ]),
+    }
+}
+
+pub(crate) fn background_job_list_schema() -> SessionToolSchema {
+    SessionToolSchema {
+        name: "job_list".into(),
+        description: "List background jobs owned by the current Session.".into(),
+        parameters: serde_json::Map::from_iter([
+            ("type".into(), serde_json::json!("object")),
+            ("additionalProperties".into(), serde_json::json!(false)),
+            ("properties".into(), serde_json::json!({})),
+        ]),
+    }
+}
+
+pub(crate) fn background_job_kill_schema() -> SessionToolSchema {
+    SessionToolSchema {
+        name: "job_kill".into(),
+        description: "Request cancellation of one background job owned by the current Session."
+            .into(),
+        parameters: serde_json::Map::from_iter([
+            ("type".into(), serde_json::json!("object")),
+            ("additionalProperties".into(), serde_json::json!(false)),
+            (
+                "properties".into(),
+                serde_json::json!({
+                    "job_id": {"type": "string", "description": "Job id returned by bash"},
+                    "reason": {"type": "string", "description": "Optional reason for stopping the job"}
+                }),
+            ),
+            ("required".into(), serde_json::json!(["job_id"])),
+        ]),
+    }
+}
+
+struct BackgroundJobOutputArguments {
+    job_id: String,
+    wait: bool,
+    timeout: Duration,
+}
+
+fn background_job_output_arguments(
+    arguments: &serde_json::Value,
+) -> Result<BackgroundJobOutputArguments, String> {
+    let object = require_only_job_arguments(arguments, &["job_id", "wait", "timeout_ms"])?;
+    let job_id = background_job_id(object)?;
+    let wait = match object.get("wait") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => return Err("job_output argument wait must be a boolean".into()),
+    };
+    let milliseconds = match object.get("timeout_ms") {
+        None => BACKGROUND_JOB_WAIT_DEFAULT_MS,
+        Some(serde_json::Value::Number(value)) => value
+            .as_f64()
+            .ok_or_else(|| "job_output argument timeout_ms must be a finite number".to_string())?,
+        Some(_) => return Err("job_output argument timeout_ms must be a number".into()),
+    };
+    if !milliseconds.is_finite() || milliseconds <= 0.0 {
+        return Err("job_output argument timeout_ms must be a positive finite number".into());
+    }
+    let milliseconds = milliseconds.min(BACKGROUND_JOB_WAIT_MAX_MS);
+    Ok(BackgroundJobOutputArguments {
+        job_id,
+        wait,
+        timeout: Duration::from_secs_f64(milliseconds / 1_000.0),
+    })
+}
+
+struct BackgroundJobKillArguments {
+    job_id: String,
+    reason: Option<String>,
+}
+
+fn background_job_kill_arguments(
+    arguments: &serde_json::Value,
+) -> Result<BackgroundJobKillArguments, String> {
+    let object = require_only_job_arguments(arguments, &["job_id", "reason"])?;
+    let job_id = background_job_id(object)?;
+    let reason = match object.get("reason") {
+        None => None,
+        Some(serde_json::Value::String(reason)) => Some(reason.clone()),
+        Some(_) => return Err("job_kill argument reason must be a string".into()),
+    };
+    Ok(BackgroundJobKillArguments { job_id, reason })
+}
+
+fn require_only_job_arguments<'a>(
+    arguments: &'a serde_json::Value,
+    allowed: &[&str],
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "job arguments must be an object".to_string())?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "job arguments may contain only {}",
+            allowed.join(", ")
+        ));
+    }
+    Ok(object)
+}
+
+fn background_job_id(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    let id = object
+        .get("job_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "job argument job_id must be a string".to_string())?;
+    if id.is_empty() {
+        return Err("job argument job_id must not be empty".into());
+    }
+    Ok(id.to_string())
+}
+
+fn background_job_snapshot_json(snapshot: &JobSnapshot) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "id": snapshot.id().as_str(),
+        "kind": snapshot.kind(),
+        "label": snapshot.label(),
+        "status": snapshot.status().as_str(),
+        "startedAt": snapshot.started_at_ms(),
+    });
+    if let Some(detail) = snapshot.detail() {
+        value["detail"] = detail.into();
+    }
+    if let Some(finished_at_ms) = snapshot.finished_at_ms() {
+        value["finishedAt"] = finished_at_ms.into();
+    }
+    value
+}
+
+fn background_job_status_line(
+    job: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    let status = job
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "background job status is invalid".to_string())?;
+    Ok(job
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || format!("[status: {status}]"),
+            |detail| format!("[status: {status}, {detail}]"),
+        ))
+}
+
 fn execute_sandboxed_bash(
     environment: &SandboxExecutionEnvironment,
+    jobs: &Arc<JobsSurface>,
     run: &ToolRunContext,
 ) -> Result<serde_json::Value, String> {
     let arguments = sandboxed_bash_arguments(run.arguments())?;
@@ -656,6 +1008,54 @@ fn execute_sandboxed_bash(
     if let Some(escalation) = escalation {
         policy_request = policy_request.with_escalation(escalation);
     }
+    if arguments.run_in_background {
+        if run.cancellation().is_cancelled() {
+            return Err("tool call cancelled".into());
+        }
+        let job_environment = environment.clone();
+        let job_command = arguments.command.clone();
+        let job_session_id = run.session_id().as_str().to_string();
+        let job_id = jobs
+            .start(
+                run.session_id(),
+                run.agent(),
+                "bash",
+                arguments.command,
+                move |completion| {
+                    let cancellation = LifecycleCancellation::default();
+                    let worker_cancellation = cancellation.clone();
+                    thread::Builder::new()
+                        .name("hartevo-background-bash".into())
+                        .spawn(move || {
+                            let managed_environment = [
+                                ("DSH_SHELL", "1"),
+                                ("DSH_SESSION_ID", job_session_id.as_str()),
+                            ];
+                            let outcome = run_sandboxed_process_in_environment_with_limits(
+                                &job_environment,
+                                vec![
+                                    OsString::from("/bin/bash"),
+                                    OsString::from("-c"),
+                                    OsString::from(job_command),
+                                ],
+                                policy_request,
+                                Some(&working_directory),
+                                SandboxProcessIo::closed(&managed_environment),
+                                &worker_cancellation,
+                                SandboxProcessLimits::without_timeout(),
+                            );
+                            let _ = completion.complete(background_bash_job_outcome(outcome));
+                        })
+                        .map_err(|error| error.to_string())?;
+                    Ok(JobControl::new(move |_| cancellation.cancel()))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(serde_json::json!({
+            "kind": "background",
+            "jobId": job_id.as_str(),
+        }));
+    }
     let managed_environment = [
         ("DSH_SHELL", "1"),
         ("DSH_SESSION_ID", run.session_id().as_str()),
@@ -680,10 +1080,42 @@ fn execute_sandboxed_bash(
     Ok(sandboxed_bash_result(&outcome))
 }
 
+fn background_bash_job_outcome(
+    outcome: Result<SandboxedProcessOutcome, SandboxProcessError>,
+) -> JobOutcome {
+    match outcome {
+        Ok(outcome) => {
+            let output = sandboxed_bash_output_for_outcome(&outcome);
+            if outcome.termination == SandboxProcessTermination::Cancelled
+                || outcome.signal.is_some()
+            {
+                let detail = outcome.signal.as_deref().map_or_else(
+                    || "killed before exit".to_string(),
+                    |signal| format!("signal: {signal}"),
+                );
+                JobOutcome::new(JobTerminalStatus::Killed)
+                    .with_detail(detail)
+                    .with_output(output)
+            } else {
+                JobOutcome::new(JobTerminalStatus::Completed)
+                    .with_detail(format!("exit code: {}", outcome.exit_code.unwrap_or(0)))
+                    .with_output(output)
+            }
+        }
+        Err(SandboxProcessError::CancelledBeforeSpawn) => {
+            JobOutcome::new(JobTerminalStatus::Killed).with_detail("killed before spawn")
+        }
+        Err(error) => JobOutcome::new(JobTerminalStatus::Failed)
+            .with_detail("process infrastructure failure")
+            .with_output(sandbox_process_error_message(&error)),
+    }
+}
+
 struct SandboxedBashArguments {
     command: String,
     workdir: Option<String>,
     timeout: ResolvedBashTimeout,
+    run_in_background: bool,
     sandbox_permissions: Option<SandboxMode>,
     justification: Option<String>,
 }
@@ -699,11 +1131,12 @@ fn sandboxed_bash_arguments(
             && key != "description"
             && key != "workdir"
             && key != "timeoutMs"
+            && key != "run_in_background"
             && key != "sandbox_permissions"
             && key != "justification"
     }) {
         return Err(
-            "bash arguments may contain only command, description, workdir, timeoutMs, sandbox_permissions, and justification"
+            "bash arguments may contain only command, description, workdir, timeoutMs, run_in_background, sandbox_permissions, and justification"
                 .into(),
         );
     }
@@ -723,6 +1156,11 @@ fn sandboxed_bash_arguments(
             resolve_bash_timeout(Some(value))?
         }
         Some(_) => return Err("bash argument timeoutMs must be a number".into()),
+    };
+    let run_in_background = match object.get("run_in_background") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => return Err("bash argument run_in_background must be a boolean".into()),
     };
     let sandbox_permissions = match object.get("sandbox_permissions") {
         None => None,
@@ -750,6 +1188,7 @@ fn sandboxed_bash_arguments(
         command,
         workdir,
         timeout,
+        run_in_background,
         sandbox_permissions,
         justification,
     })
@@ -851,6 +1290,23 @@ fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value
         result["stderrSpillPath"] = path.to_string_lossy().into_owned().into();
     }
     result
+}
+
+fn sandboxed_bash_output_for_outcome(outcome: &SandboxedProcessOutcome) -> String {
+    let classification = match outcome.classification.as_ref() {
+        None => "unconfined",
+        Some(SandboxProcessClassification::Success) => "success",
+        Some(SandboxProcessClassification::Signalled) => "signalled",
+        Some(SandboxProcessClassification::RunnerFailure { .. }) => "runner-failure",
+        Some(SandboxProcessClassification::Denied) => "denied",
+        Some(SandboxProcessClassification::CommandFailure) => "command-failure",
+    };
+    let enforcement = match outcome.enforcement {
+        None => "unconfined",
+        Some(SandboxEnforcement::Full) => "full",
+        Some(SandboxEnforcement::Partial) => "partial",
+    };
+    sandboxed_bash_output(outcome, classification, enforcement)
 }
 
 fn sandboxed_bash_output(
@@ -967,7 +1423,7 @@ fn spawn_error(
 fn wait_for_process(
     child: &mut GroupChild,
     cancellation: &LifecycleCancellation,
-    deadline: Instant,
+    deadline: Option<Instant>,
     poll_interval: Duration,
     termination_grace: Duration,
 ) -> Result<(ExitStatus, SandboxProcessTermination), SandboxProcessError> {
@@ -980,7 +1436,7 @@ fn wait_for_process(
                 poll_interval,
             );
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return terminate_group(
                 child,
                 SandboxProcessTermination::TimedOut,
@@ -1411,6 +1867,7 @@ mod tests {
         let properties = schema.parameters["properties"].as_object().unwrap();
         assert_eq!(properties["workdir"]["type"], "string");
         assert_eq!(properties["timeoutMs"]["type"], "number");
+        assert_eq!(properties["run_in_background"]["type"], "boolean");
         assert!(!properties.contains_key("stdin"));
         assert_eq!(
             schema.parameters["required"],
@@ -1426,6 +1883,16 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.workdir.as_deref(), Some("nested"));
         assert_eq!(parsed.timeout.milliseconds.to_bits(), 1234.5_f64.to_bits());
+        assert!(!parsed.run_in_background);
+        assert!(
+            sandboxed_bash_arguments(&serde_json::json!({
+                "command": "sleep 1",
+                "description": "Start one background command",
+                "run_in_background": true
+            }))
+            .unwrap()
+            .run_in_background
+        );
         assert!(
             sandboxed_bash_arguments(&serde_json::json!({
                 "command": "pwd",
@@ -1445,6 +1912,16 @@ mod tests {
             .err()
             .unwrap()
             .contains("timeoutMs must be a number")
+        );
+        assert!(
+            sandboxed_bash_arguments(&serde_json::json!({
+                "command": "sleep 1",
+                "description": "Reject a non-boolean background flag",
+                "run_in_background": "yes"
+            }))
+            .err()
+            .unwrap()
+            .contains("run_in_background must be a boolean")
         );
         assert!(
             sandboxed_bash_arguments(&serde_json::json!({
@@ -2104,7 +2581,7 @@ mod tests {
             SandboxPolicyRequest::default(),
             &cancellation,
             SandboxProcessLimits {
-                timeout: Duration::from_secs(5),
+                timeout: Some(Duration::from_secs(5)),
                 timeout_ms: 5_000.0,
                 output_bytes: 64_000,
                 output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,
@@ -2179,7 +2656,7 @@ mod tests {
             SandboxPolicyRequest::default(),
             &cancellation,
             SandboxProcessLimits {
-                timeout: Duration::from_secs(5),
+                timeout: Some(Duration::from_secs(5)),
                 timeout_ms: 5_000.0,
                 output_bytes: 64_000,
                 output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,

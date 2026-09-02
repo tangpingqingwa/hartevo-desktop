@@ -23,6 +23,7 @@ use crate::context::{Context, CordisError, EventReentry, keys};
 use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker, ListenerHandle};
 use crate::fiber::LifecycleCancellation;
+use crate::jobs::JobsSurface;
 use crate::sandbox::SandboxPolicyService;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
@@ -48,6 +49,7 @@ pub const MAPPED_KEYS: &[&str] = &[
     keys::LLM,
     keys::SESSIONS,
     keys::AGENTS,
+    keys::JOBS,
     keys::DOMAIN,
     keys::EFFECT_BROKER,
     keys::RUNTIME,
@@ -382,6 +384,7 @@ impl ToolCall {
 /// malformed JSON remains its original string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionInput {
+    agent: AgentRef,
     session_id: SessionId,
     call_seq: u64,
     turn: u64,
@@ -439,6 +442,12 @@ impl ToolRunContext {
     #[must_use]
     pub const fn cancellation(&self) -> &LifecycleCancellation {
         &self.cancellation
+    }
+
+    /// Exact live Agent lifecycle that owns this tool call.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        self.input.agent()
     }
 
     #[must_use]
@@ -533,8 +542,13 @@ impl ToolRunContext {
 }
 
 impl ToolExecutionInput {
-    pub(crate) fn from_session_call(session_id: &SessionId, call: &SessionToolCall) -> Self {
+    pub(crate) fn from_session_call(
+        agent: &AgentRef,
+        session_id: &SessionId,
+        call: &SessionToolCall,
+    ) -> Self {
         Self {
+            agent: agent.clone(),
             session_id: session_id.clone(),
             call_seq: call.seq,
             turn: call.turn,
@@ -544,6 +558,12 @@ impl ToolExecutionInput {
             raw_arguments: call.arguments.clone(),
             arguments: parse_tool_arguments(&call.arguments),
         }
+    }
+
+    /// Exact live Agent lifecycle that owns this tool call.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentRef {
+        &self.agent
     }
 
     /// Exact durable Session that owns this tool call.
@@ -3221,6 +3241,7 @@ pub(crate) fn map_surfaces(
         SessionStore::with_event_dispatcher(session_dispatcher),
     )?;
     ctx.provide(keys::AGENTS, AgentsSurface::new())?;
+    ctx.provide(keys::JOBS, JobsSurface::default())?;
     ctx.provide_reserved(authority, keys::DOMAIN, surfaces.domain)?;
     ctx.provide_reserved(authority, keys::EFFECT_BROKER, surfaces.effect_broker)?;
     ctx.provide_reserved(authority, keys::RUNTIME, surfaces.runtime)?;
