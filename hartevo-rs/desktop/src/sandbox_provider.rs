@@ -6,6 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
+#[cfg(unix)]
+use command_group::{Signal, UnixChildExt as _};
 #[cfg(test)]
 use hartevo_cordis::Context;
 use hartevo_cordis::{
@@ -27,6 +29,7 @@ const SANDBOX_PROCESS_MAX_TIMEOUT_MS: f64 = 600_000.0;
 const SANDBOX_PROCESS_OUTPUT_BYTES: usize = 64_000;
 const SANDBOX_PROCESS_OUTPUT_SPILL_BYTES: usize = 64 * 1024 * 1024;
 const SANDBOX_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SANDBOX_PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(3);
 const BASH_ENVIRONMENT_OVERRIDES: [(&str, &str); 4] = [
     ("NO_COLOR", "1"),
     ("TERM", "dumb"),
@@ -155,6 +158,7 @@ struct SandboxProcessLimits {
     output_bytes: usize,
     output_spill_bytes: usize,
     poll_interval: Duration,
+    termination_grace: Duration,
 }
 
 impl SandboxProcessLimits {
@@ -175,6 +179,7 @@ impl Default for SandboxProcessLimits {
             output_bytes: SANDBOX_PROCESS_OUTPUT_BYTES,
             output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,
             poll_interval: SANDBOX_PROCESS_POLL_INTERVAL,
+            termination_grace: SANDBOX_PROCESS_TERMINATION_GRACE,
         }
     }
 }
@@ -352,7 +357,13 @@ fn run_sandboxed_process_in_environment_with_limits(
     let deadline = Instant::now()
         .checked_add(limits.timeout)
         .unwrap_or_else(Instant::now);
-    let wait = wait_for_process(&mut child, cancellation, deadline, limits.poll_interval);
+    let wait = wait_for_process(
+        &mut child,
+        cancellation,
+        deadline,
+        limits.poll_interval,
+        limits.termination_grace,
+    );
     let stdout = join_output_collector(stdout_reader);
     let stderr = join_output_collector(stderr_reader);
     let (status, termination) = wait?;
@@ -849,13 +860,24 @@ fn wait_for_process(
     cancellation: &LifecycleCancellation,
     deadline: Instant,
     poll_interval: Duration,
+    termination_grace: Duration,
 ) -> Result<(ExitStatus, SandboxProcessTermination), SandboxProcessError> {
     loop {
         if cancellation.is_cancelled() {
-            return terminate_group(child, SandboxProcessTermination::Cancelled);
+            return terminate_group(
+                child,
+                SandboxProcessTermination::Cancelled,
+                termination_grace,
+                poll_interval,
+            );
         }
         if Instant::now() >= deadline {
-            return terminate_group(child, SandboxProcessTermination::TimedOut);
+            return terminate_group(
+                child,
+                SandboxProcessTermination::TimedOut,
+                termination_grace,
+                poll_interval,
+            );
         }
         match child.try_wait() {
             Ok(Some(status)) => return Ok((status, SandboxProcessTermination::Completed)),
@@ -871,7 +893,35 @@ fn wait_for_process(
 fn terminate_group(
     child: &mut GroupChild,
     termination: SandboxProcessTermination,
+    grace: Duration,
+    poll_interval: Duration,
 ) -> Result<(ExitStatus, SandboxProcessTermination), SandboxProcessError> {
+    #[cfg(unix)]
+    if child.signal(Signal::SIGTERM).is_ok() {
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .unwrap_or_else(Instant::now);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok((status, termination)),
+                Ok(None) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+                }
+                Err(source) => {
+                    terminate_group_best_effort(child);
+                    return Err(SandboxProcessError::Lifecycle { source });
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = (grace, poll_interval);
+
     let _ = child.kill();
     child
         .wait()
@@ -1098,7 +1148,7 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[cfg(unix)]
     use hartevo_cordis::SANDBOX_UNAVAILABLE;
@@ -1566,11 +1616,15 @@ mod tests {
             workspace.path(),
             NeverProvider,
         );
-        let timeout = resolve_bash_timeout(Some(50.0)).unwrap();
+        let timeout = resolve_bash_timeout(Some(100.0)).unwrap();
 
         let outcome = run_sandboxed_process_with_limits(
             &ctx,
-            argv(&["/bin/sh", "-c", "sleep 30"]),
+            argv(&[
+                "/bin/sh",
+                "-c",
+                "trap 'printf term-received; exit 0' TERM; while :; do sleep 30; done",
+            ]),
             SandboxPolicyRequest::default(),
             &LifecycleCancellation::default(),
             SandboxProcessLimits::with_timeout(timeout),
@@ -1578,14 +1632,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.termination, SandboxProcessTermination::TimedOut);
-        assert_eq!(outcome.timeout_ms.to_bits(), 50.0_f64.to_bits());
+        assert_eq!(outcome.timeout_ms.to_bits(), 100.0_f64.to_bits());
+        assert_eq!(outcome.stdout.bytes, b"term-received");
         let result = sandboxed_bash_result(&outcome);
-        assert_eq!(result["timeoutMs"], 50.0);
+        assert_eq!(result["timeoutMs"], 100.0);
         assert!(
             result["output"]
                 .as_str()
                 .unwrap()
-                .contains("[timed out after 50ms]")
+                .contains("[timed out after 100ms]")
         );
     }
 
@@ -1804,6 +1859,7 @@ mod tests {
                 output_bytes: 64_000,
                 output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,
                 poll_interval: Duration::from_millis(5),
+                termination_grace: Duration::from_millis(100),
             },
         )
         .unwrap();
@@ -1826,6 +1882,68 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_escalates_a_term_resistant_process_group_after_the_bounded_grace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ready = workspace.path().join("n98-ready");
+        let term_seen = workspace.path().join("n98-term-seen");
+        let ctx = fixed_context(
+            SandboxMode::ReadOnly,
+            workspace.path(),
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("trap ': > \"$1\"' TERM; : > \"$2\"; while :; do sleep 30; done"),
+                OsString::from("n98-grace-probe"),
+                term_seen.clone().into_os_string(),
+                ready.clone().into_os_string(),
+            ],
+            SandboxEnforcement::Full,
+            &[],
+            &[],
+        );
+        let cancellation = LifecycleCancellation::default();
+        let cancelling = cancellation.clone();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..400 {
+                if ready.exists() {
+                    let cancelled_at = Instant::now();
+                    cancelling.cancel();
+                    cancelled_tx.send(cancelled_at).unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("process did not arm its SIGTERM handler");
+        });
+        let grace = Duration::from_millis(150);
+
+        let outcome = run_sandboxed_process_with_limits(
+            &ctx,
+            argv(&["unreachable"]),
+            SandboxPolicyRequest::default(),
+            &cancellation,
+            SandboxProcessLimits {
+                timeout: Duration::from_secs(5),
+                timeout_ms: 5_000.0,
+                output_bytes: 64_000,
+                output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,
+                poll_interval: Duration::from_millis(5),
+                termination_grace: grace,
+            },
+        )
+        .unwrap();
+        canceller.join().unwrap();
+        let cancelled_at = cancelled_rx.recv().unwrap();
+
+        assert_eq!(outcome.termination, SandboxProcessTermination::Cancelled);
+        assert_eq!(outcome.exit_code, None);
+        assert!(term_seen.exists());
+        assert!(cancelled_at.elapsed() >= grace);
     }
 
     #[cfg(target_os = "macos")]
