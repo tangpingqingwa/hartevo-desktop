@@ -344,10 +344,6 @@ const DESKTOP_COMPACT_COMMAND_USAGE: &str = "Usage: /compact (no arguments)";
 
 /// One Desktop-owned human command result. Command text is presentation-only;
 /// a successful compaction separately names its durable summary event.
-#[allow(
-    dead_code,
-    reason = "consumed by the following Dioxus composer and production summarizer slice"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DesktopHumanCommandResult {
     Success {
@@ -361,10 +357,6 @@ pub(crate) enum DesktopHumanCommandResult {
 
 /// Whether an input belonged to the Desktop human-command surface. Unknown
 /// slash forms and ordinary messages remain available to the normal composer.
-#[allow(
-    dead_code,
-    reason = "consumed by the following Dioxus composer and production summarizer slice"
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DesktopHumanCommandDispatch {
     NotCommand,
@@ -379,6 +371,12 @@ fn compact_command_raw_input(line: &str) -> Option<&str> {
             .first()
             .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r')))
     .then_some(raw_input)
+}
+
+/// Whether the composer must offer this input to the human-command handler.
+/// The handler remains the sole owner of usage validation and execution.
+pub(crate) fn is_desktop_human_command(line: &str) -> bool {
+    compact_command_raw_input(line).is_some()
 }
 
 fn manual_compaction_failure_result(code: ManualCompactionErrorCode) -> DesktopHumanCommandResult {
@@ -878,10 +876,6 @@ impl DesktopCordisCoordinator {
     /// Inputs outside this exact lowercase command fall through untouched.
     /// Expected manual-compaction failures are stable human results; mounting,
     /// routing, and Session failures remain typed coordinator errors.
-    #[allow(
-        dead_code,
-        reason = "consumed by the following Dioxus composer and production summarizer slice"
-    )]
     pub(crate) async fn dispatch_human_command<A>(
         &mut self,
         session_id: &str,
@@ -2690,8 +2684,8 @@ mod tests {
         bind_live_domain_kernel_scope, decode_event, dispatch_live_domain_command,
         dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
         dispatch_live_effect_verification, dispatch_live_runtime, encode_event,
-        manual_compaction_failure_result, mount_cordis_host, openinterpreter_runtime_plugin,
-        runtime_open_turn,
+        is_desktop_human_command, manual_compaction_failure_result, mount_cordis_host,
+        openinterpreter_runtime_plugin, runtime_open_turn,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -3111,6 +3105,9 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_compact_command_rejects_arguments_and_preserves_fallthrough() {
+        for line in ["/compact", "/compact ", "/compact now"] {
+            assert!(is_desktop_human_command(line));
+        }
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap();
@@ -3137,6 +3134,7 @@ mod tests {
         assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
 
         for line in ["ordinary message", "/compactly", "/Compact", "/compact/"] {
+            assert!(!is_desktop_human_command(line));
             let (adapter, probe) = desktop_turn_adapter(Arc::clone(&flushes));
             let result = live
                 .dispatch_human_command(
