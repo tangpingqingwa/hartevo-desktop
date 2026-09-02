@@ -1818,6 +1818,8 @@ pub(crate) fn mount_cordis_host(
 ) -> Result<DesktopCordisCoordinator, CordisError> {
     let mut host = CordisHost::boot(openinterpreter_runtime_plugin(runtime))?;
     host_is_cordis_loop(&host)?;
+    #[cfg(target_os = "macos")]
+    crate::sandbox_provider::mount_macos_sandbox_provider(&mut host)?;
     let session_persistence = DesktopSessionPersistence::default();
     session_persistence.mount(&mut host)?;
     DesktopCordisCoordinator::new(host, session_persistence)
