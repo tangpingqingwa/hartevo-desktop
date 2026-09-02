@@ -66,6 +66,7 @@ impl std::fmt::Debug for SandboxProcessOutput {
 
 pub(crate) struct SandboxedProcessOutcome {
     pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<String>,
     pub(crate) termination: SandboxProcessTermination,
     pub(crate) timeout_ms: f64,
     pub(crate) mode: SandboxMode,
@@ -80,6 +81,7 @@ impl std::fmt::Debug for SandboxedProcessOutcome {
         formatter
             .debug_struct("SandboxedProcessOutcome")
             .field("exit_code", &self.exit_code)
+            .field("signal", &self.signal)
             .field("termination", &self.termination)
             .field("timeout_ms", &self.timeout_ms)
             .field("mode", &self.mode)
@@ -721,6 +723,7 @@ fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value
     let mut result = serde_json::json!({
         "output": output,
         "exitCode": outcome.exit_code,
+        "signal": outcome.signal.as_deref(),
         "termination": termination,
         "timeoutMs": outcome.timeout_ms,
         "classification": classification,
@@ -774,14 +777,10 @@ fn sandboxed_bash_output(
         "[sandbox: {}, {enforcement} enforcement]",
         outcome.mode
     ));
-    match outcome.exit_code {
-        Some(exit_code) if exit_code != 0 => {
-            sections.push(format!("[exit code: {exit_code}]"));
-        }
-        None if outcome.termination == SandboxProcessTermination::Completed => {
-            sections.push("[terminated by signal]".into());
-        }
-        Some(_) | None => {}
+    if let Some(signal) = outcome.signal.as_deref() {
+        sections.push(format!("[killed by signal: {signal}]"));
+    } else if let Some(exit_code) = outcome.exit_code.filter(|code| *code != 0) {
+        sections.push(format!("[exit code: {exit_code}]"));
     }
     sections.join("\n")
 }
@@ -1073,6 +1072,7 @@ fn settle_sandboxed_process(
     stdout: SandboxProcessOutput,
     stderr: SandboxProcessOutput,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
+    let signal = process_signal(status);
     let classification = match (termination, plan.confined_command()) {
         (SandboxProcessTermination::Completed, Some(command)) => {
             let stderr_text = String::from_utf8_lossy(&stderr.bytes);
@@ -1094,6 +1094,7 @@ fn settle_sandboxed_process(
     };
     Ok(SandboxedProcessOutcome {
         exit_code: status.code(),
+        signal,
         termination,
         timeout_ms,
         mode: plan.mode(),
@@ -1102,6 +1103,22 @@ fn settle_sandboxed_process(
         stdout,
         stderr,
     })
+}
+
+fn process_signal(status: ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        status.signal().map(|raw| {
+            Signal::try_from(raw).map_or_else(|_| format!("SIG{raw}"), |signal| signal.to_string())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 fn seatbelt_profile(policy: &ConfinedSandboxPolicy) -> Result<String, SandboxProviderUnavailable> {
@@ -1511,6 +1528,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.exit_code, Some(7));
+        assert_eq!(outcome.signal, None);
         assert_eq!(outcome.termination, SandboxProcessTermination::Completed);
         assert_eq!(outcome.mode, SandboxMode::ReadOnly);
         assert_eq!(outcome.enforcement, Some(SandboxEnforcement::Partial));
@@ -1540,10 +1558,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.signal, None);
         assert_eq!(outcome.mode, SandboxMode::DangerFullAccess);
         assert_eq!(outcome.enforcement, None);
         assert_eq!(outcome.classification, None);
         assert_eq!(outcome.stdout.bytes, b"exact argument");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_exit_returns_and_renders_the_exact_portable_signal_name() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = fixed_context(
+            SandboxMode::ReadOnly,
+            workspace.path(),
+            argv(&["/bin/sh", "-c", "kill -TERM $$"]),
+            SandboxEnforcement::Full,
+            &[],
+            &[],
+        );
+
+        let outcome = run_sandboxed_process(
+            &ctx,
+            argv(&["unreachable"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.signal.as_deref(), Some("SIGTERM"));
+        assert_eq!(
+            outcome.classification,
+            Some(SandboxProcessClassification::Signalled)
+        );
+        let result = sandboxed_bash_result(&outcome);
+        assert_eq!(result["signal"], "SIGTERM");
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("[killed by signal: SIGTERM]")
+        );
     }
 
     #[cfg(unix)]
@@ -1633,9 +1689,11 @@ mod tests {
 
         assert_eq!(outcome.termination, SandboxProcessTermination::TimedOut);
         assert_eq!(outcome.timeout_ms.to_bits(), 100.0_f64.to_bits());
+        assert_eq!(outcome.signal, None);
         assert_eq!(outcome.stdout.bytes, b"term-received");
         let result = sandboxed_bash_result(&outcome);
         assert_eq!(result["timeoutMs"], 100.0);
+        assert!(result["signal"].is_null());
         assert!(
             result["output"]
                 .as_str()
@@ -1866,6 +1924,7 @@ mod tests {
         canceller.join().unwrap();
 
         assert_eq!(outcome.termination, SandboxProcessTermination::Cancelled);
+        assert_eq!(outcome.signal.as_deref(), Some("SIGTERM"));
         assert_eq!(
             outcome.classification,
             Some(SandboxProcessClassification::Signalled)
@@ -1942,6 +2001,7 @@ mod tests {
 
         assert_eq!(outcome.termination, SandboxProcessTermination::Cancelled);
         assert_eq!(outcome.exit_code, None);
+        assert_eq!(outcome.signal.as_deref(), Some("SIGKILL"));
         assert!(term_seen.exists());
         assert!(cancelled_at.elapsed() >= grace);
     }
