@@ -3,6 +3,9 @@
 //! symbolic AgentLoop is not Desktop Runtime authority; OpenInterpreter
 //! remains an optional adapter.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 
 use crate::agent::{
@@ -14,11 +17,12 @@ use crate::authority::{
     EffectExecutionBinding, EffectExecutionLease, EffectExecutionPermit,
     EffectReconciliationBinding, EffectReconciliationLease, EffectReconciliationPermit,
     EffectVerificationBinding, EffectVerificationLease, EffectVerificationPermit,
-    RuntimeDispatchCompletion, RuntimeDispatchLease, RuntimeDispatchNotifications,
-    RuntimeDispatchPermit, RuntimeStatusCompletion,
+    RuntimeAgentRetention, RuntimeDispatchCompletion, RuntimeDispatchLease,
+    RuntimeDispatchNotifications, RuntimeDispatchPermit, RuntimeStatusCompletion,
 };
 use crate::compaction_automation::CompactionAutomation;
 use crate::context::{Context, CordisError, TeardownPermit, TeardownTransaction, keys};
+use crate::event::PreparedEmit;
 use crate::fiber::LifecycleCancellation;
 use crate::invariants::{InvariantGate, OPENINTERPRETER, apply_effect, enforce_runtime_invariants};
 use crate::kernel::{
@@ -30,9 +34,10 @@ use crate::loader::{
 use crate::service::Service;
 use crate::session::{SessionCallConfig, SessionId, SessionStore};
 use crate::surface::{
-    AgentRef, AgentStatus, AgentStatusChange, AgentsSurface, DesktopSurface, DomainSurface,
-    EffectBrokerSurface, HartevoSurfaces, LlmSurface, RuntimeSurface, SurfaceOwner,
-    SystemPromptSurface, ToolsSurface, events, map_surfaces, rebind_hartevo_domain,
+    AgentPublicationCommit, AgentRef, AgentStatus, AgentStatusChange, AgentsSurface,
+    DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces, LlmSurface,
+    RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolsSurface, events, map_surfaces,
+    rebind_hartevo_domain,
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
@@ -54,6 +59,7 @@ pub struct CordisHost {
     active_effect_verification: Option<ActiveEffectVerification>,
     next_effect_verification_serial: u64,
     active_runtime: Option<ActiveRuntimeDispatch>,
+    runtime_agents: HashMap<RuntimeAgentKey, RetainedRuntimeAgent>,
     deferred_runtime_status: Vec<RuntimeStatusCompletion>,
     next_runtime_serial: u64,
 }
@@ -98,6 +104,58 @@ struct ActiveRuntimeDispatch {
     lease: std::sync::Arc<RuntimeDispatchLease>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RuntimeAgentKey {
+    tenant: String,
+    project: String,
+    mission: String,
+}
+
+impl From<&AuthorityScope> for RuntimeAgentKey {
+    fn from(scope: &AuthorityScope) -> Self {
+        Self {
+            tenant: scope.tenant_id().to_owned(),
+            project: scope.project_id().to_owned(),
+            mission: scope.mission_id().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RetainedRuntimeAgent {
+    agent: AgentRef,
+    retention: Arc<RuntimeAgentRetention>,
+}
+
+struct RuntimeAgentDisposal {
+    publication: Option<AgentPublicationCommit>,
+    notification: Option<PreparedEmit>,
+}
+
+impl RuntimeAgentDisposal {
+    fn announce(mut self) {
+        drop(self.publication.take());
+        if let Some(notification) = self.notification.take() {
+            let _ = notification.dispatch_contained();
+        }
+    }
+}
+
+fn prepare_runtime_status_notifications(
+    context: &Context,
+    agent: &AgentRef,
+) -> Result<(PreparedEmit, PreparedEmit), CordisError> {
+    let running = context.prepare_emit(
+        events::AGENT_STATUS,
+        AgentStatusChange::new(agent.clone(), AgentStatus::Running),
+    )?;
+    let idle = context.prepare_emit(
+        events::AGENT_STATUS,
+        AgentStatusChange::new(agent.clone(), AgentStatus::Idle),
+    )?;
+    Ok((running, idle))
+}
+
 /// Owned second half of one Host teardown transaction.
 ///
 /// The Host is already inert when this value is returned. Calling
@@ -108,6 +166,7 @@ pub struct CordisHostTeardown {
     context: Option<Context>,
     permit: Option<TeardownPermit>,
     statuses: Vec<RuntimeStatusCompletion>,
+    agents: Vec<RuntimeAgentDisposal>,
 }
 
 impl CordisHostTeardown {
@@ -116,6 +175,7 @@ impl CordisHostTeardown {
             context: None,
             permit: None,
             statuses: Vec::new(),
+            agents: Vec::new(),
         }
     }
 
@@ -123,11 +183,13 @@ impl CordisHostTeardown {
         context: Context,
         permit: TeardownPermit,
         statuses: Vec<RuntimeStatusCompletion>,
+        agents: Vec<RuntimeAgentDisposal>,
     ) -> Self {
         Self {
             context: Some(context),
             permit: Some(permit),
             statuses,
+            agents,
         }
     }
 
@@ -137,10 +199,15 @@ impl CordisHostTeardown {
         for status in std::mem::take(&mut self.statuses) {
             status.announce();
         }
+        for agent in std::mem::take(&mut self.agents) {
+            agent.announce();
+        }
         self.complete();
     }
 
     fn complete(&mut self) {
+        self.statuses.clear();
+        self.agents.clear();
         let (Some(mut context), Some(permit)) = (self.context.take(), self.permit.take()) else {
             return;
         };
@@ -160,6 +227,7 @@ impl std::fmt::Debug for CordisHostTeardown {
             .debug_struct("CordisHostTeardown")
             .field("acquired", &self.context.is_some())
             .field("pending_statuses", &self.statuses.len())
+            .field("pending_agents", &self.agents.len())
             .finish_non_exhaustive()
     }
 }
@@ -196,6 +264,7 @@ impl std::fmt::Debug for CordisHost {
                 &self.next_effect_verification_serial,
             )
             .field("active_runtime", &self.active_runtime)
+            .field("runtime_agents", &self.runtime_agents.len())
             .field(
                 "deferred_runtime_status",
                 &self.deferred_runtime_status.len(),
@@ -229,6 +298,7 @@ impl CordisHost {
             active_effect_verification: None,
             next_effect_verification_serial: 0,
             active_runtime: None,
+            runtime_agents: HashMap::new(),
             deferred_runtime_status: Vec::new(),
             next_runtime_serial: 0,
         })
@@ -278,6 +348,7 @@ impl CordisHost {
                 active_effect_verification: None,
                 next_effect_verification_serial: 0,
                 active_runtime: None,
+                runtime_agents: HashMap::new(),
                 deferred_runtime_status: Vec::new(),
                 next_runtime_serial: 0,
             },
@@ -354,35 +425,54 @@ impl CordisHost {
             .next_runtime_serial
             .checked_add(1)
             .ok_or(CordisError::RuntimeDispatchSerialOverflow)?;
-        let agent = AgentRef::new(format!(
-            "{}:{}:{}:{}",
-            scope.project_id(),
-            scope.mission_id(),
-            runtime.generation(),
-            serial
-        ));
-        let started = self
-            .ctx
-            .prepare_emit(events::AGENT_CREATED, agent.clone())?;
-        let running_status = self.ctx.prepare_emit(
-            events::AGENT_STATUS,
-            AgentStatusChange::new(agent.clone(), AgentStatus::Running),
-        )?;
-        let idle_status = self.ctx.prepare_emit(
-            events::AGENT_STATUS,
-            AgentStatusChange::new(agent.clone(), AgentStatus::Idle),
-        )?;
-        let disposed = self
-            .ctx
-            .prepare_emit(events::AGENT_DISPOSED, agent.clone())?;
-        let unpublished = agents.prepare_publication(agent.clone());
-        let notifications =
-            RuntimeDispatchNotifications::new(started, running_status, idle_status, disposed);
+        let key = RuntimeAgentKey::from(scope);
+        let retained = self.runtime_agents.get(&key);
+        let agent = retained.map_or_else(
+            || {
+                AgentRef::new(format!(
+                    "{}:{}:{}:{}",
+                    scope.project_id(),
+                    scope.mission_id(),
+                    runtime.generation(),
+                    serial
+                ))
+            },
+            |retained| retained.agent.clone(),
+        );
+        let (running_status, idle_status) =
+            prepare_runtime_status_notifications(&self.ctx, &agent)?;
+        let (retention, retained_publication) = retained.map_or_else(
+            || (Arc::new(RuntimeAgentRetention::default()), None),
+            |retained| (Arc::clone(&retained.retention), retained.retention.take()),
+        );
+        let (started, unpublished) = if retained_publication.is_some() {
+            (None, None)
+        } else {
+            (
+                Some(
+                    self.ctx
+                        .prepare_emit(events::AGENT_CREATED, agent.clone())?,
+                ),
+                Some(agents.prepare_publication(agent.clone())),
+            )
+        };
+        if retained.is_none() {
+            self.runtime_agents.insert(
+                key,
+                RetainedRuntimeAgent {
+                    agent: agent.clone(),
+                    retention: Arc::clone(&retention),
+                },
+            );
+        }
+        let notifications = RuntimeDispatchNotifications::new(started, running_status, idle_status);
         let (permit, lease) = RuntimeDispatchPermit::issue(
             serial,
             scope.clone(),
             agent.clone(),
             unpublished,
+            retained_publication,
+            retention,
             notifications,
         );
         self.next_runtime_serial = serial;
@@ -441,7 +531,7 @@ impl CordisHost {
         .await
     }
 
-    /// Settle an issued Runtime permit and return an out-of-lock lifecycle
+    /// Settle an issued Runtime permit and return its out-of-lock Idle
     /// notification. The caller must release its host lock before announcing.
     pub fn finish_runtime(
         &mut self,
@@ -938,6 +1028,18 @@ impl CordisHost {
     /// Context. Externally synchronized callers should release their Host lock
     /// before calling [`CordisHostTeardown::announce`].
     pub fn teardown(&mut self) -> CordisHostTeardown {
+        let mut disposal_notifications = self
+            .runtime_agents
+            .iter()
+            .map(|(key, retained)| {
+                (
+                    key.clone(),
+                    self.ctx
+                        .prepare_emit(events::AGENT_DISPOSED, retained.agent.clone())
+                        .ok(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let TeardownTransaction::Acquired(permit) = self.ctx.try_begin_teardown() else {
             return CordisHostTeardown::busy();
         };
@@ -960,9 +1062,22 @@ impl CordisHost {
         {
             statuses.push(status);
         }
+        let agents = self
+            .runtime_agents
+            .drain()
+            .filter_map(|(key, retained)| {
+                retained
+                    .retention
+                    .take()
+                    .map(|publication| RuntimeAgentDisposal {
+                        publication: Some(publication),
+                        notification: disposal_notifications.remove(&key).flatten(),
+                    })
+            })
+            .collect();
         self.bound_scope = None;
         let context = std::mem::take(&mut self.ctx);
-        CordisHostTeardown::new(context, permit, statuses)
+        CordisHostTeardown::new(context, permit, statuses, agents)
     }
 
     /// Register a Runtime-start observer. Notifications prepared while the
@@ -976,8 +1091,10 @@ impl CordisHost {
             .map(|_| ())
     }
 
-    /// Register a Runtime-finished observer. The completion notification is
-    /// returned from [`Self::finish_runtime`] for out-of-lock dispatch.
+    /// Register an Agent-disposed observer.
+    ///
+    /// Runtime completion leaves the Mission Agent live and Idle. This
+    /// observer runs only when the owning Host is actually torn down.
     pub fn on_runtime_finished<F>(&mut self, observer: F) -> Result<(), CordisError>
     where
         F: Fn(&AgentRef) + Send + Sync + 'static,

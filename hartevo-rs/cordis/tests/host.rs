@@ -666,18 +666,22 @@ fn runtime_dispatch_requires_and_preserves_exact_bound_scope() {
     );
     assert!(agents.list().is_empty(), "authorization stays unpublished");
     permit.announce_started().unwrap();
-    assert_eq!(agents.list().len(), 1);
+    let agent = agents.list().into_iter().next().unwrap();
     host.finish_runtime(permit).unwrap().announce().unwrap();
     assert_eq!(host.bound_scope(), Some(&scope));
     assert_eq!(host.active_runtime_scope(), None);
-    assert!(
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    assert_eq!(
         host.context()
             .agents::<AgentsSurface>()
             .unwrap()
             .list()
-            .is_empty(),
-        "the scoped runtime agent must be disposed after the adapter returns"
+            .as_slice(),
+        std::slice::from_ref(&agent),
+        "the Mission Agent remains published while its Host is alive"
     );
+    host.teardown().announce();
+    assert!(agents.list().is_empty());
 }
 
 #[test]
@@ -758,11 +762,116 @@ fn runtime_status_events_are_ordered_visible_and_non_vetoing() {
     completion.announce().unwrap();
 
     assert_eq!(agent.status(), AgentStatus::Idle);
+    assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["created", "status:running", "status:idle"]
+    );
+
+    let teardown = host.teardown();
+    assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
+    teardown.announce();
     assert!(agents.list().is_empty());
     assert_eq!(
         *order.lock().unwrap(),
         ["created", "status:running", "status:idle", "disposed"]
     );
+}
+
+#[test]
+fn same_mission_reuses_exact_agent_after_authority_revalidation() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let created = std::sync::Arc::clone(&created);
+        host.on_runtime_started(move |_| {
+            created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap();
+    }
+    let mut first = host.authorize_runtime(&scope).unwrap();
+    first.announce_started().unwrap();
+    let agent = first.agent().clone();
+    host.finish_runtime(first).unwrap().announce().unwrap();
+
+    let next_scope = runtime_scope("project-a", "mission-a", 4, 3, 'b');
+    assert_eq!(
+        host.authorize_runtime(&next_scope).unwrap_err(),
+        CordisError::AuthorityScopeMismatch,
+        "every permit still requires the currently bound exact authority"
+    );
+    host.bind_domain_kernel_scope(
+        next_scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let mut next = host.authorize_runtime(&next_scope).unwrap();
+    assert!(next.agent().is_same_lifecycle(&agent));
+    next.announce_started().unwrap();
+    host.finish_runtime(next).unwrap().announce().unwrap();
+
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
+    host.teardown().announce();
+    assert!(agents.list().is_empty());
+}
+
+#[test]
+fn distinct_missions_retain_distinct_agents_until_host_teardown() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let first_scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        first_scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let mut first = host.authorize_runtime(&first_scope).unwrap();
+    first.announce_started().unwrap();
+    let first_agent = first.agent().clone();
+    host.finish_runtime(first).unwrap().announce().unwrap();
+
+    let second_scope = runtime_scope("project-a", "mission-b", 1, 1, 'b');
+    host.bind_domain_kernel_scope(
+        second_scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let mut second = host.authorize_runtime(&second_scope).unwrap();
+    second.announce_started().unwrap();
+    assert!(!second.agent().is_same_lifecycle(&first_agent));
+    host.finish_runtime(second).unwrap().announce().unwrap();
+    assert_eq!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .len(),
+        2
+    );
+
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    host.teardown().announce();
+    assert!(agents.list().is_empty());
 }
 
 #[tokio::test]
@@ -803,6 +912,8 @@ async fn runtime_agent_status_and_when_idle_follow_the_exact_permit() {
     assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
     assert_eq!(waiter.await.unwrap(), AgentStatus::Idle);
     completion.announce().unwrap();
+    assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
+    host.teardown().announce();
     assert!(agents.list().is_empty());
 }
 
@@ -978,6 +1089,8 @@ async fn permit_bound_turn_uses_one_live_agent_and_an_explicit_session_identity(
     drop(observed);
 
     host.finish_runtime(permit).unwrap().announce().unwrap();
+    assert_eq!(agents.list().len(), 1);
+    host.teardown().announce();
     assert!(agents.list().is_empty());
 }
 
@@ -1184,7 +1297,7 @@ fn runtime_dispatch_rejects_missing_and_stale_durable_bindings() {
 }
 
 #[test]
-fn abandoned_runtime_permit_releases_agent_and_active_slot() {
+fn abandoned_runtime_permit_releases_active_slot_and_keeps_idle_agent() {
     let mut host = CordisHost::boot(false).unwrap();
     let scope = runtime_scope("project-a", "mission-a", 3, 2, 'a');
     host.bind_domain_kernel_scope(
@@ -1253,12 +1366,13 @@ fn abandoned_runtime_permit_releases_agent_and_active_slot() {
     for status in deferred {
         status.announce();
     }
-    assert!(
+    assert_eq!(
         host.context()
             .agents::<AgentsSurface>()
             .unwrap()
             .list()
-            .is_empty()
+            .as_slice(),
+        std::slice::from_ref(&abandoned)
     );
     assert_eq!(
         *statuses.lock().unwrap(),
@@ -1273,8 +1387,14 @@ fn abandoned_runtime_permit_releases_agent_and_active_slot() {
         now(),
     )
     .unwrap();
-    let permit = host.authorize_runtime(&scope).unwrap();
-    host.finish_runtime(permit).unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    assert!(permit.agent().is_same_lifecycle(&abandoned));
+    permit.announce_started().unwrap();
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+    assert_eq!(abandoned.status(), AgentStatus::Idle);
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    host.teardown().announce();
+    assert!(agents.list().is_empty());
 }
 
 #[test]

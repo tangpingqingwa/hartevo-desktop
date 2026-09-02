@@ -2957,6 +2957,10 @@ impl Drop for AgentPublicationCommit {
 }
 
 impl AgentPublicationCommit {
+    pub(crate) fn mark_running(&self) -> bool {
+        self.agent.mark_running()
+    }
+
     pub(crate) fn mark_idle(&self) -> bool {
         self.agent.mark_idle()
     }
