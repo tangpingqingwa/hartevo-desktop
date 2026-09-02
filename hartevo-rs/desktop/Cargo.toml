@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 base64 = "0.22"
 chrono.workspace = true
+command-group.workspace = true
 dioxus.workspace = true
 dioxus-icons = "0.1"
 futures-executor.workspace = true

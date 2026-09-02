@@ -1,15 +1,146 @@
 use std::ffi::OsString;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
+use command_group::{CommandGroup, GroupChild};
 use hartevo_cordis::{
-    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, CordisError, CordisHost,
-    SandboxEnforcement, SandboxProvider, SandboxProviderUnavailable, SandboxRunnerFailureRule,
-    register_sandbox_provider,
+    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, Context, CordisError, CordisHost,
+    LifecycleCancellation, SandboxEnforcement, SandboxError, SandboxExecutionPlan, SandboxMode,
+    SandboxPolicyRequest, SandboxProcessClassification, SandboxProvider,
+    SandboxProviderUnavailable, SandboxRunnerFailureRule, classify_sandbox_process,
+    prepare_sandbox_execution, register_sandbox_provider, resolve_sandbox_policy,
 };
+use thiserror::Error;
 
 const SEATBELT_EXEC: &str = "/usr/bin/sandbox-exec";
 const SEATBELT_READ_ONLY_PROFILE: &str =
     "(version 1) (allow default) (deny file-write*) (allow file-write* (literal \"/dev/null\"))";
+const SANDBOX_PROCESS_TIMEOUT: Duration = Duration::from_mins(2);
+const SANDBOX_PROCESS_OUTPUT_BYTES: usize = 64_000;
+const SANDBOX_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SandboxProcessTermination {
+    Completed,
+    TimedOut,
+    Cancelled,
+}
+
+#[allow(
+    dead_code,
+    reason = "N89 freezes bounded output for the next tool-adapter slice"
+)]
+pub(crate) struct SandboxProcessOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) byte_count: u64,
+    pub(crate) truncated: bool,
+}
+
+impl std::fmt::Debug for SandboxProcessOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxProcessOutput")
+            .field("byte_count", &self.byte_count)
+            .field("retained_byte_count", &self.bytes.len())
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "N89 freezes settled process facts for the next tool-adapter slice"
+)]
+pub(crate) struct SandboxedProcessOutcome {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) termination: SandboxProcessTermination,
+    pub(crate) mode: SandboxMode,
+    pub(crate) enforcement: Option<SandboxEnforcement>,
+    pub(crate) classification: Option<SandboxProcessClassification>,
+    pub(crate) stdout: SandboxProcessOutput,
+    pub(crate) stderr: SandboxProcessOutput,
+}
+
+impl std::fmt::Debug for SandboxedProcessOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxedProcessOutcome")
+            .field("exit_code", &self.exit_code)
+            .field("termination", &self.termination)
+            .field("mode", &self.mode)
+            .field("enforcement", &self.enforcement)
+            .field("classification", &self.classification)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum SandboxProcessError {
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
+    #[error("sandbox process was cancelled before spawn")]
+    CancelledBeforeSpawn,
+    #[error("sandbox process workspace is unusable: {detail}")]
+    UnusableWorkspace { detail: String },
+    #[error("sandbox process failed to spawn: {source}")]
+    Spawn {
+        #[source]
+        source: io::Error,
+    },
+    #[error("sandbox process lifecycle failed: {source}")]
+    Lifecycle {
+        #[source]
+        source: io::Error,
+    },
+    #[error("sandbox process output collection failed: {source}")]
+    Output {
+        #[source]
+        source: io::Error,
+    },
+    #[error("sandbox process output collector stopped unexpectedly")]
+    OutputCollectorStopped,
+}
+
+#[allow(
+    dead_code,
+    reason = "N89 freezes structured error projection for the next tool-adapter slice"
+)]
+impl SandboxProcessError {
+    #[must_use]
+    pub(crate) const fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Sandbox(error) => error.code(),
+            Self::CancelledBeforeSpawn
+            | Self::UnusableWorkspace { .. }
+            | Self::Spawn { .. }
+            | Self::Lifecycle { .. }
+            | Self::Output { .. }
+            | Self::OutputCollectorStopped => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SandboxProcessLimits {
+    timeout: Duration,
+    output_bytes: usize,
+    poll_interval: Duration,
+}
+
+impl Default for SandboxProcessLimits {
+    fn default() -> Self {
+        Self {
+            timeout: SANDBOX_PROCESS_TIMEOUT,
+            output_bytes: SANDBOX_PROCESS_OUTPUT_BYTES,
+            poll_interval: SANDBOX_PROCESS_POLL_INTERVAL,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct MacosSeatbeltSandboxProvider;
@@ -40,6 +171,297 @@ impl SandboxProvider for MacosSeatbeltSandboxProvider {
 
 pub(crate) fn mount_macos_sandbox_provider(host: &mut CordisHost) -> Result<(), CordisError> {
     register_sandbox_provider(host.context_mut(), MacosSeatbeltSandboxProvider).map(|_| ())
+}
+
+/// Run one exact argv through the currently resolved Cordis sandbox policy.
+///
+/// This is the shared Desktop process boundary for the next concrete Cordis
+/// tool adapter. It deliberately owns only foreground process mechanics; the
+/// existing Cordis tool pipeline remains the sole tool system.
+#[allow(
+    dead_code,
+    reason = "N89 freezes the process boundary before the next tool-adapter slice consumes it"
+)]
+pub(crate) fn run_sandboxed_process(
+    ctx: &Context,
+    argv: Vec<OsString>,
+    policy_request: SandboxPolicyRequest,
+    cancellation: &LifecycleCancellation,
+) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
+    run_sandboxed_process_with_limits(
+        ctx,
+        argv,
+        policy_request,
+        cancellation,
+        SandboxProcessLimits::default(),
+    )
+}
+
+fn run_sandboxed_process_with_limits(
+    ctx: &Context,
+    argv: Vec<OsString>,
+    policy_request: SandboxPolicyRequest,
+    cancellation: &LifecycleCancellation,
+    limits: SandboxProcessLimits,
+) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
+    if cancellation.is_cancelled() {
+        return Err(SandboxProcessError::CancelledBeforeSpawn);
+    }
+    let policy = resolve_sandbox_policy(ctx, policy_request)?;
+    let plan = prepare_sandbox_execution(ctx, argv, policy)?;
+    let workspace = usable_workspace(plan.workspace_root())?;
+    if cancellation.is_cancelled() {
+        return Err(SandboxProcessError::CancelledBeforeSpawn);
+    }
+
+    let (program, arguments) = plan
+        .argv()
+        .split_first()
+        .expect("Cordis validates every prepared process argv");
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .current_dir(&workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .group_spawn()
+        .map_err(|source| spawn_error(&plan, &workspace, source))?;
+    let stdout = child.inner().stdout.take().ok_or_else(|| {
+        terminate_group_best_effort(&mut child);
+        SandboxProcessError::Output {
+            source: io::Error::other("sandbox process stdout pipe is unavailable"),
+        }
+    })?;
+    let stderr = child.inner().stderr.take().ok_or_else(|| {
+        terminate_group_best_effort(&mut child);
+        SandboxProcessError::Output {
+            source: io::Error::other("sandbox process stderr pipe is unavailable"),
+        }
+    })?;
+
+    let stdout_reader =
+        spawn_output_collector("hartevo-sandbox-stdout", stdout, limits.output_bytes).map_err(
+            |source| {
+                terminate_group_best_effort(&mut child);
+                SandboxProcessError::Output { source }
+            },
+        )?;
+    let stderr_reader =
+        match spawn_output_collector("hartevo-sandbox-stderr", stderr, limits.output_bytes) {
+            Ok(reader) => reader,
+            Err(source) => {
+                terminate_group_best_effort(&mut child);
+                let _ = stdout_reader.join();
+                return Err(SandboxProcessError::Output { source });
+            }
+        };
+
+    let deadline = Instant::now()
+        .checked_add(limits.timeout)
+        .unwrap_or_else(Instant::now);
+    let wait = wait_for_process(&mut child, cancellation, deadline, limits.poll_interval);
+    let stdout = join_output_collector(stdout_reader);
+    let stderr = join_output_collector(stderr_reader);
+    let (status, termination) = wait?;
+    let stdout = stdout?;
+    let stderr = stderr?;
+    settle_sandboxed_process(&plan, status, termination, stdout, stderr)
+}
+
+fn usable_workspace(workspace: &Path) -> Result<PathBuf, SandboxProcessError> {
+    let canonical = std::fs::canonicalize(workspace).map_err(|error| {
+        SandboxProcessError::UnusableWorkspace {
+            detail: error.to_string(),
+        }
+    })?;
+    let metadata =
+        std::fs::metadata(&canonical).map_err(|error| SandboxProcessError::UnusableWorkspace {
+            detail: error.to_string(),
+        })?;
+    if !metadata.is_dir() {
+        return Err(SandboxProcessError::UnusableWorkspace {
+            detail: "workspace root is not a directory".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(SandboxProcessError::UnusableWorkspace {
+                detail: "workspace root is not searchable".to_string(),
+            });
+        }
+    }
+    Ok(canonical)
+}
+
+fn workspace_still_usable(workspace: &Path) -> bool {
+    usable_workspace(workspace).is_ok() && std::fs::read_dir(workspace).is_ok()
+}
+
+fn spawn_error(
+    plan: &SandboxExecutionPlan,
+    workspace: &Path,
+    source: io::Error,
+) -> SandboxProcessError {
+    let runner_failed = plan.confined_command().is_some()
+        && workspace_still_usable(workspace)
+        && matches!(
+            source.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        );
+    if runner_failed {
+        let runner = plan
+            .argv()
+            .first()
+            .map_or_else(|| "<missing>".into(), |value| value.to_string_lossy());
+        SandboxError::ProviderUnavailable {
+            mode: plan.mode(),
+            detail: format!("failed to spawn sandbox runner `{runner}`: {source}"),
+        }
+        .into()
+    } else {
+        SandboxProcessError::Spawn { source }
+    }
+}
+
+fn wait_for_process(
+    child: &mut GroupChild,
+    cancellation: &LifecycleCancellation,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<(ExitStatus, SandboxProcessTermination), SandboxProcessError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return terminate_group(child, SandboxProcessTermination::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return terminate_group(child, SandboxProcessTermination::TimedOut);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((status, SandboxProcessTermination::Completed)),
+            Ok(None) => thread::sleep(poll_interval),
+            Err(source) => {
+                terminate_group_best_effort(child);
+                return Err(SandboxProcessError::Lifecycle { source });
+            }
+        }
+    }
+}
+
+fn terminate_group(
+    child: &mut GroupChild,
+    termination: SandboxProcessTermination,
+) -> Result<(ExitStatus, SandboxProcessTermination), SandboxProcessError> {
+    let _ = child.kill();
+    child
+        .wait()
+        .map(|status| (status, termination))
+        .map_err(|source| SandboxProcessError::Lifecycle { source })
+}
+
+fn terminate_group_best_effort(child: &mut GroupChild) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_output_collector<R>(
+    name: &str,
+    reader: R,
+    maximum: usize,
+) -> io::Result<JoinHandle<io::Result<SandboxProcessOutput>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || collect_output_tail(reader, maximum))
+}
+
+fn collect_output_tail(mut reader: impl Read, maximum: usize) -> io::Result<SandboxProcessOutput> {
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
+    let mut byte_count = 0_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        byte_count = byte_count.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        retain_tail(&mut bytes, &buffer[..read], maximum);
+    }
+    Ok(SandboxProcessOutput {
+        truncated: byte_count > u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        bytes,
+        byte_count,
+    })
+}
+
+fn retain_tail(retained: &mut Vec<u8>, incoming: &[u8], maximum: usize) {
+    if incoming.len() >= maximum {
+        retained.clear();
+        retained.extend_from_slice(&incoming[incoming.len() - maximum..]);
+        return;
+    }
+    let overflow = retained
+        .len()
+        .saturating_add(incoming.len())
+        .saturating_sub(maximum);
+    if overflow > 0 {
+        retained.drain(..overflow);
+    }
+    retained.extend_from_slice(incoming);
+}
+
+fn join_output_collector(
+    reader: JoinHandle<io::Result<SandboxProcessOutput>>,
+) -> Result<SandboxProcessOutput, SandboxProcessError> {
+    reader
+        .join()
+        .map_err(|_| SandboxProcessError::OutputCollectorStopped)?
+        .map_err(|source| SandboxProcessError::Output { source })
+}
+
+fn settle_sandboxed_process(
+    plan: &SandboxExecutionPlan,
+    status: ExitStatus,
+    termination: SandboxProcessTermination,
+    stdout: SandboxProcessOutput,
+    stderr: SandboxProcessOutput,
+) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
+    let classification = match (termination, plan.confined_command()) {
+        (SandboxProcessTermination::Completed, Some(command)) => {
+            let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+            match classify_sandbox_process(status.code(), &stderr_text, command) {
+                SandboxProcessClassification::RunnerFailure { detail } => {
+                    return Err(SandboxError::ProviderUnavailable {
+                        mode: plan.mode(),
+                        detail,
+                    }
+                    .into());
+                }
+                classification => Some(classification),
+            }
+        }
+        (SandboxProcessTermination::TimedOut | SandboxProcessTermination::Cancelled, Some(_)) => {
+            Some(SandboxProcessClassification::Signalled)
+        }
+        (_, None) => None,
+    };
+    Ok(SandboxedProcessOutcome {
+        exit_code: status.code(),
+        termination,
+        mode: plan.mode(),
+        enforcement: plan.enforcement(),
+        classification,
+        stdout,
+        stderr,
+    })
 }
 
 fn seatbelt_profile(policy: &ConfinedSandboxPolicy) -> Result<String, SandboxProviderUnavailable> {
@@ -84,23 +506,60 @@ fn sbpl_string(path: &Path) -> Result<String, SandboxProviderUnavailable> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    #[cfg(target_os = "macos")]
-    use std::process::{Command, Output};
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     #[cfg(unix)]
     use hartevo_cordis::SANDBOX_UNAVAILABLE;
     use hartevo_cordis::{
-        Context, CordisHost, SandboxEnforcement, SandboxExecutionPlan, SandboxMode,
-        SandboxPolicyRequest, SandboxPolicyService, SandboxProviderService, keys,
+        ConfinedArgv, ConfinedSandboxPolicy, Context, CordisHost, LifecycleCancellation,
+        SandboxEnforcement, SandboxExecutionPlan, SandboxMode, SandboxPolicyRequest,
+        SandboxPolicyService, SandboxProcessClassification, SandboxProvider,
+        SandboxProviderService, SandboxProviderUnavailable, SandboxRunnerFailureRule, keys,
         prepare_sandbox_execution, register_sandbox_provider, resolve_sandbox_policy,
     };
-    #[cfg(target_os = "macos")]
-    use hartevo_cordis::{SandboxProcessClassification, classify_sandbox_process};
 
     use super::{
         MacosSeatbeltSandboxProvider, SEATBELT_EXEC, SEATBELT_READ_ONLY_PROFILE,
-        mount_macos_sandbox_provider, sbpl_string,
+        SandboxProcessError, SandboxProcessLimits, SandboxProcessTermination,
+        mount_macos_sandbox_provider, run_sandboxed_process, run_sandboxed_process_with_limits,
+        sbpl_string,
     };
+
+    struct FixedProvider {
+        wrapped: Vec<OsString>,
+        enforcement: SandboxEnforcement,
+        denial_signatures: Vec<String>,
+        runner_failure_rules: Vec<SandboxRunnerFailureRule>,
+    }
+
+    impl SandboxProvider for FixedProvider {
+        fn confine(
+            &self,
+            _argv: &[OsString],
+            _policy: &ConfinedSandboxPolicy,
+        ) -> Result<ConfinedArgv, SandboxProviderUnavailable> {
+            Ok(ConfinedArgv::new(
+                self.wrapped.clone(),
+                self.enforcement,
+                self.denial_signatures.clone(),
+                self.runner_failure_rules.clone(),
+            ))
+        }
+    }
+
+    struct NeverProvider;
+
+    impl SandboxProvider for NeverProvider {
+        fn confine(
+            &self,
+            _argv: &[OsString],
+            _policy: &ConfinedSandboxPolicy,
+        ) -> Result<ConfinedArgv, SandboxProviderUnavailable> {
+            panic!("danger-full-access must not call the sandbox provider")
+        }
+    }
 
     fn argv(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
@@ -122,14 +581,45 @@ mod tests {
     }
 
     fn context(mode: SandboxMode, root: &std::path::Path) -> Context {
+        context_with_provider(mode, root, MacosSeatbeltSandboxProvider)
+    }
+
+    fn context_with_provider(
+        mode: SandboxMode,
+        root: &std::path::Path,
+        provider: impl SandboxProvider,
+    ) -> Context {
         let mut ctx = Context::new();
         ctx.provide(
             keys::SANDBOX_POLICY,
             SandboxPolicyService::new(mode, root).unwrap(),
         )
         .unwrap();
-        register_sandbox_provider(&mut ctx, MacosSeatbeltSandboxProvider).unwrap();
+        register_sandbox_provider(&mut ctx, provider).unwrap();
         ctx
+    }
+
+    fn fixed_context(
+        mode: SandboxMode,
+        root: &std::path::Path,
+        wrapped: Vec<OsString>,
+        enforcement: SandboxEnforcement,
+        denial_signatures: &[&str],
+        runner_failure_signatures: &[&str],
+    ) -> Context {
+        context_with_provider(
+            mode,
+            root,
+            FixedProvider {
+                wrapped,
+                enforcement,
+                denial_signatures: denial_signatures.iter().map(ToString::to_string).collect(),
+                runner_failure_rules: runner_failure_signatures
+                    .iter()
+                    .map(|signature| SandboxRunnerFailureRule::new([*signature]))
+                    .collect(),
+            },
+        )
     }
 
     fn plan(
@@ -230,10 +720,229 @@ mod tests {
         assert!(error.to_string().contains("non-UTF-8 writable root"));
     }
 
-    #[cfg(target_os = "macos")]
-    fn run(plan: &SandboxExecutionPlan) -> Output {
-        let (program, args) = plan.argv().split_first().unwrap();
-        Command::new(program).args(args).output().unwrap()
+    #[test]
+    fn consumer_runs_only_the_provider_argv_and_reports_its_exact_facts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = fixed_context(
+            SandboxMode::ReadOnly,
+            workspace.path(),
+            argv(&[
+                "/bin/sh",
+                "-c",
+                "printf 'provider-argv'; printf 'blocked-by-policy' >&2; exit 7",
+            ]),
+            SandboxEnforcement::Partial,
+            &["blocked-by-policy"],
+            &["runner-fatal"],
+        );
+
+        let outcome = run_sandboxed_process(
+            &ctx,
+            argv(&["definitely-not-the-selected-program", "original argument"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(7));
+        assert_eq!(outcome.termination, SandboxProcessTermination::Completed);
+        assert_eq!(outcome.mode, SandboxMode::ReadOnly);
+        assert_eq!(outcome.enforcement, Some(SandboxEnforcement::Partial));
+        assert_eq!(
+            outcome.classification,
+            Some(SandboxProcessClassification::Denied)
+        );
+        assert_eq!(outcome.stdout.bytes, b"provider-argv");
+        assert_eq!(outcome.stderr.bytes, b"blocked-by-policy");
+    }
+
+    #[test]
+    fn danger_full_access_bypasses_the_provider_and_preserves_original_argv() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = context_with_provider(
+            SandboxMode::DangerFullAccess,
+            workspace.path(),
+            NeverProvider,
+        );
+
+        let outcome = run_sandboxed_process(
+            &ctx,
+            argv(&["/usr/bin/printf", "%s", "exact argument"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.mode, SandboxMode::DangerFullAccess);
+        assert_eq!(outcome.enforcement, None);
+        assert_eq!(outcome.classification, None);
+        assert_eq!(outcome.stdout.bytes, b"exact argument");
+    }
+
+    #[test]
+    fn confined_runner_spawn_refusal_is_sandbox_unavailable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runner = workspace.path().join("missing-sandbox-runner");
+        let ctx = fixed_context(
+            SandboxMode::ReadOnly,
+            workspace.path(),
+            vec![runner.into_os_string()],
+            SandboxEnforcement::Full,
+            &[],
+            &[],
+        );
+
+        let error = run_sandboxed_process(
+            &ctx,
+            argv(&["unreachable"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), Some(SANDBOX_UNAVAILABLE));
+        assert!(error.to_string().contains("missing-sandbox-runner"));
+    }
+
+    #[test]
+    fn unusable_workspace_is_not_misclassified_as_runner_failure() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing_workspace = parent.path().join("missing-workspace");
+        let ctx = fixed_context(
+            SandboxMode::ReadOnly,
+            &missing_workspace,
+            vec![parent.path().join("missing-runner").into_os_string()],
+            SandboxEnforcement::Full,
+            &[],
+            &[],
+        );
+
+        let error = run_sandboxed_process(
+            &ctx,
+            argv(&["unreachable"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SandboxProcessError::UnusableWorkspace { .. }
+        ));
+        assert_eq!(error.code(), None);
+    }
+
+    #[test]
+    fn settled_runner_failure_outranks_denial_and_fails_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = fixed_context(
+            SandboxMode::ReadOnly,
+            workspace.path(),
+            argv(&[
+                "/bin/sh",
+                "-c",
+                "printf 'runner-fatal: permission denied\\n' >&2; exit 125",
+            ]),
+            SandboxEnforcement::Full,
+            &["permission denied"],
+            &["runner-fatal: "],
+        );
+
+        let error = run_sandboxed_process(
+            &ctx,
+            argv(&["unreachable"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), Some(SANDBOX_UNAVAILABLE));
+        assert!(
+            error
+                .to_string()
+                .contains("runner-fatal: permission denied")
+        );
+    }
+
+    #[test]
+    fn output_capture_is_bounded_and_debug_redacts_retained_bytes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = context_with_provider(
+            SandboxMode::DangerFullAccess,
+            workspace.path(),
+            NeverProvider,
+        );
+
+        let outcome = run_sandboxed_process(
+            &ctx,
+            argv(&["/bin/sh", "-c", "printf '%070000dN89-SECRET-TAIL' 0"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stdout.byte_count, 70_015);
+        assert!(outcome.stdout.truncated);
+        assert_eq!(outcome.stdout.bytes.len(), 64_000);
+        assert!(outcome.stdout.bytes.ends_with(b"N89-SECRET-TAIL"));
+        assert!(!format!("{outcome:?}").contains("N89-SECRET-TAIL"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_and_reaps_the_whole_process_group() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = fixed_context(
+            SandboxMode::ReadOnly,
+            workspace.path(),
+            argv(&[
+                "/bin/sh",
+                "-c",
+                "sleep 30 & child=$!; printf '%s\\n' \"$child\"; wait \"$child\"",
+            ]),
+            SandboxEnforcement::Full,
+            &[],
+            &[],
+        );
+        let cancellation = LifecycleCancellation::default();
+        let cancelling = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancelling.cancel();
+        });
+
+        let outcome = run_sandboxed_process_with_limits(
+            &ctx,
+            argv(&["unreachable"]),
+            SandboxPolicyRequest::default(),
+            &cancellation,
+            SandboxProcessLimits {
+                timeout: Duration::from_secs(5),
+                output_bytes: 64_000,
+                poll_interval: Duration::from_millis(5),
+            },
+        )
+        .unwrap();
+        canceller.join().unwrap();
+
+        assert_eq!(outcome.termination, SandboxProcessTermination::Cancelled);
+        assert_eq!(
+            outcome.classification,
+            Some(SandboxProcessClassification::Signalled)
+        );
+        let child = String::from_utf8(outcome.stdout.bytes).unwrap();
+        let child = child.trim();
+        assert!(!child.is_empty());
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", child])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -247,53 +956,53 @@ mod tests {
         let denied_outside = outside.path().join("outside-denied");
 
         let read_only = context(SandboxMode::ReadOnly, workspace.path());
-        let read_only_plan = plan(
+        let read_only_output = run_sandboxed_process(
             &read_only,
             vec![
                 OsString::from("/usr/bin/touch"),
                 denied_read_only.clone().into(),
             ],
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
         )
         .unwrap();
-        let read_only_output = run(&read_only_plan);
-        assert!(!read_only_output.status.success());
+        assert_ne!(read_only_output.exit_code, Some(0));
         assert!(!denied_read_only.exists());
         assert_eq!(
-            classify_sandbox_process(
-                read_only_output.status.code(),
-                &String::from_utf8_lossy(&read_only_output.stderr),
-                read_only_plan.confined_command().unwrap(),
-            ),
-            SandboxProcessClassification::Denied
+            read_only_output.classification,
+            Some(SandboxProcessClassification::Denied)
         );
 
         let workspace_write = context(SandboxMode::WorkspaceWrite, workspace.path());
-        let allowed_plan = plan(
+        let allowed_output = run_sandboxed_process(
             &workspace_write,
             vec![OsString::from("/usr/bin/touch"), allowed.clone().into()],
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
         )
         .unwrap();
-        assert!(run(&allowed_plan).status.success());
+        assert_eq!(allowed_output.exit_code, Some(0));
+        assert_eq!(
+            allowed_output.classification,
+            Some(SandboxProcessClassification::Success)
+        );
         assert!(allowed.exists());
 
-        let denied_plan = plan(
+        let denied_output = run_sandboxed_process(
             &workspace_write,
             vec![
                 OsString::from("/usr/bin/touch"),
                 denied_outside.clone().into(),
             ],
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
         )
         .unwrap();
-        let denied_output = run(&denied_plan);
-        assert!(!denied_output.status.success());
+        assert_ne!(denied_output.exit_code, Some(0));
         assert!(!denied_outside.exists());
         assert_eq!(
-            classify_sandbox_process(
-                denied_output.status.code(),
-                &String::from_utf8_lossy(&denied_output.stderr),
-                denied_plan.confined_command().unwrap(),
-            ),
-            SandboxProcessClassification::Denied
+            denied_output.classification,
+            Some(SandboxProcessClassification::Denied)
         );
     }
 }
