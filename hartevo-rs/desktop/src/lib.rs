@@ -451,6 +451,14 @@ impl UiFailure {
                 "STALE_SELECTION",
                 "Runtime 本地写入批准必须绑定当前冻结 digest 与 turn revision；未写入部分状态，也未执行 Effect。",
             ),
+            DesktopDataError::CordisToolApprovalUnavailable => Self::coded(
+                "EMPTY",
+                "当前没有待回答的 Cordis 工具审批；未派发工具，也未执行 Effect。",
+            ),
+            DesktopDataError::CordisToolApprovalMismatch => Self::coded(
+                "STALE_SELECTION",
+                "Cordis 工具审批已变化；旧请求已按不可用关闭，未派发工具。",
+            ),
             DesktopDataError::ProjectNotFound(_)
             | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => {
                 Self::coded("STALE_SELECTION", "当前项目已变化，请刷新后重试。")
@@ -1680,12 +1688,16 @@ pub fn App() -> Element {
     let held_local_approval = live_runtime_cancellation
         .as_ref()
         .and_then(DesktopRuntimeCancellation::held_local_approval);
+    let held_cordis_approval = live_runtime_cancellation
+        .as_ref()
+        .and_then(DesktopRuntimeCancellation::held_cordis_approval);
     let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
         project.as_ref(),
         mission.as_ref(),
         runtime_activity.as_ref(),
         runtime_projection.as_ref(),
         held_local_approval.as_ref(),
+        held_cordis_approval.as_ref(),
     );
     let operations_interrupt_available = runtime_busy && runtime_stop_available;
     let operations_interrupt_requested = runtime_stop_requested();
@@ -1760,6 +1772,70 @@ pub fn App() -> Element {
         ) {
             Ok(()) => {}
             Err(error) => model.write().set_notice(&error),
+        }
+    };
+    let request_operations_allow_cordis_once = move |()| {
+        let selected = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let Some(control) = runtime_execution_paint
+            .read()
+            .live_cancellation_for_selection(
+                selected
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+            )
+            .or_else(|| runtime_cancellation.read().clone())
+        else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CordisToolApprovalUnavailable);
+            return;
+        };
+        let Some(held) = control.held_cordis_approval() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CordisToolApprovalUnavailable);
+            return;
+        };
+        if let Err(error) = control.allow_held_cordis_tool_once(held.id()) {
+            model.write().set_notice(&error);
+        }
+    };
+    let request_operations_reject_cordis = move |()| {
+        let selected = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let Some(control) = runtime_execution_paint
+            .read()
+            .live_cancellation_for_selection(
+                selected
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+            )
+            .or_else(|| runtime_cancellation.read().clone())
+        else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CordisToolApprovalUnavailable);
+            return;
+        };
+        let Some(held) = control.held_cordis_approval() else {
+            model
+                .write()
+                .set_notice(&DesktopDataError::CordisToolApprovalUnavailable);
+            return;
+        };
+        if let Err(error) = control.reject_held_cordis_tool(held.id()) {
+            model.write().set_notice(&error);
         }
     };
     let request_operations_continue_browser = move |()| {
@@ -2626,6 +2702,8 @@ pub fn App() -> Element {
                                 on_interrupt: request_operations_interrupt,
                                 on_continue_browser_workspace: request_operations_continue_browser,
                                 on_approve_local_runtime: request_operations_approve_local_runtime,
+                                on_allow_cordis_once: request_operations_allow_cordis_once,
+                                on_reject_cordis: request_operations_reject_cordis,
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
                                         let current = model.read();
@@ -5613,6 +5691,8 @@ fn AgentOperationsWorkbench(
     on_interrupt: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_approve_local_runtime: EventHandler<()>,
+    on_allow_cordis_once: EventHandler<()>,
+    on_reject_cordis: EventHandler<()>,
 ) -> Element {
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
     let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
@@ -5814,6 +5894,29 @@ fn AgentOperationsWorkbench(
                         div { small { "External Effect approvals" } strong { "{projection.approvals.external_approval_count}" } span { "{projection.approvals.external_status.code()}" } }
                         div { small { "Verified effects" } strong { "{projection.approvals.verified_effect_count}" } span { "不会由本地 Runtime 状态代替" } }
                         div { small { "Local Runtime approval" } strong { "{projection.approvals.local_runtime_status.code()}" } span { "{projection.approvals.local_runtime_detail}" } }
+                        div { small { "Cordis tool approval" } strong { "{projection.approvals.cordis_tool_status.code()}" } span { "{projection.approvals.cordis_tool_detail}" } }
+                    }
+                    {
+                        let cordis_ready = projection.approvals.cordis_allow_once_status == OperationsStatus::Ready
+                            && projection.approvals.cordis_reject_status == OperationsStatus::Ready;
+                        rsx! {
+                            div { class: "operations-artifact-actions", aria_label: "Cordis tool approval actions",
+                                button {
+                                    disabled: !cordis_ready,
+                                    aria_label: "仅允许本次 Cordis 工具调用",
+                                    title: "只允许当前精确请求一次；不会保存 allow-all 策略",
+                                    onclick: move |_| on_allow_cordis_once.call(()),
+                                    "Allow once · {projection.approvals.cordis_allow_once_status.code()}"
+                                }
+                                button {
+                                    disabled: !cordis_ready,
+                                    aria_label: "拒绝 Cordis 工具调用",
+                                    title: "拒绝当前精确请求；工具体不会派发",
+                                    onclick: move |_| on_reject_cordis.call(()),
+                                    "Reject · {projection.approvals.cordis_reject_status.code()}"
+                                }
+                            }
+                        }
                     }
                     {
                         let local_ready = projection.approvals.local_runtime_approve_status == OperationsStatus::Ready;
@@ -5948,6 +6051,8 @@ fn OrchestratorSurface(
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
     on_approve_local_runtime: EventHandler<()>,
+    on_allow_cordis_once: EventHandler<()>,
+    on_reject_cordis: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
     on_result_action: EventHandler<ResultSurfaceAction>,
@@ -6039,6 +6144,8 @@ fn OrchestratorSurface(
                             on_interrupt,
                             on_continue_browser_workspace,
                             on_approve_local_runtime,
+                            on_allow_cordis_once,
+                            on_reject_cordis,
                         }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
@@ -6165,6 +6272,8 @@ fn OrchestratorSurface(
                         on_interrupt,
                         on_continue_browser_workspace,
                         on_approve_local_runtime,
+                        on_allow_cordis_once,
+                        on_reject_cordis,
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
@@ -9402,6 +9511,10 @@ const fn desktop_runtime_progress_label(phase: DesktopRuntimeProgressPhase) -> &
         DesktopRuntimeProgressPhase::LocalActionApproved => {
             "窗口已批准精确 Runtime 本地写入 digest"
         }
+        DesktopRuntimeProgressPhase::WaitingCordisApproval => {
+            "Cordis 工具调用正在等待本窗口的一次性回答"
+        }
+        DesktopRuntimeProgressPhase::CordisApprovalCleared => "Cordis 工具审批已回答或安全清空",
         DesktopRuntimeProgressPhase::StopRequested => "停止请求已交给协调器",
         DesktopRuntimeProgressPhase::InterruptSent => "fenced interrupt 已发送",
         DesktopRuntimeProgressPhase::Completed => "Runtime turn 已完成，正在采纳最终产物",
@@ -9426,12 +9539,14 @@ const fn desktop_runtime_progress_class(phase: DesktopRuntimeProgressPhase) -> &
     match phase {
         DesktopRuntimeProgressPhase::Completed
         | DesktopRuntimeProgressPhase::Interrupted
-        | DesktopRuntimeProgressPhase::LocalActionApproved => "terminal",
+        | DesktopRuntimeProgressPhase::LocalActionApproved
+        | DesktopRuntimeProgressPhase::CordisApprovalCleared => "terminal",
         DesktopRuntimeProgressPhase::Failed | DesktopRuntimeProgressPhase::Uncertain => "danger",
         DesktopRuntimeProgressPhase::StopRequested
         | DesktopRuntimeProgressPhase::InterruptSent
         | DesktopRuntimeProgressPhase::LocalActionDeclined
-        | DesktopRuntimeProgressPhase::WaitingLocalApproval => "attention",
+        | DesktopRuntimeProgressPhase::WaitingLocalApproval
+        | DesktopRuntimeProgressPhase::WaitingCordisApproval => "attention",
         DesktopRuntimeProgressPhase::Preparing
         | DesktopRuntimeProgressPhase::Dispatched
         | DesktopRuntimeProgressPhase::TurnStarted
@@ -11214,6 +11329,26 @@ mod tests {
         assert!(data_plane.contains("respond_context_runtime_local_approval"));
         assert!(!data_plane.contains("approved: false"));
         assert!(!data_plane.contains("LocalActionDeclined);"));
+    }
+
+    #[test]
+    fn operations_answers_cordis_tool_approval_as_a_separate_one_shot() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("allow_held_cordis_tool_once"));
+        assert!(source.contains("reject_held_cordis_tool"));
+        assert!(source.contains("on_allow_cordis_once"));
+        assert!(source.contains("on_reject_cordis"));
+        assert!(source.contains("Allow once ·"));
+        assert!(source.contains("Reject ·"));
+        let data_plane = include_str!("data_plane.rs");
+        assert!(data_plane.contains("DesktopCordisApprovalBridge"));
+        assert!(data_plane.contains("held_cordis_approval"));
+        assert!(data_plane.contains("cordis_approval.as_ref()"));
+        let host = include_str!("cordis_host.rs");
+        assert!(host.contains("prompt.agent().is_same_lifecycle(&expected_agent)"));
+        assert!(host.contains("prompt.session_id() != &expected_session"));
+        assert!(host.contains("ApprovalOutcome::AllowedOnce"));
+        assert!(!host.contains("allow_all"));
     }
 
     #[test]

@@ -247,6 +247,7 @@ impl SessionApprovalPolicy {
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     agent: AgentRef,
+    session_id: crate::session::SessionId,
     tool_name: String,
     call_id: Option<String>,
     reason: Option<String>,
@@ -259,12 +260,23 @@ impl ApprovalRequest {
         tool_name: impl Into<String>,
         cancellation: LifecycleCancellation,
     ) -> Result<Self, ApprovalError> {
+        let session_id = crate::session::SessionId::new(agent.id.clone())?;
+        Self::for_session(agent, session_id, tool_name, cancellation)
+    }
+
+    pub fn for_session(
+        agent: AgentRef,
+        session_id: crate::session::SessionId,
+        tool_name: impl Into<String>,
+        cancellation: LifecycleCancellation,
+    ) -> Result<Self, ApprovalError> {
         let tool_name = tool_name.into();
         if tool_name.is_empty() {
             return Err(ApprovalError::EmptyToolName);
         }
         Ok(Self {
             agent,
+            session_id,
             tool_name,
             call_id: None,
             reason: None,
@@ -307,6 +319,11 @@ impl ApprovalPrompt {
     #[must_use]
     pub const fn agent(&self) -> &AgentRef {
         &self.request.agent
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> &crate::session::SessionId {
+        &self.request.session_id
     }
 
     #[must_use]
@@ -377,7 +394,7 @@ pub async fn request_approval(
         .agents::<AgentsSurface>()
         .ok_or(ApprovalError::ServiceUnavailable { key: keys::AGENTS })?;
     sessions.require_live(session)?;
-    if request.agent.id != session.id().as_str() {
+    if request.session_id != *session.id() {
         return Err(ApprovalError::AgentSessionMismatch {
             agent_id: request.agent.id.clone(),
             session_id: session.id().as_str().to_owned(),

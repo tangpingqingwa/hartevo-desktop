@@ -2872,6 +2872,16 @@ impl AgentsSurface {
             .any(|published| published.is_same_lifecycle(agent)))
     }
 
+    pub(crate) fn get(&self, id: &str) -> Result<Option<AgentRef>, CordisError> {
+        Ok(self
+            .live
+            .lock()
+            .map_err(|_| CordisError::AgentRegistryPoisoned)?
+            .iter()
+            .rfind(|published| published.id == id)
+            .cloned())
+    }
+
     #[must_use]
     pub fn list(&self) -> Vec<AgentRef> {
         self.live.lock().expect("agents").clone()
@@ -3516,21 +3526,68 @@ pub fn run_tools_pipeline(ctx: &mut Context, mut call: ToolCall) -> Result<ToolC
     Ok(call)
 }
 
-/// Run one immutable durable call through ordered pre-execute policy and
-/// monotonic guards without invoking a tool body or mutating the session.
-pub fn prepare_tool_execution(
+/// One policy-approved call awaiting live guard and registration checks.
+pub(crate) struct AllowedToolPolicy {
+    input: ToolExecutionInput,
+    registered: Option<ToolRegistration>,
+    result_projection: ToolResultProjection,
+}
+
+impl AllowedToolPolicy {
+    #[must_use]
+    pub(crate) const fn input(&self) -> &ToolExecutionInput {
+        &self.input
+    }
+}
+
+/// One `ask` decision that has not yet consulted the approval service.
+pub(crate) struct PendingToolApproval {
+    allowed: AllowedToolPolicy,
+    reason: Option<String>,
+}
+
+impl PendingToolApproval {
+    #[must_use]
+    pub(crate) const fn input(&self) -> &ToolExecutionInput {
+        self.allowed.input()
+    }
+
+    #[must_use]
+    pub(crate) fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    pub(crate) fn allow(self) -> AllowedToolPolicy {
+        self.allowed
+    }
+
+    pub(crate) fn deny(self, reason: impl Into<String>) -> DeniedToolExecution {
+        denied_tool(self.allowed.input, reason, self.allowed.result_projection)
+    }
+}
+
+/// Ordered policy outcome before any live guard, classification, or body.
+pub(crate) enum ToolPolicyPreparation {
+    Allow(AllowedToolPolicy),
+    Ask(PendingToolApproval),
+    Denied(DeniedToolExecution),
+}
+
+/// Run the immutable pre-execute waterfall exactly once without invoking a
+/// tool body, asking a user, or mutating the Session.
+pub(crate) fn prepare_tool_policy(
     ctx: &mut Context,
     input: ToolExecutionInput,
-) -> Result<ToolExecutionPreparation, CordisError> {
+) -> Result<ToolPolicyPreparation, CordisError> {
     let tools = ctx
         .tools::<ToolsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
     let Ok(registered) = tools.registration(input.name()) else {
-        return Ok(denied_tool_execution(
+        return Ok(ToolPolicyPreparation::Denied(denied_tool(
             input,
             "tool registry is unavailable",
             ToolResultProjection::default(),
-        ));
+        )));
     };
     let result_projection = registered
         .as_ref()
@@ -3544,11 +3601,11 @@ pub fn prepare_tool_execution(
         || decided.arguments != input.raw_arguments()
         || decided.execution_input.as_ref() != Some(&input)
     {
-        return Ok(denied_tool_execution(
+        return Ok(ToolPolicyPreparation::Denied(denied_tool(
             input,
             "tools/pre-execute cannot rewrite durable tool identity or arguments",
             result_projection,
-        ));
+        )));
     }
     match decided.decision.as_str() {
         "deny" => {
@@ -3557,28 +3614,52 @@ pub fn prepare_tool_execution(
             } else {
                 decided.result
             };
-            return Ok(denied_tool_execution(input, reason, result_projection));
+            return Ok(ToolPolicyPreparation::Denied(denied_tool(
+                input,
+                reason,
+                result_projection,
+            )));
         }
         "ask" => {
-            let reason = if decided.result.is_empty() {
-                format!(
-                    "tool \"{}\" requires approval, but no approval channel is available",
-                    input.name()
-                )
-            } else {
-                decided.result
-            };
-            return Ok(denied_tool_execution(input, reason, result_projection));
+            return Ok(ToolPolicyPreparation::Ask(PendingToolApproval {
+                allowed: AllowedToolPolicy {
+                    input,
+                    registered,
+                    result_projection,
+                },
+                reason: (!decided.result.is_empty()).then_some(decided.result),
+            }));
         }
         "allow" => {}
         decision => {
-            return Ok(denied_tool_execution(
+            return Ok(ToolPolicyPreparation::Denied(denied_tool(
                 input,
                 format!("invalid tools/pre-execute decision \"{decision}\""),
                 result_projection,
-            ));
+            )));
         }
     }
+    Ok(ToolPolicyPreparation::Allow(AllowedToolPolicy {
+        input,
+        registered,
+        result_projection,
+    }))
+}
+
+/// Apply live monotonic guards and current registration classification after
+/// policy and any one-shot approval have settled.
+pub(crate) fn finalize_allowed_tool_policy(
+    ctx: &Context,
+    allowed: AllowedToolPolicy,
+) -> Result<ToolExecutionPreparation, CordisError> {
+    let tools = ctx
+        .tools::<ToolsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let AllowedToolPolicy {
+        input,
+        registered,
+        result_projection,
+    } = allowed;
     if let Some(reason) = tools.guard_reason(&input) {
         return Ok(denied_tool_execution(input, reason, result_projection));
     }
@@ -3606,16 +3687,50 @@ pub fn prepare_tool_execution(
     }))
 }
 
+/// Run one immutable durable call through ordered pre-execute policy and
+/// monotonic guards without invoking a tool body or mutating the session.
+/// Callers without the async Agent/Session approval boundary retain the
+/// historical fail-closed `ask` behavior.
+pub fn prepare_tool_execution(
+    ctx: &mut Context,
+    input: ToolExecutionInput,
+) -> Result<ToolExecutionPreparation, CordisError> {
+    match prepare_tool_policy(ctx, input)? {
+        ToolPolicyPreparation::Allow(allowed) => finalize_allowed_tool_policy(ctx, allowed),
+        ToolPolicyPreparation::Denied(denied) => Ok(ToolExecutionPreparation::Denied(denied)),
+        ToolPolicyPreparation::Ask(pending) => {
+            let reason = pending.reason().map_or_else(
+                || {
+                    format!(
+                        "tool \"{}\" requires approval, but no approval channel is available",
+                        pending.input().name()
+                    )
+                },
+                str::to_owned,
+            );
+            Ok(ToolExecutionPreparation::Denied(pending.deny(reason)))
+        }
+    }
+}
+
 fn denied_tool_execution(
     input: ToolExecutionInput,
     reason: impl Into<String>,
     result_projection: ToolResultProjection,
 ) -> ToolExecutionPreparation {
-    ToolExecutionPreparation::Denied(DeniedToolExecution {
+    ToolExecutionPreparation::Denied(denied_tool(input, reason, result_projection))
+}
+
+fn denied_tool(
+    input: ToolExecutionInput,
+    reason: impl Into<String>,
+    result_projection: ToolResultProjection,
+) -> DeniedToolExecution {
+    DeniedToolExecution {
         input,
         reason: reason.into(),
         result_projection,
-    })
+    }
 }
 
 /// Settle one N52 policy or registry denial through canonical post/final

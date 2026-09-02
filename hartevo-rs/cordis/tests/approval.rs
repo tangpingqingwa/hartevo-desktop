@@ -280,6 +280,41 @@ async fn exact_live_agent_identity_is_required_before_an_audit_is_opened() {
     assert_eq!(session.events().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn explicit_live_agent_may_answer_for_a_different_exact_session_id() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let agent = AgentRef::new("runtime-agent");
+    register_agent(host.context_mut(), agent.clone()).unwrap();
+    let session = host
+        .context()
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("mission-session").unwrap())
+        .unwrap();
+    session.start_turn().unwrap();
+    host.context_mut()
+        .on_serial(approval_events::APPROVAL_REQUEST, |prompt| async move {
+            assert_eq!(prompt.agent().id, "runtime-agent");
+            assert_eq!(prompt.session_id().as_str(), "mission-session");
+            Ok::<_, TestError>(BailOutcome::Bail(ApprovalOutcome::AllowedOnce))
+        })
+        .unwrap();
+    let request = ApprovalRequest::for_session(
+        agent,
+        session.id().clone(),
+        "filesystem.write",
+        LifecycleCancellation::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        request_approval(host.context_mut(), &session, request)
+            .await
+            .unwrap(),
+        ApprovalOutcome::AllowedOnce
+    );
+}
+
 #[test]
 fn replay_rejects_unpaired_audits_and_repair_cancels_a_pending_request() {
     let header = SessionHeader::new_at(SessionId::new("approval-replay").unwrap(), 1).unwrap();

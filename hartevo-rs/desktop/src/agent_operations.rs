@@ -16,6 +16,7 @@ use hartevo_domain_kernel::{
     RuntimeTurnStatus, WorkProductStatus,
 };
 
+use crate::cordis_host::DesktopHeldCordisApproval;
 use crate::{DesktopHeldLocalApproval, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +152,10 @@ pub struct ApprovalEffectProjection {
     pub local_runtime_detail: String,
     pub local_runtime_approve_status: OperationsStatus,
     pub local_runtime_request_digest: Option<String>,
+    pub cordis_tool_status: OperationsStatus,
+    pub cordis_tool_detail: String,
+    pub cordis_allow_once_status: OperationsStatus,
+    pub cordis_reject_status: OperationsStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +203,7 @@ impl AgentOperationsWorkbenchProjection {
         runtime_activity: Option<&MissionRuntimeProjection>,
         runtime: Option<&DesktopRuntimeProjection>,
         held_local_approval: Option<&DesktopHeldLocalApproval>,
+        held_cordis_approval: Option<&DesktopHeldCordisApproval>,
     ) -> Self {
         let project_name =
             project.map_or_else(|| "未选择 Project".into(), |project| project.name.clone());
@@ -211,7 +217,12 @@ impl AgentOperationsWorkbenchProjection {
                 .map(artifact_projection)
                 .collect()
         });
-        let approvals = approval_projection(mission, runtime_activity, held_local_approval);
+        let approvals = approval_projection(
+            mission,
+            runtime_activity,
+            held_local_approval,
+            held_cordis_approval,
+        );
         let browser = browser_projection(mission);
         let recovery = recovery_projection(runtime_activity);
         let quick_entry = QuickEntryProjection {
@@ -564,6 +575,7 @@ fn approval_projection(
     mission: Option<&MissionProjection>,
     runtime_activity: Option<&MissionRuntimeProjection>,
     held_local_approval: Option<&DesktopHeldLocalApproval>,
+    held_cordis_approval: Option<&DesktopHeldCordisApproval>,
 ) -> ApprovalEffectProjection {
     let external_approval_count = mission.map_or(0, |mission| mission.pending_approval_count);
     let verified_effect_count = mission.map_or(0, |mission| mission.verified_effect_count);
@@ -602,6 +614,33 @@ fn approval_projection(
             OperationsStatus::Empty
         },
         local_runtime_request_digest: held_local_approval.map(|held| held.request_digest.clone()),
+        cordis_tool_status: if held_cordis_approval.is_some() {
+            OperationsStatus::WaitingApproval
+        } else {
+            OperationsStatus::Empty
+        },
+        cordis_tool_detail: held_cordis_approval.map_or_else(
+            || "Cordis tool approval is separate from Application local-write approval.".into(),
+            |held| {
+                let call = held
+                    .call_id()
+                    .map_or_else(String::new, |call_id| format!(" · call {call_id}"));
+                let reason = held
+                    .reason()
+                    .map_or_else(String::new, |reason| format!(" · {reason}"));
+                format!("{}{}{}", held.tool_name(), call, reason)
+            },
+        ),
+        cordis_allow_once_status: if held_cordis_approval.is_some() {
+            OperationsStatus::Ready
+        } else {
+            OperationsStatus::Empty
+        },
+        cordis_reject_status: if held_cordis_approval.is_some() {
+            OperationsStatus::Ready
+        } else {
+            OperationsStatus::Empty
+        },
     }
 }
 
@@ -820,7 +859,7 @@ mod tests {
             last_updated_at: None,
             requires_reconciliation: false,
         };
-        let approval = approval_projection(None, Some(&activity), None);
+        let approval = approval_projection(None, Some(&activity), None, None);
         assert_eq!(approval.external_status, OperationsStatus::Empty);
         assert_eq!(
             approval.local_runtime_status,
@@ -856,7 +895,7 @@ mod tests {
             request_digest: "digest-local-write".into(),
             kind: hartevo_runtime_adapter::RuntimeLocalApprovalKind::FileChange,
         };
-        let approval = approval_projection(None, Some(&activity), Some(&held));
+        let approval = approval_projection(None, Some(&activity), Some(&held), None);
         assert_eq!(
             approval.local_runtime_approve_status,
             OperationsStatus::Ready

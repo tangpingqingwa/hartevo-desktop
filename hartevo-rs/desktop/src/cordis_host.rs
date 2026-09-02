@@ -14,25 +14,26 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use hartevo_cordis::{
-    AgentInboxOutcome, AgentInboxTarget, AgentTurnOutcome, AuthorityDispatchError, AuthorityScope,
-    CompactionResult, CordisError, CordisHost, DomainCommandAuthority, DomainCommandBinding,
-    DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
+    AgentInboxOutcome, AgentInboxTarget, AgentTurnOutcome, ApprovalOutcome, ApprovalPrompt,
+    ApprovalRequestId, AuthorityDispatchError, AuthorityScope, BailOutcome, CompactionResult,
+    CordisError, CordisHost, DomainCommandAuthority, DomainCommandBinding, DomainCommandPermit,
+    EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
     EffectReconciliationAuthority, EffectReconciliationBinding, EffectReconciliationPermit,
-    EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, Fiber,
-    FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
-    KernelConsentState, KernelConsentStatus, LifecycleCancellation, LlmAdapter, LlmAdapterStream,
-    LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError,
-    ManualCompactionErrorCode, RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit,
-    RuntimeStatusCompletion, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
-    SessionCallConfig, SessionCancelCause, SessionCheckpoint, SessionCompactionEnd,
-    SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionEpochHeader,
-    SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionFinishReason,
-    SessionHandle, SessionHeader, SessionId, SessionLlmFailure, SessionLlmRetry,
-    SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
-    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
-    TurnEndReason, compact_now, host_is_cordis_loop, keys, register_llm_adapter,
-    run_agent_turn as run_cordis_agent_turn, session_events,
+    EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, EventOptions,
+    Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
+    KernelConsentState, KernelConsentStatus, LifecycleCancellation, ListenerHandle, LlmAdapter,
+    LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError,
+    ManualCompactionErrorCode, NonBail, RuntimeAuthority, RuntimeDispatchCompletion,
+    RuntimeDispatchPermit, RuntimeStatusCompletion, SessionApprovalAsked, SessionApprovalDecided,
+    SessionApprovalPolicy, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
+    SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary, SessionContentBlock,
+    SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionEventRecord,
+    SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure,
+    SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
+    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+    SessionToolError, TurnEndReason, approval_events, compact_now, host_is_cordis_loop, keys,
+    register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -107,6 +108,229 @@ pub(crate) struct DesktopCordisCoordinator {
     root_fiber: Fiber,
     successful_bindings: u64,
     last_binding: Option<DesktopCordisBindingState>,
+}
+
+/// Content-minimized Desktop projection of one exact Cordis approval.
+///
+/// Tool arguments are deliberately absent: the window receives only the
+/// durable request identity and human-readable routing metadata needed to
+/// answer that one request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DesktopHeldCordisApproval {
+    id: ApprovalRequestId,
+    agent_id: String,
+    session_id: SessionId,
+    tool_name: String,
+    call_id: Option<String>,
+    reason: Option<String>,
+}
+
+impl DesktopHeldCordisApproval {
+    #[must_use]
+    pub(crate) const fn id(&self) -> &ApprovalRequestId {
+        &self.id
+    }
+
+    #[must_use]
+    pub(crate) fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    #[must_use]
+    pub(crate) fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DesktopCordisApprovalDecisionError {
+    #[error("no live Cordis tool approval is held for this Desktop turn")]
+    Unavailable,
+    #[error("Cordis tool approval must match the exact held request id")]
+    Mismatch,
+}
+
+struct DesktopPendingCordisApproval {
+    request: DesktopHeldCordisApproval,
+    answer: Option<tokio::sync::oneshot::Sender<ApprovalOutcome>>,
+}
+
+#[derive(Default)]
+struct DesktopCordisApprovalState {
+    pending: Option<DesktopPendingCordisApproval>,
+}
+
+/// Request-scoped bridge between Cordis' serial approval event and Desktop.
+///
+/// Every state transition invokes `on_change`, allowing the existing Runtime
+/// progress monitor to repaint without a second protocol or polling channel.
+#[derive(Clone)]
+pub(crate) struct DesktopCordisApprovalBridge {
+    state: Arc<Mutex<DesktopCordisApprovalState>>,
+    on_change: Arc<dyn Fn(bool) + Send + Sync>,
+}
+
+impl std::fmt::Debug for DesktopCordisApprovalBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DesktopCordisApprovalBridge")
+            .field("pending", &self.pending())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DesktopCordisApprovalBridge {
+    fn default() -> Self {
+        Self::new(|_| {})
+    }
+}
+
+impl DesktopCordisApprovalBridge {
+    pub(crate) fn new(on_change: impl Fn(bool) + Send + Sync + 'static) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DesktopCordisApprovalState::default())),
+            on_change: Arc::new(on_change),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn pending(&self) -> Option<DesktopHeldCordisApproval> {
+        self.state.lock().ok().and_then(|state| {
+            state
+                .pending
+                .as_ref()
+                .map(|pending| pending.request.clone())
+        })
+    }
+
+    pub(crate) fn allow_once(
+        &self,
+        id: &ApprovalRequestId,
+    ) -> Result<(), DesktopCordisApprovalDecisionError> {
+        self.decide(id, ApprovalOutcome::AllowedOnce)
+    }
+
+    pub(crate) fn reject(
+        &self,
+        id: &ApprovalRequestId,
+    ) -> Result<(), DesktopCordisApprovalDecisionError> {
+        self.decide(id, ApprovalOutcome::Rejected)
+    }
+
+    fn decide(
+        &self,
+        id: &ApprovalRequestId,
+        outcome: ApprovalOutcome,
+    ) -> Result<(), DesktopCordisApprovalDecisionError> {
+        let mut pending = self
+            .state
+            .lock()
+            .map_err(|_| DesktopCordisApprovalDecisionError::Unavailable)?
+            .pending
+            .take()
+            .ok_or(DesktopCordisApprovalDecisionError::Unavailable)?;
+        let matches = pending.request.id == *id;
+        let answer = if matches {
+            outcome
+        } else {
+            ApprovalOutcome::Unavailable
+        };
+        let delivered = pending
+            .answer
+            .take()
+            .is_some_and(|sender| sender.send(answer).is_ok());
+        (self.on_change)(false);
+        if !matches {
+            return Err(DesktopCordisApprovalDecisionError::Mismatch);
+        }
+        if !delivered {
+            return Err(DesktopCordisApprovalDecisionError::Unavailable);
+        }
+        Ok(())
+    }
+
+    async fn answer(&self, prompt: &ApprovalPrompt) -> ApprovalOutcome {
+        let request = DesktopHeldCordisApproval {
+            id: prompt.id().clone(),
+            agent_id: prompt.agent().id.clone(),
+            session_id: prompt.session_id().clone(),
+            tool_name: prompt.tool_name().to_owned(),
+            call_id: prompt.call_id().map(str::to_owned),
+            reason: prompt.reason().map(str::to_owned),
+        };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let stored = self.state.lock().is_ok_and(|mut state| {
+            if state.pending.is_some() {
+                return false;
+            }
+            state.pending = Some(DesktopPendingCordisApproval {
+                request: request.clone(),
+                answer: Some(sender),
+            });
+            true
+        });
+        if !stored {
+            return ApprovalOutcome::Unavailable;
+        }
+        (self.on_change)(true);
+        let guard = DesktopCordisPendingGuard {
+            bridge: self.clone(),
+            id: request.id,
+        };
+        let outcome = receiver.await.unwrap_or(ApprovalOutcome::Unavailable);
+        drop(guard);
+        outcome
+    }
+
+    fn clear_matching(&self, id: &ApprovalRequestId) {
+        let pending = self.state.lock().ok().and_then(|mut state| {
+            if state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.request.id == *id)
+            {
+                state.pending.take()
+            } else {
+                None
+            }
+        });
+        if let Some(mut pending) = pending {
+            if let Some(answer) = pending.answer.take() {
+                let _ = answer.send(ApprovalOutcome::Unavailable);
+            }
+            (self.on_change)(false);
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        let pending = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending.take());
+        if let Some(mut pending) = pending {
+            if let Some(answer) = pending.answer.take() {
+                let _ = answer.send(ApprovalOutcome::Unavailable);
+            }
+            (self.on_change)(false);
+        }
+    }
+}
+
+struct DesktopCordisPendingGuard {
+    bridge: DesktopCordisApprovalBridge,
+    id: ApprovalRequestId,
+}
+
+impl Drop for DesktopCordisPendingGuard {
+    fn drop(&mut self) {
+        self.bridge.clear_matching(&self.id);
+    }
 }
 
 /// Short-lock storage for the process-wide Cordis coordinator.
@@ -950,7 +1174,7 @@ impl DesktopCordisCoordinator {
     where
         A: LlmAdapter,
     {
-        self.run_agent_turn_with_permit(request, adapter, cancellation, None)
+        self.run_agent_turn_with_permit(request, adapter, cancellation, None, None)
             .await
     }
 
@@ -963,12 +1187,58 @@ impl DesktopCordisCoordinator {
         adapter: A,
         cancellation: &LifecycleCancellation,
         permit: &RuntimeDispatchPermit,
+        approval_bridge: Option<&DesktopCordisApprovalBridge>,
     ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
     where
         A: LlmAdapter,
     {
-        self.run_agent_turn_with_permit(request, adapter, cancellation, Some(permit))
-            .await
+        self.run_agent_turn_with_permit(
+            request,
+            adapter,
+            cancellation,
+            Some(permit),
+            approval_bridge,
+        )
+        .await
+    }
+
+    fn register_tool_approval_answerer(
+        &mut self,
+        session_id: &SessionId,
+        runtime_permit: Option<&RuntimeDispatchPermit>,
+        approval_bridge: Option<&DesktopCordisApprovalBridge>,
+    ) -> Result<Option<ListenerHandle>, CordisError> {
+        let (Some(permit), Some(bridge)) = (runtime_permit, approval_bridge) else {
+            return Ok(None);
+        };
+        let expected_agent = permit.agent().clone();
+        let expected_session = session_id.clone();
+        let bridge = bridge.clone();
+        self.host
+            .context_mut()
+            .on_serial_with_options(
+                approval_events::APPROVAL_REQUEST,
+                EventOptions {
+                    prepend: true,
+                    global: false,
+                },
+                move |prompt| {
+                    let expected_agent = expected_agent.clone();
+                    let expected_session = expected_session.clone();
+                    let bridge = bridge.clone();
+                    async move {
+                        if !prompt.agent().is_same_lifecycle(&expected_agent)
+                            || prompt.session_id() != &expected_session
+                        {
+                            return Ok::<_, std::convert::Infallible>(BailOutcome::Continue(
+                                NonBail::Undefined,
+                            ));
+                        }
+                        Ok(BailOutcome::Bail(bridge.answer(&prompt).await))
+                    }
+                },
+            )
+            .map(Some)
     }
 
     async fn run_agent_turn_with_permit<A>(
@@ -977,10 +1247,14 @@ impl DesktopCordisCoordinator {
         adapter: A,
         cancellation: &LifecycleCancellation,
         runtime_permit: Option<&RuntimeDispatchPermit>,
+        approval_bridge: Option<&DesktopCordisApprovalBridge>,
     ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
     where
         A: LlmAdapter,
     {
+        if let Some(bridge) = approval_bridge {
+            bridge.clear();
+        }
         self.ensure_root_fiber_active()?;
         let sessions = self
             .host
@@ -1013,12 +1287,28 @@ impl DesktopCordisCoordinator {
             return Err(DesktopAgentTurnError::PersistenceUnavailable);
         }
 
+        let approval_registration = self.register_tool_approval_answerer(
+            &request.session_id,
+            runtime_permit,
+            approval_bridge,
+        )?;
         let provider = request.config.provider.clone();
-        let registration = register_llm_adapter(
+        let registration = match register_llm_adapter(
             self.host.context_mut(),
             [provider],
             DesktopPersistedLlmAdapter::new(adapter, sessions.clone(), request.resolved_model),
-        )?;
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                if let Some(registration) = approval_registration.as_ref() {
+                    registration.dispose();
+                }
+                if let Some(bridge) = approval_bridge {
+                    bridge.clear();
+                }
+                return Err(error.into());
+            }
+        };
         let outcome = match runtime_permit {
             Some(permit) => {
                 self.host
@@ -1041,6 +1331,12 @@ impl DesktopCordisCoordinator {
             }
         };
         registration.dispose();
+        if let Some(registration) = approval_registration.as_ref() {
+            registration.dispose();
+        }
+        if let Some(bridge) = approval_bridge {
+            bridge.clear();
+        }
         let flushed = sessions.flush(&session).await;
 
         match (outcome, flushed) {
@@ -2667,6 +2963,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::error::Error;
     use std::fmt::{self, Display};
     use std::sync::{
@@ -2695,8 +2992,9 @@ mod tests {
         SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted,
         SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
         SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
-        SurfaceOwner, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
-        invariant_missing, is_compact_checkpoint_source, keys, session_events,
+        SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason,
+        enforce_invariants, events, host_is_cordis_loop, invariant_missing,
+        is_compact_checkpoint_source, keys, register_tool_definition, session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -2710,8 +3008,8 @@ mod tests {
     };
 
     use super::{
-        DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisSlot,
-        DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
+        DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisApprovalBridge,
+        DesktopCordisSlot, DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
         DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
         DesktopHumanCommandDispatch, DesktopHumanCommandResult, bind_live_domain_kernel,
         bind_live_domain_kernel_scope, decode_event, dispatch_live_domain_command,
@@ -2802,6 +3100,81 @@ mod tests {
             },
             probe,
         )
+    }
+
+    #[derive(Clone)]
+    struct DesktopSequencedTurnAdapter {
+        turns: Arc<Mutex<VecDeque<Vec<SessionStreamChunk>>>>,
+    }
+
+    impl LlmAdapter for DesktopSequencedTurnAdapter {
+        fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+            Ok(LlmResolvedModel::new(provider, model))
+        }
+
+        fn stream(
+            &self,
+            _request: LlmGenerateRequest,
+        ) -> Result<LlmAdapterStream, SessionLlmFailure> {
+            let chunks = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one scripted Desktop response per Cordis step");
+            Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    fn desktop_tool_schema(name: &str) -> SessionToolSchema {
+        SessionToolSchema {
+            name: name.into(),
+            description: format!("{name} tool"),
+            parameters: serde_json::Map::from_iter([(
+                "type".into(),
+                serde_json::Value::String("object".into()),
+            )]),
+        }
+    }
+
+    fn desktop_tool_turn_adapter() -> DesktopSequencedTurnAdapter {
+        let first = vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::ToolCall,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::ToolCall {
+                    id: "desktop-call-1".into(),
+                    name: "desktop-ask-tool".into(),
+                    arguments: r#"{"secret":"must-not-reach-window"}"#.into(),
+                },
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::ToolCalls,
+                replay_state: None,
+            },
+        ];
+        let second = vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::Text {
+                    text: "approved tool completed".into(),
+                },
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                replay_state: None,
+            },
+        ];
+        DesktopSequencedTurnAdapter {
+            turns: Arc::new(Mutex::new(VecDeque::from([first, second]))),
+        }
     }
 
     fn desktop_turn_request() -> DesktopAgentTurnRequest {
@@ -2986,6 +3359,163 @@ mod tests {
             .unwrap();
         assert_eq!(restored.events().unwrap(), session.events().unwrap());
         assert_eq!(restored.derive_messages().unwrap(), messages);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused Desktop contract keeps exact Agent/Session binding, minimized prompt, dispatch, and durable decision evidence together"
+    )]
+    fn desktop_runtime_answers_exact_cordis_tool_ask_once_without_exposing_arguments() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
+        let tool_runs = Arc::new(AtomicUsize::new(0));
+        {
+            let tool_runs = Arc::clone(&tool_runs);
+            register_tool_definition(
+                live.context_mut(),
+                ToolDefinition::new(desktop_tool_schema("desktop-ask-tool"), move |_| {
+                    tool_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "completed": true }))
+                }),
+            )
+            .unwrap();
+        }
+        live.context_mut()
+            .on_waterfall(events::TOOLS_PRE_EXECUTE, |mut call: ToolCall, _next| {
+                call.decision = "ask".into();
+                call.result = "approve the exact Desktop tool call".into();
+                call
+            })
+            .unwrap();
+
+        let slot = Arc::new(DesktopCordisSlot::new(live));
+        let bridge_changes = Arc::new(Mutex::new(Vec::new()));
+        let bridge = {
+            let bridge_changes = Arc::clone(&bridge_changes);
+            DesktopCordisApprovalBridge::new(move |pending| {
+                bridge_changes.lock().unwrap().push(pending);
+            })
+        };
+        let expected_agent_id = Arc::new(Mutex::new(None::<String>));
+        let answer_bridge = bridge.clone();
+        let answer_expected_agent_id = Arc::clone(&expected_agent_id);
+        let answerer = thread::spawn(move || {
+            for _ in 0..200 {
+                if let Some(held) = answer_bridge.pending() {
+                    let expected = answer_expected_agent_id.lock().unwrap().clone().unwrap();
+                    assert_eq!(held.agent_id, expected);
+                    assert_eq!(held.session_id.as_str(), "desktop-agent-session");
+                    assert_ne!(held.agent_id, held.session_id.as_str());
+                    assert_eq!(held.tool_name(), "desktop-ask-tool");
+                    assert_eq!(held.call_id(), Some("desktop-call-1"));
+                    assert_eq!(held.reason(), Some("approve the exact Desktop tool call"));
+                    assert!(!format!("{held:?}").contains("must-not-reach-window"));
+                    let id = held.id().clone();
+                    answer_bridge.allow_once(&id).unwrap();
+                    return held;
+                }
+                thread::sleep(StdDuration::from_millis(5));
+            }
+            panic!("Desktop never received the Cordis approval request");
+        });
+
+        let execution_slot = Arc::clone(&slot);
+        let execution_bridge = bridge.clone();
+        let execution_agent_id = Arc::clone(&expected_agent_id);
+        let outcome = dispatch_live_runtime(
+            &slot,
+            runtime_scope(),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                *execution_agent_id.lock().unwrap() = Some(permit.agent().id.clone());
+                let mut coordinator = execution_slot.lock().unwrap();
+                futures_executor::block_on(coordinator.run_authorized_runtime_agent_turn(
+                    desktop_turn_request(),
+                    desktop_tool_turn_adapter(),
+                    &LifecycleCancellation::default(),
+                    permit,
+                    Some(&execution_bridge),
+                ))
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        let held = answerer.join().unwrap();
+
+        assert_eq!(outcome.steps(), 2);
+        assert_eq!(outcome.reason(), TurnEndReason::Completed);
+        assert_eq!(tool_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(*bridge_changes.lock().unwrap(), [true, false]);
+        assert!(bridge.pending().is_none());
+        let session = slot
+            .lock()
+            .unwrap()
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&held.session_id)
+            .unwrap()
+            .unwrap();
+        let events = session.events().unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ApprovalAsked { approval: asked }
+                    if asked.id() == held.id()
+                        && asked.tool_name() == "desktop-ask-tool"
+                        && asked.call_id() == Some("desktop-call-1")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ApprovalDecided { approval: decided }
+                    if decided.id() == held.id()
+                        && decided.outcome() == ApprovalOutcome::AllowedOnce
+            )
+        }));
+    }
+
+    #[test]
+    fn desktop_cordis_approval_id_mismatch_closes_the_held_request() {
+        let bridge_changes = Arc::new(Mutex::new(Vec::new()));
+        let bridge = {
+            let bridge_changes = Arc::clone(&bridge_changes);
+            DesktopCordisApprovalBridge::new(move |pending| {
+                bridge_changes.lock().unwrap().push(pending);
+            })
+        };
+        let held_id = ApprovalRequestId::new("held-approval").unwrap();
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        bridge.state.lock().unwrap().pending = Some(super::DesktopPendingCordisApproval {
+            request: super::DesktopHeldCordisApproval {
+                id: held_id,
+                agent_id: "runtime-agent".into(),
+                session_id: SessionId::new("mission-session").unwrap(),
+                tool_name: "desktop-ask-tool".into(),
+                call_id: Some("desktop-call-stale".into()),
+                reason: None,
+            },
+            answer: Some(answer),
+        });
+
+        assert_eq!(
+            bridge.allow_once(&ApprovalRequestId::new("stale-approval").unwrap()),
+            Err(super::DesktopCordisApprovalDecisionError::Mismatch)
+        );
+        assert_eq!(
+            futures_executor::block_on(answered).unwrap(),
+            ApprovalOutcome::Unavailable
+        );
+        assert!(bridge.pending().is_none());
+        assert_eq!(*bridge_changes.lock().unwrap(), [false]);
     }
 
     #[tokio::test]

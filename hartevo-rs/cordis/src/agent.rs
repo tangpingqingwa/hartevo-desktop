@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
+use crate::approval::{ApprovalError, ApprovalOutcome, ApprovalRequest, request_approval};
 use crate::compaction_automation::{
     ContextOverflowRecovery, compact_before_agent_step, recover_context_overflow,
 };
@@ -30,12 +31,12 @@ use crate::surface::{
     AgentRequestErrorAction, AgentStatusChange, AgentTurnStopping, AgentsSurface, DomainSurface,
     EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
     PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
-    ToolExecutionPreparation, ToolExecutionResult, ToolsSurface,
+    ToolExecutionPreparation, ToolExecutionResult, ToolPolicyPreparation, ToolsSurface,
     aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
-    dispatch_tool_execution_with_cancellation, events, finalize_tool_execution,
-    post_tool_execution, prepare_llm_call, prepare_tool_execution, register_agent,
-    run_tools_pipeline, schedule_tool_dispatch, settle_denied_tool_execution, stream_llm,
-    stream_llm_request, stream_prepared_llm,
+    dispatch_tool_execution_with_cancellation, events, finalize_allowed_tool_policy,
+    finalize_tool_execution, post_tool_execution, prepare_llm_call, prepare_tool_execution,
+    prepare_tool_policy, register_agent, run_tools_pipeline, schedule_tool_dispatch,
+    settle_denied_tool_execution, stream_llm, stream_llm_request, stream_prepared_llm,
 };
 
 /// DeepSeek Harness-compatible default bound for overlapping tool bodies.
@@ -832,7 +833,12 @@ pub async fn run_agent_turn(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
 ) -> Result<AgentTurnOutcome, CordisError> {
-    let agent = AgentRef::new(session_id.as_str());
+    let agents = ctx
+        .agents::<AgentsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::AGENTS.to_string()]))?;
+    let agent = agents
+        .get(session_id.as_str())?
+        .unwrap_or_else(|| AgentRef::new(session_id.as_str()));
     run_agent_turn_with_invariants(
         ctx,
         &agent,
@@ -1166,13 +1172,14 @@ async fn run_agent_turn_step(
                 if calls.is_empty() {
                     return Ok(Some(TurnEndReason::Completed));
                 }
-                let outcome = run_agent_tool_batch_with_limit_and_cancellation_outcome(
+                let outcome = run_agent_tool_batch_with_approval(
                     ctx,
                     &logged,
                     &mut recorded,
                     DEFAULT_MAX_PARALLEL_TOOL_CALLS,
                     cancellation,
-                )?;
+                )
+                .await?;
                 if cancellation.is_cancelled() {
                     return Ok(Some(cancelled_turn_reason(cancellation)));
                 }
@@ -1767,10 +1774,167 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
     }
     let inputs = prepare_agent_tool_calls(ctx, logged, recorded)?;
     recorded.tool_batch_state = AgentToolBatchState::Started;
-    let mut results = Vec::with_capacity(inputs.len());
     let tools = ctx
         .tools::<ToolsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let results = run_tool_scheduler(
+        ctx,
+        &tools,
+        &inputs,
+        max_parallel_tool_calls,
+        cancellation,
+        |ctx, index| prepare_tool_execution(ctx, inputs[index].clone()),
+    )?;
+    finish_agent_tool_batch(ctx, logged, recorded, &session, results)
+}
+
+/// Resolve every pre-execute policy in model order, durably answer `ask`
+/// decisions, then enter the unchanged bounded scheduler. No body starts while
+/// an earlier approval is unresolved; live guards and registration identity
+/// are still checked only when each call reaches its dispatch slot.
+async fn run_agent_tool_batch_with_approval(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+    max_parallel_tool_calls: usize,
+    cancellation: &LifecycleCancellation,
+) -> Result<AgentToolBatchOutcome, CordisError> {
+    if max_parallel_tool_calls == 0 {
+        return Err(invalid_stream_protocol("a positive parallel tool-call limit").into());
+    }
+    if matches!(recorded.tool_batch_state, AgentToolBatchState::Started)
+        || recorded.tool_results_committed
+    {
+        return Err(invalid_stream_protocol(
+            "one tool batch start per recorded stream without execution replay",
+        )
+        .into());
+    }
+    let request = logged.call().request();
+    let session = agent_session(ctx, request.session_id())?;
+    if !recorded.tool_result_seqs.is_empty()
+        || !durable_tool_results(&session, request.turn(), request.step())?.is_empty()
+    {
+        return Err(
+            invalid_stream_protocol("a fresh tool-result boundary before starting bodies").into(),
+        );
+    }
+    let inputs = prepare_agent_tool_calls(ctx, logged, recorded)?;
+    recorded.tool_batch_state = AgentToolBatchState::Started;
+    let mut policies = std::iter::repeat_with(|| None)
+        .take(inputs.len())
+        .collect::<Vec<_>>();
+    for (index, input) in inputs.iter().cloned().enumerate() {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let policy = prepare_tool_policy(ctx, input)?;
+        policies[index] = Some(match policy {
+            ToolPolicyPreparation::Ask(pending) => {
+                resolve_tool_approval(ctx, &session, request.agent(), pending, cancellation).await?
+            }
+            settled => settled,
+        });
+    }
+
+    let tools = ctx
+        .tools::<ToolsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let results = run_tool_scheduler(
+        ctx,
+        &tools,
+        &inputs,
+        max_parallel_tool_calls,
+        cancellation,
+        |ctx, index| {
+            let policy = policies
+                .get_mut(index)
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    invalid_stream_protocol("one resolved policy for every started tool call")
+                })?;
+            match policy {
+                ToolPolicyPreparation::Allow(allowed) => finalize_allowed_tool_policy(ctx, allowed),
+                ToolPolicyPreparation::Denied(denied) => {
+                    Ok(ToolExecutionPreparation::Denied(denied))
+                }
+                ToolPolicyPreparation::Ask(_) => Err(invalid_stream_protocol(
+                    "every tool approval to settle before body scheduling",
+                )
+                .into()),
+            }
+        },
+    )?;
+    finish_agent_tool_batch(ctx, logged, recorded, &session, results)
+}
+
+async fn resolve_tool_approval(
+    ctx: &mut Context,
+    session: &SessionHandle,
+    agent: &AgentRef,
+    pending: crate::surface::PendingToolApproval,
+    cancellation: &LifecycleCancellation,
+) -> Result<ToolPolicyPreparation, CordisError> {
+    let tool_name = pending.input().name().to_owned();
+    let call_id = pending.input().call_id().to_owned();
+    let Ok(mut request) = ApprovalRequest::for_session(
+        agent.clone(),
+        session.id().clone(),
+        tool_name.clone(),
+        cancellation.clone(),
+    )
+    .and_then(|request| request.with_call_id(call_id)) else {
+        return Ok(ToolPolicyPreparation::Denied(pending.deny(format!(
+            "tool \"{tool_name}\" requires approval, but no approval channel is available"
+        ))));
+    };
+    if let Some(reason) = pending.reason() {
+        let Ok(request_with_reason) = request.with_reason(reason) else {
+            return Ok(ToolPolicyPreparation::Denied(pending.deny(format!(
+                "tool \"{tool_name}\" requires approval, but no approval channel is available"
+            ))));
+        };
+        request = request_with_reason;
+    }
+    let outcome = match request_approval(ctx, session, request).await {
+        Ok(outcome) => outcome,
+        Err(ApprovalError::Cordis(error)) => return Err(error),
+        Err(ApprovalError::Session(error)) => return Err(error.into()),
+        Err(
+            ApprovalError::ServiceUnavailable { .. }
+            | ApprovalError::EmptyToolName
+            | ApprovalError::EmptyCallId
+            | ApprovalError::EmptyReason
+            | ApprovalError::AgentSessionMismatch { .. }
+            | ApprovalError::AgentUnavailable { .. },
+        ) => ApprovalOutcome::Unavailable,
+    };
+    Ok(match outcome {
+        ApprovalOutcome::AllowedOnce => ToolPolicyPreparation::Allow(pending.allow()),
+        ApprovalOutcome::Rejected => ToolPolicyPreparation::Denied(
+            pending.deny(format!("the user rejected tool \"{tool_name}\"")),
+        ),
+        ApprovalOutcome::Cancelled => ToolPolicyPreparation::Denied(
+            pending.deny(format!("approval for tool \"{tool_name}\" was cancelled")),
+        ),
+        ApprovalOutcome::Unavailable => ToolPolicyPreparation::Denied(pending.deny(format!(
+            "tool \"{tool_name}\" requires approval, but no approval channel is available"
+        ))),
+    })
+}
+
+fn run_tool_scheduler<F>(
+    ctx: &mut Context,
+    tools: &ToolsSurface,
+    inputs: &[ToolExecutionInput],
+    max_parallel_tool_calls: usize,
+    cancellation: &LifecycleCancellation,
+    mut prepare: F,
+) -> Result<Vec<ToolExecutionResult>, CordisError>
+where
+    F: FnMut(&mut Context, usize) -> Result<ToolExecutionPreparation, CordisError>,
+{
+    let mut results = Vec::with_capacity(inputs.len());
     let mut next = 0;
     while next < inputs.len() {
         if cancellation.is_cancelled() {
@@ -1783,7 +1947,7 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
             break;
         }
         if tools.execution_mode(&inputs[next]) == crate::surface::ToolExecutionMode::Exclusive {
-            let preparation = prepare_tool_execution(ctx, inputs[next].clone())?;
+            let preparation = prepare(ctx, next)?;
             let result = settle_tool_preparation(ctx, preparation, cancellation)?;
             results.push(result);
             next += 1;
@@ -1791,10 +1955,12 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
         }
         let outcome = run_parallel_tool_group(
             ctx,
-            &tools,
-            &inputs[next..],
+            tools,
+            inputs,
+            next,
             max_parallel_tool_calls,
             cancellation,
+            &mut prepare,
         )?;
         if outcome.consumed == 0 && !outcome.aborted {
             return Err(invalid_stream_protocol("the parallel scheduler to make progress").into());
@@ -1811,6 +1977,16 @@ pub fn run_agent_tool_batch_with_limit_and_cancellation_outcome(
             break;
         }
     }
+    Ok(results)
+}
+
+fn finish_agent_tool_batch(
+    ctx: &mut Context,
+    logged: &LoggedAgentCall,
+    recorded: &mut RecordedAgentStream,
+    session: &SessionHandle,
+    results: Vec<ToolExecutionResult>,
+) -> Result<AgentToolBatchOutcome, CordisError> {
     commit_agent_tool_results(ctx, logged, recorded, &results)?;
     let concludes_turn = results
         .iter()
@@ -1863,13 +2039,16 @@ fn run_parallel_tool_group(
     ctx: &mut Context,
     tools: &ToolsSurface,
     inputs: &[ToolExecutionInput],
+    start: usize,
     max_parallel_tool_calls: usize,
     cancellation: &LifecycleCancellation,
+    prepare: &mut impl FnMut(&mut Context, usize) -> Result<ToolExecutionPreparation, CordisError>,
 ) -> Result<ParallelToolGroupOutcome, CordisError> {
+    let group_inputs = &inputs[start..];
     std::thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel();
         let mut slots = std::iter::repeat_with(|| None)
-            .take(inputs.len())
+            .take(group_inputs.len())
             .collect::<Vec<_>>();
         let mut results = Vec::new();
         let mut next_to_start = 0;
@@ -1882,17 +2061,17 @@ fn run_parallel_tool_group(
         loop {
             while !aborted
                 && !barrier_reached
-                && next_to_start < inputs.len()
+                && next_to_start < group_inputs.len()
                 && in_flight < max_parallel_tool_calls
             {
                 if next_to_start > 0
-                    && tools.execution_mode(&inputs[next_to_start])
+                    && tools.execution_mode(&group_inputs[next_to_start])
                         != crate::surface::ToolExecutionMode::Parallel
                 {
                     barrier_reached = true;
                     break;
                 }
-                let preparation = prepare_tool_execution(ctx, inputs[next_to_start].clone())?;
+                let preparation = prepare(ctx, start + next_to_start)?;
                 match preparation {
                     ToolExecutionPreparation::Denied(denied) => {
                         slots[next_to_start] = Some(denied_tool_dispatch_outcome(denied));
