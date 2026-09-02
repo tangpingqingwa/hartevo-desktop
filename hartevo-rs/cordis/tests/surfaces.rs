@@ -87,6 +87,7 @@ fn mapped_keys_are_provided_and_looked_up() {
         MAPPED_KEYS,
         [
             keys::APPROVAL,
+            keys::SANDBOX_POLICY,
             keys::TOOLS,
             keys::SYSTEM_PROMPT,
             keys::LLM,
