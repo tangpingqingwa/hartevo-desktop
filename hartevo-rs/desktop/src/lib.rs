@@ -17,6 +17,7 @@ use hartevo_application::{
     ProjectEncryptionReadiness,
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
+use hartevo_cordis::{LifecycleCancellation, SessionCancelCause};
 use hartevo_domain_kernel::{
     AcceptanceCheck, CadenceTriggerKind, ConversationState, CreatorTaskStatus, KpiContract,
     KpiDirection, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
@@ -42,11 +43,14 @@ pub mod shopify_readback;
 mod visual_fixture;
 
 use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
+use cordis_host::{
+    DesktopHumanCommandDispatch, DesktopHumanCommandResult, is_desktop_human_command,
+};
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
     DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
-    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome,
-    DesktopMissionSubmission, DesktopOpenConversationRequest,
+    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
+    DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopOpenConversationRequest,
     DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
     DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
@@ -987,6 +991,8 @@ pub fn App() -> Element {
         (legacy_visual_streaming_fixture || visual_runtime_stop_available)
             .then(DesktopRuntimeCancellation::default)
     });
+    let mut human_command_cancellation = use_signal(|| None::<LifecycleCancellation>);
+    let mut human_command_result = use_signal(|| None::<DesktopHumanCommandResult>);
     let mut runtime_stop_requested = use_signal(|| false);
     let mut runtime_progress = use_signal(move || initial_runtime_progress);
     let mut runtime_execution_paint = use_signal(DesktopRuntimeExecutionPaintState::default);
@@ -1031,6 +1037,7 @@ pub fn App() -> Element {
             runtime_text_error.set(None);
             runtime_follow_latest.set(true);
             runtime_has_unseen.set(false);
+            human_command_result.set(None);
         }
         let selection_change = {
             let mut paint = runtime_execution_paint.write();
@@ -1242,6 +1249,24 @@ pub fn App() -> Element {
             selected_result_projection(project, mission, selected_result_id_value.as_ref())
         });
     let runtime_busy = mission_submitting() || runtime_retrying();
+    let human_command_running = human_command_cancellation.read().is_some();
+    let composer_human_command_feedback = {
+        let result = human_command_result.read();
+        result.as_ref().map(|result| match result {
+            DesktopHumanCommandResult::Success {
+                text,
+                source_event_seq,
+            } => (
+                false,
+                "Cordis Session 已更新",
+                text.clone(),
+                *source_event_seq,
+            ),
+            DesktopHumanCommandResult::Error { text } => {
+                (true, "Cordis 命令未执行", text.clone(), None)
+            }
+        })
+    };
     let selected_runtime_scope = project
         .as_ref()
         .zip(mission.as_ref())
@@ -1299,6 +1324,7 @@ pub fn App() -> Element {
     );
     let runtime_stop_available = execution_stop_available
         || runtime_cancellation.read().is_some()
+        || human_command_running
         || (visual_runtime_stop_available && runtime_fallback_scope_matches);
     let project_can_start_mission = view.can_start_mission();
     let evidence = view.product_evidence().cloned();
@@ -1482,6 +1508,8 @@ pub fn App() -> Element {
         || {
             if runtime_waiting_for_turn {
                 "Mission 与执行句柄已持久化，等待首个 Runtime turn"
+            } else if human_command_running {
+                "正在通过 Cordis 压缩当前 Session"
             } else if runtime_retrying() {
                 "正在安全恢复本地 Runtime"
             } else if vm11_next_contract_route_active {
@@ -1615,8 +1643,26 @@ pub fn App() -> Element {
                 )
         })
         && !runtime_busy;
-    let can_write_composer =
-        can_edit_catalog || can_edit_continuation || can_edit_human_confirmation;
+    let can_edit_human_command = !visual_fixture_mode
+        && project_can_start_mission
+        && mission.as_ref().is_some_and(|mission| {
+            matches!(
+                mission.stage,
+                MissionStage::Running
+                    | MissionStage::Blocked
+                    | MissionStage::WaitingUser
+                    | MissionStage::WaitingApproval
+                    | MissionStage::Scheduled
+                    | MissionStage::CycleReviewed
+            )
+        })
+        && !runtime_busy;
+    let composer_human_command = is_desktop_human_command(&draft());
+    let can_write_composer = can_edit_catalog
+        || can_edit_continuation
+        || can_edit_human_confirmation
+        || can_edit_human_command;
+    let can_submit_human_command = can_edit_human_command && composer_human_command;
     let can_submit_continuation = can_edit_continuation && !draft.read().trim().is_empty();
     let runtime_projection = match &view.backend {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
@@ -1663,12 +1709,16 @@ pub fn App() -> Element {
             }
             DesktopRuntimeStopDisposition::ScopeMismatch
             | DesktopRuntimeStopDisposition::NoActiveCommand => {
-                request_desktop_runtime_stop(
-                    runtime_cancellation.read().clone(),
-                    runtime_stop_requested,
-                    runtime_progress,
-                    visual_streaming_fixture,
-                );
+                if cancel_desktop_human_command(human_command_cancellation.read().as_ref()) {
+                    runtime_stop_requested.set(true);
+                } else {
+                    request_desktop_runtime_stop(
+                        runtime_cancellation.read().clone(),
+                        runtime_stop_requested,
+                        runtime_progress,
+                        visual_streaming_fixture,
+                    );
+                }
             }
         }
     };
@@ -2712,6 +2762,30 @@ pub fn App() -> Element {
                                         }
                                     }
                                 }
+                                if let Some((is_error, title, text, source_event_seq)) = &composer_human_command_feedback {
+                                    section {
+                                        class: if *is_error { "mission-intent-guidance human-command-error" } else { "mission-intent-guidance human-command-success" },
+                                        role: if *is_error { "alert" } else { "status" },
+                                        aria_live: if *is_error { "assertive" } else { "polite" },
+                                        i { img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" } }
+                                        span {
+                                            strong { "{title}" }
+                                            small {
+                                                "{text}"
+                                                if let Some(sequence) = source_event_seq {
+                                                    " · durable event #{sequence}"
+                                                }
+                                            }
+                                        }
+                                        button {
+                                            class: "mission-intent-guidance-dismiss",
+                                            aria_label: "关闭 Cordis 命令结果",
+                                            title: "关闭",
+                                            onclick: move |_| human_command_result.set(None),
+                                            UiIcon { name: UiIconName::X, size: 13 }
+                                        }
+                                    }
+                                }
                                 div { class: "composer-context",
                                     span { "{project_name} · {composer_target}" }
                                     div { class: "composer-context-actions",
@@ -3134,7 +3208,7 @@ pub fn App() -> Element {
                                     disabled: !can_write_composer,
                                     aria_label: "Operating Contract 目标、约束与停止条件",
                                     placeholder: if mission.is_some() {
-                                        if vm11_outcome_decision_active { "写下选择该动作的理由、风险与停止条件；正文只进入加密 Mission Conversation…" } else if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "继续当前 Mission，或写明纠正与新约束…" } else { "当前 Mission 状态不接受续写，或它是 legacy bootstrap" }
+                                        if vm11_outcome_decision_active { "写下选择该动作的理由、风险与停止条件；正文只进入加密 Mission Conversation…" } else if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "继续当前 Mission，或输入 /compact 压缩当前 Cordis Session…" } else if can_edit_human_command { "可输入 /compact 压缩当前 Cordis Session；普通续写仍需持久 Conversation" } else { "当前 Mission 状态不接受续写" }
                                     } else if project_can_start_mission {
                                         "写明目标、硬约束、非目标与停止条件…"
                                     } else {
@@ -3142,6 +3216,7 @@ pub fn App() -> Element {
                                     },
                                     onfocus: move |_| composer_expanded.set(true),
                                     oninput: move |event| {
+                                        human_command_result.set(None);
                                         draft.set(event.value());
                                         let _ = dioxus::document::eval(
                                             "const input = document.getElementById('mission-composer-input'); if (input) { input.style.height = 'auto'; input.style.height = `${Math.min(input.scrollHeight, 160)}px`; }",
@@ -3577,7 +3652,88 @@ pub fn App() -> Element {
                                             }
                                         }
                                         if !(runtime_busy && runtime_stop_available) {
-                                        if mission.is_some() {
+                                        if composer_human_command && mission.is_some() {
+                                            button {
+                                                id: "mission-composer-send",
+                                                class: "send-button",
+                                                disabled: !can_submit_human_command,
+                                                aria_label: "通过 Cordis 压缩当前持久 Session",
+                                                onclick: move |_| {
+                                                    let selection = {
+                                                        let model = model.read();
+                                                        model.selected_project_id.clone().zip(
+                                                            model.current_mission().map(|mission| {
+                                                                mission.mission_id.clone()
+                                                            }),
+                                                        )
+                                                    };
+                                                    let Some((project_id, mission_id)) = selection else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "WAITING_USER".into(),
+                                                            message: "当前没有可绑定 Cordis Session 的 Mission；未启动 Runtime。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let command_nonce = MissionConversationMessageId::new();
+                                                    let request = DesktopMissionHumanCommandRequest {
+                                                        project_id,
+                                                        mission_id,
+                                                        command_id: format!(
+                                                            "desktop-human-command:{}",
+                                                            command_nonce.as_str(),
+                                                        ),
+                                                        line: draft(),
+                                                    };
+                                                    let cancellation = LifecycleCancellation::default();
+                                                    human_command_result.set(None);
+                                                    human_command_cancellation.set(Some(cancellation.clone()));
+                                                    runtime_stop_requested.set(false);
+                                                    runtime_progress.set(Vec::new());
+                                                    mission_submitting.set(true);
+                                                    spawn(async move {
+                                                        let result = tokio::task::spawn_blocking(move || {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
+                                                                plane.dispatch_mission_human_command_cancellable_os(
+                                                                    request,
+                                                                    &cancellation,
+                                                                    Utc::now(),
+                                                                )
+                                                            })
+                                                        })
+                                                        .await;
+                                                        match result {
+                                                            Ok(Ok(DesktopHumanCommandDispatch::Handled(result))) => {
+                                                                let succeeded = matches!(
+                                                                    result,
+                                                                    DesktopHumanCommandResult::Success { .. }
+                                                                );
+                                                                human_command_result.set(Some(result));
+                                                                if succeeded {
+                                                                    draft.set(String::new());
+                                                                }
+                                                            }
+                                                            Ok(Ok(DesktopHumanCommandDispatch::NotCommand)) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "CORDIS_COMMAND_ROUTE_MISMATCH".into(),
+                                                                    message: "Composer 与 Cordis 命令解析结果不一致；未写入 Mission Conversation，也未启动普通续写。".into(),
+                                                                });
+                                                            }
+                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Err(_) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "CORDIS_COMMAND_COORDINATOR_FAILED".into(),
+                                                                    message: "Cordis 命令协调任务异常结束；持久 Session/Runtime ledger 保留原状态，未改写 Mission WorkProduct。".into(),
+                                                                });
+                                                            }
+                                                        }
+                                                        human_command_cancellation.set(None);
+                                                        runtime_stop_requested.set(false);
+                                                        mission_submitting.set(false);
+                                                    });
+                                                },
+                                                UiIcon { name: UiIconName::Refresh, size: 15 }
+                                            }
+                                        } else if mission.is_some() {
                                             if human_route_active {
                                                 if vm11_outcome_decision_active {
                                                     button {
@@ -4022,12 +4178,18 @@ pub fn App() -> Element {
                                                         }
                                                         DesktopRuntimeStopDisposition::ScopeMismatch
                                                         | DesktopRuntimeStopDisposition::NoActiveCommand => {
-                                                            request_desktop_runtime_stop(
-                                                                runtime_cancellation.read().clone(),
-                                                                runtime_stop_requested,
-                                                                runtime_progress,
-                                                                visual_streaming_fixture,
-                                                            );
+                                                            if cancel_desktop_human_command(
+                                                                human_command_cancellation.read().as_ref(),
+                                                            ) {
+                                                                runtime_stop_requested.set(true);
+                                                            } else {
+                                                                request_desktop_runtime_stop(
+                                                                    runtime_cancellation.read().clone(),
+                                                                    runtime_stop_requested,
+                                                                    runtime_progress,
+                                                                    visual_streaming_fixture,
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                 },
@@ -9191,6 +9353,14 @@ fn runtime_stream_matches_message(
         && stream.items[0].text == body
 }
 
+fn cancel_desktop_human_command(control: Option<&LifecycleCancellation>) -> bool {
+    let Some(control) = control else {
+        return false;
+    };
+    control.cancel_with(SessionCancelCause::User);
+    true
+}
+
 fn request_desktop_runtime_stop(
     control: Option<DesktopRuntimeCancellation>,
     mut stop_requested: Signal<bool>,
@@ -10665,6 +10835,16 @@ mod tests {
     }
 
     #[test]
+    fn composer_human_command_cancellation_is_shared_and_typed() {
+        let cancellation = LifecycleCancellation::default();
+        assert!(!cancellation.is_cancelled());
+        assert!(cancel_desktop_human_command(Some(&cancellation)));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(cancellation.cause(), Some(SessionCancelCause::User));
+        assert!(!cancel_desktop_human_command(None));
+    }
+
+    #[test]
     fn prototype_token_sheet_keeps_source_colors_breakpoints_and_accessibility() {
         let css = include_str!("../assets/prototype.css");
         for token in [
@@ -10709,6 +10889,9 @@ mod tests {
             "mission-composer-stop",
             "event.data.is_composing()",
             "continue_mission_and_run_cancellable_os",
+            "dispatch_mission_human_command_cancellable_os",
+            "is_desktop_human_command",
+            "human-command-success",
         ] {
             assert!(
                 source.contains(contract),

@@ -3118,21 +3118,17 @@ impl DesktopDataPlane {
     /// Offer one composer line to the Desktop human-command surface. The
     /// adapter is lazy: usage errors and true no-op compactions do not open or
     /// start an Application Runtime.
-    #[allow(
-        dead_code,
-        reason = "the following Dioxus composer slice calls this production Cordis command seam"
-    )]
-    pub(crate) fn dispatch_mission_human_command_os(
+    pub(crate) fn dispatch_mission_human_command_cancellable_os(
         &self,
         request: DesktopMissionHumanCommandRequest,
+        cancellation: &LifecycleCancellation,
         now: DateTime<Utc>,
     ) -> Result<DesktopHumanCommandDispatch, DesktopDataError> {
         let secret_store = Arc::new(OsSecretStore::new(OS_SECRET_SERVICE)?);
         let runtime = discover_runtime()
             .configuration
             .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration)));
-        let cancellation = LifecycleCancellation::default();
-        self.dispatch_mission_human_command_with(secret_store, request, runtime, &cancellation, now)
+        self.dispatch_mission_human_command_with(secret_store, request, runtime, cancellation, now)
     }
 
     fn dispatch_mission_human_command_with<S>(
