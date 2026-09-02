@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -12,14 +12,15 @@ use command_group::{Signal, UnixChildExt as _};
 #[cfg(test)]
 use hartevo_cordis::Context;
 use hartevo_cordis::{
-    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, CordisError, CordisHost, JobControl,
-    JobOutcome, JobSnapshot, JobTerminalStatus, JobsSurface, LifecycleCancellation,
-    SandboxEnforcement, SandboxError, SandboxExecutionEnvironment, SandboxExecutionPlan,
-    SandboxMode, SandboxPolicyRequest, SandboxProcessClassification, SandboxProvider,
-    SandboxProviderUnavailable, SandboxRunnerFailureRule, SessionContentBlock, SessionToolSchema,
-    ToolDefinition, ToolRunContext, classify_sandbox_process, consume_sandbox_escalation_approval,
-    events, plan_sandbox_escalation_approval, register_sandbox_provider, register_tool_definition,
-    validate_sandbox_escalation_args,
+    AgentTurnStopping, BailOutcome, ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy,
+    CordisError, CordisHost, JobControl, JobOutcome, JobSnapshot, JobTerminalStatus, JobsSurface,
+    LifecycleCancellation, NonBail, SandboxEnforcement, SandboxError, SandboxExecutionEnvironment,
+    SandboxExecutionPlan, SandboxMode, SandboxPolicyRequest, SandboxProcessClassification,
+    SandboxProvider, SandboxProviderUnavailable, SandboxRunnerFailureRule, SessionContentBlock,
+    SessionId, SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
+    SessionToolSchema, ToolDefinition, ToolRunContext, classify_sandbox_process,
+    consume_sandbox_escalation_approval, events, plan_sandbox_escalation_approval,
+    register_sandbox_provider, register_tool_definition, validate_sandbox_escalation_args,
 };
 use thiserror::Error;
 
@@ -180,6 +181,7 @@ struct SandboxProcessLimits {
 struct SandboxProcessIo<'a> {
     managed_environment: &'a [(&'a str, &'a str)],
     stdin: Option<Vec<u8>>,
+    live_output: Option<BackgroundBashOutput>,
 }
 
 impl<'a> SandboxProcessIo<'a> {
@@ -187,7 +189,13 @@ impl<'a> SandboxProcessIo<'a> {
         Self {
             managed_environment,
             stdin: None,
+            live_output: None,
         }
+    }
+
+    fn with_live_output(mut self, live_output: BackgroundBashOutput) -> Self {
+        self.live_output = Some(live_output);
+        self
     }
 
     #[cfg(test)]
@@ -195,7 +203,79 @@ impl<'a> SandboxProcessIo<'a> {
         Self {
             managed_environment: &[],
             stdin: Some(stdin),
+            live_output: None,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BackgroundOutputStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Default)]
+struct BackgroundBashOutputState {
+    stdout: Vec<u8>,
+    stdout_truncated: bool,
+    stderr: Vec<u8>,
+    stderr_truncated: bool,
+}
+
+#[derive(Clone, Default)]
+struct BackgroundBashOutput {
+    state: Arc<Mutex<BackgroundBashOutputState>>,
+}
+
+impl BackgroundBashOutput {
+    fn push(&self, stream: BackgroundOutputStream, chunk: &[u8]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match stream {
+            BackgroundOutputStream::Stdout => {
+                if state.stdout.len().saturating_add(chunk.len()) > SANDBOX_PROCESS_OUTPUT_BYTES {
+                    state.stdout_truncated = true;
+                }
+                retain_tail(&mut state.stdout, chunk, SANDBOX_PROCESS_OUTPUT_BYTES);
+            }
+            BackgroundOutputStream::Stderr => {
+                if state.stderr.len().saturating_add(chunk.len()) > SANDBOX_PROCESS_OUTPUT_BYTES {
+                    state.stderr_truncated = true;
+                }
+                retain_tail(&mut state.stderr, chunk, SANDBOX_PROCESS_OUTPUT_BYTES);
+            }
+        }
+    }
+
+    fn read(&self) -> String {
+        let (stdout, stdout_truncated, stderr, stderr_truncated) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                std::mem::take(&mut state.stdout),
+                std::mem::take(&mut state.stdout_truncated),
+                std::mem::take(&mut state.stderr),
+                std::mem::take(&mut state.stderr_truncated),
+            )
+        };
+        let mut sections = Vec::new();
+        if !stdout.is_empty() {
+            sections.push(String::from_utf8_lossy(&stdout).into_owned());
+        }
+        if !stderr.is_empty() {
+            sections.push(format!("[stderr]\n{}", String::from_utf8_lossy(&stderr)));
+        }
+        if stdout_truncated {
+            sections.push("[stdout incremental output truncated; retained tail shown]".into());
+        }
+        if stderr_truncated {
+            sections.push("[stderr incremental output truncated; retained tail shown]".into());
+        }
+        sections.join("\n")
     }
 }
 
@@ -271,6 +351,40 @@ pub(crate) fn mount_macos_sandboxed_bash_tool(host: &mut CordisHost) -> Result<(
         .context()
         .jobs::<JobsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec!["jobs".into()]))?;
+    let sessions = host
+        .context()
+        .sessions::<SessionStore>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec!["sessions".into()]))?;
+    let notice_jobs = Arc::clone(&jobs);
+    host.context_mut().on_serial(
+        events::AGENT_TURN_STOPPING,
+        move |stopping: Arc<AgentTurnStopping>| {
+            let notices = notice_jobs.claim_unreported_terminal(stopping.agent());
+            for notice in notices {
+                let Ok(session_id) = SessionId::new(notice.owner_session()) else {
+                    continue;
+                };
+                let Ok(Some(session)) = sessions.get(&session_id) else {
+                    continue;
+                };
+                let _ = session.inbox().append_next_step(SessionMessage {
+                    id: format!("job:{}:completion", notice.id()),
+                    role: SessionMessageRole::User,
+                    content: vec![SessionContentBlock::Text {
+                        text: background_job_completion_notice(&notice),
+                    }],
+                    source: SessionMessageSource::Plugin {
+                        plugin: "tool-jobs".into(),
+                        compaction_id: None,
+                        source_command_id: None,
+                    },
+                });
+            }
+            std::future::ready(Ok::<_, std::convert::Infallible>(BailOutcome::Continue(
+                NonBail::Undefined,
+            )))
+        },
+    )?;
     let disposed_jobs = Arc::clone(&jobs);
     host.context_mut()
         .on_emit(events::AGENT_DISPOSED, move |agent| {
@@ -418,6 +532,9 @@ fn run_sandboxed_process_in_environment_with_limits(
         stdout,
         limits.output_bytes,
         limits.output_spill_bytes,
+        io.live_output
+            .clone()
+            .map(|output| (output, BackgroundOutputStream::Stdout)),
     )
     .map_err(|source| {
         terminate_group_best_effort(&mut child);
@@ -428,6 +545,9 @@ fn run_sandboxed_process_in_environment_with_limits(
         stderr,
         limits.output_bytes,
         limits.output_spill_bytes,
+        io.live_output
+            .clone()
+            .map(|output| (output, BackgroundOutputStream::Stderr)),
     ) {
         Ok(reader) => reader,
         Err(source) => {
@@ -810,7 +930,7 @@ fn background_job_kill_definition(jobs: Arc<JobsSurface>) -> ToolDefinition {
 pub(crate) fn background_job_output_schema() -> SessionToolSchema {
     SessionToolSchema {
         name: "job_output".into(),
-        description: "Read a background job. Set wait to block until it settles or the bounded timeout expires; a timed-out wait leaves the job running.".into(),
+        description: "Read output produced by a background job since the prior read. Set wait to block until it settles or the bounded timeout expires; a timed-out wait leaves the job running.".into(),
         parameters: serde_json::Map::from_iter([
             ("type".into(), serde_json::json!("object")),
             ("additionalProperties".into(), serde_json::json!(false)),
@@ -973,6 +1093,18 @@ fn background_job_status_line(
         ))
 }
 
+fn background_job_completion_notice(job: &JobSnapshot) -> String {
+    let detail = job
+        .detail()
+        .map_or_else(String::new, |detail| format!(", {detail}"));
+    format!(
+        "Background job {} ({}) finished [status: {}{detail}]. Read its new output with job_output.",
+        job.id(),
+        job.kind(),
+        job.status().as_str(),
+    )
+}
+
 fn execute_sandboxed_bash(
     environment: &SandboxExecutionEnvironment,
     jobs: &Arc<JobsSurface>,
@@ -1009,52 +1141,14 @@ fn execute_sandboxed_bash(
         policy_request = policy_request.with_escalation(escalation);
     }
     if arguments.run_in_background {
-        if run.cancellation().is_cancelled() {
-            return Err("tool call cancelled".into());
-        }
-        let job_environment = environment.clone();
-        let job_command = arguments.command.clone();
-        let job_session_id = run.session_id().as_str().to_string();
-        let job_id = jobs
-            .start(
-                run.session_id(),
-                run.agent(),
-                "bash",
-                arguments.command,
-                move |completion| {
-                    let cancellation = LifecycleCancellation::default();
-                    let worker_cancellation = cancellation.clone();
-                    thread::Builder::new()
-                        .name("hartevo-background-bash".into())
-                        .spawn(move || {
-                            let managed_environment = [
-                                ("DSH_SHELL", "1"),
-                                ("DSH_SESSION_ID", job_session_id.as_str()),
-                            ];
-                            let outcome = run_sandboxed_process_in_environment_with_limits(
-                                &job_environment,
-                                vec![
-                                    OsString::from("/bin/bash"),
-                                    OsString::from("-c"),
-                                    OsString::from(job_command),
-                                ],
-                                policy_request,
-                                Some(&working_directory),
-                                SandboxProcessIo::closed(&managed_environment),
-                                &worker_cancellation,
-                                SandboxProcessLimits::without_timeout(),
-                            );
-                            let _ = completion.complete(background_bash_job_outcome(outcome));
-                        })
-                        .map_err(|error| error.to_string())?;
-                    Ok(JobControl::new(move |_| cancellation.cancel()))
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        return Ok(serde_json::json!({
-            "kind": "background",
-            "jobId": job_id.as_str(),
-        }));
+        return execute_background_bash(
+            environment,
+            jobs,
+            run,
+            arguments.command,
+            policy_request,
+            working_directory,
+        );
     }
     let managed_environment = [
         ("DSH_SHELL", "1"),
@@ -1080,12 +1174,72 @@ fn execute_sandboxed_bash(
     Ok(sandboxed_bash_result(&outcome))
 }
 
+fn execute_background_bash(
+    environment: &SandboxExecutionEnvironment,
+    jobs: &Arc<JobsSurface>,
+    run: &ToolRunContext,
+    command: String,
+    policy_request: SandboxPolicyRequest,
+    working_directory: PathBuf,
+) -> Result<serde_json::Value, String> {
+    if run.cancellation().is_cancelled() {
+        return Err("tool call cancelled".into());
+    }
+    let job_environment = environment.clone();
+    let job_command = command.clone();
+    let job_session_id = run.session_id().as_str().to_string();
+    let job_id = jobs
+        .start(
+            run.session_id(),
+            run.agent(),
+            "bash",
+            command,
+            move |completion| {
+                let cancellation = LifecycleCancellation::default();
+                let worker_cancellation = cancellation.clone();
+                let live_output = BackgroundBashOutput::default();
+                let worker_output = live_output.clone();
+                thread::Builder::new()
+                    .name("hartevo-background-bash".into())
+                    .spawn(move || {
+                        let managed_environment = [
+                            ("DSH_SHELL", "1"),
+                            ("DSH_SESSION_ID", job_session_id.as_str()),
+                        ];
+                        let outcome = run_sandboxed_process_in_environment_with_limits(
+                            &job_environment,
+                            vec![
+                                OsString::from("/bin/bash"),
+                                OsString::from("-c"),
+                                OsString::from(job_command),
+                            ],
+                            policy_request,
+                            Some(&working_directory),
+                            SandboxProcessIo::closed(&managed_environment)
+                                .with_live_output(worker_output),
+                            &worker_cancellation,
+                            SandboxProcessLimits::without_timeout(),
+                        );
+                        let _ = completion.complete(background_bash_job_outcome(outcome));
+                    })
+                    .map_err(|error| error.to_string())?;
+                Ok(JobControl::new(move |_| cancellation.cancel())
+                    .with_output_reader(move || live_output.read()))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "kind": "background",
+        "jobId": job_id.as_str(),
+    }))
+}
+
 fn background_bash_job_outcome(
     outcome: Result<SandboxedProcessOutcome, SandboxProcessError>,
 ) -> JobOutcome {
     match outcome {
         Ok(outcome) => {
-            let output = sandboxed_bash_output_for_outcome(&outcome);
+            let output = sandboxed_bash_terminal_output_for_outcome(&outcome);
             if outcome.termination == SandboxProcessTermination::Cancelled
                 || outcome.signal.is_some()
             {
@@ -1268,7 +1422,7 @@ fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value
         Some(SandboxEnforcement::Full) => "full",
         Some(SandboxEnforcement::Partial) => "partial",
     };
-    let output = sandboxed_bash_output(outcome, classification, enforcement);
+    let output = sandboxed_bash_output(outcome, classification, enforcement, true);
     let mut result = serde_json::json!({
         "output": output,
         "exitCode": outcome.exit_code,
@@ -1292,7 +1446,7 @@ fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value
     result
 }
 
-fn sandboxed_bash_output_for_outcome(outcome: &SandboxedProcessOutcome) -> String {
+fn sandboxed_bash_terminal_output_for_outcome(outcome: &SandboxedProcessOutcome) -> String {
     let classification = match outcome.classification.as_ref() {
         None => "unconfined",
         Some(SandboxProcessClassification::Success) => "success",
@@ -1306,19 +1460,20 @@ fn sandboxed_bash_output_for_outcome(outcome: &SandboxedProcessOutcome) -> Strin
         Some(SandboxEnforcement::Full) => "full",
         Some(SandboxEnforcement::Partial) => "partial",
     };
-    sandboxed_bash_output(outcome, classification, enforcement)
+    sandboxed_bash_output(outcome, classification, enforcement, false)
 }
 
 fn sandboxed_bash_output(
     outcome: &SandboxedProcessOutcome,
     classification: &str,
     enforcement: &str,
+    include_process_output: bool,
 ) -> String {
     let mut sections = Vec::new();
-    if !outcome.stdout.bytes.is_empty() {
+    if include_process_output && !outcome.stdout.bytes.is_empty() {
         sections.push(String::from_utf8_lossy(&outcome.stdout.bytes).into_owned());
     }
-    if !outcome.stderr.bytes.is_empty() {
+    if include_process_output && !outcome.stderr.bytes.is_empty() {
         sections.push(format!(
             "[stderr]\n{}",
             String::from_utf8_lossy(&outcome.stderr.bytes)
@@ -1504,14 +1659,15 @@ fn spawn_output_collector<R>(
     reader: R,
     maximum: usize,
     spill_maximum: usize,
+    live_output: Option<(BackgroundBashOutput, BackgroundOutputStream)>,
 ) -> io::Result<JoinHandle<io::Result<SandboxProcessOutput>>>
 where
     R: Read + Send + 'static,
 {
     let label = name.to_string();
-    thread::Builder::new()
-        .name(label.clone())
-        .spawn(move || collect_output_tail(reader, maximum, spill_maximum, &label))
+    thread::Builder::new().name(label.clone()).spawn(move || {
+        collect_output_tail(reader, maximum, spill_maximum, &label, live_output.as_ref())
+    })
 }
 
 struct OutputSpill {
@@ -1560,6 +1716,7 @@ fn collect_output_tail(
     maximum: usize,
     spill_maximum: usize,
     label: &str,
+    live_output: Option<&(BackgroundBashOutput, BackgroundOutputStream)>,
 ) -> io::Result<SandboxProcessOutput> {
     let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
     let mut byte_count = 0_u64;
@@ -1574,6 +1731,9 @@ fn collect_output_tail(
             Err(error) => return Err(error),
         };
         let chunk = &buffer[..read];
+        if let Some((output, stream)) = live_output {
+            output.push(*stream, chunk);
+        }
         byte_count = byte_count.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         if !spill_disabled {
             if byte_count > u64::try_from(spill_maximum).unwrap_or(u64::MAX) {
@@ -1744,7 +1904,8 @@ mod tests {
     };
 
     use super::{
-        MacosSeatbeltSandboxProvider, SANDBOX_PROCESS_OUTPUT_SPILL_BYTES, SEATBELT_EXEC,
+        BackgroundBashOutput, BackgroundOutputStream, MacosSeatbeltSandboxProvider,
+        SANDBOX_PROCESS_OUTPUT_BYTES, SANDBOX_PROCESS_OUTPUT_SPILL_BYTES, SEATBELT_EXEC,
         SEATBELT_READ_ONLY_PROFILE, SandboxProcessError, SandboxProcessLimits,
         SandboxProcessTermination, collect_output_tail, configure_bash_environment,
         mount_macos_sandbox_provider, resolve_bash_timeout, resolve_bash_workdir,
@@ -2519,8 +2680,14 @@ mod tests {
 
     #[test]
     fn output_spill_is_lazy_and_drops_an_over_cap_partial_file() {
-        let exact =
-            collect_output_tail(std::io::Cursor::new(b"0123456789"), 10, 16, "exact-cap").unwrap();
+        let exact = collect_output_tail(
+            std::io::Cursor::new(b"0123456789"),
+            10,
+            16,
+            "exact-cap",
+            None,
+        )
+        .unwrap();
         assert!(!exact.truncated);
         assert_eq!(exact.bytes, b"0123456789");
         assert!(exact.spill_path.is_none());
@@ -2530,6 +2697,7 @@ mod tests {
             10,
             16,
             "bounded-spill",
+            None,
         )
         .unwrap();
         assert!(spilled.truncated);
@@ -2545,11 +2713,29 @@ mod tests {
             10,
             16,
             "over-cap",
+            None,
         )
         .unwrap();
         assert!(over_cap.truncated);
         assert_eq!(over_cap.bytes, b"789abcdefg");
         assert!(over_cap.spill_path.is_none());
+    }
+
+    #[test]
+    fn background_output_reads_each_chunk_once_and_bounds_unread_bytes() {
+        let output = BackgroundBashOutput::default();
+        output.push(BackgroundOutputStream::Stdout, b"first");
+        assert_eq!(output.read(), "first");
+        assert!(output.read().is_empty());
+
+        output.push(BackgroundOutputStream::Stderr, b"second");
+        assert_eq!(output.read(), "[stderr]\nsecond");
+        let over_cap = vec![b'x'; SANDBOX_PROCESS_OUTPUT_BYTES + 1];
+        output.push(BackgroundOutputStream::Stdout, &over_cap);
+        let bounded = output.read();
+        assert_eq!(bounded.matches('x').count(), SANDBOX_PROCESS_OUTPUT_BYTES);
+        assert!(bounded.contains("[stdout incremental output truncated; retained tail shown]"));
+        assert!(output.read().is_empty());
     }
 
     #[cfg(unix)]

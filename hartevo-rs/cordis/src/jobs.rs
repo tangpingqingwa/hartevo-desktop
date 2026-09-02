@@ -168,7 +168,7 @@ impl JobSnapshot {
     }
 }
 
-/// Output plus the state observed by the same locked read.
+/// Newly consumed output plus the state observed immediately afterward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRead {
     output: String,
@@ -225,6 +225,8 @@ pub enum JobError {
     MissingController { id: String },
     #[error("background job `{id}` cancellation panicked")]
     CancellationPanicked { id: String },
+    #[error("background job `{id}` output reader panicked")]
+    OutputReadPanicked { id: String },
     #[error("background job wait was cancelled")]
     WaitCancelled,
     #[error("background job registry is shutting down")]
@@ -237,10 +239,12 @@ pub enum JobError {
 
 /// Producer-owned cancellation entry point retained by Cordis after start.
 type JobCancelCallback = dyn Fn(Option<&str>) + Send + Sync;
+type JobOutputCallback = dyn Fn() -> String + Send + Sync;
 
 #[derive(Clone)]
 pub struct JobControl {
     cancel: Arc<JobCancelCallback>,
+    read_output: Option<Arc<JobOutputCallback>>,
 }
 
 impl JobControl {
@@ -251,7 +255,18 @@ impl JobControl {
     {
         Self {
             cancel: Arc::new(cancel),
+            read_output: None,
         }
+    }
+
+    /// Attach a consuming reader for output produced since the prior read.
+    #[must_use]
+    pub fn with_output_reader<F>(mut self, read_output: F) -> Self
+    where
+        F: Fn() -> String + Send + Sync + 'static,
+    {
+        self.read_output = Some(Arc::new(read_output));
+        self
     }
 
     fn cancel(&self, reason: Option<&str>) {
@@ -267,11 +282,14 @@ impl fmt::Debug for JobControl {
 
 struct JobRecordState {
     published: bool,
+    reported: bool,
+    waiters: usize,
     status: JobStatus,
     detail: Option<String>,
     output: Option<String>,
     finished_at_ms: Option<u64>,
     control: Option<JobControl>,
+    read_output: Option<Arc<JobOutputCallback>>,
 }
 
 struct JobRecord {
@@ -463,6 +481,9 @@ impl JobsSurface {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                record_state.read_output = control
+                    .as_ref()
+                    .and_then(|control| control.read_output.clone());
                 if !record_state.status.is_terminal() {
                     record_state.control = control.take();
                 }
@@ -540,11 +561,14 @@ impl JobsSurface {
             started_at_ms: unix_time_ms(),
             state: Mutex::new(JobRecordState {
                 published: false,
+                reported: false,
+                waiters: 0,
                 status: JobStatus::Running,
                 detail: None,
                 output: None,
                 finished_at_ms: None,
                 control: None,
+                read_output: None,
             }),
             changed: Condvar::new(),
         });
@@ -582,11 +606,35 @@ impl JobsSurface {
 
     pub fn read(&self, id: &str, owner: &SessionId) -> Result<JobRead, JobError> {
         let record = self.owned_record(id, owner)?;
-        let state = record
+        let read_output = record
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read_output
+            .clone();
+        let incremental = read_output
+            .map(|read_output| {
+                catch_unwind(AssertUnwindSafe(|| read_output())).map_err(|_| {
+                    JobError::OutputReadPanicked {
+                        id: record.id.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let mut state = record
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let output = if state.status.is_terminal() {
+        let output = if let Some(mut incremental) = incremental {
+            if state.status.is_terminal() {
+                state.reported = true;
+                if let Some(terminal) = state.output.take() {
+                    append_output(&mut incremental, &terminal);
+                }
+            }
+            incremental
+        } else if state.status.is_terminal() {
+            state.reported = true;
             state.output.clone().unwrap_or_default()
         } else {
             String::new()
@@ -618,8 +666,14 @@ impl JobsSurface {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.status.is_terminal() {
+            state.reported = true;
+            return Ok(record.snapshot_with(&state));
+        }
+        state.waiters = state.waiters.saturating_add(1);
         while !state.status.is_terminal() {
             if cancellation.is_cancelled() {
+                state.waiters = state.waiters.saturating_sub(1);
                 return Err(JobError::WaitCancelled);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -631,6 +685,10 @@ impl JobsSurface {
             let (next, _) = waited.unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
         }
+        state.waiters = state.waiters.saturating_sub(1);
+        if state.status.is_terminal() {
+            state.reported = true;
+        }
         Ok(record.snapshot_with(&state))
     }
 
@@ -641,6 +699,7 @@ impl JobsSurface {
         reason: Option<&str>,
     ) -> Result<JobKillOutcome, JobError> {
         let record = self.owned_record(id, owner)?;
+        mark_reported(&record);
         request_stop(&record, reason).map(|requested| {
             if requested {
                 JobKillOutcome::Requested
@@ -648,6 +707,25 @@ impl JobsSurface {
                 JobKillOutcome::AlreadyFinished
             }
         })
+    }
+
+    /// Atomically claim terminal notices owned by one exact live Agent.
+    #[must_use]
+    pub fn claim_unreported_terminal(&self, owner_agent: &AgentRef) -> Vec<JobSnapshot> {
+        self.records_for_agent(owner_agent)
+            .into_iter()
+            .filter_map(|record| {
+                let mut state = record
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !state.published || !state.status.is_terminal() || state.reported {
+                    return None;
+                }
+                state.reported = true;
+                Some(record.snapshot_with(&state))
+            })
+            .collect()
     }
 
     /// Cancel jobs attached to one exact disposed Agent lifecycle, boundedly
@@ -773,8 +851,17 @@ fn request_stop(record: &Arc<JobRecord>, reason: Option<&str>) -> Result<bool, J
 
 fn stop_records(records: &[Arc<JobRecord>], reason: &str) {
     for record in records {
+        mark_reported(record);
         let _ = request_stop(record, Some(reason));
     }
+}
+
+fn mark_reported(record: &Arc<JobRecord>) {
+    record
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reported = true;
 }
 
 fn wait_for_records(records: &[Arc<JobRecord>], timeout: Duration) -> bool {
@@ -814,10 +901,23 @@ fn settle_record(record: &Arc<JobRecord>, outcome: JobOutcome) -> bool {
     state.detail = outcome.detail;
     state.output = outcome.output;
     state.finished_at_ms = Some(unix_time_ms());
+    if state.waiters > 0 {
+        state.reported = true;
+    }
     state.control = None;
     drop(state);
     record.changed.notify_all();
     true
+}
+
+fn append_output(output: &mut String, addition: &str) {
+    if addition.is_empty() {
+        return;
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(addition);
 }
 
 fn unix_time_ms() -> u64 {
