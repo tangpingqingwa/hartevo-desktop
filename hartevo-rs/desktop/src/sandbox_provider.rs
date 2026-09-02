@@ -22,7 +22,8 @@ use thiserror::Error;
 const SEATBELT_EXEC: &str = "/usr/bin/sandbox-exec";
 const SEATBELT_READ_ONLY_PROFILE: &str =
     "(version 1) (allow default) (deny file-write*) (allow file-write* (literal \"/dev/null\"))";
-const SANDBOX_PROCESS_TIMEOUT: Duration = Duration::from_mins(2);
+const SANDBOX_PROCESS_TIMEOUT_MS: f64 = 120_000.0;
+const SANDBOX_PROCESS_MAX_TIMEOUT_MS: f64 = 600_000.0;
 const SANDBOX_PROCESS_OUTPUT_BYTES: usize = 64_000;
 const SANDBOX_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -53,6 +54,7 @@ impl std::fmt::Debug for SandboxProcessOutput {
 pub(crate) struct SandboxedProcessOutcome {
     pub(crate) exit_code: Option<i32>,
     pub(crate) termination: SandboxProcessTermination,
+    pub(crate) timeout_ms: f64,
     pub(crate) mode: SandboxMode,
     pub(crate) enforcement: Option<SandboxEnforcement>,
     pub(crate) classification: Option<SandboxProcessClassification>,
@@ -66,6 +68,7 @@ impl std::fmt::Debug for SandboxedProcessOutcome {
             .debug_struct("SandboxedProcessOutcome")
             .field("exit_code", &self.exit_code)
             .field("termination", &self.termination)
+            .field("timeout_ms", &self.timeout_ms)
             .field("mode", &self.mode)
             .field("enforcement", &self.enforcement)
             .field("classification", &self.classification)
@@ -120,17 +123,44 @@ impl SandboxProcessError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedBashTimeout {
+    duration: Duration,
+    milliseconds: f64,
+}
+
+impl Default for ResolvedBashTimeout {
+    fn default() -> Self {
+        Self {
+            duration: Duration::from_mins(2),
+            milliseconds: SANDBOX_PROCESS_TIMEOUT_MS,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SandboxProcessLimits {
     timeout: Duration,
+    timeout_ms: f64,
     output_bytes: usize,
     poll_interval: Duration,
+}
+
+impl SandboxProcessLimits {
+    fn with_timeout(timeout: ResolvedBashTimeout) -> Self {
+        Self {
+            timeout: timeout.duration,
+            timeout_ms: timeout.milliseconds,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for SandboxProcessLimits {
     fn default() -> Self {
         Self {
-            timeout: SANDBOX_PROCESS_TIMEOUT,
+            timeout: ResolvedBashTimeout::default().duration,
+            timeout_ms: SANDBOX_PROCESS_TIMEOUT_MS,
             output_bytes: SANDBOX_PROCESS_OUTPUT_BYTES,
             poll_interval: SANDBOX_PROCESS_POLL_INTERVAL,
         }
@@ -193,6 +223,7 @@ pub(crate) fn run_sandboxed_process(
     run_sandboxed_process_in_environment(&environment, argv, policy_request, None, cancellation)
 }
 
+#[cfg(test)]
 fn run_sandboxed_process_in_environment(
     environment: &SandboxExecutionEnvironment,
     argv: Vec<OsString>,
@@ -304,7 +335,14 @@ fn run_sandboxed_process_in_environment_with_limits(
     let (status, termination) = wait?;
     let stdout = stdout?;
     let stderr = stderr?;
-    settle_sandboxed_process(&plan, status, termination, stdout, stderr)
+    settle_sandboxed_process(
+        &plan,
+        status,
+        termination,
+        limits.timeout_ms,
+        stdout,
+        stderr,
+    )
 }
 
 fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDefinition {
@@ -370,6 +408,13 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
             }),
         ),
         (
+            "timeoutMs".into(),
+            serde_json::json!({
+                "type": "number",
+                "description": "Foreground timeout in milliseconds; defaults to 120000 and is capped at 600000"
+            }),
+        ),
+        (
             "sandbox_permissions".into(),
             serde_json::json!({
                 "type": "string",
@@ -387,7 +432,7 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
     ]);
     SessionToolSchema {
         name: "bash".into(),
-        description: "Run one foreground bash command through the Desktop sandbox. Each call uses a fresh shell; workdir defaults to the session workspace. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
+        description: "Run one foreground bash command through the Desktop sandbox. Each call uses a fresh shell; workdir defaults to the session workspace and timeoutMs defaults to 120000 with a 600000 cap. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
         parameters: serde_json::Map::from_iter([
             ("type".into(), serde_json::json!("object")),
             ("additionalProperties".into(), serde_json::json!(false)),
@@ -434,7 +479,7 @@ fn execute_sandboxed_bash(
     if let Some(escalation) = escalation {
         policy_request = policy_request.with_escalation(escalation);
     }
-    let outcome = run_sandboxed_process_in_environment(
+    let outcome = run_sandboxed_process_in_environment_with_limits(
         environment,
         vec![
             OsString::from("/bin/bash"),
@@ -444,6 +489,7 @@ fn execute_sandboxed_bash(
         policy_request,
         Some(&working_directory),
         run.cancellation(),
+        SandboxProcessLimits::with_timeout(arguments.timeout),
     )
     .map_err(|error| sandbox_process_error_message(&error))?;
     if outcome.termination == SandboxProcessTermination::Cancelled {
@@ -455,6 +501,7 @@ fn execute_sandboxed_bash(
 struct SandboxedBashArguments {
     command: String,
     workdir: Option<String>,
+    timeout: ResolvedBashTimeout,
     sandbox_permissions: Option<SandboxMode>,
     justification: Option<String>,
 }
@@ -469,11 +516,12 @@ fn sandboxed_bash_arguments(
         key != "command"
             && key != "description"
             && key != "workdir"
+            && key != "timeoutMs"
             && key != "sandbox_permissions"
             && key != "justification"
     }) {
         return Err(
-            "bash arguments may contain only command, description, workdir, sandbox_permissions, and justification"
+            "bash arguments may contain only command, description, workdir, timeoutMs, sandbox_permissions, and justification"
                 .into(),
         );
     }
@@ -483,6 +531,16 @@ fn sandboxed_bash_arguments(
         None => None,
         Some(serde_json::Value::String(workdir)) => Some(workdir.clone()),
         Some(_) => return Err("bash argument workdir must be a string".into()),
+    };
+    let timeout = match object.get("timeoutMs") {
+        None => ResolvedBashTimeout::default(),
+        Some(serde_json::Value::Number(value)) => {
+            let value = value
+                .as_f64()
+                .ok_or_else(|| "bash argument timeoutMs must be a finite number".to_string())?;
+            resolve_bash_timeout(Some(value))?
+        }
+        Some(_) => return Err("bash argument timeoutMs must be a number".into()),
     };
     let sandbox_permissions = match object.get("sandbox_permissions") {
         None => None,
@@ -509,8 +567,21 @@ fn sandboxed_bash_arguments(
     Ok(SandboxedBashArguments {
         command,
         workdir,
+        timeout,
         sandbox_permissions,
         justification,
+    })
+}
+
+fn resolve_bash_timeout(requested: Option<f64>) -> Result<ResolvedBashTimeout, String> {
+    let requested = requested.unwrap_or(SANDBOX_PROCESS_TIMEOUT_MS);
+    if !requested.is_finite() || requested <= 0.0 {
+        return Err("bash argument timeoutMs must be a positive finite number".into());
+    }
+    let milliseconds = requested.min(SANDBOX_PROCESS_MAX_TIMEOUT_MS);
+    Ok(ResolvedBashTimeout {
+        duration: Duration::from_secs_f64(milliseconds / 1_000.0),
+        milliseconds,
     })
 }
 
@@ -581,6 +652,7 @@ fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value
         "output": output,
         "exitCode": outcome.exit_code,
         "termination": termination,
+        "timeoutMs": outcome.timeout_ms,
         "classification": classification,
         "mode": outcome.mode.as_str(),
         "enforcement": enforcement,
@@ -613,7 +685,7 @@ fn sandboxed_bash_output(
         sections.push("[stderr truncated; retained tail shown]".into());
     }
     if outcome.termination == SandboxProcessTermination::TimedOut {
-        sections.push("[timed out]".into());
+        sections.push(format!("[timed out after {}ms]", outcome.timeout_ms));
     }
     if classification == "denied" {
         sections.push(format!(
@@ -797,6 +869,7 @@ fn settle_sandboxed_process(
     plan: &SandboxExecutionPlan,
     status: ExitStatus,
     termination: SandboxProcessTermination,
+    timeout_ms: f64,
     stdout: SandboxProcessOutput,
     stderr: SandboxProcessOutput,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
@@ -822,6 +895,7 @@ fn settle_sandboxed_process(
     Ok(SandboxedProcessOutcome {
         exit_code: status.code(),
         termination,
+        timeout_ms,
         mode: plan.mode(),
         enforcement: plan.enforcement(),
         classification,
@@ -889,9 +963,10 @@ mod tests {
     use super::{
         MacosSeatbeltSandboxProvider, SEATBELT_EXEC, SEATBELT_READ_ONLY_PROFILE,
         SandboxProcessError, SandboxProcessLimits, SandboxProcessTermination,
-        mount_macos_sandbox_provider, resolve_bash_workdir, run_sandboxed_process,
-        run_sandboxed_process_in_environment, run_sandboxed_process_with_limits,
-        sandboxed_bash_arguments, sandboxed_bash_schema, sbpl_string,
+        mount_macos_sandbox_provider, resolve_bash_timeout, resolve_bash_workdir,
+        run_sandboxed_process, run_sandboxed_process_in_environment,
+        run_sandboxed_process_with_limits, sandboxed_bash_arguments, sandboxed_bash_result,
+        sandboxed_bash_schema, sbpl_string,
     };
 
     struct FixedProvider {
@@ -1001,10 +1076,11 @@ mod tests {
     }
 
     #[test]
-    fn bash_workdir_schema_and_parser_keep_the_argument_optional_and_closed() {
+    fn bash_optional_schema_and_parser_keep_workdir_timeout_and_unknown_keys_closed() {
         let schema = sandboxed_bash_schema();
         let properties = schema.parameters["properties"].as_object().unwrap();
         assert_eq!(properties["workdir"]["type"], "string");
+        assert_eq!(properties["timeoutMs"]["type"], "number");
         assert_eq!(
             schema.parameters["required"],
             serde_json::json!(["command", "description"])
@@ -1013,10 +1089,12 @@ mod tests {
         let parsed = sandboxed_bash_arguments(&serde_json::json!({
             "command": "pwd",
             "description": "Show the selected directory",
-            "workdir": "nested"
+            "workdir": "nested",
+            "timeoutMs": 1234.5
         }))
         .unwrap();
         assert_eq!(parsed.workdir.as_deref(), Some("nested"));
+        assert_eq!(parsed.timeout.milliseconds.to_bits(), 1234.5_f64.to_bits());
         assert!(
             sandboxed_bash_arguments(&serde_json::json!({
                 "command": "pwd",
@@ -1030,11 +1108,44 @@ mod tests {
         assert!(
             sandboxed_bash_arguments(&serde_json::json!({
                 "command": "pwd",
+                "description": "Reject a non-number timeout",
+                "timeoutMs": "soon"
+            }))
+            .err()
+            .unwrap()
+            .contains("timeoutMs must be a number")
+        );
+        assert!(
+            sandboxed_bash_arguments(&serde_json::json!({
+                "command": "pwd",
                 "description": "Reject an unknown argument",
                 "cwd": "nested"
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn bash_timeout_defaults_caps_and_rejects_non_positive_or_non_finite_values() {
+        let default = sandboxed_bash_arguments(&serde_json::json!({
+            "command": "true",
+            "description": "Use the default timeout"
+        }))
+        .unwrap();
+        assert_eq!(
+            default.timeout.milliseconds.to_bits(),
+            120_000.0_f64.to_bits()
+        );
+        assert_eq!(
+            resolve_bash_timeout(Some(999_999.0))
+                .unwrap()
+                .milliseconds
+                .to_bits(),
+            600_000.0_f64.to_bits()
+        );
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(resolve_bash_timeout(Some(invalid)).is_err());
+        }
     }
 
     #[test]
@@ -1233,6 +1344,38 @@ mod tests {
         assert_eq!(outcome.stdout.bytes, b"exact argument");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn foreground_timeout_is_a_settled_result_with_the_effective_millisecond_marker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = context_with_provider(
+            SandboxMode::DangerFullAccess,
+            workspace.path(),
+            NeverProvider,
+        );
+        let timeout = resolve_bash_timeout(Some(50.0)).unwrap();
+
+        let outcome = run_sandboxed_process_with_limits(
+            &ctx,
+            argv(&["/bin/sh", "-c", "sleep 30"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+            SandboxProcessLimits::with_timeout(timeout),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.termination, SandboxProcessTermination::TimedOut);
+        assert_eq!(outcome.timeout_ms.to_bits(), 50.0_f64.to_bits());
+        let result = sandboxed_bash_result(&outcome);
+        assert_eq!(result["timeoutMs"], 50.0);
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("[timed out after 50ms]")
+        );
+    }
+
     #[test]
     fn confined_runner_spawn_refusal_is_sandbox_unavailable() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1372,6 +1515,7 @@ mod tests {
             &cancellation,
             SandboxProcessLimits {
                 timeout: Duration::from_secs(5),
+                timeout_ms: 5_000.0,
                 output_bytes: 64_000,
                 poll_interval: Duration::from_millis(5),
             },
