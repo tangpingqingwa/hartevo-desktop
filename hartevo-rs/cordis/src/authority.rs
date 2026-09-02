@@ -959,25 +959,53 @@ pub struct RuntimeDispatchPermit {
     settled: bool,
 }
 
+/// Shared parking slot for one Mission Agent's live registry publication.
+///
+/// A Runtime lease checks the publication out while that Agent is running and
+/// returns it here synchronously when the permit settles or is abandoned. The
+/// Host therefore retains the exact Agent while idle without letting the
+/// permit carry authority into a later turn.
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeAgentRetention {
+    publication: Mutex<Option<AgentPublicationCommit>>,
+}
+
+impl RuntimeAgentRetention {
+    pub(crate) fn take(&self) -> Option<AgentPublicationCommit> {
+        self.publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn restore(&self, publication: AgentPublicationCommit) {
+        let mut retained = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(retained.is_none(), "one exact Agent has one publication");
+        if retained.is_none() {
+            *retained = Some(publication);
+        }
+    }
+}
+
 pub(crate) struct RuntimeDispatchNotifications {
     started: Option<PreparedEmit>,
     running_status: Option<PreparedEmit>,
     idle_status: Option<PreparedEmit>,
-    disposed: Option<PreparedEmit>,
 }
 
 impl RuntimeDispatchNotifications {
     pub(crate) const fn new(
-        started: PreparedEmit,
+        started: Option<PreparedEmit>,
         running_status: PreparedEmit,
         idle_status: PreparedEmit,
-        disposed: PreparedEmit,
     ) -> Self {
         Self {
-            started: Some(started),
+            started,
             running_status: Some(running_status),
             idle_status: Some(idle_status),
-            disposed: Some(disposed),
         }
     }
 }
@@ -987,21 +1015,27 @@ impl RuntimeDispatchPermit {
         serial: u64,
         scope: AuthorityScope,
         agent: AgentRef,
-        unpublished: UnpublishedAgent,
+        unpublished: Option<UnpublishedAgent>,
+        retained_publication: Option<AgentPublicationCommit>,
+        retention: Arc<RuntimeAgentRetention>,
         mut notifications: RuntimeDispatchNotifications,
     ) -> (Self, Arc<RuntimeDispatchLease>) {
         let idle_status = notifications
             .idle_status
             .take()
             .expect("a Runtime permit always prepares its Idle notification");
-        let lease = Arc::new(RuntimeDispatchLease::new(idle_status));
+        let lease = Arc::new(RuntimeDispatchLease::new(
+            idle_status,
+            retention,
+            retained_publication,
+        ));
         (
             Self {
                 serial,
                 scope,
                 agent,
                 lease: Arc::clone(&lease),
-                unpublished: Some(unpublished),
+                unpublished,
                 notifications,
                 started_attempted: false,
                 publication_committed: false,
@@ -1019,23 +1053,23 @@ impl RuntimeDispatchPermit {
             return result.clone();
         }
         self.started_attempted = true;
-        let result = self
-            .unpublished
-            .take()
-            .ok_or(CordisError::RuntimePermitMismatch)
-            .and_then(UnpublishedAgent::commit)
-            .and_then(|publication| {
-                self.publication_committed = true;
+        let result = if let Some(unpublished) = self.unpublished.take() {
+            unpublished.commit().and_then(|publication| {
                 self.notifications
                     .started
                     .take()
                     .map_or(Ok(()), PreparedEmit::dispatch)?;
-                self.lease.retain_publication(publication)?;
-                if let Some(notification) = self.notifications.running_status.take() {
-                    let _ = notification.dispatch_contained();
-                }
-                Ok(())
-            });
+                self.lease.retain_publication(publication)
+            })
+        } else {
+            self.lease.mark_running()
+        };
+        if result.is_ok() {
+            self.publication_committed = true;
+            if let Some(notification) = self.notifications.running_status.take() {
+                let _ = notification.dispatch_contained();
+            }
+        }
         self.started_result = Some(result.clone());
         result
     }
@@ -1074,13 +1108,7 @@ impl RuntimeDispatchPermit {
         self.unpublished.take();
         let status = self.lease.complete();
         self.settled = true;
-        RuntimeDispatchCompletion {
-            status,
-            notification: self
-                .publication_committed
-                .then(|| self.notifications.disposed.take())
-                .flatten(),
-        }
+        RuntimeDispatchCompletion { status }
     }
 }
 
@@ -1111,18 +1139,16 @@ impl Drop for RuntimeDispatchPermit {
 /// announced only after that lock is released.
 #[derive(Debug)]
 pub struct RuntimeStatusCompletion {
-    publication: Option<AgentPublicationCommit>,
     status: Option<PreparedEmit>,
 }
 
 impl RuntimeStatusCompletion {
-    /// Announce the committed Idle transition, then remove its exact live
-    /// publication. Listener errors and panics are deliberately contained.
+    /// Announce the committed Idle transition. The exact Agent remains
+    /// published and is retired only with its Host lifecycle.
     pub fn announce(mut self) {
         if let Some(status) = self.status.take() {
             let _ = status.dispatch_contained();
         }
-        drop(self.publication.take());
     }
 }
 
@@ -1131,7 +1157,6 @@ impl RuntimeStatusCompletion {
 #[derive(Debug)]
 pub struct RuntimeDispatchCompletion {
     status: Option<RuntimeStatusCompletion>,
-    notification: Option<PreparedEmit>,
 }
 
 impl RuntimeDispatchCompletion {
@@ -1139,16 +1164,13 @@ impl RuntimeDispatchCompletion {
         if let Some(status) = self.status.take() {
             status.announce();
         }
-        if let Some(notification) = self.notification.take() {
-            notification.dispatch()
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 
 pub(crate) struct RuntimeDispatchLease {
     active: AtomicBool,
+    retention: Arc<RuntimeAgentRetention>,
     state: Mutex<RuntimeDispatchLeaseState>,
 }
 
@@ -1159,11 +1181,16 @@ struct RuntimeDispatchLeaseState {
 }
 
 impl RuntimeDispatchLease {
-    fn new(idle_status: PreparedEmit) -> Self {
+    fn new(
+        idle_status: PreparedEmit,
+        retention: Arc<RuntimeAgentRetention>,
+        publication: Option<AgentPublicationCommit>,
+    ) -> Self {
         Self {
             active: AtomicBool::new(true),
+            retention,
             state: Mutex::new(RuntimeDispatchLeaseState {
-                publication: None,
+                publication,
                 idle_status: Some(idle_status),
                 deferred_status: None,
             }),
@@ -1186,6 +1213,22 @@ impl RuntimeDispatchLease {
         Ok(())
     }
 
+    fn mark_running(&self) -> Result<(), CordisError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.is_active()
+            || state
+                .publication
+                .as_ref()
+                .is_none_or(|publication| !publication.mark_running())
+        {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        Ok(())
+    }
+
     fn complete(&self) -> Option<RuntimeStatusCompletion> {
         let mut state = self
             .state
@@ -1194,7 +1237,7 @@ impl RuntimeDispatchLease {
         if !self.active.swap(false, Ordering::AcqRel) {
             return state.deferred_status.take();
         }
-        Self::take_completion(&mut state)
+        self.take_completion(&mut state)
     }
 
     fn abandon(&self) {
@@ -1203,7 +1246,7 @@ impl RuntimeDispatchLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.active.swap(false, Ordering::AcqRel) {
-            state.deferred_status = Self::take_completion(&mut state);
+            state.deferred_status = self.take_completion(&mut state);
         }
     }
 
@@ -1213,7 +1256,7 @@ impl RuntimeDispatchLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.active.swap(false, Ordering::AcqRel) {
-            Self::take_completion(&mut state)
+            self.take_completion(&mut state)
         } else {
             state.deferred_status.take()
         }
@@ -1230,16 +1273,17 @@ impl RuntimeDispatchLease {
             .take()
     }
 
-    fn take_completion(state: &mut RuntimeDispatchLeaseState) -> Option<RuntimeStatusCompletion> {
+    fn take_completion(
+        &self,
+        state: &mut RuntimeDispatchLeaseState,
+    ) -> Option<RuntimeStatusCompletion> {
         let publication = state.publication.take()?;
         let status = publication
             .mark_idle()
             .then(|| state.idle_status.take())
             .flatten();
-        Some(RuntimeStatusCompletion {
-            publication: Some(publication),
-            status,
-        })
+        self.retention.restore(publication);
+        Some(RuntimeStatusCompletion { status })
     }
 }
 

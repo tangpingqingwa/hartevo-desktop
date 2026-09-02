@@ -2780,11 +2780,11 @@ where
         Ok(mut host) => host.finish_runtime(permit),
         Err(error) => Err(error.runtime()),
     };
-    let (finish, disposed) = match completion {
-        Ok(completion) => (None, completion.announce().err()),
-        Err(error) => (Some(error), None),
+    let finish = match completion {
+        Ok(completion) => completion.announce().err(),
+        Err(error) => Some(error),
     };
-    if let Some(error) = AuthorityDispatchError::from_phases(started, authority, finish, disposed) {
+    if let Some(error) = AuthorityDispatchError::from_phases(started, authority, finish, None) {
         Err(error)
     } else {
         output.ok_or_else(|| {
@@ -2989,6 +2989,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::error::Error;
     use std::fmt::{self, Display};
+    #[cfg(target_os = "macos")]
+    use std::sync::Condvar;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -3005,21 +3007,23 @@ mod tests {
         AuthorityDispatchError, AuthorityScope, CompactionCheckpoint, CompactionId,
         CompactionSummaryDraft, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
         DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
-        EffectVerificationBinding, FiberState, JobStatus, JobsSurface, KernelApproval,
-        KernelApprovalDecision, KernelConsentState, LifecycleCancellation, LlmAdapter,
-        LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, LlmSurface,
-        ManualCompactionErrorCode, OPENINTERPRETER, RuntimeBinding, SandboxError, SandboxMode,
-        SandboxModeSource, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
-        SessionCallConfig, SessionCancelCause, SessionCompactionEnd, SessionCompactionStart,
-        SessionCompactionSummary, SessionContentBlock, SessionError, SessionEvent,
-        SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure,
-        SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionMessage,
-        SessionMessageRole, SessionMessageSource, SessionSandboxMode, SessionStore,
-        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
-        SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason,
-        enforce_invariants, events, host_is_cordis_loop, invariant_missing,
-        is_compact_checkpoint_source, keys, register_tool_definition, session_events,
+        EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
+        KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
+        LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
+        OPENINTERPRETER, RuntimeBinding, SandboxError, SandboxMode, SandboxModeSource,
+        SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig,
+        SessionCancelCause, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+        SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
+        SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
+        SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
+        SessionSandboxMode, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+        SessionSurfaceIntent, SessionSurfaceOp, SessionToolSchema, SurfaceOwner, ToolCall,
+        ToolDefinition, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
+        invariant_missing, is_compact_checkpoint_source, keys, register_tool_definition,
+        session_events,
     };
+    #[cfg(target_os = "macos")]
+    use hartevo_cordis::{JobControl, JobOutcome, JobStatus, JobTerminalStatus, JobsSurface};
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
         ConsentRecordId, ConsentState, ConsentStatus, ContactChannel, LegalBasis, PersonId,
@@ -5383,7 +5387,7 @@ mod tests {
     }
 
     #[test]
-    fn started_failure_is_cached_and_lifecycle_callbacks_run_after_unlock() {
+    fn started_failure_is_cached_without_fabricating_agent_disposal() {
         let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
@@ -5461,12 +5465,12 @@ mod tests {
         );
         let completion = host.lock().unwrap().finish_runtime(permit).unwrap();
         completion.announce().unwrap();
-        assert_eq!(disposed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(disposed_calls.load(Ordering::SeqCst), 0);
         assert!(host.lock().unwrap().active_runtime_scope().is_none());
     }
 
     #[test]
-    fn started_and_disposed_failures_are_combined_and_authority_is_skipped() {
+    fn started_failure_skips_authority_without_running_disposal_callbacks() {
         let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
@@ -5497,19 +5501,16 @@ mod tests {
             },
         )
         .unwrap_err();
-        let AuthorityDispatchError::Combined(failures) = &error else {
-            panic!("expected started+disposed combined failure: {error:?}");
+        let AuthorityDispatchError::Cordis(error) = &error else {
+            panic!("expected the started failure: {error:?}");
         };
-        assert_emit_source(failures.started().unwrap(), "started");
-        assert!(failures.authority().is_none());
-        assert!(failures.finish().is_none());
-        assert_emit_source(failures.disposed().unwrap(), "disposed");
+        assert_emit_source(error, "started");
         assert_eq!(authority_calls.load(Ordering::SeqCst), 0);
         assert!(host.lock().unwrap().active_runtime_scope().is_none());
     }
 
     #[test]
-    fn authority_and_disposed_failures_are_combined_without_source_loss() {
+    fn authority_failure_is_returned_while_the_agent_remains_idle() {
         let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
@@ -5529,17 +5530,22 @@ mod tests {
             |_| Err::<(), _>(PhaseError("authority")),
         )
         .unwrap_err();
-        let AuthorityDispatchError::Combined(failures) = &error else {
-            panic!("expected authority+disposed combined failure: {error:?}");
-        };
-        assert!(failures.started().is_none());
-        assert_eq!(failures.authority(), Some(&PhaseError("authority")));
-        assert!(failures.finish().is_none());
-        assert_emit_source(failures.disposed().unwrap(), "disposed");
+        assert_eq!(
+            error,
+            AuthorityDispatchError::Authority(PhaseError("authority"))
+        );
         assert_eq!(
             error.source().unwrap().downcast_ref::<PhaseError>(),
             Some(&PhaseError("authority"))
         );
+        let mut locked = host.lock().unwrap();
+        let agents = locked.context().agents::<AgentsSurface>().unwrap();
+        let agent = agents.list().into_iter().next().unwrap();
+        assert_eq!(agent.status(), AgentStatus::Idle);
+        let teardown = locked.host_mut().teardown();
+        drop(locked);
+        teardown.announce();
+        assert!(agents.list().is_empty());
     }
 
     #[test]
@@ -5614,15 +5620,131 @@ mod tests {
             live_agent.lock().unwrap().as_ref().unwrap().status(),
             AgentStatus::Idle
         );
-        let host = host.lock().unwrap();
-        assert!(host.active_runtime_scope().is_none());
-        assert!(
-            host.context()
-                .agents::<AgentsSurface>()
-                .unwrap()
-                .list()
-                .is_empty()
+        let agent = live_agent.lock().unwrap().as_ref().unwrap().clone();
+        let mut locked = host.lock().unwrap();
+        assert!(locked.active_runtime_scope().is_none());
+        let agents = locked.context().agents::<AgentsSurface>().unwrap();
+        assert_eq!(agents.list().as_slice(), std::slice::from_ref(&agent));
+        let teardown = locked.host_mut().teardown();
+        drop(locked);
+        teardown.announce();
+        assert!(agents.list().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one journey proves background ownership across two turns and exact Host teardown"
+    )]
+    fn desktop_background_job_survives_turn_finish_and_stops_on_host_teardown() {
+        let host = Arc::new(DesktopCordisSlot::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let jobs = host
+            .lock()
+            .unwrap()
+            .context()
+            .jobs::<JobsSurface>()
+            .unwrap();
+        let owner = SessionId::new("persistent-agent-job").unwrap();
+        let stopped = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let worker_stop = Arc::clone(&stopped);
+        let control_stop = Arc::clone(&stopped);
+        let control_cancelled = Arc::clone(&cancelled);
+        let start_jobs = Arc::clone(&jobs);
+        let start_owner = owner.clone();
+        let scope = runtime_scope();
+
+        let (job_id, agent) = dispatch_live_runtime(
+            &host,
+            scope.clone(),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                let job_id = start_jobs.start(
+                    &start_owner,
+                    permit.agent(),
+                    "bash",
+                    "persistent background work",
+                    move |completion| {
+                        thread::spawn(move || {
+                            let (lock, changed) = &*worker_stop;
+                            let mut stopped = lock.lock().unwrap();
+                            while !*stopped {
+                                stopped = changed.wait(stopped).unwrap();
+                            }
+                            let _ = completion.complete(JobOutcome::new(JobTerminalStatus::Killed));
+                        });
+                        Ok(JobControl::new(move |_| {
+                            control_cancelled.fetch_add(1, Ordering::SeqCst);
+                            let (lock, changed) = &*control_stop;
+                            *lock.lock().unwrap() = true;
+                            changed.notify_all();
+                        }))
+                    },
+                )?;
+                Ok::<_, hartevo_cordis::JobError>((job_id, permit.agent().clone()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(agent.status(), AgentStatus::Idle);
+        assert_eq!(
+            jobs.get(job_id.as_str(), &owner).unwrap().status(),
+            JobStatus::Running
         );
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+
+        let expected_agent = agent.clone();
+        let observed_jobs = Arc::clone(&jobs);
+        let observed_owner = owner.clone();
+        let observed_job_id = job_id.clone();
+        dispatch_live_runtime(
+            &host,
+            scope,
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                assert!(permit.agent().is_same_lifecycle(&expected_agent));
+                assert_eq!(
+                    observed_jobs
+                        .get(observed_job_id.as_str(), &observed_owner)
+                        .unwrap()
+                        .status(),
+                    JobStatus::Running
+                );
+                Ok::<_, &'static str>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(agent.status(), AgentStatus::Idle);
+        assert_eq!(
+            jobs.get(job_id.as_str(), &owner).unwrap().status(),
+            JobStatus::Running
+        );
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+
+        let agents = host
+            .lock()
+            .unwrap()
+            .context()
+            .agents::<AgentsSurface>()
+            .unwrap();
+        let teardown = {
+            let mut locked = host.lock().unwrap();
+            locked.host_mut().teardown()
+        };
+        teardown.announce();
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        assert!(jobs.list(&owner).is_empty());
+        assert!(agents.list().is_empty());
     }
 
     #[test]
@@ -5678,14 +5800,15 @@ mod tests {
             *status_order.lock().unwrap(),
             [AgentStatus::Running, AgentStatus::Idle]
         );
-        assert!(
+        assert_eq!(
             host.lock()
                 .unwrap()
                 .context()
                 .agents::<AgentsSurface>()
                 .unwrap()
                 .list()
-                .is_empty()
+                .as_slice(),
+            std::slice::from_ref(&agent)
         );
     }
 
@@ -6112,7 +6235,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_observers_reenter_only_after_host_unlock() {
+    fn lifecycle_observers_reenter_after_unlock_and_disposal_waits_for_host_teardown() {
         let host = Arc::new(DesktopCordisSlot::new(
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap(),
@@ -6151,7 +6274,7 @@ mod tests {
                 .on_runtime_finished(move |_| {
                     assert!(
                         finished_host.try_lock().is_ok(),
-                        "finished observer must run after host unlock"
+                        "disposed observer must run after host unlock"
                     );
                     finished_count.fetch_add(1, Ordering::SeqCst);
                 })
@@ -6169,6 +6292,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+        let teardown = {
+            let mut locked = host.lock().unwrap();
+            locked.host_mut().teardown()
+        };
+        teardown.announce();
         assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 
@@ -6231,15 +6360,18 @@ mod tests {
             );
         }));
         assert!(panicked.is_err());
-        assert!(
-            host.lock()
-                .unwrap()
-                .context()
-                .agents::<AgentsSurface>()
-                .unwrap()
-                .list()
-                .is_empty()
-        );
+        let agent = host
+            .lock()
+            .unwrap()
+            .context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(agent.status(), AgentStatus::Idle);
+        let expected_agent = agent.clone();
         dispatch_live_runtime(
             &host,
             scope,
@@ -6247,9 +6379,13 @@ mod tests {
             None,
             None,
             now(),
-            |_| Ok::<_, &'static str>(()),
+            move |permit| {
+                assert!(permit.agent().is_same_lifecycle(&expected_agent));
+                Ok::<_, &'static str>(())
+            },
         )
         .unwrap();
+        assert_eq!(agent.status(), AgentStatus::Idle);
     }
 
     fn now() -> chrono::DateTime<Utc> {
