@@ -28,6 +28,7 @@ mod fiber;
 mod host;
 mod inbox;
 mod invariants;
+mod jobs;
 mod kernel;
 mod loader;
 mod registry;
@@ -116,6 +117,10 @@ pub use inbox::{AgentInbox, AgentInboxOutcome, AgentInboxTarget};
 pub use invariants::{
     InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, enforce_runtime_invariants,
     missing as invariant_missing,
+};
+pub use jobs::{
+    DEFAULT_MAX_CONCURRENT_JOBS_PER_SESSION, JobCompletion, JobControl, JobError, JobId,
+    JobKillOutcome, JobOutcome, JobRead, JobSnapshot, JobStatus, JobTerminalStatus, JobsSurface,
 };
 pub use kernel::{
     KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,

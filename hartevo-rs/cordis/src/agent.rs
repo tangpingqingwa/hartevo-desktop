@@ -1545,7 +1545,7 @@ pub fn prepare_agent_tool_calls(
     }
     Ok(scheduled
         .iter()
-        .map(|call| ToolExecutionInput::from_session_call(session.id(), call))
+        .map(|call| ToolExecutionInput::from_session_call(request.agent(), session.id(), call))
         .collect())
 }
 
