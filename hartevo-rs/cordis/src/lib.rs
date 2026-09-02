@@ -15,6 +15,7 @@
 //! config interception without changing the consuming [`Service`] adapter.
 
 mod agent;
+mod approval;
 mod authority;
 mod compaction;
 mod compaction_automation;
@@ -47,6 +48,12 @@ pub use agent::{
     run_agent_tool_batch_with_limit_and_cancellation,
     run_agent_tool_batch_with_limit_and_cancellation_outcome, run_agent_turn,
     schedule_agent_tool_calls,
+};
+pub use approval::{
+    ApprovalError, ApprovalOutcome, ApprovalPolicy, ApprovalPolicySource, ApprovalPrompt,
+    ApprovalRequest, ApprovalRequestId, ApprovalSurface, SessionApprovalAsked,
+    SessionApprovalDecided, SessionApprovalPolicy, events as approval_events, request_approval,
+    set_approval_policy,
 };
 pub use authority::{
     AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,

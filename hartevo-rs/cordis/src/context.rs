@@ -233,6 +233,7 @@ impl fmt::Debug for PendingHandle {
 
 /// Conventional Cordis / Hartevo service keys. Plugins look up by these names.
 pub mod keys {
+    pub const APPROVAL: &str = "approval";
     pub const TOOLS: &str = "tools";
     pub const SYSTEM_PROMPT: &str = "systemPrompt";
     pub const LLM: &str = "llm";
@@ -1700,6 +1701,11 @@ impl Context {
     #[must_use]
     pub fn agents<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::AGENTS)
+    }
+
+    #[must_use]
+    pub fn approval<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::APPROVAL)
     }
 
     #[must_use]
@@ -3324,6 +3330,11 @@ impl ContextView<'_> {
     #[must_use]
     pub fn agents<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::AGENTS)
+    }
+
+    #[must_use]
+    pub fn approval<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::APPROVAL)
     }
 
     #[must_use]
