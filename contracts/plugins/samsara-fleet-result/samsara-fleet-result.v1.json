@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/samsara-fleet-result/samsara-fleet-result.v1.json",
+  "title": "Hartevo Samsara fleet-operations Layer-1 result contract",
+  "description": "A bounded, read-only Samsara field-operations evidence seam. It is a proposal and recording boundary, never a Connected/native fleet-control authority.",
+  "schemaVersion": "hartevo.samsara-fleet-result-contract/v1",
+  "contractVersion": "samsara-fleet-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "service": {
+    "id": "hartevo.samsara.fleet.result",
+    "implementation": "SamsaraFleetResultService",
+    "version": "0.1.0",
+    "readOnly": true,
+    "liveExecution": false,
+    "proposalOnly": true
+  },
+  "provider": {
+    "id": "samsara.fleet",
+    "implementation": "SamsaraProvider",
+    "version": "0.1.0",
+    "apiVersion": "2026-05-06",
+    "operations": [
+      "GET /fleet/vehicles",
+      "GET /trips/stream",
+      "GET /safety-events/stream",
+      "GET /v1/fleet/maintenance/list",
+      "GET /fleet/dvirs/history",
+      "GET /alerts/incidents/stream"
+    ],
+    "acceptedProvenance": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false
+  },
+  "consumer": {
+    "id": "mission.samsara.fleet.result",
+    "implementation": "MissionSamsaraFleetConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "consentBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": [
+    "organization",
+    "tags",
+    "vehicles",
+    "equipment",
+    "trips",
+    "safety_events",
+    "maintenance",
+    "dvir",
+    "alerts",
+    "mission",
+    "project",
+    "consent",
+    "permission_digest",
+    "opaque_secret_reference"
+  ],
+  "reads": [
+    { "id": "vehicles", "method": "GET", "path": "/fleet/vehicles", "bounded": true, "writes": false },
+    { "id": "vehicle_trips", "method": "GET", "path": "/trips/stream", "bounded": true, "writes": false },
+    { "id": "safety_signals", "method": "GET", "path": "/safety-events/stream", "bounded": true, "writes": false },
+    { "id": "maintenance_status", "method": "GET", "path": "/v1/fleet/maintenance/list", "bounded": true, "writes": false },
+    { "id": "dvir_status", "method": "GET", "path": "/fleet/dvirs/history", "bounded": true, "writes": false },
+    { "id": "bounded_alerts", "method": "GET", "path": "/alerts/incidents/stream", "bounded": true, "writes": false }
+  ],
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxRecordsPerRead": 256,
+    "maxTags": 32,
+    "maxAssets": 128,
+    "maxObservationWindowSeconds": 2678400
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "scopeDigestBound": true,
+    "organizationTagAssetBound": true,
+    "missionProjectConsentBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "projections": {
+    "states": [
+      "operational",
+      "healthy",
+      "degraded",
+      "offline",
+      "safety_alert",
+      "maintenance_due",
+      "partial",
+      "retention_gap",
+      "access_lost",
+      "provider_unknown"
+    ],
+    "absenceOfAlertsIsHealthy": false,
+    "absenceOfAlertsIsAvailable": false,
+    "rawEventPayloadRetained": false,
+    "rawGpsRetained": false,
+    "rawMediaRetained": false,
+    "rawDriverPiiRetained": false
+  },
+  "transport": {
+    "provenance": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "secretReference": "opaque_only",
+    "rawSecretSerialized": false,
+    "redactedReceipts": true,
+    "externalWrites": false,
+    "nativeHttpExecution": false
+  },
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableNativeReceipt": false,
+    "effect": false,
+    "verification": false,
+    "adoptedOutcome": false,
+    "truthAuthority": false
+  },
+  "forbidden": [
+    "route_creation_or_dispatch",
+    "driver_assignment_or_driver_management",
+    "geofence_or_tag_mutation",
+    "device_command",
+    "dvir_resolve",
+    "maintenance_write",
+    "video_gps_or_media_download",
+    "raw_driver_pii",
+    "generic_fleet_control_registry",
+    "kernel_authority"
+  ],
+  "layer2Gaps": [
+    "native_secret_resolution",
+    "consented_https_execution",
+    "durable_provider_receipt",
+    "independent_status_readback",
+    "verified_mission_adoption",
+    "explicitly_authorized_fleet_effects"
+  ]
+}
