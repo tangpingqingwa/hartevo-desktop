@@ -204,8 +204,8 @@ pub use runtime_recovery::{
 pub use runtime_turn::{
     RuntimeTurnAttempt, RuntimeTurnError, RuntimeTurnEvidence, RuntimeTurnEvidenceKind,
     RuntimeTurnFailure, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
-    RuntimeTurnPrivateMessage, RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition,
-    RuntimeTurnScope, RuntimeTurnStatus,
+    RuntimeTurnPrivateMessage, RuntimeTurnPrivateTextDelta, RuntimeTurnPurpose,
+    RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus,
 };
 pub use truth::{
     TruthCandidate, TruthError, TruthFact, TruthRevisionLink, TruthSource, TruthStatus, TruthValue,

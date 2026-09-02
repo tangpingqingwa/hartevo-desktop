@@ -12,8 +12,8 @@ use hartevo_context_fabric::ContextAssemblyStatus;
 use hartevo_domain_kernel::{
     MissionId, ProjectId, RuntimeRecoveryStatus, RuntimeTurnAttempt, RuntimeTurnAttemptId,
     RuntimeTurnEvidence, RuntimeTurnEvidenceKind, RuntimeTurnPrivateMessage,
-    RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition, RuntimeTurnStatus, TenantId,
-    WorkerHandleStatus,
+    RuntimeTurnPrivateTextDelta, RuntimeTurnPurpose, RuntimeTurnRestartDisposition,
+    RuntimeTurnStatus, TenantId, WorkerHandleStatus,
 };
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
@@ -515,7 +515,8 @@ impl ProjectStore {
             || manifest.revision != scope.assembly_revision
             || manifest.digest()? != scope.assembly_manifest_digest
             || manifest.input_digest != scope.assembly_input_digest
-            || manifest.prompt_digest.as_deref() != Some(scope.prompt_digest.as_str())
+            || scope.purpose == RuntimeTurnPurpose::Agent
+                && manifest.prompt_digest.as_deref() != Some(scope.prompt_digest.as_str())
             || manifest.tenant_id != scope.tenant_id
             || manifest.project_id != scope.project_id
             || manifest.mission_id != scope.mission_id
@@ -1258,6 +1259,7 @@ mod tests {
             .expect("persist attach");
 
         let scope = RuntimeTurnScope {
+            purpose: hartevo_domain_kernel::RuntimeTurnPurpose::Agent,
             tenant_id: manifest.tenant_id.clone(),
             project_id: manifest.project_id.clone(),
             mission_id: manifest.mission_id.clone(),

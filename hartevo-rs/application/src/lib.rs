@@ -111,9 +111,9 @@ use hartevo_domain_kernel::{
     RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass,
     RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId,
     RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
-    RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition, RuntimeTurnScope,
-    RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus, TenantId,
-    TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
+    RuntimeTurnPrivateTextDelta, RuntimeTurnPurpose, RuntimeTurnRestartDisposition,
+    RuntimeTurnScope, RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus,
+    TenantId, TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
     WorkProductDependencies, WorkProductId, WorkProductManifest, WorkProductManifestError,
     WorkProductPreview, WorkProductStatus, WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease,
     WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
@@ -1146,10 +1146,19 @@ pub struct LocalMissionRuntimeIds {
     pub assembly_id: ContextAssemblyId,
 }
 
+const LOCAL_COMPACTION_GENERATION_OFFSET: u64 = 1_u64 << 62;
+
 impl LocalMissionRuntimeIds {
     pub fn for_mission(mission_id: &MissionId, generation: u64) -> Self {
-        let scoped =
-            |kind: &str| format!("local-runtime:{kind}:{}:{generation}", mission_id.as_str());
+        Self::scoped("local-runtime", mission_id, generation)
+    }
+
+    pub fn for_compaction(mission_id: &MissionId, generation: u64) -> Self {
+        Self::scoped("local-compaction-runtime", mission_id, generation)
+    }
+
+    fn scoped(scope: &str, mission_id: &MissionId, generation: u64) -> Self {
+        let scoped = |kind: &str| format!("{scope}:{kind}:{}:{generation}", mission_id.as_str());
         Self {
             workspace_id: ContextWorkspaceId::from_stable(scoped("workspace")),
             working_set_id: ContextWorkingSetId::from_stable(scoped("working-set")),
@@ -1471,6 +1480,12 @@ pub struct DispatchContextRuntimeTurn {
     pub expected_recovery_revision: u64,
     pub attachment_epoch: u64,
     pub response_timeout: StdDuration,
+}
+
+#[derive(Clone, Copy)]
+enum ContextRuntimeTurnPrompt<'a> {
+    Assembly(&'a RuntimeContextEnvelope),
+    Compaction(&'a str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11311,7 +11326,7 @@ impl ApplicationService {
             return Err(ApplicationError::RuntimeRecoveryScopeMismatch);
         }
         let recovery =
-            self.latest_runtime_recovery_for_mission(&mission.project_id, &mission.id)?;
+            self.latest_agent_runtime_recovery_for_mission(&mission.project_id, &mission.id)?;
         if recovery
             .as_ref()
             .is_some_and(|recovery| recovery.worker_generation > previous_user_generation)
@@ -12566,7 +12581,8 @@ impl ApplicationService {
         let attempt = self
             .store
             .load_runtime_turn_attempt(&command.project_id, &command.runtime_turn_attempt_id)?;
-        if attempt.scope.mission_id != command.mission_id
+        if attempt.scope.purpose != RuntimeTurnPurpose::Agent
+            || attempt.scope.mission_id != command.mission_id
             || attempt.scope.project_id != command.project_id
         {
             return Err(ApplicationError::RuntimeDraftScopeMismatch);
@@ -14103,15 +14119,38 @@ impl ApplicationService {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one transactionally recoverable orchestration boundary materializes the exact initial Mission, Context, Capsule, Worker, and Assembly closure"
-    )]
     pub fn prepare_local_mission_runtime_context(
         &mut self,
         command: PrepareLocalMissionRuntimeContext,
         session: &ProjectContextMaterialSession,
         tokenizer: &impl ContextTokenizer,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
+        self.prepare_local_mission_runtime_context_scoped(command, session, tokenizer, false, now)
+    }
+
+    /// Prepare a reusable auxiliary Context/worker authority for Cordis
+    /// compaction without reopening or replacing the ordinary Mission worker.
+    pub fn prepare_local_mission_compaction_runtime_context(
+        &mut self,
+        command: PrepareLocalMissionRuntimeContext,
+        session: &ProjectContextMaterialSession,
+        tokenizer: &impl ContextTokenizer,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
+        self.prepare_local_mission_runtime_context_scoped(command, session, tokenizer, true, now)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transactionally recoverable orchestration boundary materializes the exact initial Mission, Context, Capsule, Worker, and Assembly closure"
+    )]
+    fn prepare_local_mission_runtime_context_scoped(
+        &mut self,
+        command: PrepareLocalMissionRuntimeContext,
+        session: &ProjectContextMaterialSession,
+        tokenizer: &impl ContextTokenizer,
+        compaction: bool,
         now: DateTime<Utc>,
     ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
         if command.generation == 0 || session.project_id() != &command.project_id {
@@ -14171,7 +14210,24 @@ impl ApplicationService {
             return Err(ApplicationError::LocalRuntimeContextScopeMismatch);
         }
 
-        let ids = LocalMissionRuntimeIds::for_mission(&mission.id, command.generation);
+        let context_generation = if compaction {
+            LOCAL_COMPACTION_GENERATION_OFFSET
+                .checked_add(command.generation)
+                .filter(|generation| i64::try_from(*generation).is_ok())
+                .ok_or(ApplicationError::LocalRuntimeContextScopeMismatch)?
+        } else {
+            command.generation
+        };
+        let ids = if compaction {
+            LocalMissionRuntimeIds::for_compaction(&mission.id, context_generation)
+        } else {
+            LocalMissionRuntimeIds::for_mission(&mission.id, context_generation)
+        };
+        let policy_version = if compaction {
+            "desktop-cordis-compaction-runtime/v1"
+        } else {
+            "desktop-local-runtime/v1"
+        };
         let tokenizer_profile = tokenizer.profile()?;
         let summary = Zeroizing::new(serde_json::to_string(&serde_json::json!({
             "schema": "hartevo.local-mission-checkpoint/v1",
@@ -14189,6 +14245,7 @@ impl ApplicationService {
             "conversationRevision": conversation.as_ref().map(|conversation| conversation.revision),
             "conversation": conversation.as_ref().map(|conversation| &conversation.messages),
             "activeUserMessageSequence": latest_user_message.map(|message| message.sequence),
+            "runtimePurpose": if compaction { "cordis_compaction" } else { "agent" },
             "effectAuthority": "none; local Runtime must return a typed draft only",
         }))?);
         let source = Zeroizing::new(serde_json::to_string(&(&mission, &conversation))?);
@@ -14206,8 +14263,8 @@ impl ApplicationService {
             Ok(workspace) => {
                 if workspace.project_id != command.project_id
                     || workspace.mission_id != command.mission_id
-                    || workspace.generation != command.generation
-                    || workspace.policy_version != "desktop-local-runtime/v1"
+                    || workspace.generation != context_generation
+                    || workspace.policy_version != policy_version
                     || workspace.capability_authority != BTreeSet::from([capability.clone()])
                     || workspace.data_policy != ContextDataPolicy::BusinessOnly
                 {
@@ -14226,8 +14283,8 @@ impl ApplicationService {
                         continuation_ledger_id: ids.continuation_ledger_id.clone(),
                         project_id: command.project_id.clone(),
                         mission_id: command.mission_id.clone(),
-                        generation: command.generation,
-                        policy_version: "desktop-local-runtime/v1".into(),
+                        generation: context_generation,
+                        policy_version: policy_version.into(),
                         capability_authority: BTreeSet::from([capability.clone()]),
                         budget: ContextBudget {
                             token_limit: 65_536,
@@ -14303,7 +14360,7 @@ impl ApplicationService {
                         provenance_evidence_ids: BTreeSet::new(),
                         model_digest: sha256(&serde_json::to_vec(&tokenizer_profile)?),
                         provider_route_digest,
-                        config_digest: sha256(b"hartevo.desktop-local-runtime/v1"),
+                        config_digest: sha256(policy_version.as_bytes()),
                         worker_graph_digest: sha256(&serde_json::to_vec(&ids)?),
                         resume_cursor_digest: sha256(b"hartevo.local-runtime-cursor/0"),
                         trace_tail_sequence: 2,
@@ -14332,11 +14389,16 @@ impl ApplicationService {
                         workspace_id: ids.workspace_id.clone(),
                         parent_branch_id: None,
                         branch_id: ids.branch_id.clone(),
-                        fork_reason: "initial bounded local Runtime turn".into(),
+                        fork_reason: if compaction {
+                            "reusable bounded Cordis compaction Runtime".into()
+                        } else {
+                            "initial bounded local Runtime turn".into()
+                        },
                         scope_digest: sha256(&serde_json::to_vec(&(
                             &command.project_id,
                             &command.mission_id,
-                            command.generation,
+                            context_generation,
+                            policy_version,
                             &capability,
                             latest_user_message.map(|message| &message.content_digest),
                         ))?),
@@ -14344,7 +14406,7 @@ impl ApplicationService {
                         worker_lease_id: ids.worker_lease_id.clone(),
                         worker_id: ids.worker_id.clone(),
                         parent_worker_id: None,
-                        worker_generation: command.generation,
+                        worker_generation: context_generation,
                         lease_token_digest,
                         runtime_mapping_digest: Some(initial_mapping_digest),
                         lease_expires_at: worker_deadline,
@@ -14364,10 +14426,22 @@ impl ApplicationService {
                         },
                         inputs: ContextInputRefs::default(),
                         return_contract: ContextReturnContract {
-                            schema_id: "hartevo.runtime.work-product-draft".into(),
+                            schema_id: if compaction {
+                                "hartevo.cordis.compaction-summary".into()
+                            } else {
+                                "hartevo.runtime.work-product-draft".into()
+                            },
                             schema_version: 1,
-                            required_fields: BTreeSet::from(["draft".into(), "uncertainty".into()]),
-                            allowed_artifact_types: BTreeSet::from(["runtime_draft".into()]),
+                            required_fields: if compaction {
+                                BTreeSet::from(["summary".into()])
+                            } else {
+                                BTreeSet::from(["draft".into(), "uncertainty".into()])
+                            },
+                            allowed_artifact_types: BTreeSet::from([if compaction {
+                                "compaction_summary".into()
+                            } else {
+                                "runtime_draft".into()
+                            }]),
                             evidence_required: false,
                             uncertainty_required: true,
                             max_result_bytes: 4 * 1024 * 1024,
@@ -14386,7 +14460,7 @@ impl ApplicationService {
             || capsule.mission_id != command.mission_id
             || capsule.workspace_id != ids.workspace_id
             || capsule.worker_id != ids.worker_id
-            || capsule.worker_generation != command.generation
+            || capsule.worker_generation != context_generation
         {
             return Err(ApplicationError::LocalRuntimeContextConflict);
         }
@@ -14395,7 +14469,7 @@ impl ApplicationService {
                 &command.project_id,
                 &ids.capsule_id,
                 capsule.revision,
-                command.generation,
+                context_generation,
                 now,
             )?,
             ContextCapsuleStatus::Claimed => capsule,
@@ -15292,10 +15366,30 @@ impl ApplicationService {
         )?)
     }
 
+    pub fn latest_context_runtime_recovery_for_worker(
+        &self,
+        project_id: &ProjectId,
+        workspace_id: &ContextWorkspaceId,
+        worker_id: &WorkerId,
+    ) -> Result<Option<RuntimeRecoveryAttempt>, ApplicationError> {
+        Ok(self
+            .store
+            .list_runtime_recoveries(project_id)?
+            .into_iter()
+            .filter(|attempt| {
+                &attempt.workspace_id == workspace_id && &attempt.worker_id == worker_id
+            })
+            .max_by(|left, right| {
+                (left.updated_at, left.revision, left.id.as_str()).cmp(&(
+                    right.updated_at,
+                    right.revision,
+                    right.id.as_str(),
+                ))
+            }))
+    }
+
     /// Returns the newest integrity-checked Runtime recovery attempt for one
-    /// Mission. This is an internal coordination record, not a UI projection:
-    /// it intentionally retains the exact revision and thread binding needed
-    /// to resume safely after a Desktop restart.
+    /// Mission, including auxiliary worker scopes.
     pub fn latest_runtime_recovery_for_mission(
         &self,
         project_id: &ProjectId,
@@ -15306,6 +15400,35 @@ impl ApplicationService {
             .list_runtime_recoveries(project_id)?
             .into_iter()
             .filter(|attempt| &attempt.mission_id == mission_id)
+            .max_by(|left, right| {
+                (left.updated_at, left.revision, left.id.as_str()).cmp(&(
+                    right.updated_at,
+                    right.revision,
+                    right.id.as_str(),
+                ))
+            }))
+    }
+
+    /// Returns only the ordinary Mission Agent recovery. Cordis compaction
+    /// owns a sibling worker scope and must not replace this authority.
+    pub fn latest_agent_runtime_recovery_for_mission(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<Option<RuntimeRecoveryAttempt>, ApplicationError> {
+        Ok(self
+            .store
+            .list_runtime_recoveries(project_id)?
+            .into_iter()
+            .filter(|attempt| {
+                &attempt.mission_id == mission_id
+                    && attempt.workspace_id
+                        == LocalMissionRuntimeIds::for_mission(
+                            mission_id,
+                            attempt.worker_generation,
+                        )
+                        .workspace_id
+            })
             .max_by(|left, right| {
                 (left.updated_at, left.revision, left.id.as_str()).cmp(&(
                     right.updated_at,
@@ -15327,7 +15450,10 @@ impl ApplicationService {
             .store
             .list_runtime_turn_attempts(project_id)?
             .into_iter()
-            .filter(|attempt| &attempt.scope.mission_id == mission_id)
+            .filter(|attempt| {
+                attempt.scope.purpose == RuntimeTurnPurpose::Agent
+                    && &attempt.scope.mission_id == mission_id
+            })
             .max_by(|left, right| {
                 (left.updated_at, left.revision, left.id.as_str()).cmp(&(
                     right.updated_at,
@@ -15644,15 +15770,48 @@ impl ApplicationService {
         )
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "dispatch validates and freezes one complete manifest, worker, recovery, process, thread, and durable-write authority closure"
-    )]
     pub fn dispatch_context_runtime_turn(
         &mut self,
         managed: &mut ManagedContextRuntime,
         command: DispatchContextRuntimeTurn,
         envelope: &RuntimeContextEnvelope,
+        now: DateTime<Utc>,
+    ) -> Result<ContextRuntimeTurnDispatchOutcome, ApplicationError> {
+        self.dispatch_context_runtime_turn_with_prompt(
+            managed,
+            command,
+            ContextRuntimeTurnPrompt::Assembly(envelope),
+            now,
+        )
+    }
+
+    /// Dispatch one Cordis compaction request through the existing managed
+    /// Runtime authority without making its private summary adoptable as a
+    /// Mission draft.
+    pub fn dispatch_context_runtime_compaction_turn(
+        &mut self,
+        managed: &mut ManagedContextRuntime,
+        command: DispatchContextRuntimeTurn,
+        prompt: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ContextRuntimeTurnDispatchOutcome, ApplicationError> {
+        self.dispatch_context_runtime_turn_with_prompt(
+            managed,
+            command,
+            ContextRuntimeTurnPrompt::Compaction(prompt),
+            now,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "dispatch validates and freezes one complete manifest, worker, recovery, process, thread, and durable-write authority closure"
+    )]
+    fn dispatch_context_runtime_turn_with_prompt(
+        &mut self,
+        managed: &mut ManagedContextRuntime,
+        command: DispatchContextRuntimeTurn,
+        input: ContextRuntimeTurnPrompt<'_>,
         now: DateTime<Utc>,
     ) -> Result<ContextRuntimeTurnDispatchOutcome, ApplicationError> {
         self.require_runtime_turn_startup_reconciliation()?;
@@ -15673,7 +15832,30 @@ impl ApplicationService {
             return Err(ApplicationError::RuntimeTurnScopeMismatch);
         }
         manifest.validate_dispatchable()?;
-        envelope.validate_against(&manifest)?;
+        let (purpose, prompt_digest, prompt) = match input {
+            ContextRuntimeTurnPrompt::Assembly(envelope) => {
+                envelope.validate_against(&manifest)?;
+                let prompt_digest = manifest
+                    .prompt_digest
+                    .clone()
+                    .ok_or(ApplicationError::RuntimeTurnScopeMismatch)?;
+                (
+                    RuntimeTurnPurpose::Agent,
+                    prompt_digest,
+                    envelope.render_prompt()?,
+                )
+            }
+            ContextRuntimeTurnPrompt::Compaction(prompt) => {
+                if prompt.trim().is_empty() {
+                    return Err(ApplicationError::RuntimeTurnScopeMismatch);
+                }
+                (
+                    RuntimeTurnPurpose::Compaction,
+                    sha256(prompt.as_bytes()),
+                    prompt.to_owned(),
+                )
+            }
+        };
         if self
             .store
             .load_active_runtime_turn_for_worker(
@@ -15745,12 +15927,8 @@ impl ApplicationService {
         {
             return Err(ApplicationError::RuntimeTurnScopeMismatch);
         }
-        let prompt_digest = manifest
-            .prompt_digest
-            .clone()
-            .ok_or(ApplicationError::RuntimeTurnScopeMismatch)?;
-        let prompt = envelope.render_prompt()?;
         let scope = RuntimeTurnScope {
+            purpose,
             tenant_id: manifest.tenant_id.clone(),
             project_id: manifest.project_id.clone(),
             mission_id: manifest.mission_id.clone(),
@@ -30615,6 +30793,94 @@ sleep 30"#
                 .expect("shutdown")
                 .forced
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_runtime_turn_is_recoverable_but_never_a_mission_draft() {
+        let prompt = "PRIVATE CORDIS COMPACTION INPUT";
+        let mut ready = ready_runtime_turn_fixture(|workspace| {
+            completed_stream_fake_runtime_command(
+                workspace,
+                "private-runtime-thread-compaction",
+                "private-runtime-turn-compaction",
+                "PRIVATE-COMPACTION-SUMMARY",
+                "PRIVATE-COMPACTION-SUMMARY",
+            )
+        });
+        let turn_id = RuntimeTurnAttemptId::from("turn-attempt-cordis-compaction");
+        let command = dispatch_command(&ready, turn_id.as_str(), StdDuration::from_secs(1));
+        let dispatch = ready
+            .fixture
+            .service
+            .dispatch_context_runtime_compaction_turn(
+                &mut ready.managed,
+                command,
+                prompt,
+                now() + Duration::seconds(6),
+            )
+            .expect("compaction dispatch");
+        assert_eq!(
+            dispatch.attempt.scope.purpose,
+            RuntimeTurnPurpose::Compaction
+        );
+        assert_eq!(
+            dispatch.attempt.scope.prompt_digest,
+            sha256(prompt.as_bytes())
+        );
+        assert!(
+            ready
+                .fixture
+                .service
+                .latest_runtime_turn_for_mission(
+                    &ready.fixture.project_id,
+                    &ready.fixture.mission_id,
+                )
+                .expect("ordinary Agent turn query")
+                .is_none()
+        );
+
+        let mut revision = dispatch.attempt.revision;
+        for index in 0..5 {
+            let observation = ready
+                .fixture
+                .service
+                .observe_context_runtime_turn(
+                    &mut ready.managed,
+                    &ObserveContextRuntimeTurn {
+                        project_id: ready.fixture.project_id.clone(),
+                        id: turn_id.clone(),
+                        expected_revision: revision,
+                        event_timeout: StdDuration::from_secs(1),
+                    },
+                    now() + Duration::seconds(7 + index),
+                )
+                .expect("compaction observation");
+            revision = observation.attempt.revision;
+        }
+        let completed = ready
+            .fixture
+            .service
+            .runtime_turn_attempt(&ready.fixture.project_id, &turn_id)
+            .expect("completed compaction turn");
+        assert_eq!(completed.status, RuntimeTurnStatus::Completed);
+        assert!(matches!(
+            ready.fixture.service.adopt_runtime_turn_draft(
+                &AdoptRuntimeTurnDraft {
+                    project_id: ready.fixture.project_id.clone(),
+                    mission_id: ready.fixture.mission_id.clone(),
+                    runtime_turn_attempt_id: turn_id,
+                    expected_conversation_revision: 1,
+                },
+                now() + Duration::seconds(13),
+            ),
+            Err(ApplicationError::RuntimeDraftScopeMismatch)
+        ));
+        ready
+            .fixture
+            .service
+            .shutdown_managed_context_runtime(ready.managed, now() + Duration::seconds(14))
+            .expect("bounded compaction shutdown");
     }
 
     #[cfg(unix)]
