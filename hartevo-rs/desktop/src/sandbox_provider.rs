@@ -113,6 +113,13 @@ pub(crate) enum SandboxProcessError {
         #[source]
         source: io::Error,
     },
+    #[error("sandbox process input writer failed to start: {source}")]
+    Input {
+        #[source]
+        source: io::Error,
+    },
+    #[error("sandbox process input writer stopped unexpectedly")]
+    InputWriterStopped,
     #[error("sandbox process output collection failed: {source}")]
     Output {
         #[source]
@@ -132,6 +139,8 @@ impl SandboxProcessError {
             | Self::UnusableWorkingDirectory { .. }
             | Self::Spawn { .. }
             | Self::Lifecycle { .. }
+            | Self::Input { .. }
+            | Self::InputWriterStopped
             | Self::Output { .. }
             | Self::OutputCollectorStopped => None,
         }
@@ -161,6 +170,28 @@ struct SandboxProcessLimits {
     output_spill_bytes: usize,
     poll_interval: Duration,
     termination_grace: Duration,
+}
+
+struct SandboxProcessIo<'a> {
+    managed_environment: &'a [(&'a str, &'a str)],
+    stdin: Option<Vec<u8>>,
+}
+
+impl<'a> SandboxProcessIo<'a> {
+    const fn closed(managed_environment: &'a [(&'a str, &'a str)]) -> Self {
+        Self {
+            managed_environment,
+            stdin: None,
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_stdin(stdin: Vec<u8>) -> Self {
+        Self {
+            managed_environment: &[],
+            stdin: Some(stdin),
+        }
+    }
 }
 
 impl SandboxProcessLimits {
@@ -255,7 +286,7 @@ fn run_sandboxed_process_in_environment(
         argv,
         policy_request,
         working_directory,
-        &[],
+        SandboxProcessIo::closed(&[]),
         cancellation,
         SandboxProcessLimits::default(),
     )
@@ -275,9 +306,29 @@ fn run_sandboxed_process_with_limits(
         argv,
         policy_request,
         None,
-        &[],
+        SandboxProcessIo::closed(&[]),
         cancellation,
         limits,
+    )
+}
+
+#[cfg(test)]
+fn run_sandboxed_process_with_stdin(
+    ctx: &Context,
+    argv: Vec<OsString>,
+    policy_request: SandboxPolicyRequest,
+    stdin: Vec<u8>,
+    cancellation: &LifecycleCancellation,
+) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
+    let environment = SandboxExecutionEnvironment::capture(ctx)?;
+    run_sandboxed_process_in_environment_with_limits(
+        &environment,
+        argv,
+        policy_request,
+        None,
+        SandboxProcessIo::with_stdin(stdin),
+        cancellation,
+        SandboxProcessLimits::default(),
     )
 }
 
@@ -286,7 +337,7 @@ fn run_sandboxed_process_in_environment_with_limits(
     argv: Vec<OsString>,
     policy_request: SandboxPolicyRequest,
     working_directory: Option<&Path>,
-    managed_environment: &[(&str, &str)],
+    io: SandboxProcessIo<'_>,
     cancellation: &LifecycleCancellation,
     limits: SandboxProcessLimits,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
@@ -304,21 +355,12 @@ fn run_sandboxed_process_in_environment_with_limits(
         return Err(SandboxProcessError::CancelledBeforeSpawn);
     }
 
-    let (program, arguments) = plan
-        .argv()
-        .split_first()
-        .expect("Cordis validates every prepared process argv");
-    let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .current_dir(&working_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_bash_environment(&mut command, std::env::vars_os(), managed_environment);
-    let mut child = command
-        .group_spawn()
-        .map_err(|source| spawn_error(&plan, &working_directory, source))?;
+    let mut child = spawn_sandboxed_child(
+        &plan,
+        &working_directory,
+        io.managed_environment,
+        io.stdin.is_some(),
+    )?;
     let stdout = child.inner().stdout.take().ok_or_else(|| {
         terminate_group_best_effort(&mut child);
         SandboxProcessError::Output {
@@ -355,6 +397,15 @@ fn run_sandboxed_process_in_environment_with_limits(
             return Err(SandboxProcessError::Output { source });
         }
     };
+    let stdin_writer = match spawn_input_writer(&mut child, io.stdin) {
+        Ok(writer) => writer,
+        Err(source) => {
+            terminate_group_best_effort(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(SandboxProcessError::Input { source });
+        }
+    };
 
     let deadline = Instant::now()
         .checked_add(limits.timeout)
@@ -366,9 +417,11 @@ fn run_sandboxed_process_in_environment_with_limits(
         limits.poll_interval,
         limits.termination_grace,
     );
+    let stdin = join_input_writer(stdin_writer);
     let stdout = join_output_collector(stdout_reader);
     let stderr = join_output_collector(stderr_reader);
     let (status, termination) = wait?;
+    stdin?;
     let stdout = stdout?;
     let stderr = stderr?;
     settle_sandboxed_process(
@@ -379,6 +432,63 @@ fn run_sandboxed_process_in_environment_with_limits(
         stdout,
         stderr,
     )
+}
+
+fn spawn_sandboxed_child(
+    plan: &SandboxExecutionPlan,
+    working_directory: &Path,
+    managed_environment: &[(&str, &str)],
+    stdin_supplied: bool,
+) -> Result<GroupChild, SandboxProcessError> {
+    let (program, arguments) = plan
+        .argv()
+        .split_first()
+        .expect("Cordis validates every prepared process argv");
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .current_dir(working_directory)
+        .stdin(if stdin_supplied {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_bash_environment(&mut command, std::env::vars_os(), managed_environment);
+    command
+        .group_spawn()
+        .map_err(|source| spawn_error(plan, working_directory, source))
+}
+
+fn spawn_input_writer(
+    child: &mut GroupChild,
+    stdin: Option<Vec<u8>>,
+) -> io::Result<Option<JoinHandle<()>>> {
+    let Some(data) = stdin else {
+        return Ok(None);
+    };
+    let mut pipe = child
+        .inner()
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("sandbox process stdin pipe is unavailable"))?;
+    thread::Builder::new()
+        .name("hartevo-sandbox-stdin".into())
+        .spawn(move || {
+            // Match the Harness batch-input seam: an early EPIPE is best-effort;
+            // the child outcome and captured output remain authoritative.
+            let _ = pipe.write_all(&data);
+        })
+        .map(Some)
+}
+
+fn join_input_writer(writer: Option<JoinHandle<()>>) -> Result<(), SandboxProcessError> {
+    writer.map_or(Ok(()), |writer| {
+        writer
+            .join()
+            .map_err(|_| SandboxProcessError::InputWriterStopped)
+    })
 }
 
 fn configure_bash_environment(
@@ -559,7 +669,7 @@ fn execute_sandboxed_bash(
         ],
         policy_request,
         Some(&working_directory),
-        &managed_environment,
+        SandboxProcessIo::closed(&managed_environment),
         run.cancellation(),
         SandboxProcessLimits::with_timeout(arguments.timeout),
     )
@@ -1183,8 +1293,9 @@ mod tests {
         SandboxProcessTermination, collect_output_tail, configure_bash_environment,
         mount_macos_sandbox_provider, resolve_bash_timeout, resolve_bash_workdir,
         run_sandboxed_process, run_sandboxed_process_in_environment,
-        run_sandboxed_process_with_limits, sandboxed_bash_arguments, sandboxed_bash_result,
-        sandboxed_bash_schema, sbpl_string, scrubbed_parent_environment,
+        run_sandboxed_process_with_limits, run_sandboxed_process_with_stdin,
+        sandboxed_bash_arguments, sandboxed_bash_result, sandboxed_bash_schema, sbpl_string,
+        scrubbed_parent_environment,
     };
 
     struct FixedProvider {
@@ -1294,12 +1405,13 @@ mod tests {
     }
 
     #[test]
-    fn bash_optional_schema_and_parser_keep_workdir_timeout_and_unknown_keys_closed() {
+    fn bash_optional_schema_and_parser_keep_workdir_timeout_stdin_and_unknown_keys_closed() {
         let schema = sandboxed_bash_schema();
         assert!(schema.description.contains("$DSH_*"));
         let properties = schema.parameters["properties"].as_object().unwrap();
         assert_eq!(properties["workdir"]["type"], "string");
         assert_eq!(properties["timeoutMs"]["type"], "number");
+        assert!(!properties.contains_key("stdin"));
         assert_eq!(
             schema.parameters["required"],
             serde_json::json!(["command", "description"])
@@ -1339,6 +1451,14 @@ mod tests {
                 "command": "pwd",
                 "description": "Reject an unknown argument",
                 "cwd": "nested"
+            }))
+            .is_err()
+        );
+        assert!(
+            sandboxed_bash_arguments(&serde_json::json!({
+                "command": "cat",
+                "description": "Keep process input off the model-facing seam",
+                "stdin": "untrusted"
             }))
             .is_err()
         );
@@ -1563,6 +1683,78 @@ mod tests {
         assert_eq!(outcome.enforcement, None);
         assert_eq!(outcome.classification, None);
         assert_eq!(outcome.stdout.bytes, b"exact argument");
+    }
+
+    #[test]
+    fn omitted_stdin_is_closed_and_a_reader_observes_immediate_eof() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = context_with_provider(
+            SandboxMode::DangerFullAccess,
+            workspace.path(),
+            NeverProvider,
+        );
+
+        let outcome = run_sandboxed_process(
+            &ctx,
+            argv(&["/bin/cat"]),
+            SandboxPolicyRequest::default(),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.stdout.bytes.is_empty());
+        assert!(outcome.stderr.bytes.is_empty());
+    }
+
+    #[test]
+    fn trusted_stdin_writes_all_bytes_and_closes_the_pipe() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = context_with_provider(
+            SandboxMode::DangerFullAccess,
+            workspace.path(),
+            NeverProvider,
+        );
+        let input = vec![b'x'; 256 * 1024];
+
+        let outcome = run_sandboxed_process_with_stdin(
+            &ctx,
+            argv(&["/usr/bin/wc", "-c"]),
+            SandboxPolicyRequest::default(),
+            input,
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(
+            String::from_utf8(outcome.stdout.bytes).unwrap().trim(),
+            "262144"
+        );
+        assert!(outcome.stderr.bytes.is_empty());
+    }
+
+    #[test]
+    fn early_child_exit_keeps_stdin_write_best_effort() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = context_with_provider(
+            SandboxMode::DangerFullAccess,
+            workspace.path(),
+            NeverProvider,
+        );
+
+        let outcome = run_sandboxed_process_with_stdin(
+            &ctx,
+            argv(&["/usr/bin/true"]),
+            SandboxPolicyRequest::default(),
+            vec![b'x'; 4 * 1024 * 1024],
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.stdout.bytes.is_empty());
+        assert!(outcome.stderr.bytes.is_empty());
     }
 
     #[cfg(unix)]
