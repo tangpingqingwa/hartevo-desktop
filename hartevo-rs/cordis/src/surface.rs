@@ -381,6 +381,7 @@ impl ToolCall {
 /// malformed JSON remains its original string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionInput {
+    session_id: SessionId,
     call_seq: u64,
     turn: u64,
     step: u64,
@@ -436,6 +437,12 @@ impl ToolRunContext {
     #[must_use]
     pub const fn call_seq(&self) -> u64 {
         self.input.call_seq()
+    }
+
+    /// Exact durable Session that owns this tool call.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        self.input.session_id()
     }
 
     #[must_use]
@@ -494,8 +501,9 @@ impl ToolRunContext {
 }
 
 impl ToolExecutionInput {
-    pub(crate) fn from_session_call(call: &SessionToolCall) -> Self {
+    pub(crate) fn from_session_call(session_id: &SessionId, call: &SessionToolCall) -> Self {
         Self {
+            session_id: session_id.clone(),
             call_seq: call.seq,
             turn: call.turn,
             step: call.step,
@@ -504,6 +512,12 @@ impl ToolExecutionInput {
             raw_arguments: call.arguments.clone(),
             arguments: parse_tool_arguments(&call.arguments),
         }
+    }
+
+    /// Exact durable Session that owns this tool call.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     #[must_use]

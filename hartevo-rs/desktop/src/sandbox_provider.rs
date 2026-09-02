@@ -6,12 +6,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
+#[cfg(test)]
+use hartevo_cordis::Context;
 use hartevo_cordis::{
-    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, Context, CordisError, CordisHost,
-    LifecycleCancellation, SandboxEnforcement, SandboxError, SandboxExecutionPlan, SandboxMode,
-    SandboxPolicyRequest, SandboxProcessClassification, SandboxProvider,
-    SandboxProviderUnavailable, SandboxRunnerFailureRule, classify_sandbox_process,
-    prepare_sandbox_execution, register_sandbox_provider, resolve_sandbox_policy,
+    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, CordisError, CordisHost,
+    LifecycleCancellation, SandboxEnforcement, SandboxError, SandboxExecutionEnvironment,
+    SandboxExecutionPlan, SandboxMode, SandboxPolicyRequest, SandboxProcessClassification,
+    SandboxProvider, SandboxProviderUnavailable, SandboxRunnerFailureRule, SessionContentBlock,
+    SessionToolSchema, ToolDefinition, ToolRunContext, classify_sandbox_process,
+    register_sandbox_provider, register_tool_definition,
 };
 use thiserror::Error;
 
@@ -29,10 +32,6 @@ pub(crate) enum SandboxProcessTermination {
     Cancelled,
 }
 
-#[allow(
-    dead_code,
-    reason = "N89 freezes bounded output for the next tool-adapter slice"
-)]
 pub(crate) struct SandboxProcessOutput {
     pub(crate) bytes: Vec<u8>,
     pub(crate) byte_count: u64,
@@ -50,10 +49,6 @@ impl std::fmt::Debug for SandboxProcessOutput {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "N89 freezes settled process facts for the next tool-adapter slice"
-)]
 pub(crate) struct SandboxedProcessOutcome {
     pub(crate) exit_code: Option<i32>,
     pub(crate) termination: SandboxProcessTermination,
@@ -106,10 +101,6 @@ pub(crate) enum SandboxProcessError {
     OutputCollectorStopped,
 }
 
-#[allow(
-    dead_code,
-    reason = "N89 freezes structured error projection for the next tool-adapter slice"
-)]
 impl SandboxProcessError {
     #[must_use]
     pub(crate) const fn code(&self) -> Option<&'static str> {
@@ -173,23 +164,39 @@ pub(crate) fn mount_macos_sandbox_provider(host: &mut CordisHost) -> Result<(), 
     register_sandbox_provider(host.context_mut(), MacosSeatbeltSandboxProvider).map(|_| ())
 }
 
+pub(crate) fn mount_macos_sandboxed_bash_tool(host: &mut CordisHost) -> Result<(), CordisError> {
+    let environment = SandboxExecutionEnvironment::capture(host.context()).map_err(|error| {
+        CordisError::SandboxPolicyInitialization {
+            detail: error.to_string(),
+        }
+    })?;
+    register_tool_definition(host.context_mut(), sandboxed_bash_definition(environment)).map(|_| ())
+}
+
 /// Run one exact argv through the currently resolved Cordis sandbox policy.
 ///
 /// This is the shared Desktop process boundary for the next concrete Cordis
 /// tool adapter. It deliberately owns only foreground process mechanics; the
 /// existing Cordis tool pipeline remains the sole tool system.
-#[allow(
-    dead_code,
-    reason = "N89 freezes the process boundary before the next tool-adapter slice consumes it"
-)]
+#[cfg(test)]
 pub(crate) fn run_sandboxed_process(
     ctx: &Context,
     argv: Vec<OsString>,
     policy_request: SandboxPolicyRequest,
     cancellation: &LifecycleCancellation,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
-    run_sandboxed_process_with_limits(
-        ctx,
+    let environment = SandboxExecutionEnvironment::capture(ctx)?;
+    run_sandboxed_process_in_environment(&environment, argv, policy_request, cancellation)
+}
+
+fn run_sandboxed_process_in_environment(
+    environment: &SandboxExecutionEnvironment,
+    argv: Vec<OsString>,
+    policy_request: SandboxPolicyRequest,
+    cancellation: &LifecycleCancellation,
+) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
+    run_sandboxed_process_in_environment_with_limits(
+        environment,
         argv,
         policy_request,
         cancellation,
@@ -197,8 +204,26 @@ pub(crate) fn run_sandboxed_process(
     )
 }
 
+#[cfg(test)]
 fn run_sandboxed_process_with_limits(
     ctx: &Context,
+    argv: Vec<OsString>,
+    policy_request: SandboxPolicyRequest,
+    cancellation: &LifecycleCancellation,
+    limits: SandboxProcessLimits,
+) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
+    let environment = SandboxExecutionEnvironment::capture(ctx)?;
+    run_sandboxed_process_in_environment_with_limits(
+        &environment,
+        argv,
+        policy_request,
+        cancellation,
+        limits,
+    )
+}
+
+fn run_sandboxed_process_in_environment_with_limits(
+    environment: &SandboxExecutionEnvironment,
     argv: Vec<OsString>,
     policy_request: SandboxPolicyRequest,
     cancellation: &LifecycleCancellation,
@@ -207,8 +232,8 @@ fn run_sandboxed_process_with_limits(
     if cancellation.is_cancelled() {
         return Err(SandboxProcessError::CancelledBeforeSpawn);
     }
-    let policy = resolve_sandbox_policy(ctx, policy_request)?;
-    let plan = prepare_sandbox_execution(ctx, argv, policy)?;
+    let policy = environment.resolve(policy_request)?;
+    let plan = environment.prepare(argv, policy)?;
     let workspace = usable_workspace(plan.workspace_root())?;
     if cancellation.is_cancelled() {
         return Err(SandboxProcessError::CancelledBeforeSpawn);
@@ -268,6 +293,207 @@ fn run_sandboxed_process_with_limits(
     let stdout = stdout?;
     let stderr = stderr?;
     settle_sandboxed_process(&plan, status, termination, stdout, stderr)
+}
+
+fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDefinition {
+    ToolDefinition::new_with_run_context(sandboxed_bash_schema(), move |run| {
+        execute_sandboxed_bash(&environment, run)
+    })
+    .with_output_renderer(|_, value| {
+        let output = value
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "bash result output is invalid".to_string())?;
+        Ok(vec![SessionContentBlock::Text {
+            text: output.to_string(),
+        }])
+    })
+}
+
+fn sandboxed_bash_schema() -> SessionToolSchema {
+    let properties = serde_json::Map::from_iter([
+        (
+            "command".into(),
+            serde_json::json!({
+                "type": "string",
+                "description": "Shell command to execute in a fresh foreground bash process"
+            }),
+        ),
+        (
+            "description".into(),
+            serde_json::json!({
+                "type": "string",
+                "description": "Short explanation of what the command does"
+            }),
+        ),
+    ]);
+    SessionToolSchema {
+        name: "bash".into(),
+        description: "Run one foreground bash command through the Desktop sandbox.".into(),
+        parameters: serde_json::Map::from_iter([
+            ("type".into(), serde_json::json!("object")),
+            ("additionalProperties".into(), serde_json::json!(false)),
+            ("properties".into(), serde_json::Value::Object(properties)),
+            (
+                "required".into(),
+                serde_json::json!(["command", "description"]),
+            ),
+        ]),
+    }
+}
+
+fn execute_sandboxed_bash(
+    environment: &SandboxExecutionEnvironment,
+    run: &ToolRunContext,
+) -> Result<serde_json::Value, String> {
+    let (command, _description) = sandboxed_bash_arguments(run.arguments())?;
+    let session = environment
+        .live_session(run.session_id())
+        .map_err(|error| sandbox_error_message(&error))?;
+    let policy_request = SandboxPolicyRequest::for_session(&session)
+        .with_call_id(run.call_id())
+        .map_err(|error| sandbox_error_message(&error))?;
+    let outcome = run_sandboxed_process_in_environment(
+        environment,
+        vec![
+            OsString::from("/bin/bash"),
+            OsString::from("-c"),
+            OsString::from(command),
+        ],
+        policy_request,
+        run.cancellation(),
+    )
+    .map_err(|error| sandbox_process_error_message(&error))?;
+    if outcome.termination == SandboxProcessTermination::Cancelled {
+        return Err("tool call cancelled".into());
+    }
+    Ok(sandboxed_bash_result(&outcome))
+}
+
+fn sandboxed_bash_arguments(arguments: &serde_json::Value) -> Result<(String, String), String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "bash arguments must be an object".to_string())?;
+    if object.len() != 2
+        || object
+            .keys()
+            .any(|key| key != "command" && key != "description")
+    {
+        return Err("bash arguments must contain only command and description".into());
+    }
+    let command = non_blank_bash_argument(object, "command")?;
+    let description = non_blank_bash_argument(object, "description")?;
+    Ok((command, description))
+}
+
+fn non_blank_bash_argument(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<String, String> {
+    let value = arguments
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("bash argument {name} must be a string"))?;
+    if value.trim().is_empty() {
+        return Err(format!("bash argument {name} must not be blank"));
+    }
+    Ok(value.to_string())
+}
+
+fn sandbox_error_message(error: &SandboxError) -> String {
+    error
+        .code()
+        .map_or_else(|| error.to_string(), |code| format!("{code}: {error}"))
+}
+
+fn sandbox_process_error_message(error: &SandboxProcessError) -> String {
+    if matches!(error, SandboxProcessError::CancelledBeforeSpawn) {
+        "tool call cancelled".into()
+    } else {
+        error
+            .code()
+            .map_or_else(|| error.to_string(), |code| format!("{code}: {error}"))
+    }
+}
+
+fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value {
+    let classification = match outcome.classification.as_ref() {
+        None => "unconfined",
+        Some(SandboxProcessClassification::Success) => "success",
+        Some(SandboxProcessClassification::Signalled) => "signalled",
+        Some(SandboxProcessClassification::RunnerFailure { .. }) => "runner-failure",
+        Some(SandboxProcessClassification::Denied) => "denied",
+        Some(SandboxProcessClassification::CommandFailure) => "command-failure",
+    };
+    let termination = match outcome.termination {
+        SandboxProcessTermination::Completed => "completed",
+        SandboxProcessTermination::TimedOut => "timed-out",
+        SandboxProcessTermination::Cancelled => "cancelled",
+    };
+    let enforcement = match outcome.enforcement {
+        None => "unconfined",
+        Some(SandboxEnforcement::Full) => "full",
+        Some(SandboxEnforcement::Partial) => "partial",
+    };
+    let output = sandboxed_bash_output(outcome, classification, enforcement);
+    serde_json::json!({
+        "output": output,
+        "exitCode": outcome.exit_code,
+        "termination": termination,
+        "classification": classification,
+        "mode": outcome.mode.as_str(),
+        "enforcement": enforcement,
+        "stdoutByteCount": outcome.stdout.byte_count,
+        "stdoutTruncated": outcome.stdout.truncated,
+        "stderrByteCount": outcome.stderr.byte_count,
+        "stderrTruncated": outcome.stderr.truncated
+    })
+}
+
+fn sandboxed_bash_output(
+    outcome: &SandboxedProcessOutcome,
+    classification: &str,
+    enforcement: &str,
+) -> String {
+    let mut sections = Vec::new();
+    if !outcome.stdout.bytes.is_empty() {
+        sections.push(String::from_utf8_lossy(&outcome.stdout.bytes).into_owned());
+    }
+    if !outcome.stderr.bytes.is_empty() {
+        sections.push(format!(
+            "[stderr]\n{}",
+            String::from_utf8_lossy(&outcome.stderr.bytes)
+        ));
+    }
+    if outcome.stdout.truncated {
+        sections.push("[stdout truncated; retained tail shown]".into());
+    }
+    if outcome.stderr.truncated {
+        sections.push("[stderr truncated; retained tail shown]".into());
+    }
+    if outcome.termination == SandboxProcessTermination::TimedOut {
+        sections.push("[timed out]".into());
+    }
+    if classification == "denied" {
+        sections.push(format!(
+            "[sandbox denied file access under {} mode]",
+            outcome.mode
+        ));
+    }
+    sections.push(format!(
+        "[sandbox: {}, {enforcement} enforcement]",
+        outcome.mode
+    ));
+    match outcome.exit_code {
+        Some(exit_code) if exit_code != 0 => {
+            sections.push(format!("[exit code: {exit_code}]"));
+        }
+        None if outcome.termination == SandboxProcessTermination::Completed => {
+            sections.push("[terminated by signal]".into());
+        }
+        Some(_) | None => {}
+    }
+    sections.join("\n")
 }
 
 fn usable_workspace(workspace: &Path) -> Result<PathBuf, SandboxProcessError> {

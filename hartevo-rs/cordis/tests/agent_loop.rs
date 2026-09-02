@@ -4303,7 +4303,9 @@ fn prepared_tool_inputs_preserve_durable_identity_and_parse_harness_arguments() 
     assert!(
         prepared
             .iter()
-            .all(|input| input.turn() == turn && input.step() == 1)
+            .all(|input| input.session_id() == session.id()
+                && input.turn() == turn
+                && input.step() == 1)
     );
     assert_eq!(prepared[0].name(), "search");
     assert_eq!(prepared[0].raw_arguments(), r#"{"q":"rust","limit":2}"#);

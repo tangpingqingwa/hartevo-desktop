@@ -1819,7 +1819,10 @@ pub(crate) fn mount_cordis_host(
     let mut host = CordisHost::boot(openinterpreter_runtime_plugin(runtime))?;
     host_is_cordis_loop(&host)?;
     #[cfg(target_os = "macos")]
-    crate::sandbox_provider::mount_macos_sandbox_provider(&mut host)?;
+    {
+        crate::sandbox_provider::mount_macos_sandbox_provider(&mut host)?;
+        crate::sandbox_provider::mount_macos_sandboxed_bash_tool(&mut host)?;
+    }
     let session_persistence = DesktopSessionPersistence::default();
     session_persistence.mount(&mut host)?;
     DesktopCordisCoordinator::new(host, session_persistence)
@@ -3187,6 +3190,47 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn desktop_bash_turn_adapter() -> DesktopSequencedTurnAdapter {
+        let first = vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::ToolCall,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::ToolCall {
+                    id: "desktop-bash-call-1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"printf n90-cordis; printf n90-stderr >&2; exit 7","description":"Exercise the N90 foreground result contract"}"#.into(),
+                },
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::ToolCalls,
+                replay_state: None,
+            },
+        ];
+        let second = vec![
+            SessionStreamChunk::BlockStart {
+                index: 0,
+                block_type: SessionStreamBlockType::Text,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 0,
+                block: SessionContentBlock::Text {
+                    text: "sandboxed bash completed".into(),
+                },
+            },
+            SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                replay_state: None,
+            },
+        ];
+        DesktopSequencedTurnAdapter {
+            turns: Arc::new(Mutex::new(VecDeque::from([first, second]))),
+        }
+    }
+
     fn desktop_turn_request() -> DesktopAgentTurnRequest {
         DesktopAgentTurnRequest::new(
             "desktop-agent-session",
@@ -3369,6 +3413,73 @@ mod tests {
             .unwrap();
         assert_eq!(restored.events().unwrap(), session.events().unwrap());
         assert_eq!(restored.derive_messages().unwrap(), messages);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn desktop_production_bash_tool_runs_in_cordis_sandbox_and_commits_result() {
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        approve_agent_turn(&mut live);
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
+
+        let outcome = live
+            .run_agent_turn(
+                desktop_turn_request(),
+                desktop_bash_turn_adapter(),
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps(), 2);
+        assert_eq!(outcome.reason(), TurnEndReason::Completed);
+        let session = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&SessionId::new("desktop-agent-session").unwrap())
+            .unwrap()
+            .unwrap();
+        let events = session.events().unwrap();
+        let (message, error) = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolResult { message, error, .. }
+                    if matches!(
+                        &message.source,
+                        SessionMessageSource::Tool { call_id }
+                            if call_id == "desktop-bash-call-1"
+                    ) =>
+                {
+                    Some((message, error))
+                }
+                _ => None,
+            })
+            .expect("production Cordis bash result must be durable");
+        assert!(error.is_none());
+        let [
+            SessionContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            },
+        ] = message.content.as_slice()
+        else {
+            panic!("production Cordis bash result must use the canonical tool wrapper");
+        };
+        assert_eq!(tool_call_id, "desktop-bash-call-1");
+        assert!(!is_error);
+        let [SessionContentBlock::Text { text }] = content.as_slice() else {
+            panic!("production Cordis bash payload must be one text block");
+        };
+        assert!(text.contains("n90-cordis"));
+        assert!(text.contains("[stderr]\nn90-stderr"));
+        assert!(text.contains("[sandbox: read-only, full enforcement]"));
+        assert!(text.contains("[exit code: 7]"));
+        assert!(runtime_open_turn(&events).is_none());
     }
 
     #[test]
