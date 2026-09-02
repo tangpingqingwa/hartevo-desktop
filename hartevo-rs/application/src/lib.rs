@@ -1485,6 +1485,7 @@ pub struct DispatchContextRuntimeTurn {
 #[derive(Clone, Copy)]
 enum ContextRuntimeTurnPrompt<'a> {
     Assembly(&'a RuntimeContextEnvelope),
+    Followup(&'a str),
     Compaction(&'a str),
 }
 
@@ -12581,8 +12582,10 @@ impl ApplicationService {
         let attempt = self
             .store
             .load_runtime_turn_attempt(&command.project_id, &command.runtime_turn_attempt_id)?;
-        if attempt.scope.purpose != RuntimeTurnPurpose::Agent
-            || attempt.scope.mission_id != command.mission_id
+        if !matches!(
+            attempt.scope.purpose,
+            RuntimeTurnPurpose::Agent | RuntimeTurnPurpose::Followup
+        ) || attempt.scope.mission_id != command.mission_id
             || attempt.scope.project_id != command.project_id
         {
             return Err(ApplicationError::RuntimeDraftScopeMismatch);
@@ -14141,6 +14144,106 @@ impl ApplicationService {
         self.prepare_local_mission_runtime_context_scoped(command, session, tokenizer, true, now)
     }
 
+    /// Reopen the exact existing Mission worker for a same-Agent background
+    /// completion follow-up. The original assembly remains immutable; the new
+    /// direct prompt is bound later by its own Runtime turn scope.
+    pub fn prepare_local_mission_runtime_followup_context(
+        &self,
+        command: &PrepareLocalMissionRuntimeContext,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
+        if command.generation == 0 {
+            return Err(ApplicationError::LocalRuntimeContextScopeMismatch);
+        }
+        let mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.project_id != command.project_id
+            || mission.id != command.mission_id
+            || mission.stage != MissionStage::Running
+            || mission.contract.valid_until <= now
+        {
+            return Err(ApplicationError::LocalRuntimeMissionNotSchedulable);
+        }
+        let ids = LocalMissionRuntimeIds::for_mission(&mission.id, command.generation);
+        let workspace = self
+            .store
+            .load_context_workspace(&command.project_id, &ids.workspace_id)?;
+        workspace.validate_for(&mission, now)?;
+        if workspace.generation != command.generation
+            || workspace.policy_version != "desktop-local-runtime/v1"
+        {
+            return Err(ApplicationError::LocalRuntimeContextConflict);
+        }
+        let capsule = self
+            .store
+            .load_context_capsule(&command.project_id, &ids.capsule_id)?;
+        let branch = self
+            .store
+            .load_context_branch(&command.project_id, &ids.branch_id)?;
+        let lease = self
+            .store
+            .load_worker_lease(&command.project_id, &ids.worker_lease_id)?;
+        let handle = self.store.load_worker_handle(
+            &command.project_id,
+            &ids.workspace_id,
+            &ids.worker_id,
+        )?;
+        let mailbox = self
+            .store
+            .load_worker_mailbox(&command.project_id, &ids.mailbox_id)?;
+        let facts = self
+            .store
+            .load_context_capsule_facts(&command.project_id, &capsule.id)?;
+        branch.validate_for_workspace(&workspace, now)?;
+        lease.validate_for(&workspace, &branch, now)?;
+        capsule.validate_for(&workspace, &branch, &lease, &mission, &facts, now)?;
+        handle.validate_for(&workspace, &branch, &lease, &capsule, None, now)?;
+        mailbox.validate_for(&handle, now)?;
+        if branch.status != ContextBranchStatus::Active
+            || lease.status != WorkerLeaseStatus::Active
+            || capsule.status != ContextCapsuleStatus::Claimed
+            || handle.status != WorkerHandleStatus::Attached
+        {
+            return Err(ApplicationError::LocalRuntimeContextConflict);
+        }
+        let manifest = self
+            .store
+            .load_context_assembly_manifest(&command.project_id, &ids.assembly_id)?;
+        manifest.validate_dispatchable()?;
+        let checkpoint = self
+            .store
+            .load_context_checkpoint(&command.project_id, &manifest.checkpoint_id)?;
+        if manifest.tenant_id != mission.tenant_id
+            || manifest.project_id != command.project_id
+            || manifest.mission_id != mission.id
+            || manifest.workspace_id != workspace.id
+            || manifest.capsule_id != capsule.id
+            || manifest.capsule_revision != capsule.revision
+            || manifest.branch_id != branch.id
+            || manifest.branch_revision != branch.revision
+            || manifest.worker_id != handle.worker_id
+            || manifest.worker_generation != command.generation
+            || manifest.worker_lease_id != lease.id
+            || manifest.worker_lease_revision != lease.revision
+            || manifest.checkpoint_id != checkpoint.id
+            || manifest.checkpoint_digest != checkpoint.digest()?
+            || manifest.capsule_authority_digest != capsule.authority_digest
+        {
+            return Err(ApplicationError::LocalRuntimeContextConflict);
+        }
+        Ok(PreparedLocalMissionRuntimeContext {
+            ids,
+            capsule,
+            handle,
+            mailbox,
+            assembly: ContextAssemblyOutcome {
+                manifest,
+                envelope: None,
+            },
+        })
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one transactionally recoverable orchestration boundary materializes the exact initial Mission, Context, Capsule, Worker, and Assembly closure"
@@ -15451,8 +15554,10 @@ impl ApplicationService {
             .list_runtime_turn_attempts(project_id)?
             .into_iter()
             .filter(|attempt| {
-                attempt.scope.purpose == RuntimeTurnPurpose::Agent
-                    && &attempt.scope.mission_id == mission_id
+                matches!(
+                    attempt.scope.purpose,
+                    RuntimeTurnPurpose::Agent | RuntimeTurnPurpose::Followup
+                ) && &attempt.scope.mission_id == mission_id
             })
             .max_by(|left, right| {
                 (left.updated_at, left.revision, left.id.as_str()).cmp(&(
@@ -15803,6 +15908,24 @@ impl ApplicationService {
         )
     }
 
+    /// Dispatch one same-Agent background completion continuation through the
+    /// existing managed Runtime. The direct prompt is private Runtime input,
+    /// while its completed output remains eligible for Mission adoption.
+    pub fn dispatch_context_runtime_followup_turn(
+        &mut self,
+        managed: &mut ManagedContextRuntime,
+        command: DispatchContextRuntimeTurn,
+        prompt: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ContextRuntimeTurnDispatchOutcome, ApplicationError> {
+        self.dispatch_context_runtime_turn_with_prompt(
+            managed,
+            command,
+            ContextRuntimeTurnPrompt::Followup(prompt),
+            now,
+        )
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "dispatch validates and freezes one complete manifest, worker, recovery, process, thread, and durable-write authority closure"
@@ -15851,6 +15974,16 @@ impl ApplicationService {
                 }
                 (
                     RuntimeTurnPurpose::Compaction,
+                    sha256(prompt.as_bytes()),
+                    prompt.to_owned(),
+                )
+            }
+            ContextRuntimeTurnPrompt::Followup(prompt) => {
+                if prompt.trim().is_empty() {
+                    return Err(ApplicationError::RuntimeTurnScopeMismatch);
+                }
+                (
+                    RuntimeTurnPurpose::Followup,
                     sha256(prompt.as_bytes()),
                     prompt.to_owned(),
                 )

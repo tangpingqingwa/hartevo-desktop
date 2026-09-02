@@ -54,11 +54,12 @@ use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{
     ApprovalRequestId, AuthorityDispatchError, AuthorityScope, COMPACTION_INSTRUCTION, CordisError,
     DomainCommandBinding, DomainCommandKind, EffectExecutionBinding, EffectReconciliationBinding,
-    EffectVerificationBinding, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
-    LlmGenerateRequest, LlmRequestPurpose, LlmResolvedModel, RuntimeBinding, RuntimeDispatchPermit,
-    RuntimeRecordBinding, SessionCallConfig, SessionCancelCause, SessionContentBlock,
-    SessionFinishReason, SessionLlmFailure, SessionMessageRole, SessionMessageSource,
-    SessionStreamBlockType, SessionStreamChunk, TurnEndReason,
+    EffectVerificationBinding, JobTerminalNotice, LifecycleCancellation, LlmAdapter,
+    LlmAdapterStream, LlmError, LlmGenerateRequest, LlmRequestPurpose, LlmResolvedModel,
+    RuntimeBinding, RuntimeDispatchPermit, RuntimeRecordBinding, SessionCallConfig,
+    SessionCancelCause, SessionContentBlock, SessionFinishReason, SessionId, SessionLlmFailure,
+    SessionMessageRole, SessionMessageSource, SessionStreamBlockType, SessionStreamChunk,
+    TurnEndReason,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -98,7 +99,8 @@ use crate::cordis_host::{
     DesktopCordisApprovalDecisionError, DesktopCordisSlot, DesktopDomainCommandAuthorization,
     DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
     DesktopEffectVerificationAuthorization, DesktopHeldCordisApproval, DesktopHumanCommandDispatch,
-    DesktopRuntimeSessionTranscript, dispatch_live_domain_command, dispatch_live_effect_execution,
+    DesktopRuntimeSessionTranscript, dispatch_idle_job_completion_runtime,
+    dispatch_live_domain_command, dispatch_live_effect_execution,
     dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
     mount_cordis_host,
 };
@@ -1423,12 +1425,17 @@ struct DesktopLiveAgentTurnCompletion {
     user_interrupt_sent: bool,
 }
 
+struct DesktopIdleJobCompletionFollowup {
+    turn_id: RuntimeTurnAttemptId,
+}
+
 type DesktopLiveAgentTurnResult = Result<DesktopLiveAgentTurnCompletion, DesktopDataError>;
 type DesktopLiveAgentTurnSlot = Arc<Mutex<Option<DesktopLiveAgentTurnResult>>>;
 
 #[derive(Clone, Copy)]
 enum DesktopApplicationRuntimeTurnInput<'a> {
     Mission(&'a RuntimeContextEnvelope),
+    Followup(&'a str),
     Compaction {
         prompt: &'a str,
         cancellation: &'a LifecycleCancellation,
@@ -1440,17 +1447,19 @@ struct DesktopApplicationLlmAdapter<Run> {
     model: String,
     session_id: String,
     message_id: String,
+    expected_source: SessionMessageSource,
     user_body_digest: String,
     run: Mutex<Option<Run>>,
     completion: DesktopLiveAgentTurnSlot,
 }
 
 impl<Run> DesktopApplicationLlmAdapter<Run> {
-    fn new(
+    fn new_for_source(
         provider: String,
         model: String,
         session_id: String,
         message_id: String,
+        expected_source: SessionMessageSource,
         user_body: &str,
         run: Run,
     ) -> (Self, DesktopLiveAgentTurnSlot) {
@@ -1461,6 +1470,7 @@ impl<Run> DesktopApplicationLlmAdapter<Run> {
                 model,
                 session_id,
                 message_id,
+                expected_source,
                 user_body_digest: format!("{:x}", Sha256::digest(user_body.as_bytes())),
                 run: Mutex::new(Some(run)),
                 completion: Arc::clone(&completion),
@@ -1486,7 +1496,7 @@ impl<Run> DesktopApplicationLlmAdapter<Run> {
         };
         if matching.next().is_some()
             || message.role != SessionMessageRole::User
-            || message.source != SessionMessageSource::User
+            || message.source != self.expected_source
         {
             return false;
         }
@@ -1814,7 +1824,8 @@ fn run_desktop_application_runtime_turn(
     mut logical_millis: i64,
 ) -> Result<(DesktopLiveAgentTurnCompletion, Vec<SessionStreamChunk>), DesktopDataError> {
     let lifecycle_cancellation = match &input {
-        DesktopApplicationRuntimeTurnInput::Mission(_) => None,
+        DesktopApplicationRuntimeTurnInput::Mission(_)
+        | DesktopApplicationRuntimeTurnInput::Followup(_) => None,
         DesktopApplicationRuntimeTurnInput::Compaction { cancellation, .. } => Some(*cancellation),
     };
     let active_recovery = service.active_context_runtime_recovery(
@@ -1907,6 +1918,13 @@ fn run_desktop_application_runtime_turn(
             )?,
         DesktopApplicationRuntimeTurnInput::Compaction { prompt, .. } => service
             .dispatch_context_runtime_compaction_turn(
+                &mut managed,
+                dispatch_command,
+                prompt,
+                now + Duration::milliseconds(logical_millis),
+            )?,
+        DesktopApplicationRuntimeTurnInput::Followup(prompt) => service
+            .dispatch_context_runtime_followup_turn(
                 &mut managed,
                 dispatch_command,
                 prompt,
@@ -2276,7 +2294,9 @@ impl DesktopDataPlane {
             return Ok(plane.clone());
         }
         let candidate = Self::discover()?;
-        Ok(Self::install_persistent(&DESKTOP_DATA_PLANE, candidate))
+        let plane = Self::install_persistent(&DESKTOP_DATA_PLANE, candidate);
+        plane.install_idle_job_completion_observer()?;
+        Ok(plane)
     }
 
     fn install_persistent(cell: &OnceLock<Self>, candidate: Self) -> Self {
@@ -2284,6 +2304,30 @@ impl DesktopDataPlane {
             return candidate;
         }
         cell.get().cloned().unwrap_or(candidate)
+    }
+
+    fn install_idle_job_completion_observer(&self) -> Result<(), DesktopDataError> {
+        let jobs = self
+            .cordis
+            .lock()
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
+            .jobs()?;
+        jobs.on_terminal(|notice| {
+            let agent = notice.owner_agent().clone();
+            let _ = std::thread::Builder::new()
+                .name("cordis-job-followup".into())
+                .spawn(move || {
+                    futures_executor::block_on(agent.when_idle());
+                    if agent.status() != hartevo_cordis::AgentStatus::Idle {
+                        return;
+                    }
+                    let Ok(plane) = DesktopDataPlane::persistent() else {
+                        return;
+                    };
+                    let _ = plane.run_idle_job_completion_followup_os(&notice, Utc::now());
+                });
+        });
+        Ok(())
     }
 
     #[cfg(test)]
@@ -5507,6 +5551,104 @@ impl DesktopDataPlane {
         validate_catalog_continuation_handle(&service, request, catalog_handle)
     }
 
+    fn run_idle_job_completion_followup_os(
+        &self,
+        notice: &JobTerminalNotice,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DesktopMissionSubmission>, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let runtime = discover_runtime();
+        self.run_idle_job_completion_followup_with(
+            &secret_store,
+            notice,
+            runtime
+                .configuration
+                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
+            runtime.projection.status,
+            now,
+        )
+    }
+
+    fn run_idle_job_completion_followup_with(
+        &self,
+        secret_store: &impl SecretStore,
+        notice: &JobTerminalNotice,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DesktopMissionSubmission>, DesktopDataError> {
+        if notice.owner_agent().status() != hartevo_cordis::AgentStatus::Idle {
+            return Ok(None);
+        }
+        let identity = self
+            .cordis
+            .lock()
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
+            .retained_runtime_agent_identity(notice.owner_agent());
+        let Some(identity) = identity else {
+            return Ok(None);
+        };
+        if identity.mission() != notice.owner_session().as_str() {
+            return Ok(None);
+        }
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        let project_id = ProjectId::from(identity.project());
+        let mission_id = MissionId::from(identity.mission());
+        let (mut service, runtime_reconciliation, context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.tenant_id.as_str() != identity.tenant()
+            || mission.project_id != project_id
+            || mission.id != mission_id
+            || mission.stage != MissionStage::Running
+        {
+            return Ok(None);
+        }
+        if mission.definition.is_some() {
+            let dispatch =
+                service.dispatch_current_mission_checkpoint(&project_id, &mission_id, now)?;
+            if dispatch.executor != MissionCheckpointExecutor::Runtime
+                || dispatch.state != MissionCheckpointDispatchState::Ready
+            {
+                return Ok(None);
+            }
+        }
+        let scope = runtime_authority_scope(&service, &project_id, &mission_id)?;
+        let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+        let turn_id = RuntimeTurnAttemptId::new();
+        map_runtime_dispatch_result(dispatch_idle_job_completion_runtime(
+            &self.cordis,
+            notice,
+            scope,
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            move |permit| {
+                let current_scope = runtime_authority_scope(&service, &project_id, &mission_id)?;
+                if &current_scope != permit.scope() {
+                    return Err(CordisError::AuthorityScopeMismatch.into());
+                }
+                self.run_existing_mission_runtime_authorized(
+                    service,
+                    permit,
+                    secret_store,
+                    runtime_reconciliation,
+                    &context_session,
+                    &project_id,
+                    mission_id,
+                    Some(runtime),
+                    availability,
+                    Some(DesktopIdleJobCompletionFollowup { turn_id }),
+                    None,
+                    now,
+                )
+            },
+        ))
+    }
+
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -5590,6 +5732,7 @@ impl DesktopDataPlane {
                     mission_id,
                     runtime,
                     availability,
+                    None,
                     cancellation,
                     now,
                 )
@@ -5718,9 +5861,11 @@ impl DesktopDataPlane {
         mission_id: MissionId,
         runtime: Option<DesktopRuntimeSource>,
         availability: DesktopRuntimeAvailabilityStatus,
+        followup: Option<DesktopIdleJobCompletionFollowup>,
         cancellation: Option<&DesktopRuntimeCancellation>,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let is_followup = followup.is_some();
         if let Some(control) = cancellation {
             control.record_progress(DesktopRuntimeProgressPhase::Preparing);
         }
@@ -5785,6 +5930,7 @@ impl DesktopDataPlane {
         };
         if let (Some(turn), Some(message), Some(runtime)) =
             (current_turn, completed_message.as_ref(), runtime.as_ref())
+            && turn.scope.purpose == hartevo_domain_kernel::RuntimeTurnPurpose::Agent
             && !self.runtime_session_has_committed_message_id(
                 mission.id.as_str(),
                 &format!("runtime:{}:user", turn.id.as_str()),
@@ -5801,6 +5947,7 @@ impl DesktopDataPlane {
             )?;
         }
         if let Some(turn) = current_turn
+            && !is_followup
             && turn.status == RuntimeTurnStatus::Completed
             && mission.definition.is_some()
             && completed_message.is_some()
@@ -5827,6 +5974,7 @@ impl DesktopDataPlane {
             );
         }
         if let Some(turn) = current_turn
+            && !is_followup
             && turn.status == RuntimeTurnStatus::Completed
             && mission.definition.is_none()
         {
@@ -5931,79 +6079,62 @@ impl DesktopDataPlane {
             4 * 1024 * 1024,
         )
         .map_err(|error| DesktopDataError::Application(ApplicationError::from(error)))?;
-        let prepared = service.prepare_local_mission_runtime_context(
-            PrepareLocalMissionRuntimeContext {
-                project_id: project_id.clone(),
-                mission_id: mission_id.clone(),
-                generation: resume_plan.generation,
-            },
-            context_session,
-            &tokenizer,
-            now + Duration::milliseconds(logical_millis),
-        )?;
-        logical_millis += 1;
-        let Some(envelope) = prepared.assembly.envelope.clone() else {
-            return self.finish_mission_submission(
-                &service,
-                secret_store,
-                runtime_reconciliation,
-                mission_id,
-                DesktopMissionRuntimeOutcome::ContextBlocked {
-                    status: prepared.assembly.manifest.status,
-                },
+        let prepare_command = PrepareLocalMissionRuntimeContext {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            generation: resume_plan.generation,
+        };
+        let prepared = if is_followup {
+            service.prepare_local_mission_runtime_followup_context(
+                &prepare_command,
                 now + Duration::milliseconds(logical_millis),
-            );
+            )?
+        } else {
+            service.prepare_local_mission_runtime_context(
+                prepare_command,
+                context_session,
+                &tokenizer,
+                now + Duration::milliseconds(logical_millis),
+            )?
+        };
+        logical_millis += 1;
+        let envelope = if is_followup {
+            None
+        } else {
+            let Some(envelope) = prepared.assembly.envelope.clone() else {
+                return self.finish_mission_submission(
+                    &service,
+                    secret_store,
+                    runtime_reconciliation,
+                    mission_id,
+                    DesktopMissionRuntimeOutcome::ContextBlocked {
+                        status: prepared.assembly.manifest.status,
+                    },
+                    now + Duration::milliseconds(logical_millis),
+                );
+            };
+            Some(envelope)
         };
         let mission_scope_digest = format!("{:x}", Sha256::digest(mission_id.as_str().as_bytes()));
         let runtime_home =
             ensure_project_runtime_home(context_session.project_root(), &mission_scope_digest)?;
         let runtime_command =
             runtime.into_command(context_session.project_root(), &runtime_home)?;
-        let turn_id = RuntimeTurnAttemptId::new();
+        let turn_id = followup.map_or_else(RuntimeTurnAttemptId::new, |followup| followup.turn_id);
         let message_id = format!("runtime:{}:user", turn_id.as_str());
-        let user_body = Self::runtime_session_user_body(&service, &mission)?;
-        let request = DesktopAgentTurnRequest::new(
-            mission.id.as_str(),
-            &message_id,
-            user_body.clone(),
-            context_session.project_root(),
-            SessionCallConfig {
-                provider: runtime_provider.clone(),
-                model: runtime_model.clone(),
-                reasoning_effort: None,
-                temperature: None,
-                max_tokens: None,
-                stop: None,
-            },
-        )
-        .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
+        let request_config = SessionCallConfig {
+            provider: runtime_provider.clone(),
+            model: runtime_model.clone(),
+            reasoning_effort: None,
+            temperature: None,
+            max_tokens: None,
+            stop: None,
+        };
         let runtime_task_id = prepared.capsule.task_id.clone();
         let adapter_project_id = project_id.clone();
         let adapter_turn_id = turn_id.clone();
         let adapter_model = runtime_model.clone();
         let adapter_cancellation = cancellation.cloned();
-        let (adapter, completion) = DesktopApplicationLlmAdapter::new(
-            runtime_provider.clone(),
-            runtime_model.clone(),
-            mission.id.as_str().to_owned(),
-            message_id,
-            &user_body,
-            move || {
-                run_desktop_application_runtime_turn(
-                    service,
-                    &adapter_project_id,
-                    prepared,
-                    DesktopApplicationRuntimeTurnInput::Mission(&envelope),
-                    resume_plan,
-                    &runtime_command,
-                    adapter_model,
-                    adapter_cancellation.as_ref(),
-                    &adapter_turn_id,
-                    now,
-                    logical_millis,
-                )
-            },
-        );
         let cordis_cancellation = cancellation
             .filter(|control| !control.is_requested())
             .map_or_else(
@@ -6011,18 +6142,94 @@ impl DesktopDataPlane {
                 DesktopRuntimeCancellation::cordis_cancellation,
             );
         let cordis_approval = cancellation.map(DesktopRuntimeCancellation::cordis_approval_bridge);
-        let agent_result = {
+        let (agent_result, completion) = {
             let mut cordis = self
                 .cordis
                 .checkout()
                 .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
-            futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
-                request,
-                adapter,
-                &cordis_cancellation,
-                permit,
-                cordis_approval.as_ref(),
-            ))
+            let (request, user_body, expected_source) = if is_followup {
+                let session_id =
+                    SessionId::new(mission.id.as_str().to_owned()).map_err(|error| {
+                        DesktopDataError::CordisSessionPersistence(error.to_string())
+                    })?;
+                let Some((request, body)) = futures_executor::block_on(
+                    cordis.prepare_idle_job_completion_followup(
+                        permit,
+                        &session_id,
+                        message_id.clone(),
+                        context_session.project_root().to_path_buf(),
+                        request_config.clone(),
+                    ),
+                )
+                .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
+                else {
+                    return Err(DesktopDataError::CordisSessionPersistence(
+                        "idle job follow-up lost eligibility before Runtime dispatch".into(),
+                    ));
+                };
+                (
+                    request,
+                    body,
+                    SessionMessageSource::Plugin {
+                        plugin: "tool-jobs".into(),
+                        compaction_id: None,
+                        source_command_id: None,
+                    },
+                )
+            } else {
+                let body = Self::runtime_session_user_body(&service, &mission)?;
+                let request = DesktopAgentTurnRequest::new(
+                    mission.id.as_str(),
+                    &message_id,
+                    body.clone(),
+                    context_session.project_root(),
+                    request_config.clone(),
+                )
+                .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
+                (request, body, SessionMessageSource::User)
+            };
+            let application_body = user_body.clone();
+            let (adapter, completion) = DesktopApplicationLlmAdapter::new_for_source(
+                runtime_provider.clone(),
+                runtime_model.clone(),
+                mission.id.as_str().to_owned(),
+                message_id,
+                expected_source,
+                &user_body,
+                move || {
+                    let input = if is_followup {
+                        DesktopApplicationRuntimeTurnInput::Followup(&application_body)
+                    } else {
+                        DesktopApplicationRuntimeTurnInput::Mission(
+                            envelope
+                                .as_ref()
+                                .expect("ordinary Runtime preparation includes its envelope"),
+                        )
+                    };
+                    run_desktop_application_runtime_turn(
+                        service,
+                        &adapter_project_id,
+                        prepared,
+                        input,
+                        resume_plan,
+                        &runtime_command,
+                        adapter_model,
+                        adapter_cancellation.as_ref(),
+                        &adapter_turn_id,
+                        now,
+                        logical_millis,
+                    )
+                },
+            );
+            let agent_result =
+                futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
+                    request,
+                    adapter,
+                    &cordis_cancellation,
+                    permit,
+                    cordis_approval.as_ref(),
+                ));
+            (agent_result, completion)
         };
         let completion = completion
             .lock()
@@ -7407,6 +7614,11 @@ fn runtime_authority_fence_digest(
             runtime_authority_field(&mut hasher, "turn_id", turn.id.as_str().as_bytes());
             runtime_authority_field(
                 &mut hasher,
+                "turn_purpose",
+                format!("{:?}", scope.purpose).as_bytes(),
+            );
+            runtime_authority_field(
+                &mut hasher,
                 "turn_tenant",
                 scope.tenant_id.as_str().as_bytes(),
             );
@@ -8260,6 +8472,7 @@ mod tests {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     };
 
     use chrono::Duration;
@@ -14091,11 +14304,12 @@ sleep 30"#;
             .open_application_from_secret(&database_secret, observed_at())
             .expect("Application service");
         let cancellation = LifecycleCancellation::default();
-        let (adapter, _) = DesktopApplicationLlmAdapter::new(
+        let (adapter, _) = DesktopApplicationLlmAdapter::new_for_source(
             "fixture-provider".into(),
             "fixture-model".into(),
             "non-user-interrupt".into(),
             "non-user-interrupt-message".into(),
+            SessionMessageSource::User,
             "non-user interrupt",
             move || {
                 Ok((
@@ -15148,6 +15362,136 @@ sleep 30"#;
                 restored.request_header().unwrap(),
                 Some(expected_request_header)
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end assertion binds terminal signal, fresh permit, exact Agent, direct follow-up prompt, and durable Session evidence"
+    )]
+    fn completed_background_job_wakes_the_same_idle_agent_with_a_followup_turn() {
+        use hartevo_cordis::{AgentsSurface, JobsSurface, SessionStore};
+
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let submission = plane
+            .start_mission_and_run_with(
+                &secrets,
+                &project_id,
+                "Prepare one reviewable local draft without external effects",
+                Some(completed_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("initial Runtime turn");
+        let session_id = SessionId::new(submission.mission_id.as_str()).unwrap();
+        let (agent, job_id, notice) = plane.with_cordis_host(|host| {
+            let agent = host
+                .context()
+                .agents::<AgentsSurface>()
+                .expect("Agent surface")
+                .list()
+                .into_iter()
+                .find(|agent| agent.status() == hartevo_cordis::AgentStatus::Idle)
+                .expect("retained Idle Agent");
+            let jobs = host.context().jobs::<JobsSurface>().expect("Jobs surface");
+            let (send, receive) = mpsc::channel();
+            jobs.on_terminal(move |notice| {
+                send.send(notice).unwrap();
+            });
+            let job_id = jobs
+                .start(
+                    &session_id,
+                    &agent,
+                    "bash",
+                    "finish follow-up fixture",
+                    |completion| {
+                        assert!(
+                            completion.complete(
+                                hartevo_cordis::JobOutcome::new(
+                                    hartevo_cordis::JobTerminalStatus::Completed,
+                                )
+                                .with_detail("exit code: 0")
+                                .with_output("private completed output"),
+                            )
+                        );
+                        Ok(hartevo_cordis::JobControl::new(|_| {}))
+                    },
+                )
+                .expect("completed background job");
+            let notice = receive
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("content-free terminal notice");
+            (agent, job_id, notice)
+        });
+        let expected_notice = format!(
+            "Background job {job_id} (bash) finished [status: completed, exit code: 0]. Read its new output with job_output."
+        );
+
+        let followup = plane
+            .run_idle_job_completion_followup_with(
+                &secrets,
+                &notice,
+                Some(resumed_completed_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("same-Agent background completion follow-up")
+            .expect("eligible completion wakes Runtime");
+        assert!(matches!(
+            followup.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(4))
+            .expect("follow-up Application state");
+        let turn = service
+            .latest_runtime_turn_for_mission(&project_id, &submission.mission_id)
+            .expect("follow-up turn query")
+            .expect("follow-up turn");
+        assert_eq!(
+            turn.scope.purpose,
+            hartevo_domain_kernel::RuntimeTurnPurpose::Followup
+        );
+        assert_eq!(
+            turn.scope.prompt_digest,
+            format!("{:x}", Sha256::digest(expected_notice.as_bytes()))
+        );
+        assert_eq!(turn.status, RuntimeTurnStatus::Completed);
+
+        plane.with_cordis_host(|host| {
+            let agents = host.context().agents::<AgentsSurface>().unwrap().list();
+            assert_eq!(agents.len(), 1);
+            assert!(agents[0].is_same_lifecycle(&agent));
+            assert_eq!(agents[0].status(), hartevo_cordis::AgentStatus::Idle);
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&session_id)
+                .unwrap()
+                .unwrap();
+            let messages = session.derive_messages().unwrap();
+            assert_eq!(messages.len(), 4);
+            assert_eq!(
+                messages[2].source,
+                SessionMessageSource::Plugin {
+                    plugin: "tool-jobs".into(),
+                    compaction_id: None,
+                    source_command_id: None,
+                }
+            );
+            assert!(matches!(
+                messages[2].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == &expected_notice
+            ));
+            let jobs = host.context().jobs::<JobsSurface>().unwrap();
+            assert!(jobs.unreported_terminal(&agent).is_empty());
         });
     }
 

@@ -21,10 +21,11 @@ use hartevo_cordis::{
     EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
     EffectReconciliationAuthority, EffectReconciliationBinding, EffectReconciliationPermit,
     EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, EventOptions,
-    Fiber, FiberState, FiberUid, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
-    KernelConsentState, KernelConsentStatus, LifecycleCancellation, ListenerHandle, LlmAdapter,
-    LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel, ManualCompactionError,
-    ManualCompactionErrorCode, NonBail, RuntimeAuthority, RuntimeDispatchCompletion,
+    Fiber, FiberState, FiberUid, JobId, JobTerminalNotice, JobsSurface, KernelApproval,
+    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
+    LifecycleCancellation, ListenerHandle, LlmAdapter, LlmAdapterStream, LlmError,
+    LlmGenerateRequest, LlmResolvedModel, ManualCompactionError, ManualCompactionErrorCode,
+    NonBail, RuntimeAgentIdentity, RuntimeAuthority, RuntimeDispatchCompletion,
     RuntimeDispatchPermit, RuntimeStatusCompletion, SandboxError, SessionApprovalAsked,
     SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig, SessionCancelCause,
     SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
@@ -49,6 +50,8 @@ use hartevo_storage::{
 use thiserror::Error;
 
 use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+
+const IDLE_JOB_COMPLETION_WAKE_BUDGET: u8 = 3;
 
 /// Whether OpenInterpreter is configured as an optional runtime adapter.
 #[must_use]
@@ -110,6 +113,13 @@ pub(crate) struct DesktopCordisCoordinator {
     root_fiber: Fiber,
     successful_bindings: u64,
     last_binding: Option<DesktopCordisBindingState>,
+    idle_job_wake_budgets: Vec<DesktopIdleJobWakeBudget>,
+}
+
+#[derive(Debug)]
+struct DesktopIdleJobWakeBudget {
+    agent: hartevo_cordis::AgentRef,
+    remaining: u8,
 }
 
 /// Content-minimized Desktop projection of one exact Cordis approval.
@@ -672,6 +682,36 @@ impl DesktopAgentTurnRequest {
             resolved_model,
         })
     }
+
+    pub(crate) fn job_completion(
+        session_id: impl Into<String>,
+        message_id: impl Into<String>,
+        body: impl Into<String>,
+        workspace_root: impl Into<PathBuf>,
+        config: SessionCallConfig,
+    ) -> Result<Self, SessionError> {
+        let resolved_model = LlmResolvedModel::new(config.provider.clone(), config.model.clone());
+        Ok(Self {
+            session_id: SessionId::new(session_id.into())?,
+            input: SessionMessage {
+                id: message_id.into(),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::Text { text: body.into() }],
+                source: SessionMessageSource::Plugin {
+                    plugin: "tool-jobs".into(),
+                    compaction_id: None,
+                    source_command_id: None,
+                },
+            },
+            workspace_root: workspace_root.into(),
+            config,
+            resolved_model,
+        })
+    }
+
+    fn is_human_input(&self) -> bool {
+        self.input.source == SessionMessageSource::User
+    }
 }
 
 impl std::fmt::Debug for DesktopAgentTurnRequest {
@@ -987,6 +1027,7 @@ impl DesktopCordisCoordinator {
             root_fiber,
             successful_bindings: 0,
             last_binding: None,
+            idle_job_wake_budgets: Vec::new(),
         };
         coordinator.ensure_root_fiber_active()?;
         Ok(coordinator)
@@ -1011,6 +1052,21 @@ impl DesktopCordisCoordinator {
             .sessions::<SessionStore>()
             .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
         self.session_persistence.bind_and_restore(store, &sessions)
+    }
+
+    #[must_use]
+    pub(crate) fn retained_runtime_agent_identity(
+        &self,
+        agent: &hartevo_cordis::AgentRef,
+    ) -> Option<RuntimeAgentIdentity> {
+        self.host.retained_runtime_agent_identity(agent)
+    }
+
+    pub(crate) fn jobs(&self) -> Result<Arc<JobsSurface>, CordisError> {
+        self.host
+            .context()
+            .jobs::<JobsSurface>()
+            .ok_or_else(|| CordisError::MissingDependencies(vec![keys::JOBS.to_string()]))
     }
 
     /// Read one exact durable input identity without deriving the visible
@@ -1208,6 +1264,154 @@ impl DesktopCordisCoordinator {
         .await
     }
 
+    /// Durably queue one grouped idle-job completion follow-up for the exact
+    /// retained Agent. Returning `None` is the normal suppressed/budgeted path.
+    pub(crate) async fn prepare_idle_job_completion_followup(
+        &mut self,
+        permit: &RuntimeDispatchPermit,
+        session_id: &SessionId,
+        message_id: String,
+        workspace_root: PathBuf,
+        config: SessionCallConfig,
+    ) -> Result<Option<(DesktopAgentTurnRequest, String)>, DesktopAgentTurnError> {
+        self.ensure_root_fiber_active()?;
+        let agent = permit.agent();
+        if agent.status() != hartevo_cordis::AgentStatus::Running {
+            return Ok(None);
+        }
+        let Some(identity) = self.host.retained_runtime_agent_identity(agent) else {
+            return Ok(None);
+        };
+        if identity.mission() != session_id.as_str()
+            || !self
+                .idle_job_wake_budgets
+                .iter()
+                .any(|budget| budget.agent.is_same_lifecycle(agent) && budget.remaining > 0)
+        {
+            return Ok(None);
+        }
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopAgentTurnError::MissingSessionStore)?;
+        let session = sessions
+            .get(session_id)?
+            .ok_or_else(|| DesktopAgentTurnError::SessionBusy(session_id.to_string()))?;
+        if runtime_open_turn(&session.events()?).is_some() || session.inbox().has_pending()? {
+            return Ok(None);
+        }
+        let jobs = self
+            .host
+            .context()
+            .jobs::<JobsSurface>()
+            .ok_or_else(|| CordisError::MissingDependencies(vec![keys::JOBS.into()]))?;
+        let notices = jobs.unreported_terminal(agent);
+        if notices.is_empty()
+            || notices
+                .iter()
+                .any(|notice| notice.owner_session() != session_id.as_str())
+        {
+            return Ok(None);
+        }
+        let body = notices
+            .iter()
+            .map(crate::sandbox_provider::background_job_completion_notice)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = DesktopAgentTurnRequest::job_completion(
+            session_id.as_str(),
+            message_id,
+            body.clone(),
+            workspace_root,
+            config,
+        )?;
+        session.inbox().append_next_turn(request.input.clone())?;
+        if !sessions.flush(&session).await? {
+            return Err(DesktopAgentTurnError::PersistenceUnavailable);
+        }
+        let ids = notices
+            .iter()
+            .map(|notice| notice.id().clone())
+            .collect::<Vec<JobId>>();
+        let _ = jobs.mark_terminal_reported(agent, &ids);
+        let consumed = self.consume_idle_job_completion_wake_budget(agent);
+        debug_assert!(consumed, "eligibility reserved one wake budget");
+        Ok(Some((request, body)))
+    }
+
+    fn idle_job_completion_is_eligible(
+        &self,
+        agent: &hartevo_cordis::AgentRef,
+        session_id: &SessionId,
+    ) -> Result<bool, DesktopAgentTurnError> {
+        if agent.status() != hartevo_cordis::AgentStatus::Idle
+            || !self
+                .idle_job_wake_budgets
+                .iter()
+                .any(|budget| budget.agent.is_same_lifecycle(agent) && budget.remaining > 0)
+        {
+            return Ok(false);
+        }
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopAgentTurnError::MissingSessionStore)?;
+        let Some(session) = sessions.get(session_id)? else {
+            return Ok(false);
+        };
+        if runtime_open_turn(&session.events()?).is_some() || session.inbox().has_pending()? {
+            return Ok(false);
+        }
+        let jobs = self
+            .host
+            .context()
+            .jobs::<JobsSurface>()
+            .ok_or_else(|| CordisError::MissingDependencies(vec![keys::JOBS.to_string()]))?;
+        let notices = jobs.unreported_terminal(agent);
+        Ok(!notices.is_empty()
+            && notices
+                .iter()
+                .all(|notice| notice.owner_session() == session_id.as_str()))
+    }
+
+    fn reset_idle_job_completion_wake_budget(&mut self, agent: &hartevo_cordis::AgentRef) {
+        self.idle_job_wake_budgets
+            .retain(|budget| !budget.agent.is_same_lifecycle(agent));
+        self.idle_job_wake_budgets.push(DesktopIdleJobWakeBudget {
+            agent: agent.clone(),
+            remaining: IDLE_JOB_COMPLETION_WAKE_BUDGET,
+        });
+    }
+
+    fn consume_idle_job_completion_wake_budget(
+        &mut self,
+        agent: &hartevo_cordis::AgentRef,
+    ) -> bool {
+        let Some(budget) = self
+            .idle_job_wake_budgets
+            .iter_mut()
+            .find(|budget| budget.agent.is_same_lifecycle(agent) && budget.remaining > 0)
+        else {
+            return false;
+        };
+        budget.remaining -= 1;
+        true
+    }
+
+    fn reset_idle_job_wake_budget_for_request(
+        &mut self,
+        request: &DesktopAgentTurnRequest,
+        runtime_permit: Option<&RuntimeDispatchPermit>,
+    ) {
+        if request.is_human_input()
+            && let Some(permit) = runtime_permit
+        {
+            self.reset_idle_job_completion_wake_budget(permit.agent());
+        }
+    }
+
     fn register_tool_approval_answerer(
         &mut self,
         session_id: &SessionId,
@@ -1294,6 +1498,7 @@ impl DesktopCordisCoordinator {
         if !sessions.flush(&session).await? {
             return Err(DesktopAgentTurnError::PersistenceUnavailable);
         }
+        self.reset_idle_job_wake_budget_for_request(&request, runtime_permit);
 
         let approval_registration = self.register_tool_approval_answerer(
             &request.session_id,
@@ -2793,6 +2998,93 @@ where
     }
 }
 
+/// Wake one exact retained Idle Agent after a background job becomes terminal.
+///
+/// Authorization and the Running transition happen before the durable plugin
+/// input is queued. Busy, stale, disposed, or exhausted-budget observations
+/// are ordinary suppression and never invoke the adapter.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one narrow wake boundary binds exact job ownership, fresh Domain facts, Session input, Runtime route, and lifecycle settlement"
+)]
+pub(crate) fn dispatch_idle_job_completion_runtime<Execute, Output, AdapterError>(
+    cordis: &Arc<DesktopCordisSlot>,
+    notice: &JobTerminalNotice,
+    scope: AuthorityScope,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+    execute: Execute,
+) -> Result<Option<Output>, AuthorityDispatchError<AdapterError>>
+where
+    Execute: FnOnce(&RuntimeDispatchPermit) -> Result<Output, AdapterError>,
+{
+    let mut permit = {
+        let mut host = match cordis.lock() {
+            Ok(host) => host,
+            Err(DesktopCordisSlotError::CheckedOut) => return Ok(None),
+            Err(error) => return Err(error.runtime().into()),
+        };
+        if notice.owner_agent().status() != hartevo_cordis::AgentStatus::Idle {
+            return Ok(None);
+        }
+        let Some(identity) = host
+            .host
+            .retained_runtime_agent_identity(notice.owner_agent())
+        else {
+            return Ok(None);
+        };
+        if identity.tenant() != scope.tenant_id()
+            || identity.project() != scope.project_id()
+            || identity.mission() != scope.mission_id()
+            || identity.mission() != notice.owner_session().as_str()
+            || !host
+                .idle_job_completion_is_eligible(notice.owner_agent(), notice.owner_session())
+                .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        match host.bind_and_authorize_runtime(
+            scope,
+            kernel_consent_state(consent),
+            record.map(kernel_consent_record),
+            approval.map(kernel_approval),
+            now,
+        ) {
+            Ok(permit) => permit,
+            Err(CordisError::RuntimeDispatchBusy) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+    };
+
+    let started = permit.announce_started().err();
+    let (output, authority) = if started.is_none() {
+        match execute(&permit) {
+            Ok(output) => (Some(output), None),
+            Err(error) => (None, Some(error)),
+        }
+    } else {
+        (None, None)
+    };
+
+    let completion = match cordis.lock() {
+        Ok(mut host) => host.finish_runtime(permit),
+        Err(error) => Err(error.runtime()),
+    };
+    let finish = match completion {
+        Ok(completion) => completion.announce().err(),
+        Err(error) => Some(error),
+    };
+    if let Some(error) = AuthorityDispatchError::from_phases(started, authority, finish, None) {
+        Err(error)
+    } else {
+        output.map(Some).ok_or_else(|| {
+            AuthorityDispatchError::Cordis(Box::new(CordisError::RuntimePermitMismatch))
+        })
+    }
+}
+
 /// Bind exact live facts, issue a one-shot Domain-command permit, release the
 /// coordinator lock for Application, then settle the permit under a second
 /// short lock. This path grants no Effect execution capability.
@@ -3059,6 +3351,25 @@ mod tests {
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         }
+    }
+
+    #[test]
+    fn idle_job_completion_budget_is_three_and_exact_lifecycle_scoped() {
+        let mut coordinator =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        let agent = AgentRef::new("budget-agent");
+        let same_id_replacement = AgentRef::new(agent.id.clone());
+
+        coordinator.reset_idle_job_completion_wake_budget(&agent);
+        assert!(!coordinator.consume_idle_job_completion_wake_budget(&same_id_replacement));
+        for _ in 0..3 {
+            assert!(coordinator.consume_idle_job_completion_wake_budget(&agent));
+        }
+        assert!(!coordinator.consume_idle_job_completion_wake_budget(&agent));
+
+        coordinator.reset_idle_job_completion_wake_budget(&agent);
+        assert!(coordinator.consume_idle_job_completion_wake_budget(&agent));
     }
 
     #[derive(Default)]

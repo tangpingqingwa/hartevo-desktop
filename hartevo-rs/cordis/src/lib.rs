@@ -111,7 +111,7 @@ pub use fiber::{
 };
 pub use host::{
     CordisHost, CordisHostTeardown, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID,
-    host_is_cordis_loop, host_plugin_ids,
+    RuntimeAgentIdentity, host_is_cordis_loop, host_plugin_ids,
 };
 pub use inbox::{AgentInbox, AgentInboxOutcome, AgentInboxTarget};
 pub use invariants::{
@@ -120,7 +120,8 @@ pub use invariants::{
 };
 pub use jobs::{
     DEFAULT_MAX_CONCURRENT_JOBS_PER_SESSION, JobCompletion, JobControl, JobError, JobId,
-    JobKillOutcome, JobOutcome, JobRead, JobSnapshot, JobStatus, JobTerminalStatus, JobsSurface,
+    JobKillOutcome, JobOutcome, JobRead, JobSnapshot, JobStatus, JobTerminalNotice,
+    JobTerminalStatus, JobsSurface,
 };
 pub use kernel::{
     KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,

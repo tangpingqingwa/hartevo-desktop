@@ -1093,7 +1093,7 @@ fn background_job_status_line(
         ))
 }
 
-fn background_job_completion_notice(job: &JobSnapshot) -> String {
+pub(crate) fn background_job_completion_notice(job: &JobSnapshot) -> String {
     let detail = job
         .detail()
         .map_or_else(String::new, |detail| format!(", {detail}"));
