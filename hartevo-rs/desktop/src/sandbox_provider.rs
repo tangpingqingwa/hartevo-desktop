@@ -243,6 +243,7 @@ fn run_sandboxed_process_in_environment(
         argv,
         policy_request,
         working_directory,
+        &[],
         cancellation,
         SandboxProcessLimits::default(),
     )
@@ -262,6 +263,7 @@ fn run_sandboxed_process_with_limits(
         argv,
         policy_request,
         None,
+        &[],
         cancellation,
         limits,
     )
@@ -272,6 +274,7 @@ fn run_sandboxed_process_in_environment_with_limits(
     argv: Vec<OsString>,
     policy_request: SandboxPolicyRequest,
     working_directory: Option<&Path>,
+    managed_environment: &[(&str, &str)],
     cancellation: &LifecycleCancellation,
     limits: SandboxProcessLimits,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
@@ -300,7 +303,7 @@ fn run_sandboxed_process_in_environment_with_limits(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_bash_environment(&mut command, std::env::vars_os());
+    configure_bash_environment(&mut command, std::env::vars_os(), managed_environment);
     let mut child = command
         .group_spawn()
         .map_err(|source| spawn_error(&plan, &working_directory, source))?;
@@ -356,10 +359,12 @@ fn run_sandboxed_process_in_environment_with_limits(
 fn configure_bash_environment(
     command: &mut Command,
     parent: impl IntoIterator<Item = (OsString, OsString)>,
+    managed: &[(&str, &str)],
 ) {
     command.env_clear();
     command.envs(scrubbed_parent_environment(parent));
     command.envs(BASH_ENVIRONMENT_OVERRIDES);
+    command.envs(managed.iter().copied());
 }
 
 fn scrubbed_parent_environment(
@@ -469,7 +474,7 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
     ]);
     SessionToolSchema {
         name: "bash".into(),
-        description: "Run one foreground bash command through the Desktop sandbox. Each call uses a fresh shell; workdir defaults to the session workspace and timeoutMs defaults to 120000 with a 600000 cap. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
+        description: "Run one foreground bash command through the Desktop sandbox. Each call uses a fresh shell; workdir defaults to the session workspace and timeoutMs defaults to 120000 with a 600000 cap. Trusted current-Session facts are available through managed $DSH_* variables. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
         parameters: serde_json::Map::from_iter([
             ("type".into(), serde_json::json!("object")),
             ("additionalProperties".into(), serde_json::json!(false)),
@@ -516,6 +521,10 @@ fn execute_sandboxed_bash(
     if let Some(escalation) = escalation {
         policy_request = policy_request.with_escalation(escalation);
     }
+    let managed_environment = [
+        ("DSH_SHELL", "1"),
+        ("DSH_SESSION_ID", run.session_id().as_str()),
+    ];
     let outcome = run_sandboxed_process_in_environment_with_limits(
         environment,
         vec![
@@ -525,6 +534,7 @@ fn execute_sandboxed_bash(
         ],
         policy_request,
         Some(&working_directory),
+        &managed_environment,
         run.cancellation(),
         SandboxProcessLimits::with_timeout(arguments.timeout),
     )
@@ -1115,6 +1125,7 @@ mod tests {
     #[test]
     fn bash_optional_schema_and_parser_keep_workdir_timeout_and_unknown_keys_closed() {
         let schema = sandboxed_bash_schema();
+        assert!(schema.description.contains("$DSH_*"));
         let properties = schema.parameters["properties"].as_object().unwrap();
         assert_eq!(properties["workdir"]["type"], "string");
         assert_eq!(properties["timeoutMs"]["type"], "number");
@@ -1383,7 +1394,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bash_environment_retains_ordinary_values_scrubs_sensitive_values_and_sets_terminal_facts() {
+    fn bash_environment_scrubs_parent_and_sets_terminal_and_managed_facts() {
         let parent = [
             ("PATH", "/fixture/bin"),
             ("HOME", "/fixture/home"),
@@ -1394,9 +1405,12 @@ mod tests {
             ("DB_PASSWORD", "fixture-value"),
             ("CLIENT_SECRET", "fixture-value"),
             ("AUTH_TOKEN", "fixture-value"),
+            ("DSH_SHELL", "stale"),
+            ("DSH_SESSION_ID", "stale"),
             ("TERM", "parent-term"),
         ]
         .map(|(key, value)| (OsString::from(key), OsString::from(value)));
+        let managed = [("DSH_SHELL", "1"), ("DSH_SESSION_ID", "session-n96")];
         let mut command = Command::new("/bin/sh");
         command.args([
             "-c",
@@ -1410,15 +1424,15 @@ mod tests {
                 "test -z \"${DB_PASSWORD+x}\" && ",
                 "test -z \"${CLIENT_SECRET+x}\" && ",
                 "test -z \"${AUTH_TOKEN+x}\" && ",
-                "printf '%s' \"$NO_COLOR|$TERM|$PAGER|$GIT_PAGER\""
+                "printf '%s' \"$NO_COLOR|$TERM|$PAGER|$GIT_PAGER|$DSH_SHELL|$DSH_SESSION_ID\""
             ),
         ]);
-        configure_bash_environment(&mut command, parent);
+        configure_bash_environment(&mut command, parent, &managed);
 
         let output = command.output().unwrap();
 
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"1|dumb|cat|cat");
+        assert_eq!(output.stdout, b"1|dumb|cat|cat|1|session-n96");
         assert!(output.stderr.is_empty());
     }
 
