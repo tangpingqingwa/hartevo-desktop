@@ -138,10 +138,10 @@ pub use sandbox::{
     SandboxExecutionEnvironment, SandboxExecutionPlan, SandboxExecutionPolicy, SandboxMode,
     SandboxModeSource, SandboxPolicyRequest, SandboxPolicyService, SandboxProcessClassification,
     SandboxProvider, SandboxProviderService, SandboxProviderUnavailable, SandboxRunnerFailureRule,
-    SessionSandboxMode, approve_sandbox_escalation, classify_sandbox_process,
-    consume_sandbox_escalation_approval, plan_sandbox_escalation_approval,
-    prepare_sandbox_execution, register_sandbox_provider, resolve_sandbox_policy, set_sandbox_mode,
-    validate_sandbox_escalation_args,
+    SandboxWorkspaceBinding, SessionSandboxMode, approve_sandbox_escalation,
+    bind_sandbox_workspace, classify_sandbox_process, consume_sandbox_escalation_approval,
+    plan_sandbox_escalation_approval, prepare_sandbox_execution, register_sandbox_provider,
+    resolve_sandbox_policy, set_sandbox_mode, validate_sandbox_escalation_args,
 };
 pub use service::{
     AssociatedAccessor, AssociatedAccessorHandle, CallableService, Service, ServiceAssociation,
