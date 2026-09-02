@@ -28,6 +28,7 @@ rust_decimal.workspace = true
 sha2.workspace = true
 serde = { workspace = true, optional = true }
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -36,7 +37,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-tempfile.workspace = true
 
 [features]
 default = ["desktop"]

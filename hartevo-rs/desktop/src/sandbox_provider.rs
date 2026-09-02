@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
@@ -25,6 +25,7 @@ const SEATBELT_READ_ONLY_PROFILE: &str =
 const SANDBOX_PROCESS_TIMEOUT_MS: f64 = 120_000.0;
 const SANDBOX_PROCESS_MAX_TIMEOUT_MS: f64 = 600_000.0;
 const SANDBOX_PROCESS_OUTPUT_BYTES: usize = 64_000;
+const SANDBOX_PROCESS_OUTPUT_SPILL_BYTES: usize = 64 * 1024 * 1024;
 const SANDBOX_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const BASH_ENVIRONMENT_OVERRIDES: [(&str, &str); 4] = [
     ("NO_COLOR", "1"),
@@ -45,6 +46,7 @@ pub(crate) struct SandboxProcessOutput {
     pub(crate) bytes: Vec<u8>,
     pub(crate) byte_count: u64,
     pub(crate) truncated: bool,
+    pub(crate) spill_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for SandboxProcessOutput {
@@ -54,6 +56,7 @@ impl std::fmt::Debug for SandboxProcessOutput {
             .field("byte_count", &self.byte_count)
             .field("retained_byte_count", &self.bytes.len())
             .field("truncated", &self.truncated)
+            .field("spill_available", &self.spill_path.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -150,6 +153,7 @@ struct SandboxProcessLimits {
     timeout: Duration,
     timeout_ms: f64,
     output_bytes: usize,
+    output_spill_bytes: usize,
     poll_interval: Duration,
 }
 
@@ -169,6 +173,7 @@ impl Default for SandboxProcessLimits {
             timeout: ResolvedBashTimeout::default().duration,
             timeout_ms: SANDBOX_PROCESS_TIMEOUT_MS,
             output_bytes: SANDBOX_PROCESS_OUTPUT_BYTES,
+            output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,
             poll_interval: SANDBOX_PROCESS_POLL_INTERVAL,
         }
     }
@@ -320,22 +325,29 @@ fn run_sandboxed_process_in_environment_with_limits(
         }
     })?;
 
-    let stdout_reader =
-        spawn_output_collector("hartevo-sandbox-stdout", stdout, limits.output_bytes).map_err(
-            |source| {
-                terminate_group_best_effort(&mut child);
-                SandboxProcessError::Output { source }
-            },
-        )?;
-    let stderr_reader =
-        match spawn_output_collector("hartevo-sandbox-stderr", stderr, limits.output_bytes) {
-            Ok(reader) => reader,
-            Err(source) => {
-                terminate_group_best_effort(&mut child);
-                let _ = stdout_reader.join();
-                return Err(SandboxProcessError::Output { source });
-            }
-        };
+    let stdout_reader = spawn_output_collector(
+        "hartevo-sandbox-stdout",
+        stdout,
+        limits.output_bytes,
+        limits.output_spill_bytes,
+    )
+    .map_err(|source| {
+        terminate_group_best_effort(&mut child);
+        SandboxProcessError::Output { source }
+    })?;
+    let stderr_reader = match spawn_output_collector(
+        "hartevo-sandbox-stderr",
+        stderr,
+        limits.output_bytes,
+        limits.output_spill_bytes,
+    ) {
+        Ok(reader) => reader,
+        Err(source) => {
+            terminate_group_best_effort(&mut child);
+            let _ = stdout_reader.join();
+            return Err(SandboxProcessError::Output { source });
+        }
+    };
 
     let deadline = Instant::now()
         .checked_add(limits.timeout)
@@ -695,7 +707,7 @@ fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value
         Some(SandboxEnforcement::Partial) => "partial",
     };
     let output = sandboxed_bash_output(outcome, classification, enforcement);
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "output": output,
         "exitCode": outcome.exit_code,
         "termination": termination,
@@ -707,7 +719,14 @@ fn sandboxed_bash_result(outcome: &SandboxedProcessOutcome) -> serde_json::Value
         "stdoutTruncated": outcome.stdout.truncated,
         "stderrByteCount": outcome.stderr.byte_count,
         "stderrTruncated": outcome.stderr.truncated
-    })
+    });
+    if let Some(path) = outcome.stdout.spill_path.as_ref() {
+        result["stdoutSpillPath"] = path.to_string_lossy().into_owned().into();
+    }
+    if let Some(path) = outcome.stderr.spill_path.as_ref() {
+        result["stderrSpillPath"] = path.to_string_lossy().into_owned().into();
+    }
+    result
 }
 
 fn sandboxed_bash_output(
@@ -726,10 +745,10 @@ fn sandboxed_bash_output(
         ));
     }
     if outcome.stdout.truncated {
-        sections.push("[stdout truncated; retained tail shown]".into());
+        sections.push(truncation_marker("stdout", &outcome.stdout));
     }
     if outcome.stderr.truncated {
-        sections.push("[stderr truncated; retained tail shown]".into());
+        sections.push(truncation_marker("stderr", &outcome.stderr));
     }
     if outcome.termination == SandboxProcessTermination::TimedOut {
         sections.push(format!("[timed out after {}ms]", outcome.timeout_ms));
@@ -754,6 +773,18 @@ fn sandboxed_bash_output(
         Some(_) | None => {}
     }
     sections.join("\n")
+}
+
+fn truncation_marker(stream: &str, output: &SandboxProcessOutput) -> String {
+    output.spill_path.as_ref().map_or_else(
+        || format!("[{stream} truncated; full output unavailable; retained tail shown]"),
+        |path| {
+            format!(
+                "[{stream} truncated; full output: {}]",
+                path.to_string_lossy()
+            )
+        },
+    )
 }
 
 fn usable_workspace(workspace: &Path) -> Result<PathBuf, SandboxProcessError> {
@@ -857,18 +888,68 @@ fn spawn_output_collector<R>(
     name: &str,
     reader: R,
     maximum: usize,
+    spill_maximum: usize,
 ) -> io::Result<JoinHandle<io::Result<SandboxProcessOutput>>>
 where
     R: Read + Send + 'static,
 {
+    let label = name.to_string();
     thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || collect_output_tail(reader, maximum))
+        .name(label.clone())
+        .spawn(move || collect_output_tail(reader, maximum, spill_maximum, &label))
 }
 
-fn collect_output_tail(mut reader: impl Read, maximum: usize) -> io::Result<SandboxProcessOutput> {
+struct OutputSpill {
+    directory: tempfile::TempDir,
+    file: tempfile::NamedTempFile,
+}
+
+impl OutputSpill {
+    fn create(label: &str) -> io::Result<Self> {
+        let mut directory_builder = tempfile::Builder::new();
+        directory_builder.prefix("hartevo-subprocess-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            directory_builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let directory = directory_builder.tempdir()?;
+        let mut file_builder = tempfile::Builder::new();
+        file_builder.prefix(label).suffix(".log");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            file_builder.permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        let file = file_builder.tempfile_in(directory.path())?;
+        Ok(Self { directory, file })
+    }
+
+    fn persist(mut self) -> Option<PathBuf> {
+        if self.file.flush().is_err() {
+            return None;
+        }
+        let Ok((file, path)) = self.file.keep() else {
+            return None;
+        };
+        drop(file);
+        let _directory = self.directory.keep();
+        Some(path)
+    }
+}
+
+fn collect_output_tail(
+    mut reader: impl Read,
+    maximum: usize,
+    spill_maximum: usize,
+    label: &str,
+) -> io::Result<SandboxProcessOutput> {
     let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
     let mut byte_count = 0_u64;
+    let mut spill: Option<OutputSpill> = None;
+    let mut spill_disabled = false;
     let mut buffer = [0_u8; 8 * 1024];
     loop {
         let read = match reader.read(&mut buffer) {
@@ -877,13 +958,35 @@ fn collect_output_tail(mut reader: impl Read, maximum: usize) -> io::Result<Sand
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
+        let chunk = &buffer[..read];
         byte_count = byte_count.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-        retain_tail(&mut bytes, &buffer[..read], maximum);
+        if !spill_disabled {
+            if byte_count > u64::try_from(spill_maximum).unwrap_or(u64::MAX) {
+                spill = None;
+                spill_disabled = true;
+            } else if let Some(active) = spill.as_mut() {
+                if active.file.write_all(chunk).is_err() {
+                    spill = None;
+                    spill_disabled = true;
+                }
+            } else if bytes.len().saturating_add(chunk.len()) > maximum {
+                match OutputSpill::create(label).and_then(|mut active| {
+                    active.file.write_all(&bytes)?;
+                    active.file.write_all(chunk)?;
+                    Ok(active)
+                }) {
+                    Ok(active) => spill = Some(active),
+                    Err(_) => spill_disabled = true,
+                }
+            }
+        }
+        retain_tail(&mut bytes, chunk, maximum);
     }
     Ok(SandboxProcessOutput {
         truncated: byte_count > u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         bytes,
         byte_count,
+        spill_path: spill.and_then(OutputSpill::persist),
     })
 }
 
@@ -1008,10 +1111,11 @@ mod tests {
     };
 
     use super::{
-        MacosSeatbeltSandboxProvider, SEATBELT_EXEC, SEATBELT_READ_ONLY_PROFILE,
-        SandboxProcessError, SandboxProcessLimits, SandboxProcessTermination,
-        configure_bash_environment, mount_macos_sandbox_provider, resolve_bash_timeout,
-        resolve_bash_workdir, run_sandboxed_process, run_sandboxed_process_in_environment,
+        MacosSeatbeltSandboxProvider, SANDBOX_PROCESS_OUTPUT_SPILL_BYTES, SEATBELT_EXEC,
+        SEATBELT_READ_ONLY_PROFILE, SandboxProcessError, SandboxProcessLimits,
+        SandboxProcessTermination, collect_output_tail, configure_bash_environment,
+        mount_macos_sandbox_provider, resolve_bash_timeout, resolve_bash_workdir,
+        run_sandboxed_process, run_sandboxed_process_in_environment,
         run_sandboxed_process_with_limits, sandboxed_bash_arguments, sandboxed_bash_result,
         sandboxed_bash_schema, sbpl_string, scrubbed_parent_environment,
     };
@@ -1592,6 +1696,78 @@ mod tests {
         assert_eq!(outcome.stdout.bytes.len(), 64_000);
         assert!(outcome.stdout.bytes.ends_with(b"N89-SECRET-TAIL"));
         assert!(!format!("{outcome:?}").contains("N89-SECRET-TAIL"));
+        let spill_path = outcome
+            .stdout
+            .spill_path
+            .as_ref()
+            .expect("truncated output below the spill cap must remain recoverable");
+        let full_output = std::fs::read(spill_path).unwrap();
+        assert_eq!(full_output.len(), 70_015);
+        assert!(full_output.ends_with(b"N89-SECRET-TAIL"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(spill_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(spill_path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let result = sandboxed_bash_result(&outcome);
+        assert_eq!(
+            result["stdoutSpillPath"].as_str(),
+            Some(spill_path.to_string_lossy().as_ref())
+        );
+        assert!(result["output"].as_str().unwrap().contains(&format!(
+            "[stdout truncated; full output: {}]",
+            spill_path.display()
+        )));
+        let spill_directory = spill_path.parent().unwrap().to_path_buf();
+        std::fs::remove_file(spill_path).unwrap();
+        std::fs::remove_dir(spill_directory).unwrap();
+    }
+
+    #[test]
+    fn output_spill_is_lazy_and_drops_an_over_cap_partial_file() {
+        let exact =
+            collect_output_tail(std::io::Cursor::new(b"0123456789"), 10, 16, "exact-cap").unwrap();
+        assert!(!exact.truncated);
+        assert_eq!(exact.bytes, b"0123456789");
+        assert!(exact.spill_path.is_none());
+
+        let spilled = collect_output_tail(
+            std::io::Cursor::new(b"0123456789abcdef"),
+            10,
+            16,
+            "bounded-spill",
+        )
+        .unwrap();
+        assert!(spilled.truncated);
+        assert_eq!(spilled.bytes, b"6789abcdef");
+        let spill_path = spilled.spill_path.unwrap();
+        assert_eq!(std::fs::read(&spill_path).unwrap(), b"0123456789abcdef");
+        let spill_directory = spill_path.parent().unwrap().to_path_buf();
+        std::fs::remove_file(spill_path).unwrap();
+        std::fs::remove_dir(spill_directory).unwrap();
+
+        let over_cap = collect_output_tail(
+            std::io::Cursor::new(b"0123456789abcdefg"),
+            10,
+            16,
+            "over-cap",
+        )
+        .unwrap();
+        assert!(over_cap.truncated);
+        assert_eq!(over_cap.bytes, b"789abcdefg");
+        assert!(over_cap.spill_path.is_none());
     }
 
     #[cfg(unix)]
@@ -1626,6 +1802,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 timeout_ms: 5_000.0,
                 output_bytes: 64_000,
+                output_spill_bytes: SANDBOX_PROCESS_OUTPUT_SPILL_BYTES,
                 poll_interval: Duration::from_millis(5),
             },
         )
