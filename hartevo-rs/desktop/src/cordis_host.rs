@@ -31,9 +31,10 @@ use hartevo_cordis::{
     SessionFinishReason, SessionHandle, SessionHeader, SessionId, SessionLlmFailure,
     SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
-    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-    SessionToolError, TurnEndReason, approval_events, compact_now, host_is_cordis_loop, keys,
-    register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
+    SessionSandboxMode, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+    SessionSurfaceIntent, SessionToolError, TurnEndReason, approval_events, compact_now,
+    host_is_cordis_loop, keys, register_llm_adapter, run_agent_turn as run_cordis_agent_turn,
+    session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -2113,6 +2114,9 @@ fn encode_event(
                     approval: approval.to_json_value()?,
                 }
             }
+            SessionEventKind::SandboxMode { sandbox } => PersistedSessionEventKind::SandboxMode {
+                sandbox: sandbox.to_json_value()?,
+            },
             SessionEventKind::LlmRetry { retry } => PersistedSessionEventKind::LlmRetry {
                 retry: retry.to_json_value()?,
             },
@@ -2306,6 +2310,9 @@ fn decode_event(
                     approval: SessionApprovalPolicy::from_json_value(approval)?,
                 }
             }
+            PersistedSessionEventKind::SandboxMode { sandbox } => SessionEventKind::SandboxMode {
+                sandbox: SessionSandboxMode::from_json_value(sandbox)?,
+            },
             PersistedSessionEventKind::LlmRetry { retry } => SessionEventKind::LlmRetry {
                 retry: SessionLlmRetry::from_json_value(retry)?,
             },
@@ -2985,16 +2992,17 @@ mod tests {
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
-        OPENINTERPRETER, RuntimeBinding, SessionApprovalAsked, SessionApprovalDecided,
-        SessionApprovalPolicy, SessionCallConfig, SessionCancelCause, SessionCompactionEnd,
-        SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionError,
-        SessionEvent, SessionEventKind, SessionFinishReason, SessionHandle, SessionId,
-        SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted,
-        SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore,
-        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
-        SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason,
-        enforce_invariants, events, host_is_cordis_loop, invariant_missing,
-        is_compact_checkpoint_source, keys, register_tool_definition, session_events,
+        OPENINTERPRETER, RuntimeBinding, SandboxMode, SandboxModeSource, SessionApprovalAsked,
+        SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig, SessionCancelCause,
+        SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+        SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
+        SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
+        SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
+        SessionSandboxMode, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+        SessionSurfaceIntent, SessionSurfaceOp, SessionToolSchema, SurfaceOwner, ToolCall,
+        ToolDefinition, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
+        invariant_missing, is_compact_checkpoint_source, keys, register_tool_definition,
+        session_events,
     };
     use hartevo_domain_kernel::{
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
@@ -3978,6 +3986,33 @@ mod tests {
             let persisted = encode_event(&event).unwrap();
             assert_eq!(decode_event(&persisted).unwrap(), event);
         }
+    }
+
+    #[test]
+    fn sandbox_mode_codec_round_trips_the_closed_policy_vocabulary() {
+        let event = SessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: SessionEventKind::SandboxMode {
+                sandbox: SessionSandboxMode::new(
+                    SandboxMode::WorkspaceWrite,
+                    Some(SandboxModeSource::Delegation),
+                ),
+            },
+        };
+
+        let persisted = encode_event(&event).unwrap();
+        assert_eq!(decode_event(&persisted).unwrap(), event);
+        let PersistedSessionEventKind::SandboxMode { sandbox } = persisted.kind else {
+            unreachable!();
+        };
+        assert_eq!(
+            sandbox,
+            serde_json::json!({
+                "mode": "workspace-write",
+                "source": "delegation",
+            })
+        );
     }
 
     #[test]

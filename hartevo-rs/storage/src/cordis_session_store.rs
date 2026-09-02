@@ -168,6 +168,9 @@ pub enum PersistedSessionEventKind {
     ApprovalPolicy {
         approval: serde_json::Value,
     },
+    SandboxMode {
+        sandbox: serde_json::Value,
+    },
     LlmRetry {
         retry: serde_json::Value,
     },
@@ -490,6 +493,10 @@ fn validate_event_payload(
             validate_approval_policy(approval)?;
             (None, None)
         }
+        PersistedSessionEventKind::SandboxMode { sandbox } => {
+            validate_sandbox_mode(sandbox)?;
+            (None, None)
+        }
         PersistedSessionEventKind::LlmRetry { retry } => retry_scope(
             retry,
             "llm/retry payload must be a JSON object",
@@ -646,6 +653,25 @@ fn validate_approval_policy(approval: &serde_json::Value) -> Result<(), StorageE
         Some(source) if source.as_str() == Some("delegation") => Ok(()),
         Some(_) => Err(StorageError::InvalidSessionCheckpoint(
             "approval/policy source is invalid",
+        )),
+    }
+}
+
+fn validate_sandbox_mode(sandbox: &serde_json::Value) -> Result<(), StorageError> {
+    validate_request_json(sandbox, "sandbox/mode payload must be a JSON object")?;
+    if !matches!(
+        sandbox.get("mode").and_then(serde_json::Value::as_str),
+        Some("read-only" | "workspace-write" | "danger-full-access")
+    ) {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "sandbox/mode value is invalid",
+        ));
+    }
+    match sandbox.get("source") {
+        None => Ok(()),
+        Some(source) if source.as_str() == Some("delegation") => Ok(()),
+        Some(_) => Err(StorageError::InvalidSessionCheckpoint(
+            "sandbox/mode source is invalid",
         )),
     }
 }
@@ -1417,6 +1443,45 @@ mod tests {
                 seq: 0,
                 time_ms: 1,
                 kind,
+            }]);
+            assert!(matches!(
+                isolated.persist_session_checkpoint(&invalid),
+                Err(StorageError::InvalidSessionCheckpoint(actual)) if actual == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn sandbox_mode_round_trips_and_rejects_open_vocabulary() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        let policy = checkpoint(vec![PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: PersistedSessionEventKind::SandboxMode {
+                sandbox: serde_json::json!({
+                    "mode": "workspace-write",
+                    "source": "delegation",
+                }),
+            },
+        }]);
+        assert!(store.persist_session_checkpoint(&policy).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![policy]);
+
+        for (sandbox, expected) in [
+            (
+                serde_json::json!({ "mode": "host-root" }),
+                "sandbox/mode value is invalid",
+            ),
+            (
+                serde_json::json!({ "mode": "read-only", "source": "inherit" }),
+                "sandbox/mode source is invalid",
+            ),
+        ] {
+            let mut isolated = ProjectStore::in_memory().unwrap();
+            let invalid = checkpoint(vec![PersistedSessionEvent {
+                seq: 0,
+                time_ms: 1,
+                kind: PersistedSessionEventKind::SandboxMode { sandbox },
             }]);
             assert!(matches!(
                 isolated.persist_session_checkpoint(&invalid),

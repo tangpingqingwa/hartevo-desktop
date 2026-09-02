@@ -29,6 +29,7 @@ use crate::event::{Emit, EventKey, EventSchemaId, Parallel};
 use crate::inbox::{
     AgentInbox, AgentInboxOutcome, AgentInboxState, AgentInboxTarget, validate_agent_inbox_event,
 };
+use crate::sandbox::{SandboxMode, SandboxModeSource, SessionSandboxMode};
 
 /// The Rust Session format written by this bounded implementation.
 pub const SESSION_FORMAT_VERSION: u32 = 0;
@@ -773,6 +774,9 @@ pub enum SessionEventKind {
     ApprovalPolicy {
         approval: SessionApprovalPolicy,
     },
+    SandboxMode {
+        sandbox: SessionSandboxMode,
+    },
     LlmRetry {
         retry: SessionLlmRetry,
     },
@@ -829,6 +833,7 @@ impl SessionEventKind {
             Self::ApprovalAsked { .. } => "approval/asked",
             Self::ApprovalDecided { .. } => "approval/decided",
             Self::ApprovalPolicy { .. } => "approval/policy",
+            Self::SandboxMode { .. } => "sandbox/mode",
             Self::LlmRetry { .. } => "llm/retry",
             Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::CompactionStart { .. } => "compaction/start",
@@ -857,6 +862,7 @@ impl SessionEventKind {
             | Self::ApprovalAsked { .. }
             | Self::ApprovalDecided { .. }
             | Self::ApprovalPolicy { .. }
+            | Self::SandboxMode { .. }
             | Self::LlmRetry { .. }
             | Self::LlmRetryStarted { .. }
             | Self::CompactionStart { .. }
@@ -882,6 +888,7 @@ impl SessionEventKind {
             | Self::ApprovalAsked { .. }
             | Self::ApprovalDecided { .. }
             | Self::ApprovalPolicy { .. }
+            | Self::SandboxMode { .. }
             | Self::LlmRetry { .. }
             | Self::LlmRetryStarted { .. }
             | Self::CompactionStart { .. }
@@ -961,6 +968,7 @@ struct SessionState {
     pending_tool_calls: HashSet<String>,
     pending_approvals: BTreeSet<ApprovalRequestId>,
     approval_policy: ApprovalPolicy,
+    sandbox_mode: Option<SandboxMode>,
     request_provider: Option<String>,
     retry_chains: HashMap<String, SessionRetryState>,
     compaction: Option<SessionCompactionState>,
@@ -1089,6 +1097,10 @@ impl SessionState {
             SessionEventKind::ApprovalPolicy { approval } => {
                 approval.to_json_value()?;
                 self.approval_policy = approval.policy();
+            }
+            SessionEventKind::SandboxMode { sandbox } => {
+                sandbox.to_json_value()?;
+                self.sandbox_mode = Some(sandbox.mode());
             }
             SessionEventKind::LlmRetry { retry } => self.apply_llm_retry(retry)?,
             SessionEventKind::LlmRetryStarted { started } => {
@@ -1511,6 +1523,7 @@ impl SessionState {
             | SessionEventKind::ApprovalAsked { .. }
             | SessionEventKind::ApprovalDecided { .. }
             | SessionEventKind::ApprovalPolicy { .. }
+            | SessionEventKind::SandboxMode { .. }
             | SessionEventKind::LlmRetry { .. }
             | SessionEventKind::LlmRetryStarted { .. }
             | SessionEventKind::CompactionStart { .. }
@@ -1843,6 +1856,7 @@ fn pending_interrupted_tool_calls(events: &[SessionEvent]) -> Vec<(String, u64, 
             | SessionEventKind::ApprovalAsked { .. }
             | SessionEventKind::ApprovalDecided { .. }
             | SessionEventKind::ApprovalPolicy { .. }
+            | SessionEventKind::SandboxMode { .. }
             | SessionEventKind::LlmRetry { .. }
             | SessionEventKind::LlmRetryStarted { .. }
             | SessionEventKind::CompactionStart { .. }
@@ -2472,6 +2486,11 @@ impl SessionLog {
         self.state.approval_policy
     }
 
+    #[must_use]
+    pub const fn sandbox_mode(&self) -> Option<SandboxMode> {
+        self.state.sandbox_mode
+    }
+
     pub fn start_turn(&mut self) -> Result<u64, SessionError> {
         let turn = self
             .state
@@ -2609,6 +2628,18 @@ impl SessionLog {
         Ok(self
             .append(SessionEventKind::ApprovalPolicy {
                 approval: SessionApprovalPolicy::new(policy, source),
+            })?
+            .seq)
+    }
+
+    fn append_sandbox_mode(
+        &mut self,
+        mode: SandboxMode,
+        source: Option<SandboxModeSource>,
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::SandboxMode {
+                sandbox: SessionSandboxMode::new(mode, source),
             })?
             .seq)
     }
@@ -3451,6 +3482,10 @@ impl SessionHandle {
         Ok(self.lock()?.approval_policy())
     }
 
+    pub fn sandbox_mode(&self) -> Result<Option<SandboxMode>, SessionError> {
+        Ok(self.lock()?.sandbox_mode())
+    }
+
     pub(crate) fn set_approval_policy(
         &self,
         policy: ApprovalPolicy,
@@ -3479,6 +3514,14 @@ impl SessionHandle {
             let _ = dispatcher.emit_contained(events::SESSION_EVENT, record);
         }
         Ok(record.is_some())
+    }
+
+    pub(crate) fn append_sandbox_mode(
+        &self,
+        mode: SandboxMode,
+        source: Option<SandboxModeSource>,
+    ) -> Result<u64, SessionError> {
+        self.commit(|log| log.append_sandbox_mode(mode, source))
     }
 
     pub fn append_llm_retry(&self, retry: SessionLlmRetry) -> Result<u64, SessionError> {
@@ -3974,6 +4017,8 @@ pub enum SessionError {
     EmptyApprovalId,
     #[error("session approval persistence encoding is invalid")]
     InvalidApprovalEncoding,
+    #[error("session sandbox policy persistence encoding is invalid")]
+    InvalidSandboxPolicyEncoding,
     #[error("session approval must have {expected}")]
     InvalidApproval { expected: &'static str },
     #[error("session approval `{id}` is already pending")]
