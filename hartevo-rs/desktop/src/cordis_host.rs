@@ -3214,6 +3214,18 @@ mod tests {
                     arguments: r#"{"command":"pwd; printf n90-cordis; printf n90-stderr >&2; exit 7","description":"Exercise the N90 foreground result contract"}"#.into(),
                 },
             },
+            SessionStreamChunk::BlockStart {
+                index: 1,
+                block_type: SessionStreamBlockType::ToolCall,
+            },
+            SessionStreamChunk::BlockEnd {
+                index: 1,
+                block: SessionContentBlock::ToolCall {
+                    id: "desktop-bash-workdir-call".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"pwd","description":"Show the explicit working directory","workdir":"nested"}"#.into(),
+                },
+            },
             SessionStreamChunk::Finish {
                 reason: SessionFinishReason::ToolCalls,
                 replay_state: None,
@@ -3244,8 +3256,18 @@ mod tests {
     fn desktop_bash_escalation_turn_adapter(
         call_id: &str,
         command: &str,
+        workdir: Option<&str>,
         justification: &str,
     ) -> DesktopSequencedTurnAdapter {
+        let mut arguments = serde_json::json!({
+            "command": command,
+            "description": "Exercise one exact N91 sandbox escalation",
+            "sandbox_permissions": "workspace-write",
+            "justification": justification,
+        });
+        if let Some(workdir) = workdir {
+            arguments["workdir"] = serde_json::json!(workdir);
+        }
         let first = vec![
             SessionStreamChunk::BlockStart {
                 index: 0,
@@ -3256,13 +3278,7 @@ mod tests {
                 block: SessionContentBlock::ToolCall {
                     id: call_id.into(),
                     name: "bash".into(),
-                    arguments: serde_json::json!({
-                        "command": command,
-                        "description": "Exercise one exact N91 sandbox escalation",
-                        "sandbox_permissions": "workspace-write",
-                        "justification": justification,
-                    })
-                    .to_string(),
+                    arguments: arguments.to_string(),
                 },
             },
             SessionStreamChunk::Finish {
@@ -3488,6 +3504,9 @@ mod tests {
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let workspace_root = scratch.path().canonicalize().unwrap();
+        let nested = scratch.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let nested = nested.canonicalize().unwrap();
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap();
@@ -3550,6 +3569,37 @@ mod tests {
         assert!(text.contains("[stderr]\nn90-stderr"));
         assert!(text.contains("[sandbox: read-only, full enforcement]"));
         assert!(text.contains("[exit code: 7]"));
+        let workdir_message = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolResult { message, error, .. }
+                    if error.is_none()
+                        && matches!(
+                            &message.source,
+                            SessionMessageSource::Tool { call_id }
+                                if call_id == "desktop-bash-workdir-call"
+                        ) =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .expect("explicit workdir result must be durable");
+        let [
+            SessionContentBlock::ToolResult {
+                content,
+                is_error: false,
+                ..
+            },
+        ] = workdir_message.content.as_slice()
+        else {
+            panic!("explicit workdir must use the canonical successful tool wrapper");
+        };
+        let [SessionContentBlock::Text { text }] = content.as_slice() else {
+            panic!("explicit workdir result must contain one text block");
+        };
+        assert!(text.contains(&nested.display().to_string()));
+        assert!(text.contains("[sandbox: read-only, full enforcement]"));
         assert!(runtime_open_turn(&events).is_none());
     }
 
@@ -3564,8 +3614,10 @@ mod tests {
             .prefix("n91-approved-")
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
-        let marker = scratch.path().join("allowed-marker");
-        let workspace_root = scratch.path().canonicalize().unwrap();
+        let nested = scratch.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let marker = nested.join("allowed-marker");
+        let nested = nested.canonicalize().unwrap();
         let request_workspace_root = scratch.path().to_path_buf();
         let command = "printf n91-approved > allowed-marker; cat allowed-marker; pwd";
         let justification = "create the N91 marker inside the current workspace";
@@ -3626,6 +3678,7 @@ mod tests {
                     desktop_bash_escalation_turn_adapter(
                         "desktop-bash-escalation-allow",
                         command,
+                        Some("nested"),
                         justification,
                     ),
                     &LifecycleCancellation::default(),
@@ -3697,7 +3750,7 @@ mod tests {
             })
             .expect("approved escalation must commit one successful ToolResult");
         assert!(result_text.contains("n91-approved"));
-        assert!(result_text.contains(&workspace_root.display().to_string()));
+        assert!(result_text.contains(&nested.display().to_string()));
         assert!(result_text.contains("[sandbox: workspace-write, full enforcement]"));
         assert!(runtime_open_turn(&events).is_none());
     }
@@ -3773,6 +3826,7 @@ mod tests {
                     desktop_bash_escalation_turn_adapter(
                         "desktop-bash-escalation-reject",
                         command,
+                        None,
                         "write a marker that rejection must prevent",
                     ),
                     &LifecycleCancellation::default(),
