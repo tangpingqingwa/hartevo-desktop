@@ -6,6 +6,7 @@
 //! reverse through the existing `effect()` / `on()` disposer stack.
 //! OpenInterpreter is never provided on those Hartevo-owned keys.
 
+use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -396,6 +397,7 @@ pub struct ToolExecutionInput {
 pub struct ToolRunContext {
     input: ToolExecutionInput,
     cancellation: LifecycleCancellation,
+    approval: Mutex<Option<ToolApprovalGrant>>,
     additional_contexts: Mutex<Vec<SessionMessage>>,
     concludes_turn: AtomicBool,
 }
@@ -414,10 +416,15 @@ impl fmt::Debug for ToolRunContext {
 }
 
 impl ToolRunContext {
-    fn new(input: ToolExecutionInput, cancellation: LifecycleCancellation) -> Self {
+    fn new(
+        input: ToolExecutionInput,
+        cancellation: LifecycleCancellation,
+        approval: Option<ToolApprovalGrant>,
+    ) -> Self {
         Self {
             input,
             cancellation,
+            approval: Mutex::new(approval),
             additional_contexts: Mutex::new(Vec::new()),
             concludes_turn: AtomicBool::new(false),
         }
@@ -473,6 +480,31 @@ impl ToolRunContext {
     #[must_use]
     pub const fn arguments(&self) -> &serde_json::Value {
         self.input.arguments()
+    }
+
+    /// Consume the definition-owned payload attached only after this exact
+    /// call received an `allowed-once` approval decision.
+    pub(crate) fn take_approval_payload<T>(&self) -> Option<T>
+    where
+        T: Any + Send + Sync,
+    {
+        let grant = self
+            .approval
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        if grant.session_id != *self.session_id()
+            || grant.tool_name != self.name()
+            || grant.call_id != self.call_id()
+        {
+            return None;
+        }
+        grant
+            .requirement
+            .payload
+            .downcast::<T>()
+            .ok()
+            .map(|payload| *payload)
     }
 
     /// Defer one typed context until the final result reaches the agent driver.
@@ -579,6 +611,7 @@ pub struct PreparedToolExecution {
     input: ToolExecutionInput,
     mode: ToolExecutionMode,
     registration_identity: Arc<()>,
+    approval: Option<ToolApprovalGrant>,
     result_projection: ToolResultProjection,
 }
 
@@ -738,6 +771,9 @@ impl ToolExecutionPreparation {
 }
 
 type ToolExecutor = Arc<dyn Fn(&ToolRunContext) -> Result<serde_json::Value, String> + Send + Sync>;
+type ToolApprovalPlanner = Arc<
+    dyn Fn(&ToolExecutionInput) -> Result<Option<ToolApprovalRequirement>, String> + Send + Sync,
+>;
 type ToolResultRenderer = Arc<
     dyn Fn(&serde_json::Value, &serde_json::Value) -> Result<Vec<SessionContentBlock>, String>
         + Send
@@ -758,11 +794,61 @@ struct ToolResultProjection {
     finalizer: Option<ToolContentFinalizer>,
 }
 
+/// One definition-owned approval ask prepared before any tool body starts.
+///
+/// The payload is opaque outside the defining subsystem and reaches the body
+/// only after the canonical Agent/Session approval path returns
+/// `allowed-once` for this exact call.
+pub struct ToolApprovalRequirement {
+    reason: Option<String>,
+    payload: Box<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for ToolApprovalRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolApprovalRequirement")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolApprovalRequirement {
+    /// Create one exact approval requirement with a definition-owned payload.
+    /// Empty reasons remain fail-closed when the canonical approval request is
+    /// built and never deliver the payload to the body.
+    #[must_use]
+    pub fn new<T>(reason: impl Into<String>, payload: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            reason: Some(reason.into()),
+            payload: Box::new(payload),
+        }
+    }
+
+    fn policy(reason: Option<String>) -> Self {
+        Self {
+            reason,
+            payload: Box::new(()),
+        }
+    }
+}
+
+struct ToolApprovalGrant {
+    session_id: SessionId,
+    tool_name: String,
+    call_id: String,
+    requirement: ToolApprovalRequirement,
+}
+
 /// One reversible executable tool definition. Schema, concurrency policy, and
 /// body share the same opaque Cordis registration identity.
 pub struct ToolDefinition {
     schema: SessionToolSchema,
     classifier: Option<ToolConcurrencyClassifier>,
+    approval_planner: Option<ToolApprovalPlanner>,
     executor: ToolExecutor,
     result_projection: ToolResultProjection,
 }
@@ -773,6 +859,7 @@ impl fmt::Debug for ToolDefinition {
             .debug_struct("ToolDefinition")
             .field("schema", &self.schema)
             .field("has_classifier", &self.classifier.is_some())
+            .field("has_approval_planner", &self.approval_planner.is_some())
             .field(
                 "has_output_renderer",
                 &self.result_projection.renderer.is_some(),
@@ -794,6 +881,7 @@ impl ToolDefinition {
         Self {
             schema,
             classifier: None,
+            approval_planner: None,
             executor: Arc::new(move |run| executor(run.input())),
             result_projection: ToolResultProjection::default(),
         }
@@ -809,6 +897,7 @@ impl ToolDefinition {
         Self {
             schema,
             classifier: None,
+            approval_planner: None,
             executor: Arc::new(executor),
             result_projection: ToolResultProjection::default(),
         }
@@ -820,6 +909,22 @@ impl ToolDefinition {
         F: Fn(&serde_json::Value) -> Result<bool, String> + Send + Sync + 'static,
     {
         self.classifier = Some(Arc::new(classifier));
+        self
+    }
+
+    /// Attach a definition-owned, fail-closed approval planner. A returned
+    /// requirement is resolved by the async Agent driver before scheduling;
+    /// its opaque payload is delivered to the exact body only on
+    /// `allowed-once`.
+    #[must_use]
+    pub fn with_approval_requirement<F>(mut self, planner: F) -> Self
+    where
+        F: Fn(&ToolExecutionInput) -> Result<Option<ToolApprovalRequirement>, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.approval_planner = Some(Arc::new(planner));
         self
     }
 
@@ -2281,6 +2386,7 @@ struct ToolRegistration {
     name: String,
     identity: Arc<()>,
     classifier: Option<ToolConcurrencyClassifier>,
+    approval_planner: Option<ToolApprovalPlanner>,
     executor: Option<ToolExecutor>,
     result_projection: ToolResultProjection,
 }
@@ -2291,6 +2397,7 @@ impl fmt::Debug for ToolRegistration {
             .debug_struct("ToolRegistration")
             .field("name", &self.name)
             .field("has_classifier", &self.classifier.is_some())
+            .field("has_approval_planner", &self.approval_planner.is_some())
             .field("has_executor", &self.executor.is_some())
             .field(
                 "has_output_renderer",
@@ -2364,6 +2471,7 @@ impl ToolsSurface {
                 name,
                 identity: Arc::clone(&identity),
                 classifier,
+                approval_planner: None,
                 executor,
                 result_projection: ToolResultProjection::default(),
             });
@@ -2371,13 +2479,14 @@ impl ToolsSurface {
     }
 
     fn register_schema(&self, schema: SessionToolSchema) -> Result<Arc<()>, PromptError> {
-        self.register_schema_with_runtime(schema, None, None, ToolResultProjection::default())
+        self.register_schema_with_runtime(schema, None, None, None, ToolResultProjection::default())
     }
 
     fn register_definition(&self, definition: ToolDefinition) -> Result<Arc<()>, PromptError> {
         self.register_schema_with_runtime(
             definition.schema,
             definition.classifier,
+            definition.approval_planner,
             Some(definition.executor),
             definition.result_projection,
         )
@@ -2387,6 +2496,7 @@ impl ToolsSurface {
         &self,
         schema: SessionToolSchema,
         classifier: Option<ToolConcurrencyClassifier>,
+        approval_planner: Option<ToolApprovalPlanner>,
         executor: Option<ToolExecutor>,
         result_projection: ToolResultProjection,
     ) -> Result<Arc<()>, PromptError> {
@@ -2406,6 +2516,7 @@ impl ToolsSurface {
             name,
             identity: Arc::clone(&identity),
             classifier,
+            approval_planner,
             executor,
             result_projection,
         });
@@ -3552,6 +3663,7 @@ pub fn run_tools_pipeline(ctx: &mut Context, mut call: ToolCall) -> Result<ToolC
 pub(crate) struct AllowedToolPolicy {
     input: ToolExecutionInput,
     registered: Option<ToolRegistration>,
+    approval: Option<ToolApprovalGrant>,
     result_projection: ToolResultProjection,
 }
 
@@ -3565,7 +3677,7 @@ impl AllowedToolPolicy {
 /// One `ask` decision that has not yet consulted the approval service.
 pub(crate) struct PendingToolApproval {
     allowed: AllowedToolPolicy,
-    reason: Option<String>,
+    requirement: ToolApprovalRequirement,
 }
 
 impl PendingToolApproval {
@@ -3576,10 +3688,16 @@ impl PendingToolApproval {
 
     #[must_use]
     pub(crate) fn reason(&self) -> Option<&str> {
-        self.reason.as_deref()
+        self.requirement.reason.as_deref()
     }
 
-    pub(crate) fn allow(self) -> AllowedToolPolicy {
+    pub(crate) fn allow(mut self) -> AllowedToolPolicy {
+        self.allowed.approval = Some(ToolApprovalGrant {
+            session_id: self.allowed.input.session_id().clone(),
+            tool_name: self.allowed.input.name().to_string(),
+            call_id: self.allowed.input.call_id().to_string(),
+            requirement: self.requirement,
+        });
         self.allowed
     }
 
@@ -3629,7 +3747,7 @@ pub(crate) fn prepare_tool_policy(
             result_projection,
         )));
     }
-    match decided.decision.as_str() {
+    let event_requirement = match decided.decision.as_str() {
         "deny" => {
             let reason = if decided.result.is_empty() {
                 format!("tool \"{}\" was denied by pre-execute policy", input.name())
@@ -3642,17 +3760,10 @@ pub(crate) fn prepare_tool_policy(
                 result_projection,
             )));
         }
-        "ask" => {
-            return Ok(ToolPolicyPreparation::Ask(PendingToolApproval {
-                allowed: AllowedToolPolicy {
-                    input,
-                    registered,
-                    result_projection,
-                },
-                reason: (!decided.result.is_empty()).then_some(decided.result),
-            }));
-        }
-        "allow" => {}
+        "ask" => Some(ToolApprovalRequirement::policy(
+            (!decided.result.is_empty()).then_some(decided.result),
+        )),
+        "allow" => None,
         decision => {
             return Ok(ToolPolicyPreparation::Denied(denied_tool(
                 input,
@@ -3660,12 +3771,46 @@ pub(crate) fn prepare_tool_policy(
                 result_projection,
             )));
         }
-    }
-    Ok(ToolPolicyPreparation::Allow(AllowedToolPolicy {
+    };
+    let definition_requirement = match registered
+        .as_ref()
+        .and_then(|registration| registration.approval_planner.as_ref())
+    {
+        None => None,
+        Some(planner) => match catch_unwind(AssertUnwindSafe(|| planner(&input))) {
+            Ok(Ok(requirement)) => requirement,
+            Ok(Err(reason)) => {
+                return Ok(ToolPolicyPreparation::Denied(denied_tool(
+                    input,
+                    reason,
+                    result_projection,
+                )));
+            }
+            Err(_) => {
+                return Ok(ToolPolicyPreparation::Denied(denied_tool(
+                    input,
+                    "tool approval planner panicked",
+                    result_projection,
+                )));
+            }
+        },
+    };
+    let allowed = AllowedToolPolicy {
         input,
         registered,
+        approval: None,
         result_projection,
-    }))
+    };
+    Ok(
+        if let Some(requirement) = definition_requirement.or(event_requirement) {
+            ToolPolicyPreparation::Ask(PendingToolApproval {
+                allowed,
+                requirement,
+            })
+        } else {
+            ToolPolicyPreparation::Allow(allowed)
+        },
+    )
 }
 
 /// Apply live monotonic guards and current registration classification after
@@ -3680,6 +3825,7 @@ pub(crate) fn finalize_allowed_tool_policy(
     let AllowedToolPolicy {
         input,
         registered,
+        approval,
         result_projection,
     } = allowed;
     if let Some(reason) = tools.guard_reason(&input) {
@@ -3705,6 +3851,7 @@ pub(crate) fn finalize_allowed_tool_policy(
         input,
         mode,
         registration_identity: registered.identity,
+        approval,
         result_projection: registered.result_projection,
     }))
 }
@@ -3868,6 +4015,7 @@ fn dispatch_prepared_tool_execution(
     let PreparedToolExecution {
         input,
         registration_identity,
+        approval,
         result_projection,
         ..
     } = prepared;
@@ -3903,7 +4051,7 @@ fn dispatch_prepared_tool_execution(
         };
         Arc::clone(executor)
     };
-    let run = ToolRunContext::new(input, cancellation);
+    let run = ToolRunContext::new(input, cancellation, approval);
     let result = match catch_unwind(AssertUnwindSafe(|| executor(&run))) {
         Ok(Ok(value)) => ToolDispatchResult::Success { value },
         Ok(Err(message)) => ToolDispatchResult::Failure { message },

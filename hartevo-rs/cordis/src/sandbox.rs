@@ -10,7 +10,7 @@ use crate::approval::{ApprovalError, ApprovalOutcome, ApprovalRequest, request_a
 use crate::context::{Context, CordisError, ProviderHandle, keys};
 use crate::fiber::LifecycleCancellation;
 use crate::session::{SessionError, SessionHandle, SessionId, SessionStore};
-use crate::surface::AgentRef;
+use crate::surface::{AgentRef, ToolApprovalRequirement, ToolExecutionInput, ToolRunContext};
 
 /// Every supported file-effect mode, from narrowest to widest.
 pub const SANDBOX_MODES: &[SandboxMode] = &[
@@ -838,6 +838,100 @@ pub fn validate_sandbox_escalation_args(
         return Err(SandboxError::BlankJustification);
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct PendingSandboxEscalation {
+    requested_mode: SandboxMode,
+    effective_mode: SandboxMode,
+    justification: String,
+    subject: String,
+    workspace_root: PathBuf,
+    session_id: SessionId,
+    tool_name: String,
+    call_id: String,
+}
+
+/// Prepare the definition-owned approval requirement for one exact sandbox
+/// escalation. The opaque payload cannot reach the tool body until the
+/// canonical Agent approval path returns `allowed-once`.
+pub fn plan_sandbox_escalation_approval(
+    input: &ToolExecutionInput,
+    policy: &SandboxExecutionPolicy,
+    requested_mode: Option<SandboxMode>,
+    justification: Option<&str>,
+    subject: &str,
+) -> Result<Option<ToolApprovalRequirement>, SandboxError> {
+    validate_sandbox_escalation_args(requested_mode, justification)?;
+    let (Some(requested_mode), Some(justification)) = (requested_mode, justification) else {
+        return Ok(None);
+    };
+    if subject.is_empty() {
+        return Err(SandboxError::EmptySubject);
+    }
+    if !requested_mode.is_strictly_wider_than(policy.mode()) {
+        return Err(SandboxError::NotStrictlyWider {
+            requested: requested_mode,
+            current: policy.mode(),
+        });
+    }
+    if policy.session_id() != Some(input.session_id()) || policy.call_id() != Some(input.call_id())
+    {
+        return Err(SandboxError::EscalationGrantMismatch);
+    }
+    let pending = PendingSandboxEscalation {
+        requested_mode,
+        effective_mode: policy.mode(),
+        justification: justification.to_string(),
+        subject: subject.to_string(),
+        workspace_root: policy.workspace_root().to_path_buf(),
+        session_id: input.session_id().clone(),
+        tool_name: input.name().to_string(),
+        call_id: input.call_id().to_string(),
+    };
+    Ok(Some(ToolApprovalRequirement::new(
+        format!("escalate sandbox to {requested_mode}: {justification}"),
+        pending,
+    )))
+}
+
+/// Consume the approved definition payload and mint the existing exact
+/// sandbox grant only when the live policy and immutable call still match.
+pub fn consume_sandbox_escalation_approval(
+    run: &ToolRunContext,
+    policy: &SandboxExecutionPolicy,
+    requested_mode: Option<SandboxMode>,
+    justification: Option<&str>,
+    subject: &str,
+) -> Result<Option<SandboxEscalationGrant>, SandboxError> {
+    validate_sandbox_escalation_args(requested_mode, justification)?;
+    let (Some(requested_mode), Some(justification)) = (requested_mode, justification) else {
+        return Ok(None);
+    };
+    let pending = run
+        .take_approval_payload::<PendingSandboxEscalation>()
+        .ok_or(SandboxError::EscalationGrantMismatch)?;
+    if !requested_mode.is_strictly_wider_than(policy.mode())
+        || pending.requested_mode != requested_mode
+        || pending.effective_mode != policy.mode()
+        || pending.justification != justification
+        || pending.subject != subject
+        || pending.workspace_root != policy.workspace_root()
+        || pending.session_id != *run.session_id()
+        || pending.tool_name != run.name()
+        || pending.call_id != run.call_id()
+        || policy.session_id() != Some(run.session_id())
+        || policy.call_id() != Some(run.call_id())
+    {
+        return Err(SandboxError::EscalationGrantMismatch);
+    }
+    Ok(Some(SandboxEscalationGrant {
+        mode: requested_mode,
+        from_mode: pending.effective_mode,
+        session_id: pending.session_id,
+        call_id: pending.call_id,
+        workspace_root: pending.workspace_root,
+    }))
 }
 
 /// Exact approval-routing identity held by an escalating tool call.

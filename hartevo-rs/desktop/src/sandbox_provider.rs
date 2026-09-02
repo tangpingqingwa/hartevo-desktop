@@ -14,7 +14,8 @@ use hartevo_cordis::{
     SandboxExecutionPlan, SandboxMode, SandboxPolicyRequest, SandboxProcessClassification,
     SandboxProvider, SandboxProviderUnavailable, SandboxRunnerFailureRule, SessionContentBlock,
     SessionToolSchema, ToolDefinition, ToolRunContext, classify_sandbox_process,
-    register_sandbox_provider, register_tool_definition,
+    consume_sandbox_escalation_approval, plan_sandbox_escalation_approval,
+    register_sandbox_provider, register_tool_definition, validate_sandbox_escalation_args,
 };
 use thiserror::Error;
 
@@ -296,8 +297,30 @@ fn run_sandboxed_process_in_environment_with_limits(
 }
 
 fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDefinition {
+    let approval_environment = environment.clone();
     ToolDefinition::new_with_run_context(sandboxed_bash_schema(), move |run| {
         execute_sandboxed_bash(&environment, run)
+    })
+    .with_approval_requirement(move |input| {
+        let arguments = sandboxed_bash_arguments(input.arguments())?;
+        let session = approval_environment
+            .live_session(input.session_id())
+            .map_err(|error| sandbox_error_message(&error))?;
+        let policy = approval_environment
+            .resolve(
+                SandboxPolicyRequest::for_session(&session)
+                    .with_call_id(input.call_id())
+                    .map_err(|error| sandbox_error_message(&error))?,
+            )
+            .map_err(|error| sandbox_error_message(&error))?;
+        plan_sandbox_escalation_approval(
+            input,
+            &policy,
+            arguments.sandbox_permissions,
+            arguments.justification.as_deref(),
+            "command",
+        )
+        .map_err(|error| sandbox_error_message(&error))
     })
     .with_output_renderer(|_, value| {
         let output = value
@@ -326,10 +349,25 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
                 "description": "Short explanation of what the command does"
             }),
         ),
+        (
+            "sandbox_permissions".into(),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["workspace-write", "danger-full-access"],
+                "description": "One wider sandbox mode for this exact call; requires justification and user approval"
+            }),
+        ),
+        (
+            "justification".into(),
+            serde_json::json!({
+                "type": "string",
+                "description": "Required with sandbox_permissions: why this exact command needs wider file access"
+            }),
+        ),
     ]);
     SessionToolSchema {
         name: "bash".into(),
-        description: "Run one foreground bash command through the Desktop sandbox.".into(),
+        description: "Run one foreground bash command through the Desktop sandbox. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
         parameters: serde_json::Map::from_iter([
             ("type".into(), serde_json::json!("object")),
             ("additionalProperties".into(), serde_json::json!(false)),
@@ -346,19 +384,37 @@ fn execute_sandboxed_bash(
     environment: &SandboxExecutionEnvironment,
     run: &ToolRunContext,
 ) -> Result<serde_json::Value, String> {
-    let (command, _description) = sandboxed_bash_arguments(run.arguments())?;
+    let arguments = sandboxed_bash_arguments(run.arguments())?;
     let session = environment
         .live_session(run.session_id())
         .map_err(|error| sandbox_error_message(&error))?;
-    let policy_request = SandboxPolicyRequest::for_session(&session)
+    let standing_policy = environment
+        .resolve(
+            SandboxPolicyRequest::for_session(&session)
+                .with_call_id(run.call_id())
+                .map_err(|error| sandbox_error_message(&error))?,
+        )
+        .map_err(|error| sandbox_error_message(&error))?;
+    let escalation = consume_sandbox_escalation_approval(
+        run,
+        &standing_policy,
+        arguments.sandbox_permissions,
+        arguments.justification.as_deref(),
+        "command",
+    )
+    .map_err(|error| sandbox_error_message(&error))?;
+    let mut policy_request = SandboxPolicyRequest::for_session(&session)
         .with_call_id(run.call_id())
         .map_err(|error| sandbox_error_message(&error))?;
+    if let Some(escalation) = escalation {
+        policy_request = policy_request.with_escalation(escalation);
+    }
     let outcome = run_sandboxed_process_in_environment(
         environment,
         vec![
             OsString::from("/bin/bash"),
             OsString::from("-c"),
-            OsString::from(command),
+            OsString::from(arguments.command),
         ],
         policy_request,
         run.cancellation(),
@@ -370,20 +426,58 @@ fn execute_sandboxed_bash(
     Ok(sandboxed_bash_result(&outcome))
 }
 
-fn sandboxed_bash_arguments(arguments: &serde_json::Value) -> Result<(String, String), String> {
+struct SandboxedBashArguments {
+    command: String,
+    sandbox_permissions: Option<SandboxMode>,
+    justification: Option<String>,
+}
+
+fn sandboxed_bash_arguments(
+    arguments: &serde_json::Value,
+) -> Result<SandboxedBashArguments, String> {
     let object = arguments
         .as_object()
         .ok_or_else(|| "bash arguments must be an object".to_string())?;
-    if object.len() != 2
-        || object
-            .keys()
-            .any(|key| key != "command" && key != "description")
-    {
-        return Err("bash arguments must contain only command and description".into());
+    if object.keys().any(|key| {
+        key != "command"
+            && key != "description"
+            && key != "sandbox_permissions"
+            && key != "justification"
+    }) {
+        return Err(
+            "bash arguments may contain only command, description, sandbox_permissions, and justification"
+                .into(),
+        );
     }
     let command = non_blank_bash_argument(object, "command")?;
-    let description = non_blank_bash_argument(object, "description")?;
-    Ok((command, description))
+    let _description = non_blank_bash_argument(object, "description")?;
+    let sandbox_permissions = match object.get("sandbox_permissions") {
+        None => None,
+        Some(serde_json::Value::String(mode)) if mode == "workspace-write" => {
+            Some(SandboxMode::WorkspaceWrite)
+        }
+        Some(serde_json::Value::String(mode)) if mode == "danger-full-access" => {
+            Some(SandboxMode::DangerFullAccess)
+        }
+        Some(_) => {
+            return Err(
+                "bash argument sandbox_permissions must be workspace-write or danger-full-access"
+                    .into(),
+            );
+        }
+    };
+    let justification = match object.get("justification") {
+        None => None,
+        Some(serde_json::Value::String(justification)) => Some(justification.clone()),
+        Some(_) => return Err("bash argument justification must be a string".into()),
+    };
+    validate_sandbox_escalation_args(sandbox_permissions, justification.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(SandboxedBashArguments {
+        command,
+        sandbox_permissions,
+        justification,
+    })
 }
 
 fn non_blank_bash_argument(
