@@ -83,6 +83,8 @@ pub(crate) enum SandboxProcessError {
     CancelledBeforeSpawn,
     #[error("sandbox process workspace is unusable: {detail}")]
     UnusableWorkspace { detail: String },
+    #[error("sandbox process working directory is unusable: {detail}")]
+    UnusableWorkingDirectory { detail: String },
     #[error("sandbox process failed to spawn: {source}")]
     Spawn {
         #[source]
@@ -109,6 +111,7 @@ impl SandboxProcessError {
             Self::Sandbox(error) => error.code(),
             Self::CancelledBeforeSpawn
             | Self::UnusableWorkspace { .. }
+            | Self::UnusableWorkingDirectory { .. }
             | Self::Spawn { .. }
             | Self::Lifecycle { .. }
             | Self::Output { .. }
@@ -187,19 +190,21 @@ pub(crate) fn run_sandboxed_process(
     cancellation: &LifecycleCancellation,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
     let environment = SandboxExecutionEnvironment::capture(ctx)?;
-    run_sandboxed_process_in_environment(&environment, argv, policy_request, cancellation)
+    run_sandboxed_process_in_environment(&environment, argv, policy_request, None, cancellation)
 }
 
 fn run_sandboxed_process_in_environment(
     environment: &SandboxExecutionEnvironment,
     argv: Vec<OsString>,
     policy_request: SandboxPolicyRequest,
+    working_directory: Option<&Path>,
     cancellation: &LifecycleCancellation,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
     run_sandboxed_process_in_environment_with_limits(
         environment,
         argv,
         policy_request,
+        working_directory,
         cancellation,
         SandboxProcessLimits::default(),
     )
@@ -218,6 +223,7 @@ fn run_sandboxed_process_with_limits(
         &environment,
         argv,
         policy_request,
+        None,
         cancellation,
         limits,
     )
@@ -227,6 +233,7 @@ fn run_sandboxed_process_in_environment_with_limits(
     environment: &SandboxExecutionEnvironment,
     argv: Vec<OsString>,
     policy_request: SandboxPolicyRequest,
+    working_directory: Option<&Path>,
     cancellation: &LifecycleCancellation,
     limits: SandboxProcessLimits,
 ) -> Result<SandboxedProcessOutcome, SandboxProcessError> {
@@ -236,6 +243,10 @@ fn run_sandboxed_process_in_environment_with_limits(
     let policy = environment.resolve(policy_request)?;
     let plan = environment.prepare(argv, policy)?;
     let workspace = usable_workspace(plan.workspace_root())?;
+    let working_directory = working_directory
+        .map(usable_working_directory)
+        .transpose()?
+        .unwrap_or(workspace);
     if cancellation.is_cancelled() {
         return Err(SandboxProcessError::CancelledBeforeSpawn);
     }
@@ -247,13 +258,13 @@ fn run_sandboxed_process_in_environment_with_limits(
     let mut command = Command::new(program);
     command
         .args(arguments)
-        .current_dir(&workspace)
+        .current_dir(&working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
         .group_spawn()
-        .map_err(|source| spawn_error(&plan, &workspace, source))?;
+        .map_err(|source| spawn_error(&plan, &working_directory, source))?;
     let stdout = child.inner().stdout.take().ok_or_else(|| {
         terminate_group_best_effort(&mut child);
         SandboxProcessError::Output {
@@ -313,6 +324,8 @@ fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDe
                     .map_err(|error| sandbox_error_message(&error))?,
             )
             .map_err(|error| sandbox_error_message(&error))?;
+        resolve_bash_workdir(policy.workspace_root(), arguments.workdir.as_deref())
+            .map_err(|error| sandbox_process_error_message(&error))?;
         plan_sandbox_escalation_approval(
             input,
             &policy,
@@ -350,6 +363,13 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
             }),
         ),
         (
+            "workdir".into(),
+            serde_json::json!({
+                "type": "string",
+                "description": "Working directory for this call; relative paths resolve from the session workspace"
+            }),
+        ),
+        (
             "sandbox_permissions".into(),
             serde_json::json!({
                 "type": "string",
@@ -367,7 +387,7 @@ pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
     ]);
     SessionToolSchema {
         name: "bash".into(),
-        description: "Run one foreground bash command through the Desktop sandbox. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
+        description: "Run one foreground bash command through the Desktop sandbox. Each call uses a fresh shell; workdir defaults to the session workspace. A denied command may be retried once with the narrowest wider sandbox_permissions plus justification; the retry asks the user before execution.".into(),
         parameters: serde_json::Map::from_iter([
             ("type".into(), serde_json::json!("object")),
             ("additionalProperties".into(), serde_json::json!(false)),
@@ -395,6 +415,11 @@ fn execute_sandboxed_bash(
                 .map_err(|error| sandbox_error_message(&error))?,
         )
         .map_err(|error| sandbox_error_message(&error))?;
+    let working_directory = resolve_bash_workdir(
+        standing_policy.workspace_root(),
+        arguments.workdir.as_deref(),
+    )
+    .map_err(|error| sandbox_process_error_message(&error))?;
     let escalation = consume_sandbox_escalation_approval(
         run,
         &standing_policy,
@@ -417,6 +442,7 @@ fn execute_sandboxed_bash(
             OsString::from(arguments.command),
         ],
         policy_request,
+        Some(&working_directory),
         run.cancellation(),
     )
     .map_err(|error| sandbox_process_error_message(&error))?;
@@ -428,6 +454,7 @@ fn execute_sandboxed_bash(
 
 struct SandboxedBashArguments {
     command: String,
+    workdir: Option<String>,
     sandbox_permissions: Option<SandboxMode>,
     justification: Option<String>,
 }
@@ -441,16 +468,22 @@ fn sandboxed_bash_arguments(
     if object.keys().any(|key| {
         key != "command"
             && key != "description"
+            && key != "workdir"
             && key != "sandbox_permissions"
             && key != "justification"
     }) {
         return Err(
-            "bash arguments may contain only command, description, sandbox_permissions, and justification"
+            "bash arguments may contain only command, description, workdir, sandbox_permissions, and justification"
                 .into(),
         );
     }
     let command = non_blank_bash_argument(object, "command")?;
     let _description = non_blank_bash_argument(object, "description")?;
+    let workdir = match object.get("workdir") {
+        None => None,
+        Some(serde_json::Value::String(workdir)) => Some(workdir.clone()),
+        Some(_) => return Err("bash argument workdir must be a string".into()),
+    };
     let sandbox_permissions = match object.get("sandbox_permissions") {
         None => None,
         Some(serde_json::Value::String(mode)) if mode == "workspace-write" => {
@@ -475,9 +508,23 @@ fn sandboxed_bash_arguments(
         .map_err(|error| error.to_string())?;
     Ok(SandboxedBashArguments {
         command,
+        workdir,
         sandbox_permissions,
         justification,
     })
+}
+
+fn resolve_bash_workdir(
+    workspace_root: &Path,
+    requested: Option<&str>,
+) -> Result<PathBuf, SandboxProcessError> {
+    let requested = requested.map(Path::new);
+    let working_directory = match requested {
+        None => workspace_root.to_path_buf(),
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => workspace_root.join(path),
+    };
+    usable_working_directory(&working_directory)
 }
 
 fn non_blank_bash_argument(
@@ -591,44 +638,43 @@ fn sandboxed_bash_output(
 }
 
 fn usable_workspace(workspace: &Path) -> Result<PathBuf, SandboxProcessError> {
-    let canonical = std::fs::canonicalize(workspace).map_err(|error| {
-        SandboxProcessError::UnusableWorkspace {
-            detail: error.to_string(),
-        }
-    })?;
-    let metadata =
-        std::fs::metadata(&canonical).map_err(|error| SandboxProcessError::UnusableWorkspace {
-            detail: error.to_string(),
-        })?;
+    canonical_searchable_directory(workspace)
+        .map_err(|detail| SandboxProcessError::UnusableWorkspace { detail })
+}
+
+fn usable_working_directory(workdir: &Path) -> Result<PathBuf, SandboxProcessError> {
+    canonical_searchable_directory(workdir)
+        .map_err(|detail| SandboxProcessError::UnusableWorkingDirectory { detail })
+}
+
+fn canonical_searchable_directory(directory: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(directory).map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| error.to_string())?;
     if !metadata.is_dir() {
-        return Err(SandboxProcessError::UnusableWorkspace {
-            detail: "workspace root is not a directory".to_string(),
-        });
+        return Err("path is not a directory".into());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
 
         if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(SandboxProcessError::UnusableWorkspace {
-                detail: "workspace root is not searchable".to_string(),
-            });
+            return Err("directory is not searchable".into());
         }
     }
     Ok(canonical)
 }
 
-fn workspace_still_usable(workspace: &Path) -> bool {
-    usable_workspace(workspace).is_ok() && std::fs::read_dir(workspace).is_ok()
+fn directory_still_usable(directory: &Path) -> bool {
+    canonical_searchable_directory(directory).is_ok() && std::fs::read_dir(directory).is_ok()
 }
 
 fn spawn_error(
     plan: &SandboxExecutionPlan,
-    workspace: &Path,
+    working_directory: &Path,
     source: io::Error,
 ) -> SandboxProcessError {
     let runner_failed = plan.confined_command().is_some()
-        && workspace_still_usable(workspace)
+        && directory_still_usable(working_directory)
         && matches!(
             source.kind(),
             io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
@@ -834,8 +880,8 @@ mod tests {
     use hartevo_cordis::SANDBOX_UNAVAILABLE;
     use hartevo_cordis::{
         ConfinedArgv, ConfinedSandboxPolicy, Context, CordisHost, LifecycleCancellation,
-        SandboxEnforcement, SandboxExecutionPlan, SandboxMode, SandboxPolicyRequest,
-        SandboxPolicyService, SandboxProcessClassification, SandboxProvider,
+        SandboxEnforcement, SandboxExecutionEnvironment, SandboxExecutionPlan, SandboxMode,
+        SandboxPolicyRequest, SandboxPolicyService, SandboxProcessClassification, SandboxProvider,
         SandboxProviderService, SandboxProviderUnavailable, SandboxRunnerFailureRule, keys,
         prepare_sandbox_execution, register_sandbox_provider, resolve_sandbox_policy,
     };
@@ -843,8 +889,9 @@ mod tests {
     use super::{
         MacosSeatbeltSandboxProvider, SEATBELT_EXEC, SEATBELT_READ_ONLY_PROFILE,
         SandboxProcessError, SandboxProcessLimits, SandboxProcessTermination,
-        mount_macos_sandbox_provider, run_sandboxed_process, run_sandboxed_process_with_limits,
-        sbpl_string,
+        mount_macos_sandbox_provider, resolve_bash_workdir, run_sandboxed_process,
+        run_sandboxed_process_in_environment, run_sandboxed_process_with_limits,
+        sandboxed_bash_arguments, sandboxed_bash_schema, sbpl_string,
     };
 
     struct FixedProvider {
@@ -951,6 +998,92 @@ mod tests {
             argv,
             resolve_sandbox_policy(ctx, SandboxPolicyRequest::default()).unwrap(),
         )
+    }
+
+    #[test]
+    fn bash_workdir_schema_and_parser_keep_the_argument_optional_and_closed() {
+        let schema = sandboxed_bash_schema();
+        let properties = schema.parameters["properties"].as_object().unwrap();
+        assert_eq!(properties["workdir"]["type"], "string");
+        assert_eq!(
+            schema.parameters["required"],
+            serde_json::json!(["command", "description"])
+        );
+
+        let parsed = sandboxed_bash_arguments(&serde_json::json!({
+            "command": "pwd",
+            "description": "Show the selected directory",
+            "workdir": "nested"
+        }))
+        .unwrap();
+        assert_eq!(parsed.workdir.as_deref(), Some("nested"));
+        assert!(
+            sandboxed_bash_arguments(&serde_json::json!({
+                "command": "pwd",
+                "description": "Reject a non-string directory",
+                "workdir": 1
+            }))
+            .err()
+            .unwrap()
+            .contains("workdir must be a string")
+        );
+        assert!(
+            sandboxed_bash_arguments(&serde_json::json!({
+                "command": "pwd",
+                "description": "Reject an unknown argument",
+                "cwd": "nested"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bash_workdir_defaults_and_resolves_relative_or_absolute_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let nested = nested.canonicalize().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+
+        assert_eq!(resolve_bash_workdir(&workspace, None).unwrap(), workspace);
+        assert_eq!(
+            resolve_bash_workdir(&workspace, Some("nested")).unwrap(),
+            nested
+        );
+        assert_eq!(
+            resolve_bash_workdir(&workspace, outside.to_str()).unwrap(),
+            outside
+        );
+    }
+
+    #[test]
+    fn unusable_bash_workdir_fails_before_child_spawn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = workspace.path().join("missing-workdir");
+        let marker = workspace.path().join("must-not-exist");
+        let ctx = context_with_provider(
+            SandboxMode::DangerFullAccess,
+            workspace.path(),
+            NeverProvider,
+        );
+        let environment = SandboxExecutionEnvironment::capture(&ctx).unwrap();
+
+        let error = run_sandboxed_process_in_environment(
+            &environment,
+            vec![OsString::from("/usr/bin/touch"), marker.clone().into()],
+            SandboxPolicyRequest::default(),
+            Some(&missing),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SandboxProcessError::UnusableWorkingDirectory { .. }
+        ));
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -1263,6 +1396,33 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absolute_bash_workdir_does_not_widen_the_workspace_write_root() {
+        let current = std::env::current_dir().unwrap();
+        let workspace = tempfile::tempdir_in(&current).unwrap();
+        let outside = tempfile::tempdir_in(&current).unwrap();
+        let marker = outside.path().join("must-not-exist");
+        let ctx = context(SandboxMode::WorkspaceWrite, workspace.path());
+        let environment = SandboxExecutionEnvironment::capture(&ctx).unwrap();
+
+        let outcome = run_sandboxed_process_in_environment(
+            &environment,
+            argv(&["/usr/bin/touch", "must-not-exist"]),
+            SandboxPolicyRequest::default(),
+            Some(outside.path()),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap();
+
+        assert_ne!(outcome.exit_code, Some(0));
+        assert_eq!(
+            outcome.classification,
+            Some(SandboxProcessClassification::Denied)
+        );
+        assert!(!marker.exists());
     }
 
     #[cfg(target_os = "macos")]
