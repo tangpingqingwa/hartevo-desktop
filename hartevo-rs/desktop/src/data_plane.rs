@@ -14703,14 +14703,13 @@ sleep 30"#;
         assert_eq!(bound_scope.project_id(), project_id.as_str());
         assert_eq!(bound_scope.mission_id(), submission.mission_id.as_str());
         plane.with_cordis_host(|host| {
-            assert!(
-                host.context()
-                    .agents::<hartevo_cordis::AgentsSurface>()
-                    .unwrap()
-                    .list()
-                    .is_empty(),
-                "Cordis must dispose the exact scoped agent after Runtime returns"
-            );
+            let agents = host
+                .context()
+                .agents::<hartevo_cordis::AgentsSurface>()
+                .unwrap()
+                .list();
+            assert_eq!(agents.len(), 1);
+            assert_eq!(agents[0].status(), hartevo_cordis::AgentStatus::Idle);
         });
 
         let database_secret = secrets
