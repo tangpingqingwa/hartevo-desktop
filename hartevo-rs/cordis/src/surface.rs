@@ -22,6 +22,7 @@ use crate::context::{Context, CordisError, EventReentry, keys};
 use crate::effect::RegistrationHandle;
 use crate::event::{DispatchMode, EventKey, EventModeMarker, ListenerHandle};
 use crate::fiber::LifecycleCancellation;
+use crate::sandbox::SandboxPolicyService;
 use crate::session::{
     SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock, SessionFinishReason,
     SessionId, SessionLlmFailure, SessionLlmRetryMode, SessionMessage, SessionStore,
@@ -40,6 +41,7 @@ const TOOL_ABORTED_BEFORE_DISPATCH_MESSAGE: &str = "tool call aborted before dis
 /// Cordis keys this mapping provides and looks up.
 pub const MAPPED_KEYS: &[&str] = &[
     keys::APPROVAL,
+    keys::SANDBOX_POLICY,
     keys::TOOLS,
     keys::SYSTEM_PROMPT,
     keys::LLM,
@@ -3081,6 +3083,12 @@ pub(crate) fn map_surfaces(
     let session_dispatcher = ctx.event_reentry()?;
     ctx.provide(keys::TOOLS, ToolsSurface::new())?;
     ctx.provide(keys::APPROVAL, ApprovalSurface)?;
+    let sandbox_policy = SandboxPolicyService::from_process().map_err(|error| {
+        CordisError::SandboxPolicyInitialization {
+            detail: error.to_string(),
+        }
+    })?;
+    ctx.provide(keys::SANDBOX_POLICY, sandbox_policy)?;
     ctx.provide(keys::SYSTEM_PROMPT, SystemPromptSurface::default())?;
     ctx.provide(keys::LLM, LlmSurface::new())?;
     ctx.provide(

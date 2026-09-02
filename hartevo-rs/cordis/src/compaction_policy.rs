@@ -931,6 +931,7 @@ const fn surface_message(event: &SessionEvent) -> Option<&SessionMessage> {
         | SessionEventKind::ApprovalAsked { .. }
         | SessionEventKind::ApprovalDecided { .. }
         | SessionEventKind::ApprovalPolicy { .. }
+        | SessionEventKind::SandboxMode { .. }
         | SessionEventKind::LlmRetry { .. }
         | SessionEventKind::LlmRetryStarted { .. }
         | SessionEventKind::CompactionStart { .. }

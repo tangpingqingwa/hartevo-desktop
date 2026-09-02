@@ -32,6 +32,7 @@ mod kernel;
 mod loader;
 mod registry;
 mod retry;
+mod sandbox;
 mod service;
 mod session;
 mod surface;
@@ -130,6 +131,13 @@ pub use registry::{
     LifecycleRegistry,
 };
 pub use retry::{LLM_RETRY_KEYS, LlmRetry};
+pub use sandbox::{
+    SANDBOX_ESCALATION_TARGETS, SANDBOX_MODES, SandboxError, SandboxEscalationApproval,
+    SandboxEscalationGrant, SandboxEscalationRequest, SandboxExecutionPolicy, SandboxMode,
+    SandboxModeSource, SandboxPolicyRequest, SandboxPolicyService, SessionSandboxMode,
+    approve_sandbox_escalation, resolve_sandbox_policy, set_sandbox_mode,
+    validate_sandbox_escalation_args,
+};
 pub use service::{
     AssociatedAccessor, AssociatedAccessorHandle, CallableService, Service, ServiceAssociation,
     ServiceCall, ServiceCaller, ServiceHandle, ServiceOptions, ServiceOrigin, ServiceShadow,
