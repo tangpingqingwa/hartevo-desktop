@@ -3150,6 +3150,72 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[derive(Clone)]
+    struct DesktopCompletionNoticeAdapter {
+        turns: Arc<Mutex<VecDeque<Vec<SessionStreamChunk>>>>,
+        seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl LlmAdapter for DesktopCompletionNoticeAdapter {
+        fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+            Ok(LlmResolvedModel::new(provider, model))
+        }
+
+        fn stream(
+            &self,
+            request: LlmGenerateRequest,
+        ) -> Result<LlmAdapterStream, SessionLlmFailure> {
+            let request_index = {
+                let mut seen = self.seen.lock().unwrap();
+                let index = seen.len();
+                seen.push(request);
+                index
+            };
+            if request_index == 1 {
+                std::thread::sleep(StdDuration::from_millis(200));
+            }
+            let chunks = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one scripted Desktop completion-notice response per Cordis step");
+            Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn desktop_tool_text_results(events: &[SessionEvent]) -> HashMap<String, String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                let SessionEventKind::ToolResult { message, error, .. } = &event.kind else {
+                    return None;
+                };
+                assert!(error.is_none());
+                let SessionMessageSource::Tool { call_id } = &message.source else {
+                    return None;
+                };
+                let [
+                    SessionContentBlock::ToolResult {
+                        content,
+                        is_error: false,
+                        ..
+                    },
+                ] = message.content.as_slice()
+                else {
+                    return None;
+                };
+                let [SessionContentBlock::Text { text }] = content.as_slice() else {
+                    return None;
+                };
+                Some((call_id.clone(), text.clone()))
+            })
+            .collect()
+    }
+
     fn desktop_tool_schema(name: &str) -> SessionToolSchema {
         SessionToolSchema {
             name: name.into(),
@@ -3294,10 +3360,20 @@ mod tests {
             desktop_single_tool_turn(
                 "desktop-background-start-short",
                 "bash",
-                r#"{"command":"sleep 0.05; printf n101-background-complete","description":"Start the short background completion proof","run_in_background":true}"#,
+                r#"{"command":"printf n102-first; sleep 1; printf n102-second","description":"Start the incremental background output proof","run_in_background":true}"#,
             ),
             desktop_single_tool_turn(
-                "desktop-background-read-short",
+                "desktop-background-read-first",
+                "job_output",
+                r#"{"job_id":"bash-1","wait":true,"timeout_ms":500}"#,
+            ),
+            desktop_single_tool_turn(
+                "desktop-background-read-empty",
+                "job_output",
+                r#"{"job_id":"bash-1"}"#,
+            ),
+            desktop_single_tool_turn(
+                "desktop-background-read-terminal",
                 "job_output",
                 r#"{"job_id":"bash-1","wait":true,"timeout_ms":5000}"#,
             ),
@@ -3342,6 +3418,60 @@ mod tests {
         DesktopSequencedTurnAdapter {
             turns: Arc::new(Mutex::new(VecDeque::from(turns))),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn desktop_completion_notice_turn_adapter() -> (
+        DesktopCompletionNoticeAdapter,
+        Arc<Mutex<Vec<LlmGenerateRequest>>>,
+    ) {
+        let turns = [
+            desktop_single_tool_turn(
+                "desktop-background-notice-start",
+                "bash",
+                r#"{"command":"printf n102-notice-ready","description":"Finish while the owning Agent remains active","run_in_background":true}"#,
+            ),
+            vec![
+                SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                },
+                SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "background job still settling".into(),
+                    },
+                },
+                SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+            vec![
+                SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                },
+                SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "background completion notice observed".into(),
+                    },
+                },
+                SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+        ];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            DesktopCompletionNoticeAdapter {
+                turns: Arc::new(Mutex::new(VecDeque::from(turns))),
+                seen: Arc::clone(&seen),
+            },
+            seen,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -3756,7 +3886,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.steps(), 8);
+        assert_eq!(outcome.steps(), 10);
         assert_eq!(outcome.reason(), TurnEndReason::Completed);
         let session_id = SessionId::new("desktop-agent-session").unwrap();
         let session = live
@@ -3767,44 +3897,31 @@ mod tests {
             .unwrap()
             .unwrap();
         let events = session.events().unwrap();
-        let mut results = HashMap::new();
-        for event in &events {
-            let SessionEventKind::ToolResult { message, error, .. } = &event.kind else {
-                continue;
-            };
-            assert!(error.is_none());
-            let SessionMessageSource::Tool { call_id } = &message.source else {
-                continue;
-            };
-            let [
-                SessionContentBlock::ToolResult {
-                    content,
-                    is_error: false,
-                    ..
-                },
-            ] = message.content.as_slice()
-            else {
-                continue;
-            };
-            let [SessionContentBlock::Text { text }] = content.as_slice() else {
-                continue;
-            };
-            results.insert(call_id.clone(), text.clone());
-        }
+        let results = desktop_tool_text_results(&events);
 
         assert_eq!(
             results["desktop-background-start-short"],
             "started background job bash-1"
         );
-        let short = &results["desktop-background-read-short"];
-        assert!(short.contains("n101-background-complete"));
-        assert!(short.contains("[sandbox: read-only, full enforcement]"));
-        assert!(short.contains("[status: completed, exit code: 0]"));
+        let first = &results["desktop-background-read-first"];
+        assert!(first.contains("n102-first"));
+        assert!(!first.contains("n102-second"));
+        assert!(first.contains("[status: running]"));
+        let empty = &results["desktop-background-read-empty"];
+        assert!(empty.contains("(no new output)"));
+        assert!(!empty.contains("n102-first"));
+        assert!(!empty.contains("n102-second"));
+        let terminal = &results["desktop-background-read-terminal"];
+        assert!(!terminal.contains("n102-first"));
+        assert!(terminal.contains("n102-second"));
+        assert!(terminal.contains("[sandbox: read-only, full enforcement]"));
+        assert!(terminal.contains("[status: completed, exit code: 0]"));
         assert_eq!(
             results["desktop-background-start-long"],
             "started background job bash-2"
         );
-        assert!(results["desktop-background-probe-long"].contains("[status: running]"));
+        let probe = &results["desktop-background-probe-long"];
+        assert!(probe.contains("[status: running]"));
         let list = &results["desktop-background-list"];
         assert!(list.contains("bash-1 [bash] completed"));
         assert!(list.contains("bash-2 [bash] running"));
@@ -3815,10 +3932,10 @@ mod tests {
         let killed = &results["desktop-background-read-long"];
         assert!(killed.contains("[killed by signal: SIGTERM]"));
         assert!(killed.contains("[status: killed, signal: SIGTERM]"));
-        let child_pid = killed
+        let child_pid = probe
             .lines()
             .find_map(|line| line.parse::<u32>().ok())
-            .expect("background command must report its child pid before cancellation");
+            .expect("the live incremental read must report the child pid before cancellation");
         assert!(
             !Command::new("/bin/kill")
                 .args(["-0", &child_pid.to_string()])
@@ -3835,6 +3952,53 @@ mod tests {
         assert_eq!(snapshots[0].status(), JobStatus::Completed);
         assert_eq!(snapshots[1].status(), JobStatus::Killed);
         assert!(runtime_open_turn(&events).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn desktop_background_completion_notifies_the_exact_active_agent_once() {
+        let scratch = tempfile::Builder::new()
+            .prefix("n102-completion-notice-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        approve_agent_turn(&mut live);
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
+        let (adapter, seen) = desktop_completion_notice_turn_adapter();
+
+        let outcome = live
+            .run_agent_turn(
+                desktop_turn_request_in(scratch.path()),
+                adapter,
+                &LifecycleCancellation::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.steps(), 3);
+        assert_eq!(outcome.reason(), TurnEndReason::Completed);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        let notices = seen[2]
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    &message.source,
+                    SessionMessageSource::Plugin { plugin, .. } if plugin == "tool-jobs"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(
+            notices[0].content.as_slice(),
+            [SessionContentBlock::Text { text }]
+                if text.contains("Background job bash-1 (bash) finished [status: completed, exit code: 0]")
+                    && text.contains("job_output")
+        ));
     }
 
     #[cfg(target_os = "macos")]

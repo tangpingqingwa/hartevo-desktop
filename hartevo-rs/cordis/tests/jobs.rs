@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -219,4 +220,93 @@ fn wait_cancellation_does_not_stop_the_job() {
         JobKillOutcome::Requested
     );
     assert!(jobs.dispose_agent_and_wait(&agent, Duration::from_secs(1)));
+}
+
+#[test]
+fn streaming_output_reads_only_new_bytes_and_terminal_metadata_once() {
+    let jobs = JobsSurface::new(1);
+    let owner = session("jobs-stream");
+    let agent = AgentRef::new("jobs-stream-agent");
+    let chunks = Arc::new(Mutex::new(VecDeque::from(["first".to_string()])));
+    let completion_slot = Arc::new(Mutex::new(None));
+    let reader_chunks = Arc::clone(&chunks);
+    let producer_completion = Arc::clone(&completion_slot);
+    let id = jobs
+        .start(&owner, &agent, "bash", "stream", move |completion| {
+            *producer_completion.lock().unwrap() = Some(completion);
+            Ok(JobControl::new(|_| {}).with_output_reader(move || {
+                reader_chunks
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default()
+            }))
+        })
+        .unwrap();
+
+    let first = jobs.read(id.as_str(), &owner).unwrap();
+    assert_eq!(first.output(), "first");
+    assert_eq!(first.snapshot().status(), JobStatus::Running);
+    assert!(jobs.read(id.as_str(), &owner).unwrap().output().is_empty());
+
+    chunks.lock().unwrap().push_back("second".into());
+    assert!(
+        completion_slot.lock().unwrap().take().unwrap().complete(
+            JobOutcome::new(JobTerminalStatus::Completed)
+                .with_detail("exit code: 0")
+                .with_output("[sandbox: read-only, full enforcement]"),
+        )
+    );
+    let terminal = jobs.read(id.as_str(), &owner).unwrap();
+    assert_eq!(
+        terminal.output(),
+        "second\n[sandbox: read-only, full enforcement]"
+    );
+    assert_eq!(terminal.snapshot().status(), JobStatus::Completed);
+    assert!(jobs.read(id.as_str(), &owner).unwrap().output().is_empty());
+    assert!(jobs.claim_unreported_terminal(&agent).is_empty());
+}
+
+#[test]
+fn completion_claim_is_exact_lifecycle_one_shot_and_wait_suppresses_it() {
+    let jobs = JobsSurface::new(2);
+    let owner = session("jobs-notice");
+    let agent = AgentRef::new("jobs-notice-agent");
+    let replacement = AgentRef::new(agent.id.clone());
+    let first = jobs
+        .start(&owner, &agent, "bash", "notify", |completion| {
+            assert!(completion.complete(
+                JobOutcome::new(JobTerminalStatus::Completed).with_detail("exit code: 0"),
+            ));
+            Ok(JobControl::new(|_| {}))
+        })
+        .unwrap();
+
+    assert!(jobs.claim_unreported_terminal(&replacement).is_empty());
+    let claimed = jobs.claim_unreported_terminal(&agent);
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id(), &first);
+    assert!(jobs.claim_unreported_terminal(&agent).is_empty());
+
+    let second = jobs
+        .start(&owner, &agent, "bash", "waited", |completion| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = completion.complete(JobOutcome::new(JobTerminalStatus::Completed));
+            });
+            Ok(JobControl::new(|_| {}))
+        })
+        .unwrap();
+    assert_eq!(
+        jobs.wait(
+            second.as_str(),
+            &owner,
+            Duration::from_secs(1),
+            &LifecycleCancellation::default(),
+        )
+        .unwrap()
+        .status(),
+        JobStatus::Completed
+    );
+    assert!(jobs.claim_unreported_terminal(&agent).is_empty());
 }
