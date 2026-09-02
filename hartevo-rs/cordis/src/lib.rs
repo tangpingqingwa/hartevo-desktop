@@ -132,10 +132,14 @@ pub use registry::{
 };
 pub use retry::{LLM_RETRY_KEYS, LlmRetry};
 pub use sandbox::{
-    SANDBOX_ESCALATION_TARGETS, SANDBOX_MODES, SandboxError, SandboxEscalationApproval,
-    SandboxEscalationGrant, SandboxEscalationRequest, SandboxExecutionPolicy, SandboxMode,
-    SandboxModeSource, SandboxPolicyRequest, SandboxPolicyService, SessionSandboxMode,
-    approve_sandbox_escalation, resolve_sandbox_policy, set_sandbox_mode,
+    ConfinedArgv, ConfinedSandboxMode, ConfinedSandboxPolicy, SANDBOX_ESCALATION_TARGETS,
+    SANDBOX_MODES, SANDBOX_UNAVAILABLE, SandboxEnforcement, SandboxError,
+    SandboxEscalationApproval, SandboxEscalationGrant, SandboxEscalationRequest,
+    SandboxExecutionPlan, SandboxExecutionPolicy, SandboxMode, SandboxModeSource,
+    SandboxPolicyRequest, SandboxPolicyService, SandboxProcessClassification, SandboxProvider,
+    SandboxProviderService, SandboxProviderUnavailable, SandboxRunnerFailureRule,
+    SessionSandboxMode, approve_sandbox_escalation, classify_sandbox_process,
+    prepare_sandbox_execution, register_sandbox_provider, resolve_sandbox_policy, set_sandbox_mode,
     validate_sandbox_escalation_args,
 };
 pub use service::{
