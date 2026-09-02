@@ -310,7 +310,7 @@ fn sandboxed_bash_definition(environment: SandboxExecutionEnvironment) -> ToolDe
     })
 }
 
-fn sandboxed_bash_schema() -> SessionToolSchema {
+pub(crate) fn sandboxed_bash_schema() -> SessionToolSchema {
     let properties = serde_json::Map::from_iter([
         (
             "command".into(),
