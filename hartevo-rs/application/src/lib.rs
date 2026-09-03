@@ -609,7 +609,7 @@ impl CordisMissionTurnPlan {
                 _ => {}
             }
         }
-        if open_attempt.is_some() {
+        if open_turn.is_some() || open_attempt.is_some() {
             return Err(ApplicationError::CordisDraftTurnNotCompleted);
         }
         let completed = attempts
@@ -24104,6 +24104,25 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 10, 10, 0, 0)
             .single()
             .expect("valid time")
+    }
+
+    #[test]
+    fn cordis_mission_turn_plan_rejects_crash_open_turn_before_input() {
+        let mission_id = MissionId::from("mission-cordis-open-turn");
+        let mut session = SessionLog::new(
+            hartevo_cordis::SessionId::new(mission_id.as_str()).expect("Session identity"),
+        )
+        .expect("Session log");
+        session.start_turn().expect("crash-open turn");
+        let checkpoint = SessionCheckpoint {
+            header: session.header().clone(),
+            events: session.events().to_vec(),
+        };
+
+        assert!(matches!(
+            CordisMissionTurnPlan::from_session(Some(&checkpoint), &mission_id, 1),
+            Err(ApplicationError::CordisDraftTurnNotCompleted)
+        ));
     }
 
     fn outbox_for_event(
