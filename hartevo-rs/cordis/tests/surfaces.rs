@@ -7,10 +7,10 @@ use hartevo_cordis::{
     Emit, EnvironmentOverlay, EventKey, LlmAdapter, LlmAdapterStream, LlmChunkStream, LlmError,
     LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmRetryPolicy, LlmStream,
     LoaderContext, MAPPED_KEYS, PluginId, PromptAssembly, PromptError, PromptSection,
-    RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionId,
-    SessionLlmFailure, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionStreamBlockType, SessionStreamChunk, SessionToolSchema, SurfaceOwner,
-    SystemPromptSurface, ToolCall, ToolsSurface, Waterfall, approval_events,
+    RuntimeSurface, SUBAGENT_TOOL_NAME, SessionCallConfig, SessionContentBlock,
+    SessionFinishReason, SessionId, SessionLlmFailure, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionStreamBlockType, SessionStreamChunk, SessionToolSchema,
+    SurfaceOwner, SystemPromptSurface, ToolCall, ToolsSurface, Waterfall, approval_events,
     assemble_system_prompt, events, expected_mode, keys, prepare_llm_call, register_agent,
     register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
     register_tool_schema, run_tools_pipeline, session_events, stream_llm, stream_llm_request,
@@ -241,7 +241,7 @@ fn prompt_and_tool_schema_assembly_is_deterministic_detached_and_reversible() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        ["alpha", "zulu"]
+        ["alpha", SUBAGENT_TOOL_NAME, "zulu"]
     );
 
     late.dispose();
@@ -254,10 +254,10 @@ fn prompt_and_tool_schema_assembly_is_deterministic_detached_and_reversible() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        ["alpha"]
+        ["alpha", SUBAGENT_TOOL_NAME]
     );
     assert_eq!(frozen.system(), Some("First.\n\nAlpha.\n\nZulu."));
-    assert_eq!(frozen.tools().len(), 2);
+    assert_eq!(frozen.tools().len(), 3);
 
     assert_eq!(
         register_prompt_section(&mut ctx, PromptSection::new("alpha", 99, "duplicate"))
@@ -317,7 +317,7 @@ fn tools_pipeline_runs_on_ctx_tools_not_openinterpreter() {
     register_tool(&mut ctx, "search").unwrap();
     assert_eq!(
         ctx.tools::<ToolsSurface>().unwrap().names(),
-        ["search".to_string()]
+        [SUBAGENT_TOOL_NAME.to_string(), "search".to_string()]
     );
 
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -956,7 +956,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
     ctx.on_emit(events::AGENT_CREATED, |_: &AgentRef| {})
         .unwrap();
 
-    assert_eq!(ctx.tools::<ToolsSurface>().unwrap().names().len(), 1);
+    assert_eq!(ctx.tools::<ToolsSurface>().unwrap().names().len(), 2);
     assert_eq!(
         ctx.llm::<hartevo_cordis::LlmSurface>()
             .unwrap()
@@ -1016,7 +1016,7 @@ fn teardown_undoes_every_registration_and_fresh_host_can_reload() {
     register_tool(&mut reloaded, "search-2").unwrap();
     assert_eq!(
         reloaded.tools::<ToolsSurface>().unwrap().names(),
-        ["search-2".to_string()]
+        [SUBAGENT_TOOL_NAME.to_string(), "search-2".to_string()]
     );
     assert_eq!(
         reloaded.event_mode(events::TOOLS_PRE_EXECUTE),

@@ -29,14 +29,15 @@ use crate::session::{
 use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,
     AgentRequestErrorAction, AgentStatusChange, AgentTurnStopping, AgentsSurface, DomainSurface,
-    EffectBrokerSurface, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream, LlmSurface,
-    PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
+    EffectBrokerSurface, HostToolAccess, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream,
+    LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
     ToolExecutionPreparation, ToolExecutionResult, ToolPolicyPreparation, ToolsSurface,
     aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
-    dispatch_tool_execution_with_cancellation, events, finalize_allowed_tool_policy,
-    finalize_tool_execution, post_tool_execution, prepare_llm_call, prepare_tool_execution,
-    prepare_tool_policy, register_agent, run_tools_pipeline, schedule_tool_dispatch,
-    settle_denied_tool_execution, stream_llm, stream_llm_request, stream_prepared_llm,
+    dispatch_host_tool_execution_with_cancellation, dispatch_tool_execution_with_cancellation,
+    events, finalize_allowed_tool_policy, finalize_tool_execution, post_tool_execution,
+    prepare_llm_call, prepare_tool_execution, prepare_tool_policy, register_agent,
+    run_tools_pipeline, schedule_tool_dispatch, settle_denied_tool_execution, stream_llm,
+    stream_llm_request, stream_prepared_llm,
 };
 
 /// DeepSeek Harness-compatible default bound for overlapping tool bodies.
@@ -846,6 +847,7 @@ pub async fn run_agent_turn(
         seed_config,
         cancellation,
         enforce_invariants,
+        HostToolAccess::Denied,
     )
     .await
 }
@@ -868,6 +870,7 @@ pub(crate) async fn run_authorized_runtime_agent_turn(
         seed_config,
         cancellation,
         enforce_runtime_invariants,
+        HostToolAccess::RuntimeAuthorized,
     )
     .await
 }
@@ -879,6 +882,7 @@ async fn run_agent_turn_with_invariants(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
     enforce: fn(&Context) -> Result<(), CordisError>,
+    host_tool_access: HostToolAccess,
 ) -> Result<AgentTurnOutcome, CordisError> {
     require_loop_surfaces(ctx)?;
     validate_agent_request_config(&seed_config)?;
@@ -908,6 +912,7 @@ async fn run_agent_turn_with_invariants(
         seed_config,
         cancellation,
         &mut current_step,
+        host_tool_access,
     )
     .await;
     let reason = result.as_ref().map_or_else(
@@ -933,8 +938,9 @@ async fn run_agent_turn_with_invariants(
 }
 
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the durable turn driver keeps pressure maintenance, step ownership, and terminal steering in one ordered loop"
+    reason = "the durable turn driver keeps exact identity, cancellation, host admission, step ownership, and terminal steering together"
 )]
 async fn drive_agent_turn(
     ctx: &mut Context,
@@ -944,6 +950,7 @@ async fn drive_agent_turn(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
     current_step: &mut Option<u64>,
+    host_tool_access: HostToolAccess,
 ) -> Result<AgentTurnOutcome, CordisError> {
     let mut target = AgentInboxTarget::NextTurn;
     let mut steps = 0_u64;
@@ -1013,7 +1020,14 @@ async fn drive_agent_turn(
         };
         steps = step;
 
-        let step_result = run_agent_turn_step(ctx, logged, &mut request_state, cancellation).await;
+        let step_result = run_agent_turn_step(
+            ctx,
+            logged,
+            &mut request_state,
+            cancellation,
+            host_tool_access,
+        )
+        .await;
         session.finish_step(turn, step)?;
         let step_end = step_result?;
         if let Some(reason @ TurnEndReason::Aborted(_)) = step_end {
@@ -1088,11 +1102,16 @@ fn has_agent_step_candidate(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "same-step provider recovery and one authorized tool settlement remain one ordered durable operation"
+)]
 async fn run_agent_turn_step(
     ctx: &mut Context,
     mut logged: LoggedAgentCall,
     request_state: &mut AgentRequestLogState,
     cancellation: &LifecycleCancellation,
+    host_tool_access: HostToolAccess,
 ) -> Result<Option<TurnEndReason>, CordisError> {
     let mut overflow_retries = 0_u64;
     loop {
@@ -1178,6 +1197,7 @@ async fn run_agent_turn_step(
                     &mut recorded,
                     DEFAULT_MAX_PARALLEL_TOOL_CALLS,
                     cancellation,
+                    host_tool_access,
                 )
                 .await?;
                 if cancellation.is_cancelled() {
@@ -1798,6 +1818,7 @@ async fn run_agent_tool_batch_with_approval(
     recorded: &mut RecordedAgentStream,
     max_parallel_tool_calls: usize,
     cancellation: &LifecycleCancellation,
+    host_tool_access: HostToolAccess,
 ) -> Result<AgentToolBatchOutcome, CordisError> {
     if max_parallel_tool_calls == 0 {
         return Err(invalid_stream_protocol("a positive parallel tool-call limit").into());
@@ -1840,32 +1861,99 @@ async fn run_agent_tool_batch_with_approval(
     let tools = ctx
         .tools::<ToolsSurface>()
         .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
-    let results = run_tool_scheduler(
-        ctx,
-        &tools,
-        &inputs,
-        max_parallel_tool_calls,
-        cancellation,
-        |ctx, index| {
-            let policy = policies
-                .get_mut(index)
-                .and_then(Option::take)
-                .ok_or_else(|| {
-                    invalid_stream_protocol("one resolved policy for every started tool call")
-                })?;
-            match policy {
-                ToolPolicyPreparation::Allow(allowed) => finalize_allowed_tool_policy(ctx, allowed),
-                ToolPolicyPreparation::Denied(denied) => {
-                    Ok(ToolExecutionPreparation::Denied(denied))
-                }
-                ToolPolicyPreparation::Ask(_) => Err(invalid_stream_protocol(
-                    "every tool approval to settle before body scheduling",
-                )
-                .into()),
-            }
-        },
-    )?;
+    let results = if tools.has_host_tool(&inputs) {
+        run_host_tool_batch(
+            ctx,
+            &inputs,
+            &mut policies,
+            cancellation,
+            logged.call().config(),
+            host_tool_access,
+        )
+        .await?
+    } else {
+        run_tool_scheduler(
+            ctx,
+            &tools,
+            &inputs,
+            max_parallel_tool_calls,
+            cancellation,
+            |ctx, index| finalize_resolved_tool_policy(ctx, &mut policies, index),
+        )?
+    };
     finish_agent_tool_batch(ctx, logged, recorded, &session, results)
+}
+
+/// A batch containing a host-local body becomes one ordered driver-thread
+/// barrier. Ordinary batches retain the existing bounded parallel scheduler.
+async fn run_host_tool_batch(
+    ctx: &mut Context,
+    inputs: &[ToolExecutionInput],
+    policies: &mut [Option<ToolPolicyPreparation>],
+    cancellation: &LifecycleCancellation,
+    inherited_config: &SessionCallConfig,
+    host_tool_access: HostToolAccess,
+) -> Result<Vec<ToolExecutionResult>, CordisError> {
+    let mut results = Vec::with_capacity(inputs.len());
+    for index in 0..inputs.len() {
+        if cancellation.is_cancelled() {
+            results.extend(
+                inputs[index..]
+                    .iter()
+                    .cloned()
+                    .map(aborted_before_dispatch_tool_result),
+            );
+            break;
+        }
+        let preparation = finalize_resolved_tool_policy(ctx, policies, index)?;
+        let result = match preparation {
+            ToolExecutionPreparation::Dispatch(prepared) => {
+                let outcome = dispatch_host_tool_execution_with_cancellation(
+                    ctx,
+                    prepared,
+                    cancellation,
+                    inherited_config.clone(),
+                    host_tool_access,
+                )
+                .await?;
+                let outcome = post_tool_execution(ctx, outcome)?;
+                finalize_tool_execution(ctx, outcome)
+            }
+            ToolExecutionPreparation::Denied(denied) => settle_denied_tool_execution(ctx, denied)?,
+        };
+        results.push(result);
+        if cancellation.is_cancelled() && index + 1 < inputs.len() {
+            results.extend(
+                inputs[index + 1..]
+                    .iter()
+                    .cloned()
+                    .map(aborted_before_dispatch_tool_result),
+            );
+            break;
+        }
+    }
+    Ok(results)
+}
+
+fn finalize_resolved_tool_policy(
+    ctx: &mut Context,
+    policies: &mut [Option<ToolPolicyPreparation>],
+    index: usize,
+) -> Result<ToolExecutionPreparation, CordisError> {
+    let policy = policies
+        .get_mut(index)
+        .and_then(Option::take)
+        .ok_or_else(|| {
+            invalid_stream_protocol("one resolved policy for every started tool call")
+        })?;
+    match policy {
+        ToolPolicyPreparation::Allow(allowed) => finalize_allowed_tool_policy(ctx, allowed),
+        ToolPolicyPreparation::Denied(denied) => Ok(ToolExecutionPreparation::Denied(denied)),
+        ToolPolicyPreparation::Ask(_) => Err(invalid_stream_protocol(
+            "every tool approval to settle before body scheduling",
+        )
+        .into()),
+    }
 }
 
 async fn resolve_tool_approval(
