@@ -13936,6 +13936,284 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one focused journey proves same-Agent native human continuation, exact Domain adoption, idempotent replay, and SQLCipher cold restore"
+    )]
+    fn cordis_native_deepseek_human_continuation_reuses_the_durable_session() {
+        use hartevo_cordis::{AgentsSurface, SessionEventKind, SessionStore};
+
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let private_goal = "Draft the first native Cordis answer";
+        let initial_draft = "First native Cordis answer.";
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let initial_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut request = catalog_runtime_request(&project_id);
+        request.title = Some("Native Cordis human continuation".into());
+        request.goal = private_goal.into();
+        let initial = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                request,
+                Some(native_deepseek_mission_source(
+                    initial_draft,
+                    Arc::clone(&initial_calls),
+                    Arc::clone(&initial_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("initial native Cordis turn");
+        let initial_work_product_id = match &initial.runtime_outcome {
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id.clone(),
+            outcome => panic!("unexpected initial native outcome: {outcome:?}"),
+        };
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let initial_service = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("initial Application state");
+        let initial_conversation = initial_service
+            .mission_conversation(&project_id, &initial.mission_id)
+            .expect("initial Mission conversation");
+        assert_eq!(initial_conversation.revision, 2);
+        assert_eq!(initial_conversation.messages.len(), 2);
+        assert!(
+            initial_service
+                .latest_runtime_turn_for_mission(&project_id, &initial.mission_id)
+                .expect("no initial Application Runtime turn")
+                .is_none()
+        );
+        drop(initial_service);
+
+        let handle = current_catalog_handle(&plane, &secrets, &project_id, &initial.mission_id);
+        let session_id = SessionId::new(initial.mission_id.as_str()).unwrap();
+        let retained_agent = plane.with_cordis_host(|host| {
+            host.context()
+                .agents::<AgentsSurface>()
+                .expect("Agent surface")
+                .list()
+                .into_iter()
+                .find(|agent| agent.status() == hartevo_cordis::AgentStatus::Idle)
+                .expect("retained native Agent")
+        });
+
+        let continuation_body = "Now revise it using only the confirmed first-party evidence";
+        let continued_draft = "Revised native Cordis answer.";
+        let continuation_request = DesktopMissionContinuationRequest {
+            project_id: project_id.clone(),
+            mission_id: initial.mission_id.clone(),
+            message_id: MissionConversationMessageId::from("native-human-continuation-1"),
+            kind: MissionConversationMessageKind::Correction,
+            body: continuation_body.into(),
+            idempotency_key: "native-human-continuation:1".into(),
+            expected_conversation_revision: initial_conversation.revision,
+        };
+        let continuation_calls = Arc::new(AtomicUsize::new(0));
+        let continuation_requests = Arc::new(Mutex::new(Vec::new()));
+        let continued = plane
+            .continue_catalog_mission_and_run_with(
+                &secrets,
+                continuation_request.clone(),
+                catalog_runtime_authority(handle.clone()),
+                Some(native_deepseek_mission_source(
+                    continued_draft,
+                    Arc::clone(&continuation_calls),
+                    Arc::clone(&continuation_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("native Cordis human continuation");
+        let continued_work_product_id = match &continued.runtime_outcome {
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id.clone(),
+            outcome => panic!("unexpected continued native outcome: {outcome:?}"),
+        };
+        assert_ne!(continued_work_product_id, initial_work_product_id);
+        assert_eq!(continuation_calls.load(Ordering::SeqCst), 1);
+
+        let requests = continuation_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire_messages = requests[0]["messages"].as_array().expect("wire messages");
+        for expected in [private_goal, initial_draft, continuation_body] {
+            assert!(wire_messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content == expected)
+            }));
+        }
+        assert!(!requests[0].to_string().contains("desktop-mission-secret"));
+        drop(requests);
+
+        let continued_service = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("continued Application state");
+        let continued_mission = continued_service
+            .load_mission(&project_id, &initial.mission_id)
+            .expect("continued Mission");
+        assert_eq!(continued_mission.work_products.len(), 2);
+        assert!(continued_mission.effects.is_empty());
+        let continued_conversation = continued_service
+            .mission_conversation(&project_id, &initial.mission_id)
+            .expect("continued Mission conversation");
+        assert_eq!(continued_conversation.revision, 4);
+        assert_eq!(continued_conversation.messages.len(), 4);
+        assert_eq!(continued_conversation.messages[2].body, continuation_body);
+        assert_eq!(continued_conversation.messages[3].body, continued_draft);
+        assert_eq!(
+            continued_conversation.messages[3].work_product_id.as_ref(),
+            Some(&continued_work_product_id)
+        );
+        assert!(
+            continued_service
+                .latest_runtime_turn_for_mission(&project_id, &initial.mission_id)
+                .expect("no fabricated Application Runtime turn")
+                .is_none()
+        );
+        let mission_events = continued_service
+            .mission_events(&project_id, &initial.mission_id)
+            .expect("continued Mission events");
+        let event_json = serde_json::to_string(&mission_events).unwrap();
+        for private in [
+            private_goal,
+            initial_draft,
+            continuation_body,
+            continued_draft,
+        ] {
+            assert!(!event_json.contains(private));
+        }
+        drop(continued_service);
+
+        let session_events = plane.with_cordis_host(|host| {
+            let agents = host.context().agents::<AgentsSurface>().unwrap().list();
+            assert_eq!(agents.len(), 1);
+            assert!(agents[0].is_same_lifecycle(&retained_agent));
+            assert_eq!(agents[0].status(), hartevo_cordis::AgentStatus::Idle);
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&session_id)
+                .unwrap()
+                .expect("continued native Session");
+            let messages = session.derive_messages().unwrap();
+            assert_eq!(messages.len(), 4);
+            assert_eq!(messages[2].source, SessionMessageSource::User);
+            assert!(matches!(
+                messages[2].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == continuation_body
+            ));
+            assert!(matches!(
+                messages[3].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == continued_draft
+            ));
+            let events = session.events().unwrap();
+            let user_message_ids = events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::UserMessage { message, .. }
+                        if message.source == SessionMessageSource::User =>
+                    {
+                        Some(message.id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_message_ids,
+                vec![
+                    format!("mission:{}:generation:1:user", initial.mission_id.as_str()),
+                    format!("mission:{}:generation:3:user", initial.mission_id.as_str()),
+                ]
+            );
+            events
+        });
+
+        let replay = plane
+            .continue_catalog_mission_and_run_with(
+                &secrets,
+                continuation_request,
+                catalog_runtime_authority(handle),
+                Some(native_deepseek_mission_source(
+                    "must not be requested",
+                    Arc::clone(&continuation_calls),
+                    Arc::clone(&continuation_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("idempotent native continuation replay");
+        assert_eq!(
+            replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady {
+                work_product_id: continued_work_product_id.clone(),
+            }
+        );
+        assert_eq!(continuation_calls.load(Ordering::SeqCst), 1);
+        let replay_service = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("replayed Application state");
+        assert_eq!(
+            replay_service
+                .mission_events(&project_id, &initial.mission_id)
+                .expect("unchanged Mission events"),
+            mission_events
+        );
+        drop(replay_service);
+
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(&secrets, observed_at() + Duration::minutes(5))
+                .expect("restore native human continuation"),
+            DesktopLoadState::Ready(_)
+        ));
+        let cold_replay = cold
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &initial.mission_id,
+                Some(native_deepseek_mission_source(
+                    "must not be requested after restart",
+                    Arc::clone(&continuation_calls),
+                    Arc::clone(&continuation_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(6),
+            )
+            .expect("cold native continuation replay");
+        assert_eq!(
+            cold_replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady {
+                work_product_id: continued_work_product_id,
+            }
+        );
+        assert_eq!(continuation_calls.load(Ordering::SeqCst), 1);
+        cold.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&session_id)
+                .unwrap()
+                .expect("cold continued native Session");
+            assert_eq!(session.events().unwrap(), session_events);
+        });
+        let cold_service = cold
+            .open_read_application_from_secret(&database_secret)
+            .expect("cold Application state");
+        assert_eq!(
+            cold_service
+                .mission_events(&project_id, &initial.mission_id)
+                .expect("cold unchanged Mission events"),
+            mission_events
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one focused journey proves native manual compaction, Domain isolation, and SQLCipher cold restore"
     )]
     fn cordis_native_deepseek_manual_compaction_stays_out_of_application_runtime() {

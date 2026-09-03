@@ -11794,22 +11794,6 @@ impl ApplicationService {
         {
             return Err(ApplicationError::RuntimeRecoveryScopeMismatch);
         }
-        if let Some(recovery) = &recovery {
-            if recovery.project_id != mission.project_id
-                || recovery.mission_id != mission.id
-                || recovery.workspace_id != ids.workspace_id
-                || recovery.worker_id != ids.worker_id
-                || recovery.worker_generation != previous_user_generation
-            {
-                return Err(ApplicationError::RuntimeRecoveryScopeMismatch);
-            }
-            let checkpoint = self
-                .store
-                .load_context_checkpoint(&mission.project_id, &recovery.checkpoint_id)?;
-            recovery.validate_for(&handle, &checkpoint, now)?;
-        } else if handle.status != WorkerHandleStatus::Attached {
-            return Err(ApplicationError::RuntimeRecoveryScopeMismatch);
-        }
         let already_terminal = matches!(
             (branch.status, lease.status, capsule.status, handle.status),
             (
@@ -11824,6 +11808,22 @@ impl ApplicationService {
                 WorkerHandleStatus::Cancelled | WorkerHandleStatus::Failed
             )
         );
+        if let Some(recovery) = &recovery {
+            if recovery.project_id != mission.project_id
+                || recovery.mission_id != mission.id
+                || recovery.workspace_id != ids.workspace_id
+                || recovery.worker_id != ids.worker_id
+                || recovery.worker_generation != previous_user_generation
+            {
+                return Err(ApplicationError::RuntimeRecoveryScopeMismatch);
+            }
+            let checkpoint = self
+                .store
+                .load_context_checkpoint(&mission.project_id, &recovery.checkpoint_id)?;
+            recovery.validate_for(&handle, &checkpoint, now)?;
+        } else if handle.status != WorkerHandleStatus::Attached && !already_terminal {
+            return Err(ApplicationError::RuntimeRecoveryScopeMismatch);
+        }
         if already_terminal {
             return Ok(());
         }
