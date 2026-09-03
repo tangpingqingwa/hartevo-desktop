@@ -3453,11 +3453,17 @@ mod tests {
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
     fn projection(status: DesktopRuntimeAvailabilityStatus) -> DesktopRuntimeProjection {
+        let program_sha256 = matches!(
+            status,
+            DesktopRuntimeAvailabilityStatus::ReadyDevelopment
+                | DesktopRuntimeAvailabilityStatus::ReadyDistribution
+        )
+        .then(|| "a".repeat(64));
         DesktopRuntimeProjection {
             status,
             target: Some("aarch64-apple-darwin".into()),
             release: OPENINTERPRETER_RELEASE.into(),
-            program_sha256: None,
+            program_sha256,
             provider: None,
             model: None,
             distribution_signature_evidence: None,
