@@ -1963,6 +1963,7 @@ mod tests {
             program_sha256: None,
             provider: None,
             model: None,
+            native_credential_source: None,
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         }

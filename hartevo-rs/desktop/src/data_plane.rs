@@ -8942,6 +8942,7 @@ mod tests {
     use hartevo_storage::{MemorySecretStore, ProviderRecoveryState};
     use rust_decimal::Decimal;
 
+    use crate::runtime_plane::DesktopNativeCredentialSource;
     use crate::runtime_subscription::{
         DesktopCatalogRuntimeDispatchAuthority, DesktopRuntimeDelivery,
         DesktopRuntimeExecutionPaintState, DesktopRuntimeReducerEffect,
@@ -9050,6 +9051,10 @@ mod tests {
         );
         assert_eq!(projection.provider.as_deref(), Some(DEEPSEEK_PROVIDER_ID));
         assert_eq!(projection.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(
+            projection.native_credential_source,
+            Some(DesktopNativeCredentialSource::DesktopProfile)
+        );
         assert_eq!(store.entry_count().expect("entry count"), 1);
         let stored = store
             .get(&first.native_provider_profile_reference)
@@ -9060,9 +9065,13 @@ mod tests {
             Err(SecretStoreError::SecretNotFound)
         ));
 
-        first
+        let cleared = first
             .clear_native_deepseek_with(&store)
             .expect("clear native profile");
+        assert_ne!(
+            cleared.native_credential_source,
+            Some(DesktopNativeCredentialSource::DesktopProfile)
+        );
         first
             .clear_native_deepseek_with(&store)
             .expect("idempotent clear");

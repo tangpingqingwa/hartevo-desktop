@@ -34,6 +34,12 @@ pub enum DesktopRuntimeAvailabilityStatus {
     UnsupportedHost,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopNativeCredentialSource {
+    DesktopProfile,
+    Environment,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopRuntimeProjection {
     pub status: DesktopRuntimeAvailabilityStatus,
@@ -42,6 +48,7 @@ pub struct DesktopRuntimeProjection {
     pub program_sha256: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub native_credential_source: Option<DesktopNativeCredentialSource>,
     pub distribution_signature_evidence: Option<String>,
     /// This remains false while Desktop uses the conservative UTF-8 byte
     /// budget. It prevents the Journey from being counted as production
@@ -58,6 +65,7 @@ impl DesktopRuntimeProjection {
             program_sha256: None,
             provider: normalized_env(RUNTIME_PROVIDER_ENV),
             model: normalized_env(RUNTIME_MODEL_ENV),
+            native_credential_source: None,
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         }
@@ -378,6 +386,7 @@ fn discover_openinterpreter() -> DesktopRuntimeDiscovery {
         program_sha256: Some(artifact.program_sha256.clone()),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
+        native_credential_source: None,
         distribution_signature_evidence: Some(artifact.distribution_signature_evidence.clone()),
         exact_tokenizer_evidence: false,
     };
@@ -423,6 +432,10 @@ fn discover_native_deepseek(
     } else {
         DesktopRuntimeAvailabilityStatus::ConfigurationRequired
     };
+    let native_credential_source = credentials.as_ref().map(|credentials| match credentials {
+        NativeCredentialSource::Environment => DesktopNativeCredentialSource::Environment,
+        NativeCredentialSource::DesktopProfile(_) => DesktopNativeCredentialSource::DesktopProfile,
+    });
     let projection = DesktopRuntimeProjection {
         status,
         target: Some(CORDIS_NATIVE_TARGET.into()),
@@ -430,6 +443,7 @@ fn discover_native_deepseek(
         program_sha256: None,
         provider: Some(DEEPSEEK_PROVIDER_ID.into()),
         model: model.clone(),
+        native_credential_source,
         distribution_signature_evidence: None,
         exact_tokenizer_evidence: false,
     };
@@ -464,6 +478,7 @@ fn native_unavailable(
             program_sha256: None,
             provider: Some(DEEPSEEK_PROVIDER_ID.into()),
             model,
+            native_credential_source: None,
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         },
@@ -647,6 +662,10 @@ mod tests {
             missing_model.projection.provider.as_deref(),
             Some(DEEPSEEK_PROVIDER_ID)
         );
+        assert_eq!(
+            missing_model.projection.native_credential_source,
+            Some(DesktopNativeCredentialSource::Environment)
+        );
         assert!(missing_model.configuration.is_none());
 
         let missing_credential = discover_native_deepseek(Some("deepseek-chat".into()), None);
@@ -654,6 +673,7 @@ mod tests {
             missing_credential.projection.status,
             DesktopRuntimeAvailabilityStatus::ConfigurationRequired
         );
+        assert_eq!(missing_credential.projection.native_credential_source, None);
         assert!(missing_credential.configuration.is_none());
     }
 
@@ -671,12 +691,70 @@ mod tests {
             discovery.projection.target.as_deref(),
             Some(CORDIS_NATIVE_TARGET)
         );
+        assert_eq!(
+            discovery.projection.native_credential_source,
+            Some(DesktopNativeCredentialSource::Environment)
+        );
         assert!(discovery.projection.program_sha256.is_none());
         let configuration = discovery.configuration.expect("native configuration");
         assert_eq!(configuration.provider, DEEPSEEK_PROVIDER_ID);
         assert_eq!(configuration.model, "deepseek-chat");
         assert!(configuration.artifact.is_none());
         assert!(configuration.native_profile_reference.is_none());
+    }
+
+    #[test]
+    fn native_credential_source_projection_is_typed_and_reference_free() {
+        let reference = SecretReference {
+            tenant_id: TenantId::from("local-desktop-installation"),
+            project_id: ProjectId::from("desktop-runtime"),
+            provider: DEEPSEEK_PROVIDER_ID.into(),
+            account_scope: "private-data-root-reference".into(),
+            purpose: "native_llm_profile".into(),
+            version: 1,
+        };
+        let stored = discover_native_deepseek(
+            Some("deepseek-chat".into()),
+            Some(NativeCredentialSource::DesktopProfile(reference.clone())),
+        );
+        assert_eq!(
+            stored.projection.native_credential_source,
+            Some(DesktopNativeCredentialSource::DesktopProfile)
+        );
+        assert!(!format!("{:?}", stored.projection).contains("private-data-root-reference"));
+        assert_eq!(
+            stored
+                .configuration
+                .expect("stored native configuration")
+                .native_profile_reference,
+            Some(reference)
+        );
+
+        let environment = discover_native_deepseek(
+            Some("deepseek-chat".into()),
+            Some(NativeCredentialSource::Environment),
+        );
+        assert_eq!(
+            environment.projection.native_credential_source,
+            Some(DesktopNativeCredentialSource::Environment)
+        );
+        assert_eq!(
+            native_unavailable(
+                DesktopRuntimeAvailabilityStatus::IntegrityError,
+                Some("deepseek-chat".into()),
+            )
+            .projection
+            .native_credential_source,
+            None
+        );
+        assert_eq!(
+            DesktopRuntimeProjection::with_status(
+                DesktopRuntimeAvailabilityStatus::NotConfigured,
+                Some("openinterpreter-target".into()),
+            )
+            .native_credential_source,
+            None
+        );
     }
 
     #[test]
