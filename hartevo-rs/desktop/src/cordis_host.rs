@@ -3314,6 +3314,11 @@ mod tests {
 
     use chrono::{Duration, TimeZone, Utc};
     use futures_util::stream;
+    #[cfg(target_os = "macos")]
+    use hartevo_application::llm_deepseek::{
+        DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, DeepSeekTransport,
+        DeepSeekWireResponse,
+    };
     use hartevo_cordis::{
         AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStatusChange, AgentStep,
         AgentsSurface, ApprovalOutcome, ApprovalPolicy, ApprovalPolicySource, ApprovalRequestId,
@@ -3342,11 +3347,6 @@ mod tests {
         ActorId, Approval, ApprovalDecision, ApprovalId, ConsentPurpose, ConsentRecord,
         ConsentRecordId, ConsentState, ConsentStatus, ContactChannel, LegalBasis, PersonId,
         ProjectId, TenantId,
-    };
-    #[cfg(target_os = "macos")]
-    use hartevo_llm_deepseek::{
-        DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, DeepSeekTransport,
-        DeepSeekWireResponse,
     };
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
     use hartevo_storage::{

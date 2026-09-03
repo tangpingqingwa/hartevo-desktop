@@ -1,6 +1,7 @@
 //! Direct DeepSeek chat-completions transport for the Rust Cordis LLM seam.
 //!
-//! Provider-specific HTTP and credentials stay outside `hartevo-cordis`.
+//! Provider-specific HTTP and credentials stay in the Application adapter
+//! layer, outside `hartevo-cordis`.
 //! Connection facts and the named credential are resolved once for every
 //! request, while one adapter instance can serve any number of parent or child
 //! Cordis calls.
