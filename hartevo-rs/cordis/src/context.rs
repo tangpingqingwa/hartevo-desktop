@@ -242,6 +242,7 @@ pub mod keys {
     pub const SESSIONS: &str = "sessions";
     pub const AGENTS: &str = "agents";
     pub const JOBS: &str = "jobs";
+    pub const SUBAGENTS: &str = "subagents";
     pub const COMPACTION: &str = "compaction";
     pub const DOMAIN: &str = "domain";
     pub const EFFECT_BROKER: &str = "effect_broker";
@@ -1711,6 +1712,11 @@ impl Context {
     #[must_use]
     pub fn jobs<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::JOBS)
+    }
+
+    #[must_use]
+    pub fn subagents<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::SUBAGENTS)
     }
 
     #[must_use]
@@ -3355,6 +3361,11 @@ impl ContextView<'_> {
     #[must_use]
     pub fn jobs<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::JOBS)
+    }
+
+    #[must_use]
+    pub fn subagents<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::SUBAGENTS)
     }
 
     #[must_use]

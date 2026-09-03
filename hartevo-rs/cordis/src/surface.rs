@@ -31,6 +31,7 @@ use crate::session::{
     SessionStreamChunk, SessionToolCall, SessionToolError, SessionToolSchema,
     events as session_events, validate_agent_request_config, validate_agent_user_message,
 };
+use crate::subagent::SubagentRuntime;
 
 /// Canonical DeepSeek Harness code for a tool call cancelled before dispatch.
 pub const TOOL_ABORTED_BEFORE_DISPATCH: &str = "ABORTED_BEFORE_DISPATCH";
@@ -50,6 +51,7 @@ pub const MAPPED_KEYS: &[&str] = &[
     keys::SESSIONS,
     keys::AGENTS,
     keys::JOBS,
+    keys::SUBAGENTS,
     keys::DOMAIN,
     keys::EFFECT_BROKER,
     keys::RUNTIME,
@@ -3246,6 +3248,7 @@ pub(crate) fn map_surfaces(
     )?;
     ctx.provide(keys::AGENTS, AgentsSurface::new())?;
     ctx.provide(keys::JOBS, JobsSurface::default())?;
+    ctx.provide(keys::SUBAGENTS, SubagentRuntime::new())?;
     ctx.provide_reserved(authority, keys::DOMAIN, surfaces.domain)?;
     ctx.provide_reserved(authority, keys::EFFECT_BROKER, surfaces.effect_broker)?;
     ctx.provide_reserved(authority, keys::RUNTIME, surfaces.runtime)?;
