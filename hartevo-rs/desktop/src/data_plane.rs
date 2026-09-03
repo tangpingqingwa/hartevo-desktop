@@ -35,15 +35,15 @@ use hartevo_application::{
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
     KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
-    ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
+    ObserveContextRuntimeTurn, PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext,
     PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProposePreviewEffect, ProvisionProjectEncryption, ReconcileUncertainEffect,
     RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
     ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
-    RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
-    RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission, TakeOverBrowserWorkspace, VerifyRecordedReceiptAtRevision,
-    Vm11NextContractOrValidTerminalResult,
+    ResumeBrowserWorkspace, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
+    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
+    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission, TakeOverBrowserWorkspace,
+    VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -1395,6 +1395,17 @@ pub struct DesktopContinueBrowserWorkspaceRequest {
 /// Application owns the restrictive transition and persistence ordering.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopTakeOverBrowserWorkspaceRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub expected_generation: u64,
+}
+
+/// Exact Desktop pause/resume fence for one Mission-bound Browser Workspace.
+/// The current owner state remains SQLCipher/Application-owned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopBrowserWorkspaceControlRequest {
     pub project_id: ProjectId,
     pub mission_id: MissionId,
     pub workspace_id: BrowserWorkspaceId,
@@ -3850,6 +3861,122 @@ impl DesktopDataPlane {
                 new_lease_id: BrowserControlLeaseId::new(),
                 lease_expires_at: now + Duration::hours(1),
                 evidence_digest,
+            },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    /// Pauses an exact agent- or user-held Browser Workspace. Application
+    /// fences the Host before persistence; no browser action or Effect runs.
+    pub fn pause_browser_workspace_os(
+        &self,
+        request: DesktopBrowserWorkspaceControlRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.pause_browser_workspace_with(&secret_store, request, now)
+    }
+
+    pub fn pause_browser_workspace_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopBrowserWorkspaceControlRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if !valid_browser_workspace_control_request(&request) {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceControl);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
+            .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
+        if !browser_workspace_request_matches(&request, &live) {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceControl);
+        }
+        if !matches!(
+            live.control_state,
+            BrowserControlState::AgentControlled | BrowserControlState::UserControlled
+        ) {
+            return Err(DesktopDataError::BrowserWorkspacePauseUnavailable);
+        }
+        let mut host = DesktopBrowserControlHost::attach(&live)?;
+        service.pause_browser_workspace(
+            &mut host,
+            PauseBrowserWorkspace {
+                project_id,
+                workspace_id: request.workspace_id,
+                expected_revision: request.expected_revision,
+                expected_generation: request.expected_generation,
+                new_lease_id: BrowserControlLeaseId::new(),
+                evidence_digest: browser_workspace_control_evidence_digest("pause", &live, now),
+            },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    /// Resumes an exact paused Browser Workspace. Application persists the
+    /// renewed owner lease before Host synchronization.
+    pub fn resume_browser_workspace_os(
+        &self,
+        request: DesktopBrowserWorkspaceControlRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.resume_browser_workspace_with(&secret_store, request, now)
+    }
+
+    pub fn resume_browser_workspace_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopBrowserWorkspaceControlRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if !valid_browser_workspace_control_request(&request) {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceControl);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
+            .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
+        if !browser_workspace_request_matches(&request, &live) {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceControl);
+        }
+        let agent_lease_expires_at = match live.control_state {
+            BrowserControlState::PausedAgent => Some(now + Duration::hours(1)),
+            BrowserControlState::PausedUser => None,
+            _ => return Err(DesktopDataError::BrowserWorkspaceResumeUnavailable),
+        };
+        let mut host = DesktopBrowserControlHost::attach(&live)?;
+        service.resume_browser_workspace(
+            &mut host,
+            ResumeBrowserWorkspace {
+                project_id,
+                workspace_id: request.workspace_id,
+                expected_revision: request.expected_revision,
+                expected_generation: request.expected_generation,
+                new_lease_id: BrowserControlLeaseId::new(),
+                agent_lease_expires_at,
+                evidence_digest: browser_workspace_control_evidence_digest("resume", &live, now),
             },
             now,
         )?;
@@ -8426,10 +8553,10 @@ fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation 
 
 /// Process-local BrowserControlHost for Desktop ownership transitions.
 ///
-/// Take over fences this Host before persistence; Continue persists the new
-/// Agent lease before this Host adopts it. A non-successor fails as
-/// `BrowserHostReconciliationRequired`. This is not a Fake Host test helper
-/// and does not execute Effects.
+/// Restrictive transitions fence this Host before persistence; permissive
+/// transitions persist the new lease before this Host adopts it. A
+/// non-successor fails as `BrowserHostReconciliationRequired`. This is not a
+/// Fake Host test helper and does not execute Effects.
 struct DesktopBrowserControlHost {
     workspace: BrowserWorkspace,
 }
@@ -8510,6 +8637,49 @@ fn take_over_browser_workspace_evidence_digest(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"desktop.browser_workspace.take_over\0");
+    hasher.update(workspace.project_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.mission_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.revision.to_le_bytes());
+    hasher.update(workspace.lease_generation.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", workspace.control_state).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_rfc3339().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn valid_browser_workspace_control_request(
+    request: &DesktopBrowserWorkspaceControlRequest,
+) -> bool {
+    request.expected_revision > 0
+        && request.expected_generation > 0
+        && !request.workspace_id.as_str().trim().is_empty()
+}
+
+fn browser_workspace_request_matches(
+    request: &DesktopBrowserWorkspaceControlRequest,
+    workspace: &BrowserWorkspace,
+) -> bool {
+    workspace.id == request.workspace_id
+        && workspace.project_id == request.project_id
+        && workspace.mission_id == request.mission_id
+        && workspace.revision == request.expected_revision
+        && workspace.lease_generation == request.expected_generation
+}
+
+fn browser_workspace_control_evidence_digest(
+    action: &str,
+    workspace: &BrowserWorkspace,
+    now: DateTime<Utc>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"desktop.browser_workspace.control\0");
+    hasher.update(action.as_bytes());
+    hasher.update(b"\0");
     hasher.update(workspace.project_id.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(workspace.mission_id.as_str().as_bytes());
@@ -8903,12 +9073,20 @@ pub enum DesktopDataError {
         "Browser Workspace Take over requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
     )]
     InvalidBrowserWorkspaceTakeOver,
-    #[error("no live Mission-bound Browser Workspace exists for Take over or Continue")]
+    #[error("no live Mission-bound Browser Workspace exists for ownership control")]
     BrowserWorkspaceUnavailable,
     #[error("Browser Workspace Continue requires a user-held lease")]
     BrowserWorkspaceContinueNotHeld,
     #[error("Browser Workspace Take over requires an agent-held lease")]
     BrowserWorkspaceTakeOverNotAgentHeld,
+    #[error(
+        "Browser Workspace control requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
+    )]
+    InvalidBrowserWorkspaceControl,
+    #[error("Browser Workspace Pause requires an agent- or user-held live lease")]
+    BrowserWorkspacePauseUnavailable,
+    #[error("Browser Workspace Resume requires a paused agent or user lease")]
+    BrowserWorkspaceResumeUnavailable,
     #[error(
         "Creator Deliverable Review requires the exact Project, Mission, task, deliverable, CAS revision, frozen checklist, and a typed ReviewDecision"
     )]
@@ -22569,6 +22747,179 @@ sleep 30"#;
         assert!(
             durable
                 .agent_lease_proof(now + Duration::seconds(4))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle test proves stale rejection and both preserved owner classes"
+    )]
+    fn pause_resume_browser_workspace_preserves_user_and_agent_owner() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(5);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "Desktop 通过 Cordis Application 暂停并恢复 Browser Workspace",
+                now,
+            )
+            .expect("mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let (workspace_id, revision, generation) = persist_user_held_browser_workspace(
+            &plane,
+            &secrets,
+            &project_id,
+            &mission_id,
+            now + Duration::seconds(1),
+        );
+
+        let stale = plane.pause_browser_workspace_with(
+            &secrets,
+            DesktopBrowserWorkspaceControlRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace_id.clone(),
+                expected_revision: revision.saturating_add(1),
+                expected_generation: generation,
+            },
+            now + Duration::seconds(2),
+        );
+        assert!(matches!(
+            stale,
+            Err(DesktopDataError::InvalidBrowserWorkspaceControl)
+        ));
+
+        let paused_user = plane
+            .pause_browser_workspace_with(
+                &secrets,
+                DesktopBrowserWorkspaceControlRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: revision,
+                    expected_generation: generation,
+                },
+                now + Duration::seconds(3),
+            )
+            .expect("pause user-held workspace");
+        let paused_user = paused_user.inventory.projects[0].missions[0]
+            .browser_workspace
+            .as_ref()
+            .expect("paused user workspace");
+        assert_eq!(paused_user.control_state, BrowserControlState::PausedUser);
+        assert_eq!(paused_user.revision, revision.saturating_add(1));
+        assert_eq!(paused_user.lease_generation, generation.saturating_add(1));
+
+        let resumed_user = plane
+            .resume_browser_workspace_with(
+                &secrets,
+                DesktopBrowserWorkspaceControlRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: revision.saturating_add(1),
+                    expected_generation: generation.saturating_add(1),
+                },
+                now + Duration::seconds(4),
+            )
+            .expect("resume user-held workspace");
+        let resumed_user = resumed_user.inventory.projects[0].missions[0]
+            .browser_workspace
+            .as_ref()
+            .expect("resumed user workspace");
+        assert_eq!(
+            resumed_user.control_state,
+            BrowserControlState::UserControlled
+        );
+        assert_eq!(resumed_user.revision, revision.saturating_add(2));
+        assert_eq!(resumed_user.lease_generation, generation.saturating_add(2));
+
+        let continued = plane
+            .continue_browser_workspace_with(
+                &secrets,
+                DesktopContinueBrowserWorkspaceRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: revision.saturating_add(2),
+                    expected_generation: generation.saturating_add(2),
+                },
+                now + Duration::seconds(5),
+            )
+            .expect("continue resumed user workspace");
+        assert_eq!(
+            continued.inventory.projects[0].missions[0]
+                .browser_workspace
+                .as_ref()
+                .expect("continued agent workspace")
+                .control_state,
+            BrowserControlState::AgentControlled
+        );
+
+        let paused_agent = plane
+            .pause_browser_workspace_with(
+                &secrets,
+                DesktopBrowserWorkspaceControlRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: revision.saturating_add(3),
+                    expected_generation: generation.saturating_add(3),
+                },
+                now + Duration::seconds(6),
+            )
+            .expect("pause agent-held workspace");
+        assert_eq!(
+            paused_agent.inventory.projects[0].missions[0]
+                .browser_workspace
+                .as_ref()
+                .expect("paused agent workspace")
+                .control_state,
+            BrowserControlState::PausedAgent
+        );
+
+        let resumed_agent = plane
+            .resume_browser_workspace_with(
+                &secrets,
+                DesktopBrowserWorkspaceControlRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: revision.saturating_add(4),
+                    expected_generation: generation.saturating_add(4),
+                },
+                now + Duration::seconds(7),
+            )
+            .expect("resume agent-held workspace");
+        let resumed_agent = resumed_agent.inventory.projects[0].missions[0]
+            .browser_workspace
+            .as_ref()
+            .expect("resumed agent workspace");
+        assert_eq!(
+            resumed_agent.control_state,
+            BrowserControlState::AgentControlled
+        );
+        assert_eq!(resumed_agent.revision, revision.saturating_add(5));
+        assert_eq!(resumed_agent.lease_generation, generation.saturating_add(5));
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(8))
+            .expect("reopen");
+        let durable = service
+            .load_browser_workspace(&project_id, &workspace_id)
+            .expect("durable resumed workspace");
+        assert_eq!(durable.control_state, BrowserControlState::AgentControlled);
+        assert_eq!(durable.revision, revision.saturating_add(5));
+        assert_eq!(durable.lease_generation, generation.saturating_add(5));
+        assert!(
+            durable
+                .agent_lease_proof(now + Duration::seconds(8))
                 .is_ok()
         );
     }

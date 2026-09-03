@@ -48,9 +48,10 @@ use cordis_host::{
     DesktopHumanCommandDispatch, DesktopHumanCommandResult, is_desktop_human_command,
 };
 use data_plane::{
-    DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
-    DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
-    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
+    DesktopBrowserWorkspaceControlRequest, DesktopCatalogMissionRequest,
+    DesktopContinueBrowserWorkspaceRequest, DesktopDataError, DesktopDataPlane,
+    DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest, DesktopLoadState,
+    DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopOpenConversationRequest,
     DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
@@ -411,6 +412,10 @@ impl UiFailure {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive Desktop-to-UI error boundary intentionally stays in one mapping"
+    )]
     fn from_error(error: &DesktopDataError) -> Self {
         match error {
             DesktopDataError::MissingDatabaseKey => Self::coded(
@@ -456,6 +461,7 @@ impl UiFailure {
             | DesktopDataError::InvalidEffectReconciliation
             | DesktopDataError::InvalidBrowserWorkspaceContinue
             | DesktopDataError::InvalidBrowserWorkspaceTakeOver
+            | DesktopDataError::InvalidBrowserWorkspaceControl
             | DesktopDataError::InvalidCreatorDeliverableReview => Self::coded(
                 "WAITING_USER",
                 "精确窗口动作必须绑定冻结 digest 与当前 CAS revision；未写入部分状态，也未执行 Effect。",
@@ -470,10 +476,12 @@ impl UiFailure {
             ),
             DesktopDataError::BrowserWorkspaceUnavailable => Self::coded(
                 "EMPTY",
-                "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Take over 或 Continue。",
+                "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行所有权控制。",
             ),
             DesktopDataError::BrowserWorkspaceContinueNotHeld
-            | DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld => Self::coded(
+            | DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld
+            | DesktopDataError::BrowserWorkspacePauseUnavailable
+            | DesktopDataError::BrowserWorkspaceResumeUnavailable => Self::coded(
                 "STALE_SELECTION",
                 "Browser Workspace 所有权已与所选动作不匹配，请刷新后重试。未改写 lease，也未执行 Effect。",
             ),
@@ -2071,6 +2079,106 @@ pub fn App() -> Element {
             }
         });
     };
+    let request_operations_pause_browser = move |()| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Browser Workspace，也未执行 Pause。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(workspace) = mission.browser_workspace.as_ref() else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message:
+                    "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Pause。"
+                        .into(),
+            });
+            return;
+        };
+        let request = DesktopBrowserWorkspaceControlRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.pause_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => model.write().set_ready(snapshot, false),
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_PAUSE_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Pause 协调异常结束；未执行 Effect，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
+    };
+    let request_operations_resume_browser = move |()| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Browser Workspace，也未执行 Resume。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(workspace) = mission.browser_workspace.as_ref() else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message:
+                    "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Resume。"
+                        .into(),
+            });
+            return;
+        };
+        let request = DesktopBrowserWorkspaceControlRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.resume_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => model.write().set_ready(snapshot, false),
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_RESUME_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Resume 协调异常结束；未执行 Effect，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
+    };
     let request_partners_review_creator_deliverable = move |decision: ReviewDecision| {
         let selection = {
             let current = model.read();
@@ -2883,6 +2991,8 @@ pub fn App() -> Element {
                                 on_interrupt: request_operations_interrupt,
                                 on_take_over_browser_workspace: request_operations_take_over_browser,
                                 on_continue_browser_workspace: request_operations_continue_browser,
+                                on_pause_browser_workspace: request_operations_pause_browser,
+                                on_resume_browser_workspace: request_operations_resume_browser,
                                 on_approve_local_runtime: request_operations_approve_local_runtime,
                                 on_allow_cordis_once: request_operations_allow_cordis_once,
                                 on_reject_cordis: request_operations_reject_cordis,
@@ -5880,6 +5990,8 @@ fn AgentOperationsWorkbench(
     on_interrupt: EventHandler<()>,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
+    on_pause_browser_workspace: EventHandler<()>,
+    on_resume_browser_workspace: EventHandler<()>,
     on_approve_local_runtime: EventHandler<()>,
     on_allow_cordis_once: EventHandler<()>,
     on_reject_cordis: EventHandler<()>,
@@ -6133,7 +6245,7 @@ fn AgentOperationsWorkbench(
                     header { class: "operations-card-header",
                         div {
                             span { class: "operations-eyebrow", "BROWSER WORKSPACE" }
-                            h3 { "Identity and takeover" }
+                            h3 { "Identity and control" }
                         }
                         span { class: format!("operations-status {}", projection.browser.status.tone()), "{projection.browser.status.code()}" }
                     }
@@ -6176,6 +6288,40 @@ fn AgentOperationsWorkbench(
                                     title: "{continue_title}",
                                     onclick: move |_| on_continue_browser_workspace.call(()),
                                     "{continue_label}"
+                                }
+                            }
+                        }
+                        {
+                            let pause_ready = projection.browser.pause_status == OperationsStatus::Ready;
+                            let pause_title = match projection.browser.pause_status {
+                                OperationsStatus::Ready => "通过 Application pause_browser_workspace 收紧 Host 后持久化暂停",
+                                _ => "当前 Browser Workspace 不可暂停",
+                            };
+                            let pause_label = format!("Pause · {}", projection.browser.pause_status.code());
+                            rsx! {
+                                button {
+                                    disabled: !pause_ready,
+                                    aria_label: "暂停 Browser Workspace",
+                                    title: "{pause_title}",
+                                    onclick: move |_| on_pause_browser_workspace.call(()),
+                                    "{pause_label}"
+                                }
+                            }
+                        }
+                        {
+                            let resume_ready = projection.browser.resume_status == OperationsStatus::Ready;
+                            let resume_title = match projection.browser.resume_status {
+                                OperationsStatus::Ready => "通过 Application resume_browser_workspace 恢复原所有者",
+                                _ => "当前 Browser Workspace 不可恢复",
+                            };
+                            let resume_label = format!("Resume · {}", projection.browser.resume_status.code());
+                            rsx! {
+                                button {
+                                    disabled: !resume_ready,
+                                    aria_label: "恢复 Browser Workspace",
+                                    title: "{resume_title}",
+                                    onclick: move |_| on_resume_browser_workspace.call(()),
+                                    "{resume_label}"
                                 }
                             }
                         }
@@ -6251,6 +6397,8 @@ fn OrchestratorSurface(
     interrupt_requested: bool,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
+    on_pause_browser_workspace: EventHandler<()>,
+    on_resume_browser_workspace: EventHandler<()>,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
@@ -6352,6 +6500,8 @@ fn OrchestratorSurface(
                             on_interrupt,
                             on_take_over_browser_workspace,
                             on_continue_browser_workspace,
+                            on_pause_browser_workspace,
+                            on_resume_browser_workspace,
                             on_approve_local_runtime,
                             on_allow_cordis_once,
                             on_reject_cordis,
@@ -6481,6 +6631,8 @@ fn OrchestratorSurface(
                         on_interrupt,
                         on_take_over_browser_workspace,
                         on_continue_browser_workspace,
+                        on_pause_browser_workspace,
+                        on_resume_browser_workspace,
                         on_approve_local_runtime,
                         on_allow_cordis_once,
                         on_reject_cordis,
@@ -11605,10 +11757,17 @@ mod tests {
         assert!(source.contains("DesktopTakeOverBrowserWorkspaceRequest"));
         assert!(source.contains("continue_browser_workspace_os"));
         assert!(source.contains("DesktopContinueBrowserWorkspaceRequest"));
+        assert!(source.contains("pause_browser_workspace_os"));
+        assert!(source.contains("resume_browser_workspace_os"));
+        assert!(source.contains("DesktopBrowserWorkspaceControlRequest"));
         assert!(source.contains("format!(\"Take over · {}\""));
         assert!(source.contains("format!(\"Continue · {}\""));
+        assert!(source.contains("format!(\"Pause · {}\""));
+        assert!(source.contains("format!(\"Resume · {}\""));
         assert!(source.contains("on_take_over_browser_workspace"));
         assert!(source.contains("on_continue_browser_workspace"));
+        assert!(source.contains("on_pause_browser_workspace"));
+        assert!(source.contains("on_resume_browser_workspace"));
         assert!(source.contains("BrowserHostReconciliationRequired"));
     }
 

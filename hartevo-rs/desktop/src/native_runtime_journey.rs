@@ -1296,6 +1296,10 @@ fn adoption_receipt_digest(
     hex::encode(hasher.finalize())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive Desktop error boundary intentionally stays in one mapping"
+)]
 fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
     let code = match error {
         DesktopDataError::Application(ApplicationError::RuntimeDraftScopeMismatch) => {
@@ -1367,6 +1371,9 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::BrowserWorkspaceUnavailable
         | DesktopDataError::BrowserWorkspaceContinueNotHeld
         | DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld
+        | DesktopDataError::InvalidBrowserWorkspaceControl
+        | DesktopDataError::BrowserWorkspacePauseUnavailable
+        | DesktopDataError::BrowserWorkspaceResumeUnavailable
         | DesktopDataError::InvalidCreatorDeliverableReview
         | DesktopDataError::CreatorDeliverableReviewUnavailable
         | DesktopDataError::CreatorDeliverableReviewStale

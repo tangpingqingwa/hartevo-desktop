@@ -169,6 +169,8 @@ pub struct BrowserWorkspaceProjection {
     pub lease_generation: Option<u64>,
     pub take_over_status: OperationsStatus,
     pub continue_status: OperationsStatus,
+    pub pause_status: OperationsStatus,
+    pub resume_status: OperationsStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -668,6 +670,8 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             lease_generation: None,
             take_over_status: OperationsStatus::Empty,
             continue_status: OperationsStatus::Empty,
+            pause_status: OperationsStatus::Empty,
+            resume_status: OperationsStatus::Empty,
         };
     };
     let Some(workspace) = mission.browser_workspace.as_ref() else {
@@ -675,12 +679,14 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             status: OperationsStatus::Empty,
             identity: "No Mission-bound Browser Workspace".into(),
             control_owner: "No owner".into(),
-            next_action: "Continue stays empty until a durable workspace exists".into(),
+            next_action: "Ownership controls stay empty until a durable workspace exists".into(),
             workspace_id: None,
             revision: None,
             lease_generation: None,
             take_over_status: OperationsStatus::Empty,
             continue_status: OperationsStatus::Empty,
+            pause_status: OperationsStatus::Empty,
+            resume_status: OperationsStatus::Empty,
         };
     };
     match workspace.control_state {
@@ -694,6 +700,8 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             lease_generation: Some(workspace.lease_generation),
             take_over_status: OperationsStatus::Empty,
             continue_status: OperationsStatus::Ready,
+            pause_status: OperationsStatus::Ready,
+            resume_status: OperationsStatus::Empty,
         },
         BrowserControlState::AgentControlled => browser_workspace_view(
             workspace,
@@ -702,17 +710,29 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             "Take over issues Application take_over_browser_workspace",
             OperationsStatus::Ready,
             OperationsStatus::Empty,
+            OperationsStatus::Ready,
+            OperationsStatus::Empty,
         ),
-        BrowserControlState::PausedAgent | BrowserControlState::PausedUser => {
-            browser_workspace_view(
-                workspace,
-                OperationsStatus::WaitingUser,
-                "Workspace is paused",
-                "Pause/Resume remains NOT_IMPLEMENTED; ownership actions stay disabled",
-                OperationsStatus::NotImplemented,
-                OperationsStatus::NotImplemented,
-            )
-        }
+        BrowserControlState::PausedAgent => browser_workspace_view(
+            workspace,
+            OperationsStatus::WaitingUser,
+            "Agent-owned workspace is paused",
+            "Resume restores Agent ownership with a fresh lease",
+            OperationsStatus::Empty,
+            OperationsStatus::Empty,
+            OperationsStatus::Empty,
+            OperationsStatus::Ready,
+        ),
+        BrowserControlState::PausedUser => browser_workspace_view(
+            workspace,
+            OperationsStatus::WaitingUser,
+            "User-owned workspace is paused",
+            "Resume restores User ownership",
+            OperationsStatus::Empty,
+            OperationsStatus::Empty,
+            OperationsStatus::Empty,
+            OperationsStatus::Ready,
+        ),
         BrowserControlState::Completed
         | BrowserControlState::KeptForUser
         | BrowserControlState::Closed => browser_workspace_view(
@@ -722,10 +742,16 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             "Ownership actions do not reopen a closed workspace",
             OperationsStatus::Empty,
             OperationsStatus::Empty,
+            OperationsStatus::Empty,
+            OperationsStatus::Empty,
         ),
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the constructor keeps four independent Browser action statuses explicit"
+)]
 fn browser_workspace_view(
     workspace: &DurableBrowserWorkspaceProjection,
     status: OperationsStatus,
@@ -733,6 +759,8 @@ fn browser_workspace_view(
     next_action: &str,
     take_over_status: OperationsStatus,
     continue_status: OperationsStatus,
+    pause_status: OperationsStatus,
+    resume_status: OperationsStatus,
 ) -> BrowserWorkspaceProjection {
     BrowserWorkspaceProjection {
         status,
@@ -744,6 +772,8 @@ fn browser_workspace_view(
         lease_generation: Some(workspace.lease_generation),
         take_over_status,
         continue_status,
+        pause_status,
+        resume_status,
     }
 }
 
@@ -977,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_continue_stays_empty_without_a_mission_bound_workspace() {
+    fn browser_ownership_controls_follow_durable_state() {
         let mission = MissionProjection {
             surface: "orchestrator".into(),
             project_id: "project".into(),
@@ -1021,6 +1051,8 @@ mod tests {
         assert_eq!(empty.status, OperationsStatus::Empty);
         assert_eq!(empty.take_over_status, OperationsStatus::Empty);
         assert_eq!(empty.continue_status, OperationsStatus::Empty);
+        assert_eq!(empty.pause_status, OperationsStatus::Empty);
+        assert_eq!(empty.resume_status, OperationsStatus::Empty);
         assert!(empty.workspace_id.is_none());
 
         let mut held = mission.clone();
@@ -1035,6 +1067,8 @@ mod tests {
         let ready = browser_projection(Some(&held));
         assert_eq!(ready.take_over_status, OperationsStatus::Empty);
         assert_eq!(ready.continue_status, OperationsStatus::Ready);
+        assert_eq!(ready.pause_status, OperationsStatus::Ready);
+        assert_eq!(ready.resume_status, OperationsStatus::Empty);
         assert_eq!(ready.status, OperationsStatus::WaitingUser);
 
         held.browser_workspace
@@ -1044,7 +1078,31 @@ mod tests {
         let agent = browser_projection(Some(&held));
         assert_eq!(agent.take_over_status, OperationsStatus::Ready);
         assert_eq!(agent.continue_status, OperationsStatus::Empty);
+        assert_eq!(agent.pause_status, OperationsStatus::Ready);
+        assert_eq!(agent.resume_status, OperationsStatus::Empty);
         assert!(agent.next_action.contains("take_over_browser_workspace"));
+
+        held.browser_workspace
+            .as_mut()
+            .expect("workspace")
+            .control_state = BrowserControlState::PausedAgent;
+        let paused_agent = browser_projection(Some(&held));
+        assert_eq!(paused_agent.take_over_status, OperationsStatus::Empty);
+        assert_eq!(paused_agent.continue_status, OperationsStatus::Empty);
+        assert_eq!(paused_agent.pause_status, OperationsStatus::Empty);
+        assert_eq!(paused_agent.resume_status, OperationsStatus::Ready);
+        assert!(paused_agent.control_owner.contains("Agent-owned"));
+
+        held.browser_workspace
+            .as_mut()
+            .expect("workspace")
+            .control_state = BrowserControlState::PausedUser;
+        let paused_user = browser_projection(Some(&held));
+        assert_eq!(paused_user.take_over_status, OperationsStatus::Empty);
+        assert_eq!(paused_user.continue_status, OperationsStatus::Empty);
+        assert_eq!(paused_user.pause_status, OperationsStatus::Empty);
+        assert_eq!(paused_user.resume_status, OperationsStatus::Ready);
+        assert!(paused_user.control_owner.contains("User-owned"));
     }
 
     #[test]
