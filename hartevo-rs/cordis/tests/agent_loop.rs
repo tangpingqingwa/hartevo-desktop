@@ -13,7 +13,7 @@ use hartevo_cordis::{
     KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmChunkStream,
     LlmError, LlmGenerateRequest, LlmModelReasoning, LlmResolvedModel, LlmRetry, LlmRetryPolicy,
     LlmStream, LoaderContext, LoggedAgentCall, NonBail, PromptError, PromptSection,
-    RecordedAgentStream, RuntimeSurface, SessionCallConfig, SessionCancelCause,
+    RecordedAgentStream, RuntimeSurface, SUBAGENT_TOOL_NAME, SessionCallConfig, SessionCancelCause,
     SessionContentBlock, SessionError, SessionEventKind, SessionFinishReason, SessionHandle,
     SessionId, SessionLlmFailure, SessionLlmRetryMode, SessionMessage, SessionMessageRole,
     SessionMessageSource, SessionReplayEnvelope, SessionRequestHeaderReason, SessionStore,
@@ -1638,6 +1638,60 @@ fn turn_driver_calls_model_from_history_after_an_empty_tool_continuation() {
     );
 }
 
+#[tokio::test]
+async fn host_local_subagent_tool_fails_closed_outside_the_runtime_authorized_driver() {
+    let mut ctx = mapped();
+    let mut delegated = Vec::from(tool_call_chunks(
+        0,
+        "unauthorized-subagent",
+        SUBAGENT_TOOL_NAME,
+        r#"{"prompt":"do not start"}"#,
+    ));
+    delegated.push(SessionStreamChunk::Finish {
+        reason: SessionFinishReason::ToolCalls,
+        replay_state: None,
+    });
+    let (adapter, _) = sequenced_adapter(vec![
+        delegated,
+        text_finish_chunks("handled denial", SessionFinishReason::Stop),
+    ]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let sessions = ctx.sessions::<SessionStore>().unwrap();
+    let session = sessions
+        .create(SessionId::new("generic-subagent-denial").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("generic-input", "delegate"))
+        .unwrap();
+
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &LifecycleCancellation::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(outcome.steps(), 2);
+    assert_eq!(sessions.len().unwrap(), 1, "no child Session may start");
+    assert!(session.derive_messages().unwrap().iter().any(|message| {
+        matches!(
+            message.content.as_slice(),
+            [SessionContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error: true,
+            }] if tool_call_id == "unauthorized-subagent"
+                && content == &[SessionContentBlock::Text {
+                    text: "Error: host-local tool requires an authorized Runtime agent driver".into()
+                }]
+        )
+    }));
+}
+
 #[test]
 fn concluding_tool_context_is_consumed_before_the_turn_closes() {
     let mut ctx = mapped();
@@ -2691,7 +2745,16 @@ fn agent_build_logs_effective_header_context_and_deduplicates() {
     assert_eq!(header.config, initial.call().config().clone());
     assert!(header.adapter_defaults.unwrap().reasoning_effort);
     assert_eq!(header.system, None);
-    assert_eq!(header.tools, None);
+    assert_eq!(
+        header
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        [SUBAGENT_TOOL_NAME]
+    );
     assert_eq!(
         session.request_context().unwrap().unwrap().context_window,
         Some(64_000)
@@ -2956,7 +3019,7 @@ fn agent_build_freezes_and_persists_prompt_tools_in_harness_order() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        ["alpha", "zulu"]
+        ["alpha", SUBAGENT_TOOL_NAME, "zulu"]
     );
     let first_header = session.request_header().unwrap().unwrap();
     assert_eq!(
@@ -2974,7 +3037,7 @@ fn agent_build_freezes_and_persists_prompt_tools_in_harness_order() {
         first.call().assembly().system(),
         Some("First.\n\nAlpha.\n\nZulu.")
     );
-    assert_eq!(first.call().assembly().tools().len(), 2);
+    assert_eq!(first.call().assembly().tools().len(), 3);
     close_logged_turn(&session, turn);
 
     let (turn, changed) = build_logged_turn(
@@ -2992,7 +3055,7 @@ fn agent_build_freezes_and_persists_prompt_tools_in_harness_order() {
         changed.call().assembly().system(),
         Some("First.\n\nAlpha.\n\nZulu.\n\nLater.")
     );
-    assert_eq!(changed.call().assembly().tools().len(), 3);
+    assert_eq!(changed.call().assembly().tools().len(), 4);
     assert!(!changed.context_appended());
     close_logged_turn(&session, turn);
 }
@@ -3330,10 +3393,10 @@ fn logged_agent_call_dispatches_exact_request_without_session_writes() {
     assert_eq!(request.config().max_tokens, Some(512));
     assert_eq!(request.messages(), [user_message("request-1", "request-1")]);
     assert_eq!(request.system(), Some("Follow the durable plan."));
-    assert_eq!(
-        request.tools(),
-        Some(std::slice::from_ref(&tool_schema("search")))
-    );
+    let tools = request.tools().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].name, "search");
+    assert_eq!(tools[1].name, SUBAGENT_TOOL_NAME);
     assert_eq!(request.session_id(), Some(session.id()));
     drop(requests);
     assert_eq!(session.events().unwrap(), before);

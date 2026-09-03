@@ -6,13 +6,14 @@ use futures_util::FutureExt;
 use hartevo_cordis::{
     AgentRef, AgentStatus, AgentStatusChange, AgentsSurface, AuthorityScope, Context, CordisError,
     CordisHost, KernelConsentState, OneShotSubagentDescriptor, ResolvedSubagentStartRequest,
-    RuntimeBinding, SPAWN_SUBAGENT_PROVIDER_NAME, SUBAGENT_DESCRIPTOR_VERSION, SessionCallConfig,
-    SessionContentBlock, SessionEventKind, SessionFinishReason, SessionId, SessionMessageRole,
-    SessionMessageSource, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-    SubagentCapabilities, SubagentCapability, SubagentDescriptorMode, SubagentError,
-    SubagentProvider, SubagentResult, SubagentRun, SubagentRunEndInfo, SubagentRunInfo,
-    SubagentRuntime, SubagentStartRequest, SubagentStopReason, SubagentToolFilter,
-    events as agent_events, register_subagent_provider, subagent_events,
+    RuntimeBinding, SPAWN_SUBAGENT_PROVIDER_NAME, SUBAGENT_DESCRIPTOR_VERSION, SUBAGENT_TOOL_NAME,
+    SessionCallConfig, SessionContentBlock, SessionEventKind, SessionFinishReason, SessionId,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamBlockType,
+    SessionStreamChunk, SessionToolSchema, SubagentCapabilities, SubagentCapability,
+    SubagentDescriptorMode, SubagentError, SubagentProvider, SubagentResult, SubagentRun,
+    SubagentRunEndInfo, SubagentRunInfo, SubagentRuntime, SubagentStartRequest, SubagentStopReason,
+    SubagentToolFilter, TurnEndReason, events as agent_events, register_subagent_provider,
+    subagent_events,
 };
 use tokio::sync::Notify;
 
@@ -46,6 +47,13 @@ fn call_config(provider: &str, model: &str) -> SessionCallConfig {
         stop: None,
     }
 }
+
+type ObservedCall = (
+    Option<SessionId>,
+    Vec<SessionMessage>,
+    Vec<SessionToolSchema>,
+    SessionCallConfig,
+);
 
 struct StubRun {
     id: SessionId,
@@ -807,6 +815,204 @@ async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host
             .unwrap()
             .iter()
             .any(|agent| agent.is_same_lifecycle(&child_agent))
+    );
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end journey proves model binding, fresh child context, result return, and disposal"
+)]
+async fn authorized_runtime_subagent_tool_returns_a_fresh_child_result_to_its_parent() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("parent-session");
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let parent_session_id = SessionId::new("parent-session").unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let parent_session = sessions.create(parent_session_id.clone()).unwrap();
+    parent_session
+        .inbox()
+        .append_next_turn(SessionMessage {
+            id: "parent-prompt".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "delegate the focused check".into(),
+            }],
+            source: SessionMessageSource::User,
+        })
+        .unwrap();
+
+    let observed = Arc::new(Mutex::new(Vec::<ObservedCall>::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    host.context_mut()
+        .on_waterfall(agent_events::LLM_STREAM, {
+            let observed = Arc::clone(&observed);
+            let calls = Arc::clone(&calls);
+            move |stream, _next| {
+                let request = stream.request().expect("generated Agent request");
+                observed.lock().unwrap().push((
+                    request.session_id().cloned(),
+                    request.messages().to_vec(),
+                    request.tools().unwrap_or_default().to_vec(),
+                    request.config().clone(),
+                ));
+                let chunks = match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![
+                        SessionStreamChunk::BlockStart {
+                            index: 0,
+                            block_type: SessionStreamBlockType::ToolCall,
+                        },
+                        SessionStreamChunk::BlockEnd {
+                            index: 0,
+                            block: SessionContentBlock::ToolCall {
+                                id: "delegate-1".into(),
+                                name: SUBAGENT_TOOL_NAME.into(),
+                                arguments: serde_json::json!({
+                                    "prompt": "perform the independent focused check"
+                                })
+                                .to_string(),
+                            },
+                        },
+                        SessionStreamChunk::BlockStart {
+                            index: 1,
+                            block_type: SessionStreamBlockType::ToolCall,
+                        },
+                        SessionStreamChunk::BlockEnd {
+                            index: 1,
+                            block: SessionContentBlock::ToolCall {
+                                id: "delegate-blank".into(),
+                                name: SUBAGENT_TOOL_NAME.into(),
+                                arguments: serde_json::json!({ "prompt": "   " }).to_string(),
+                            },
+                        },
+                        SessionStreamChunk::Finish {
+                            reason: SessionFinishReason::ToolCalls,
+                            replay_state: None,
+                        },
+                    ],
+                    1 => vec![
+                        SessionStreamChunk::BlockStart {
+                            index: 0,
+                            block_type: SessionStreamBlockType::Text,
+                        },
+                        SessionStreamChunk::BlockEnd {
+                            index: 0,
+                            block: SessionContentBlock::Text {
+                                text: "child answer".into(),
+                            },
+                        },
+                        SessionStreamChunk::Finish {
+                            reason: SessionFinishReason::Stop,
+                            replay_state: None,
+                        },
+                    ],
+                    2 => vec![
+                        SessionStreamChunk::BlockStart {
+                            index: 0,
+                            block_type: SessionStreamBlockType::Text,
+                        },
+                        SessionStreamChunk::BlockEnd {
+                            index: 0,
+                            block: SessionContentBlock::Text {
+                                text: "parent completed".into(),
+                            },
+                        },
+                        SessionStreamChunk::Finish {
+                            reason: SessionFinishReason::Stop,
+                            replay_state: None,
+                        },
+                    ],
+                    index => panic!("unexpected model call {index}"),
+                };
+                stream.with_chunk_stream(Box::pin(futures_util::stream::iter(chunks)))
+            }
+        })
+        .unwrap();
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let outcome = host
+        .run_authorized_runtime_agent_turn(
+            &permit,
+            &parent_session_id,
+            call_config("mock", "model"),
+            &hartevo_cordis::LifecycleCancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(outcome.steps(), 2);
+
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.len(), 3);
+    let schema = observed[0]
+        .2
+        .iter()
+        .find(|schema| schema.name == SUBAGENT_TOOL_NAME)
+        .expect("subagent schema must be model-visible");
+    assert_eq!(schema.parameters["required"], serde_json::json!(["prompt"]));
+    assert_eq!(
+        observed[1].1.len(),
+        1,
+        "child must receive no parent history"
+    );
+    assert_eq!(
+        observed[1].1[0].content,
+        [SessionContentBlock::Text {
+            text: "perform the independent focused check".into()
+        }]
+    );
+    assert_eq!(observed[1].3, call_config("mock", "model"));
+    assert!(observed[2].1.iter().any(|message| {
+        matches!(
+            message.content.as_slice(),
+            [SessionContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error: false,
+            }] if tool_call_id == "delegate-1"
+                && content == &[SessionContentBlock::Text { text: "child answer".into() }]
+        )
+    }));
+    assert!(observed[2].1.iter().any(|message| {
+        matches!(
+            message.content.as_slice(),
+            [SessionContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error: true,
+            }] if tool_call_id == "delegate-blank"
+                && content == &[SessionContentBlock::Text {
+                    text: "Error: subagent prompt must not be blank".into()
+                }]
+        )
+    }));
+    let child_session_id = observed[1].0.clone().expect("child session id");
+    drop(observed);
+
+    let child = sessions.get(&child_session_id).unwrap().unwrap();
+    assert_eq!(
+        child.header().unwrap().parent_session,
+        Some(parent_session_id.clone())
+    );
+    assert_eq!(sessions.len().unwrap(), 2);
+    assert!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .iter()
+            .all(|agent| agent.id != child_session_id.as_str()),
+        "foreground child Agent must be disposed after collection"
     );
     host.finish_runtime(permit).unwrap().announce().unwrap();
 }

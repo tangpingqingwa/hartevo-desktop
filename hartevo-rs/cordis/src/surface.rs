@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use futures_core::Stream;
+use futures_util::FutureExt;
 use tokio::sync::watch;
 
 use crate::approval::{ApprovalSurface, events as approval_events};
@@ -31,7 +32,7 @@ use crate::session::{
     SessionStreamChunk, SessionToolCall, SessionToolError, SessionToolSchema,
     events as session_events, validate_agent_request_config, validate_agent_user_message,
 };
-use crate::subagent::{SubagentRuntime, events as subagent_events};
+use crate::subagent::{SubagentRuntime, events as subagent_events, run_foreground_subagent_tool};
 
 /// Canonical DeepSeek Harness code for a tool call cancelled before dispatch.
 pub const TOOL_ABORTED_BEFORE_DISPATCH: &str = "ABORTED_BEFORE_DISPATCH";
@@ -624,6 +625,21 @@ pub enum ToolExecutionMode {
     Exclusive,
 }
 
+/// Host-owned async bodies that must retain the Agent driver's mutable
+/// [`Context`] instead of moving onto a detached scheduler worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostToolExecutor {
+    ForegroundSubagent { provider: String },
+}
+
+/// Sealed admission carried only by the complete Agent driver. Public and
+/// legacy tool entry points never receive the Runtime-authorized variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostToolAccess {
+    Denied,
+    RuntimeAuthorized,
+}
+
 /// One call admitted through ordered policy and guards for later dispatch.
 ///
 /// The registration identity is intentionally opaque. A later dispatch stage
@@ -633,6 +649,7 @@ pub struct PreparedToolExecution {
     input: ToolExecutionInput,
     mode: ToolExecutionMode,
     registration_identity: Arc<()>,
+    host_executor: Option<HostToolExecutor>,
     approval: Option<ToolApprovalGrant>,
     result_projection: ToolResultProjection,
 }
@@ -871,7 +888,8 @@ pub struct ToolDefinition {
     schema: SessionToolSchema,
     classifier: Option<ToolConcurrencyClassifier>,
     approval_planner: Option<ToolApprovalPlanner>,
-    executor: ToolExecutor,
+    executor: Option<ToolExecutor>,
+    host_executor: Option<HostToolExecutor>,
     result_projection: ToolResultProjection,
 }
 
@@ -882,6 +900,8 @@ impl fmt::Debug for ToolDefinition {
             .field("schema", &self.schema)
             .field("has_classifier", &self.classifier.is_some())
             .field("has_approval_planner", &self.approval_planner.is_some())
+            .field("has_executor", &self.executor.is_some())
+            .field("host_executor", &self.host_executor)
             .field(
                 "has_output_renderer",
                 &self.result_projection.renderer.is_some(),
@@ -904,7 +924,8 @@ impl ToolDefinition {
             schema,
             classifier: None,
             approval_planner: None,
-            executor: Arc::new(move |run| executor(run.input())),
+            executor: Some(Arc::new(move |run| executor(run.input()))),
+            host_executor: None,
             result_projection: ToolResultProjection::default(),
         }
     }
@@ -920,7 +941,22 @@ impl ToolDefinition {
             schema,
             classifier: None,
             approval_planner: None,
-            executor: Arc::new(executor),
+            executor: Some(Arc::new(executor)),
+            host_executor: None,
+            result_projection: ToolResultProjection::default(),
+        }
+    }
+
+    /// Register one crate-owned body that must execute on the async Agent
+    /// driver with its live host Context. This is deliberately not public: a
+    /// plugin cannot manufacture Runtime authority by selecting this route.
+    pub(crate) fn new_host(schema: SessionToolSchema, executor: HostToolExecutor) -> Self {
+        Self {
+            schema,
+            classifier: None,
+            approval_planner: None,
+            executor: None,
+            host_executor: Some(executor),
             result_projection: ToolResultProjection::default(),
         }
     }
@@ -2410,6 +2446,7 @@ struct ToolRegistration {
     classifier: Option<ToolConcurrencyClassifier>,
     approval_planner: Option<ToolApprovalPlanner>,
     executor: Option<ToolExecutor>,
+    host_executor: Option<HostToolExecutor>,
     result_projection: ToolResultProjection,
 }
 
@@ -2421,6 +2458,7 @@ impl fmt::Debug for ToolRegistration {
             .field("has_classifier", &self.classifier.is_some())
             .field("has_approval_planner", &self.approval_planner.is_some())
             .field("has_executor", &self.executor.is_some())
+            .field("host_executor", &self.host_executor)
             .field(
                 "has_output_renderer",
                 &self.result_projection.renderer.is_some(),
@@ -2495,13 +2533,21 @@ impl ToolsSurface {
                 classifier,
                 approval_planner: None,
                 executor,
+                host_executor: None,
                 result_projection: ToolResultProjection::default(),
             });
         identity
     }
 
     fn register_schema(&self, schema: SessionToolSchema) -> Result<Arc<()>, PromptError> {
-        self.register_schema_with_runtime(schema, None, None, None, ToolResultProjection::default())
+        self.register_schema_with_runtime(
+            schema,
+            None,
+            None,
+            None,
+            None,
+            ToolResultProjection::default(),
+        )
     }
 
     fn register_definition(&self, definition: ToolDefinition) -> Result<Arc<()>, PromptError> {
@@ -2509,7 +2555,8 @@ impl ToolsSurface {
             definition.schema,
             definition.classifier,
             definition.approval_planner,
-            Some(definition.executor),
+            definition.executor,
+            definition.host_executor,
             definition.result_projection,
         )
     }
@@ -2520,6 +2567,7 @@ impl ToolsSurface {
         classifier: Option<ToolConcurrencyClassifier>,
         approval_planner: Option<ToolApprovalPlanner>,
         executor: Option<ToolExecutor>,
+        host_executor: Option<HostToolExecutor>,
         result_projection: ToolResultProjection,
     ) -> Result<Arc<()>, PromptError> {
         let name = schema.name.clone();
@@ -2540,6 +2588,7 @@ impl ToolsSurface {
             classifier,
             approval_planner,
             executor,
+            host_executor,
             result_projection,
         });
         state.schemas.push(schema);
@@ -2690,6 +2739,18 @@ impl ToolsSurface {
             return ToolExecutionMode::Exclusive;
         }
         mode
+    }
+
+    /// Whether the current batch contains a body that can only run on the
+    /// host-owned async driver. Registration identity is checked again when
+    /// that exact call reaches dispatch.
+    pub(crate) fn has_host_tool(&self, inputs: &[ToolExecutionInput]) -> bool {
+        inputs.iter().any(|input| {
+            self.registration(input.name())
+                .ok()
+                .flatten()
+                .is_some_and(|registered| registered.host_executor.is_some())
+        })
     }
 
     /// Revalidate that a dispatch preparation still names the exact visible
@@ -3883,6 +3944,7 @@ pub(crate) fn finalize_allowed_tool_policy(
         input,
         mode,
         registration_identity: registered.identity,
+        host_executor: registered.host_executor,
         approval,
         result_projection: registered.result_projection,
     }))
@@ -3970,6 +4032,87 @@ pub(crate) fn dispatch_tool_execution_with_cancellation(
     cancellation: &LifecycleCancellation,
 ) -> Result<ToolDispatchOutcome, CordisError> {
     schedule_tool_dispatch(ctx, prepared, cancellation.clone())?.dispatch()
+}
+
+/// Execute one admitted host-local body without lending the mutable Cordis
+/// Context to a worker. Pre-execute policy, approval, guards, registration
+/// identity, post-execute policy, and result finalization remain owned by the
+/// caller. The synchronous around-dispatch waterfall is intentionally not
+/// entered because its continuation cannot hold an async host borrow.
+pub(crate) async fn dispatch_host_tool_execution_with_cancellation(
+    ctx: &mut Context,
+    prepared: PreparedToolExecution,
+    cancellation: &LifecycleCancellation,
+    inherited_config: SessionCallConfig,
+    access: HostToolAccess,
+) -> Result<ToolDispatchOutcome, CordisError> {
+    let Some(expected_host_executor) = prepared.host_executor.clone() else {
+        return dispatch_tool_execution_with_cancellation(ctx, prepared, cancellation);
+    };
+    let tools = ctx
+        .tools::<ToolsSurface>()
+        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::TOOLS.to_string()]))?;
+    let input = prepared.input.clone();
+    let result_projection = prepared.result_projection.clone();
+    let host_executor = {
+        let Ok(state) = tools.state.lock() else {
+            return Ok(tool_dispatch_failure(
+                input,
+                "tool registry is unavailable",
+                result_projection,
+            ));
+        };
+        let Some(registered) = state
+            .names
+            .iter()
+            .rfind(|registered| registered.name == input.name())
+        else {
+            return Ok(tool_dispatch_failure(
+                input,
+                "tool registration changed before dispatch",
+                result_projection,
+            ));
+        };
+        if !Arc::ptr_eq(&registered.identity, &prepared.registration_identity)
+            || registered.host_executor.as_ref() != Some(&expected_host_executor)
+        {
+            return Ok(tool_dispatch_failure(
+                input,
+                "tool registration changed before dispatch",
+                result_projection,
+            ));
+        }
+        expected_host_executor
+    };
+    if access != HostToolAccess::RuntimeAuthorized {
+        return Ok(tool_dispatch_failure(
+            input,
+            "host-local tool requires an authorized Runtime agent driver",
+            result_projection,
+        ));
+    }
+
+    let run = ToolRunContext::new(input, cancellation.clone(), prepared.approval);
+    let execution = match host_executor {
+        HostToolExecutor::ForegroundSubagent { provider } => {
+            run_foreground_subagent_tool(ctx, &run, provider, inherited_config)
+        }
+    };
+    let result = match AssertUnwindSafe(execution).catch_unwind().await {
+        Ok(Ok(value)) => ToolDispatchResult::Success { value },
+        Ok(Err(message)) => ToolDispatchResult::Failure { message },
+        Err(_) => ToolDispatchResult::Failure {
+            message: format!("tool \"{}\" panicked", run.name()),
+        },
+    };
+    let (input, additional_contexts, concludes_turn) = run.into_parts();
+    Ok(ToolDispatchOutcome {
+        input,
+        result,
+        result_projection,
+        additional_contexts,
+        concludes_turn,
+    })
 }
 
 /// Prepare one admitted around-dispatch/body operation for execution on a
@@ -4070,6 +4213,14 @@ fn dispatch_prepared_tool_execution(
             return tool_dispatch_failure(
                 input,
                 "tool registration changed before dispatch",
+                result_projection,
+            );
+        }
+        if registered.host_executor.is_some() {
+            let name = input.name().to_string();
+            return tool_dispatch_failure(
+                input,
+                format!("host-local tool \"{name}\" requires an authorized Runtime agent driver"),
                 result_projection,
             );
         }

@@ -5,6 +5,7 @@
 //! their own transports; later slices add continuation and model-facing tools.
 
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,11 +19,13 @@ use crate::agent::run_authorized_runtime_agent_turn;
 use crate::service::Service;
 use crate::session::{
     SessionError, SessionEventKind, SessionHandle, SessionMessage, SessionMessageRole,
-    SessionMessageSource, SessionStore, TurnEndReason, validate_agent_request_config,
+    SessionMessageSource, SessionStore, SessionToolSchema, TurnEndReason,
+    validate_agent_request_config,
 };
 use crate::surface::{
     AgentPreStepDecision, AgentPublicationCommit, AgentStatus, AgentStatusChange, AgentsSurface,
-    events as agent_events,
+    HostToolExecutor, ToolDefinition, ToolRunContext, events as agent_events,
+    register_tool_definition,
 };
 use crate::{
     AgentRef, Context, CordisError, Emit, EventKey, EventReentry, EventSchemaId,
@@ -39,8 +42,11 @@ pub const SUBAGENT_SPAWN_IN_PROCESS_PLUGIN_ID: &str = "subagent-spawn-in-process
 /// Default registry name of the in-process fresh-session provider.
 pub const SPAWN_SUBAGENT_PROVIDER_NAME: &str = "spawn";
 
+/// Model-visible name of the first bounded foreground delegation tool.
+pub const SUBAGENT_TOOL_NAME: &str = "subagent";
+
 /// Services required by the host-plane in-process provider.
-pub const SUBAGENT_SPAWN_IN_PROCESS_KEYS: &[&str] = &[keys::SUBAGENTS];
+pub const SUBAGENT_SPAWN_IN_PROCESS_KEYS: &[&str] = &[keys::SUBAGENTS, keys::TOOLS];
 
 /// Supported lifecycle mode of a child descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -433,11 +439,184 @@ impl Service for SpawnInProcessSubagent {
     }
 
     fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
+        let provider_name = self.provider_name.clone();
         let provider: Arc<dyn SubagentProvider> = Arc::new(self);
-        register_subagent_provider(ctx, provider)
-            .map(|_| ())
-            .map_err(Into::into)
+        let provider_registration = register_subagent_provider(ctx, provider)?;
+        if let Err(error) =
+            register_tool_definition(ctx, foreground_subagent_tool_definition(provider_name))
+        {
+            provider_registration.dispose();
+            return Err(error);
+        }
+        Ok(())
     }
+}
+
+fn foreground_subagent_tool_definition(provider: String) -> ToolDefinition {
+    let parameters = serde_json::Map::from_iter([
+        ("type".into(), serde_json::json!("object")),
+        ("additionalProperties".into(), serde_json::json!(false)),
+        (
+            "properties".into(),
+            serde_json::json!({
+                "prompt": {
+                    "type": "string",
+                    "description": "The complete, self-contained task for the subagent. It does not share this conversation's context, so include everything it needs."
+                }
+            }),
+        ),
+        ("required".into(), serde_json::json!(["prompt"])),
+    ]);
+    ToolDefinition::new_host(
+        SessionToolSchema {
+            name: SUBAGENT_TOOL_NAME.into(),
+            description: "Delegate a self-contained task to a fresh subagent working in its own context. The call waits for the result and returns only the final answer; the child does not see this conversation, so provide a complete standalone prompt."
+                .into(),
+            parameters,
+        },
+        HostToolExecutor::ForegroundSubagent { provider },
+    )
+    .with_output_renderer(|_, value| render_foreground_subagent_output(value))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForegroundSubagentArguments {
+    prompt: String,
+}
+
+/// Execute the one bounded model-facing provider binding. The caller is the
+/// sealed host-tool dispatcher, so the exact Agent and Session identities come
+/// from the durable tool input instead of model-authored arguments.
+pub(crate) async fn run_foreground_subagent_tool(
+    ctx: &mut Context,
+    tool: &ToolRunContext,
+    provider: String,
+    inherited_config: SessionCallConfig,
+) -> Result<serde_json::Value, String> {
+    let arguments: ForegroundSubagentArguments =
+        serde_json::from_value(tool.arguments().clone())
+            .map_err(|error| format!("invalid subagent arguments: {error}"))?;
+    if arguments.prompt.trim().is_empty() {
+        return Err("subagent prompt must not be blank".into());
+    }
+    let runtime = ctx
+        .subagents::<SubagentRuntime>()
+        .ok_or_else(|| "the Cordis subagent runtime is unavailable".to_string())?;
+    let mut request = SubagentStartRequest::new(
+        tool.agent().clone(),
+        vec![SessionContentBlock::Text {
+            text: arguments.prompt,
+        }],
+    )
+    .with_parent_session(tool.session_id().clone());
+    request.cancellation = tool.cancellation().clone();
+    let run = runtime
+        .start_local(ctx, &provider, request, inherited_config)
+        .await
+        .map_err(|error| error.to_string())?;
+    settle_foreground_subagent_run(run).await
+}
+
+async fn settle_foreground_subagent_run(
+    run: Arc<dyn SubagentRun>,
+) -> Result<serde_json::Value, String> {
+    let run_id = run.id().as_str().to_owned();
+    let result_run = Arc::clone(&run);
+    let execution = match AssertUnwindSafe(async move {
+        let result = result_run
+            .result()
+            .await
+            .map_err(|error| error.to_string())?;
+        foreground_subagent_result(&run_id, result)
+    })
+    .catch_unwind()
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("subagent result collection panicked".into()),
+    };
+    let disposal =
+        match AssertUnwindSafe(
+            async move { run.dispose().await.map_err(|error| error.to_string()) },
+        )
+        .catch_unwind()
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err("subagent disposal panicked".into()),
+        };
+    match (execution, disposal) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(dispose)) => Err(dispose),
+        (Err(error), Err(dispose)) => Err(format!(
+            "subagent run failed: {error}; dispose failed: {dispose}"
+        )),
+    }
+}
+
+fn foreground_subagent_result(
+    run_id: &str,
+    result: SubagentResult,
+) -> Result<serde_json::Value, String> {
+    if result.stop_reason != SubagentStopReason::Completed {
+        return Err(subagent_stop_error(&result));
+    }
+    let output = serde_json::to_value(result.output)
+        .map_err(|error| format!("subagent output could not be encoded: {error}"))?;
+    Ok(serde_json::json!({
+        "kind": "foreground",
+        "runId": run_id,
+        "output": output,
+    }))
+}
+
+fn subagent_stop_error(result: &SubagentResult) -> String {
+    let headline = match result.stop_reason {
+        SubagentStopReason::Completed => "subagent run completed",
+        SubagentStopReason::Aborted => "subagent run was cancelled",
+        SubagentStopReason::Error => "subagent run failed",
+        SubagentStopReason::MaxTokens => "subagent run hit its token limit before finishing",
+        SubagentStopReason::Refusal => "subagent declined the task",
+    };
+    let diagnostic = result
+        .diagnostic
+        .as_ref()
+        .map_or_else(String::new, |detail| format!("\nDiagnostic: {detail}"));
+    let partial = result
+        .output
+        .iter()
+        .filter_map(|block| match block {
+            SessionContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let partial = if partial.is_empty() {
+        String::new()
+    } else {
+        format!("\nPartial output before the run ended:\n{partial}")
+    };
+    format!("{headline}{diagnostic}{partial}")
+}
+
+fn render_foreground_subagent_output(
+    value: &serde_json::Value,
+) -> Result<Vec<SessionContentBlock>, String> {
+    let output = value
+        .get("output")
+        .cloned()
+        .ok_or_else(|| "foreground subagent result has no output".to_string())?;
+    let output: Vec<SessionContentBlock> = serde_json::from_value(output)
+        .map_err(|error| format!("foreground subagent output is invalid: {error}"))?;
+    let text = output
+        .iter()
+        .filter_map(|block| match block {
+            SessionContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    Ok(vec![SessionContentBlock::Text { text }])
 }
 
 impl SubagentProvider for SpawnInProcessSubagent {
@@ -1029,13 +1208,13 @@ impl SubagentRuntime {
         );
         establishment.commit();
 
-        let outcome = run_authorized_runtime_agent_turn(
+        let outcome = Box::pin(run_authorized_runtime_agent_turn(
             ctx,
             &child_agent,
             &child_id,
             config,
             &prepared.request.cancellation,
-        )
+        ))
         .await;
         let descriptor_failure = descriptor_failure
             .lock()
