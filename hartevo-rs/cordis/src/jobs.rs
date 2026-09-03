@@ -240,6 +240,29 @@ pub enum JobError {
 /// Producer-owned cancellation entry point retained by Cordis after start.
 type JobCancelCallback = dyn Fn(Option<&str>) + Send + Sync;
 type JobOutputCallback = dyn Fn() -> String + Send + Sync;
+type JobTerminalObserver = dyn Fn(JobTerminalNotice) + Send + Sync;
+
+/// Content-free signal that one exact Agent-owned job became terminal.
+///
+/// Consumers must still claim current job facts before acting. The signal
+/// grants no Session, Runtime, Domain, Effect, or provider authority.
+#[derive(Clone, Debug)]
+pub struct JobTerminalNotice {
+    owner_session: SessionId,
+    owner_agent: AgentRef,
+}
+
+impl JobTerminalNotice {
+    #[must_use]
+    pub const fn owner_session(&self) -> &SessionId {
+        &self.owner_session
+    }
+
+    #[must_use]
+    pub const fn owner_agent(&self) -> &AgentRef {
+        &self.owner_agent
+    }
+}
 
 #[derive(Clone)]
 pub struct JobControl {
@@ -283,6 +306,7 @@ impl fmt::Debug for JobControl {
 struct JobRecordState {
     published: bool,
     reported: bool,
+    terminal_signalled: bool,
     waiters: usize,
     status: JobStatus,
     detail: Option<String>,
@@ -301,6 +325,7 @@ struct JobRecord {
     started_at_ms: u64,
     state: Mutex<JobRecordState>,
     changed: Condvar,
+    terminal_observer: Arc<Mutex<Option<Arc<JobTerminalObserver>>>>,
 }
 
 impl JobRecord {
@@ -372,6 +397,7 @@ struct JobsState {
 struct JobsInner {
     max_concurrent_jobs_per_session: usize,
     state: Mutex<JobsState>,
+    terminal_observer: Arc<Mutex<Option<Arc<JobTerminalObserver>>>>,
 }
 
 impl Drop for JobsInner {
@@ -431,8 +457,22 @@ impl JobsSurface {
             inner: Arc::new(JobsInner {
                 max_concurrent_jobs_per_session,
                 state: Mutex::new(JobsState::default()),
+                terminal_observer: Arc::new(Mutex::new(None)),
             }),
         }
+    }
+
+    /// Install the process-local terminal signal sink used by the host wake
+    /// driver. Replacing the sink is harmless and affects only future signals.
+    pub fn on_terminal<F>(&self, observer: F)
+    where
+        F: Fn(JobTerminalNotice) + Send + Sync + 'static,
+    {
+        *self
+            .inner
+            .terminal_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(observer));
     }
 
     /// Preflight and register one producer. The callback starts work and gives
@@ -502,6 +542,7 @@ impl JobsSurface {
         }
 
         record.changed.notify_all();
+        signal_terminal(&record);
         Ok(record.id.clone())
     }
 
@@ -562,6 +603,7 @@ impl JobsSurface {
             state: Mutex::new(JobRecordState {
                 published: false,
                 reported: false,
+                terminal_signalled: false,
                 waiters: 0,
                 status: JobStatus::Running,
                 detail: None,
@@ -571,6 +613,7 @@ impl JobsSurface {
                 read_output: None,
             }),
             changed: Condvar::new(),
+            terminal_observer: Arc::clone(&self.inner.terminal_observer),
         });
         state.records.insert(id, Arc::clone(&record));
         Ok(record)
@@ -726,6 +769,46 @@ impl JobsSurface {
                 Some(record.snapshot_with(&state))
             })
             .collect()
+    }
+
+    /// Snapshot terminal work that has not yet been reported.
+    ///
+    /// Desktop uses this only while the exact Agent is idle and its coordinator
+    /// is exclusively checked out, then commits the corresponding inbox
+    /// message before marking these ids reported.
+    #[must_use]
+    pub fn unreported_terminal(&self, owner_agent: &AgentRef) -> Vec<JobSnapshot> {
+        self.records_for_agent(owner_agent)
+            .into_iter()
+            .filter_map(|record| {
+                let state = record
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (state.published && state.status.is_terminal() && !state.reported)
+                    .then(|| record.snapshot_with(&state))
+            })
+            .collect()
+    }
+
+    /// Mark the exact terminal ids reported after their durable inbox message
+    /// has committed. Unknown, non-terminal, or cross-Agent ids are ignored.
+    pub fn mark_terminal_reported(&self, owner_agent: &AgentRef, ids: &[JobId]) -> usize {
+        self.records_for_agent(owner_agent)
+            .into_iter()
+            .filter(|record| ids.iter().any(|id| id == &record.id))
+            .filter(|record| {
+                let mut state = record
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !state.published || !state.status.is_terminal() || state.reported {
+                    return false;
+                }
+                state.reported = true;
+                true
+            })
+            .count()
     }
 
     /// Cancel jobs attached to one exact disposed Agent lifecycle, boundedly
@@ -907,7 +990,39 @@ fn settle_record(record: &Arc<JobRecord>, outcome: JobOutcome) -> bool {
     state.control = None;
     drop(state);
     record.changed.notify_all();
+    signal_terminal(record);
     true
+}
+
+fn signal_terminal(record: &Arc<JobRecord>) {
+    let observer = record
+        .terminal_observer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(observer) = observer else {
+        return;
+    };
+    let notice = {
+        let mut state = record
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.published
+            || !state.status.is_terminal()
+            || state.reported
+            || state.terminal_signalled
+        {
+            return;
+        }
+        state.terminal_signalled = true;
+        JobTerminalNotice {
+            owner_session: SessionId::new(record.owner_session.clone())
+                .expect("a Job owner was validated before reservation"),
+            owner_agent: record.owner_agent.clone(),
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| observer(notice)));
 }
 
 fn append_output(output: &mut String, addition: &str) {

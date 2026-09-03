@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 use hartevo_cordis::{
@@ -309,4 +309,42 @@ fn completion_claim_is_exact_lifecycle_one_shot_and_wait_suppresses_it() {
         JobStatus::Completed
     );
     assert!(jobs.claim_unreported_terminal(&agent).is_empty());
+}
+
+#[test]
+fn terminal_observer_signals_once_after_publication_without_job_content() {
+    let jobs = JobsSurface::new(1);
+    let owner = session("jobs-terminal-observer");
+    let agent = AgentRef::new("jobs-terminal-observer-agent");
+    let (send, receive) = mpsc::channel();
+    jobs.on_terminal(move |notice| {
+        send.send(notice).unwrap();
+    });
+
+    let id = jobs
+        .start(&owner, &agent, "bash", "private label", |completion| {
+            assert!(
+                completion.complete(
+                    JobOutcome::new(JobTerminalStatus::Completed)
+                        .with_detail("private detail")
+                        .with_output("private output"),
+                )
+            );
+            Ok(JobControl::new(|_| {}))
+        })
+        .unwrap();
+
+    let notice = receive.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(notice.owner_session(), &owner);
+    assert!(notice.owner_agent().is_same_lifecycle(&agent));
+    assert!(receive.recv_timeout(Duration::from_millis(20)).is_err());
+
+    let pending = jobs.unreported_terminal(&agent);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id(), &id);
+    assert_eq!(
+        jobs.mark_terminal_reported(&agent, std::slice::from_ref(&id)),
+        1
+    );
+    assert!(jobs.unreported_terminal(&agent).is_empty());
 }

@@ -111,6 +111,35 @@ struct RuntimeAgentKey {
     mission: String,
 }
 
+/// Durable-domain identity of one retained Runtime Agent.
+///
+/// This deliberately omits every revision and capability. Desktop may use the
+/// ids to reopen Application state, but must recompute authority before a new
+/// Runtime dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeAgentIdentity {
+    tenant: String,
+    project: String,
+    mission: String,
+}
+
+impl RuntimeAgentIdentity {
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    #[must_use]
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    #[must_use]
+    pub fn mission(&self) -> &str {
+        &self.mission
+    }
+}
+
 impl From<&AuthorityScope> for RuntimeAgentKey {
     fn from(scope: &AuthorityScope) -> Self {
         Self {
@@ -967,6 +996,23 @@ impl CordisHost {
             .as_ref()
             .filter(|active| active.lease.is_active())
             .map(|active| &active.scope)
+    }
+
+    /// Resolve ids for one exact retained Agent lifecycle without returning
+    /// stale Runtime authority from its preceding turn.
+    #[must_use]
+    pub fn retained_runtime_agent_identity(
+        &self,
+        agent: &AgentRef,
+    ) -> Option<RuntimeAgentIdentity> {
+        self.runtime_agents
+            .iter()
+            .find(|(_, retained)| retained.agent.is_same_lifecycle(agent))
+            .map(|(key, _)| RuntimeAgentIdentity {
+                tenant: key.tenant.clone(),
+                project: key.project.clone(),
+                mission: key.mission.clone(),
+            })
     }
 
     #[must_use]

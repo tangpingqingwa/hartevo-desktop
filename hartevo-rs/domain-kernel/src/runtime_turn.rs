@@ -24,6 +24,9 @@ const LEGACY_AGENT_MESSAGE_ITEM_DIGEST: &str =
 pub enum RuntimeTurnPurpose {
     #[default]
     Agent,
+    /// One same-Agent continuation prompted by newly completed background
+    /// work. Unlike compaction, its completed output remains Mission work.
+    Followup,
     Compaction,
 }
 
@@ -1257,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_runtime_scope_defaults_to_agent_and_compaction_changes_identity() {
+    fn legacy_runtime_scope_defaults_to_agent_and_auxiliary_purposes_change_identity() {
         let agent = scope();
         let mut legacy = serde_json::to_value(&agent).expect("scope JSON");
         assert!(legacy.get("purpose").is_none());
@@ -1270,6 +1273,16 @@ mod tests {
         assert_eq!(decoded.digest().unwrap(), agent.digest().unwrap());
 
         let mut compaction = agent;
+        let mut followup = compaction.clone();
+        followup.purpose = RuntimeTurnPurpose::Followup;
+        assert_eq!(
+            serde_json::to_value(&followup)
+                .expect("follow-up scope JSON")
+                .get("purpose"),
+            Some(&serde_json::json!("followup"))
+        );
+        assert_ne!(followup.digest().unwrap(), decoded.digest().unwrap());
+
         compaction.purpose = RuntimeTurnPurpose::Compaction;
         assert_eq!(
             serde_json::to_value(&compaction)
