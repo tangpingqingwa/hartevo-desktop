@@ -2188,12 +2188,15 @@ name = "hartevo-application"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-executor",
+ "futures-util",
  "hartevo-browser-adapter",
  "hartevo-catalog",
  "hartevo-cloud-storage",
  "hartevo-commerce-connector",
  "hartevo-connector-sdk",
  "hartevo-context-fabric",
+ "hartevo-cordis",
  "hartevo-domain-kernel",
  "hartevo-effect-broker",
  "hartevo-runtime-adapter",
@@ -2207,6 +2210,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio-postgres",
+ "ureq",
+ "url",
  "zeroize",
 ]
 

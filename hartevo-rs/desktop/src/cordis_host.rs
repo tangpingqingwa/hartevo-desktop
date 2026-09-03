@@ -3314,6 +3314,11 @@ mod tests {
 
     use chrono::{Duration, TimeZone, Utc};
     use futures_util::stream;
+    #[cfg(target_os = "macos")]
+    use hartevo_application::llm_deepseek::{
+        DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, DeepSeekTransport,
+        DeepSeekWireResponse,
+    };
     use hartevo_cordis::{
         AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStatusChange, AgentStep,
         AgentsSurface, ApprovalOutcome, ApprovalPolicy, ApprovalPolicySource, ApprovalRequestId,
@@ -3348,6 +3353,8 @@ mod tests {
         PersistedAgentInboxOutcome, PersistedAgentInboxTarget, PersistedSessionEvent,
         PersistedSessionEventKind, ProjectStore,
     };
+    #[cfg(target_os = "macos")]
+    use zeroize::Zeroizing;
 
     use super::{
         DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisApprovalBridge,
@@ -3490,29 +3497,52 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[derive(Clone)]
-    struct DesktopObservedSequencedTurnAdapter {
-        turns: Arc<Mutex<VecDeque<Vec<SessionStreamChunk>>>>,
+    struct DesktopObservedDeepSeekAdapter {
+        adapter: Arc<DeepSeekAdapter>,
         seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
     }
 
     #[cfg(target_os = "macos")]
-    impl LlmAdapter for DesktopObservedSequencedTurnAdapter {
+    impl LlmAdapter for DesktopObservedDeepSeekAdapter {
         fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
-            Ok(LlmResolvedModel::new(provider, model))
+            self.adapter.prepare_model(provider, model)
         }
 
         fn stream(
             &self,
             request: LlmGenerateRequest,
         ) -> Result<LlmAdapterStream, SessionLlmFailure> {
-            self.seen.lock().unwrap().push(request);
-            let chunks = self
-                .turns
+            self.seen.lock().unwrap().push(request.clone());
+            self.adapter.stream(request)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Clone)]
+    struct DesktopDeepSeekFixtureTransport {
+        responses: Arc<Mutex<VecDeque<DeepSeekWireResponse>>>,
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl DeepSeekTransport for DesktopDeepSeekFixtureTransport {
+        fn execute(
+            &self,
+            connection: &DeepSeekConnection,
+            api_key: &str,
+            request: &serde_json::Value,
+            cancellation: &LifecycleCancellation,
+        ) -> Result<DeepSeekWireResponse, SessionLlmFailure> {
+            assert!(!cancellation.is_cancelled());
+            assert_eq!(connection.base_url().as_str(), "https://api.deepseek.com/");
+            assert_eq!(api_key, "desktop-fixture-secret");
+            self.seen.lock().unwrap().push(request.clone());
+            Ok(self
+                .responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("one observed Desktop response per Cordis parent/child step");
-            Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+                .expect("one DeepSeek fixture response per Cordis parent/child step"))
         }
     }
 
@@ -3721,61 +3751,116 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn desktop_deepseek_response(
+        request_id: &str,
+        payload: &serde_json::Value,
+    ) -> DeepSeekWireResponse {
+        DeepSeekWireResponse::new(
+            vec![payload.to_string(), "[DONE]".into()],
+            Some(request_id.into()),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple exposes the adapter and three independent observations to one focused Desktop journey"
+    )]
     fn desktop_foreground_subagent_turn_adapter() -> (
-        DesktopObservedSequencedTurnAdapter,
+        DesktopObservedDeepSeekAdapter,
         Arc<Mutex<Vec<LlmGenerateRequest>>>,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        Arc<AtomicUsize>,
     ) {
         let turns = [
-            desktop_single_tool_turn(
-                "desktop-subagent-call-1",
-                SUBAGENT_TOOL_NAME,
-                r#"{"prompt":"inspect the exact Desktop workspace boundary"}"#,
+            desktop_deepseek_response(
+                "desktop-deepseek-parent-1",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "reasoning_content": "delegate the bounded inspection",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "desktop-subagent-call-1",
+                                "function": {
+                                    "name": SUBAGENT_TOOL_NAME,
+                                    "arguments": r#"{"prompt":"inspect the exact Desktop workspace boundary"}"#,
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                }),
             ),
-            desktop_single_tool_turn(
-                "desktop-subagent-bash-call-1",
-                "bash",
-                r#"{"command":"pwd; printf n112-child","description":"Verify the delegated Desktop workspace binding"}"#,
+            desktop_deepseek_response(
+                "desktop-deepseek-child-1",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "desktop-subagent-bash-call-1",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": r#"{"command":"pwd; printf n113-child","description":"Verify the delegated Desktop workspace binding"}"#,
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                }),
             ),
-            vec![
-                SessionStreamChunk::BlockStart {
-                    index: 0,
-                    block_type: SessionStreamBlockType::Text,
-                },
-                SessionStreamChunk::BlockEnd {
-                    index: 0,
-                    block: SessionContentBlock::Text {
-                        text: "child inspected desktop".into(),
-                    },
-                },
-                SessionStreamChunk::Finish {
-                    reason: SessionFinishReason::Stop,
-                    replay_state: None,
-                },
-            ],
-            vec![
-                SessionStreamChunk::BlockStart {
-                    index: 0,
-                    block_type: SessionStreamBlockType::Text,
-                },
-                SessionStreamChunk::BlockEnd {
-                    index: 0,
-                    block: SessionContentBlock::Text {
-                        text: "parent received child".into(),
-                    },
-                },
-                SessionStreamChunk::Finish {
-                    reason: SessionFinishReason::Stop,
-                    replay_state: None,
-                },
-            ],
+            desktop_deepseek_response(
+                "desktop-deepseek-child-2",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": "child inspected desktop"},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+            desktop_deepseek_response(
+                "desktop-deepseek-parent-2",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": "parent received child"},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
         ];
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_wire = Arc::new(Mutex::new(Vec::new()));
+        let credential_resolutions = Arc::new(AtomicUsize::new(0));
+        let transport = DesktopDeepSeekFixtureTransport {
+            responses: Arc::new(Mutex::new(VecDeque::from(turns))),
+            seen: Arc::clone(&seen_wire),
+        };
+        let credential_counter = Arc::clone(&credential_resolutions);
+        let adapter = DeepSeekAdapter::new(
+            DeepSeekConnection::new(
+                "https://api.deepseek.com",
+                "DEEPSEEK_API_KEY",
+                128_000,
+                8_192,
+                StdDuration::from_secs(5),
+            )
+            .unwrap(),
+            move |name: &str| {
+                assert_eq!(name, "DEEPSEEK_API_KEY");
+                credential_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(Zeroizing::new("desktop-fixture-secret".into()))
+            },
+            transport,
+        );
         (
-            DesktopObservedSequencedTurnAdapter {
-                turns: Arc::new(Mutex::new(VecDeque::from(turns))),
+            DesktopObservedDeepSeekAdapter {
+                adapter: Arc::new(adapter),
                 seen: Arc::clone(&seen),
             },
             seen,
+            seen_wire,
+            credential_resolutions,
         )
     }
 
@@ -3976,6 +4061,32 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os = "macos")]
+    fn desktop_deepseek_turn_request_in<A: LlmAdapter>(
+        workspace_root: &std::path::Path,
+        adapter: &A,
+    ) -> DesktopAgentTurnRequest {
+        let mut request = DesktopAgentTurnRequest::new(
+            "desktop-agent-session",
+            "desktop-agent-input-1",
+            "private desktop prompt",
+            workspace_root,
+            SessionCallConfig {
+                provider: DEEPSEEK_PROVIDER_ID.into(),
+                model: "deepseek-chat".into(),
+                reasoning_effort: Some("high".into()),
+                temperature: None,
+                max_tokens: None,
+                stop: None,
+            },
+        )
+        .unwrap();
+        request.resolved_model = adapter
+            .prepare_model(DEEPSEEK_PROVIDER_ID, "deepseek-chat")
+            .unwrap();
+        request
+    }
+
     fn approve_agent_turn(host: &mut super::DesktopCordisCoordinator) {
         host.bind_domain_kernel(
             KernelConsentState::Confirmed,
@@ -4147,11 +4258,11 @@ mod tests {
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one focused journey proves the Desktop parent/child/parent request, sandbox, disposal, and cold-restore closure"
+        reason = "one focused journey proves DeepSeek wire translation plus the Desktop parent/child/parent sandbox, disposal, and cold-restore closure"
     )]
-    async fn desktop_foreground_subagent_runs_child_bash_and_cold_restores_both_sessions() {
+    async fn desktop_deepseek_adapter_runs_child_bash_and_cold_restores_both_sessions() {
         let scratch = tempfile::Builder::new()
-            .prefix("n112-subagent-")
+            .prefix("n113-deepseek-subagent-")
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let workspace_root = scratch.path().canonicalize().unwrap();
@@ -4169,10 +4280,11 @@ mod tests {
         set_sandbox_mode(live.context(), &parent, SandboxMode::ReadOnly, None)
             .await
             .unwrap();
-        let (adapter, seen) = desktop_foreground_subagent_turn_adapter();
+        let (adapter, seen, seen_wire, credential_resolutions) =
+            desktop_foreground_subagent_turn_adapter();
+        let request = desktop_deepseek_turn_request_in(&workspace_root, &adapter);
         let slot = Arc::new(DesktopCordisSlot::new(live));
         let execution_slot = Arc::clone(&slot);
-        let request_workspace = workspace_root.clone();
         let scope = AuthorityScope::new("tenant-a", "project-a", parent_id.as_str(), 4)
             .unwrap()
             .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap());
@@ -4187,7 +4299,7 @@ mod tests {
             move |permit| {
                 let mut coordinator = execution_slot.lock().unwrap();
                 futures_executor::block_on(coordinator.run_authorized_runtime_agent_turn(
-                    desktop_turn_request_in(&request_workspace),
+                    request,
                     adapter,
                     &LifecycleCancellation::default(),
                     permit,
@@ -4236,7 +4348,7 @@ mod tests {
                         && content.iter().any(|block| matches!(
                             block,
                             SessionContentBlock::Text { text }
-                                if text.contains("n112-child")
+                                if text.contains("n113-child")
                                     && text.contains("[sandbox: read-only, full enforcement]")
                         ))
                 )
@@ -4257,6 +4369,60 @@ mod tests {
             )
         }));
         drop(observed);
+
+        assert_eq!(credential_resolutions.load(Ordering::SeqCst), 4);
+        let wire = seen_wire.lock().unwrap();
+        assert_eq!(wire.len(), 4);
+        assert!(
+            wire.iter()
+                .all(|request| request["model"] == "deepseek-chat")
+        );
+        assert_eq!(wire[0]["thinking"], serde_json::json!({"type": "enabled"}));
+        assert_eq!(wire[0]["reasoning_effort"], "high");
+        assert_eq!(wire[0]["max_tokens"], 8_192);
+        assert!(
+            wire[0]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == SUBAGENT_TOOL_NAME)
+        );
+        assert!(
+            wire[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "user"
+                        && message["content"] == "inspect the exact Desktop workspace boundary"
+                })
+        );
+        assert!(
+            wire[2]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "desktop-subagent-bash-call-1"
+                        && message["content"].as_str().is_some_and(|text| {
+                            text.contains("n113-child")
+                                && text.contains("[sandbox: read-only, full enforcement]")
+                        })
+                })
+        );
+        assert!(
+            wire[3]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "desktop-subagent-call-1"
+                        && message["content"] == "child inspected desktop"
+                })
+        );
+        drop(wire);
 
         let (parent_events, parent_messages, child_events, child_messages, store) = {
             let live = slot.lock().unwrap();
