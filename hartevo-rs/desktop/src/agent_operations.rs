@@ -167,6 +167,7 @@ pub struct BrowserWorkspaceProjection {
     pub workspace_id: Option<BrowserWorkspaceId>,
     pub revision: Option<u64>,
     pub lease_generation: Option<u64>,
+    pub take_over_status: OperationsStatus,
     pub continue_status: OperationsStatus,
 }
 
@@ -665,6 +666,7 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             workspace_id: None,
             revision: None,
             lease_generation: None,
+            take_over_status: OperationsStatus::Empty,
             continue_status: OperationsStatus::Empty,
         };
     };
@@ -677,6 +679,7 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             workspace_id: None,
             revision: None,
             lease_generation: None,
+            take_over_status: OperationsStatus::Empty,
             continue_status: OperationsStatus::Empty,
         };
     };
@@ -689,21 +692,24 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             workspace_id: Some(workspace.workspace_id.clone()),
             revision: Some(workspace.revision),
             lease_generation: Some(workspace.lease_generation),
+            take_over_status: OperationsStatus::Empty,
             continue_status: OperationsStatus::Ready,
         },
         BrowserControlState::AgentControlled => browser_workspace_view(
             workspace,
             OperationsStatus::Active,
             "Agent holds the current lease",
-            "Take over remains NOT_IMPLEMENTED; Continue stays disabled",
-            OperationsStatus::NotImplemented,
+            "Take over issues Application take_over_browser_workspace",
+            OperationsStatus::Ready,
+            OperationsStatus::Empty,
         ),
         BrowserControlState::PausedAgent | BrowserControlState::PausedUser => {
             browser_workspace_view(
                 workspace,
                 OperationsStatus::WaitingUser,
                 "Workspace is paused",
-                "Pause/Resume remains NOT_IMPLEMENTED; Continue stays disabled",
+                "Pause/Resume remains NOT_IMPLEMENTED; ownership actions stay disabled",
+                OperationsStatus::NotImplemented,
                 OperationsStatus::NotImplemented,
             )
         }
@@ -713,7 +719,8 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
             workspace,
             OperationsStatus::Empty,
             "Workspace is terminal",
-            "Continue does not reopen a closed workspace",
+            "Ownership actions do not reopen a closed workspace",
+            OperationsStatus::Empty,
             OperationsStatus::Empty,
         ),
     }
@@ -724,6 +731,7 @@ fn browser_workspace_view(
     status: OperationsStatus,
     control_owner: &str,
     next_action: &str,
+    take_over_status: OperationsStatus,
     continue_status: OperationsStatus,
 ) -> BrowserWorkspaceProjection {
     BrowserWorkspaceProjection {
@@ -734,6 +742,7 @@ fn browser_workspace_view(
         workspace_id: Some(workspace.workspace_id.clone()),
         revision: Some(workspace.revision),
         lease_generation: Some(workspace.lease_generation),
+        take_over_status,
         continue_status,
     }
 }
@@ -1010,6 +1019,7 @@ mod tests {
         };
         let empty = browser_projection(Some(&mission));
         assert_eq!(empty.status, OperationsStatus::Empty);
+        assert_eq!(empty.take_over_status, OperationsStatus::Empty);
         assert_eq!(empty.continue_status, OperationsStatus::Empty);
         assert!(empty.workspace_id.is_none());
 
@@ -1023,6 +1033,7 @@ mod tests {
             lease_generation: 2,
         });
         let ready = browser_projection(Some(&held));
+        assert_eq!(ready.take_over_status, OperationsStatus::Empty);
         assert_eq!(ready.continue_status, OperationsStatus::Ready);
         assert_eq!(ready.status, OperationsStatus::WaitingUser);
 
@@ -1031,12 +1042,9 @@ mod tests {
             .expect("workspace")
             .control_state = BrowserControlState::AgentControlled;
         let agent = browser_projection(Some(&held));
-        assert_eq!(agent.continue_status, OperationsStatus::NotImplemented);
-        assert!(
-            agent
-                .next_action
-                .contains("Take over remains NOT_IMPLEMENTED")
-        );
+        assert_eq!(agent.take_over_status, OperationsStatus::Ready);
+        assert_eq!(agent.continue_status, OperationsStatus::Empty);
+        assert!(agent.next_action.contains("take_over_browser_workspace"));
     }
 
     #[test]

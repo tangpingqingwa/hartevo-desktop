@@ -42,7 +42,7 @@ use hartevo_application::{
     ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
     RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
     RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission, VerifyRecordedReceiptAtRevision,
+    StartCatalogMission, StartMission, TakeOverBrowserWorkspace, VerifyRecordedReceiptAtRevision,
     Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
@@ -1383,6 +1383,18 @@ impl fmt::Debug for DesktopPreviewEffectProposalRequest {
 /// invents a workspace or treats Continue as Verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopContinueBrowserWorkspaceRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub expected_generation: u64,
+}
+
+/// Window Take over for one Mission-bound Browser Workspace. Desktop accepts
+/// only the exact agent-held revision and generation projected from SQLCipher;
+/// Application owns the restrictive transition and persistence ordering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopTakeOverBrowserWorkspaceRequest {
     pub project_id: ProjectId,
     pub mission_id: MissionId,
     pub workspace_id: BrowserWorkspaceId,
@@ -3709,6 +3721,74 @@ impl DesktopDataPlane {
             runtime_reconciliation,
             mission_id,
             runtime_outcome,
+            now,
+        )
+    }
+
+    /// Takes one agent-held Browser Workspace through Application
+    /// `take_over_browser_workspace` and a real BrowserControlHost. The Host
+    /// fence runs before persistence; no browser action or Effect is executed.
+    pub fn take_over_browser_workspace_os(
+        &self,
+        request: DesktopTakeOverBrowserWorkspaceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.take_over_browser_workspace_with(&secret_store, request, now)
+    }
+
+    pub fn take_over_browser_workspace_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopTakeOverBrowserWorkspaceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.expected_revision == 0
+            || request.expected_generation == 0
+            || request.workspace_id.as_str().trim().is_empty()
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceTakeOver);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
+            .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
+        if live.id != request.workspace_id
+            || live.mission_id != request.mission_id
+            || live.project_id != project_id
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceTakeOver);
+        }
+        if live.control_state != BrowserControlState::AgentControlled {
+            return Err(DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld);
+        }
+        if live.revision != request.expected_revision
+            || live.lease_generation != request.expected_generation
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceTakeOver);
+        }
+        let evidence_digest = take_over_browser_workspace_evidence_digest(&live, now);
+        let mut host = DesktopBrowserControlHost::attach(&live)?;
+        service.take_over_browser_workspace(
+            &mut host,
+            TakeOverBrowserWorkspace {
+                project_id,
+                workspace_id: request.workspace_id,
+                expected_revision: request.expected_revision,
+                expected_generation: request.expected_generation,
+                new_lease_id: BrowserControlLeaseId::new(),
+                evidence_digest,
+            },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
             now,
         )
     }
@@ -8344,12 +8424,12 @@ fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation 
     }
 }
 
-/// Process-local BrowserControlHost for Desktop Continue.
+/// Process-local BrowserControlHost for Desktop ownership transitions.
 ///
-/// Continue is a permissive transition: Application persists the new Agent
-/// lease first, then this Host must adopt that successor. An unregistered or
-/// non-successor Host fails as `BrowserHostReconciliationRequired`. This is
-/// not a Fake Host test helper and does not execute Effects.
+/// Take over fences this Host before persistence; Continue persists the new
+/// Agent lease before this Host adopts it. A non-successor fails as
+/// `BrowserHostReconciliationRequired`. This is not a Fake Host test helper
+/// and does not execute Effects.
 struct DesktopBrowserControlHost {
     workspace: BrowserWorkspace,
 }
@@ -8409,6 +8489,27 @@ fn continue_browser_workspace_evidence_digest(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"desktop.browser_workspace.continue\0");
+    hasher.update(workspace.project_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.mission_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.revision.to_le_bytes());
+    hasher.update(workspace.lease_generation.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", workspace.control_state).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_rfc3339().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn take_over_browser_workspace_evidence_digest(
+    workspace: &BrowserWorkspace,
+    now: DateTime<Utc>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"desktop.browser_workspace.take_over\0");
     hasher.update(workspace.project_id.as_str().as_bytes());
     hasher.update(b"\0");
     hasher.update(workspace.mission_id.as_str().as_bytes());
@@ -8798,12 +8899,16 @@ pub enum DesktopDataError {
         "Browser Workspace Continue requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
     )]
     InvalidBrowserWorkspaceContinue,
-    #[error("no live Mission-bound Browser Workspace exists for Continue")]
-    BrowserWorkspaceUnavailable,
     #[error(
-        "Browser Workspace Continue requires a user-held lease; Take over remains NOT_IMPLEMENTED"
+        "Browser Workspace Take over requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
     )]
+    InvalidBrowserWorkspaceTakeOver,
+    #[error("no live Mission-bound Browser Workspace exists for Take over or Continue")]
+    BrowserWorkspaceUnavailable,
+    #[error("Browser Workspace Continue requires a user-held lease")]
     BrowserWorkspaceContinueNotHeld,
+    #[error("Browser Workspace Take over requires an agent-held lease")]
+    BrowserWorkspaceTakeOverNotAgentHeld,
     #[error(
         "Creator Deliverable Review requires the exact Project, Mission, task, deliverable, CAS revision, frozen checklist, and a typed ReviewDecision"
     )]
@@ -8914,7 +9019,7 @@ mod tests {
         AcceptCreatorTask, CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject,
         EvidenceInput, ProposePreviewEffect, ProvisionProjectEncryption, PublishCreatorTask,
         ResearchPacket, RuntimeTextSubscriptionError, StartCreatorWorkMission, StartMission,
-        StartRelationshipMission, SubmitCreatorDeliverable, TakeOverBrowserWorkspace,
+        StartRelationshipMission, SubmitCreatorDeliverable,
     };
     use hartevo_browser_adapter::FakeBrowserHost;
     use hartevo_domain_kernel::{
@@ -22240,14 +22345,18 @@ sleep 30"#;
     }
 
     #[test]
-    fn continue_on_agent_held_workspace_stays_disabled() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one test proves the exact Desktop takeover-to-continue ownership round trip"
+    )]
+    fn take_over_then_continue_browser_workspace_round_trips_ownership() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let now = observed_at() + Duration::minutes(3);
         let started = plane
             .start_mission_with(
                 &secrets,
                 &project_id,
-                "Agent-held Continue 在 Take over 前保持 NOT_IMPLEMENTED",
+                "Desktop 通过 Cordis Application 接管并交还 Browser Workspace",
                 now,
             )
             .expect("mission");
@@ -22291,12 +22400,13 @@ sleep 30"#;
             workspace.control_state,
             BrowserControlState::AgentControlled
         );
+        drop(service);
         let refused = plane.continue_browser_workspace_with(
             &secrets,
             DesktopContinueBrowserWorkspaceRequest {
                 project_id: project_id.clone(),
-                mission_id,
-                workspace_id: workspace.id,
+                mission_id: mission_id.clone(),
+                workspace_id: workspace.id.clone(),
                 expected_revision: workspace.revision,
                 expected_generation: workspace.lease_generation,
             },
@@ -22306,6 +22416,95 @@ sleep 30"#;
             refused,
             Err(DesktopDataError::BrowserWorkspaceContinueNotHeld)
         ));
+
+        let stale = plane.take_over_browser_workspace_with(
+            &secrets,
+            DesktopTakeOverBrowserWorkspaceRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace.id.clone(),
+                expected_revision: workspace.revision.saturating_add(1),
+                expected_generation: workspace.lease_generation,
+            },
+            now + Duration::seconds(3),
+        );
+        assert!(matches!(
+            stale,
+            Err(DesktopDataError::InvalidBrowserWorkspaceTakeOver)
+        ));
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(3))
+            .expect("reopen after stale takeover");
+        let unchanged = service
+            .load_browser_workspace(&project_id, &workspace.id)
+            .expect("unchanged workspace");
+        assert_eq!(
+            unchanged.control_state,
+            BrowserControlState::AgentControlled
+        );
+        assert_eq!(unchanged.revision, workspace.revision);
+        assert_eq!(unchanged.lease_generation, workspace.lease_generation);
+        drop(service);
+
+        let taken = plane
+            .take_over_browser_workspace_with(
+                &secrets,
+                DesktopTakeOverBrowserWorkspaceRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    expected_revision: workspace.revision,
+                    expected_generation: workspace.lease_generation,
+                },
+                now + Duration::seconds(4),
+            )
+            .expect("Take over through Application");
+        let user_held = taken.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("taken-over Mission")
+            .browser_workspace
+            .as_ref()
+            .expect("taken-over workspace");
+        assert_eq!(user_held.workspace_id, workspace.id);
+        assert_eq!(user_held.control_state, BrowserControlState::UserControlled);
+        assert_eq!(user_held.revision, workspace.revision.saturating_add(1));
+        assert_eq!(
+            user_held.lease_generation,
+            workspace.lease_generation.saturating_add(1)
+        );
+
+        let continued = plane
+            .continue_browser_workspace_with(
+                &secrets,
+                DesktopContinueBrowserWorkspaceRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: user_held.workspace_id.clone(),
+                    expected_revision: user_held.revision,
+                    expected_generation: user_held.lease_generation,
+                },
+                now + Duration::seconds(5),
+            )
+            .expect("Continue through Application");
+        let agent_held = continued.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("continued Mission")
+            .browser_workspace
+            .as_ref()
+            .expect("continued workspace");
+        assert_eq!(
+            agent_held.control_state,
+            BrowserControlState::AgentControlled
+        );
+        assert_eq!(agent_held.revision, workspace.revision.saturating_add(2));
+        assert_eq!(
+            agent_held.lease_generation,
+            workspace.lease_generation.saturating_add(2)
+        );
     }
 
     #[test]
