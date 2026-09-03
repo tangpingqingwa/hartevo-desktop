@@ -21,6 +21,9 @@ const SESSION_HEADER_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cordis_sessio
   seed_length INTEGER CHECK (seed_length IS NULL OR seed_length >= 0),
   event_count INTEGER NOT NULL CHECK (event_count >= 0),
   revision INTEGER NOT NULL CHECK (revision > 0),
+  delegation_depth INTEGER NOT NULL DEFAULT 0 CHECK (
+    delegation_depth >= 0 AND delegation_depth <= 4294967295
+  ),
   CHECK (seed_length IS NULL OR seed_length <= event_count)
 )";
 
@@ -40,6 +43,29 @@ pub(crate) fn install_cordis_session_schema(
     Ok(())
 }
 
+pub(crate) fn migrate_cordis_session_schema_v50(
+    transaction: &Transaction<'_>,
+) -> Result<(), StorageError> {
+    let mut statement = transaction.prepare("PRAGMA table_info(cordis_session_headers)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_delegation_depth = false;
+    for column in columns {
+        if column? == "delegation_depth" {
+            has_delegation_depth = true;
+        }
+    }
+    drop(statement);
+    if !has_delegation_depth {
+        transaction.execute_batch(
+            "ALTER TABLE cordis_session_headers
+             ADD COLUMN delegation_depth INTEGER NOT NULL DEFAULT 0 CHECK (
+               delegation_depth >= 0 AND delegation_depth <= 4294967295
+             );",
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_cordis_session_schema(connection: &Connection) -> Result<(), StorageError> {
     for (name, expected) in [
         ("cordis_session_headers", SESSION_HEADER_TABLE_SQL),
@@ -53,11 +79,11 @@ pub(crate) fn verify_cordis_session_schema(connection: &Connection) -> Result<()
             )
             .optional()?
             .ok_or_else(|| {
-                StorageError::DomainDecode(format!("Cordis Session v49 table {name} is missing"))
+                StorageError::DomainDecode(format!("Cordis Session v50 table {name} is missing"))
             })?;
         if normalize_schema_sql(&actual) != normalize_schema_sql(expected) {
             return Err(StorageError::DomainDecode(format!(
-                "Cordis Session v49 table {name} does not match"
+                "Cordis Session v50 table {name} does not match"
             )));
         }
     }
@@ -229,6 +255,7 @@ pub struct PersistedSessionHeader {
     pub id: String,
     pub created_at_ms: i64,
     pub parent_session: Option<String>,
+    pub delegation_depth: u32,
     pub seed_length: Option<u64>,
 }
 
@@ -327,7 +354,7 @@ impl ProjectStore {
     ) -> Result<Vec<PersistedSessionCheckpoint>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT format_version, id, created_at_ms, parent_session_id,
-                    seed_length, event_count
+                    delegation_depth, seed_length, event_count
              FROM cordis_session_headers
              ORDER BY created_at_ms, id",
         )?;
@@ -337,14 +364,30 @@ impl ProjectStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         let mut checkpoints = Vec::new();
         for row in rows {
-            let (version, id, created_at_ms, parent_session, seed_length, event_count) = row?;
-            let header = decode_header(version, id, created_at_ms, parent_session, seed_length)?;
+            let (
+                version,
+                id,
+                created_at_ms,
+                parent_session,
+                delegation_depth,
+                seed_length,
+                event_count,
+            ) = row?;
+            let header = decode_header(
+                version,
+                id,
+                created_at_ms,
+                parent_session,
+                delegation_depth,
+                seed_length,
+            )?;
             let events = load_events(&self.connection, &header.id)?;
             let expected_count = usize::try_from(event_count).map_err(|_| {
                 StorageError::DomainDecode("Cordis Session event count does not fit memory".into())
@@ -782,8 +825,8 @@ fn insert_header(
     transaction.execute(
         "INSERT INTO cordis_session_headers (
            id, format_version, created_at_ms, parent_session_id,
-           seed_length, event_count, revision
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+           seed_length, event_count, revision, delegation_depth
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
         params![
             checkpoint.header.id,
             i64::from(checkpoint.header.version),
@@ -795,6 +838,7 @@ fn insert_header(
                 .map(|length| sqlite_u64(length, "seed length"))
                 .transpose()?,
             sqlite_usize(checkpoint.events.len(), "event count")?,
+            i64::from(checkpoint.header.delegation_depth),
         ],
     )?;
     Ok(())
@@ -807,7 +851,7 @@ fn load_header(
     let row = connection
         .query_row(
             "SELECT format_version, id, created_at_ms, parent_session_id,
-                    seed_length, event_count
+                    delegation_depth, seed_length, event_count
              FROM cordis_session_headers WHERE id = ?1",
             [id],
             |row| {
@@ -816,16 +860,32 @@ fn load_header(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(version, id, created_at_ms, parent_session, seed_length, event_count)| {
+        |(
+            version,
+            id,
+            created_at_ms,
+            parent_session,
+            delegation_depth,
+            seed_length,
+            event_count,
+        )| {
             Ok((
-                decode_header(version, id, created_at_ms, parent_session, seed_length)?,
+                decode_header(
+                    version,
+                    id,
+                    created_at_ms,
+                    parent_session,
+                    delegation_depth,
+                    seed_length,
+                )?,
                 event_count,
             ))
         },
@@ -838,6 +898,7 @@ fn decode_header(
     id: String,
     created_at_ms: i64,
     parent_session: Option<String>,
+    delegation_depth: i64,
     seed_length: Option<i64>,
 ) -> Result<PersistedSessionHeader, StorageError> {
     Ok(PersistedSessionHeader {
@@ -847,6 +908,9 @@ fn decode_header(
         id,
         created_at_ms,
         parent_session,
+        delegation_depth: u32::try_from(delegation_depth).map_err(|_| {
+            StorageError::DomainDecode("Cordis Session delegation depth is invalid".into())
+        })?,
         seed_length: seed_length
             .map(|length| {
                 u64::try_from(length).map_err(|_| {
@@ -905,6 +969,7 @@ mod tests {
                 id: "session-1".into(),
                 created_at_ms: 1,
                 parent_session: None,
+                delegation_depth: 0,
                 seed_length: None,
             },
             events,
@@ -1695,6 +1760,95 @@ mod tests {
         assert!(matches!(
             store.migrate(),
             Err(StorageError::DomainDecode(_))
+        ));
+    }
+
+    #[test]
+    fn migration_v50_defaults_existing_sessions_to_depth_zero_without_event_drift() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE cordis_session_events;
+                 DROP TABLE cordis_session_headers;
+                 CREATE TABLE cordis_session_headers (
+                   id TEXT PRIMARY KEY CHECK (length(id) > 0),
+                   format_version INTEGER NOT NULL CHECK (
+                     format_version >= 0 AND format_version <= 4294967295
+                   ),
+                   created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                   parent_session_id TEXT CHECK (
+                     parent_session_id IS NULL OR length(parent_session_id) > 0
+                   ),
+                   seed_length INTEGER CHECK (seed_length IS NULL OR seed_length >= 0),
+                   event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   CHECK (seed_length IS NULL OR seed_length <= event_count)
+                 );
+                 CREATE TABLE cordis_session_events (
+                   session_id TEXT NOT NULL,
+                   seq INTEGER NOT NULL CHECK (seq >= 0),
+                   event_json TEXT NOT NULL CHECK (length(trim(event_json)) > 2),
+                   PRIMARY KEY (session_id, seq),
+                   FOREIGN KEY (session_id) REFERENCES cordis_session_headers(id) ON DELETE CASCADE
+                 );
+                 DELETE FROM schema_migrations WHERE version >= 50;",
+            )
+            .unwrap();
+        assert_eq!(store.schema_version().unwrap(), 49);
+
+        let events = completed_turn();
+        store
+            .connection
+            .execute(
+                "INSERT INTO cordis_session_headers (
+                   id, format_version, created_at_ms, parent_session_id,
+                   seed_length, event_count, revision
+                 ) VALUES (?1, 0, 1, NULL, NULL, ?2, 1)",
+                params!["legacy-depth", i64::try_from(events.len()).unwrap()],
+            )
+            .unwrap();
+        for event in &events {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO cordis_session_events (session_id, seq, event_json)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        "legacy-depth",
+                        i64::try_from(event.seq).unwrap(),
+                        serde_json::to_string(event).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        store.migrate().unwrap();
+        let loaded = store.load_session_checkpoints().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].header.delegation_depth, 0);
+        assert_eq!(loaded[0].events, events);
+    }
+
+    #[test]
+    fn invalid_persisted_delegation_depth_fails_closed() {
+        let mut store = ProjectStore::in_memory().unwrap();
+        store
+            .persist_session_checkpoint(&checkpoint(completed_turn()))
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE cordis_session_headers SET delegation_depth = -1;
+                 PRAGMA ignore_check_constraints = OFF;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.load_session_checkpoints(),
+            Err(StorageError::DomainDecode(message))
+                if message.contains("delegation depth")
         ));
     }
 }

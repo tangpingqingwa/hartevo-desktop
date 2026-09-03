@@ -5,10 +5,11 @@ use chrono::{TimeZone, Utc};
 use futures_util::FutureExt;
 use hartevo_cordis::{
     AgentRef, AgentStatus, AgentStatusChange, AgentsSurface, AuthorityScope, Context, CordisError,
-    CordisHost, KernelConsentState, OneShotSubagentDescriptor, ResolvedSubagentStartRequest,
-    RuntimeBinding, SPAWN_SUBAGENT_PROVIDER_NAME, SUBAGENT_DESCRIPTOR_VERSION, SUBAGENT_TOOL_NAME,
-    SessionCallConfig, SessionContentBlock, SessionEventKind, SessionFinishReason, SessionId,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamBlockType,
+    CordisHost, DEFAULT_SUBAGENT_MAX_DEPTH, KernelConsentState, OneShotSubagentDescriptor,
+    ResolvedSubagentStartRequest, RuntimeBinding, SPAWN_SUBAGENT_PROVIDER_NAME,
+    SUBAGENT_DESCRIPTOR_VERSION, SUBAGENT_TOOL_NAME, SessionCallConfig, SessionContentBlock,
+    SessionEventKind, SessionFinishReason, SessionHeader, SessionId, SessionMessage,
+    SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamBlockType,
     SessionStreamChunk, SessionToolSchema, SubagentCapabilities, SubagentCapability,
     SubagentDescriptorMode, SubagentError, SubagentProvider, SubagentResult, SubagentRun,
     SubagentRunEndInfo, SubagentRunInfo, SubagentRuntime, SubagentStartRequest, SubagentStopReason,
@@ -694,6 +695,11 @@ async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host
             .supports(SubagentCapability::AgentOptions)
     );
     assert!(
+        provider
+            .capabilities()
+            .supports(SubagentCapability::DepthLimit)
+    );
+    assert!(
         !provider
             .capabilities()
             .supports(SubagentCapability::Persona)
@@ -752,6 +758,7 @@ async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host
     let child = sessions.get(run.id()).unwrap().unwrap();
     let header = child.header().unwrap();
     assert_eq!(header.parent_session, Some(parent_session_id));
+    assert_eq!(header.delegation_depth, 1);
     assert_eq!(header.seed_length, Some(0));
     assert_eq!(
         child.request_header().unwrap().unwrap().config,
@@ -1004,6 +1011,7 @@ async fn authorized_runtime_subagent_tool_returns_a_fresh_child_result_to_its_pa
         child.header().unwrap().parent_session,
         Some(parent_session_id.clone())
     );
+    assert_eq!(child.header().unwrap().delegation_depth, 1);
     assert_eq!(sessions.len().unwrap(), 2);
     assert!(
         host.context()
@@ -1014,6 +1022,123 @@ async fn authorized_runtime_subagent_tool_returns_a_fresh_child_result_to_its_pa
             .all(|agent| agent.id != child_session_id.as_str()),
         "foreground child Agent must be disposed after collection"
     );
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep rejection and every zero-side-effect assertion together.
+async fn model_subagent_tool_rejects_depth_four_before_any_child_side_effect() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("depth-three-parent");
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let parent_session_id = SessionId::new("depth-three-parent").unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let mut header = SessionHeader::new_at(parent_session_id.clone(), 1).unwrap();
+    header.delegation_depth = DEFAULT_SUBAGENT_MAX_DEPTH;
+    let parent = sessions.restore(header, Vec::new()).unwrap();
+    parent
+        .inbox()
+        .append_next_turn(SessionMessage {
+            id: "depth-parent-prompt".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "try one more delegation".into(),
+            }],
+            source: SessionMessageSource::User,
+        })
+        .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    host.context_mut()
+        .on_waterfall(agent_events::LLM_STREAM, {
+            let calls = Arc::clone(&calls);
+            move |stream, _next| {
+                let chunks = match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![
+                        SessionStreamChunk::BlockStart {
+                            index: 0,
+                            block_type: SessionStreamBlockType::ToolCall,
+                        },
+                        SessionStreamChunk::BlockEnd {
+                            index: 0,
+                            block: SessionContentBlock::ToolCall {
+                                id: "too-deep".into(),
+                                name: SUBAGENT_TOOL_NAME.into(),
+                                arguments: serde_json::json!({
+                                    "prompt": "this child must never be created"
+                                })
+                                .to_string(),
+                            },
+                        },
+                        SessionStreamChunk::Finish {
+                            reason: SessionFinishReason::ToolCalls,
+                            replay_state: None,
+                        },
+                    ],
+                    1 => vec![SessionStreamChunk::Finish {
+                        reason: SessionFinishReason::Stop,
+                        replay_state: None,
+                    }],
+                    index => panic!("unexpected model call {index}"),
+                };
+                stream.with_chunk_stream(Box::pin(futures_util::stream::iter(chunks)))
+            }
+        })
+        .unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    host.context_mut()
+        .on_emit(subagent_events::SUBAGENT_START, {
+            let starts = Arc::clone(&starts);
+            move |_| {
+                starts.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .unwrap();
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let outcome = host
+        .run_authorized_runtime_agent_turn(
+            &permit,
+            &parent_session_id,
+            call_config("mock", "model"),
+            &hartevo_cordis::LifecycleCancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), TurnEndReason::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert_eq!(sessions.len().unwrap(), 1);
+    assert_eq!(
+        host.context()
+            .agents::<AgentsSurface>()
+            .unwrap()
+            .list()
+            .len(),
+        1
+    );
+    let messages = parent.derive_messages().unwrap();
+    assert!(messages.iter().any(|message| {
+        matches!(
+            message.content.as_slice(),
+            [SessionContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error: true,
+            }] if tool_call_id == "too-deep"
+                && content == &[SessionContentBlock::Text {
+                    text: "Error: subagent depth 4 exceeds max depth 3".into(),
+                }]
+        )
+    }));
     host.finish_runtime(permit).unwrap().announce().unwrap();
 }
 

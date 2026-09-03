@@ -1658,6 +1658,7 @@ fn fork_detaches_empty_and_latest_closed_seeds_with_lineage() {
         Some(empty_parent_id)
     );
     assert_eq!(empty_child.header().unwrap().seed_length, Some(0));
+    assert_eq!(empty_child.header().unwrap().delegation_depth, 0);
 
     let parent_id = SessionId::new("fork-parent").unwrap();
     let parent = store.create(parent_id.clone()).unwrap();
@@ -1673,6 +1674,7 @@ fn fork_detaches_empty_and_latest_closed_seeds_with_lineage() {
     assert_eq!(child.events().unwrap(), inherited);
     assert_eq!(child.header().unwrap().parent_session, Some(parent_id));
     assert_eq!(child.header().unwrap().seed_length, Some(4));
+    assert_eq!(child.header().unwrap().delegation_depth, 0);
 
     let parent_turn = parent.start_turn().unwrap();
     parent
@@ -1707,6 +1709,7 @@ fn spawn_child_records_lineage_without_copying_parent_history() {
         Some(parent_id.clone())
     );
     assert_eq!(child.header().unwrap().seed_length, Some(0));
+    assert_eq!(child.header().unwrap().delegation_depth, 1);
     assert_eq!(parent.events().unwrap().len(), 3);
 
     let child_turn = child.start_turn().unwrap();
@@ -1717,6 +1720,15 @@ fn spawn_child_records_lineage_without_copying_parent_history() {
         .finish_turn(child_turn, TurnEndReason::Blocked)
         .unwrap();
     assert!(child.derive_messages().unwrap().is_empty());
+
+    let grandchild = store
+        .spawn_child(&child_id, SessionId::new("spawn-grandchild").unwrap())
+        .unwrap();
+    assert_eq!(grandchild.header().unwrap().delegation_depth, 2);
+    let fork = store
+        .fork(&child_id, None, SessionId::new("spawn-child-fork").unwrap())
+        .unwrap();
+    assert_eq!(fork.header().unwrap().delegation_depth, 1);
 
     let missing = SessionId::new("missing-parent").unwrap();
     let missing_child = SessionId::new("missing-spawn-child").unwrap();
@@ -1731,6 +1743,22 @@ fn spawn_child_records_lineage_without_copying_parent_history() {
         store.spawn_child(&parent_id, child_id.clone()).unwrap_err(),
         SessionError::SessionAlreadyExists { id: child_id }
     );
+}
+
+#[test]
+fn spawn_child_rejects_delegation_depth_overflow_before_publication() {
+    let store = SessionStore::new();
+    let parent_id = SessionId::new("max-depth-parent").unwrap();
+    let mut header = SessionHeader::new_at(parent_id.clone(), 1).unwrap();
+    header.delegation_depth = u32::MAX;
+    store.restore(header, Vec::new()).unwrap();
+    let child_id = SessionId::new("overflow-child").unwrap();
+
+    assert_eq!(
+        store.spawn_child(&parent_id, child_id.clone()).unwrap_err(),
+        SessionError::DelegationDepthOverflow
+    );
+    assert!(store.get(&child_id).unwrap().is_none());
 }
 
 #[test]

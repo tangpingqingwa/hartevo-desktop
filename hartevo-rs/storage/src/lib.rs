@@ -101,7 +101,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 49;
+pub const STORAGE_SCHEMA_VERSION: i64 = 50;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4435,6 +4435,13 @@ impl ProjectStore {
             cordis_session_store::install_cordis_session_schema(&transaction)?;
             cordis_session_store::verify_cordis_session_schema(&transaction)?;
             record_migration(&transaction, 49)?;
+            transaction.commit()?;
+        }
+        if current_schema_version(&self.connection)? < 50 {
+            let transaction = self.connection.transaction()?;
+            cordis_session_store::migrate_cordis_session_schema_v50(&transaction)?;
+            cordis_session_store::verify_cordis_session_schema(&transaction)?;
+            record_migration(&transaction, 50)?;
             transaction.commit()?;
         }
         provider_recovery_store::verify_provider_recovery_schema(&self.connection)?;
