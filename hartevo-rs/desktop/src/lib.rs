@@ -54,7 +54,8 @@ use data_plane::{
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopOpenConversationRequest,
     DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
-    DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
+    DesktopSnapshot, DesktopTakeOverBrowserWorkspaceRequest,
+    DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
     DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
     ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
     RecoveryKitDraft,
@@ -454,6 +455,7 @@ impl UiFailure {
             | DesktopDataError::InvalidApprovedEffectExecution
             | DesktopDataError::InvalidEffectReconciliation
             | DesktopDataError::InvalidBrowserWorkspaceContinue
+            | DesktopDataError::InvalidBrowserWorkspaceTakeOver
             | DesktopDataError::InvalidCreatorDeliverableReview => Self::coded(
                 "WAITING_USER",
                 "精确窗口动作必须绑定冻结 digest 与当前 CAS revision；未写入部分状态，也未执行 Effect。",
@@ -468,11 +470,12 @@ impl UiFailure {
             ),
             DesktopDataError::BrowserWorkspaceUnavailable => Self::coded(
                 "EMPTY",
-                "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Continue。",
+                "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Take over 或 Continue。",
             ),
-            DesktopDataError::BrowserWorkspaceContinueNotHeld => Self::coded(
-                "NOT_IMPLEMENTED",
-                "Continue 需要用户持有的 Browser Workspace lease；Take over 仍为 NOT_IMPLEMENTED，未签发新 Agent lease，也未执行 Effect。",
+            DesktopDataError::BrowserWorkspaceContinueNotHeld
+            | DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld => Self::coded(
+                "STALE_SELECTION",
+                "Browser Workspace 所有权已与所选动作不匹配，请刷新后重试。未改写 lease，也未执行 Effect。",
             ),
             DesktopDataError::InvalidRecoveryKey => Self::coded(
                 "WAITING_USER",
@@ -1964,6 +1967,58 @@ pub fn App() -> Element {
             model.write().set_notice(&error);
         }
     };
+    let request_operations_take_over_browser = move |()| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Browser Workspace，也未执行 Take over。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(workspace) = mission.browser_workspace.as_ref() else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message:
+                    "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Take over。"
+                        .into(),
+            });
+            return;
+        };
+        let request = DesktopTakeOverBrowserWorkspaceRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.take_over_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    model.write().set_ready(snapshot, false);
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_TAKEOVER_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Take over 协调异常结束；未执行 Effect，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
+    };
     let request_operations_continue_browser = move |()| {
         let selection = {
             let current = model.read();
@@ -2826,6 +2881,7 @@ pub fn App() -> Element {
                                     restore_ui_focus("mission-composer-input");
                                 },
                                 on_interrupt: request_operations_interrupt,
+                                on_take_over_browser_workspace: request_operations_take_over_browser,
                                 on_continue_browser_workspace: request_operations_continue_browser,
                                 on_approve_local_runtime: request_operations_approve_local_runtime,
                                 on_allow_cordis_once: request_operations_allow_cordis_once,
@@ -5822,6 +5878,7 @@ fn AgentOperationsWorkbench(
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_approve_local_runtime: EventHandler<()>,
     on_allow_cordis_once: EventHandler<()>,
@@ -6086,13 +6143,30 @@ fn AgentOperationsWorkbench(
                         div { small { "Next action" } strong { "{projection.browser.next_action}" } }
                     }
                     div { class: "operations-artifact-actions",
-                        button { disabled: true, aria_label: "接管 Browser Workspace", title: "等待 BW-01 owner API", "Take over · NOT_IMPLEMENTED" }
+                        {
+                            let take_over_ready = projection.browser.take_over_status == OperationsStatus::Ready;
+                            let take_over_title = match projection.browser.take_over_status {
+                                OperationsStatus::Ready => "通过 Application take_over_browser_workspace 切换为用户持有",
+                                OperationsStatus::Empty => "当前没有 Agent 持有的 Browser Workspace",
+                                _ => "暂停状态尚不允许改变 Browser Workspace owner",
+                            };
+                            let take_over_label = format!("Take over · {}", projection.browser.take_over_status.code());
+                            rsx! {
+                                button {
+                                    disabled: !take_over_ready,
+                                    aria_label: "接管 Browser Workspace",
+                                    title: "{take_over_title}",
+                                    onclick: move |_| on_take_over_browser_workspace.call(()),
+                                    "{take_over_label}"
+                                }
+                            }
+                        }
                         {
                             let continue_ready = projection.browser.continue_status == OperationsStatus::Ready;
                             let continue_title = match projection.browser.continue_status {
                                 OperationsStatus::Ready => "通过 Application continue_browser_workspace 签发新 Agent lease",
                                 OperationsStatus::Empty => "当前 Mission 没有用户持有的 Browser Workspace",
-                                _ => "Continue 需要用户持有的 lease；Take over 仍为 NOT_IMPLEMENTED",
+                                _ => "暂停状态尚不允许改变 Browser Workspace owner",
                             };
                             let continue_label = format!("Continue · {}", projection.browser.continue_status.code());
                             rsx! {
@@ -6175,6 +6249,7 @@ fn OrchestratorSurface(
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
     interrupt_requested: bool,
+    on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
@@ -6275,6 +6350,7 @@ fn OrchestratorSurface(
                             interrupt_requested: false,
                             on_quick_entry,
                             on_interrupt,
+                            on_take_over_browser_workspace,
                             on_continue_browser_workspace,
                             on_approve_local_runtime,
                             on_allow_cordis_once,
@@ -6403,6 +6479,7 @@ fn OrchestratorSurface(
                         interrupt_requested,
                         on_quick_entry,
                         on_interrupt,
+                        on_take_over_browser_workspace,
                         on_continue_browser_workspace,
                         on_approve_local_runtime,
                         on_allow_cordis_once,
@@ -11522,12 +11599,15 @@ mod tests {
     }
 
     #[test]
-    fn operations_continue_calls_application_continue_browser_workspace() {
+    fn operations_browser_ownership_calls_application_transitions() {
         let source = include_str!("lib.rs");
+        assert!(source.contains("take_over_browser_workspace_os"));
+        assert!(source.contains("DesktopTakeOverBrowserWorkspaceRequest"));
         assert!(source.contains("continue_browser_workspace_os"));
         assert!(source.contains("DesktopContinueBrowserWorkspaceRequest"));
-        assert!(source.contains("Take over · NOT_IMPLEMENTED"));
+        assert!(source.contains("format!(\"Take over · {}\""));
         assert!(source.contains("format!(\"Continue · {}\""));
+        assert!(source.contains("on_take_over_browser_workspace"));
         assert!(source.contains("on_continue_browser_workspace"));
         assert!(source.contains("BrowserHostReconciliationRequired"));
     }

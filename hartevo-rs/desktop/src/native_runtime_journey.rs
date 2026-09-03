@@ -1363,8 +1363,10 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidApprovedEffectExecution
         | DesktopDataError::InvalidEffectReconciliation
         | DesktopDataError::InvalidBrowserWorkspaceContinue
+        | DesktopDataError::InvalidBrowserWorkspaceTakeOver
         | DesktopDataError::BrowserWorkspaceUnavailable
         | DesktopDataError::BrowserWorkspaceContinueNotHeld
+        | DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld
         | DesktopDataError::InvalidCreatorDeliverableReview
         | DesktopDataError::CreatorDeliverableReviewUnavailable
         | DesktopDataError::CreatorDeliverableReviewStale
