@@ -8266,6 +8266,34 @@ fn native_credential_source_label(runtime: Option<&DesktopRuntimeProjection>) ->
     }
 }
 
+fn native_profile_clear_enabled(
+    runtime: Option<&DesktopRuntimeProjection>,
+    actions_enabled: bool,
+    action_busy: bool,
+) -> bool {
+    actions_enabled
+        && !action_busy
+        && runtime.is_some_and(|runtime| {
+            runtime.native_credential_source == Some(DesktopNativeCredentialSource::DesktopProfile)
+        })
+}
+
+fn native_credential_source_detail(runtime: Option<&DesktopRuntimeProjection>) -> &'static str {
+    let Some(runtime) = runtime else {
+        return "数据层就绪后才能管理桌面配置。";
+    };
+    match runtime.native_credential_source {
+        Some(DesktopNativeCredentialSource::DesktopProfile) => {
+            "清除会删除当前数据目录绑定的桌面配置。"
+        }
+        Some(DesktopNativeCredentialSource::Environment) => {
+            "环境变量由应用外管理；桌面不会读取显示或修改它。"
+        }
+        None if runtime.is_cordis_native() => "尚无桌面配置；保存后可在此清除。",
+        None => "当前不是 Cordis 原生路由。",
+    }
+}
+
 #[component]
 fn SettingsSurface(
     runtime: Option<DesktopRuntimeProjection>,
@@ -8300,12 +8328,14 @@ fn SettingsSurface(
         .and_then(|runtime| runtime.model.as_deref())
         .unwrap_or("未配置");
     let credential_source = native_credential_source_label(runtime.as_ref());
+    let credential_source_detail = native_credential_source_detail(runtime.as_ref());
     let can_save_native_provider = {
         let model = native_model.read();
         let credential = native_credential.read();
         actions_enabled && !action_busy && credential.has_valid_shape(model.as_str())
     };
-    let can_clear_native_provider = actions_enabled && !action_busy;
+    let can_clear_native_provider =
+        native_profile_clear_enabled(runtime.as_ref(), actions_enabled, action_busy);
     rsx! {
         section { class: "settings-shell", aria_label: "Hartevo 设置",
             header { class: "settings-topbar",
@@ -8395,7 +8425,7 @@ fn SettingsSurface(
                                 div { class: "settings-provider-actions",
                                     span {
                                         strong { "{credential_source}" }
-                                        small { "清除桌面配置后，若存在受支持的环境变量配置，Runtime 会如实回退并继续显示。" }
+                                        small { "{credential_source_detail}" }
                                     }
                                     div {
                                         button {
@@ -11763,7 +11793,7 @@ mod tests {
     }
 
     #[test]
-    fn native_credential_source_label_never_infers_secret_store_from_route() {
+    fn native_credential_source_controls_only_the_owned_profile() {
         let mut runtime = DesktopRuntimeProjection {
             status: DesktopRuntimeAvailabilityStatus::ReadyDistribution,
             target: Some("cordis-native".into()),
@@ -11779,14 +11809,29 @@ mod tests {
             native_credential_source_label(Some(&runtime)),
             "桌面配置 · OS Secret Store"
         );
+        assert!(native_profile_clear_enabled(Some(&runtime), true, false));
+        assert!(!native_profile_clear_enabled(Some(&runtime), false, false));
+        assert!(!native_profile_clear_enabled(Some(&runtime), true, true));
+        assert_eq!(
+            native_credential_source_detail(Some(&runtime)),
+            "清除会删除当前数据目录绑定的桌面配置。"
+        );
 
         runtime.native_credential_source = Some(DesktopNativeCredentialSource::Environment);
         assert_eq!(native_credential_source_label(Some(&runtime)), "环境变量");
+        assert!(!native_profile_clear_enabled(Some(&runtime), true, false));
+        assert_eq!(
+            native_credential_source_detail(Some(&runtime)),
+            "环境变量由应用外管理；桌面不会读取显示或修改它。"
+        );
         runtime.native_credential_source = None;
         assert_eq!(native_credential_source_label(Some(&runtime)), "未配置");
+        assert!(!native_profile_clear_enabled(Some(&runtime), true, false));
         runtime.target = Some("openinterpreter-target".into());
         assert_eq!(native_credential_source_label(Some(&runtime)), "不适用");
+        assert!(!native_profile_clear_enabled(Some(&runtime), true, false));
         assert_eq!(native_credential_source_label(None), "数据层未就绪");
+        assert!(!native_profile_clear_enabled(None, true, false));
     }
 
     #[test]
@@ -11802,6 +11847,7 @@ mod tests {
             "autocomplete: \"new-password\"",
             "NO PROVIDER CALL",
             "native_credential_source_label",
+            "native_profile_clear_enabled",
             "DesktopNativeCredentialSource::DesktopProfile",
             "DesktopNativeCredentialSource::Environment",
         ] {
