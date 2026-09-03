@@ -3341,6 +3341,42 @@ impl DesktopDataPlane {
     where
         S: SecretStore + 'static,
     {
+        if runtime
+            .as_ref()
+            .is_some_and(DesktopRuntimeSource::is_native_deepseek)
+        {
+            let adapter = match runtime {
+                Some(DesktopRuntimeSource::Pinned(configuration))
+                    if configuration.artifact.is_none()
+                        && configuration.provider == DEEPSEEK_PROVIDER_ID =>
+                {
+                    let connection =
+                        DeepSeekConnection::official("DEEPSEEK_API_KEY").map_err(|error| {
+                            DesktopDataError::CordisSessionPersistence(error.to_string())
+                        })?;
+                    DeepSeekAdapter::production(connection)
+                }
+                #[cfg(any(test, feature = "native-journey"))]
+                Some(DesktopRuntimeSource::NativeDeepSeek { adapter, .. }) => adapter,
+                _ => {
+                    return Err(DesktopDataError::CordisSessionPersistence(
+                        "Desktop native compaction provider is unavailable".into(),
+                    ));
+                }
+            };
+            let mut cordis = self
+                .cordis
+                .checkout()
+                .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
+            return futures_executor::block_on(cordis.dispatch_human_command(
+                request.mission_id.as_str(),
+                request.command_id,
+                &request.line,
+                adapter,
+                cancellation,
+            ))
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()));
+        }
         let provider = runtime
             .as_ref()
             .map_or_else(String::new, |runtime| runtime.provider().to_owned());
@@ -13895,6 +13931,195 @@ sleep 30"#;
             ));
         });
         assert_eq!(followup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused journey proves native manual compaction, Domain isolation, and SQLCipher cold restore"
+    )]
+    fn cordis_native_deepseek_manual_compaction_stays_out_of_application_runtime() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let secrets = Arc::new(secrets);
+        let private_goal =
+            "Preserve this native Cordis context without starting Application Runtime. ".repeat(24);
+        let initial_draft = "Native draft retained after compaction.";
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let initial_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut request = catalog_runtime_request(&project_id);
+        request.title = Some("Native Cordis manual compaction".into());
+        request.goal = private_goal.clone();
+        let submission = plane
+            .start_catalog_mission_and_run_with(
+                secrets.as_ref(),
+                request,
+                Some(native_deepseek_mission_source(
+                    initial_draft,
+                    Arc::clone(&initial_calls),
+                    Arc::clone(&initial_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("initial native Cordis turn");
+        assert!(matches!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("Application snapshot before compaction");
+        let mission_before = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("Mission before compaction");
+        let conversation_before = service
+            .mission_conversation(&project_id, &submission.mission_id)
+            .expect("Conversation before compaction");
+        let events_before = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("Mission events before compaction");
+        drop(service);
+
+        let compacted_summary = "Short native Cordis checkpoint.";
+        let compaction_calls = Arc::new(AtomicUsize::new(0));
+        let compaction_requests = Arc::new(Mutex::new(Vec::new()));
+        let result = plane
+            .dispatch_mission_human_command_with(
+                Arc::clone(&secrets),
+                DesktopMissionHumanCommandRequest {
+                    project_id: project_id.clone(),
+                    mission_id: submission.mission_id.clone(),
+                    command_id: "desktop-native-compact-1".into(),
+                    line: "/compact".into(),
+                },
+                Some(native_deepseek_mission_source(
+                    compacted_summary,
+                    Arc::clone(&compaction_calls),
+                    Arc::clone(&compaction_requests),
+                )),
+                &LifecycleCancellation::default(),
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("native Cordis manual compaction");
+        assert!(
+            matches!(
+                &result,
+                DesktopHumanCommandDispatch::Handled(
+                    crate::cordis_host::DesktopHumanCommandResult::Success {
+                        source_event_seq: Some(_),
+                        ..
+                    }
+                )
+            ),
+            "unexpected native compaction result: {result:?}"
+        );
+        assert_eq!(compaction_calls.load(Ordering::SeqCst), 1);
+        let requests = compaction_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0]["messages"].as_array().expect("wire messages");
+        assert!(messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Preserve this native Cordis context"))
+        }));
+        assert!(messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content == COMPACTION_INSTRUCTION)
+        }));
+        assert!(!requests[0].to_string().contains("desktop-mission-secret"));
+        drop(requests);
+
+        let session_id = SessionId::new(submission.mission_id.as_str()).unwrap();
+        let (expected_events, expected_surface, expected_messages) =
+            plane.with_cordis_host(|host| {
+                let session = host
+                    .context()
+                    .sessions::<hartevo_cordis::SessionStore>()
+                    .unwrap()
+                    .get(&session_id)
+                    .unwrap()
+                    .expect("compacted native Session");
+                let events = session.events().unwrap();
+                assert!(events.iter().any(|event| matches!(
+                    &event.kind,
+                    hartevo_cordis::SessionEventKind::CompactionEnd { compaction }
+                        if compaction.error.is_none()
+                )));
+                let surface = session.surface().unwrap();
+                let messages = session.derive_messages().unwrap();
+                assert_eq!(messages.len(), 2);
+                assert!(hartevo_cordis::is_compact_checkpoint_source(
+                    &messages[0].source
+                ));
+                assert!(messages[0].content.iter().any(|block| matches!(
+                    block,
+                    SessionContentBlock::Text { text } if text == compacted_summary
+                )));
+                assert!(matches!(
+                    messages[1].content.as_slice(),
+                    [SessionContentBlock::Text { text }] if text == initial_draft
+                ));
+                (events, surface, messages)
+            });
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(5))
+            .expect("Application snapshot after compaction");
+        assert_eq!(
+            service
+                .load_mission(&project_id, &submission.mission_id)
+                .expect("Mission after compaction")
+                .work_products,
+            mission_before.work_products
+        );
+        assert_eq!(
+            service
+                .mission_conversation(&project_id, &submission.mission_id)
+                .expect("Conversation after compaction"),
+            conversation_before
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("Mission events after compaction"),
+            events_before
+        );
+        drop(service);
+        let database_key = DatabaseKey::from_secret(&database_secret).expect("database key");
+        assert!(
+            ProjectStore::open(&plane.database_path, &database_key)
+                .expect("Runtime store")
+                .list_runtime_turn_attempts(&project_id)
+                .expect("Runtime attempts")
+                .is_empty()
+        );
+
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(secrets.as_ref(), observed_at() + Duration::minutes(6))
+                .expect("restore compacted native Session"),
+            DesktopLoadState::Ready(_)
+        ));
+        cold.with_cordis_host(|host| {
+            let restored = host
+                .context()
+                .sessions::<hartevo_cordis::SessionStore>()
+                .unwrap()
+                .get(&session_id)
+                .unwrap()
+                .expect("cold compacted native Session");
+            assert_eq!(restored.events().unwrap(), expected_events);
+            assert_eq!(restored.surface().unwrap(), expected_surface);
+            assert_eq!(restored.derive_messages().unwrap(), expected_messages);
+        });
+        assert_eq!(compaction_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]

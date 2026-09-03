@@ -1184,7 +1184,11 @@ impl DesktopCordisCoordinator {
             DesktopManualCompactionError::MissingRequestHeader(session_id.to_string())
         })?;
         let provider = header.config.provider.clone();
-        let resolved_model = LlmResolvedModel::new(provider.clone(), header.config.model.clone());
+        // Resolve before opening the durable bracket; the persisted wrapper
+        // revalidates the same descriptor after flushing compaction/start.
+        let resolved_model = adapter
+            .prepare_model(&provider, &header.config.model)
+            .map_err(CordisError::from)?;
         let registration = register_llm_adapter(
             self.host.context_mut(),
             [provider],
@@ -5368,7 +5372,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 2);
         assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.observed_prepare_flushes.load(Ordering::SeqCst), 1);
         assert_eq!(probe.observed_flushes.load(Ordering::SeqCst), 1);
