@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::agent::run_authorized_runtime_agent_turn;
 use crate::approval::{ApprovalPolicy, ApprovalPolicySource};
-use crate::sandbox::SandboxModeSource;
+use crate::sandbox::{SandboxModeSource, SandboxWorkspaceBinding, inherit_sandbox_workspace};
 use crate::service::Service;
 use crate::session::{
     SessionError, SessionEventKind, SessionHandle, SessionMessage, SessionMessageRole,
@@ -831,6 +831,7 @@ struct LocalSubagentDriveGuard {
     child: SessionHandle,
     provider: String,
     descriptor_listener: Option<crate::ListenerHandle>,
+    _workspace_binding: Option<SandboxWorkspaceBinding>,
     finished: bool,
 }
 
@@ -840,12 +841,14 @@ impl LocalSubagentDriveGuard {
         child: SessionHandle,
         provider: String,
         descriptor_listener: crate::ListenerHandle,
+        workspace_binding: Option<SandboxWorkspaceBinding>,
     ) -> Self {
         Self {
             run,
             child,
             provider,
             descriptor_listener: Some(descriptor_listener),
+            _workspace_binding: workspace_binding,
             finished: false,
         }
     }
@@ -1172,6 +1175,8 @@ impl SubagentRuntime {
             .spawn_child(&parent_session, child_id.clone())
             .map_err(|error| provider_start_failure(&provider, error))?;
         let establishment = LocalSessionEstablishment::new(Arc::clone(&sessions), child.clone());
+        let workspace_binding = inherit_sandbox_workspace(ctx, &parent, &child)
+            .map_err(|error| provider_start_failure(&provider, error))?;
         if let Some(mode) = inherited_sandbox_mode {
             child
                 .append_sandbox_mode(mode, Some(SandboxModeSource::Delegation))
@@ -1252,6 +1257,7 @@ impl SubagentRuntime {
             child.clone(),
             provider.clone(),
             descriptor_listener,
+            workspace_binding,
         );
         establishment.commit();
 
@@ -1267,7 +1273,23 @@ impl SubagentRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        drive.finish(local_result(&child, outcome, descriptor_failure, &provider));
+        let result = local_result(&child, outcome, descriptor_failure, &provider);
+        // A successful child result must be durable before it becomes parent
+        // tool input. No-listener hosts remain valid, while listener failure
+        // turns the child result into a provider error.
+        let result = match sessions.flush(&child).await {
+            Ok(_) => result,
+            Err(flush) => {
+                let detail = match result {
+                    Ok(_) => format!("child Session completion flush failed: {flush}"),
+                    Err(run) => {
+                        format!("{run}; child Session completion flush also failed: {flush}")
+                    }
+                };
+                Err(provider_start_failure(&provider, detail))
+            }
+        };
+        drive.finish(result);
         Ok(observed)
     }
 }

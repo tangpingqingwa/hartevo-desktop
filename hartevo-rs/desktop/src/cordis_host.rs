@@ -3323,17 +3323,18 @@ mod tests {
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
-        OPENINTERPRETER, OneShotSubagentDescriptor, RuntimeBinding, SandboxError, SandboxMode,
-        SandboxModeSource, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
-        SessionCallConfig, SessionCancelCause, SessionCheckpoint, SessionCompactionEnd,
-        SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionError,
-        SessionEvent, SessionEventKind, SessionFinishReason, SessionHandle, SessionHeader,
-        SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted,
-        SessionMessage, SessionMessageRole, SessionMessageSource, SessionSandboxMode, SessionStore,
-        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
-        SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason,
-        enforce_invariants, events, host_is_cordis_loop, invariant_missing,
-        is_compact_checkpoint_source, keys, register_tool_definition, session_events,
+        OPENINTERPRETER, OneShotSubagentDescriptor, RuntimeBinding, SUBAGENT_TOOL_NAME,
+        SandboxError, SandboxMode, SandboxModeSource, SessionApprovalAsked, SessionApprovalDecided,
+        SessionApprovalPolicy, SessionCallConfig, SessionCancelCause, SessionCheckpoint,
+        SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
+        SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
+        SessionHandle, SessionHeader, SessionId, SessionLlmFailure, SessionLlmRetry,
+        SessionLlmRetryMode, SessionLlmRetryStarted, SessionMessage, SessionMessageRole,
+        SessionMessageSource, SessionSandboxMode, SessionStore, SessionStreamBlockType,
+        SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp, SessionToolSchema,
+        SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason, enforce_invariants, events,
+        host_is_cordis_loop, invariant_missing, is_compact_checkpoint_source, keys,
+        register_tool_definition, session_events, set_sandbox_mode,
     };
     #[cfg(target_os = "macos")]
     use hartevo_cordis::{JobControl, JobOutcome, JobStatus, JobTerminalStatus, JobsSurface};
@@ -3483,6 +3484,34 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("one scripted Desktop response per Cordis step");
+            Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Clone)]
+    struct DesktopObservedSequencedTurnAdapter {
+        turns: Arc<Mutex<VecDeque<Vec<SessionStreamChunk>>>>,
+        seen: Arc<Mutex<Vec<LlmGenerateRequest>>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl LlmAdapter for DesktopObservedSequencedTurnAdapter {
+        fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+            Ok(LlmResolvedModel::new(provider, model))
+        }
+
+        fn stream(
+            &self,
+            request: LlmGenerateRequest,
+        ) -> Result<LlmAdapterStream, SessionLlmFailure> {
+            self.seen.lock().unwrap().push(request);
+            let chunks = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one observed Desktop response per Cordis parent/child step");
             Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -3689,6 +3718,65 @@ mod tests {
                 replay_state: None,
             },
         ]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn desktop_foreground_subagent_turn_adapter() -> (
+        DesktopObservedSequencedTurnAdapter,
+        Arc<Mutex<Vec<LlmGenerateRequest>>>,
+    ) {
+        let turns = [
+            desktop_single_tool_turn(
+                "desktop-subagent-call-1",
+                SUBAGENT_TOOL_NAME,
+                r#"{"prompt":"inspect the exact Desktop workspace boundary"}"#,
+            ),
+            desktop_single_tool_turn(
+                "desktop-subagent-bash-call-1",
+                "bash",
+                r#"{"command":"pwd; printf n112-child","description":"Verify the delegated Desktop workspace binding"}"#,
+            ),
+            vec![
+                SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                },
+                SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "child inspected desktop".into(),
+                    },
+                },
+                SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+            vec![
+                SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                },
+                SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "parent received child".into(),
+                    },
+                },
+                SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                },
+            ],
+        ];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            DesktopObservedSequencedTurnAdapter {
+                turns: Arc::new(Mutex::new(VecDeque::from(turns))),
+                seen: Arc::clone(&seen),
+            },
+            seen,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -4053,6 +4141,204 @@ mod tests {
             .unwrap();
         assert_eq!(restored.events().unwrap(), session.events().unwrap());
         assert_eq!(restored.derive_messages().unwrap(), messages);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused journey proves the Desktop parent/child/parent request, sandbox, disposal, and cold-restore closure"
+    )]
+    async fn desktop_foreground_subagent_runs_child_bash_and_cold_restores_both_sessions() {
+        let scratch = tempfile::Builder::new()
+            .prefix("n112-subagent-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let workspace_root = scratch.path().canonicalize().unwrap();
+        let parent_id = SessionId::new("desktop-agent-session").unwrap();
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(
+            live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+                .unwrap(),
+            0
+        );
+        let sessions = live.context().sessions::<SessionStore>().unwrap();
+        let parent = sessions.create(parent_id.clone()).unwrap();
+        set_sandbox_mode(live.context(), &parent, SandboxMode::ReadOnly, None)
+            .await
+            .unwrap();
+        let (adapter, seen) = desktop_foreground_subagent_turn_adapter();
+        let slot = Arc::new(DesktopCordisSlot::new(live));
+        let execution_slot = Arc::clone(&slot);
+        let request_workspace = workspace_root.clone();
+        let scope = AuthorityScope::new("tenant-a", "project-a", parent_id.as_str(), 4)
+            .unwrap()
+            .with_runtime(RuntimeBinding::new(2, None, None, "a".repeat(64)).unwrap());
+
+        let outcome = dispatch_live_runtime(
+            &slot,
+            scope,
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                let mut coordinator = execution_slot.lock().unwrap();
+                futures_executor::block_on(coordinator.run_authorized_runtime_agent_turn(
+                    desktop_turn_request_in(&request_workspace),
+                    adapter,
+                    &LifecycleCancellation::default(),
+                    permit,
+                    None,
+                ))
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.steps(), 2);
+        assert_eq!(outcome.reason(), TurnEndReason::Completed);
+        let observed = seen.lock().unwrap();
+        assert_eq!(observed.len(), 4);
+        assert_eq!(observed[0].session_id(), Some(&parent_id));
+        let child_id = observed[1]
+            .session_id()
+            .cloned()
+            .expect("child request must carry its Session identity");
+        assert_eq!(observed[2].session_id(), Some(&child_id));
+        assert_eq!(observed[3].session_id(), Some(&parent_id));
+        assert!(
+            observed[0]
+                .tools()
+                .unwrap_or_default()
+                .iter()
+                .any(|schema| schema.name == SUBAGENT_TOOL_NAME)
+        );
+        assert_eq!(observed[1].messages().len(), 1);
+        assert_eq!(
+            observed[1].messages()[0].content,
+            [SessionContentBlock::Text {
+                text: "inspect the exact Desktop workspace boundary".into(),
+            }]
+        );
+        assert_eq!(observed[1].config(), observed[0].config());
+        assert!(
+            observed[2].messages().iter().any(|message| {
+                matches!(
+                    message.content.as_slice(),
+                    [SessionContentBlock::ToolResult {
+                        tool_call_id,
+                        content,
+                        is_error: false,
+                    }] if tool_call_id == "desktop-subagent-bash-call-1"
+                        && content.iter().any(|block| matches!(
+                            block,
+                            SessionContentBlock::Text { text }
+                                if text.contains("n112-child")
+                                    && text.contains("[sandbox: read-only, full enforcement]")
+                        ))
+                )
+            }),
+            "the child must observe its real sandboxed Desktop bash result"
+        );
+        assert!(observed[3].messages().iter().any(|message| {
+            matches!(
+                message.content.as_slice(),
+                [SessionContentBlock::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error: false,
+                }] if tool_call_id == "desktop-subagent-call-1"
+                    && content == &[SessionContentBlock::Text {
+                        text: "child inspected desktop".into(),
+                    }]
+            )
+        }));
+        drop(observed);
+
+        let (parent_events, parent_messages, child_events, child_messages, store) = {
+            let live = slot.lock().unwrap();
+            let sessions = live.context().sessions::<SessionStore>().unwrap();
+            assert_eq!(sessions.len().unwrap(), 2);
+            let parent = sessions.get(&parent_id).unwrap().unwrap();
+            let child = sessions.get(&child_id).unwrap().unwrap();
+            let child_header = child.header().unwrap();
+            assert_eq!(child_header.parent_session, Some(parent_id.clone()));
+            assert_eq!(child_header.delegation_depth, 1);
+            assert_eq!(parent.sandbox_mode().unwrap(), Some(SandboxMode::ReadOnly));
+            assert_eq!(parent.approval_policy().unwrap(), ApprovalPolicy::Ask);
+            assert_eq!(child.sandbox_mode().unwrap(), Some(SandboxMode::ReadOnly));
+            assert_eq!(child.approval_policy().unwrap(), ApprovalPolicy::Never);
+            let child_events = child.events().unwrap();
+            let delegated_sandbox = child_events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        SessionEventKind::SandboxMode { sandbox }
+                            if sandbox.mode() == SandboxMode::ReadOnly
+                                && sandbox.source() == Some(SandboxModeSource::Delegation)
+                    )
+                })
+                .unwrap();
+            let delegated_approval = child_events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        SessionEventKind::ApprovalPolicy { approval }
+                            if approval.policy() == ApprovalPolicy::Never
+                                && approval.source() == Some(ApprovalPolicySource::Delegation)
+                    )
+                })
+                .unwrap();
+            let child_turn_start = child_events
+                .iter()
+                .position(|event| matches!(event.kind, SessionEventKind::TurnStart { .. }))
+                .unwrap();
+            assert!(delegated_sandbox < child_turn_start);
+            assert!(delegated_approval < child_turn_start);
+            assert!(runtime_open_turn(&child_events).is_none());
+            let parent_events = parent.events().unwrap();
+            assert!(runtime_open_turn(&parent_events).is_none());
+            assert!(
+                live.context()
+                    .agents::<AgentsSurface>()
+                    .unwrap()
+                    .list()
+                    .iter()
+                    .all(|agent| agent.id != child_id.as_str()),
+                "the foreground child Agent must be disposed"
+            );
+            let store = live
+                .session_persistence
+                .store
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap();
+            (
+                parent_events,
+                parent.derive_messages().unwrap(),
+                child_events,
+                child.derive_messages().unwrap(),
+                store,
+            )
+        };
+
+        let mut cold =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(cold.bind_session_persistence(store).unwrap(), 2);
+        let restored_sessions = cold.context().sessions::<SessionStore>().unwrap();
+        let restored_parent = restored_sessions.get(&parent_id).unwrap().unwrap();
+        let restored_child = restored_sessions.get(&child_id).unwrap().unwrap();
+        assert_eq!(restored_parent.events().unwrap(), parent_events);
+        assert_eq!(restored_parent.derive_messages().unwrap(), parent_messages);
+        assert_eq!(restored_child.events().unwrap(), child_events);
+        assert_eq!(restored_child.derive_messages().unwrap(), child_messages);
     }
 
     #[cfg(target_os = "macos")]
