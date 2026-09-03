@@ -443,17 +443,28 @@ fn runtime_projection(
         };
     };
     let status = runtime_operations_status(runtime.status);
+    let cordis_native = runtime.is_cordis_native();
     RuntimeConfigurationProjection {
         status,
         provider: runtime.provider.clone().unwrap_or_else(|| "未配置".into()),
         model: runtime.model.clone().unwrap_or_else(|| "未配置".into()),
-        harness: if status.is_actionable() {
+        harness: if cordis_native {
+            "Cordis-native DeepSeek Harness".into()
+        } else if status.is_actionable() {
             "Pinned OpenInterpreter App Server".into()
         } else {
             "等待 OI-01 harness identity".into()
         },
-        reasoning_effort: "等待 OI-01 typed setting".into(),
-        service_tier: "等待 OI-01 typed setting".into(),
+        reasoning_effort: if cordis_native {
+            "等待 Cordis-native typed setting".into()
+        } else {
+            "等待 OI-01 typed setting".into()
+        },
+        service_tier: if cordis_native {
+            "等待 Cordis-native typed setting".into()
+        } else {
+            "等待 OI-01 typed setting".into()
+        },
         data_boundary: "Project-bound local Context".into(),
         pinned_release: runtime.release.clone(),
     }
@@ -832,6 +843,26 @@ mod tests {
         assert_eq!(projection.reasoning_effort, "等待 OI-01 typed setting");
         assert!(!projection.harness.contains("private-target-path"));
         assert!(!projection.harness.contains("private-program-digest"));
+    }
+
+    #[test]
+    fn runtime_config_names_the_cordis_native_path_without_openinterpreter_leakage() {
+        let runtime = DesktopRuntimeProjection {
+            status: DesktopRuntimeAvailabilityStatus::ConfigurationRequired,
+            target: Some("cordis-native".into()),
+            release: "deepseek-harness-cd5ef814/cordis-v1".into(),
+            program_sha256: None,
+            provider: Some("deepseek-official".into()),
+            model: None,
+            distribution_signature_evidence: None,
+            exact_tokenizer_evidence: false,
+        };
+        let projection = runtime_projection(Some(&runtime));
+        assert_eq!(projection.status, OperationsStatus::WaitingUser);
+        assert_eq!(projection.harness, "Cordis-native DeepSeek Harness");
+        assert!(!projection.harness.contains("OpenInterpreter"));
+        assert!(projection.reasoning_effort.contains("Cordis-native"));
+        assert!(projection.service_tier.contains("Cordis-native"));
     }
 
     #[test]
