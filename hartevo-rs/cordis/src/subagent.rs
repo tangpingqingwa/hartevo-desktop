@@ -1,19 +1,108 @@
 //! Named provider registry for child-agent delegation.
 //!
-//! This module owns only the provider-selection seam. Provider backends own
-//! child construction and caller-held runs; later slices add descriptors,
-//! lifecycle observation, continuation, and model-facing tools.
+//! This module owns provider selection plus the provider-neutral one-shot
+//! descriptor and lifecycle seam. Provider backends still own child
+//! construction and durable descriptor seeding; later slices add continuation
+//! and model-facing tools.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures_util::future::BoxFuture;
+use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, Shared};
 use thiserror::Error;
 
 use crate::{
-    AgentRef, Context, LifecycleCancellation, RegistrationHandle, SessionCallConfig,
-    SessionContentBlock, SessionId,
+    AgentRef, Context, Emit, EventKey, EventReentry, EventSchemaId, LifecycleCancellation,
+    RegistrationHandle, SessionCallConfig, SessionContentBlock, SessionId,
 };
+
+/// DeepSeek Harness descriptor format implemented by this slice.
+pub const SUBAGENT_DESCRIPTOR_VERSION: u32 = 3;
+
+/// Supported lifecycle mode of a child descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentDescriptorMode {
+    OneShot,
+}
+
+/// Detached durable identity passed to a one-shot provider before child work.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OneShotSubagentDescriptor {
+    pub version: u32,
+    pub mode: SubagentDescriptorMode,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl OneShotSubagentDescriptor {
+    #[must_use]
+    pub fn new(provider: impl Into<String>, label: Option<String>) -> Self {
+        Self {
+            version: SUBAGENT_DESCRIPTOR_VERSION,
+            mode: SubagentDescriptorMode::OneShot,
+            provider: provider.into(),
+            label,
+        }
+    }
+}
+
+/// Opaque identity shared by one run's start/end lifecycle pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SubagentRunId(String);
+
+impl SubagentRunId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SubagentRunId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Observable facts published after a provider has established one run.
+#[derive(Debug, Clone)]
+pub struct SubagentRunInfo {
+    pub run_id: SubagentRunId,
+    pub provider: String,
+    pub id: SessionId,
+    pub local: bool,
+    pub parent: AgentRef,
+}
+
+/// Observable terminal facts published exactly once for an established run.
+#[derive(Debug, Clone)]
+pub struct SubagentRunEndInfo {
+    pub run_id: SubagentRunId,
+    pub provider: String,
+    pub id: SessionId,
+    pub local: bool,
+    pub parent: AgentRef,
+    pub stop_reason: SubagentStopReason,
+    pub last_assistant_message: Option<Vec<SessionContentBlock>>,
+}
+
+/// Typed lifecycle events emitted by the Cordis subagent service.
+pub mod events {
+    use super::{Emit, EventKey, EventSchemaId, SubagentRunEndInfo, SubagentRunInfo};
+
+    pub const SUBAGENT_START: EventKey<Emit, SubagentRunInfo, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.subagent.start.v1"),
+        "subagent/start",
+    );
+    pub const SUBAGENT_END: EventKey<Emit, SubagentRunEndInfo, ()> = EventKey::new(
+        EventSchemaId::new("hartevo.subagent.end.v1"),
+        "subagent/end",
+    );
+}
 
 /// Start-time features a provider can honor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -111,6 +200,39 @@ impl SubagentStartRequest {
     }
 }
 
+/// Provider-facing request after Cordis has detached the durable descriptor.
+#[derive(Debug, Clone)]
+pub struct ResolvedSubagentStartRequest {
+    pub label: Option<String>,
+    pub prompt: Vec<SessionContentBlock>,
+    pub parent: AgentRef,
+    pub cancellation: LifecycleCancellation,
+    pub agent_options: Option<SessionCallConfig>,
+    pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
+    pub max_depth: Option<u32>,
+    pub tool_filter: Option<SubagentToolFilter>,
+    pub persona: Option<String>,
+    pub descriptor: OneShotSubagentDescriptor,
+}
+
+impl ResolvedSubagentStartRequest {
+    fn one_shot(provider: &str, request: SubagentStartRequest) -> Self {
+        let descriptor = OneShotSubagentDescriptor::new(provider, request.label.clone());
+        Self {
+            label: request.label,
+            prompt: request.prompt,
+            parent: request.parent,
+            cancellation: request.cancellation,
+            agent_options: request.agent_options,
+            output_schema: request.output_schema,
+            max_depth: request.max_depth,
+            tool_filter: request.tool_filter,
+            persona: request.persona,
+            descriptor,
+        }
+    }
+}
+
 /// Why a child run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStopReason {
@@ -187,6 +309,8 @@ pub enum SubagentError {
     RegistryPoisoned,
     #[error("subagent provider registration identity overflowed")]
     ProviderIdentityOverflow,
+    #[error("subagent run identity overflowed")]
+    RunIdentityOverflow,
     #[error("subagent provider `{provider}` failed to start: {detail}")]
     ProviderStart { provider: String, detail: String },
 }
@@ -203,6 +327,7 @@ impl SubagentError {
             Self::RuntimeUnavailable => "RUNTIME_UNAVAILABLE",
             Self::RegistryPoisoned => "INVARIANT",
             Self::ProviderIdentityOverflow => "PROVIDER_IDENTITY_OVERFLOW",
+            Self::RunIdentityOverflow => "RUN_ID_OVERFLOW",
             Self::ProviderStart { .. } => "PROVIDER_START_FAILED",
         }
     }
@@ -223,8 +348,33 @@ pub trait SubagentProvider: Send + Sync + 'static {
     fn inherits_parent_context(&self) -> bool;
     fn start(
         &self,
-        request: SubagentStartRequest,
+        request: ResolvedSubagentStartRequest,
     ) -> BoxFuture<'static, Result<Arc<dyn SubagentRun>, SubagentError>>;
+}
+
+type SharedSubagentResult = Shared<BoxFuture<'static, Result<SubagentResult, SubagentError>>>;
+
+struct ObservedSubagentRun {
+    inner: Arc<dyn SubagentRun>,
+    result: SharedSubagentResult,
+}
+
+impl SubagentRun for ObservedSubagentRun {
+    fn id(&self) -> &SessionId {
+        self.inner.id()
+    }
+
+    fn local_agent(&self) -> Option<AgentRef> {
+        self.inner.local_agent()
+    }
+
+    fn result(&self) -> BoxFuture<'static, Result<SubagentResult, SubagentError>> {
+        self.result.clone().boxed()
+    }
+
+    fn dispose(&self) -> BoxFuture<'static, Result<(), SubagentError>> {
+        self.inner.dispose()
+    }
 }
 
 struct ProviderRegistration {
@@ -239,15 +389,30 @@ struct RegistryState {
 }
 
 /// Cordis service implementing exact-name provider selection.
-#[derive(Default)]
 pub struct SubagentRuntime {
     state: Mutex<RegistryState>,
+    events: EventReentry,
+    next_run_id: AtomicU64,
 }
 
 impl SubagentRuntime {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(events: EventReentry) -> Self {
+        Self {
+            state: Mutex::new(RegistryState::default()),
+            events,
+            next_run_id: AtomicU64::new(0),
+        }
+    }
+
+    fn allocate_run_id(&self) -> Result<SubagentRunId, SubagentError> {
+        let previous = self
+            .next_run_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| SubagentError::RunIdentityOverflow)?;
+        Ok(SubagentRunId(format!("subagent-run-{}", previous + 1)))
     }
 
     fn register_provider(&self, provider: Arc<dyn SubagentProvider>) -> Result<u64, SubagentError> {
@@ -351,7 +516,54 @@ impl SubagentRuntime {
                 capability,
             });
         }
-        provider.start(request).await
+        let run_id = self.allocate_run_id()?;
+        let request = ResolvedSubagentStartRequest::one_shot(provider.name(), request);
+        let parent = request.parent.clone();
+        let run = provider.start(request).await?;
+        let info = SubagentRunInfo {
+            run_id,
+            provider: provider.name().to_owned(),
+            id: run.id().clone(),
+            local: run.local_agent().is_some(),
+            parent,
+        };
+        let terminal_info = info.clone();
+        let terminal_events = self.events.clone();
+        let result = run.result();
+        let result = async move {
+            let outcome = result.await;
+            let (stop_reason, last_assistant_message) = match &outcome {
+                Ok(result) => (
+                    result.stop_reason,
+                    (!result.output.is_empty()).then(|| result.output.clone()),
+                ),
+                Err(_) => (SubagentStopReason::Error, None),
+            };
+            let ended = SubagentRunEndInfo {
+                run_id: terminal_info.run_id,
+                provider: terminal_info.provider,
+                id: terminal_info.id,
+                local: terminal_info.local,
+                parent: terminal_info.parent,
+                stop_reason,
+                last_assistant_message,
+            };
+            let _ = terminal_events.emit_contained(events::SUBAGENT_END, &ended);
+            outcome
+        }
+        .boxed()
+        .shared();
+        let observed: Arc<dyn SubagentRun> = Arc::new(ObservedSubagentRun {
+            inner: run,
+            result: result.clone(),
+        });
+        let _ = self.events.emit_contained(events::SUBAGENT_START, &info);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                drop(result.await);
+            }));
+        }
+        Ok(observed)
     }
 }
 

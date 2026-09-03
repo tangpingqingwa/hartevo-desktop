@@ -14,7 +14,7 @@ use hartevo_cordis::{
     assemble_system_prompt, events, expected_mode, keys, prepare_llm_call, register_agent,
     register_llm_adapter, register_llm_stream, register_prompt_section, register_tool,
     register_tool_schema, run_tools_pipeline, session_events, stream_llm, stream_llm_request,
-    stream_prepared_llm,
+    stream_prepared_llm, subagent_events,
 };
 
 fn mapped() -> Context {
@@ -182,7 +182,7 @@ fn tools_pipeline_locks_exactly_one_mode_per_event() {
 }
 
 #[test]
-fn all_sixteen_mapped_events_keep_their_exact_typed_descriptors() {
+fn all_eighteen_mapped_events_keep_their_exact_typed_descriptors() {
     let ctx = mapped();
     macro_rules! assert_mapped {
         ($key:expr, $mode:expr) => {{
@@ -206,6 +206,8 @@ fn all_sixteen_mapped_events_keep_their_exact_typed_descriptors() {
     assert_mapped!(events::AGENT_REQUEST, DispatchMode::Waterfall);
     assert_mapped!(events::AGENT_REQUEST_ERROR, DispatchMode::Waterfall);
     assert_mapped!(events::AGENT_TURN_STOPPING, DispatchMode::Serial);
+    assert_mapped!(subagent_events::SUBAGENT_START, DispatchMode::Emit);
+    assert_mapped!(subagent_events::SUBAGENT_END, DispatchMode::Emit);
     assert_mapped!(session_events::SESSION_EVENT, DispatchMode::Emit);
     assert_mapped!(session_events::SESSION_FLUSH, DispatchMode::Parallel);
 }
