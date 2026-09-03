@@ -55,6 +55,8 @@ use hartevo_context_fabric::{
 };
 #[cfg(test)]
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
+#[cfg(all(test, target_os = "macos"))]
+use hartevo_cordis::{AgentsSurface, ApprovalPolicy, SUBAGENT_TOOL_NAME, SessionStore};
 use hartevo_cordis::{
     ApprovalRequestId, AuthorityDispatchError, AuthorityScope, COMPACTION_INSTRUCTION, CordisError,
     DomainCommandBinding, DomainCommandKind, EffectExecutionBinding, EffectReconciliationBinding,
@@ -10608,6 +10610,8 @@ sleep 30"#
     #[derive(Clone)]
     enum MissionDeepSeekOutcome {
         Response(DeepSeekWireResponse),
+        #[cfg(target_os = "macos")]
+        Responses(Arc<Mutex<VecDeque<DeepSeekWireResponse>>>),
         Failure(SessionLlmFailure),
     }
 
@@ -10626,8 +10630,111 @@ sleep 30"#
             self.requests.lock().unwrap().push(request.clone());
             match &self.outcome {
                 MissionDeepSeekOutcome::Response(response) => Ok(response.clone()),
+                #[cfg(target_os = "macos")]
+                MissionDeepSeekOutcome::Responses(responses) => Ok(responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("one native Mission response per parent or child step")),
                 MissionDeepSeekOutcome::Failure(failure) => Err(failure.clone()),
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_mission_deepseek_response(
+        request_id: &str,
+        payload: &serde_json::Value,
+    ) -> DeepSeekWireResponse {
+        DeepSeekWireResponse::new(
+            vec![payload.to_string(), "[DONE]".into()],
+            Some(request_id.into()),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_deepseek_subagent_mission_source(
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> DesktopRuntimeSource {
+        let responses = VecDeque::from([
+            native_mission_deepseek_response(
+                "desktop-mission-parent-1",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "desktop-mission-subagent-call",
+                                "function": {
+                                    "name": SUBAGENT_TOOL_NAME,
+                                    "arguments": r#"{"prompt":"inspect the exact Mission workspace"}"#,
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                }),
+            ),
+            native_mission_deepseek_response(
+                "desktop-mission-child-1",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "desktop-mission-child-bash-call",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": r#"{"command":"printf 'n120-session=%s\\n' \"$DSH_SESSION_ID\"; pwd; printf n120-child","description":"Verify the delegated Mission workspace"}"#,
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                }),
+            ),
+            native_mission_deepseek_response(
+                "desktop-mission-child-2",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": "child inspected Mission workspace"},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+            native_mission_deepseek_response(
+                "desktop-mission-parent-2",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": "parent adopted bounded child evidence"},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+        ]);
+        let adapter = DeepSeekAdapter::new(
+            DeepSeekConnection::new(
+                "https://api.deepseek.com",
+                "DEEPSEEK_API_KEY",
+                128_000,
+                8_192,
+                StdDuration::from_secs(5),
+            )
+            .unwrap(),
+            |name: &str| {
+                assert_eq!(name, "DEEPSEEK_API_KEY");
+                Ok(Zeroizing::new("desktop-mission-secret".into()))
+            },
+            MissionDeepSeekTransport {
+                outcome: MissionDeepSeekOutcome::Responses(Arc::new(Mutex::new(responses))),
+                calls,
+                requests,
+            },
+        );
+        DesktopRuntimeSource::NativeDeepSeek {
+            model: "deepseek-chat".into(),
+            adapter,
         }
     }
 
@@ -13563,6 +13670,243 @@ sleep 30"#;
             service
                 .mission_events(&project_id, &submission.mission_id)
                 .expect("unchanged native Mission events"),
+            events_before_restart
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused Desktop journey proves native parent/child/tool execution, Domain adoption, and encrypted cold replay together"
+    )]
+    fn cordis_native_deepseek_subagent_mission_adopts_only_the_parent_result() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let private_goal = "Delegate one bounded inspection inside this Mission workspace";
+        let final_draft = "parent adopted bounded child evidence";
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let workspace_root = {
+            let (service, _) = plane
+                .open_application_from_secret(
+                    &database_secret,
+                    observed_at() + Duration::minutes(2),
+                )
+                .expect("open Application for Mission workspace");
+            plane
+                .project_context_material_session(
+                    &service,
+                    &secrets,
+                    &project_id,
+                    observed_at() + Duration::minutes(2),
+                )
+                .expect("project Context material session")
+                .project_root()
+                .to_path_buf()
+        };
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let submission = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Native Cordis subagent Mission".into()),
+                    goal: private_goal.into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "owner".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "EUR".into(),
+                },
+                Some(native_deepseek_subagent_mission_source(
+                    Arc::clone(&provider_calls),
+                    Arc::clone(&provider_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("native Cordis subagent Mission");
+        let work_product_id = match &submission.runtime_outcome {
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id.clone(),
+            outcome => panic!("unexpected native subagent outcome: {outcome:?}"),
+        };
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 4);
+
+        let requests = provider_requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["model"] == "deepseek-chat")
+        );
+        assert!(
+            requests[0]["tools"]
+                .as_array()
+                .expect("parent tools")
+                .iter()
+                .any(|tool| tool["function"]["name"] == SUBAGENT_TOOL_NAME)
+        );
+        assert!(
+            requests[1]["messages"]
+                .as_array()
+                .expect("child messages")
+                .iter()
+                .any(|message| {
+                    message["role"] == "user"
+                        && message["content"] == "inspect the exact Mission workspace"
+                })
+        );
+        let child_tool_output = requests[2]["messages"]
+            .as_array()
+            .expect("child continuation messages")
+            .iter()
+            .find(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "desktop-mission-child-bash-call"
+            })
+            .and_then(|message| message["content"].as_str())
+            .expect("durable child bash result");
+        assert!(child_tool_output.contains("n120-child"));
+        assert!(child_tool_output.contains(&workspace_root.to_string_lossy().into_owned()));
+        assert!(child_tool_output.contains("[sandbox: read-only, full enforcement]"));
+        let child_session_id = child_tool_output
+            .lines()
+            .find_map(|line| line.strip_prefix("n120-session="))
+            .map(str::trim)
+            .map(str::to_owned)
+            .and_then(|id| SessionId::new(id).ok())
+            .expect("managed child Session identity in bash output");
+        assert!(
+            requests[3]["messages"]
+                .as_array()
+                .expect("parent continuation messages")
+                .iter()
+                .any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "desktop-mission-subagent-call"
+                        && message["content"] == "child inspected Mission workspace"
+                })
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.to_string().contains("desktop-mission-secret"))
+        );
+        drop(requests);
+
+        let parent_session_id = SessionId::new(submission.mission_id.as_str().to_owned()).unwrap();
+        plane.with_cordis_host(|host| {
+            let sessions = host.context().sessions::<SessionStore>().unwrap();
+            assert_eq!(sessions.len().unwrap(), 2);
+            let parent = sessions.get(&parent_session_id).unwrap().unwrap();
+            let child = sessions.get(&child_session_id).unwrap().unwrap();
+            assert_eq!(
+                child.header().unwrap().parent_session,
+                Some(parent_session_id.clone())
+            );
+            assert_eq!(child.header().unwrap().delegation_depth, 1);
+            assert_eq!(parent.approval_policy().unwrap(), ApprovalPolicy::Ask);
+            assert_eq!(child.approval_policy().unwrap(), ApprovalPolicy::Never);
+            assert!(
+                host.context()
+                    .agents::<AgentsSurface>()
+                    .unwrap()
+                    .list()
+                    .iter()
+                    .all(|agent| agent.id != child_session_id.as_str())
+            );
+        });
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(4))
+            .expect("open adopted Domain state");
+        let mission = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("adopted native subagent Mission");
+        assert_eq!(mission.work_products.len(), 1);
+        assert_eq!(mission.work_products[0].id, work_product_id);
+        assert!(mission.effects.is_empty());
+        assert!(
+            service
+                .latest_runtime_turn_for_mission(&project_id, &submission.mission_id)
+                .expect("legacy Runtime query")
+                .is_none()
+        );
+        let conversation = service
+            .mission_conversation(&project_id, &submission.mission_id)
+            .expect("Mission conversation");
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[1].body, final_draft);
+        assert_eq!(
+            conversation.messages[1].work_product_id.as_ref(),
+            Some(&work_product_id)
+        );
+        let events_before_restart = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("content-private Mission events");
+        let event_json = serde_json::to_string(&events_before_restart).unwrap();
+        for private_text in [
+            private_goal,
+            "n120-child",
+            "child inspected Mission workspace",
+        ] {
+            assert!(!event_json.contains(private_text));
+        }
+
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(&secrets, observed_at() + Duration::minutes(5))
+                .expect("restore parent and child Sessions"),
+            DesktopLoadState::Ready(_)
+        ));
+        cold.with_cordis_host(|host| {
+            let sessions = host.context().sessions::<SessionStore>().unwrap();
+            assert_eq!(sessions.len().unwrap(), 2);
+            assert_eq!(
+                sessions
+                    .get(&child_session_id)
+                    .unwrap()
+                    .unwrap()
+                    .approval_policy()
+                    .unwrap(),
+                ApprovalPolicy::Never
+            );
+        });
+        let replay = cold
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                Some(native_deepseek_mission_source(
+                    "must not be requested",
+                    Arc::clone(&provider_calls),
+                    Arc::clone(&provider_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(6),
+            )
+            .expect("cold native subagent adoption replay");
+        assert_eq!(
+            replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id }
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(provider_requests.lock().unwrap().len(), 4);
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(7))
+            .expect("open unchanged replay state");
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("unchanged Mission events"),
             events_before_restart
         );
     }
