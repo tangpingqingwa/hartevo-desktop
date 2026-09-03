@@ -472,6 +472,39 @@ impl SandboxPolicyService {
             })
     }
 
+    fn inherit_workspace(
+        self: &Arc<Self>,
+        parent: &SessionId,
+        child: SessionId,
+    ) -> Result<Option<SandboxWorkspaceBinding>, SandboxError> {
+        let identity = Arc::new(());
+        let mut workspaces = self.session_workspaces.lock().map_err(|_| {
+            SandboxError::WorkspaceBindingUnavailable {
+                detail: "the binding store is poisoned".into(),
+            }
+        })?;
+        let Some(root) = workspaces.get(parent).map(|binding| binding.root.clone()) else {
+            return Ok(None);
+        };
+        if workspaces.contains_key(&child) {
+            return Err(SandboxError::WorkspaceBindingUnavailable {
+                detail: format!("Session `{child}` already has a live workspace binding"),
+            });
+        }
+        workspaces.insert(
+            child.clone(),
+            SandboxWorkspaceRegistration {
+                identity: Arc::clone(&identity),
+                root,
+            },
+        );
+        Ok(Some(SandboxWorkspaceBinding {
+            policy: Arc::downgrade(self),
+            session_id: child,
+            identity,
+        }))
+    }
+
     fn resolve(
         &self,
         request: SandboxPolicyRequest,
@@ -922,6 +955,30 @@ pub fn bind_sandbox_workspace(
     sessions.require_live(session)?;
     let workspace_root = canonical_bound_workspace_root(workspace_root.into())?;
     policy.bind_workspace(session.id().clone(), workspace_root)
+}
+
+/// Copy one parent's live Desktop workspace binding onto a fresh local child.
+///
+/// The returned RAII handle is deliberately ephemeral: callers must retain it
+/// only while the child is driven, and dropping it removes the child binding.
+pub(crate) fn inherit_sandbox_workspace(
+    ctx: &Context,
+    parent: &SessionHandle,
+    child: &SessionHandle,
+) -> Result<Option<SandboxWorkspaceBinding>, SandboxError> {
+    let policy = ctx
+        .get::<SandboxPolicyService>(keys::SANDBOX_POLICY)
+        .ok_or(SandboxError::ServiceUnavailable {
+            key: keys::SANDBOX_POLICY,
+        })?;
+    let sessions = ctx
+        .sessions::<SessionStore>()
+        .ok_or(SandboxError::ServiceUnavailable {
+            key: keys::SESSIONS,
+        })?;
+    sessions.require_live(parent)?;
+    sessions.require_live(child)?;
+    policy.inherit_workspace(parent.id(), child.id().clone())
 }
 
 /// Append and flush exactly one session mode switch before returning.
