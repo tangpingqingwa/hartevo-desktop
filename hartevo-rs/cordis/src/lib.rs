@@ -36,6 +36,7 @@ mod retry;
 mod sandbox;
 mod service;
 mod session;
+mod subagent;
 mod surface;
 
 pub use agent::{
@@ -165,6 +166,11 @@ pub use session::{
     SessionStreamChunk, SessionSurface, SessionSurfaceIntent, SessionSurfaceOp, SessionTokenUsage,
     SessionToolCall, SessionToolError, SessionToolSchema, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN,
     TurnEndReason, events as session_events,
+};
+pub use subagent::{
+    SubagentCapabilities, SubagentCapability, SubagentError, SubagentProvider, SubagentResult,
+    SubagentRun, SubagentRuntime, SubagentStartRequest, SubagentStopReason, SubagentToolFilter,
+    register_subagent_provider,
 };
 pub use surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,

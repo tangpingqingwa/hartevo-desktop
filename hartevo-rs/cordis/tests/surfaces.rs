@@ -82,7 +82,7 @@ impl LlmAdapter for TestStreamingAdapter {
 
 #[test]
 fn mapped_keys_are_provided_and_looked_up() {
-    let ctx = mapped();
+    let mut ctx = mapped();
     assert_eq!(
         MAPPED_KEYS,
         [
@@ -94,6 +94,7 @@ fn mapped_keys_are_provided_and_looked_up() {
             keys::SESSIONS,
             keys::AGENTS,
             keys::JOBS,
+            keys::SUBAGENTS,
             keys::DOMAIN,
             keys::EFFECT_BROKER,
             keys::RUNTIME,
@@ -110,6 +111,13 @@ fn mapped_keys_are_provided_and_looked_up() {
     assert!(ctx.llm::<hartevo_cordis::LlmSurface>().is_some());
     assert!(ctx.agents::<hartevo_cordis::AgentsSurface>().is_some());
     assert!(ctx.jobs::<hartevo_cordis::JobsSurface>().is_some());
+    assert!(ctx.subagents::<hartevo_cordis::SubagentRuntime>().is_some());
+    let root = ctx.root_fiber();
+    assert!(
+        ctx.with_fiber(&root)
+            .subagents::<hartevo_cordis::SubagentRuntime>()
+            .is_some()
+    );
     assert!(ctx.sessions::<u32>().is_none());
     assert_eq!(
         ctx.domain::<DomainSurface>().as_deref(),
