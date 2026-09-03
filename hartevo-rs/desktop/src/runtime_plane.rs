@@ -1,6 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use hartevo_application::llm_deepseek::DEEPSEEK_PROVIDER_ID;
 use hartevo_runtime_adapter::{
     AdapterError, OPENINTERPRETER_RELEASE, VerifiedRuntimeArtifact, host_openinterpreter_target,
     pinned_runtime_artifact, verify_pinned_runtime_artifact,
@@ -9,6 +10,8 @@ use hartevo_runtime_adapter::{
 pub const RUNTIME_PROGRAM_ENV: &str = "HARTEVO_OPENINTERPRETER_BIN";
 pub const RUNTIME_PROVIDER_ENV: &str = "HARTEVO_RUNTIME_PROVIDER";
 pub const RUNTIME_MODEL_ENV: &str = "HARTEVO_RUNTIME_MODEL";
+const CORDIS_NATIVE_TARGET: &str = "cordis-native";
+const DEEPSEEK_NATIVE_RELEASE: &str = "deepseek-harness-cd5ef814/cordis-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DesktopRuntimeAvailabilityStatus {
@@ -54,7 +57,7 @@ impl DesktopRuntimeProjection {
 
 pub(crate) struct DesktopRuntimeConfiguration {
     pub projection: DesktopRuntimeProjection,
-    pub artifact: VerifiedRuntimeArtifact,
+    pub artifact: Option<VerifiedRuntimeArtifact>,
     pub provider: String,
     pub model: String,
 }
@@ -75,6 +78,13 @@ pub(crate) struct DesktopRuntimeDiscovery {
 }
 
 pub(crate) fn discover_runtime() -> DesktopRuntimeDiscovery {
+    if normalized_env(RUNTIME_PROVIDER_ENV).as_deref() == Some(DEEPSEEK_PROVIDER_ID) {
+        return discover_native_deepseek(normalized_env(RUNTIME_MODEL_ENV));
+    }
+    discover_openinterpreter()
+}
+
+fn discover_openinterpreter() -> DesktopRuntimeDiscovery {
     let target = match host_openinterpreter_target() {
         Ok(target) => target.to_owned(),
         Err(_) => {
@@ -170,8 +180,35 @@ pub(crate) fn discover_runtime() -> DesktopRuntimeDiscovery {
         projection: projection.clone(),
         configuration: Some(DesktopRuntimeConfiguration {
             projection,
-            artifact,
+            artifact: Some(artifact),
             provider,
+            model,
+        }),
+    }
+}
+
+fn discover_native_deepseek(model: Option<String>) -> DesktopRuntimeDiscovery {
+    let status = if model.is_some() {
+        DesktopRuntimeAvailabilityStatus::ReadyDistribution
+    } else {
+        DesktopRuntimeAvailabilityStatus::ConfigurationRequired
+    };
+    let projection = DesktopRuntimeProjection {
+        status,
+        target: Some(CORDIS_NATIVE_TARGET.into()),
+        release: DEEPSEEK_NATIVE_RELEASE.into(),
+        program_sha256: None,
+        provider: Some(DEEPSEEK_PROVIDER_ID.into()),
+        model: model.clone(),
+        distribution_signature_evidence: None,
+        exact_tokenizer_evidence: false,
+    };
+    DesktopRuntimeDiscovery {
+        projection: projection.clone(),
+        configuration: model.map(|model| DesktopRuntimeConfiguration {
+            projection,
+            artifact: None,
+            provider: DEEPSEEK_PROVIDER_ID.into(),
             model,
         }),
     }
@@ -294,6 +331,24 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn native_deepseek_discovery_needs_no_openinterpreter_artifact() {
+        let discovery = discover_native_deepseek(Some("deepseek-chat".into()));
+        assert_eq!(
+            discovery.projection.status,
+            DesktopRuntimeAvailabilityStatus::ReadyDistribution
+        );
+        assert_eq!(
+            discovery.projection.target.as_deref(),
+            Some(CORDIS_NATIVE_TARGET)
+        );
+        assert!(discovery.projection.program_sha256.is_none());
+        let configuration = discovery.configuration.expect("native configuration");
+        assert_eq!(configuration.provider, DEEPSEEK_PROVIDER_ID);
+        assert_eq!(configuration.model, "deepseek-chat");
+        assert!(configuration.artifact.is_none());
+    }
 
     #[test]
     fn runtime_home_is_project_scoped_and_symlink_fenced() {

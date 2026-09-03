@@ -60,6 +60,10 @@ use hartevo_context_fabric::{
     ContextAssemblyRequest, ContextAssemblyStatus, ContextMaterialReference,
     ContextMaterialResolver, ContextTokenizer, ResolvedContextMaterial, RuntimeContextEnvelope,
 };
+use hartevo_cordis::{
+    SessionCheckpoint, SessionContentBlock, SessionEventKind, SessionLog, SessionMessageRole,
+    SessionMessageSource, SessionRequestHeader, TurnEndReason,
+};
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, ApprovalPolicy,
     AttributionRecord, AutomatedReplyAuthorization, AutonomyLevel, BrowserActionBatchId,
@@ -483,6 +487,185 @@ pub struct AdoptRuntimeTurnDraft {
     pub expected_conversation_revision: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct AdoptCordisSessionDraft {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub generation: u64,
+    pub expected_conversation_revision: u64,
+}
+
+/// Validated, content-private proof of one completed Cordis Session turn.
+///
+/// Callers cannot construct this value directly. The constructor replays the
+/// complete typed Session log and derives the draft only from the final model
+/// message in the exact turn containing the deterministic Mission input.
+#[derive(Clone)]
+pub struct CordisMissionDraft {
+    session_id: String,
+    turn: u64,
+    provider: String,
+    model: String,
+    system_prompt_digest: String,
+    body: String,
+    body_digest: String,
+    user_message_id: String,
+}
+
+impl fmt::Debug for CordisMissionDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CordisMissionDraft")
+            .field("session_id", &self.session_id)
+            .field("turn", &self.turn)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("system_prompt_digest", &self.system_prompt_digest)
+            .field("body_digest", &self.body_digest)
+            .field("user_message_id", &self.user_message_id)
+            .field("body", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[must_use]
+pub fn cordis_mission_user_message_id(mission_id: &MissionId, generation: u64) -> String {
+    format!(
+        "mission:{}:generation:{generation}:user",
+        mission_id.as_str()
+    )
+}
+
+impl CordisMissionDraft {
+    /// Return `None` when this Session has never consumed the requested input.
+    /// Once that identity is present, every mismatch fails closed.
+    pub fn from_completed_session(
+        checkpoint: &SessionCheckpoint,
+        expected_user_message_id: &str,
+    ) -> Result<Option<Self>, ApplicationError> {
+        SessionLog::restore(checkpoint.header.clone(), checkpoint.events.clone())
+            .map_err(|_| ApplicationError::CordisDraftSessionInvalid)?;
+
+        let mut open_turn = None;
+        let mut matching_turn = None;
+        let mut request_header = None;
+        let mut assistant_messages = Vec::new();
+        for event in &checkpoint.events {
+            match &event.kind {
+                SessionEventKind::TurnStart { turn } => {
+                    open_turn = Some(*turn);
+                    request_header = None;
+                    assistant_messages.clear();
+                }
+                SessionEventKind::UserMessage { message, .. }
+                    if message.id == expected_user_message_id =>
+                {
+                    if message.role != SessionMessageRole::User
+                        || message.source != SessionMessageSource::User
+                        || open_turn.is_none()
+                        || matching_turn.is_some()
+                    {
+                        return Err(ApplicationError::CordisDraftScopeMismatch);
+                    }
+                    matching_turn = open_turn;
+                }
+                SessionEventKind::RequestHeader { request } if open_turn == matching_turn => {
+                    request_header = Some(request.clone());
+                }
+                SessionEventKind::AssistantMessage {
+                    turn,
+                    step,
+                    message,
+                    ..
+                } if Some(*turn) == matching_turn => {
+                    assistant_messages.push((*step, message.clone()));
+                }
+                SessionEventKind::TurnEnd { turn, reason } if Some(*turn) == matching_turn => {
+                    if *reason != TurnEndReason::Completed {
+                        return Err(ApplicationError::CordisDraftTurnNotCompleted);
+                    }
+                    let header = request_header
+                        .as_ref()
+                        .ok_or(ApplicationError::CordisDraftScopeMismatch)?;
+                    return Self::from_closed_turn(
+                        checkpoint.header.id.as_str(),
+                        *turn,
+                        expected_user_message_id,
+                        header,
+                        &assistant_messages,
+                    )
+                    .map(Some);
+                }
+                SessionEventKind::TurnEnd { turn, .. } if open_turn == Some(*turn) => {
+                    open_turn = None;
+                }
+                _ => {}
+            }
+        }
+        if matching_turn.is_some() {
+            Err(ApplicationError::CordisDraftTurnNotCompleted)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn from_closed_turn(
+        session_id: &str,
+        turn: u64,
+        user_message_id: &str,
+        request: &SessionRequestHeader,
+        messages: &[(u64, hartevo_cordis::SessionMessage)],
+    ) -> Result<Self, ApplicationError> {
+        let (step, message) = messages
+            .iter()
+            .max_by_key(|(step, _)| *step)
+            .ok_or(ApplicationError::CordisDraftMessageMissing)?;
+        if messages
+            .iter()
+            .filter(|(candidate, _)| candidate == step)
+            .count()
+            != 1
+            || message.role != SessionMessageRole::Assistant
+        {
+            return Err(ApplicationError::CordisDraftScopeMismatch);
+        }
+        let SessionMessageSource::Model { provider, model } = &message.source else {
+            return Err(ApplicationError::CordisDraftScopeMismatch);
+        };
+        if request.header.config.provider != *provider || request.header.config.model != *model {
+            return Err(ApplicationError::CordisDraftScopeMismatch);
+        }
+        let system_prompt = request
+            .header
+            .system
+            .as_deref()
+            .ok_or(ApplicationError::CordisDraftScopeMismatch)?;
+        let mut body = String::new();
+        for block in &message.content {
+            match block {
+                SessionContentBlock::Text { text } => body.push_str(text),
+                SessionContentBlock::Reasoning { .. } => {}
+                SessionContentBlock::ToolCall { .. } | SessionContentBlock::ToolResult { .. } => {
+                    return Err(ApplicationError::CordisDraftScopeMismatch);
+                }
+            }
+        }
+        if body.trim().is_empty() {
+            return Err(ApplicationError::CordisDraftMessageMissing);
+        }
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            turn,
+            provider: provider.clone(),
+            model: model.clone(),
+            system_prompt_digest: sha256(system_prompt.as_bytes()),
+            body_digest: sha256(body.as_bytes()),
+            body,
+            user_message_id: user_message_id.to_owned(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeDraftAdoption {
     pub mission: Mission,
@@ -490,6 +673,94 @@ pub struct RuntimeDraftAdoption {
     pub work_product: WorkProduct,
     pub conversation: MissionConversation,
     pub message: MissionConversationMessage,
+}
+
+#[derive(Clone, Debug)]
+enum MissionDraftOrigin {
+    ApplicationRuntime(RuntimeTurnAttemptId),
+    CordisSession { session_id: String, turn: u64 },
+}
+
+impl MissionDraftOrigin {
+    fn identity(&self) -> String {
+        match self {
+            Self::ApplicationRuntime(turn_id) => format!("runtime-draft:{}", turn_id.as_str()),
+            Self::CordisSession { session_id, turn } => {
+                format!("cordis-draft:{session_id}:turn:{turn}")
+            }
+        }
+    }
+
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::ApplicationRuntime(_) => "application-runtime",
+            Self::CordisSession { .. } => "cordis-session",
+        }
+    }
+
+    fn runtime_turn_id(&self) -> Option<&str> {
+        match self {
+            Self::ApplicationRuntime(turn_id) => Some(turn_id.as_str()),
+            Self::CordisSession { .. } => None,
+        }
+    }
+
+    fn cordis_session_id(&self) -> Option<&str> {
+        match self {
+            Self::ApplicationRuntime(_) => None,
+            Self::CordisSession { session_id, .. } => Some(session_id),
+        }
+    }
+
+    const fn cordis_turn(&self) -> Option<u64> {
+        match self {
+            Self::ApplicationRuntime(_) => None,
+            Self::CordisSession { turn, .. } => Some(*turn),
+        }
+    }
+
+    const fn title(&self) -> &'static str {
+        match self {
+            Self::ApplicationRuntime(_) => "Runtime draft · requires human review",
+            Self::CordisSession { .. } => "Cordis draft · requires human review",
+        }
+    }
+
+    const fn uncertainty_label(&self) -> &'static [u8] {
+        match self {
+            Self::ApplicationRuntime(_) => b"runtime-draft-requires-human-review",
+            Self::CordisSession { .. } => b"cordis-draft-requires-human-review",
+        }
+    }
+
+    const fn scope_error(&self) -> ApplicationError {
+        match self {
+            Self::ApplicationRuntime(_) => ApplicationError::RuntimeDraftScopeMismatch,
+            Self::CordisSession { .. } => ApplicationError::CordisDraftScopeMismatch,
+        }
+    }
+
+    const fn replay_error(&self) -> ApplicationError {
+        match self {
+            Self::ApplicationRuntime(_) => ApplicationError::RuntimeDraftReplayMismatch,
+            Self::CordisSession { .. } => ApplicationError::CordisDraftReplayMismatch,
+        }
+    }
+
+    const fn conversation_advanced_error(&self) -> ApplicationError {
+        match self {
+            Self::ApplicationRuntime(_) => ApplicationError::RuntimeDraftConversationAdvanced,
+            Self::CordisSession { .. } => ApplicationError::CordisDraftScopeMismatch,
+        }
+    }
+}
+
+struct VerifiedMissionDraft {
+    origin: MissionDraftOrigin,
+    generation: u64,
+    capsule: ContextCapsule,
+    body: String,
+    body_digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -12571,10 +12842,6 @@ impl ApplicationService {
     /// definitively completed Runtime turn. IDs and content are derived from
     /// the durable turn ledger, so a Desktop caller cannot swap the payload or
     /// attach a result to another Mission/generation.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one recoverable adoption boundary binds the private Runtime result to Mission, Work Product, Conversation, capsule, branch, handle, lease, and redacted evidence"
-    )]
     pub fn adopt_runtime_turn_draft(
         &mut self,
         command: &AdoptRuntimeTurnDraft,
@@ -12601,34 +12868,126 @@ impl ApplicationService {
                 &command.runtime_turn_attempt_id,
             )?
             .ok_or(ApplicationError::RuntimeDraftMessageMissing)?;
-        let mut mission = self
-            .store
-            .load_mission(&command.project_id, &command.mission_id)?;
         let capsule = self
             .store
             .load_context_capsule(&command.project_id, &attempt.scope.capsule_id)?;
+        if capsule.worker_generation != attempt.scope.worker_generation {
+            return Err(ApplicationError::RuntimeDraftScopeMismatch);
+        }
+        self.adopt_verified_mission_draft(
+            &command.project_id,
+            &command.mission_id,
+            command.expected_conversation_revision,
+            VerifiedMissionDraft {
+                origin: MissionDraftOrigin::ApplicationRuntime(attempt.id),
+                generation: attempt.scope.worker_generation,
+                capsule,
+                body: private_message.body,
+                body_digest: private_message.body_digest,
+            },
+            now,
+        )
+    }
+
+    /// Adopt one definitively completed, SQLCipher-durable Cordis turn as the
+    /// Mission draft. The provider body is derived by [`CordisMissionDraft`]
+    /// from the typed Session log; this command only supplies Domain scope and
+    /// optimistic concurrency facts.
+    pub fn adopt_cordis_session_draft(
+        &mut self,
+        command: &AdoptCordisSessionDraft,
+        draft: CordisMissionDraft,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeDraftAdoption, ApplicationError> {
+        let CordisMissionDraft {
+            session_id,
+            turn,
+            provider,
+            model,
+            system_prompt_digest,
+            body,
+            body_digest,
+            user_message_id,
+        } = draft;
+        if command.generation == 0
+            || session_id != command.mission_id.as_str()
+            || user_message_id
+                != cordis_mission_user_message_id(&command.mission_id, command.generation)
+        {
+            return Err(ApplicationError::CordisDraftScopeMismatch);
+        }
+        let ids = LocalMissionRuntimeIds::for_mission(&command.mission_id, command.generation);
+        let capsule = self
+            .store
+            .load_context_capsule(&command.project_id, &ids.capsule_id)?;
+        let assembly = self
+            .store
+            .load_context_assembly_manifest(&command.project_id, &ids.assembly_id)?;
+        let profile = assembly
+            .tokenizer_profile
+            .as_ref()
+            .ok_or(ApplicationError::CordisDraftScopeMismatch)?;
+        if assembly.project_id != command.project_id
+            || assembly.mission_id != command.mission_id
+            || assembly.capsule_id != capsule.id
+            || assembly.worker_generation != command.generation
+            || assembly.prompt_digest.as_deref() != Some(system_prompt_digest.as_str())
+            || profile.provider != provider
+            || profile.model != model
+            || capsule.worker_generation != command.generation
+        {
+            return Err(ApplicationError::CordisDraftScopeMismatch);
+        }
+        assembly.validate_dispatchable()?;
+        self.adopt_verified_mission_draft(
+            &command.project_id,
+            &command.mission_id,
+            command.expected_conversation_revision,
+            VerifiedMissionDraft {
+                origin: MissionDraftOrigin::CordisSession { session_id, turn },
+                generation: command.generation,
+                capsule,
+                body,
+                body_digest,
+            },
+            now,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one shared recoverable boundary atomically adopts either verified Runtime or Cordis draft evidence without duplicating authority transitions"
+    )]
+    fn adopt_verified_mission_draft(
+        &mut self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        expected_conversation_revision: u64,
+        draft: VerifiedMissionDraft,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeDraftAdoption, ApplicationError> {
+        let VerifiedMissionDraft {
+            origin,
+            generation,
+            capsule,
+            body,
+            body_digest,
+        } = draft;
+        let mut mission = self.store.load_mission(project_id, mission_id)?;
         if capsule.mission_id != mission.id
-            || capsule.worker_generation != attempt.scope.worker_generation
+            || capsule.worker_generation != generation
             || capsule.task_id.as_str().trim().is_empty()
         {
-            return Err(ApplicationError::RuntimeDraftScopeMismatch);
+            return Err(origin.scope_error());
         }
         let mut conversation = self
             .store
-            .load_mission_conversation(&command.project_id, &command.mission_id)?;
-        let work_product_id = WorkProductId::from_stable(format!(
-            "runtime-draft:{}",
-            command.runtime_turn_attempt_id.as_str()
-        ));
-        let conversation_message_id = MissionConversationMessageId::from_stable(format!(
-            "mission-message:runtime-draft:{}",
-            command.runtime_turn_attempt_id.as_str()
-        ));
-        let idempotency_key = format!(
-            "runtime-draft:{}:{}",
-            command.runtime_turn_attempt_id.as_str(),
-            private_message.body_digest
-        );
+            .load_mission_conversation(project_id, mission_id)?;
+        let identity = origin.identity();
+        let work_product_id = WorkProductId::from_stable(identity.clone());
+        let conversation_message_id =
+            MissionConversationMessageId::from_stable(format!("mission-message:{identity}"));
+        let idempotency_key = format!("{identity}:{body_digest}");
 
         if let Some(work_product) = mission
             .work_products
@@ -12638,33 +12997,33 @@ impl ApplicationService {
         {
             let manifest = self
                 .store
-                .load_work_product_manifest(&command.project_id, &work_product_id)?;
+                .load_work_product_manifest(project_id, &work_product_id)?;
             let message = conversation
                 .messages
                 .iter()
                 .find(|message| message.id == conversation_message_id)
                 .cloned()
-                .ok_or(ApplicationError::RuntimeDraftReplayMismatch)?;
-            if work_product.body != private_message.body
-                || message.body != private_message.body
-                || message.content_digest != private_message.body_digest
+                .ok_or_else(|| origin.replay_error())?;
+            if work_product.body != body
+                || message.body != body
+                || message.content_digest != body_digest
                 || message.idempotency_key != idempotency_key
                 || message.work_product_id.as_ref() != Some(&work_product_id)
                 || manifest.work_product_id != work_product_id
             {
-                return Err(ApplicationError::RuntimeDraftReplayMismatch);
+                return Err(origin.replay_error());
             }
             let branch = self
                 .store
-                .load_context_branch(&command.project_id, &capsule.branch_id)?;
+                .load_context_branch(project_id, &capsule.branch_id)?;
             let handle = self.store.load_worker_handle(
-                &command.project_id,
+                project_id,
                 &capsule.workspace_id,
                 &capsule.worker_id,
             )?;
             let lease = self
                 .store
-                .load_worker_lease(&command.project_id, &capsule.worker_lease_id)?;
+                .load_worker_lease(project_id, &capsule.worker_lease_id)?;
             if capsule.status != ContextCapsuleStatus::Accepted
                 || !matches!(
                     branch.status,
@@ -12673,7 +13032,7 @@ impl ApplicationService {
                 || handle.status != WorkerHandleStatus::Completed
                 || lease.status != WorkerLeaseStatus::Released
             {
-                return Err(ApplicationError::RuntimeDraftReplayMismatch);
+                return Err(origin.replay_error());
             }
             return Ok(RuntimeDraftAdoption {
                 mission,
@@ -12684,9 +13043,9 @@ impl ApplicationService {
             });
         }
 
-        if conversation.revision != command.expected_conversation_revision {
+        if conversation.revision != expected_conversation_revision {
             return Err(ApplicationError::MissionConversationRevisionMismatch {
-                expected: command.expected_conversation_revision,
+                expected: expected_conversation_revision,
                 actual: conversation.revision,
             });
         }
@@ -12696,18 +13055,17 @@ impl ApplicationService {
             .rev()
             .find(|message| message.role == MissionConversationRole::User)
             .map(|message| message.sequence)
-            .ok_or(ApplicationError::RuntimeDraftConversationAdvanced)?;
-        if latest_user_sequence != attempt.scope.worker_generation {
-            return Err(ApplicationError::RuntimeDraftConversationAdvanced);
+            .ok_or_else(|| origin.conversation_advanced_error())?;
+        if latest_user_sequence != generation {
+            return Err(origin.conversation_advanced_error());
         }
 
         let expected_mission_revision = mission.revision;
-        let title = "Runtime draft · requires human review".to_owned();
         mission.record_work_product(
             WorkProduct::draft(
                 work_product_id.clone(),
-                title,
-                private_message.body.clone(),
+                origin.title(),
+                body.clone(),
                 BTreeSet::new(),
             ),
             now,
@@ -12718,7 +13076,7 @@ impl ApplicationService {
             .find(|work_product| work_product.id == work_product_id)
             .cloned()
             .ok_or_else(|| MissionError::UnknownWorkProduct(work_product_id.clone()))?;
-        let preview = private_message.body.chars().take(4_000).collect::<String>();
+        let preview = body.chars().take(4_000).collect::<String>();
         let manifest = WorkProductManifest::create(
             mission.tenant_id.clone(),
             mission.project_id.clone(),
@@ -12735,33 +13093,32 @@ impl ApplicationService {
             BTreeSet::from(["/body".into()]),
             now,
         )?;
-        let expected_conversation_revision = conversation.revision;
+        let prior_conversation_revision = conversation.revision;
         let (message, appended) = conversation.append_runtime_draft(
             conversation_message_id,
-            private_message.body,
+            body,
             work_product_id,
             idempotency_key,
             &mission,
             now,
         )?;
         if !appended {
-            return Err(ApplicationError::RuntimeDraftReplayMismatch);
+            return Err(origin.replay_error());
         }
-        let runtime_body_digest = private_message.body_digest.clone();
-        let result_size_bytes = u64::try_from(work_product.body.len())
-            .map_err(|_| ApplicationError::RuntimeDraftScopeMismatch)?;
+        let result_size_bytes =
+            u64::try_from(work_product.body.len()).map_err(|_| origin.scope_error())?;
         let expected_capsule_revision = capsule.revision;
         let mut submitted_capsule = capsule;
         submitted_capsule.submit_result(
-            attempt.scope.worker_generation,
+            generation,
             ContextReturnReceipt {
                 schema_id: submitted_capsule.return_contract.schema_id.clone(),
                 schema_version: submitted_capsule.return_contract.schema_version,
-                result_digest: runtime_body_digest.clone(),
+                result_digest: body_digest.clone(),
                 result_size_bytes,
                 evidence_ids: BTreeSet::new(),
                 artifact_digests: BTreeSet::from([manifest.artifact_digest.clone()]),
-                uncertainty_digest: sha256(b"runtime-draft-requires-human-review"),
+                uncertainty_digest: sha256(origin.uncertainty_label()),
                 next_recommendation_digest: None,
                 submitted_at: now,
             },
@@ -12771,11 +13128,11 @@ impl ApplicationService {
         accepted_capsule.accept_result(now)?;
         let mut branch = self
             .store
-            .load_context_branch(&command.project_id, &accepted_capsule.branch_id)?;
+            .load_context_branch(project_id, &accepted_capsule.branch_id)?;
         let expected_branch_revision = branch.revision;
         branch.complete_for_capsule(&accepted_capsule, now)?;
         let mut handle = self.store.load_worker_handle(
-            &command.project_id,
+            project_id,
             &accepted_capsule.workspace_id,
             &accepted_capsule.worker_id,
         )?;
@@ -12783,16 +13140,16 @@ impl ApplicationService {
         handle.complete(&accepted_capsule, now)?;
         let mut lease = self
             .store
-            .load_worker_lease(&command.project_id, &accepted_capsule.worker_lease_id)?;
+            .load_worker_lease(project_id, &accepted_capsule.worker_lease_id)?;
         let expected_lease_revision = lease.revision;
         let lease_token_digest = lease.lease_token_digest.clone();
-        lease.release(accepted_capsule.worker_generation, &lease_token_digest, now)?;
+        lease.release(generation, &lease_token_digest, now)?;
         self.store.finalize_runtime_draft_with_conversation_atomic(
             &mission,
             expected_mission_revision,
             &manifest,
             &conversation,
-            expected_conversation_revision,
+            prior_conversation_revision,
             &submitted_capsule,
             &accepted_capsule,
             expected_capsule_revision,
@@ -12810,8 +13167,11 @@ impl ApplicationService {
                         "workProductType": manifest.work_product_type,
                         "manifestVersion": manifest.version,
                         "manifestDigest": manifest.manifest_digest,
-                        "runtimeTurnAttemptId": attempt.id,
-                        "runtimeMessageDigest": runtime_body_digest,
+                        "draftSource": origin.kind(),
+                        "cordisSessionId": origin.cordis_session_id(),
+                        "cordisTurn": origin.cordis_turn(),
+                        "runtimeTurnAttemptId": origin.runtime_turn_id(),
+                        "runtimeMessageDigest": body_digest,
                     }),
                     now,
                 ),
@@ -12827,7 +13187,10 @@ impl ApplicationService {
                         "missionRevision": message.mission_revision,
                         "checkpointId": message.checkpoint_id,
                         "workProductId": message.work_product_id,
-                        "runtimeTurnAttemptId": attempt.id,
+                        "draftSource": origin.kind(),
+                        "cordisSessionId": origin.cordis_session_id(),
+                        "cordisTurn": origin.cordis_turn(),
+                        "runtimeTurnAttemptId": origin.runtime_turn_id(),
                         "authorityChanged": false,
                     }),
                     now,
@@ -12839,7 +13202,7 @@ impl ApplicationService {
                         "branchId": branch.id,
                         "workerId": handle.worker_id,
                         "workerGeneration": accepted_capsule.worker_generation,
-                        "resultDigest": runtime_body_digest,
+                        "resultDigest": body_digest,
                         "capsuleRevision": accepted_capsule.revision,
                         "branchRevision": branch.revision,
                         "handleRevision": handle.revision,
@@ -12868,7 +13231,6 @@ impl ApplicationService {
             message,
         })
     }
-
     pub fn record_research(
         &mut self,
         project_id: &ProjectId,
@@ -23282,6 +23644,16 @@ pub enum ApplicationError {
     RuntimeDraftConversationAdvanced,
     #[error("persisted Runtime draft replay does not match its turn-bound content")]
     RuntimeDraftReplayMismatch,
+    #[error("Cordis draft Session history is not a valid closed log")]
+    CordisDraftSessionInvalid,
+    #[error("Cordis draft turn did not complete definitively")]
+    CordisDraftTurnNotCompleted,
+    #[error("completed Cordis draft turn has no final text message")]
+    CordisDraftMessageMissing,
+    #[error("Cordis draft does not match its Mission, Context, provider, or input scope")]
+    CordisDraftScopeMismatch,
+    #[error("persisted Cordis draft replay does not match its Session-bound content")]
+    CordisDraftReplayMismatch,
     #[error("local Runtime Context session does not match the exact project scope")]
     LocalRuntimeContextScopeMismatch,
     #[error("local Runtime Context graph conflicts with an existing durable generation")]

@@ -25,18 +25,19 @@ use hartevo_cordis::{
     KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
     LifecycleCancellation, ListenerHandle, LlmAdapter, LlmAdapterStream, LlmError,
     LlmGenerateRequest, LlmResolvedModel, ManualCompactionError, ManualCompactionErrorCode,
-    NonBail, OneShotSubagentDescriptor, RuntimeAgentIdentity, RuntimeAuthority,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeStatusCompletion, SandboxError,
-    SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig,
-    SessionCancelCause, SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart,
-    SessionCompactionSummary, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
-    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
-    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
-    SessionRequestHeader, SessionRequestHeaderReason, SessionSandboxMode, SessionStore,
-    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
-    TurnEndReason, approval_events, bind_sandbox_workspace, compact_now, host_is_cordis_loop, keys,
-    register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
+    NonBail, OneShotSubagentDescriptor, PromptSection, RegistrationHandle, RuntimeAgentIdentity,
+    RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeStatusCompletion,
+    SandboxError, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
+    SessionCallConfig, SessionCancelCause, SessionCheckpoint, SessionCompactionEnd,
+    SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionEpochHeader,
+    SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionFinishReason,
+    SessionHandle, SessionHeader, SessionId, SessionLlmFailure, SessionLlmRetry,
+    SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
+    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionSandboxMode,
+    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+    SessionToolError, TurnEndReason, approval_events, bind_sandbox_workspace, compact_now,
+    host_is_cordis_loop, keys, register_llm_adapter, register_prompt_section,
+    run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -56,11 +57,12 @@ const IDLE_JOB_COMPLETION_WAKE_BUDGET: u8 = 3;
 /// Whether OpenInterpreter is configured as an optional runtime adapter.
 #[must_use]
 fn openinterpreter_runtime_plugin(runtime: &DesktopRuntimeProjection) -> bool {
-    matches!(
-        runtime.status,
-        DesktopRuntimeAvailabilityStatus::ReadyDevelopment
-            | DesktopRuntimeAvailabilityStatus::ReadyDistribution
-    )
+    runtime.program_sha256.is_some()
+        && matches!(
+            runtime.status,
+            DesktopRuntimeAvailabilityStatus::ReadyDevelopment
+                | DesktopRuntimeAvailabilityStatus::ReadyDistribution
+        )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -652,6 +654,7 @@ pub(crate) struct DesktopAgentTurnRequest {
     workspace_root: PathBuf,
     config: SessionCallConfig,
     resolved_model: LlmResolvedModel,
+    system_prompt: Option<String>,
 }
 
 impl DesktopAgentTurnRequest {
@@ -680,6 +683,7 @@ impl DesktopAgentTurnRequest {
             workspace_root: workspace_root.into(),
             config,
             resolved_model,
+            system_prompt: None,
         })
     }
 
@@ -706,7 +710,19 @@ impl DesktopAgentTurnRequest {
             workspace_root: workspace_root.into(),
             config,
             resolved_model,
+            system_prompt: None,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(system_prompt.into());
+        self
+    }
+
+    pub(crate) fn resolve_with(mut self, adapter: &impl LlmAdapter) -> Result<Self, LlmError> {
+        self.resolved_model = adapter.prepare_model(&self.config.provider, &self.config.model)?;
+        Ok(self)
     }
 
     fn is_human_input(&self) -> bool {
@@ -723,6 +739,10 @@ impl std::fmt::Debug for DesktopAgentTurnRequest {
             .field("workspace_root", &"[REDACTED]")
             .field("config", &self.config)
             .field("resolved_model", &self.resolved_model)
+            .field(
+                "system_prompt",
+                &self.system_prompt.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("user_body", &"[REDACTED]")
             .finish()
     }
@@ -1093,6 +1113,29 @@ impl DesktopCordisCoordinator {
         ))
     }
 
+    /// Snapshot one already validated live Session. Callers use this only
+    /// after the awaited flush boundary, or after SQLCipher restore, so the
+    /// detached prefix is safe input to Application's draft-proof parser.
+    pub(crate) fn session_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionCheckpoint>, DesktopAgentTurnError> {
+        self.ensure_root_fiber_active()?;
+        let sessions = self
+            .host
+            .context()
+            .sessions::<SessionStore>()
+            .ok_or(DesktopAgentTurnError::MissingSessionStore)?;
+        let session_id = SessionId::new(session_id.to_owned())?;
+        let Some(session) = sessions.get(&session_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(SessionCheckpoint {
+            header: session.header()?,
+            events: session.events()?,
+        }))
+    }
+
     /// Run one idle-session manual compaction through the Desktop persistence
     /// and request-scoped provider boundary.
     ///
@@ -1451,6 +1494,30 @@ impl DesktopCordisCoordinator {
             .map(Some)
     }
 
+    fn register_request_prompt(
+        &mut self,
+        request: &DesktopAgentTurnRequest,
+    ) -> Result<Option<RegistrationHandle>, CordisError> {
+        request
+            .system_prompt
+            .as_ref()
+            .map(|system_prompt| {
+                register_prompt_section(
+                    self.host.context_mut(),
+                    PromptSection::new(
+                        format!("desktop-request:{}", request.input.id),
+                        1_000,
+                        system_prompt.clone(),
+                    ),
+                )
+            })
+            .transpose()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one request lifetime owns durable input, scoped prompt/provider/approval registrations, terminal flush, and exact teardown"
+    )]
     async fn run_agent_turn_with_permit<A>(
         &mut self,
         request: DesktopAgentTurnRequest,
@@ -1500,11 +1567,20 @@ impl DesktopCordisCoordinator {
         }
         self.reset_idle_job_wake_budget_for_request(&request, runtime_permit);
 
-        let approval_registration = self.register_tool_approval_answerer(
+        let prompt_registration = self.register_request_prompt(&request)?;
+        let approval_registration = match self.register_tool_approval_answerer(
             &request.session_id,
             runtime_permit,
             approval_bridge,
-        )?;
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                if let Some(registration) = prompt_registration.as_ref() {
+                    registration.dispose();
+                }
+                return Err(error.into());
+            }
+        };
         let provider = request.config.provider.clone();
         let registration = match register_llm_adapter(
             self.host.context_mut(),
@@ -1513,6 +1589,9 @@ impl DesktopCordisCoordinator {
         ) {
             Ok(registration) => registration,
             Err(error) => {
+                if let Some(registration) = prompt_registration.as_ref() {
+                    registration.dispose();
+                }
                 if let Some(registration) = approval_registration.as_ref() {
                     registration.dispose();
                 }
@@ -1544,6 +1623,9 @@ impl DesktopCordisCoordinator {
             }
         };
         registration.dispose();
+        if let Some(registration) = prompt_registration.as_ref() {
+            registration.dispose();
+        }
         if let Some(registration) = approval_registration.as_ref() {
             registration.dispose();
         }
