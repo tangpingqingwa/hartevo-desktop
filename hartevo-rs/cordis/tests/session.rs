@@ -4,14 +4,15 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentStep, CordisError, CordisHost, DispatchMode, KernelApproval, KernelApprovalDecision,
-    KernelConsentState, SessionCallConfig, SessionCallConfigAdapterDefaults, SessionContentBlock,
-    SessionEpochHeader, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
-    SessionHeader, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
-    SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionReplayEnvelope, SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason,
-    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-    SessionSurfaceOp, SessionTokenUsage, SessionToolError, SessionToolSchema, TOOL_NOT_STARTED,
-    TOOL_OUTCOME_UNKNOWN, TurnEndReason, invariant_missing, session_events,
+    KernelConsentState, OneShotSubagentDescriptor, SessionCallConfig,
+    SessionCallConfigAdapterDefaults, SessionContentBlock, SessionEpochHeader, SessionError,
+    SessionEvent, SessionEventKind, SessionFinishReason, SessionHeader, SessionId,
+    SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionReplayEnvelope,
+    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
+    SessionTokenUsage, SessionToolError, SessionToolSchema, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN,
+    TurnEndReason, invariant_missing, session_events,
 };
 
 #[derive(Debug)]
@@ -129,6 +130,51 @@ fn boundary_log_is_contiguous_and_restores_exactly() {
     let restored = SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap();
     assert_eq!(restored, log);
     assert_eq!(restored.header().id, id);
+}
+
+#[test]
+fn subagent_descriptor_is_durable_model_hidden_and_fail_closed() {
+    let mut log = SessionLog::new_at(SessionId::new("subagent-child").unwrap(), 1).unwrap();
+    let turn = log.start_turn().unwrap();
+    let descriptor = OneShotSubagentDescriptor::new("spawn", Some("research".into()));
+    assert_eq!(
+        log.append_subagent_descriptor(descriptor.clone()).unwrap(),
+        1
+    );
+    log.append_user_message(user_message("child-prompt", "inspect the crate"))
+        .unwrap();
+    log.finish_turn(turn, TurnEndReason::Blocked).unwrap();
+
+    assert_eq!(log.events()[1].kind.event_type(), "subagent/descriptor");
+    assert_eq!(log.derive_messages().len(), 1);
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), log.events().to_vec()).unwrap(),
+        log
+    );
+
+    let mut wrong_version = log.events().to_vec();
+    let SessionEventKind::SubagentDescriptor { descriptor } = &mut wrong_version[1].kind else {
+        unreachable!("fixture contains a descriptor");
+    };
+    descriptor.version += 1;
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), wrong_version).unwrap_err(),
+        SessionError::InvalidSubagentDescriptor {
+            expected: "the current descriptor version",
+        }
+    );
+
+    let mut blank_provider = log.events().to_vec();
+    let SessionEventKind::SubagentDescriptor { descriptor } = &mut blank_provider[1].kind else {
+        unreachable!("fixture contains a descriptor");
+    };
+    descriptor.provider = "  ".into();
+    assert_eq!(
+        SessionLog::restore(log.header().clone(), blank_provider).unwrap_err(),
+        SessionError::InvalidSubagentDescriptor {
+            expected: "a non-blank provider",
+        }
+    );
 }
 
 #[test]
@@ -1640,6 +1686,51 @@ fn fork_detaches_empty_and_latest_closed_seeds_with_lineage() {
         .unwrap();
     assert_eq!(parent.events().unwrap().len(), 6);
     assert_eq!(child.events().unwrap().len(), 6);
+}
+
+#[test]
+fn spawn_child_records_lineage_without_copying_parent_history() {
+    let store = SessionStore::new();
+    let parent_id = SessionId::new("spawn-parent").unwrap();
+    let parent = store.create(parent_id.clone()).unwrap();
+    let turn = parent.start_turn().unwrap();
+    parent
+        .append_user_message(user_message("parent-message", "private parent history"))
+        .unwrap();
+    parent.finish_turn(turn, TurnEndReason::Completed).unwrap();
+
+    let child_id = SessionId::new("spawn-child").unwrap();
+    let child = store.spawn_child(&parent_id, child_id.clone()).unwrap();
+    assert!(child.events().unwrap().is_empty());
+    assert_eq!(
+        child.header().unwrap().parent_session,
+        Some(parent_id.clone())
+    );
+    assert_eq!(child.header().unwrap().seed_length, Some(0));
+    assert_eq!(parent.events().unwrap().len(), 3);
+
+    let child_turn = child.start_turn().unwrap();
+    child
+        .append_subagent_descriptor(OneShotSubagentDescriptor::new("spawn", None))
+        .unwrap();
+    child
+        .finish_turn(child_turn, TurnEndReason::Blocked)
+        .unwrap();
+    assert!(child.derive_messages().unwrap().is_empty());
+
+    let missing = SessionId::new("missing-parent").unwrap();
+    let missing_child = SessionId::new("missing-spawn-child").unwrap();
+    assert_eq!(
+        store
+            .spawn_child(&missing, missing_child.clone())
+            .unwrap_err(),
+        SessionError::SessionNotFound { id: missing }
+    );
+    assert!(store.get(&missing_child).unwrap().is_none());
+    assert_eq!(
+        store.spawn_child(&parent_id, child_id.clone()).unwrap_err(),
+        SessionError::SessionAlreadyExists { id: child_id }
+    );
 }
 
 #[test]

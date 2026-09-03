@@ -25,18 +25,18 @@ use hartevo_cordis::{
     KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
     LifecycleCancellation, ListenerHandle, LlmAdapter, LlmAdapterStream, LlmError,
     LlmGenerateRequest, LlmResolvedModel, ManualCompactionError, ManualCompactionErrorCode,
-    NonBail, RuntimeAgentIdentity, RuntimeAuthority, RuntimeDispatchCompletion,
-    RuntimeDispatchPermit, RuntimeStatusCompletion, SandboxError, SessionApprovalAsked,
-    SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig, SessionCancelCause,
-    SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
-    SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent, SessionEventKind,
-    SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader, SessionId,
-    SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionRequestContext, SessionRequestHeader,
-    SessionRequestHeaderReason, SessionSandboxMode, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionSurfaceIntent, SessionToolError, TurnEndReason, approval_events,
-    bind_sandbox_workspace, compact_now, host_is_cordis_loop, keys, register_llm_adapter,
-    run_agent_turn as run_cordis_agent_turn, session_events,
+    NonBail, OneShotSubagentDescriptor, RuntimeAgentIdentity, RuntimeAuthority,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeStatusCompletion, SandboxError,
+    SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig,
+    SessionCancelCause, SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart,
+    SessionCompactionSummary, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
+    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
+    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
+    SessionRequestHeader, SessionRequestHeaderReason, SessionSandboxMode, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
+    TurnEndReason, approval_events, bind_sandbox_workspace, compact_now, host_is_cordis_loop, keys,
+    register_llm_adapter, run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -2279,6 +2279,15 @@ fn encode_event(
                 turn: *turn,
                 step: *step,
             },
+            SessionEventKind::SubagentDescriptor { descriptor } => {
+                PersistedSessionEventKind::SubagentDescriptor {
+                    descriptor: serde_json::to_value(descriptor).map_err(|_| {
+                        SessionError::InvalidSubagentDescriptor {
+                            expected: "valid JSON",
+                        }
+                    })?,
+                }
+            }
             SessionEventKind::AgentInboxSpliced {
                 target,
                 start,
@@ -2487,6 +2496,16 @@ fn decode_event(
                 turn: *turn,
                 step: *step,
             },
+            PersistedSessionEventKind::SubagentDescriptor { descriptor } => {
+                SessionEventKind::SubagentDescriptor {
+                    descriptor: serde_json::from_value::<OneShotSubagentDescriptor>(
+                        descriptor.clone(),
+                    )
+                    .map_err(|_| SessionError::InvalidSubagentDescriptor {
+                        expected: "the versioned one-shot schema",
+                    })?,
+                }
+            }
             PersistedSessionEventKind::AgentInboxSpliced {
                 target,
                 start,
@@ -3302,17 +3321,17 @@ mod tests {
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
-        OPENINTERPRETER, RuntimeBinding, SandboxError, SandboxMode, SandboxModeSource,
-        SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig,
-        SessionCancelCause, SessionCompactionEnd, SessionCompactionStart, SessionCompactionSummary,
-        SessionContentBlock, SessionError, SessionEvent, SessionEventKind, SessionFinishReason,
-        SessionHandle, SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode,
-        SessionLlmRetryStarted, SessionMessage, SessionMessageRole, SessionMessageSource,
-        SessionSandboxMode, SessionStore, SessionStreamBlockType, SessionStreamChunk,
-        SessionSurfaceIntent, SessionSurfaceOp, SessionToolSchema, SurfaceOwner, ToolCall,
-        ToolDefinition, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
-        invariant_missing, is_compact_checkpoint_source, keys, register_tool_definition,
-        session_events,
+        OPENINTERPRETER, OneShotSubagentDescriptor, RuntimeBinding, SandboxError, SandboxMode,
+        SandboxModeSource, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
+        SessionCallConfig, SessionCancelCause, SessionCompactionEnd, SessionCompactionStart,
+        SessionCompactionSummary, SessionContentBlock, SessionError, SessionEvent,
+        SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure,
+        SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionMessage,
+        SessionMessageRole, SessionMessageSource, SessionSandboxMode, SessionStore,
+        SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
+        SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason,
+        enforce_invariants, events, host_is_cordis_loop, invariant_missing,
+        is_compact_checkpoint_source, keys, register_tool_definition, session_events,
     };
     #[cfg(target_os = "macos")]
     use hartevo_cordis::{JobControl, JobOutcome, JobStatus, JobTerminalStatus, JobsSurface};
@@ -3331,12 +3350,13 @@ mod tests {
         DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisApprovalBridge,
         DesktopCordisSlot, DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
         DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
-        DesktopHumanCommandDispatch, DesktopHumanCommandResult, bind_live_domain_kernel,
-        bind_live_domain_kernel_scope, decode_event, dispatch_live_domain_command,
-        dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
-        dispatch_live_effect_verification, dispatch_live_runtime, encode_event,
-        is_desktop_human_command, manual_compaction_failure_result, mount_cordis_host,
-        openinterpreter_runtime_plugin, runtime_open_turn,
+        DesktopHumanCommandDispatch, DesktopHumanCommandResult, DesktopSessionPersistenceError,
+        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_event,
+        dispatch_live_domain_command, dispatch_live_effect_execution,
+        dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
+        dispatch_live_runtime, encode_event, is_desktop_human_command,
+        manual_compaction_failure_result, mount_cordis_host, openinterpreter_runtime_plugin,
+        runtime_open_turn,
     };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -5228,6 +5248,50 @@ mod tests {
             } if inserted.is_empty()
         ));
         assert_eq!(decode_event(&persisted).unwrap(), event);
+    }
+
+    #[test]
+    fn subagent_descriptor_codec_round_trips_exactly() {
+        let event = SessionEvent {
+            seq: 1,
+            time_ms: 2,
+            kind: SessionEventKind::SubagentDescriptor {
+                descriptor: OneShotSubagentDescriptor::new("spawn", Some("research".into())),
+            },
+        };
+
+        let persisted = encode_event(&event).unwrap();
+        assert!(matches!(
+            &persisted.kind,
+            PersistedSessionEventKind::SubagentDescriptor { descriptor }
+                if descriptor == &serde_json::json!({
+                    "version": 3,
+                    "mode": "one-shot",
+                    "provider": "spawn",
+                    "label": "research",
+                })
+        ));
+        assert_eq!(decode_event(&persisted).unwrap(), event);
+
+        let invalid = PersistedSessionEvent {
+            seq: 1,
+            time_ms: 2,
+            kind: PersistedSessionEventKind::SubagentDescriptor {
+                descriptor: serde_json::json!({
+                    "version": 3,
+                    "mode": "continuable",
+                    "provider": "spawn",
+                }),
+            },
+        };
+        assert!(matches!(
+            decode_event(&invalid),
+            Err(DesktopSessionPersistenceError::Session(
+                SessionError::InvalidSubagentDescriptor {
+                    expected: "the versioned one-shot schema",
+                }
+            ))
+        ));
     }
 
     #[test]

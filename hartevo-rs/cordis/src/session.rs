@@ -30,6 +30,7 @@ use crate::inbox::{
     AgentInbox, AgentInboxOutcome, AgentInboxState, AgentInboxTarget, validate_agent_inbox_event,
 };
 use crate::sandbox::{SandboxMode, SandboxModeSource, SessionSandboxMode};
+use crate::subagent::{OneShotSubagentDescriptor, SUBAGENT_DESCRIPTOR_VERSION};
 
 /// The Rust Session format written by this bounded implementation.
 pub const SESSION_FORMAT_VERSION: u32 = 0;
@@ -747,6 +748,9 @@ pub enum SessionEventKind {
         turn: u64,
         step: u64,
     },
+    SubagentDescriptor {
+        descriptor: OneShotSubagentDescriptor,
+    },
     AgentInboxSpliced {
         target: AgentInboxTarget,
         start: u64,
@@ -826,6 +830,7 @@ impl SessionEventKind {
             Self::TurnEnd { .. } => "turn/end",
             Self::StepStart { .. } => "step/start",
             Self::StepEnd { .. } => "step/end",
+            Self::SubagentDescriptor { .. } => "subagent/descriptor",
             Self::AgentInboxSpliced { .. } => "agent/inbox/spliced",
             Self::AssistantChunk { .. } => "assistant/chunk",
             Self::RequestHeader { .. } => "request/header",
@@ -855,6 +860,7 @@ impl SessionEventKind {
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
             | Self::StepEnd { .. }
+            | Self::SubagentDescriptor { .. }
             | Self::AgentInboxSpliced { .. }
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
@@ -881,6 +887,7 @@ impl SessionEventKind {
             | Self::TurnEnd { .. }
             | Self::StepStart { .. }
             | Self::StepEnd { .. }
+            | Self::SubagentDescriptor { .. }
             | Self::AgentInboxSpliced { .. }
             | Self::AssistantChunk { .. }
             | Self::RequestHeader { .. }
@@ -1050,6 +1057,18 @@ impl SessionState {
                 self.pending_tool_calls.clear();
                 self.open_step = None;
                 self.retry_chains.clear();
+            }
+            SessionEventKind::SubagentDescriptor { descriptor } => {
+                if descriptor.version != SUBAGENT_DESCRIPTOR_VERSION {
+                    return Err(SessionError::InvalidSubagentDescriptor {
+                        expected: "the current descriptor version",
+                    });
+                }
+                if descriptor.provider.trim().is_empty() {
+                    return Err(SessionError::InvalidSubagentDescriptor {
+                        expected: "a non-blank provider",
+                    });
+                }
             }
             SessionEventKind::AgentInboxSpliced {
                 removed_count,
@@ -1516,6 +1535,7 @@ impl SessionState {
             | SessionEventKind::TurnEnd { .. }
             | SessionEventKind::StepStart { .. }
             | SessionEventKind::StepEnd { .. }
+            | SessionEventKind::SubagentDescriptor { .. }
             | SessionEventKind::AgentInboxSpliced { .. }
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
@@ -1849,6 +1869,7 @@ fn pending_interrupted_tool_calls(events: &[SessionEvent]) -> Vec<(String, u64, 
                 }
             }
             SessionEventKind::StepStart { .. }
+            | SessionEventKind::SubagentDescriptor { .. }
             | SessionEventKind::AgentInboxSpliced { .. }
             | SessionEventKind::AssistantChunk { .. }
             | SessionEventKind::RequestHeader { .. }
@@ -2520,6 +2541,16 @@ impl SessionLog {
     pub fn finish_step(&mut self, turn: u64, step: u64) -> Result<(), SessionError> {
         self.append(SessionEventKind::StepEnd { turn, step })?;
         Ok(())
+    }
+
+    /// Append one durable, model-hidden identity for a session-backed child.
+    pub fn append_subagent_descriptor(
+        &mut self,
+        descriptor: OneShotSubagentDescriptor,
+    ) -> Result<u64, SessionError> {
+        Ok(self
+            .append(SessionEventKind::SubagentDescriptor { descriptor })?
+            .seq)
     }
 
     fn append_agent_inbox_splice(
@@ -3208,6 +3239,14 @@ impl SessionHandle {
         self.commit(|log| log.finish_step(turn, step))
     }
 
+    /// Append one durable, model-hidden identity for a session-backed child.
+    pub fn append_subagent_descriptor(
+        &self,
+        descriptor: OneShotSubagentDescriptor,
+    ) -> Result<u64, SessionError> {
+        self.commit(|log| log.append_subagent_descriptor(descriptor))
+    }
+
     pub(crate) fn require_open_turn(&self, turn: u64) -> Result<(), SessionError> {
         require_turn(self.lock()?.open_turn(), turn)
     }
@@ -3822,6 +3861,36 @@ impl SessionStore {
         Ok(handle)
     }
 
+    /// Create a fresh child Session with lineage but no inherited history.
+    pub fn spawn_child(
+        &self,
+        parent_id: &SessionId,
+        child_id: SessionId,
+    ) -> Result<SessionHandle, SessionError> {
+        let mut state = self.lock()?;
+        if state.sessions.contains_key(&child_id) {
+            return Err(SessionError::SessionAlreadyExists { id: child_id });
+        }
+        if !state.sessions.contains_key(parent_id) {
+            return Err(SessionError::SessionNotFound {
+                id: parent_id.clone(),
+            });
+        }
+        let header = SessionHeader {
+            version: SESSION_FORMAT_VERSION,
+            id: child_id.clone(),
+            created_at_ms: Utc::now().timestamp_millis(),
+            parent_session: Some(parent_id.clone()),
+            seed_length: Some(0),
+        };
+        let handle = SessionHandle::new(
+            SessionLog::restore(header, Vec::new())?,
+            self.event_dispatcher.clone(),
+        )?;
+        state.sessions.insert(child_id, handle.clone());
+        Ok(handle)
+    }
+
     pub fn restore(
         &self,
         header: SessionHeader,
@@ -4055,6 +4124,8 @@ pub enum SessionError {
     InvalidToolResultError { expected: &'static str },
     #[error("session tool/call must have {expected}")]
     InvalidToolCall { expected: &'static str },
+    #[error("session subagent/descriptor must have {expected}")]
+    InvalidSubagentDescriptor { expected: &'static str },
     #[error("session message persistence encoding is invalid")]
     InvalidMessageEncoding,
     #[error("session assistant chunk persistence encoding is invalid")]
