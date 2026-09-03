@@ -16,6 +16,8 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::agent::run_authorized_runtime_agent_turn;
+use crate::approval::{ApprovalPolicy, ApprovalPolicySource};
+use crate::sandbox::SandboxModeSource;
 use crate::service::Service;
 use crate::session::{
     SessionError, SessionEventKind, SessionHandle, SessionMessage, SessionMessageRole,
@@ -1147,6 +1149,9 @@ impl SubagentRuntime {
             .get(&parent_session)
             .map_err(|error| provider_start_failure(&provider, error))?
             .ok_or_else(|| provider_start_failure(&provider, "parent Session is unavailable"))?;
+        let inherited_sandbox_mode = parent
+            .sandbox_mode()
+            .map_err(|error| provider_start_failure(&provider, error))?;
         let attempted_depth = parent
             .header()
             .map_err(|error| provider_start_failure(&provider, error))?
@@ -1167,6 +1172,17 @@ impl SubagentRuntime {
             .spawn_child(&parent_session, child_id.clone())
             .map_err(|error| provider_start_failure(&provider, error))?;
         let establishment = LocalSessionEstablishment::new(Arc::clone(&sessions), child.clone());
+        if let Some(mode) = inherited_sandbox_mode {
+            child
+                .append_sandbox_mode(mode, Some(SandboxModeSource::Delegation))
+                .map_err(|error| provider_start_failure(&provider, error))?;
+        }
+        child
+            .set_approval_policy(
+                ApprovalPolicy::Never,
+                Some(ApprovalPolicySource::Delegation),
+            )
+            .map_err(|error| provider_start_failure(&provider, error))?;
         child
             .inbox()
             .append_next_turn(SessionMessage {

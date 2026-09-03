@@ -4,16 +4,17 @@ use std::sync::{Arc, Mutex};
 use chrono::{TimeZone, Utc};
 use futures_util::FutureExt;
 use hartevo_cordis::{
-    AgentRef, AgentStatus, AgentStatusChange, AgentsSurface, AuthorityScope, Context, CordisError,
-    CordisHost, DEFAULT_SUBAGENT_MAX_DEPTH, KernelConsentState, OneShotSubagentDescriptor,
-    ResolvedSubagentStartRequest, RuntimeBinding, SPAWN_SUBAGENT_PROVIDER_NAME,
-    SUBAGENT_DESCRIPTOR_VERSION, SUBAGENT_TOOL_NAME, SessionCallConfig, SessionContentBlock,
-    SessionEventKind, SessionFinishReason, SessionHeader, SessionId, SessionMessage,
-    SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamBlockType,
-    SessionStreamChunk, SessionToolSchema, SubagentCapabilities, SubagentCapability,
-    SubagentDescriptorMode, SubagentError, SubagentProvider, SubagentResult, SubagentRun,
-    SubagentRunEndInfo, SubagentRunInfo, SubagentRuntime, SubagentStartRequest, SubagentStopReason,
-    SubagentToolFilter, TurnEndReason, events as agent_events, register_subagent_provider,
+    AgentRef, AgentStatus, AgentStatusChange, AgentsSurface, ApprovalPolicy, ApprovalPolicySource,
+    AuthorityScope, Context, CordisError, CordisHost, DEFAULT_SUBAGENT_MAX_DEPTH,
+    KernelConsentState, OneShotSubagentDescriptor, ResolvedSubagentStartRequest, RuntimeBinding,
+    SPAWN_SUBAGENT_PROVIDER_NAME, SUBAGENT_DESCRIPTOR_VERSION, SUBAGENT_TOOL_NAME, SandboxMode,
+    SandboxModeSource, SessionCallConfig, SessionContentBlock, SessionEventKind,
+    SessionFinishReason, SessionHeader, SessionId, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionStore, SessionStreamBlockType, SessionStreamChunk,
+    SessionToolSchema, SubagentCapabilities, SubagentCapability, SubagentDescriptorMode,
+    SubagentError, SubagentProvider, SubagentResult, SubagentRun, SubagentRunEndInfo,
+    SubagentRunInfo, SubagentRuntime, SubagentStartRequest, SubagentStopReason, SubagentToolFilter,
+    TurnEndReason, events as agent_events, register_subagent_provider, set_sandbox_mode,
     subagent_events,
 };
 use tokio::sync::Notify;
@@ -619,6 +620,14 @@ async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host
             source: SessionMessageSource::User,
         })
         .unwrap();
+    set_sandbox_mode(
+        host.context(),
+        &parent_session,
+        SandboxMode::WorkspaceWrite,
+        None,
+    )
+    .await
+    .unwrap();
 
     let lifecycle = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let starts = Arc::new(Mutex::new(Vec::<SubagentRunInfo>::new()));
@@ -658,27 +667,53 @@ async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host
         })
         .unwrap();
     host.context_mut()
-        .on_waterfall(agent_events::LLM_STREAM, |stream, _next| {
-            stream.with_chunk_stream(Box::pin(futures_util::stream::iter([
-                SessionStreamChunk::BlockStart {
-                    index: 0,
-                    block_type: SessionStreamBlockType::Text,
-                },
-                SessionStreamChunk::TextDelta {
-                    index: 0,
-                    text: "child done".into(),
-                },
-                SessionStreamChunk::BlockEnd {
-                    index: 0,
-                    block: SessionContentBlock::Text {
+        .on_waterfall(agent_events::LLM_STREAM, {
+            let sessions = Arc::clone(&sessions);
+            move |stream, _next| {
+                let session_id = stream
+                    .request()
+                    .and_then(|request| request.session_id())
+                    .expect("child model request session id");
+                let child = sessions.get(session_id).unwrap().unwrap();
+                assert_eq!(
+                    child.sandbox_mode().unwrap(),
+                    Some(SandboxMode::WorkspaceWrite)
+                );
+                assert_eq!(child.approval_policy().unwrap(), ApprovalPolicy::Never);
+                let events = child.events().unwrap();
+                assert!(events.iter().any(|event| matches!(
+                    event.kind,
+                    SessionEventKind::SandboxMode { sandbox }
+                        if sandbox.mode() == SandboxMode::WorkspaceWrite
+                            && sandbox.source() == Some(SandboxModeSource::Delegation)
+                )));
+                assert!(events.iter().any(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ApprovalPolicy { approval }
+                        if approval.policy() == ApprovalPolicy::Never
+                            && approval.source() == Some(ApprovalPolicySource::Delegation)
+                )));
+                stream.with_chunk_stream(Box::pin(futures_util::stream::iter([
+                    SessionStreamChunk::BlockStart {
+                        index: 0,
+                        block_type: SessionStreamBlockType::Text,
+                    },
+                    SessionStreamChunk::TextDelta {
+                        index: 0,
                         text: "child done".into(),
                     },
-                },
-                SessionStreamChunk::Finish {
-                    reason: SessionFinishReason::Stop,
-                    replay_state: None,
-                },
-            ])))
+                    SessionStreamChunk::BlockEnd {
+                        index: 0,
+                        block: SessionContentBlock::Text {
+                            text: "child done".into(),
+                        },
+                    },
+                    SessionStreamChunk::Finish {
+                        reason: SessionFinishReason::Stop,
+                        replay_state: None,
+                    },
+                ])))
+            }
         })
         .unwrap();
 
@@ -761,6 +796,19 @@ async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host
     assert_eq!(header.delegation_depth, 1);
     assert_eq!(header.seed_length, Some(0));
     assert_eq!(
+        child.sandbox_mode().unwrap(),
+        Some(SandboxMode::WorkspaceWrite)
+    );
+    assert_eq!(child.approval_policy().unwrap(), ApprovalPolicy::Never);
+    assert_eq!(
+        parent_session.sandbox_mode().unwrap(),
+        Some(SandboxMode::WorkspaceWrite)
+    );
+    assert_eq!(
+        parent_session.approval_policy().unwrap(),
+        ApprovalPolicy::Ask
+    );
+    assert_eq!(
         child.request_header().unwrap().unwrap().config,
         call_config("mock", "model")
     );
@@ -786,6 +834,30 @@ async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host
         .iter()
         .position(|event| matches!(event.kind, SessionEventKind::RequestHeader { .. }))
         .unwrap();
+    let delegated_sandbox = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.kind,
+                SessionEventKind::SandboxMode { sandbox }
+                    if sandbox.mode() == SandboxMode::WorkspaceWrite
+                        && sandbox.source() == Some(SandboxModeSource::Delegation)
+            )
+        })
+        .unwrap();
+    let delegated_approval = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.kind,
+                SessionEventKind::ApprovalPolicy { approval }
+                    if approval.policy() == ApprovalPolicy::Never
+                        && approval.source() == Some(ApprovalPolicySource::Delegation)
+            )
+        })
+        .unwrap();
+    assert!(delegated_sandbox < turn_start);
+    assert!(delegated_approval < turn_start);
     assert!(turn_start < descriptor_positions[0]);
     assert!(descriptor_positions[0] < request_header);
     let messages = child.derive_messages().unwrap();
@@ -1012,6 +1084,20 @@ async fn authorized_runtime_subagent_tool_returns_a_fresh_child_result_to_its_pa
         Some(parent_session_id.clone())
     );
     assert_eq!(child.header().unwrap().delegation_depth, 1);
+    assert_eq!(child.sandbox_mode().unwrap(), None);
+    assert_eq!(child.approval_policy().unwrap(), ApprovalPolicy::Never);
+    let child_events = child.events().unwrap();
+    assert!(
+        !child_events
+            .iter()
+            .any(|event| matches!(event.kind, SessionEventKind::SandboxMode { .. }))
+    );
+    assert!(child_events.iter().any(|event| matches!(
+        event.kind,
+        SessionEventKind::ApprovalPolicy { approval }
+            if approval.policy() == ApprovalPolicy::Never
+                && approval.source() == Some(ApprovalPolicySource::Delegation)
+    )));
     assert_eq!(sessions.len().unwrap(), 2);
     assert!(
         host.context()
