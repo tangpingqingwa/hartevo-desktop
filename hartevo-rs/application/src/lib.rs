@@ -2781,6 +2781,27 @@ pub struct ContinueBrowserWorkspace {
 }
 
 #[derive(Clone, Debug)]
+pub struct PauseBrowserWorkspace {
+    pub project_id: ProjectId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub expected_generation: u64,
+    pub new_lease_id: BrowserControlLeaseId,
+    pub evidence_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResumeBrowserWorkspace {
+    pub project_id: ProjectId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub expected_generation: u64,
+    pub new_lease_id: BrowserControlLeaseId,
+    pub agent_lease_expires_at: Option<DateTime<Utc>>,
+    pub evidence_digest: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct AcknowledgeBrowserBatchReceipt {
     pub project_id: ProjectId,
     pub workspace_id: BrowserWorkspaceId,
@@ -5437,6 +5458,68 @@ impl ApplicationService {
             command.expected_generation,
             command.new_lease_id,
             command.lease_expires_at,
+            command.evidence_digest,
+            now,
+        )?;
+        self.store
+            .update_browser_workspace_atomic(&workspace, command.expected_revision)?;
+        if let Err(source) = host.sync_workspace(&workspace) {
+            return Err(ApplicationError::BrowserHostReconciliationRequired {
+                workspace_id: workspace.id.clone(),
+                source,
+            });
+        }
+        Ok(workspace)
+    }
+
+    /// Pause is restrictive, so the Host is fenced before the durable state
+    /// changes. A persistence conflict leaves the Host safely paused and is
+    /// reported for reconciliation.
+    pub fn pause_browser_workspace(
+        &mut self,
+        host: &mut impl BrowserControlHost,
+        command: PauseBrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserWorkspace, ApplicationError> {
+        let mut workspace = self
+            .store
+            .load_browser_workspace(&command.project_id, &command.workspace_id)?;
+        workspace.pause(
+            command.expected_revision,
+            command.expected_generation,
+            command.new_lease_id,
+            command.evidence_digest,
+            now,
+        )?;
+        host.sync_workspace(&workspace)?;
+        if let Err(source) = self
+            .store
+            .update_browser_workspace_atomic(&workspace, command.expected_revision)
+        {
+            return Err(ApplicationError::BrowserPersistenceReconciliationRequired {
+                workspace_id: workspace.id.clone(),
+                source,
+            });
+        }
+        Ok(workspace)
+    }
+
+    /// Resume is permissive, so the new durable lease is committed before the
+    /// Host receives it. Host failure therefore requires reconciliation.
+    pub fn resume_browser_workspace(
+        &mut self,
+        host: &mut impl BrowserControlHost,
+        command: ResumeBrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserWorkspace, ApplicationError> {
+        let mut workspace = self
+            .store
+            .load_browser_workspace(&command.project_id, &command.workspace_id)?;
+        workspace.resume(
+            command.expected_revision,
+            command.expected_generation,
+            command.new_lease_id,
+            command.agent_lease_expires_at,
             command.evidence_digest,
             now,
         )?;
@@ -43030,6 +43113,120 @@ sleep 30"#
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one ownership lifecycle test covers both paused owner classes"
+    )]
+    fn browser_application_pause_resume_preserves_owner_class() {
+        let directory = tempfile::tempdir().expect("browser pause directory");
+        let store = ProjectStore::in_memory().expect("store");
+        let mut fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let mut host = registered_browser_host(&fixture.profile, &fixture.workspace);
+
+        let paused_agent = fixture
+            .service
+            .pause_browser_workspace(
+                &mut host,
+                PauseBrowserWorkspace {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 1,
+                    expected_generation: 1,
+                    new_lease_id: BrowserControlLeaseId::from("lease-browser-pause-2"),
+                    evidence_digest: "b".repeat(64),
+                },
+                now() + Duration::seconds(1),
+            )
+            .expect("pause agent-owned workspace");
+        assert_eq!(paused_agent.control_state, BrowserControlState::PausedAgent);
+        assert!(paused_agent.agent_lease_expires_at.is_none());
+
+        let resumed_agent = fixture
+            .service
+            .resume_browser_workspace(
+                &mut host,
+                ResumeBrowserWorkspace {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 2,
+                    expected_generation: 2,
+                    new_lease_id: BrowserControlLeaseId::from("lease-browser-pause-3"),
+                    agent_lease_expires_at: Some(now() + Duration::hours(1)),
+                    evidence_digest: "c".repeat(64),
+                },
+                now() + Duration::seconds(2),
+            )
+            .expect("resume agent-owned workspace");
+        assert_eq!(
+            resumed_agent.control_state,
+            BrowserControlState::AgentControlled
+        );
+
+        let taken_over = fixture
+            .service
+            .take_over_browser_workspace(
+                &mut host,
+                TakeOverBrowserWorkspace {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 3,
+                    expected_generation: 3,
+                    new_lease_id: BrowserControlLeaseId::from("lease-browser-pause-4"),
+                    evidence_digest: "d".repeat(64),
+                },
+                now() + Duration::seconds(3),
+            )
+            .expect("take over resumed agent workspace");
+        assert_eq!(
+            taken_over.control_state,
+            BrowserControlState::UserControlled
+        );
+
+        let paused_user = fixture
+            .service
+            .pause_browser_workspace(
+                &mut host,
+                PauseBrowserWorkspace {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 4,
+                    expected_generation: 4,
+                    new_lease_id: BrowserControlLeaseId::from("lease-browser-pause-5"),
+                    evidence_digest: "e".repeat(64),
+                },
+                now() + Duration::seconds(4),
+            )
+            .expect("pause user-owned workspace");
+        assert_eq!(paused_user.control_state, BrowserControlState::PausedUser);
+
+        let resumed_user = fixture
+            .service
+            .resume_browser_workspace(
+                &mut host,
+                ResumeBrowserWorkspace {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 5,
+                    expected_generation: 5,
+                    new_lease_id: BrowserControlLeaseId::from("lease-browser-pause-6"),
+                    agent_lease_expires_at: None,
+                    evidence_digest: "f".repeat(64),
+                },
+                now() + Duration::seconds(5),
+            )
+            .expect("resume user-owned workspace");
+        assert_eq!(
+            resumed_user.control_state,
+            BrowserControlState::UserControlled
+        );
+        assert_eq!(
+            (resumed_user.revision, resumed_user.lease_generation),
+            (6, 6)
+        );
+        assert!(resumed_user.agent_lease_expires_at.is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one journey proves exact browser prefix persistence, restart, tamper rejection, idempotent acknowledgement, and suffix-only recovery"
     )]
     fn browser_batch_receipt_survives_restart_and_resumes_only_exact_suffix() {
@@ -43666,12 +43863,75 @@ sleep 30"#
         assert_eq!(durable.lease_generation, 2);
     }
 
-    struct RejectingContinueHost;
+    struct RejectingControlHost;
 
-    impl BrowserControlHost for RejectingContinueHost {
+    impl BrowserControlHost for RejectingControlHost {
         fn sync_workspace(&mut self, _workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
             Err(BrowserError::WorkspaceNotRegistered)
         }
+    }
+
+    #[test]
+    fn pause_rejects_before_persistence_while_resume_failure_keeps_durable_grant() {
+        let directory = tempfile::tempdir().expect("browser ordering directory");
+        let store = ProjectStore::in_memory().expect("store");
+        let mut fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let pause = PauseBrowserWorkspace {
+            project_id: fixture.project_id.clone(),
+            workspace_id: fixture.workspace.id.clone(),
+            expected_revision: 1,
+            expected_generation: 1,
+            new_lease_id: BrowserControlLeaseId::from("lease-browser-ordering-2"),
+            evidence_digest: "b".repeat(64),
+        };
+        assert!(matches!(
+            fixture.service.pause_browser_workspace(
+                &mut RejectingControlHost,
+                pause.clone(),
+                now() + Duration::seconds(1),
+            ),
+            Err(ApplicationError::Browser(
+                BrowserError::WorkspaceNotRegistered
+            ))
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .load_browser_workspace(&fixture.project_id, &fixture.workspace.id)
+                .expect("pause rejection leaves durable state")
+                .control_state,
+            BrowserControlState::AgentControlled
+        );
+
+        let mut host = registered_browser_host(&fixture.profile, &fixture.workspace);
+        fixture
+            .service
+            .pause_browser_workspace(&mut host, pause, now() + Duration::seconds(1))
+            .expect("persist exact pause");
+        assert!(matches!(
+            fixture.service.resume_browser_workspace(
+                &mut RejectingControlHost,
+                ResumeBrowserWorkspace {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 2,
+                    expected_generation: 2,
+                    new_lease_id: BrowserControlLeaseId::from("lease-browser-ordering-3"),
+                    agent_lease_expires_at: Some(now() + Duration::hours(1)),
+                    evidence_digest: "c".repeat(64),
+                },
+                now() + Duration::seconds(2),
+            ),
+            Err(ApplicationError::BrowserHostReconciliationRequired { .. })
+        ));
+        assert_eq!(
+            fixture
+                .service
+                .load_browser_workspace(&fixture.project_id, &fixture.workspace.id)
+                .expect("resume grant remains durable")
+                .control_state,
+            BrowserControlState::AgentControlled
+        );
     }
 
     #[test]
@@ -43698,7 +43958,7 @@ sleep 30"#
 
         assert!(matches!(
             fixture.service.continue_browser_workspace(
-                &mut RejectingContinueHost,
+                &mut RejectingControlHost,
                 ContinueBrowserWorkspace {
                     project_id: fixture.project_id.clone(),
                     workspace_id: fixture.workspace.id.clone(),
