@@ -21,16 +21,19 @@ use hartevo_application::connectors::shopify_readback::{
 use hartevo_application::connectors::shopify_recovery::{
     ShopifyRecoveryCapsuleRef, ShopifyRecoveryError,
 };
+use hartevo_application::llm_deepseek::{
+    DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection,
+};
 use hartevo_application::{
-    AcceptWorkProduct, AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
-    ApplicationMissionCheckpointExecution, ApplicationService, ApproveProposedEffect,
-    CatalogMissionExecutionHandle, ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace,
-    CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
-    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
-    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
-    ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
-    KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
-    ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
+    AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
+    AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
+    ApplicationService, ApproveProposedEffect, CatalogMissionExecutionHandle,
+    ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace, CordisMissionDraft, CreateProject,
+    DecideVm11OutcomeReview, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
+    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
+    ExecuteApplicationMissionCheckpoint, ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn,
+    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
+    MissionRuntimeProjection, ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
     PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProposePreviewEffect, ProvisionProjectEncryption, ReconcileUncertainEffect,
     RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
@@ -38,7 +41,7 @@ use hartevo_application::{
     RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
     RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
     StartCatalogMission, StartMission, VerifyRecordedReceiptAtRevision,
-    Vm11NextContractOrValidTerminalResult,
+    Vm11NextContractOrValidTerminalResult, cordis_mission_user_message_id,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -2148,11 +2151,25 @@ fn run_desktop_application_runtime_turn(
 pub(crate) enum DesktopRuntimeSource {
     Pinned(Box<DesktopRuntimeConfiguration>),
     #[cfg(any(test, feature = "native-journey"))]
+    #[allow(
+        dead_code,
+        reason = "the native-journey feature exposes this injectable route to focused Desktop harnesses"
+    )]
+    NativeDeepSeek {
+        model: String,
+        adapter: DeepSeekAdapter,
+    },
+    #[cfg(any(test, feature = "native-journey"))]
     Fixture {
         provider: String,
         model: String,
         command_builder: DesktopRuntimeCommandBuilder,
     },
+}
+
+enum DesktopMissionProvider {
+    NativeDeepSeek(DeepSeekAdapter),
+    ApplicationRuntime(RuntimeCommand),
 }
 
 struct LocalRuntimeResumePlan {
@@ -2162,9 +2179,23 @@ struct LocalRuntimeResumePlan {
 }
 
 impl DesktopRuntimeSource {
+    fn is_native_deepseek(&self) -> bool {
+        match self {
+            Self::Pinned(configuration) => {
+                configuration.artifact.is_none() && configuration.provider == DEEPSEEK_PROVIDER_ID
+            }
+            #[cfg(any(test, feature = "native-journey"))]
+            Self::NativeDeepSeek { .. } => true,
+            #[cfg(any(test, feature = "native-journey"))]
+            Self::Fixture { .. } => false,
+        }
+    }
+
     fn provider(&self) -> &str {
         match self {
             Self::Pinned(configuration) => &configuration.provider,
+            #[cfg(any(test, feature = "native-journey"))]
+            Self::NativeDeepSeek { .. } => DEEPSEEK_PROVIDER_ID,
             #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { provider, .. } => provider,
         }
@@ -2174,7 +2205,56 @@ impl DesktopRuntimeSource {
         match self {
             Self::Pinned(configuration) => &configuration.model,
             #[cfg(any(test, feature = "native-journey"))]
+            Self::NativeDeepSeek { model, .. } => model,
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { model, .. } => model,
+        }
+    }
+
+    fn into_mission_provider(
+        self,
+        project_root: &Path,
+        mission_scope_digest: &str,
+    ) -> Result<DesktopMissionProvider, DesktopDataError> {
+        match self {
+            Self::Pinned(configuration) => match configuration.artifact {
+                Some(artifact) => {
+                    let runtime_home =
+                        ensure_project_runtime_home(project_root, mission_scope_digest)?;
+                    artifact
+                        .runtime_command(project_root, &runtime_home)
+                        .map(DesktopMissionProvider::ApplicationRuntime)
+                        .map_err(|error| {
+                            DesktopDataError::Application(ApplicationError::Runtime(error))
+                        })
+                }
+                None if configuration.provider == DEEPSEEK_PROVIDER_ID => {
+                    let connection =
+                        DeepSeekConnection::official("DEEPSEEK_API_KEY").map_err(|error| {
+                            DesktopDataError::CordisSessionPersistence(error.to_string())
+                        })?;
+                    Ok(DesktopMissionProvider::NativeDeepSeek(
+                        DeepSeekAdapter::production(connection),
+                    ))
+                }
+                None => Err(DesktopDataError::CordisSessionPersistence(
+                    "Desktop native provider configuration is unsupported".into(),
+                )),
+            },
+            #[cfg(any(test, feature = "native-journey"))]
+            Self::NativeDeepSeek { adapter, .. } => {
+                Ok(DesktopMissionProvider::NativeDeepSeek(adapter))
+            }
+            #[cfg(any(test, feature = "native-journey"))]
+            Self::Fixture {
+                command_builder, ..
+            } => {
+                let runtime_home = ensure_project_runtime_home(project_root, mission_scope_digest)?;
+                Ok(DesktopMissionProvider::ApplicationRuntime(command_builder(
+                    project_root,
+                    &runtime_home,
+                )))
+            }
         }
     }
 
@@ -2186,8 +2266,18 @@ impl DesktopRuntimeSource {
         match self {
             Self::Pinned(configuration) => configuration
                 .artifact
+                .ok_or_else(|| {
+                    DesktopDataError::CordisSessionPersistence(
+                        "Cordis-native provider does not expose an Application Runtime command"
+                            .into(),
+                    )
+                })?
                 .runtime_command(project_root, runtime_home)
                 .map_err(|error| DesktopDataError::Application(ApplicationError::Runtime(error))),
+            #[cfg(any(test, feature = "native-journey"))]
+            Self::NativeDeepSeek { .. } => Err(DesktopDataError::CordisSessionPersistence(
+                "Cordis-native provider does not expose an Application Runtime command".into(),
+            )),
             #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture {
                 command_builder, ..
@@ -6070,6 +6160,46 @@ impl DesktopDataPlane {
                 }
             }
         };
+        if runtime.is_native_deepseek() && !is_followup {
+            let user_message_id =
+                cordis_mission_user_message_id(&mission_id, resume_plan.generation);
+            let checkpoint = {
+                let cordis = self.cordis.checkout().map_err(|error| {
+                    DesktopDataError::CordisSessionPersistence(error.to_string())
+                })?;
+                cordis
+                    .session_checkpoint(mission.id.as_str())
+                    .map_err(|error| {
+                        DesktopDataError::CordisSessionPersistence(error.to_string())
+                    })?
+            };
+            if let Some(checkpoint) = checkpoint
+                && let Some(draft) =
+                    CordisMissionDraft::from_completed_session(&checkpoint, &user_message_id)?
+            {
+                let conversation = service.mission_conversation(project_id, &mission_id)?;
+                let adoption = service.adopt_cordis_session_draft(
+                    &AdoptCordisSessionDraft {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        generation: resume_plan.generation,
+                        expected_conversation_revision: conversation.revision,
+                    },
+                    draft,
+                    now + Duration::milliseconds(logical_millis),
+                )?;
+                return self.finish_mission_submission(
+                    &service,
+                    secret_store,
+                    runtime_reconciliation,
+                    mission_id,
+                    DesktopMissionRuntimeOutcome::DraftReady {
+                        work_product_id: adoption.work_product.id,
+                    },
+                    now + Duration::milliseconds(logical_millis + 1),
+                );
+            }
+        }
         let runtime_provider = runtime.provider().to_owned();
         let runtime_model = runtime.model().to_owned();
         let tokenizer = ConservativeByteBudgetTokenizer::new(
@@ -6116,12 +6246,8 @@ impl DesktopDataPlane {
             Some(envelope)
         };
         let mission_scope_digest = format!("{:x}", Sha256::digest(mission_id.as_str().as_bytes()));
-        let runtime_home =
-            ensure_project_runtime_home(context_session.project_root(), &mission_scope_digest)?;
-        let runtime_command =
-            runtime.into_command(context_session.project_root(), &runtime_home)?;
-        let turn_id = followup.map_or_else(RuntimeTurnAttemptId::new, |followup| followup.turn_id);
-        let message_id = format!("runtime:{}:user", turn_id.as_str());
+        let mission_provider =
+            runtime.into_mission_provider(context_session.project_root(), &mission_scope_digest)?;
         let request_config = SessionCallConfig {
             provider: runtime_provider.clone(),
             model: runtime_model.clone(),
@@ -6130,11 +6256,6 @@ impl DesktopDataPlane {
             max_tokens: None,
             stop: None,
         };
-        let runtime_task_id = prepared.capsule.task_id.clone();
-        let adapter_project_id = project_id.clone();
-        let adapter_turn_id = turn_id.clone();
-        let adapter_model = runtime_model.clone();
-        let adapter_cancellation = cancellation.cloned();
         let cordis_cancellation = cancellation
             .filter(|control| !control.is_requested())
             .map_or_else(
@@ -6142,6 +6263,125 @@ impl DesktopDataPlane {
                 DesktopRuntimeCancellation::cordis_cancellation,
             );
         let cordis_approval = cancellation.map(DesktopRuntimeCancellation::cordis_approval_bridge);
+        if let DesktopMissionProvider::NativeDeepSeek(adapter) = &mission_provider {
+            let adapter = adapter.clone();
+            if is_followup {
+                return Err(DesktopDataError::CordisSessionPersistence(
+                    "Cordis-native provider follow-up adoption is not available in this slice"
+                        .into(),
+                ));
+            }
+            let prompt = envelope
+                .as_ref()
+                .ok_or(ApplicationError::CordisDraftScopeMismatch)?
+                .render_prompt()
+                .map_err(ApplicationError::from)?;
+            let user_body = Self::runtime_session_user_body(&service, &mission)?;
+            let message_id = cordis_mission_user_message_id(&mission_id, resume_plan.generation);
+            let request = DesktopAgentTurnRequest::new(
+                mission.id.as_str(),
+                &message_id,
+                user_body,
+                context_session.project_root(),
+                request_config,
+            )
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
+            .with_system_prompt(prompt)
+            .resolve_with(&adapter)
+            .map_err(CordisError::from)?;
+            let (agent_result, checkpoint) = {
+                let mut cordis = self.cordis.checkout().map_err(|error| {
+                    DesktopDataError::CordisSessionPersistence(error.to_string())
+                })?;
+                let result = futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
+                    request,
+                    adapter,
+                    &cordis_cancellation,
+                    permit,
+                    cordis_approval.as_ref(),
+                ));
+                let checkpoint =
+                    cordis
+                        .session_checkpoint(mission.id.as_str())
+                        .map_err(|error| {
+                            DesktopDataError::CordisSessionPersistence(error.to_string())
+                        })?;
+                (result, checkpoint)
+            };
+            let outcome = match agent_result {
+                Ok(outcome) => match outcome.reason() {
+                    TurnEndReason::Completed => {
+                        let checkpoint = checkpoint.ok_or_else(|| {
+                            DesktopDataError::CordisSessionPersistence(
+                                "completed Cordis turn has no durable Session checkpoint".into(),
+                            )
+                        })?;
+                        let draft =
+                            CordisMissionDraft::from_completed_session(&checkpoint, &message_id)?
+                                .ok_or(ApplicationError::CordisDraftMessageMissing)?;
+                        let conversation = service.mission_conversation(project_id, &mission_id)?;
+                        let adoption = service.adopt_cordis_session_draft(
+                            &AdoptCordisSessionDraft {
+                                project_id: project_id.clone(),
+                                mission_id: mission_id.clone(),
+                                generation: resume_plan.generation,
+                                expected_conversation_revision: conversation.revision,
+                            },
+                            draft,
+                            now + Duration::milliseconds(logical_millis + 1),
+                        )?;
+                        DesktopMissionRuntimeOutcome::DraftReady {
+                            work_product_id: adoption.work_product.id,
+                        }
+                    }
+                    TurnEndReason::Interrupted | TurnEndReason::Aborted(_) => {
+                        DesktopMissionRuntimeOutcome::Interrupted
+                    }
+                    TurnEndReason::Blocked | TurnEndReason::Error | TurnEndReason::MaxTokens => {
+                        DesktopMissionRuntimeOutcome::Failed
+                    }
+                },
+                Err(DesktopAgentTurnError::Cordis(CordisError::Llm(_))) => {
+                    DesktopMissionRuntimeOutcome::Failed
+                }
+                Err(error) => {
+                    return Err(DesktopDataError::CordisSessionPersistence(
+                        error.to_string(),
+                    ));
+                }
+            };
+            if let Some(control) = cancellation {
+                let phase = match &outcome {
+                    DesktopMissionRuntimeOutcome::DraftReady { .. } => {
+                        DesktopRuntimeProgressPhase::Completed
+                    }
+                    DesktopMissionRuntimeOutcome::Interrupted => {
+                        DesktopRuntimeProgressPhase::Interrupted
+                    }
+                    DesktopMissionRuntimeOutcome::Failed => DesktopRuntimeProgressPhase::Failed,
+                    _ => DesktopRuntimeProgressPhase::Uncertain,
+                };
+                control.record_progress(phase);
+            }
+            return self.finish_mission_submission(
+                &service,
+                secret_store,
+                runtime_reconciliation,
+                mission_id,
+                outcome,
+                now + Duration::milliseconds(logical_millis + 2),
+            );
+        }
+        let DesktopMissionProvider::ApplicationRuntime(runtime_command) = mission_provider else {
+            unreachable!("native provider returned above")
+        };
+        let turn_id = followup.map_or_else(RuntimeTurnAttemptId::new, |followup| followup.turn_id);
+        let message_id = format!("runtime:{}:user", turn_id.as_str());
+        let runtime_task_id = prepared.capsule.task_id.clone();
+        let adapter_project_id = project_id.clone();
+        let adapter_turn_id = turn_id.clone();
+        let adapter_model = runtime_model.clone();
+        let adapter_cancellation = cancellation.cloned();
         let (agent_result, completion) = {
             let mut cordis = self
                 .cordis
@@ -8470,7 +8710,7 @@ impl From<DesktopCordisApprovalDecisionError> for DesktopDataError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     };
@@ -8488,6 +8728,7 @@ mod tests {
         ShopifyEffectIdempotencyKey, ShopifyFulfillmentLineItem,
         ShopifyFulfillmentOrderLineItemGid, ShopifyFulfillmentScope,
     };
+    use hartevo_application::llm_deepseek::{DeepSeekTransport, DeepSeekWireResponse};
     use hartevo_application::{
         AcceptCreatorTask, CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject,
         EvidenceInput, ProposePreviewEffect, ProvisionProjectEncryption, PublishCreatorTask,
@@ -10270,6 +10511,73 @@ sleep 30"#
             provider: "fixture-provider".into(),
             model: "fixture-model".into(),
             command_builder: Box::new(completed_runtime_fixture_command),
+        }
+    }
+
+    #[derive(Clone)]
+    struct MissionDeepSeekTransport {
+        response: DeepSeekWireResponse,
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl DeepSeekTransport for MissionDeepSeekTransport {
+        fn execute(
+            &self,
+            connection: &DeepSeekConnection,
+            api_key: &str,
+            request: &serde_json::Value,
+            cancellation: &LifecycleCancellation,
+        ) -> Result<DeepSeekWireResponse, SessionLlmFailure> {
+            assert_eq!(connection.base_url().as_str(), "https://api.deepseek.com/");
+            assert_eq!(api_key, "desktop-mission-secret");
+            assert!(!cancellation.is_cancelled());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    fn native_deepseek_mission_source(
+        draft: &str,
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> DesktopRuntimeSource {
+        let response = DeepSeekWireResponse::new(
+            vec![
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": draft},
+                        "finish_reason": "stop",
+                    }],
+                })
+                .to_string(),
+                "[DONE]".into(),
+            ],
+            Some("desktop-mission-draft".into()),
+        );
+        let adapter = DeepSeekAdapter::new(
+            DeepSeekConnection::new(
+                "https://api.deepseek.com",
+                "DEEPSEEK_API_KEY",
+                128_000,
+                8_192,
+                StdDuration::from_secs(5),
+            )
+            .unwrap(),
+            |name: &str| {
+                assert_eq!(name, "DEEPSEEK_API_KEY");
+                Ok(Zeroizing::new("desktop-mission-secret".into()))
+            },
+            MissionDeepSeekTransport {
+                response,
+                calls,
+                requests,
+            },
+        );
+        DesktopRuntimeSource::NativeDeepSeek {
+            model: "deepseek-chat".into(),
+            adapter,
         }
     }
 
@@ -12973,6 +13281,162 @@ sleep 30"#;
         let append_cursor = journey.pull_and_apply_append(&reset_cursor);
         journey.acknowledge_caught_up(&append_cursor);
         journey.reselect_and_reopen(&append_cursor);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused Desktop journey proves native request composition, atomic Domain adoption, SQLCipher privacy, and cold replay together"
+    )]
+    fn cordis_native_deepseek_mission_adopts_once_and_recovers_without_provider_replay() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let private_goal = "Produce a bounded native Cordis market draft";
+        let private_draft = "Native Cordis draft; no OpenInterpreter process was launched.";
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let submission = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Native Cordis Mission".into()),
+                    goal: private_goal.into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "owner".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "EUR".into(),
+                },
+                Some(native_deepseek_mission_source(
+                    private_draft,
+                    Arc::clone(&provider_calls),
+                    Arc::clone(&provider_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("native Cordis Mission draft");
+        let work_product_id = match &submission.runtime_outcome {
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id.clone(),
+            outcome => panic!("unexpected native Cordis outcome: {outcome:?}"),
+        };
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        let requests = provider_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0]["messages"].as_array().expect("wire messages");
+        assert!(messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("HARTEVO_CONTEXT_ENVELOPE_V2"))
+        }));
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message["role"] == "user" && message["content"] == private_goal })
+        );
+        assert!(!requests[0].to_string().contains("desktop-mission-secret"));
+        drop(requests);
+        plane.with_cordis_host(|host| {
+            assert!(
+                hartevo_cordis::assemble_system_prompt(host.context_mut())
+                    .expect("post-turn prompt assembly")
+                    .system()
+                    .is_none()
+            );
+        });
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("reopen native Cordis state");
+        assert!(
+            service
+                .latest_runtime_turn_for_mission(&project_id, &submission.mission_id)
+                .expect("legacy Runtime query")
+                .is_none()
+        );
+        let conversation = service
+            .mission_conversation(&project_id, &submission.mission_id)
+            .expect("Mission conversation");
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[1].body, private_draft);
+        assert_eq!(
+            conversation.messages[1].work_product_id.as_ref(),
+            Some(&work_product_id)
+        );
+        let ids =
+            hartevo_application::LocalMissionRuntimeIds::for_mission(&submission.mission_id, 1);
+        assert_eq!(
+            service
+                .context_capsule(&project_id, &ids.capsule_id)
+                .expect("accepted native capsule")
+                .status,
+            ContextCapsuleStatus::Accepted
+        );
+        assert_eq!(
+            service
+                .context_branch(&project_id, &ids.branch_id)
+                .expect("completed native branch")
+                .status,
+            ContextBranchStatus::Completed
+        );
+        assert_eq!(
+            service
+                .context_worker_lease(&project_id, &ids.worker_lease_id)
+                .expect("released native lease")
+                .status,
+            WorkerLeaseStatus::Released
+        );
+        let events_before_restart = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("native Mission events");
+        let event_json = serde_json::to_string(&events_before_restart).unwrap();
+        assert!(!event_json.contains(private_goal));
+        assert!(!event_json.contains(private_draft));
+
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(&secrets, observed_at() + Duration::minutes(4))
+                .expect("restore SQLCipher and Cordis Session"),
+            DesktopLoadState::Ready(_)
+        ));
+        let replay = cold
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                Some(native_deepseek_mission_source(
+                    "must not be requested",
+                    Arc::clone(&provider_calls),
+                    Arc::clone(&provider_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(5),
+            )
+            .expect("cold native Cordis adoption replay");
+        assert_eq!(
+            replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id }
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(6))
+            .expect("reopen after native replay");
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("unchanged native Mission events"),
+            events_before_restart
+        );
     }
 
     #[cfg(unix)]
