@@ -1,7 +1,7 @@
 //! Desktop-facing Cordis host. Mounts SurfaceMapping, automatic compaction,
-//! AgentLoop, and InvariantGate, and issues typed Domain-command and Runtime permits. The
-//! symbolic AgentLoop is not Desktop Runtime authority; OpenInterpreter
-//! remains an optional adapter.
+//! AgentLoop, the local spawn provider, and InvariantGate, and issues typed
+//! Domain-command and Runtime permits. The symbolic AgentLoop is not Desktop
+//! Runtime authority; OpenInterpreter remains an optional adapter.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +33,10 @@ use crate::loader::{
 };
 use crate::service::Service;
 use crate::session::{SessionCallConfig, SessionId, SessionStore};
+use crate::subagent::{
+    SUBAGENT_SPAWN_IN_PROCESS_PLUGIN_ID, SpawnInProcessSubagent, SubagentRun, SubagentRuntime,
+    SubagentStartRequest,
+};
 use crate::surface::{
     AgentPublicationCommit, AgentRef, AgentStatus, AgentStatusChange, AgentsSurface,
     DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces, LlmSurface,
@@ -41,7 +45,13 @@ use crate::surface::{
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
-pub const HOST_PLUGIN_IDS: &[&str] = &["surfaces", "compaction-basic", "agent-loop", "invariants"];
+pub const HOST_PLUGIN_IDS: &[&str] = &[
+    "surfaces",
+    "compaction-basic",
+    "agent-loop",
+    SUBAGENT_SPAWN_IN_PROCESS_PLUGIN_ID,
+    "invariants",
+];
 
 /// Optional OpenInterpreter adapter plugin id. Never the loop.
 pub const OPENINTERPRETER_PLUGIN_ID: &str = OPENINTERPRETER;
@@ -304,8 +314,8 @@ impl std::fmt::Debug for CordisHost {
 }
 
 impl CordisHost {
-    /// Mount the sealed Hartevo surfaces, automatic compaction, AgentLoop, and
-    /// InvariantGate on a fresh context.
+    /// Mount the sealed Hartevo surfaces, automatic compaction, AgentLoop,
+    /// local spawn provider, and InvariantGate on a fresh context.
     ///
     /// `runtime_plugin` may name OpenInterpreter as an optional adapter on
     /// [`RuntimeSurface::plugin`]. Domain and Effect stay Hartevo-owned.
@@ -314,6 +324,7 @@ impl CordisHost {
         map_surfaces(&mut ctx, desktop_surfaces(openinterpreter))?;
         ctx.mount(CompactionAutomation::default())?;
         ctx.mount(AgentLoop)?;
+        ctx.mount(SpawnInProcessSubagent::default())?;
         ctx.mount(InvariantGate)?;
         Ok(Self {
             ctx,
@@ -333,7 +344,7 @@ impl CordisHost {
         })
     }
 
-    /// Same four services, selected by overlay rather than a crate boot list.
+    /// Same host services, selected by overlay rather than a crate boot list.
     pub fn boot_overlay(
         overlay: &EnvironmentOverlay,
         loader: &LoaderContext,
@@ -350,6 +361,11 @@ impl CordisHost {
         .with_inject(CompactionAutomation::inject().iter().copied());
         let loop_plugin = PluginSpec::new("agent-loop", |_config, ctx| AgentLoop.apply(ctx))
             .with_inject(AgentLoop::inject().iter().copied());
+        let spawn_subagent =
+            PluginSpec::new(SUBAGENT_SPAWN_IN_PROCESS_PLUGIN_ID, |_config, ctx| {
+                SpawnInProcessSubagent::default().apply(ctx)
+            })
+            .with_inject(SpawnInProcessSubagent::inject().iter().copied());
         let gate = PluginSpec::new("invariants", |_config, ctx| InvariantGate.apply(ctx))
             .with_inject(InvariantGate::inject().iter().copied());
         let adapter = PluginSpec::new(OPENINTERPRETER_PLUGIN_ID, |_config, ctx| {
@@ -362,7 +378,14 @@ impl CordisHost {
             &mut ctx,
             loader,
             overlay,
-            &[mapping, compaction, loop_plugin, gate, adapter],
+            &[
+                mapping,
+                compaction,
+                loop_plugin,
+                spawn_subagent,
+                gate,
+                adapter,
+            ],
         )?;
         Ok((
             Self {
@@ -526,6 +549,55 @@ impl CordisHost {
         seed_config: SessionCallConfig,
         cancellation: &LifecycleCancellation,
     ) -> Result<AgentTurnOutcome, CordisError> {
+        self.require_active_runtime_permit(permit)?;
+        run_authorized_runtime_agent_turn(
+            &mut self.ctx,
+            permit.agent(),
+            session_id,
+            seed_config,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Establish and synchronously drive one fresh local child under the exact
+    /// active parent Runtime permit.
+    ///
+    /// The inherited config is frozen by value before child publication. This
+    /// keeps the single mutable Context host-owned instead of lending it to a
+    /// detached `'static` provider future.
+    pub async fn run_authorized_local_subagent(
+        &mut self,
+        permit: &RuntimeDispatchPermit,
+        provider: &str,
+        request: SubagentStartRequest,
+        inherited_config: SessionCallConfig,
+    ) -> Result<Arc<dyn SubagentRun>, CordisError> {
+        self.require_active_runtime_permit(permit)?;
+        if !request.parent.is_same_lifecycle(permit.agent()) {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        if request
+            .parent_session
+            .as_ref()
+            .is_some_and(|session| session.as_str() != permit.scope().mission_id())
+        {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        let runtime = self
+            .ctx
+            .subagents::<SubagentRuntime>()
+            .ok_or_else(|| CordisError::MissingDependencies(vec![keys::SUBAGENTS.to_string()]))?;
+        runtime
+            .start_local(&mut self.ctx, provider, request, inherited_config)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn require_active_runtime_permit(
+        &mut self,
+        permit: &RuntimeDispatchPermit,
+    ) -> Result<(), CordisError> {
         self.reap_abandoned_runtime();
         let Some(active) = self.active_runtime.as_ref() else {
             return Err(CordisError::RuntimePermitMismatch);
@@ -550,14 +622,7 @@ impl CordisHost {
         {
             return Err(CordisError::RuntimePermitMismatch);
         }
-        run_authorized_runtime_agent_turn(
-            &mut self.ctx,
-            permit.agent(),
-            session_id,
-            seed_config,
-            cancellation,
-        )
-        .await
+        Ok(())
     }
 
     /// Settle an issued Runtime permit and return its out-of-lock Idle
@@ -1338,11 +1403,12 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
 }
 
 #[must_use]
-pub fn host_plugin_ids() -> [PluginId; 4] {
+pub fn host_plugin_ids() -> [PluginId; 5] {
     [
         PluginId::new(HOST_PLUGIN_IDS[0]),
         PluginId::new(HOST_PLUGIN_IDS[1]),
         PluginId::new(HOST_PLUGIN_IDS[2]),
         PluginId::new(HOST_PLUGIN_IDS[3]),
+        PluginId::new(HOST_PLUGIN_IDS[4]),
     ]
 }

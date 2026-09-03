@@ -1,25 +1,46 @@
 //! Named provider registry for child-agent delegation.
 //!
-//! This module owns provider selection plus the provider-neutral one-shot
-//! descriptor and lifecycle seam. Provider backends still own child
-//! construction and durable descriptor seeding; later slices add continuation
-//! and model-facing tools.
+//! This module owns provider selection, the provider-neutral one-shot lifecycle,
+//! and the first host-driven fresh-Session provider. Detached backends retain
+//! their own transports; later slices add continuation and model-facing tools.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
 use thiserror::Error;
+use tokio::sync::Notify;
+use uuid::Uuid;
 
+use crate::agent::run_authorized_runtime_agent_turn;
+use crate::service::Service;
+use crate::session::{
+    SessionError, SessionEventKind, SessionHandle, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionStore, TurnEndReason, validate_agent_request_config,
+};
+use crate::surface::{
+    AgentPreStepDecision, AgentPublicationCommit, AgentStatus, AgentStatusChange, AgentsSurface,
+    events as agent_events,
+};
 use crate::{
-    AgentRef, Context, Emit, EventKey, EventReentry, EventSchemaId, LifecycleCancellation,
-    RegistrationHandle, SessionCallConfig, SessionContentBlock, SessionId,
+    AgentRef, Context, CordisError, Emit, EventKey, EventReentry, EventSchemaId,
+    LifecycleCancellation, RegistrationHandle, SessionCallConfig, SessionContentBlock, SessionId,
+    keys,
 };
 
 /// DeepSeek Harness descriptor format implemented by this slice.
 pub const SUBAGENT_DESCRIPTOR_VERSION: u32 = 3;
+
+/// Host-plane id of the first in-process one-shot provider plugin.
+pub const SUBAGENT_SPAWN_IN_PROCESS_PLUGIN_ID: &str = "subagent-spawn-in-process";
+
+/// Default registry name of the in-process fresh-session provider.
+pub const SPAWN_SUBAGENT_PROVIDER_NAME: &str = "spawn";
+
+/// Services required by the host-plane in-process provider.
+pub const SUBAGENT_SPAWN_IN_PROCESS_KEYS: &[&str] = &[keys::SUBAGENTS];
 
 /// Supported lifecycle mode of a child descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -175,6 +196,7 @@ pub struct SubagentStartRequest {
     pub label: Option<String>,
     pub prompt: Vec<SessionContentBlock>,
     pub parent: AgentRef,
+    pub parent_session: Option<SessionId>,
     pub cancellation: LifecycleCancellation,
     pub agent_options: Option<SessionCallConfig>,
     pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
@@ -190,6 +212,7 @@ impl SubagentStartRequest {
             label: None,
             prompt,
             parent,
+            parent_session: None,
             cancellation: LifecycleCancellation::default(),
             agent_options: None,
             output_schema: None,
@@ -197,6 +220,13 @@ impl SubagentStartRequest {
             tool_filter: None,
             persona: None,
         }
+    }
+
+    /// Bind the exact parent Session when a provider creates a local child.
+    #[must_use]
+    pub fn with_parent_session(mut self, parent_session: SessionId) -> Self {
+        self.parent_session = Some(parent_session);
+        self
     }
 }
 
@@ -206,6 +236,7 @@ pub struct ResolvedSubagentStartRequest {
     pub label: Option<String>,
     pub prompt: Vec<SessionContentBlock>,
     pub parent: AgentRef,
+    pub parent_session: Option<SessionId>,
     pub cancellation: LifecycleCancellation,
     pub agent_options: Option<SessionCallConfig>,
     pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
@@ -222,6 +253,7 @@ impl ResolvedSubagentStartRequest {
             label: request.label,
             prompt: request.prompt,
             parent: request.parent,
+            parent_session: request.parent_session,
             cancellation: request.cancellation,
             agent_options: request.agent_options,
             output_schema: request.output_schema,
@@ -311,6 +343,12 @@ pub enum SubagentError {
     ProviderIdentityOverflow,
     #[error("subagent run identity overflowed")]
     RunIdentityOverflow,
+    #[error("subagent provider `{provider}` requires the local Cordis host driver")]
+    HostDriverRequired { provider: String },
+    #[error("subagent provider `{provider}` requires an exact parent Session")]
+    ParentSessionRequired { provider: String },
+    #[error("subagent provider `{provider}` was cancelled before child publication")]
+    AbortedBeforePublication { provider: String },
     #[error("subagent provider `{provider}` failed to start: {detail}")]
     ProviderStart { provider: String, detail: String },
 }
@@ -328,6 +366,9 @@ impl SubagentError {
             Self::RegistryPoisoned => "INVARIANT",
             Self::ProviderIdentityOverflow => "PROVIDER_IDENTITY_OVERFLOW",
             Self::RunIdentityOverflow => "RUN_ID_OVERFLOW",
+            Self::HostDriverRequired { .. } => "HOST_DRIVER_REQUIRED",
+            Self::ParentSessionRequired { .. } => "PARENT_SESSION_REQUIRED",
+            Self::AbortedBeforePublication { .. } => "ABORTED",
             Self::ProviderStart { .. } => "PROVIDER_START_FAILED",
         }
     }
@@ -350,6 +391,88 @@ pub trait SubagentProvider: Send + Sync + 'static {
         &self,
         request: ResolvedSubagentStartRequest,
     ) -> BoxFuture<'static, Result<Arc<dyn SubagentRun>, SubagentError>>;
+
+    /// Resolve a same-Context child call before the host borrows its Context.
+    ///
+    /// Detached providers return `None`. A local provider returns the frozen
+    /// config the host must drive, optionally replacing inherited parent
+    /// options with the request's explicit `agent_options`.
+    fn local_agent_config(
+        &self,
+        _request: &ResolvedSubagentStartRequest,
+        _inherited: &SessionCallConfig,
+    ) -> Option<SessionCallConfig> {
+        None
+    }
+}
+
+/// First host-plane provider: a fresh child Session on the same Cordis Context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnInProcessSubagent {
+    provider_name: String,
+}
+
+impl SpawnInProcessSubagent {
+    #[must_use]
+    pub fn new(provider_name: impl Into<String>) -> Self {
+        Self {
+            provider_name: provider_name.into(),
+        }
+    }
+}
+
+impl Default for SpawnInProcessSubagent {
+    fn default() -> Self {
+        Self::new(SPAWN_SUBAGENT_PROVIDER_NAME)
+    }
+}
+
+impl Service for SpawnInProcessSubagent {
+    fn inject() -> &'static [&'static str] {
+        SUBAGENT_SPAWN_IN_PROCESS_KEYS
+    }
+
+    fn apply(self, ctx: &mut Context) -> Result<(), CordisError> {
+        let provider: Arc<dyn SubagentProvider> = Arc::new(self);
+        register_subagent_provider(ctx, provider)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+}
+
+impl SubagentProvider for SpawnInProcessSubagent {
+    fn name(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn capabilities(&self) -> SubagentCapabilities {
+        SubagentCapabilities::NONE.with(SubagentCapability::AgentOptions)
+    }
+
+    fn inherits_parent_context(&self) -> bool {
+        false
+    }
+
+    fn start(
+        &self,
+        _request: ResolvedSubagentStartRequest,
+    ) -> BoxFuture<'static, Result<Arc<dyn SubagentRun>, SubagentError>> {
+        let provider = self.provider_name.clone();
+        async move { Err(SubagentError::HostDriverRequired { provider }) }.boxed()
+    }
+
+    fn local_agent_config(
+        &self,
+        request: &ResolvedSubagentStartRequest,
+        inherited: &SessionCallConfig,
+    ) -> Option<SessionCallConfig> {
+        Some(
+            request
+                .agent_options
+                .clone()
+                .unwrap_or_else(|| inherited.clone()),
+        )
+    }
 }
 
 type SharedSubagentResult = Shared<BoxFuture<'static, Result<SubagentResult, SubagentError>>>;
@@ -380,6 +503,185 @@ impl SubagentRun for ObservedSubagentRun {
 struct ProviderRegistration {
     id: u64,
     provider: Arc<dyn SubagentProvider>,
+}
+
+struct PreparedSubagentStart {
+    run_id: SubagentRunId,
+    provider_name: String,
+    provider: Arc<dyn SubagentProvider>,
+    request: ResolvedSubagentStartRequest,
+}
+
+struct LocalSubagentRunState {
+    result: Option<Result<SubagentResult, SubagentError>>,
+    publication: Option<AgentPublicationCommit>,
+}
+
+struct LocalSubagentRun {
+    id: SessionId,
+    agent: AgentRef,
+    events: EventReentry,
+    state: Arc<Mutex<LocalSubagentRunState>>,
+    settled: Arc<Notify>,
+}
+
+impl LocalSubagentRun {
+    fn new(
+        id: SessionId,
+        agent: AgentRef,
+        events: EventReentry,
+        publication: AgentPublicationCommit,
+    ) -> Self {
+        Self {
+            id,
+            agent,
+            events,
+            state: Arc::new(Mutex::new(LocalSubagentRunState {
+                result: None,
+                publication: Some(publication),
+            })),
+            settled: Arc::new(Notify::new()),
+        }
+    }
+
+    fn settle(&self, result: Result<SubagentResult, SubagentError>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.result.is_some() {
+            return;
+        }
+        let became_idle = state
+            .publication
+            .as_ref()
+            .is_some_and(AgentPublicationCommit::mark_idle);
+        state.result = Some(result);
+        drop(state);
+        if became_idle {
+            let _ = self.events.emit_contained(
+                agent_events::AGENT_STATUS,
+                &AgentStatusChange::new(self.agent.clone(), AgentStatus::Idle),
+            );
+        }
+        self.settled.notify_waiters();
+    }
+
+    fn release_publication(&self) {
+        let publication = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .publication
+            .take();
+        if publication.is_some() {
+            drop(publication);
+            let _ = self
+                .events
+                .emit_contained(agent_events::AGENT_DISPOSED, &self.agent);
+        }
+    }
+}
+
+impl SubagentRun for LocalSubagentRun {
+    fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    fn local_agent(&self) -> Option<AgentRef> {
+        Some(self.agent.clone())
+    }
+
+    fn result(&self) -> BoxFuture<'static, Result<SubagentResult, SubagentError>> {
+        let state = Arc::clone(&self.state);
+        let settled = Arc::clone(&self.settled);
+        async move {
+            loop {
+                let notified = settled.notified();
+                if let Some(result) = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .result
+                    .clone()
+                {
+                    return result;
+                }
+                notified.await;
+            }
+        }
+        .boxed()
+    }
+
+    fn dispose(&self) -> BoxFuture<'static, Result<(), SubagentError>> {
+        let state = Arc::clone(&self.state);
+        let events = self.events.clone();
+        let agent = self.agent.clone();
+        async move {
+            let publication = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .publication
+                .take();
+            if publication.is_some() {
+                drop(publication);
+                let _ = events.emit_contained(agent_events::AGENT_DISPOSED, &agent);
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+struct LocalSubagentDriveGuard {
+    run: Arc<LocalSubagentRun>,
+    child: SessionHandle,
+    provider: String,
+    descriptor_listener: Option<crate::ListenerHandle>,
+    finished: bool,
+}
+
+impl LocalSubagentDriveGuard {
+    fn new(
+        run: Arc<LocalSubagentRun>,
+        child: SessionHandle,
+        provider: String,
+        descriptor_listener: crate::ListenerHandle,
+    ) -> Self {
+        Self {
+            run,
+            child,
+            provider,
+            descriptor_listener: Some(descriptor_listener),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, result: Result<SubagentResult, SubagentError>) {
+        if let Some(listener) = self.descriptor_listener.take() {
+            listener.dispose();
+        }
+        self.run.settle(result);
+        self.finished = true;
+    }
+}
+
+impl Drop for LocalSubagentDriveGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(listener) = self.descriptor_listener.take() {
+            listener.dispose();
+        }
+        let output = final_assistant_output(&self.child).unwrap_or_default();
+        let mut result = SubagentResult::new(output, SubagentStopReason::Aborted);
+        result.diagnostic = Some(format!(
+            "subagent provider `{}` host drive was dropped before settlement",
+            self.provider
+        ));
+        self.run.settle(Ok(result));
+        self.run.release_publication();
+    }
 }
 
 #[derive(Default)]
@@ -479,12 +781,11 @@ impl SubagentRuntime {
             .map(|registered| Arc::clone(&registered.provider)))
     }
 
-    /// Select a provider, fail closed on unsupported options, and start it.
-    pub async fn start(
+    fn prepare_start(
         &self,
         name: &str,
         request: SubagentStartRequest,
-    ) -> Result<Arc<dyn SubagentRun>, SubagentError> {
+    ) -> Result<PreparedSubagentStart, SubagentError> {
         let provider = self
             .get_provider(name)?
             .ok_or_else(|| SubagentError::NoProvider {
@@ -517,12 +818,26 @@ impl SubagentRuntime {
             });
         }
         let run_id = self.allocate_run_id()?;
-        let request = ResolvedSubagentStartRequest::one_shot(provider.name(), request);
-        let parent = request.parent.clone();
-        let run = provider.start(request).await?;
+        let provider_name = provider.name().to_owned();
+        let request = ResolvedSubagentStartRequest::one_shot(&provider_name, request);
+        Ok(PreparedSubagentStart {
+            run_id,
+            provider_name,
+            provider,
+            request,
+        })
+    }
+
+    fn observe_run(
+        &self,
+        run_id: SubagentRunId,
+        provider: String,
+        parent: AgentRef,
+        run: Arc<dyn SubagentRun>,
+    ) -> Arc<dyn SubagentRun> {
         let info = SubagentRunInfo {
             run_id,
-            provider: provider.name().to_owned(),
+            provider,
             id: run.id().clone(),
             local: run.local_agent().is_some(),
             parent,
@@ -563,7 +878,198 @@ impl SubagentRuntime {
                 drop(result.await);
             }));
         }
+        observed
+    }
+
+    /// Select a provider, fail closed on unsupported options, and start it.
+    pub async fn start(
+        &self,
+        name: &str,
+        request: SubagentStartRequest,
+    ) -> Result<Arc<dyn SubagentRun>, SubagentError> {
+        let prepared = self.prepare_start(name, request)?;
+        let parent = prepared.request.parent.clone();
+        let run = prepared.provider.start(prepared.request).await?;
+        Ok(self.observe_run(prepared.run_id, prepared.provider_name, parent, run))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered host transaction keeps child establishment, publication, drive, and settlement adjacent"
+    )]
+    pub(crate) async fn start_local(
+        &self,
+        ctx: &mut Context,
+        name: &str,
+        request: SubagentStartRequest,
+        inherited_config: SessionCallConfig,
+    ) -> Result<Arc<dyn SubagentRun>, SubagentError> {
+        let prepared = self.prepare_start(name, request)?;
+        let provider = prepared.provider_name.clone();
+        let config = prepared
+            .provider
+            .local_agent_config(&prepared.request, &inherited_config)
+            .ok_or_else(|| SubagentError::HostDriverRequired {
+                provider: provider.clone(),
+            })?;
+        validate_agent_request_config(&config)
+            .map_err(|error| provider_start_failure(&provider, error))?;
+        if prepared.request.cancellation.is_cancelled() {
+            return Err(SubagentError::AbortedBeforePublication { provider });
+        }
+        let parent_session = prepared.request.parent_session.clone().ok_or_else(|| {
+            SubagentError::ParentSessionRequired {
+                provider: provider.clone(),
+            }
+        })?;
+        let sessions = ctx
+            .sessions::<SessionStore>()
+            .ok_or_else(|| provider_start_failure(&provider, "SessionStore is unavailable"))?;
+        let child_id = SessionId::new(Uuid::now_v7().to_string())
+            .map_err(|error| provider_start_failure(&provider, error))?;
+        let child = sessions
+            .spawn_child(&parent_session, child_id.clone())
+            .map_err(|error| provider_start_failure(&provider, error))?;
+        child
+            .inbox()
+            .append_next_turn(SessionMessage {
+                id: format!("subagent:{}:prompt", child_id.as_str()),
+                role: SessionMessageRole::User,
+                content: prepared.request.prompt.clone(),
+                source: SessionMessageSource::User,
+            })
+            .map_err(|error| provider_start_failure(&provider, error))?;
+
+        let child_agent = AgentRef::new(child_id.as_str());
+        let descriptor_appended = Arc::new(AtomicBool::new(false));
+        let descriptor_failure = Arc::new(Mutex::new(None::<String>));
+        let descriptor_listener = ctx
+            .on_waterfall(agent_events::AGENT_PRE_STEP, {
+                let child_agent = child_agent.clone();
+                let child = child.clone();
+                let descriptor = prepared.request.descriptor.clone();
+                let descriptor_appended = Arc::clone(&descriptor_appended);
+                let descriptor_failure = Arc::clone(&descriptor_failure);
+                move |proposal, next| {
+                    let proposal = next(proposal);
+                    if proposal.agent().is_same_lifecycle(&child_agent)
+                        && matches!(proposal.decision(), AgentPreStepDecision::Enter { .. })
+                        && !descriptor_appended.swap(true, Ordering::AcqRel)
+                        && let Err(error) = child.append_subagent_descriptor(descriptor.clone())
+                    {
+                        *descriptor_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(error.to_string());
+                        return proposal.reject();
+                    }
+                    proposal
+                }
+            })
+            .map_err(|error| provider_start_failure(&provider, error))?;
+        let agents = ctx
+            .agents::<AgentsSurface>()
+            .ok_or_else(|| provider_start_failure(&provider, "AgentsSurface is unavailable"))?;
+        let publication = agents
+            .prepare_publication(child_agent.clone())
+            .commit()
+            .map_err(|error| provider_start_failure(&provider, error))?;
+        let local = Arc::new(LocalSubagentRun::new(
+            child_id.clone(),
+            child_agent.clone(),
+            self.events.clone(),
+            publication,
+        ));
+        let _ = self
+            .events
+            .emit_contained(agent_events::AGENT_CREATED, &child_agent);
+        let _ = self.events.emit_contained(
+            agent_events::AGENT_STATUS,
+            &AgentStatusChange::new(child_agent.clone(), AgentStatus::Running),
+        );
+        let erased: Arc<dyn SubagentRun> = local.clone();
+        let observed = self.observe_run(
+            prepared.run_id,
+            prepared.provider_name,
+            prepared.request.parent,
+            erased,
+        );
+        let drive = LocalSubagentDriveGuard::new(
+            Arc::clone(&local),
+            child.clone(),
+            provider.clone(),
+            descriptor_listener,
+        );
+
+        let outcome = run_authorized_runtime_agent_turn(
+            ctx,
+            &child_agent,
+            &child_id,
+            config,
+            &prepared.request.cancellation,
+        )
+        .await;
+        let descriptor_failure = descriptor_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drive.finish(local_result(&child, outcome, descriptor_failure, &provider));
         Ok(observed)
+    }
+}
+
+fn provider_start_failure(provider: &str, error: impl fmt::Display) -> SubagentError {
+    SubagentError::ProviderStart {
+        provider: provider.to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+fn local_result(
+    child: &SessionHandle,
+    outcome: Result<crate::AgentTurnOutcome, CordisError>,
+    descriptor_failure: Option<String>,
+    provider: &str,
+) -> Result<SubagentResult, SubagentError> {
+    let output =
+        final_assistant_output(child).map_err(|error| provider_start_failure(provider, error))?;
+    if let Some(diagnostic) = descriptor_failure {
+        let mut result = SubagentResult::new(output, SubagentStopReason::Error);
+        result.diagnostic = Some(diagnostic);
+        return Ok(result);
+    }
+    match outcome {
+        Ok(outcome) => Ok(SubagentResult::new(
+            output,
+            subagent_stop_reason(outcome.reason()),
+        )),
+        Err(error) => {
+            let mut result = SubagentResult::new(output, SubagentStopReason::Error);
+            result.diagnostic = Some(error.to_string());
+            Ok(result)
+        }
+    }
+}
+
+fn final_assistant_output(child: &SessionHandle) -> Result<Vec<SessionContentBlock>, SessionError> {
+    Ok(child
+        .events()?
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.kind {
+            SessionEventKind::AssistantMessage { message, .. } => Some(message.content),
+            _ => None,
+        })
+        .unwrap_or_default())
+}
+
+const fn subagent_stop_reason(reason: TurnEndReason) -> SubagentStopReason {
+    match reason {
+        TurnEndReason::Completed => SubagentStopReason::Completed,
+        TurnEndReason::Aborted(_) => SubagentStopReason::Aborted,
+        TurnEndReason::Blocked => SubagentStopReason::Refusal,
+        TurnEndReason::MaxTokens => SubagentStopReason::MaxTokens,
+        TurnEndReason::Error | TurnEndReason::Interrupted => SubagentStopReason::Error,
     }
 }
 
