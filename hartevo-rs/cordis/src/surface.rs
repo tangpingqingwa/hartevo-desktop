@@ -31,7 +31,7 @@ use crate::session::{
     SessionStreamChunk, SessionToolCall, SessionToolError, SessionToolSchema,
     events as session_events, validate_agent_request_config, validate_agent_user_message,
 };
-use crate::subagent::SubagentRuntime;
+use crate::subagent::{SubagentRuntime, events as subagent_events};
 
 /// Canonical DeepSeek Harness code for a tool call cancelled before dispatch.
 pub const TOOL_ABORTED_BEFORE_DISPATCH: &str = "ABORTED_BEFORE_DISPATCH";
@@ -3231,7 +3231,7 @@ pub(crate) fn map_surfaces(
     }
     validate_mapped_events(ctx)?;
 
-    let session_dispatcher = ctx.event_reentry()?;
+    let event_dispatcher = ctx.event_reentry()?;
     ctx.provide(keys::TOOLS, ToolsSurface::new())?;
     ctx.provide(keys::APPROVAL, ApprovalSurface)?;
     let sandbox_policy = SandboxPolicyService::from_process().map_err(|error| {
@@ -3244,11 +3244,11 @@ pub(crate) fn map_surfaces(
     ctx.provide(keys::LLM, LlmSurface::new())?;
     ctx.provide(
         keys::SESSIONS,
-        SessionStore::with_event_dispatcher(session_dispatcher),
+        SessionStore::with_event_dispatcher(event_dispatcher.clone()),
     )?;
     ctx.provide(keys::AGENTS, AgentsSurface::new())?;
     ctx.provide(keys::JOBS, JobsSurface::default())?;
-    ctx.provide(keys::SUBAGENTS, SubagentRuntime::new())?;
+    ctx.provide(keys::SUBAGENTS, SubagentRuntime::new(event_dispatcher))?;
     ctx.provide_reserved(authority, keys::DOMAIN, surfaces.domain)?;
     ctx.provide_reserved(authority, keys::EFFECT_BROKER, surfaces.effect_broker)?;
     ctx.provide_reserved(authority, keys::RUNTIME, surfaces.runtime)?;
@@ -3271,6 +3271,8 @@ fn validate_mapped_events(ctx: &Context) -> Result<(), CordisError> {
     validate_mapped_event(ctx, events::AGENT_REQUEST)?;
     validate_mapped_event(ctx, events::AGENT_REQUEST_ERROR)?;
     validate_mapped_event(ctx, events::AGENT_TURN_STOPPING)?;
+    validate_mapped_event(ctx, subagent_events::SUBAGENT_START)?;
+    validate_mapped_event(ctx, subagent_events::SUBAGENT_END)?;
     validate_mapped_event(ctx, session_events::SESSION_EVENT)?;
     validate_mapped_event(ctx, session_events::SESSION_FLUSH)?;
     Ok(())
@@ -3323,6 +3325,8 @@ fn lock_mapped_events(ctx: &mut Context) -> Result<(), CordisError> {
     ctx.lock_event_key(events::AGENT_REQUEST)?;
     ctx.lock_event_key(events::AGENT_REQUEST_ERROR)?;
     ctx.lock_event_key(events::AGENT_TURN_STOPPING)?;
+    ctx.lock_event_key(subagent_events::SUBAGENT_START)?;
+    ctx.lock_event_key(subagent_events::SUBAGENT_END)?;
     ctx.lock_event_key(session_events::SESSION_EVENT)?;
     ctx.lock_event_key(session_events::SESSION_FLUSH)?;
     Ok(())
@@ -4335,9 +4339,8 @@ pub fn expected_mode(name: impl AsRef<str>) -> Option<DispatchMode> {
         | "agent/request"
         | "agent/request-error" => Some(DispatchMode::Waterfall),
         "approval/request" | "agent/turn-stopping" => Some(DispatchMode::Serial),
-        "tools/result" | "agent/created" | "agent/status" | "agent/disposed" | "session/event" => {
-            Some(DispatchMode::Emit)
-        }
+        "tools/result" | "agent/created" | "agent/status" | "agent/disposed" | "subagent/start"
+        | "subagent/end" | "session/event" => Some(DispatchMode::Emit),
         "session/flush" => Some(DispatchMode::Parallel),
         _ => None,
     }
