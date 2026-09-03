@@ -536,6 +536,162 @@ pub fn cordis_mission_user_message_id(mission_id: &MissionId, generation: u64) -
     )
 }
 
+#[derive(Clone, Debug)]
+pub enum CordisMissionTurnPlan {
+    Adopt(CordisMissionDraft),
+    Dispatch { user_message_id: String },
+}
+
+impl CordisMissionTurnPlan {
+    /// Selects the only safe next action for one Mission generation.
+    ///
+    /// A completed attempt always wins and is adopted without provider replay.
+    /// Closed non-completed attempts advance to a fresh deterministic identity;
+    /// open, duplicate, gapped, or malformed attempt histories fail closed.
+    pub fn from_session(
+        checkpoint: Option<&SessionCheckpoint>,
+        mission_id: &MissionId,
+        generation: u64,
+    ) -> Result<Self, ApplicationError> {
+        if generation == 0 {
+            return Err(ApplicationError::CordisDraftScopeMismatch);
+        }
+        let Some(checkpoint) = checkpoint else {
+            return Ok(Self::Dispatch {
+                user_message_id: cordis_mission_user_message_id(mission_id, generation),
+            });
+        };
+        SessionLog::restore(checkpoint.header.clone(), checkpoint.events.clone())
+            .map_err(|_| ApplicationError::CordisDraftSessionInvalid)?;
+        if checkpoint.header.id.as_str() != mission_id.as_str() {
+            return Err(ApplicationError::CordisDraftScopeMismatch);
+        }
+
+        let mut open_turn = None;
+        let mut open_attempt = None;
+        let mut attempts = BTreeMap::<u64, (String, Option<TurnEndReason>)>::new();
+        for event in &checkpoint.events {
+            match &event.kind {
+                SessionEventKind::TurnStart { turn } => {
+                    open_turn = Some(*turn);
+                    open_attempt = None;
+                }
+                SessionEventKind::UserMessage { message, .. } => {
+                    let Some(attempt) =
+                        cordis_mission_user_message_attempt(&message.id, mission_id, generation)?
+                    else {
+                        continue;
+                    };
+                    let expected_attempt = u64::try_from(attempts.len())
+                        .ok()
+                        .and_then(|attempt| attempt.checked_add(1))
+                        .ok_or(ApplicationError::CordisDraftScopeMismatch)?;
+                    if message.role != SessionMessageRole::User
+                        || message.source != SessionMessageSource::User
+                        || open_turn.is_none()
+                        || open_attempt.is_some()
+                        || attempt != expected_attempt
+                    {
+                        return Err(ApplicationError::CordisDraftScopeMismatch);
+                    }
+                    open_attempt = Some(attempt);
+                    attempts.insert(attempt, (message.id.clone(), None));
+                }
+                SessionEventKind::TurnEnd { turn, reason } if open_turn == Some(*turn) => {
+                    if let Some(attempt) = open_attempt.take() {
+                        attempts
+                            .get_mut(&attempt)
+                            .ok_or(ApplicationError::CordisDraftScopeMismatch)?
+                            .1 = Some(*reason);
+                    }
+                    open_turn = None;
+                }
+                _ => {}
+            }
+        }
+        if open_turn.is_some() || open_attempt.is_some() {
+            return Err(ApplicationError::CordisDraftTurnNotCompleted);
+        }
+        let completed = attempts
+            .iter()
+            .filter_map(|(attempt, (_, reason))| {
+                (reason.as_ref() == Some(&TurnEndReason::Completed)).then_some(*attempt)
+            })
+            .collect::<Vec<_>>();
+        if completed.len() > 1 {
+            return Err(ApplicationError::CordisDraftReplayMismatch);
+        }
+        if let Some(completed_attempt) = completed.first().copied() {
+            if Some(completed_attempt) != attempts.keys().next_back().copied() {
+                return Err(ApplicationError::CordisDraftReplayMismatch);
+            }
+            let message_id = &attempts
+                .get(&completed_attempt)
+                .ok_or(ApplicationError::CordisDraftReplayMismatch)?
+                .0;
+            let draft = CordisMissionDraft::from_completed_session(checkpoint, message_id)?
+                .ok_or(ApplicationError::CordisDraftReplayMismatch)?;
+            return Ok(Self::Adopt(draft));
+        }
+        if attempts.values().any(|(_, reason)| reason.is_none()) {
+            return Err(ApplicationError::CordisDraftTurnNotCompleted);
+        }
+        let next_attempt = attempts
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(ApplicationError::CordisDraftScopeMismatch)?;
+        Ok(Self::Dispatch {
+            user_message_id: cordis_mission_user_message_id_for_attempt(
+                mission_id,
+                generation,
+                next_attempt,
+            ),
+        })
+    }
+}
+
+fn cordis_mission_user_message_id_for_attempt(
+    mission_id: &MissionId,
+    generation: u64,
+    attempt: u64,
+) -> String {
+    if attempt == 1 {
+        cordis_mission_user_message_id(mission_id, generation)
+    } else {
+        format!(
+            "mission:{}:generation:{generation}:attempt:{attempt}:user",
+            mission_id.as_str()
+        )
+    }
+}
+
+fn cordis_mission_user_message_attempt(
+    message_id: &str,
+    mission_id: &MissionId,
+    generation: u64,
+) -> Result<Option<u64>, ApplicationError> {
+    let scope = format!("mission:{}:generation:{generation}:", mission_id.as_str());
+    let Some(suffix) = message_id.strip_prefix(&scope) else {
+        return Ok(None);
+    };
+    if suffix == "user" {
+        return Ok(Some(1));
+    }
+    let attempt = suffix
+        .strip_prefix("attempt:")
+        .and_then(|suffix| suffix.strip_suffix(":user"))
+        .and_then(|attempt| attempt.parse::<u64>().ok())
+        .filter(|attempt| *attempt >= 2)
+        .ok_or(ApplicationError::CordisDraftScopeMismatch)?;
+    if suffix != format!("attempt:{attempt}:user") {
+        return Err(ApplicationError::CordisDraftScopeMismatch);
+    }
+    Ok(Some(attempt))
+}
+
 impl CordisMissionDraft {
     /// Return `None` when this Session has never consumed the requested input.
     /// Once that identity is present, every mismatch fails closed.
@@ -12909,10 +13065,14 @@ impl ApplicationService {
             body_digest,
             user_message_id,
         } = draft;
+        let user_message_attempt = cordis_mission_user_message_attempt(
+            &user_message_id,
+            &command.mission_id,
+            command.generation,
+        )?;
         if command.generation == 0
             || session_id != command.mission_id.as_str()
-            || user_message_id
-                != cordis_mission_user_message_id(&command.mission_id, command.generation)
+            || user_message_attempt.is_none()
         {
             return Err(ApplicationError::CordisDraftScopeMismatch);
         }
@@ -23944,6 +24104,25 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 10, 10, 0, 0)
             .single()
             .expect("valid time")
+    }
+
+    #[test]
+    fn cordis_mission_turn_plan_rejects_crash_open_turn_before_input() {
+        let mission_id = MissionId::from("mission-cordis-open-turn");
+        let mut session = SessionLog::new(
+            hartevo_cordis::SessionId::new(mission_id.as_str()).expect("Session identity"),
+        )
+        .expect("Session log");
+        session.start_turn().expect("crash-open turn");
+        let checkpoint = SessionCheckpoint {
+            header: session.header().clone(),
+            events: session.events().to_vec(),
+        };
+
+        assert!(matches!(
+            CordisMissionTurnPlan::from_session(Some(&checkpoint), &mission_id, 1),
+            Err(ApplicationError::CordisDraftTurnNotCompleted)
+        ));
     }
 
     fn outbox_for_event(
