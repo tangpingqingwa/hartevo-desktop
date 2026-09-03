@@ -22,7 +22,8 @@ use hartevo_application::connectors::shopify_recovery::{
     ShopifyRecoveryCapsuleRef, ShopifyRecoveryError,
 };
 use hartevo_application::llm_deepseek::{
-    DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, UreqDeepSeekTransport,
+    DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, DeepSeekTransport,
+    UreqDeepSeekTransport,
 };
 use hartevo_application::{
     AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
@@ -2290,21 +2291,42 @@ impl DesktopRuntimeSource {
 fn production_native_deepseek_adapter(
     configuration: &DesktopRuntimeConfiguration,
 ) -> Result<DeepSeekAdapter, DesktopDataError> {
+    if configuration.native_profile_reference.is_none() {
+        let connection = DeepSeekConnection::official(DEEPSEEK_CREDENTIAL_ENV)
+            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
+        return Ok(DeepSeekAdapter::production(connection));
+    }
+    native_deepseek_profile_adapter(
+        configuration,
+        Arc::new(OsSecretStore::new(OS_SECRET_SERVICE)?),
+        UreqDeepSeekTransport,
+    )
+}
+
+fn native_deepseek_profile_adapter<S, T>(
+    configuration: &DesktopRuntimeConfiguration,
+    store: Arc<S>,
+    transport: T,
+) -> Result<DeepSeekAdapter, DesktopDataError>
+where
+    S: SecretStore + 'static,
+    T: DeepSeekTransport,
+{
+    if configuration.artifact.is_some() || configuration.provider != DEEPSEEK_PROVIDER_ID {
+        return Err(DesktopDataError::CordisSessionPersistence(
+            "Desktop native provider configuration is unsupported".into(),
+        ));
+    }
+    let Some(reference) = configuration.native_profile_reference.clone() else {
+        return Err(DesktopDataError::CordisSessionPersistence(
+            "Desktop native provider profile reference is unavailable".into(),
+        ));
+    };
     let connection = DeepSeekConnection::official(DEEPSEEK_CREDENTIAL_ENV)
         .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
-    let Some(reference) = configuration.native_profile_reference.clone() else {
-        return Ok(DeepSeekAdapter::production(connection));
-    };
-    let resolver = DesktopNativeDeepSeekCredentialResolver::new(
-        Arc::new(OsSecretStore::new(OS_SECRET_SERVICE)?),
-        reference,
-        configuration.model.clone(),
-    );
-    Ok(DeepSeekAdapter::new(
-        connection,
-        resolver,
-        UreqDeepSeekTransport,
-    ))
+    let resolver =
+        DesktopNativeDeepSeekCredentialResolver::new(store, reference, configuration.model.clone());
+    Ok(DeepSeekAdapter::new(connection, resolver, transport))
 }
 
 impl DesktopSnapshot {
@@ -8935,6 +8957,66 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    #[derive(Clone)]
+    struct NativeProviderReadinessTransport {
+        expected_credential_sha256: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DeepSeekTransport for NativeProviderReadinessTransport {
+        fn execute(
+            &self,
+            connection: &DeepSeekConnection,
+            api_key: &str,
+            request: &serde_json::Value,
+            cancellation: &LifecycleCancellation,
+        ) -> Result<DeepSeekWireResponse, SessionLlmFailure> {
+            assert_eq!(connection.base_url().as_str(), "https://api.deepseek.com/");
+            assert_eq!(request["model"], "deepseek-chat");
+            assert!(!cancellation.is_cancelled());
+            assert_eq!(
+                format!("{:x}", Sha256::digest(api_key.as_bytes())),
+                self.expected_credential_sha256
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DeepSeekWireResponse::new(
+                vec![
+                    serde_json::json!({
+                        "choices": [{
+                            "delta": {"content": "native profile ready"},
+                            "finish_reason": "stop",
+                        }],
+                    })
+                    .to_string(),
+                    "[DONE]".into(),
+                ],
+                Some("desktop-native-readiness".into()),
+            ))
+        }
+    }
+
+    fn native_provider_readiness_request(id: &str) -> LlmGenerateRequest {
+        LlmGenerateRequest::new(
+            SessionCallConfig {
+                provider: DEEPSEEK_PROVIDER_ID.into(),
+                model: "deepseek-chat".into(),
+                reasoning_effort: None,
+                temperature: None,
+                max_tokens: Some(64),
+                stop: None,
+            },
+            vec![hartevo_cordis::SessionMessage {
+                id: format!("{id}-message"),
+                role: SessionMessageRole::User,
+                content: vec![SessionContentBlock::Text {
+                    text: "confirm native provider readiness".into(),
+                }],
+                source: SessionMessageSource::User,
+            }],
+        )
+        .with_session_id(SessionId::new(id).expect("valid readiness Session id"))
+    }
+
     #[test]
     fn native_deepseek_profile_is_data_root_scoped_and_never_projected() {
         let first_root = tempfile::tempdir().expect("first data root");
@@ -8985,6 +9067,95 @@ mod tests {
             .clear_native_deepseek_with(&store)
             .expect("idempotent clear");
         assert_eq!(store.entry_count().expect("entry count"), 0);
+    }
+
+    #[test]
+    fn native_deepseek_profile_survives_cold_reopen_and_revokes_at_request_boundary() {
+        let directory = tempfile::tempdir().expect("readiness data root");
+        let data_root = directory.path().join("desktop-data");
+        let first = DesktopDataPlane::at_data_root(&data_root).expect("first plane");
+        let store = Arc::new(MemorySecretStore::default());
+        first
+            .configure_native_deepseek_with(
+                store.as_ref(),
+                "deepseek-chat",
+                Zeroizing::new("desktop-readiness-secret-a".into()),
+            )
+            .expect("configure native profile");
+        let profile_reference = first.native_provider_profile_reference.clone();
+        drop(first);
+
+        let reopened = DesktopDataPlane::at_data_root(&data_root).expect("cold reopened plane");
+        assert_eq!(
+            reopened.native_provider_profile_reference,
+            profile_reference
+        );
+        let discovery = reopened.discover_runtime_with(store.as_ref());
+        assert_eq!(
+            discovery.projection.status,
+            DesktopRuntimeAvailabilityStatus::ReadyDistribution
+        );
+        let configuration = discovery.configuration.expect("ready native configuration");
+        assert_eq!(
+            configuration.native_profile_reference.as_ref(),
+            Some(&profile_reference)
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rotated_credential = "desktop-readiness-secret-b";
+        let adapter = native_deepseek_profile_adapter(
+            &configuration,
+            Arc::clone(&store),
+            NativeProviderReadinessTransport {
+                expected_credential_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(rotated_credential.as_bytes())
+                ),
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("compose production native profile adapter");
+        assert!(!format!("{configuration:?}").contains("desktop-readiness-secret"));
+        assert!(!format!("{adapter:?}").contains("desktop-readiness-secret"));
+
+        reopened
+            .configure_native_deepseek_with(
+                store.as_ref(),
+                "deepseek-chat",
+                Zeroizing::new(rotated_credential.into()),
+            )
+            .expect("rotate stored credential after discovery");
+        adapter
+            .prepare_model(DEEPSEEK_PROVIDER_ID, "deepseek-chat")
+            .expect("prepare exact native model");
+        let _stream = adapter
+            .stream(native_provider_readiness_request(
+                "native-readiness-before-clear",
+            ))
+            .expect("resolve the rotated credential at request time");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        reopened
+            .clear_native_deepseek_with(store.as_ref())
+            .expect("clear stored native profile");
+        assert!(matches!(
+            store.get(&profile_reference),
+            Err(SecretStoreError::SecretNotFound)
+        ));
+        let fallback = reopened.discover_runtime_with(store.as_ref());
+        assert!(
+            fallback
+                .configuration
+                .as_ref()
+                .is_none_or(|configuration| configuration.native_profile_reference.is_none())
+        );
+        let Err(failure) = adapter.stream(native_provider_readiness_request(
+            "native-readiness-after-clear",
+        )) else {
+            panic!("cleared profile must fail before transport");
+        };
+        assert_eq!(failure.code, "INVALID_CONFIGURATION");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
