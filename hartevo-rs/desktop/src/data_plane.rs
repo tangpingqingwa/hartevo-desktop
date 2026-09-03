@@ -28,12 +28,13 @@ use hartevo_application::{
     AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
     AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
     ApplicationService, ApproveProposedEffect, CatalogMissionExecutionHandle,
-    ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace, CordisMissionDraft, CreateProject,
-    DecideVm11OutcomeReview, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
-    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
-    ExecuteApplicationMissionCheckpoint, ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn,
-    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
-    MissionRuntimeProjection, ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
+    ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace, CordisMissionDraft,
+    CordisMissionTurnPlan, CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
+    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
+    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
+    ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
+    KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
+    ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
     PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProposePreviewEffect, ProvisionProjectEncryption, ReconcileUncertainEffect,
     RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
@@ -41,7 +42,7 @@ use hartevo_application::{
     RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
     RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition,
     StartCatalogMission, StartMission, VerifyRecordedReceiptAtRevision,
-    Vm11NextContractOrValidTerminalResult, cordis_mission_user_message_id,
+    Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -6160,9 +6161,7 @@ impl DesktopDataPlane {
                 }
             }
         };
-        if runtime.is_native_deepseek() && !is_followup {
-            let user_message_id =
-                cordis_mission_user_message_id(&mission_id, resume_plan.generation);
+        let native_turn_plan = if runtime.is_native_deepseek() && !is_followup {
             let checkpoint = {
                 let cordis = self.cordis.checkout().map_err(|error| {
                     DesktopDataError::CordisSessionPersistence(error.to_string())
@@ -6173,33 +6172,39 @@ impl DesktopDataPlane {
                         DesktopDataError::CordisSessionPersistence(error.to_string())
                     })?
             };
-            if let Some(checkpoint) = checkpoint
-                && let Some(draft) =
-                    CordisMissionDraft::from_completed_session(&checkpoint, &user_message_id)?
-            {
-                let conversation = service.mission_conversation(project_id, &mission_id)?;
-                let adoption = service.adopt_cordis_session_draft(
-                    &AdoptCordisSessionDraft {
-                        project_id: project_id.clone(),
-                        mission_id: mission_id.clone(),
-                        generation: resume_plan.generation,
-                        expected_conversation_revision: conversation.revision,
-                    },
-                    draft,
-                    now + Duration::milliseconds(logical_millis),
-                )?;
-                return self.finish_mission_submission(
-                    &service,
-                    secret_store,
-                    runtime_reconciliation,
-                    mission_id,
-                    DesktopMissionRuntimeOutcome::DraftReady {
-                        work_product_id: adoption.work_product.id,
-                    },
-                    now + Duration::milliseconds(logical_millis + 1),
-                );
+            match CordisMissionTurnPlan::from_session(
+                checkpoint.as_ref(),
+                &mission_id,
+                resume_plan.generation,
+            )? {
+                CordisMissionTurnPlan::Adopt(draft) => {
+                    let conversation = service.mission_conversation(project_id, &mission_id)?;
+                    let adoption = service.adopt_cordis_session_draft(
+                        &AdoptCordisSessionDraft {
+                            project_id: project_id.clone(),
+                            mission_id: mission_id.clone(),
+                            generation: resume_plan.generation,
+                            expected_conversation_revision: conversation.revision,
+                        },
+                        draft,
+                        now + Duration::milliseconds(logical_millis),
+                    )?;
+                    return self.finish_mission_submission(
+                        &service,
+                        secret_store,
+                        runtime_reconciliation,
+                        mission_id,
+                        DesktopMissionRuntimeOutcome::DraftReady {
+                            work_product_id: adoption.work_product.id,
+                        },
+                        now + Duration::milliseconds(logical_millis + 1),
+                    );
+                }
+                dispatch @ CordisMissionTurnPlan::Dispatch { .. } => Some(dispatch),
             }
-        }
+        } else {
+            None
+        };
         let runtime_provider = runtime.provider().to_owned();
         let runtime_model = runtime.model().to_owned();
         let tokenizer = ConservativeByteBudgetTokenizer::new(
@@ -6277,7 +6282,12 @@ impl DesktopDataPlane {
                 .render_prompt()
                 .map_err(ApplicationError::from)?;
             let user_body = Self::runtime_session_user_body(&service, &mission)?;
-            let message_id = cordis_mission_user_message_id(&mission_id, resume_plan.generation);
+            let Some(CordisMissionTurnPlan::Dispatch {
+                user_message_id: message_id,
+            }) = native_turn_plan
+            else {
+                return Err(ApplicationError::CordisDraftScopeMismatch.into());
+            };
             let request = DesktopAgentTurnRequest::new(
                 mission.id.as_str(),
                 &message_id,
@@ -10516,9 +10526,15 @@ sleep 30"#
 
     #[derive(Clone)]
     struct MissionDeepSeekTransport {
-        response: DeepSeekWireResponse,
+        outcome: MissionDeepSeekOutcome,
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[derive(Clone)]
+    enum MissionDeepSeekOutcome {
+        Response(DeepSeekWireResponse),
+        Failure(SessionLlmFailure),
     }
 
     impl DeepSeekTransport for MissionDeepSeekTransport {
@@ -10534,7 +10550,10 @@ sleep 30"#
             assert!(!cancellation.is_cancelled());
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.requests.lock().unwrap().push(request.clone());
-            Ok(self.response.clone())
+            match &self.outcome {
+                MissionDeepSeekOutcome::Response(response) => Ok(response.clone()),
+                MissionDeepSeekOutcome::Failure(failure) => Err(failure.clone()),
+            }
         }
     }
 
@@ -10570,7 +10589,42 @@ sleep 30"#
                 Ok(Zeroizing::new("desktop-mission-secret".into()))
             },
             MissionDeepSeekTransport {
-                response,
+                outcome: MissionDeepSeekOutcome::Response(response),
+                calls,
+                requests,
+            },
+        );
+        DesktopRuntimeSource::NativeDeepSeek {
+            model: "deepseek-chat".into(),
+            adapter,
+        }
+    }
+
+    fn failing_native_deepseek_mission_source(
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> DesktopRuntimeSource {
+        let adapter = DeepSeekAdapter::new(
+            DeepSeekConnection::new(
+                "https://api.deepseek.com",
+                "DEEPSEEK_API_KEY",
+                128_000,
+                8_192,
+                StdDuration::from_secs(5),
+            )
+            .unwrap(),
+            |name: &str| {
+                assert_eq!(name, "DEEPSEEK_API_KEY");
+                Ok(Zeroizing::new("desktop-mission-secret".into()))
+            },
+            MissionDeepSeekTransport {
+                outcome: MissionDeepSeekOutcome::Failure(SessionLlmFailure {
+                    message: "bounded fixture provider failure".into(),
+                    code: "FIXTURE_FAILURE".into(),
+                    status: Some(503),
+                    provider_retry_after_ms: None,
+                    request_id: Some("fixture-failure-request".into()),
+                }),
                 calls,
                 requests,
             },
@@ -13437,6 +13491,139 @@ sleep 30"#;
                 .expect("unchanged native Mission events"),
             events_before_restart
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused journey proves a closed native failure advances the input identity while completed SQLCipher evidence still suppresses replay"
+    )]
+    fn cordis_native_deepseek_mission_retries_after_closed_failure_and_cold_recovers() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let private_goal = "Recover this native Cordis Mission after one provider failure";
+        let private_draft = "Recovered native Cordis draft.";
+        let failed_calls = Arc::new(AtomicUsize::new(0));
+        let failed_requests = Arc::new(Mutex::new(Vec::new()));
+        let failed = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Recoverable native Cordis Mission".into()),
+                    goal: private_goal.into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "owner".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "EUR".into(),
+                },
+                Some(failing_native_deepseek_mission_source(
+                    Arc::clone(&failed_calls),
+                    Arc::clone(&failed_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("closed native provider failure");
+        assert_eq!(failed.runtime_outcome, DesktopMissionRuntimeOutcome::Failed);
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+
+        let success_calls = Arc::new(AtomicUsize::new(0));
+        let success_requests = Arc::new(Mutex::new(Vec::new()));
+        let recovered = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &failed.mission_id,
+                Some(native_deepseek_mission_source(
+                    private_draft,
+                    Arc::clone(&success_calls),
+                    Arc::clone(&success_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("retry native provider with a fresh Session identity");
+        let work_product_id = match &recovered.runtime_outcome {
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id.clone(),
+            outcome => panic!("unexpected recovered native outcome: {outcome:?}"),
+        };
+        assert_eq!(success_calls.load(Ordering::SeqCst), 1);
+
+        plane.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<hartevo_cordis::SessionStore>()
+                .expect("Session store")
+                .get(&hartevo_cordis::SessionId::new(failed.mission_id.as_str()).unwrap())
+                .expect("Session lookup")
+                .expect("native Mission Session");
+            let events = session.events().expect("native Mission events");
+            let user_message_ids = events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    hartevo_cordis::SessionEventKind::UserMessage { message, .. }
+                        if message.source == SessionMessageSource::User =>
+                    {
+                        Some(message.id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_message_ids,
+                vec![
+                    format!("mission:{}:generation:1:user", failed.mission_id.as_str()),
+                    format!(
+                        "mission:{}:generation:1:attempt:2:user",
+                        failed.mission_id.as_str()
+                    ),
+                ]
+            );
+            let reasons = events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    hartevo_cordis::SessionEventKind::TurnEnd { reason, .. } => Some(*reason),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reasons,
+                vec![TurnEndReason::Error, TurnEndReason::Completed]
+            );
+        });
+
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(&secrets, observed_at() + Duration::minutes(4))
+                .expect("restore failed and completed native turns"),
+            DesktopLoadState::Ready(_)
+        ));
+        let replay = cold
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &failed.mission_id,
+                Some(native_deepseek_mission_source(
+                    "must not be requested",
+                    Arc::clone(&success_calls),
+                    Arc::clone(&success_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(5),
+            )
+            .expect("cold adoption of the completed retry");
+        assert_eq!(
+            replay.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id }
+        );
+        assert_eq!(success_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
