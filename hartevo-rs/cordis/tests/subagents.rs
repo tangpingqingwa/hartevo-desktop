@@ -897,5 +897,59 @@ async fn local_spawn_fails_closed_before_publication_without_exact_admission() {
             .unwrap(),
         before
     );
+
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+}
+
+#[tokio::test]
+async fn local_spawn_rolls_back_a_child_session_when_establishment_fails() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("parent-session");
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    sessions
+        .create(SessionId::new("parent-session").unwrap())
+        .unwrap();
+    let before = sessions.len().unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let invalid_prompt = SubagentStartRequest::new(
+        permit.agent().clone(),
+        vec![SessionContentBlock::ToolCall {
+            id: String::new(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        }],
+    )
+    .with_parent_session(SessionId::new("parent-session").unwrap());
+
+    let error = host
+        .run_authorized_local_subagent(
+            &permit,
+            SPAWN_SUBAGENT_PROVIDER_NAME,
+            invalid_prompt,
+            call_config("mock", "model"),
+        )
+        .await
+        .err()
+        .expect("invalid prompt must fail establishment");
+
+    assert!(matches!(
+        error,
+        CordisError::Subagent(SubagentError::ProviderStart { provider, .. })
+            if provider == SPAWN_SUBAGENT_PROVIDER_NAME
+    ));
+    assert_eq!(
+        sessions.len().unwrap(),
+        before,
+        "failed establishment must remove its exact child Session"
+    );
     host.finish_runtime(permit).unwrap().announce().unwrap();
 }

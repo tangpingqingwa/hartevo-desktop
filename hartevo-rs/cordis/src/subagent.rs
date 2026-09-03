@@ -684,6 +684,32 @@ impl Drop for LocalSubagentDriveGuard {
     }
 }
 
+struct LocalSessionEstablishment {
+    sessions: Arc<SessionStore>,
+    child: Option<SessionHandle>,
+}
+
+impl LocalSessionEstablishment {
+    fn new(sessions: Arc<SessionStore>, child: SessionHandle) -> Self {
+        Self {
+            sessions,
+            child: Some(child),
+        }
+    }
+
+    fn commit(mut self) {
+        self.child.take();
+    }
+}
+
+impl Drop for LocalSessionEstablishment {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            let _ = self.sessions.remove_exact(&child);
+        }
+    }
+}
+
 #[derive(Default)]
 struct RegistryState {
     last_registration_id: u64,
@@ -930,6 +956,7 @@ impl SubagentRuntime {
         let child = sessions
             .spawn_child(&parent_session, child_id.clone())
             .map_err(|error| provider_start_failure(&provider, error))?;
+        let establishment = LocalSessionEstablishment::new(Arc::clone(&sessions), child.clone());
         child
             .inbox()
             .append_next_turn(SessionMessage {
@@ -1000,6 +1027,7 @@ impl SubagentRuntime {
             provider.clone(),
             descriptor_listener,
         );
+        establishment.commit();
 
         let outcome = run_authorized_runtime_agent_turn(
             ctx,
