@@ -924,6 +924,7 @@ const fn surface_message(event: &SessionEvent) -> Option<&SessionMessage> {
         | SessionEventKind::TurnEnd { .. }
         | SessionEventKind::StepStart { .. }
         | SessionEventKind::StepEnd { .. }
+        | SessionEventKind::SubagentDescriptor { .. }
         | SessionEventKind::AgentInboxSpliced { .. }
         | SessionEventKind::AssistantChunk { .. }
         | SessionEventKind::RequestHeader { .. }

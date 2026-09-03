@@ -130,6 +130,9 @@ pub enum PersistedSessionEventKind {
         turn: u64,
         step: u64,
     },
+    SubagentDescriptor {
+        descriptor: serde_json::Value,
+    },
     AgentInboxSpliced {
         target: PersistedAgentInboxTarget,
         start: u64,
@@ -433,6 +436,10 @@ fn validate_event_payload(
         | PersistedSessionEventKind::TurnEnd { turn, .. } => (Some(*turn), None),
         PersistedSessionEventKind::StepStart { turn, step }
         | PersistedSessionEventKind::StepEnd { turn, step } => (Some(*turn), Some(*step)),
+        PersistedSessionEventKind::SubagentDescriptor { descriptor } => {
+            validate_subagent_descriptor(descriptor)?;
+            (None, None)
+        }
         PersistedSessionEventKind::AgentInboxSpliced {
             start,
             removed_count,
@@ -559,6 +566,60 @@ fn validate_event_payload(
             (Some(*turn), Some(*step))
         }
     })
+}
+
+fn validate_subagent_descriptor(value: &serde_json::Value) -> Result<(), StorageError> {
+    let descriptor = value
+        .as_object()
+        .ok_or(StorageError::InvalidSessionCheckpoint(
+            "subagent/descriptor payload must be a JSON object",
+        ))?;
+    let expected_len = if descriptor.contains_key("label") {
+        4
+    } else {
+        3
+    };
+    if descriptor.len() != expected_len
+        || !descriptor.contains_key("version")
+        || !descriptor.contains_key("mode")
+        || !descriptor.contains_key("provider")
+    {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "subagent/descriptor payload has unknown or missing fields",
+        ));
+    }
+    if descriptor
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(3)
+    {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "subagent/descriptor version must be 3",
+        ));
+    }
+    if descriptor.get("mode").and_then(serde_json::Value::as_str) != Some("one-shot") {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "subagent/descriptor mode must be one-shot",
+        ));
+    }
+    if descriptor
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|provider| provider.trim().is_empty())
+    {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "subagent/descriptor provider must not be blank",
+        ));
+    }
+    if descriptor
+        .get("label")
+        .is_some_and(|label| !label.is_string())
+    {
+        return Err(StorageError::InvalidSessionCheckpoint(
+            "subagent/descriptor label must be a string",
+        ));
+    }
+    Ok(())
 }
 
 fn retry_scope(
@@ -1488,6 +1549,71 @@ mod tests {
                 Err(StorageError::InvalidSessionCheckpoint(actual)) if actual == expected
             ));
         }
+    }
+
+    #[test]
+    fn subagent_descriptor_round_trips_and_rejects_invalid_payloads() {
+        let descriptor = PersistedSessionEventKind::SubagentDescriptor {
+            descriptor: serde_json::json!({
+                "version": 3,
+                "mode": "one-shot",
+                "provider": "spawn",
+                "label": "research",
+            }),
+        };
+        assert_eq!(validate_event_payload(&descriptor).unwrap(), (None, None));
+
+        for (descriptor, expected) in [
+            (
+                serde_json::json!({
+                    "version": 4,
+                    "mode": "one-shot",
+                    "provider": "spawn",
+                }),
+                "subagent/descriptor version must be 3",
+            ),
+            (
+                serde_json::json!({
+                    "version": 3,
+                    "mode": "continuable",
+                    "provider": "spawn",
+                }),
+                "subagent/descriptor mode must be one-shot",
+            ),
+            (
+                serde_json::json!({
+                    "version": 3,
+                    "mode": "one-shot",
+                    "provider": " ",
+                }),
+                "subagent/descriptor provider must not be blank",
+            ),
+            (
+                serde_json::json!({
+                    "version": 3,
+                    "mode": "one-shot",
+                    "provider": "spawn",
+                    "extra": true,
+                }),
+                "subagent/descriptor payload has unknown or missing fields",
+            ),
+        ] {
+            assert!(matches!(
+                validate_event_payload(&PersistedSessionEventKind::SubagentDescriptor {
+                    descriptor,
+                }),
+                Err(StorageError::InvalidSessionCheckpoint(actual)) if actual == expected
+            ));
+        }
+
+        let mut store = ProjectStore::in_memory().unwrap();
+        let durable = checkpoint(vec![PersistedSessionEvent {
+            seq: 0,
+            time_ms: 1,
+            kind: descriptor,
+        }]);
+        assert!(store.persist_session_checkpoint(&durable).unwrap());
+        assert_eq!(store.load_session_checkpoints().unwrap(), vec![durable]);
     }
 
     #[test]
