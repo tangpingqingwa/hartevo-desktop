@@ -11039,19 +11039,6 @@ sleep 30"#
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> DesktopRuntimeSource {
-        let response = DeepSeekWireResponse::new(
-            vec![
-                serde_json::json!({
-                    "choices": [{
-                        "delta": {"content": draft},
-                        "finish_reason": "stop",
-                    }],
-                })
-                .to_string(),
-                "[DONE]".into(),
-            ],
-            Some("desktop-mission-draft".into()),
-        );
         let adapter = DeepSeekAdapter::new(
             DeepSeekConnection::new(
                 "https://api.deepseek.com",
@@ -11066,7 +11053,7 @@ sleep 30"#
                 Ok(Zeroizing::new("desktop-mission-secret".into()))
             },
             MissionDeepSeekTransport {
-                outcome: MissionDeepSeekOutcome::Response(response),
+                outcome: MissionDeepSeekOutcome::Response(native_deepseek_mission_response(draft)),
                 calls,
                 requests,
             },
@@ -11075,6 +11062,49 @@ sleep 30"#
             model: "deepseek-chat".into(),
             adapter,
         }
+    }
+
+    fn native_deepseek_mission_response(draft: &str) -> DeepSeekWireResponse {
+        DeepSeekWireResponse::new(
+            vec![
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": draft},
+                        "finish_reason": "stop",
+                    }],
+                })
+                .to_string(),
+                "[DONE]".into(),
+            ],
+            Some("desktop-mission-draft".into()),
+        )
+    }
+
+    fn stored_native_deepseek_mission_source(
+        plane: &DesktopDataPlane,
+        store: Arc<MemorySecretStore>,
+        draft: &str,
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> DesktopRuntimeSource {
+        let discovery = plane.discover_runtime_with(store.as_ref());
+        assert_eq!(
+            discovery.projection.status,
+            DesktopRuntimeAvailabilityStatus::ReadyDistribution
+        );
+        let configuration = discovery.configuration.expect("stored native profile");
+        let model = configuration.model.clone();
+        let adapter = native_deepseek_profile_adapter(
+            &configuration,
+            store,
+            MissionDeepSeekTransport {
+                outcome: MissionDeepSeekOutcome::Response(native_deepseek_mission_response(draft)),
+                calls,
+                requests,
+            },
+        )
+        .expect("production stored-profile adapter");
+        DesktopRuntimeSource::NativeDeepSeek { model, adapter }
     }
 
     fn failing_native_deepseek_mission_source(
@@ -13819,15 +13849,37 @@ sleep 30"#;
         clippy::too_many_lines,
         reason = "one focused Desktop journey proves native request composition, atomic Domain adoption, SQLCipher privacy, and cold replay together"
     )]
-    fn cordis_native_deepseek_mission_adopts_once_and_recovers_without_provider_replay() {
-        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+    fn cordis_stored_native_deepseek_profile_drives_mission_and_recovers_without_provider_replay() {
+        let (directory, initial_plane, secrets, project_id) = ready_personal_fixture();
+        let secrets = Arc::new(secrets);
+        initial_plane
+            .configure_native_deepseek_with(
+                secrets.as_ref(),
+                "deepseek-chat",
+                Zeroizing::new("desktop-mission-secret".into()),
+            )
+            .expect("save native provider profile");
+        let data_root = initial_plane.data_root.clone();
+        drop(initial_plane);
+
+        let plane = DesktopDataPlane::at_data_root(&data_root).expect("reopen configured plane");
+        let DesktopLoadState::Ready(reopened) = plane
+            .load_with(secrets.as_ref(), observed_at() + Duration::minutes(2))
+            .expect("load configured Desktop")
+        else {
+            panic!("configured Desktop must remain initialized");
+        };
+        assert_eq!(
+            reopened.runtime.status,
+            DesktopRuntimeAvailabilityStatus::ReadyDistribution
+        );
         let private_goal = "Produce a bounded native Cordis market draft";
         let private_draft = "Native Cordis draft; no OpenInterpreter process was launched.";
         let provider_calls = Arc::new(AtomicUsize::new(0));
         let provider_requests = Arc::new(Mutex::new(Vec::new()));
         let submission = plane
             .start_catalog_mission_and_run_with(
-                &secrets,
+                secrets.as_ref(),
                 DesktopCatalogMissionRequest {
                     project_id: project_id.clone(),
                     manifest_id: "VM-04".into(),
@@ -13843,7 +13895,9 @@ sleep 30"#;
                     budget_minor: 0,
                     currency: "EUR".into(),
                 },
-                Some(native_deepseek_mission_source(
+                Some(stored_native_deepseek_mission_source(
+                    &plane,
+                    Arc::clone(&secrets),
                     private_draft,
                     Arc::clone(&provider_calls),
                     Arc::clone(&provider_requests),
@@ -13936,20 +13990,23 @@ sleep 30"#;
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
-            cold.load_with(&secrets, observed_at() + Duration::minutes(4))
+            cold.load_with(secrets.as_ref(), observed_at() + Duration::minutes(4))
                 .expect("restore SQLCipher and Cordis Session"),
             DesktopLoadState::Ready(_)
         ));
+        let replay_source = stored_native_deepseek_mission_source(
+            &cold,
+            Arc::clone(&secrets),
+            "must not be requested",
+            Arc::clone(&provider_calls),
+            Arc::clone(&provider_requests),
+        );
         let replay = cold
             .resume_mission_runtime_with(
-                &secrets,
+                secrets.as_ref(),
                 &project_id,
                 &submission.mission_id,
-                Some(native_deepseek_mission_source(
-                    "must not be requested",
-                    Arc::clone(&provider_calls),
-                    Arc::clone(&provider_requests),
-                )),
+                Some(replay_source),
                 DesktopRuntimeAvailabilityStatus::ReadyDistribution,
                 observed_at() + Duration::minutes(5),
             )
