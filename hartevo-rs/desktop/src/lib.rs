@@ -353,6 +353,46 @@ impl std::fmt::Debug for SensitiveRecoveryInput {
     }
 }
 
+struct SensitiveProviderCredential {
+    value: Zeroizing<String>,
+}
+
+impl Default for SensitiveProviderCredential {
+    fn default() -> Self {
+        Self {
+            value: Zeroizing::new(String::new()),
+        }
+    }
+}
+
+impl SensitiveProviderCredential {
+    fn replace(&mut self, value: String) {
+        self.value = Zeroizing::new(value);
+    }
+
+    fn expose_for_input(&self) -> &str {
+        self.value.as_str()
+    }
+
+    fn has_valid_shape(&self, model: &str) -> bool {
+        runtime_plane::valid_native_deepseek_settings(model, self.value.as_str())
+    }
+
+    fn take(&mut self) -> Zeroizing<String> {
+        std::mem::replace(&mut self.value, Zeroizing::new(String::new()))
+    }
+
+    fn clear(&mut self) {
+        self.value = Zeroizing::new(String::new());
+    }
+}
+
+impl std::fmt::Debug for SensitiveProviderCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SensitiveProviderCredential([REDACTED])")
+    }
+}
+
 impl UiFailure {
     fn from_runtime_subscription_error(_error: RuntimeSubscriptionError) -> Self {
         Self {
@@ -581,6 +621,21 @@ impl DesktopUiModel {
         self.backend = DesktopBackendState::Ready(Box::new(snapshot));
         self.notice = None;
         self.restore_valid_selection(select_latest_mission);
+    }
+
+    fn set_runtime_projection(&mut self, runtime: DesktopRuntimeProjection) {
+        match &mut self.backend {
+            DesktopBackendState::Ready(snapshot) => {
+                snapshot.runtime = runtime;
+                self.notice = None;
+            }
+            DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => {
+                self.notice = Some(UiFailure::coded(
+                    "STALE_SETTINGS",
+                    "桌面数据层尚未就绪，未改变 Runtime 配置；请先完成本机数据初始化。",
+                ));
+            }
+        }
     }
 
     fn set_notice(&mut self, error: &DesktopDataError) {
@@ -1023,6 +1078,7 @@ pub fn App() -> Element {
     let mut active_overlay = use_signal(ActiveOverlay::default);
     let mut composer_tool_menu = use_signal(|| false);
     let mut runtime_profile_open = use_signal(|| false);
+    let mut native_provider_settings_busy = use_signal(|| false);
     let mut fixture_attachment_visible = use_signal(|| false);
     let mut mission_menu_id = use_signal(|| None::<MissionId>);
     let mut current_object_menu = use_signal(|| false);
@@ -1676,6 +1732,73 @@ pub fn App() -> Element {
     let runtime_projection = match &view.backend {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
+    };
+    let native_provider_settings_enabled = runtime_projection
+        .as_ref()
+        .is_some_and(DesktopRuntimeProjection::is_cordis_native);
+    let request_configure_native_provider = move |(model_name, credential): (
+        String,
+        Zeroizing<String>,
+    )| {
+        if visual_fixture_mode {
+            model.write().notice = Some(UiFailure::coded(
+                "VISUAL_FIXTURE",
+                "视觉夹具不会写入 OS Secret Store，也不会启动 Provider 请求。",
+            ));
+            return;
+        }
+        if native_provider_settings_busy() {
+            return;
+        }
+        native_provider_settings_busy.set(true);
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.configure_native_deepseek_os(model_name, credential))
+            })
+            .await;
+            native_provider_settings_busy.set(false);
+            match result {
+                Ok(Ok(runtime)) => model.write().set_runtime_projection(runtime),
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure::coded(
+                        "NATIVE_PROVIDER_SETTINGS_COORDINATOR_FAILED",
+                        "本机模型配置协调异常结束；凭据未进入日志、投影或 Cordis，且未启动 Provider 请求。",
+                    ));
+                }
+            }
+        });
+    };
+    let request_clear_native_provider = move |()| {
+        if visual_fixture_mode {
+            model.write().notice = Some(UiFailure::coded(
+                "VISUAL_FIXTURE",
+                "视觉夹具不会清除 OS Secret Store，也不会改变 Runtime 配置。",
+            ));
+            return;
+        }
+        if native_provider_settings_busy() {
+            return;
+        }
+        native_provider_settings_busy.set(true);
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent().and_then(|plane| plane.clear_native_deepseek_os())
+            })
+            .await;
+            native_provider_settings_busy.set(false);
+            match result {
+                Ok(Ok(runtime)) => model.write().set_runtime_projection(runtime),
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure::coded(
+                        "NATIVE_PROVIDER_SETTINGS_COORDINATOR_FAILED",
+                        "清除本机模型配置时协调异常结束；未启动 Provider 请求，也未改变 Domain 或 Effect。",
+                    ));
+                }
+            }
+        });
     };
     let live_runtime_cancellation = runtime_execution_paint
         .read()
@@ -2780,7 +2903,14 @@ pub fn App() -> Element {
                         } else if current_surface == Surface::Outcomes {
                             OutcomesSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Settings {
-                            SettingsSurface { runtime: runtime_projection.clone(), on_close: move |()| surface.set(surface_before_settings()) }
+                            SettingsSurface {
+                                runtime: runtime_projection.clone(),
+                                actions_enabled: native_provider_settings_enabled,
+                                action_busy: native_provider_settings_busy(),
+                                on_configure_native_provider: request_configure_native_provider,
+                                on_clear_native_provider: request_clear_native_provider,
+                                on_close: move |()| surface.set(surface_before_settings()),
+                            }
                         } else if current_surface == Surface::StateCoverage {
                             StateCoverageSurface {}
                         } else if let Some(product_evidence) = evidence.clone() {
@@ -8125,10 +8255,25 @@ fn OutcomesSurface(
 #[component]
 fn SettingsSurface(
     runtime: Option<DesktopRuntimeProjection>,
+    actions_enabled: bool,
+    action_busy: bool,
+    on_configure_native_provider: EventHandler<(String, Zeroizing<String>)>,
+    on_clear_native_provider: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
-    let mut active_panel = use_signal(|| "general");
+    let initial_panel = if active_visual_surface_variant().as_deref() == Some("settings-models") {
+        "models"
+    } else {
+        "general"
+    };
+    let mut active_panel = use_signal(move || initial_panel);
     let mut settings_query = use_signal(String::new);
+    let initial_native_model = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.model.clone())
+        .unwrap_or_else(|| "deepseek-chat".to_owned());
+    let mut native_model = use_signal(move || initial_native_model);
+    let mut native_credential = use_signal(SensitiveProviderCredential::default);
     let runtime_status = runtime.as_ref().map_or("数据层未就绪", |runtime| {
         runtime_availability_label(runtime.status)
     });
@@ -8140,6 +8285,15 @@ fn SettingsSurface(
         .as_ref()
         .and_then(|runtime| runtime.model.as_deref())
         .unwrap_or("未配置");
+    let native_route = runtime
+        .as_ref()
+        .is_some_and(DesktopRuntimeProjection::is_cordis_native);
+    let can_save_native_provider = {
+        let model = native_model.read();
+        let credential = native_credential.read();
+        actions_enabled && !action_busy && credential.has_valid_shape(model.as_str())
+    };
+    let can_clear_native_provider = actions_enabled && !action_busy;
     rsx! {
         section { class: "settings-shell", aria_label: "Hartevo 设置",
             header { class: "settings-topbar",
@@ -8187,10 +8341,73 @@ fn SettingsSurface(
                         SettingsRow { title: "减少动态效果", detail: "跟随系统 prefers-reduced-motion。", value: "跟随系统" }
                     }
                 } else if active_panel() == "models" {
-                    SettingsPanel { title: "模型与 Runtime", detail: "模型选择不改变 Mission Capability、预算或审批边界。",
-                        SettingsRow { title: "Runtime", detail: "来自 DesktopRuntimeProjection。", value: runtime_status }
-                        SettingsRow { title: "Provider", detail: "没有配置时不显示可用。", value: provider }
-                        SettingsRow { title: "Model", detail: "只展示真实配置。", value: model }
+                    section { class: "settings-panel", aria_busy: action_busy,
+                        header {
+                            h1 { "模型与 Runtime" }
+                            p { "为 Cordis 原生路径配置 DeepSeek。模型选择不会改变 Mission Capability、预算或审批边界。" }
+                        }
+                        section { class: "settings-section",
+                            h2 { "当前状态" }
+                            div { class: "settings-group",
+                                SettingsRow { title: "Runtime", detail: "来自 DesktopRuntimeProjection。", value: runtime_status }
+                                SettingsRow { title: "Provider", detail: "没有真实配置时不显示可用。", value: provider }
+                                SettingsRow { title: "Model", detail: "只展示当前生效投影。", value: model }
+                            }
+                        }
+                        section { class: "settings-section",
+                            h2 { "Cordis 原生配置" }
+                            div { class: "settings-group",
+                                SettingsControlRow { title: "DeepSeek model", detail: "保存后用于新的 Cordis Session；不会改写既有 Mission 合同。",
+                                    input {
+                                        value: "{native_model}",
+                                        disabled: !actions_enabled || action_busy,
+                                        autocomplete: "off",
+                                        spellcheck: "false",
+                                        aria_label: "DeepSeek model",
+                                        oninput: move |event| native_model.set(event.value()),
+                                    }
+                                }
+                                SettingsControlRow { title: "DeepSeek API key", detail: "仅写入当前数据目录绑定的 OS Secret Store；保存后不会回读或显示。",
+                                    input {
+                                        r#type: "password",
+                                        value: "{native_credential.read().expose_for_input()}",
+                                        disabled: !actions_enabled || action_busy,
+                                        autocomplete: "new-password",
+                                        spellcheck: "false",
+                                        placeholder: "输入新的 API key",
+                                        aria_label: "DeepSeek API key",
+                                        oninput: move |event| native_credential.write().replace(event.value()),
+                                    }
+                                }
+                                div { class: "settings-provider-actions",
+                                    span {
+                                        strong { if native_route { "OS Secret Store" } else { "当前不是 Cordis 原生路由" } }
+                                        small { "清除桌面配置后，若存在受支持的环境变量配置，Runtime 会如实回退并继续显示。" }
+                                    }
+                                    div {
+                                        button {
+                                            class: "quiet-button",
+                                            disabled: !can_clear_native_provider,
+                                            onclick: move |_| {
+                                                native_credential.write().clear();
+                                                on_clear_native_provider.call(());
+                                            },
+                                            "清除桌面配置"
+                                        }
+                                        button {
+                                            class: "surface-button primary",
+                                            disabled: !can_save_native_provider,
+                                            onclick: move |_| {
+                                                let credential = native_credential.write().take();
+                                                on_configure_native_provider.call((native_model(), credential));
+                                            },
+                                            if action_busy { "正在更新…" } else { "保存并刷新 Runtime" }
+                                        }
+                                    }
+                                }
+                            }
+                            p { class: "settings-boundary", span { class: "honesty-badge", "NO PROVIDER CALL" } " 保存或清除只更新本机配置与 Runtime 投影，不会启动 Provider 请求、Runtime turn、Domain 写入或 Effect。" }
+                        }
                     }
                 } else if active_panel() == "shortcuts" {
                     SettingsPanel { title: "快捷键", detail: "核心路径支持键盘与明确焦点。",
@@ -11510,6 +11727,66 @@ mod tests {
         input.clear();
         assert!(!input.has_valid_shape());
         assert!(input.expose_for_submission().is_empty());
+    }
+
+    #[test]
+    fn provider_credential_is_zeroizing_move_only_ui_state() {
+        let mut input = SensitiveProviderCredential::default();
+        input.replace("fixture-credential-value".to_owned());
+        assert!(input.has_valid_shape("deepseek-chat"));
+        assert_eq!(
+            format!("{input:?}"),
+            "SensitiveProviderCredential([REDACTED])"
+        );
+
+        let credential = input.take();
+        assert_eq!(credential.as_str(), "fixture-credential-value");
+        assert!(input.expose_for_input().is_empty());
+
+        input.replace(" surrounding-space ".to_owned());
+        assert!(!input.has_valid_shape("deepseek-chat"));
+        input.clear();
+        assert!(input.expose_for_input().is_empty());
+    }
+
+    #[test]
+    fn model_settings_bind_only_to_native_configuration_seam() {
+        let source = include_str!("lib.rs");
+        let css = include_str!("../assets/prototype.css");
+        for contract in [
+            "configure_native_deepseek_os",
+            "clear_native_deepseek_os",
+            "set_runtime_projection",
+            "SensitiveProviderCredential([REDACTED])",
+            "r#type: \"password\"",
+            "autocomplete: \"new-password\"",
+            "NO PROVIDER CALL",
+            "DesktopRuntimeProjection::is_cordis_native",
+        ] {
+            assert!(
+                source.contains(contract),
+                "missing settings contract {contract}"
+            );
+        }
+        for selector in [
+            ".settings-provider-actions",
+            ".settings-control input",
+            ".settings-provider-actions .surface-button",
+        ] {
+            assert!(
+                css.contains(selector),
+                "missing settings selector {selector}"
+            );
+        }
+        for forbidden in [
+            ["API key", " 已保存："].concat(),
+            ["credential", ".to_string()"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "settings source contains forbidden credential rendering"
+            );
+        }
     }
 
     #[test]

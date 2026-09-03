@@ -3500,6 +3500,7 @@ body.resizing-workpad {
 }
 
 .settings-control select,
+.settings-control input,
 .settings-path-control input {
   width: 100%;
   height: 31px;
@@ -3508,6 +3509,44 @@ body.resizing-workpad {
   border-radius: 6px;
   color: #66676c;
   background: #fafafb;
+  font-size: 8.5px;
+}
+
+.settings-provider-actions {
+  display: grid;
+  min-height: 68px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 20px;
+  padding: 10px 13px;
+}
+
+.settings-provider-actions > span {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-provider-actions strong {
+  font-size: 10px;
+}
+
+.settings-provider-actions small {
+  color: #85868b;
+  font-size: 8.5px;
+  line-height: 1.45;
+}
+
+.settings-provider-actions > div {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.settings-provider-actions .surface-button {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 7px;
   font-size: 8.5px;
 }
 
@@ -5796,6 +5835,17 @@ body.resizing-workpad {
     grid-template-columns: minmax(0, 1fr);
     gap: 9px;
     padding-block: 13px;
+  }
+
+  .settings-provider-actions {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+    padding-block: 13px;
+  }
+
+  .settings-provider-actions > div {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .settings-switch {

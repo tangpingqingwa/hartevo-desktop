@@ -102,7 +102,7 @@ impl DesktopNativeDeepSeekProfile {
         credential: Zeroizing<String>,
     ) -> Result<Self, SecretStoreError> {
         let model = model.into();
-        if !valid_native_model(&model) || !valid_native_credential(&credential) {
+        if !valid_native_deepseek_settings(&model, &credential) {
             return Err(SecretStoreError::InvalidSecret);
         }
         Ok(Self { model, credential })
@@ -498,6 +498,10 @@ fn valid_native_credential(value: &str) -> bool {
         && value.len() <= MAX_NATIVE_CREDENTIAL_BYTES
         && value == value.trim()
         && !value.chars().any(char::is_control)
+}
+
+pub(crate) fn valid_native_deepseek_settings(model: &str, credential: &str) -> bool {
+    valid_native_model(model) && valid_native_credential(credential)
 }
 
 fn unavailable(
