@@ -6161,7 +6161,8 @@ impl DesktopDataPlane {
                 }
             }
         };
-        let native_turn_plan = if runtime.is_native_deepseek() && !is_followup {
+        let native_deepseek = runtime.is_native_deepseek();
+        let native_turn_plan = if native_deepseek && !is_followup {
             let checkpoint = {
                 let cordis = self.cordis.checkout().map_err(|error| {
                     DesktopDataError::CordisSessionPersistence(error.to_string())
@@ -6219,23 +6220,28 @@ impl DesktopDataPlane {
             mission_id: mission_id.clone(),
             generation: resume_plan.generation,
         };
-        let prepared = if is_followup {
-            service.prepare_local_mission_runtime_followup_context(
+        let prepared = if native_deepseek && is_followup {
+            None
+        } else if is_followup {
+            Some(service.prepare_local_mission_runtime_followup_context(
                 &prepare_command,
                 now + Duration::milliseconds(logical_millis),
-            )?
+            )?)
         } else {
-            service.prepare_local_mission_runtime_context(
+            Some(service.prepare_local_mission_runtime_context(
                 prepare_command,
                 context_session,
                 &tokenizer,
                 now + Duration::milliseconds(logical_millis),
-            )?
+            )?)
         };
         logical_millis += 1;
         let envelope = if is_followup {
             None
         } else {
+            let prepared = prepared
+                .as_ref()
+                .ok_or(ApplicationError::LocalRuntimeContextConflict)?;
             let Some(envelope) = prepared.assembly.envelope.clone() else {
                 return self.finish_mission_submission(
                     &service,
@@ -6270,39 +6276,63 @@ impl DesktopDataPlane {
         let cordis_approval = cancellation.map(DesktopRuntimeCancellation::cordis_approval_bridge);
         if let DesktopMissionProvider::NativeDeepSeek(adapter) = &mission_provider {
             let adapter = adapter.clone();
-            if is_followup {
-                return Err(DesktopDataError::CordisSessionPersistence(
-                    "Cordis-native provider follow-up adoption is not available in this slice"
-                        .into(),
-                ));
-            }
-            let prompt = envelope
-                .as_ref()
-                .ok_or(ApplicationError::CordisDraftScopeMismatch)?
-                .render_prompt()
-                .map_err(ApplicationError::from)?;
-            let user_body = Self::runtime_session_user_body(&service, &mission)?;
-            let Some(CordisMissionTurnPlan::Dispatch {
-                user_message_id: message_id,
-            }) = native_turn_plan
-            else {
-                return Err(ApplicationError::CordisDraftScopeMismatch.into());
-            };
-            let request = DesktopAgentTurnRequest::new(
-                mission.id.as_str(),
-                &message_id,
-                user_body,
-                context_session.project_root(),
-                request_config,
-            )
-            .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
-            .with_system_prompt(prompt)
-            .resolve_with(&adapter)
-            .map_err(CordisError::from)?;
-            let (agent_result, checkpoint) = {
+            let (agent_result, checkpoint, message_id) = {
                 let mut cordis = self.cordis.checkout().map_err(|error| {
                     DesktopDataError::CordisSessionPersistence(error.to_string())
                 })?;
+                let (request, message_id) = if let Some(followup) = followup.as_ref() {
+                    let message_id = format!("runtime:{}:user", followup.turn_id.as_str());
+                    let session_id =
+                        SessionId::new(mission.id.as_str().to_owned()).map_err(|error| {
+                            DesktopDataError::CordisSessionPersistence(error.to_string())
+                        })?;
+                    let Some((request, _body)) =
+                        futures_executor::block_on(cordis.prepare_idle_job_completion_followup(
+                            permit,
+                            &session_id,
+                            message_id.clone(),
+                            context_session.project_root().to_path_buf(),
+                            request_config.clone(),
+                        ))
+                        .map_err(|error| {
+                            DesktopDataError::CordisSessionPersistence(error.to_string())
+                        })?
+                    else {
+                        return Err(DesktopDataError::CordisSessionPersistence(
+                            "idle job follow-up lost eligibility before native provider dispatch"
+                                .into(),
+                        ));
+                    };
+                    (
+                        request.resolve_with(&adapter).map_err(CordisError::from)?,
+                        message_id,
+                    )
+                } else {
+                    let prompt = envelope
+                        .as_ref()
+                        .ok_or(ApplicationError::CordisDraftScopeMismatch)?
+                        .render_prompt()
+                        .map_err(ApplicationError::from)?;
+                    let user_body = Self::runtime_session_user_body(&service, &mission)?;
+                    let Some(CordisMissionTurnPlan::Dispatch {
+                        user_message_id: message_id,
+                    }) = native_turn_plan
+                    else {
+                        return Err(ApplicationError::CordisDraftScopeMismatch.into());
+                    };
+                    let request = DesktopAgentTurnRequest::new(
+                        mission.id.as_str(),
+                        &message_id,
+                        user_body,
+                        context_session.project_root(),
+                        request_config.clone(),
+                    )
+                    .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?
+                    .with_system_prompt(prompt)
+                    .resolve_with(&adapter)
+                    .map_err(CordisError::from)?;
+                    (request, message_id)
+                };
                 let result = futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
                     request,
                     adapter,
@@ -6316,7 +6346,7 @@ impl DesktopDataPlane {
                         .map_err(|error| {
                             DesktopDataError::CordisSessionPersistence(error.to_string())
                         })?;
-                (result, checkpoint)
+                (result, checkpoint, message_id)
             };
             let outcome = match agent_result {
                 Ok(outcome) => match outcome.reason() {
@@ -6326,22 +6356,29 @@ impl DesktopDataPlane {
                                 "completed Cordis turn has no durable Session checkpoint".into(),
                             )
                         })?;
-                        let draft =
-                            CordisMissionDraft::from_completed_session(&checkpoint, &message_id)?
-                                .ok_or(ApplicationError::CordisDraftMessageMissing)?;
-                        let conversation = service.mission_conversation(project_id, &mission_id)?;
-                        let adoption = service.adopt_cordis_session_draft(
-                            &AdoptCordisSessionDraft {
-                                project_id: project_id.clone(),
-                                mission_id: mission_id.clone(),
-                                generation: resume_plan.generation,
-                                expected_conversation_revision: conversation.revision,
-                            },
-                            draft,
-                            now + Duration::milliseconds(logical_millis + 1),
-                        )?;
-                        DesktopMissionRuntimeOutcome::DraftReady {
-                            work_product_id: adoption.work_product.id,
+                        if is_followup {
+                            DesktopMissionRuntimeOutcome::CompletedWithoutArtifact
+                        } else {
+                            let draft = CordisMissionDraft::from_completed_session(
+                                &checkpoint,
+                                &message_id,
+                            )?
+                            .ok_or(ApplicationError::CordisDraftMessageMissing)?;
+                            let conversation =
+                                service.mission_conversation(project_id, &mission_id)?;
+                            let adoption = service.adopt_cordis_session_draft(
+                                &AdoptCordisSessionDraft {
+                                    project_id: project_id.clone(),
+                                    mission_id: mission_id.clone(),
+                                    generation: resume_plan.generation,
+                                    expected_conversation_revision: conversation.revision,
+                                },
+                                draft,
+                                now + Duration::milliseconds(logical_millis + 1),
+                            )?;
+                            DesktopMissionRuntimeOutcome::DraftReady {
+                                work_product_id: adoption.work_product.id,
+                            }
                         }
                     }
                     TurnEndReason::Interrupted | TurnEndReason::Aborted(_) => {
@@ -6385,6 +6422,7 @@ impl DesktopDataPlane {
         let DesktopMissionProvider::ApplicationRuntime(runtime_command) = mission_provider else {
             unreachable!("native provider returned above")
         };
+        let prepared = prepared.ok_or(ApplicationError::LocalRuntimeContextConflict)?;
         let turn_id = followup.map_or_else(RuntimeTurnAttemptId::new, |followup| followup.turn_id);
         let message_id = format!("runtime:{}:user", turn_id.as_str());
         let runtime_task_id = prepared.capsule.task_id.clone();
@@ -13624,6 +13662,239 @@ sleep 30"#;
             DesktopMissionRuntimeOutcome::DraftReady { work_product_id }
         );
         assert_eq!(success_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused journey proves same-Agent native follow-up, provider history, Domain non-fabrication, and SQLCipher cold restore"
+    )]
+    fn cordis_native_deepseek_idle_job_followup_stays_in_the_durable_session() {
+        use hartevo_cordis::{AgentsSurface, JobsSurface, SessionStore};
+
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let private_goal = "Keep this native Cordis Mission ready for a background completion";
+        let initial_draft = "Native Cordis draft before the background job.";
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let initial_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut request = catalog_runtime_request(&project_id);
+        request.title = Some("Native Cordis idle follow-up".into());
+        request.goal = private_goal.into();
+        let submission = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                request,
+                Some(native_deepseek_mission_source(
+                    initial_draft,
+                    Arc::clone(&initial_calls),
+                    Arc::clone(&initial_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("initial native Cordis turn");
+        assert!(matches!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("Application snapshot before follow-up");
+        let mission_before = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("Mission before follow-up");
+        let conversation_before = service
+            .mission_conversation(&project_id, &submission.mission_id)
+            .expect("Conversation before follow-up");
+        let events_before = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("Mission events before follow-up");
+        drop(service);
+
+        let session_id = SessionId::new(submission.mission_id.as_str()).unwrap();
+        let (agent, job_id, notice) = plane.with_cordis_host(|host| {
+            let agent = host
+                .context()
+                .agents::<AgentsSurface>()
+                .expect("Agent surface")
+                .list()
+                .into_iter()
+                .find(|agent| agent.status() == hartevo_cordis::AgentStatus::Idle)
+                .expect("retained native Agent");
+            let jobs = host.context().jobs::<JobsSurface>().expect("Jobs surface");
+            let (send, receive) = mpsc::channel();
+            jobs.on_terminal(move |notice| {
+                send.send(notice).unwrap();
+            });
+            let job_id = jobs
+                .start(
+                    &session_id,
+                    &agent,
+                    "bash",
+                    "finish native follow-up fixture",
+                    |completion| {
+                        assert!(
+                            completion.complete(
+                                hartevo_cordis::JobOutcome::new(
+                                    hartevo_cordis::JobTerminalStatus::Completed,
+                                )
+                                .with_detail("exit code: 0")
+                                .with_output("private native job output"),
+                            )
+                        );
+                        Ok(hartevo_cordis::JobControl::new(|_| {}))
+                    },
+                )
+                .expect("completed native background job");
+            let notice = receive
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("content-free native terminal notice");
+            (agent, job_id, notice)
+        });
+        let expected_notice = format!(
+            "Background job {job_id} (bash) finished [status: completed, exit code: 0]. Read its new output with job_output."
+        );
+        let followup_body = "Native Cordis acknowledged the completed background job.";
+        let followup_calls = Arc::new(AtomicUsize::new(0));
+        let followup_requests = Arc::new(Mutex::new(Vec::new()));
+        let followup = plane
+            .run_idle_job_completion_followup_with(
+                &secrets,
+                &notice,
+                Some(native_deepseek_mission_source(
+                    followup_body,
+                    Arc::clone(&followup_calls),
+                    Arc::clone(&followup_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("native Cordis idle follow-up")
+            .expect("eligible native completion wake");
+        assert_eq!(
+            followup.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CompletedWithoutArtifact
+        );
+        assert_eq!(followup_calls.load(Ordering::SeqCst), 1);
+
+        let requests = followup_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire_messages = requests[0]["messages"].as_array().expect("wire messages");
+        for expected in [private_goal, initial_draft, expected_notice.as_str()] {
+            assert!(wire_messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content == expected)
+            }));
+        }
+        assert!(
+            !requests[0]
+                .to_string()
+                .contains("private native job output")
+        );
+        drop(requests);
+
+        plane.with_cordis_host(|host| {
+            let agents = host.context().agents::<AgentsSurface>().unwrap().list();
+            assert_eq!(agents.len(), 1);
+            assert!(agents[0].is_same_lifecycle(&agent));
+            assert_eq!(agents[0].status(), hartevo_cordis::AgentStatus::Idle);
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&session_id)
+                .unwrap()
+                .unwrap();
+            let messages = session.derive_messages().unwrap();
+            assert_eq!(messages.len(), 4);
+            assert_eq!(
+                messages[2].source,
+                SessionMessageSource::Plugin {
+                    plugin: "tool-jobs".into(),
+                    compaction_id: None,
+                    source_command_id: None,
+                }
+            );
+            assert!(matches!(
+                messages[2].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == &expected_notice
+            ));
+            assert!(matches!(
+                messages[3].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == followup_body
+            ));
+            assert!(
+                host.context()
+                    .jobs::<JobsSurface>()
+                    .unwrap()
+                    .unreported_terminal(&agent)
+                    .is_empty()
+            );
+        });
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(5))
+            .expect("Application snapshot after follow-up");
+        assert_eq!(
+            service
+                .load_mission(&project_id, &submission.mission_id)
+                .expect("Mission after follow-up")
+                .work_products,
+            mission_before.work_products
+        );
+        assert_eq!(
+            service
+                .mission_conversation(&project_id, &submission.mission_id)
+                .expect("Conversation after follow-up"),
+            conversation_before
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("Mission events after follow-up"),
+            events_before
+        );
+        assert!(
+            service
+                .latest_runtime_turn_for_mission(&project_id, &submission.mission_id)
+                .expect("no fabricated Application Runtime turn")
+                .is_none()
+        );
+        drop(service);
+
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(&secrets, observed_at() + Duration::minutes(6))
+                .expect("restore native follow-up Session"),
+            DesktopLoadState::Ready(_)
+        ));
+        cold.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&session_id)
+                .unwrap()
+                .expect("cold native Mission Session");
+            let messages = session.derive_messages().unwrap();
+            assert_eq!(messages.len(), 4);
+            assert!(matches!(
+                messages[2].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == &expected_notice
+            ));
+            assert!(matches!(
+                messages[3].content.as_slice(),
+                [SessionContentBlock::Text { text }] if text == followup_body
+            ));
+        });
+        assert_eq!(followup_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
