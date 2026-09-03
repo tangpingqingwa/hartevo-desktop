@@ -2362,6 +2362,7 @@ dependencies = [
  "hartevo-cordis",
  "hartevo-domain-kernel",
  "hartevo-effect-broker",
+ "hartevo-llm-deepseek",
  "hartevo-runtime-adapter",
  "hartevo-storage",
  "hex",
@@ -2422,6 +2423,20 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+]
+
+[[package]]
+name = "hartevo-llm-deepseek"
+version = "0.1.0"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "hartevo-cordis",
+ "serde_json",
+ "thiserror 2.0.20",
+ "ureq",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
