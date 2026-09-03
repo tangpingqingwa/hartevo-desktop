@@ -168,11 +168,13 @@ pub use session::{
     TurnEndReason, events as session_events,
 };
 pub use subagent::{
-    OneShotSubagentDescriptor, ResolvedSubagentStartRequest, SUBAGENT_DESCRIPTOR_VERSION,
-    SubagentCapabilities, SubagentCapability, SubagentDescriptorMode, SubagentError,
-    SubagentProvider, SubagentResult, SubagentRun, SubagentRunEndInfo, SubagentRunId,
-    SubagentRunInfo, SubagentRuntime, SubagentStartRequest, SubagentStopReason, SubagentToolFilter,
-    events as subagent_events, register_subagent_provider,
+    OneShotSubagentDescriptor, ResolvedSubagentStartRequest, SPAWN_SUBAGENT_PROVIDER_NAME,
+    SUBAGENT_DESCRIPTOR_VERSION, SUBAGENT_SPAWN_IN_PROCESS_KEYS,
+    SUBAGENT_SPAWN_IN_PROCESS_PLUGIN_ID, SpawnInProcessSubagent, SubagentCapabilities,
+    SubagentCapability, SubagentDescriptorMode, SubagentError, SubagentProvider, SubagentResult,
+    SubagentRun, SubagentRunEndInfo, SubagentRunId, SubagentRunInfo, SubagentRuntime,
+    SubagentStartRequest, SubagentStopReason, SubagentToolFilter, events as subagent_events,
+    register_subagent_provider,
 };
 pub use surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,

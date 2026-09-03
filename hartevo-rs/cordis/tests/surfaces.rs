@@ -1071,6 +1071,7 @@ fn overlay_still_selects_plugins_instead_of_a_crate_boot_list() {
             PluginId::new("surfaces"),
             PluginId::new("compaction-basic"),
             PluginId::new("agent-loop"),
+            PluginId::new("subagent-spawn-in-process"),
             PluginId::new("invariants"),
         ]
     );

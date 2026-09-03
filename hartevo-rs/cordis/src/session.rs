@@ -4024,6 +4024,19 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Remove one exact live Session instance during failed establishment.
+    pub(crate) fn remove_exact(&self, session: &SessionHandle) -> Result<bool, SessionError> {
+        let mut state = self.lock()?;
+        let Some(live) = state.sessions.get(session.id()) else {
+            return Ok(false);
+        };
+        if !session.same_instance(live) {
+            return Ok(false);
+        }
+        state.sessions.remove(session.id());
+        Ok(true)
+    }
+
     pub fn len(&self) -> Result<usize, SessionError> {
         Ok(self.lock()?.sessions.len())
     }

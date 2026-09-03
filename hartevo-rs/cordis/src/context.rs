@@ -486,6 +486,8 @@ pub enum CordisError {
     Llm(#[from] crate::surface::LlmError),
     #[error(transparent)]
     Session(#[from] crate::session::SessionError),
+    #[error(transparent)]
+    Subagent(#[from] crate::subagent::SubagentError),
     #[error("Cordis sandbox policy initialization failed: {detail}")]
     SandboxPolicyInitialization { detail: String },
 }

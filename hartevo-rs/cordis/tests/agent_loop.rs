@@ -7347,6 +7347,7 @@ fn overlay_selects_surface_mapping_compaction_then_agent_loop() {
             hartevo_cordis::PluginId::new("surfaces"),
             hartevo_cordis::PluginId::new("compaction-basic"),
             hartevo_cordis::PluginId::new("agent-loop"),
+            hartevo_cordis::PluginId::new("subagent-spawn-in-process"),
             hartevo_cordis::PluginId::new("invariants"),
         ]
     );

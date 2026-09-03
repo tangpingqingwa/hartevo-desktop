@@ -1,14 +1,18 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{TimeZone, Utc};
 use futures_util::FutureExt;
 use hartevo_cordis::{
-    AgentRef, Context, CordisHost, OneShotSubagentDescriptor, ResolvedSubagentStartRequest,
-    SUBAGENT_DESCRIPTOR_VERSION, SessionCallConfig, SessionContentBlock, SessionId,
+    AgentRef, AgentStatus, AgentStatusChange, AgentsSurface, AuthorityScope, Context, CordisError,
+    CordisHost, KernelConsentState, OneShotSubagentDescriptor, ResolvedSubagentStartRequest,
+    RuntimeBinding, SPAWN_SUBAGENT_PROVIDER_NAME, SUBAGENT_DESCRIPTOR_VERSION, SessionCallConfig,
+    SessionContentBlock, SessionEventKind, SessionFinishReason, SessionId, SessionMessageRole,
+    SessionMessageSource, SessionStore, SessionStreamBlockType, SessionStreamChunk,
     SubagentCapabilities, SubagentCapability, SubagentDescriptorMode, SubagentError,
     SubagentProvider, SubagentResult, SubagentRun, SubagentRunEndInfo, SubagentRunInfo,
     SubagentRuntime, SubagentStartRequest, SubagentStopReason, SubagentToolFilter,
-    register_subagent_provider, subagent_events,
+    events as agent_events, register_subagent_provider, subagent_events,
 };
 use tokio::sync::Notify;
 
@@ -24,6 +28,23 @@ fn request(parent: AgentRef) -> SubagentStartRequest {
             text: "delegate this".into(),
         }],
     )
+}
+
+fn runtime_scope(mission: &str) -> AuthorityScope {
+    AuthorityScope::new("tenant-a", "project-a", mission, 1)
+        .unwrap()
+        .with_runtime(RuntimeBinding::new(1, None, None, "a".repeat(64)).unwrap())
+}
+
+fn call_config(provider: &str, model: &str) -> SessionCallConfig {
+    SessionCallConfig {
+        provider: provider.into(),
+        model: model.into(),
+        reasoning_effort: None,
+        temperature: None,
+        max_tokens: None,
+        stop: None,
+    }
 }
 
 struct StubRun {
@@ -207,7 +228,7 @@ fn providers_register_in_order_and_exact_generation_disposal_is_idempotent() {
     let alpha_registration = register_subagent_provider(&mut ctx, Arc::clone(&alpha)).unwrap();
     let beta_registration = register_subagent_provider(&mut ctx, Arc::clone(&beta)).unwrap();
 
-    assert_eq!(runtime.list().unwrap(), ["alpha", "beta"]);
+    assert_eq!(runtime.list().unwrap(), ["spawn", "alpha", "beta"]);
     assert!(Arc::ptr_eq(
         &runtime.get_provider("alpha").unwrap().unwrap(),
         &alpha
@@ -225,12 +246,12 @@ fn providers_register_in_order_and_exact_generation_disposal_is_idempotent() {
 
     assert!(alpha_registration.dispose());
     assert!(!alpha_registration.dispose());
-    assert_eq!(runtime.list().unwrap(), ["beta"]);
+    assert_eq!(runtime.list().unwrap(), ["spawn", "beta"]);
     let replacement: Arc<dyn SubagentProvider> =
         Arc::new(StubProvider::new("alpha", SubagentCapabilities::NONE));
     let replacement_registration =
         register_subagent_provider(&mut ctx, Arc::clone(&replacement)).unwrap();
-    assert_eq!(runtime.list().unwrap(), ["beta", "alpha"]);
+    assert_eq!(runtime.list().unwrap(), ["spawn", "beta", "alpha"]);
     assert!(Arc::ptr_eq(
         &runtime.get_provider("alpha").unwrap().unwrap(),
         &replacement
@@ -238,7 +259,7 @@ fn providers_register_in_order_and_exact_generation_disposal_is_idempotent() {
 
     assert!(beta_registration.dispose());
     assert!(replacement_registration.dispose());
-    assert!(runtime.list().unwrap().is_empty());
+    assert_eq!(runtime.list().unwrap(), ["spawn"]);
 }
 
 #[test]
@@ -268,7 +289,7 @@ fn context_teardown_reverses_fiber_owned_provider_registration() {
     let provider: Arc<dyn SubagentProvider> =
         Arc::new(StubProvider::new("scoped", SubagentCapabilities::NONE));
     let registration = register_subagent_provider(&mut ctx, provider).unwrap();
-    assert_eq!(runtime.list().unwrap(), ["scoped"]);
+    assert_eq!(runtime.list().unwrap(), ["spawn", "scoped"]);
 
     ctx.teardown();
 
@@ -379,7 +400,7 @@ async fn unregister_during_start_blocks_new_calls_but_preserves_selected_provide
     });
     started.notified().await;
     assert!(registration.dispose());
-    assert!(runtime.list().unwrap().is_empty());
+    assert_eq!(runtime.list().unwrap(), ["spawn"]);
     assert!(matches!(
         runtime
             .start("deferred", request(AgentRef::new("later-parent")))
@@ -558,4 +579,377 @@ async fn repeated_provider_and_child_ids_get_distinct_run_ids() {
     let run_ids = run_ids.lock().unwrap();
     assert_eq!(run_ids.len(), 2);
     assert_ne!(run_ids[0], run_ids[1]);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one journey proves establishment, durable ordering, result mapping, and exact disposal together"
+)]
+async fn default_spawn_provider_runs_one_fresh_child_through_the_authorized_host() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("parent-session");
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let parent_session_id = SessionId::new("parent-session").unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    let parent_session = sessions.create(parent_session_id.clone()).unwrap();
+    parent_session
+        .append_user_message(hartevo_cordis::SessionMessage {
+            id: "parent-only".into(),
+            role: SessionMessageRole::User,
+            content: vec![SessionContentBlock::Text {
+                text: "do not inherit me".into(),
+            }],
+            source: SessionMessageSource::User,
+        })
+        .unwrap();
+
+    let lifecycle = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let starts = Arc::new(Mutex::new(Vec::<SubagentRunInfo>::new()));
+    let ends = Arc::new(Mutex::new(Vec::<SubagentRunEndInfo>::new()));
+    let statuses = Arc::new(Mutex::new(Vec::<AgentStatusChange>::new()));
+    let disposed = Arc::new(Mutex::new(Vec::<AgentRef>::new()));
+    host.context_mut()
+        .on_emit(subagent_events::SUBAGENT_START, {
+            let lifecycle = Arc::clone(&lifecycle);
+            let starts = Arc::clone(&starts);
+            move |info| {
+                lifecycle.lock().unwrap().push("start");
+                starts.lock().unwrap().push(info.clone());
+            }
+        })
+        .unwrap();
+    host.context_mut()
+        .on_emit(agent_events::AGENT_STATUS, {
+            let statuses = Arc::clone(&statuses);
+            move |status| statuses.lock().unwrap().push(status.clone())
+        })
+        .unwrap();
+    host.context_mut()
+        .on_emit(agent_events::AGENT_DISPOSED, {
+            let disposed = Arc::clone(&disposed);
+            move |agent| disposed.lock().unwrap().push(agent.clone())
+        })
+        .unwrap();
+    host.context_mut()
+        .on_emit(subagent_events::SUBAGENT_END, {
+            let lifecycle = Arc::clone(&lifecycle);
+            let ends = Arc::clone(&ends);
+            move |info| {
+                lifecycle.lock().unwrap().push("end");
+                ends.lock().unwrap().push(info.clone());
+            }
+        })
+        .unwrap();
+    host.context_mut()
+        .on_waterfall(agent_events::LLM_STREAM, |stream, _next| {
+            stream.with_chunk_stream(Box::pin(futures_util::stream::iter([
+                SessionStreamChunk::BlockStart {
+                    index: 0,
+                    block_type: SessionStreamBlockType::Text,
+                },
+                SessionStreamChunk::TextDelta {
+                    index: 0,
+                    text: "child done".into(),
+                },
+                SessionStreamChunk::BlockEnd {
+                    index: 0,
+                    block: SessionContentBlock::Text {
+                        text: "child done".into(),
+                    },
+                },
+                SessionStreamChunk::Finish {
+                    reason: SessionFinishReason::Stop,
+                    replay_state: None,
+                },
+            ])))
+        })
+        .unwrap();
+
+    let runtime = host.context().subagents::<SubagentRuntime>().unwrap();
+    assert_eq!(runtime.list().unwrap(), [SPAWN_SUBAGENT_PROVIDER_NAME]);
+    let provider = runtime
+        .get_provider(SPAWN_SUBAGENT_PROVIDER_NAME)
+        .unwrap()
+        .unwrap();
+    assert!(!provider.inherits_parent_context());
+    assert!(
+        provider
+            .capabilities()
+            .supports(SubagentCapability::AgentOptions)
+    );
+    assert!(
+        !provider
+            .capabilities()
+            .supports(SubagentCapability::Persona)
+    );
+
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let parent = permit.agent().clone();
+    let request = SubagentStartRequest::new(
+        parent.clone(),
+        vec![SessionContentBlock::Text {
+            text: "delegate this".into(),
+        }],
+    )
+    .with_parent_session(parent_session_id.clone());
+    let agents = host.context().agents::<AgentsSurface>().unwrap();
+    let run = host
+        .run_authorized_local_subagent(
+            &permit,
+            SPAWN_SUBAGENT_PROVIDER_NAME,
+            request,
+            call_config("mock", "model"),
+        )
+        .await
+        .unwrap();
+
+    let child_agent = run.local_agent().unwrap();
+    assert_eq!(child_agent.status(), AgentStatus::Idle);
+    assert!(
+        agents
+            .list()
+            .iter()
+            .any(|agent| agent.is_same_lifecycle(&child_agent))
+    );
+    assert_eq!(*lifecycle.lock().unwrap(), ["start"]);
+    let result = run.result().await.unwrap();
+    assert_eq!(result.stop_reason, SubagentStopReason::Completed);
+    assert_eq!(
+        result.output,
+        [SessionContentBlock::Text {
+            text: "child done".into()
+        }]
+    );
+    assert_eq!(*lifecycle.lock().unwrap(), ["start", "end"]);
+    assert_eq!(
+        statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|status| status.agent().is_same_lifecycle(&child_agent))
+            .map(AgentStatusChange::status)
+            .collect::<Vec<_>>(),
+        [AgentStatus::Running, AgentStatus::Idle]
+    );
+
+    let child = sessions.get(run.id()).unwrap().unwrap();
+    let header = child.header().unwrap();
+    assert_eq!(header.parent_session, Some(parent_session_id));
+    assert_eq!(header.seed_length, Some(0));
+    assert_eq!(
+        child.request_header().unwrap().unwrap().config,
+        call_config("mock", "model")
+    );
+    let events = child.events().unwrap();
+    let descriptor_positions = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(
+                &event.kind,
+                SessionEventKind::SubagentDescriptor { descriptor }
+                    if descriptor == &OneShotSubagentDescriptor::new("spawn", None)
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(descriptor_positions.len(), 1);
+    let turn_start = events
+        .iter()
+        .position(|event| matches!(event.kind, SessionEventKind::TurnStart { .. }))
+        .unwrap();
+    let request_header = events
+        .iter()
+        .position(|event| matches!(event.kind, SessionEventKind::RequestHeader { .. }))
+        .unwrap();
+    assert!(turn_start < descriptor_positions[0]);
+    assert!(descriptor_positions[0] < request_header);
+    let messages = child.derive_messages().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[0].content,
+        [SessionContentBlock::Text {
+            text: "delegate this".into()
+        }]
+    );
+    assert!(messages.iter().all(|message| message.id != "parent-only"));
+
+    {
+        let starts = starts.lock().unwrap();
+        let ends = ends.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(starts[0].run_id, ends[0].run_id);
+        assert!(starts[0].local);
+        assert!(starts[0].parent.is_same_lifecycle(&parent));
+        assert_eq!(ends[0].last_assistant_message, Some(result.output));
+    }
+
+    run.dispose().await.unwrap();
+    assert!(
+        !agents
+            .list()
+            .iter()
+            .any(|agent| agent.is_same_lifecycle(&child_agent))
+    );
+    assert!(
+        disposed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|agent| agent.is_same_lifecycle(&child_agent))
+    );
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+}
+
+#[tokio::test]
+async fn local_spawn_fails_closed_before_publication_without_exact_admission() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let runtime = host.context().subagents::<SubagentRuntime>().unwrap();
+    let detached = runtime
+        .start(
+            SPAWN_SUBAGENT_PROVIDER_NAME,
+            request(AgentRef::new("parent")),
+        )
+        .await
+        .err()
+        .expect("detached local provider must fail closed");
+    assert_eq!(detached.code(), "HOST_DRIVER_REQUIRED");
+
+    let scope = runtime_scope("parent-session");
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap(),
+    )
+    .unwrap();
+    host.context()
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("parent-session").unwrap())
+        .unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+
+    let wrong_parent = SubagentStartRequest::new(
+        AgentRef::new(permit.agent().id.clone()),
+        vec![SessionContentBlock::Text { text: "x".into() }],
+    )
+    .with_parent_session(SessionId::new("parent-session").unwrap());
+    assert_eq!(
+        host.run_authorized_local_subagent(
+            &permit,
+            SPAWN_SUBAGENT_PROVIDER_NAME,
+            wrong_parent,
+            call_config("mock", "model"),
+        )
+        .await
+        .err()
+        .expect("lookalike parent lifecycle must fail"),
+        CordisError::RuntimePermitMismatch
+    );
+
+    let mut unsupported = SubagentStartRequest::new(
+        permit.agent().clone(),
+        vec![SessionContentBlock::Text { text: "x".into() }],
+    )
+    .with_parent_session(SessionId::new("parent-session").unwrap());
+    unsupported.persona = Some("not implemented".into());
+    let before = host
+        .context()
+        .sessions::<SessionStore>()
+        .unwrap()
+        .len()
+        .unwrap();
+    let error = host
+        .run_authorized_local_subagent(
+            &permit,
+            SPAWN_SUBAGENT_PROVIDER_NAME,
+            unsupported,
+            call_config("mock", "model"),
+        )
+        .await
+        .err()
+        .expect("unsupported local capability must fail");
+    assert_eq!(
+        error,
+        CordisError::Subagent(SubagentError::UnsupportedCapability {
+            provider: SPAWN_SUBAGENT_PROVIDER_NAME.into(),
+            capability: SubagentCapability::Persona,
+        })
+    );
+    assert_eq!(
+        host.context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .len()
+            .unwrap(),
+        before
+    );
+
+    host.finish_runtime(permit).unwrap().announce().unwrap();
+}
+
+#[tokio::test]
+async fn local_spawn_rolls_back_a_child_session_when_establishment_fails() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = runtime_scope("parent-session");
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap(),
+    )
+    .unwrap();
+    let sessions = host.context().sessions::<SessionStore>().unwrap();
+    sessions
+        .create(SessionId::new("parent-session").unwrap())
+        .unwrap();
+    let before = sessions.len().unwrap();
+    let mut permit = host.authorize_runtime(&scope).unwrap();
+    permit.announce_started().unwrap();
+    let invalid_prompt = SubagentStartRequest::new(
+        permit.agent().clone(),
+        vec![SessionContentBlock::ToolCall {
+            id: String::new(),
+            name: "tool".into(),
+            arguments: "{}".into(),
+        }],
+    )
+    .with_parent_session(SessionId::new("parent-session").unwrap());
+
+    let error = host
+        .run_authorized_local_subagent(
+            &permit,
+            SPAWN_SUBAGENT_PROVIDER_NAME,
+            invalid_prompt,
+            call_config("mock", "model"),
+        )
+        .await
+        .err()
+        .expect("invalid prompt must fail establishment");
+
+    assert!(matches!(
+        error,
+        CordisError::Subagent(SubagentError::ProviderStart { provider, .. })
+            if provider == SPAWN_SUBAGENT_PROVIDER_NAME
+    ));
+    assert_eq!(
+        sessions.len().unwrap(),
+        before,
+        "failed establishment must remove its exact child Session"
+    );
+    host.finish_runtime(permit).unwrap().announce().unwrap();
 }
