@@ -22,7 +22,7 @@ use hartevo_application::connectors::shopify_recovery::{
     ShopifyRecoveryCapsuleRef, ShopifyRecoveryError,
 };
 use hartevo_application::llm_deepseek::{
-    DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection,
+    DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, UreqDeepSeekTransport,
 };
 use hartevo_application::{
     AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
@@ -116,8 +116,10 @@ use crate::cordis_host::{
     bind_live_domain_kernel_scope_for_test as bind_host_live_domain_kernel_scope,
 };
 use crate::runtime_plane::{
-    DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
-    discover_runtime, ensure_project_runtime_home,
+    DEEPSEEK_CREDENTIAL_ENV, DesktopNativeDeepSeekCredentialResolver,
+    DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeDiscovery,
+    DesktopRuntimeProjection, clear_native_deepseek_profile, discover_runtime,
+    discover_runtime_with_native_profile, ensure_project_runtime_home, put_native_deepseek_profile,
 };
 use crate::runtime_subscription::DesktopCatalogRuntimeDispatchAuthority;
 use crate::shopify_readback::{
@@ -2220,30 +2222,26 @@ impl DesktopRuntimeSource {
         mission_scope_digest: &str,
     ) -> Result<DesktopMissionProvider, DesktopDataError> {
         match self {
-            Self::Pinned(configuration) => match configuration.artifact {
-                Some(artifact) => {
-                    let runtime_home =
-                        ensure_project_runtime_home(project_root, mission_scope_digest)?;
-                    artifact
-                        .runtime_command(project_root, &runtime_home)
-                        .map(DesktopMissionProvider::ApplicationRuntime)
-                        .map_err(|error| {
-                            DesktopDataError::Application(ApplicationError::Runtime(error))
-                        })
+            Self::Pinned(configuration) if configuration.artifact.is_none() => {
+                if configuration.provider != DEEPSEEK_PROVIDER_ID {
+                    return Err(DesktopDataError::CordisSessionPersistence(
+                        "Desktop native provider configuration is unsupported".into(),
+                    ));
                 }
-                None if configuration.provider == DEEPSEEK_PROVIDER_ID => {
-                    let connection =
-                        DeepSeekConnection::official("DEEPSEEK_API_KEY").map_err(|error| {
-                            DesktopDataError::CordisSessionPersistence(error.to_string())
-                        })?;
-                    Ok(DesktopMissionProvider::NativeDeepSeek(
-                        DeepSeekAdapter::production(connection),
-                    ))
-                }
-                None => Err(DesktopDataError::CordisSessionPersistence(
-                    "Desktop native provider configuration is unsupported".into(),
-                )),
-            },
+                production_native_deepseek_adapter(&configuration)
+                    .map(DesktopMissionProvider::NativeDeepSeek)
+            }
+            Self::Pinned(configuration) => {
+                let runtime_home = ensure_project_runtime_home(project_root, mission_scope_digest)?;
+                configuration
+                    .artifact
+                    .expect("pinned Application Runtime artifact checked above")
+                    .runtime_command(project_root, &runtime_home)
+                    .map(DesktopMissionProvider::ApplicationRuntime)
+                    .map_err(|error| {
+                        DesktopDataError::Application(ApplicationError::Runtime(error))
+                    })
+            }
             #[cfg(any(test, feature = "native-journey"))]
             Self::NativeDeepSeek { adapter, .. } => {
                 Ok(DesktopMissionProvider::NativeDeepSeek(adapter))
@@ -2287,6 +2285,26 @@ impl DesktopRuntimeSource {
             } => Ok(command_builder(project_root, runtime_home)),
         }
     }
+}
+
+fn production_native_deepseek_adapter(
+    configuration: &DesktopRuntimeConfiguration,
+) -> Result<DeepSeekAdapter, DesktopDataError> {
+    let connection = DeepSeekConnection::official(DEEPSEEK_CREDENTIAL_ENV)
+        .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
+    let Some(reference) = configuration.native_profile_reference.clone() else {
+        return Ok(DeepSeekAdapter::production(connection));
+    };
+    let resolver = DesktopNativeDeepSeekCredentialResolver::new(
+        Arc::new(OsSecretStore::new(OS_SECRET_SERVICE)?),
+        reference,
+        configuration.model.clone(),
+    );
+    Ok(DeepSeekAdapter::new(
+        connection,
+        resolver,
+        UreqDeepSeekTransport,
+    ))
 }
 
 impl DesktopSnapshot {
@@ -2367,6 +2385,7 @@ pub struct DesktopDataPlane {
     data_root_identity: DataRootIdentity,
     database_path: PathBuf,
     database_key_reference: SecretReference,
+    native_provider_profile_reference: SecretReference,
     device_id: DeviceId,
     cordis: Arc<DesktopCordisSlot>,
 }
@@ -2524,6 +2543,14 @@ impl DesktopDataPlane {
             purpose: "desktop_sqlcipher_database_key".into(),
             version: 1,
         };
+        let native_provider_profile_reference = SecretReference {
+            tenant_id: TenantId::from("local-desktop-installation"),
+            project_id: ProjectId::from("desktop-runtime"),
+            provider: DEEPSEEK_PROVIDER_ID.into(),
+            account_scope: format!("data-root:{root_digest}"),
+            purpose: "native_llm_profile".into(),
+            version: 1,
+        };
         let device_id = DeviceId::from_stable(format!("desktop-device:{root_digest}"));
         let cordis = Arc::new(DesktopCordisSlot::new(mount_cordis_host(
             &discover_runtime().projection,
@@ -2533,6 +2560,7 @@ impl DesktopDataPlane {
             data_root_identity,
             database_path,
             database_key_reference,
+            native_provider_profile_reference,
             device_id,
             cordis,
         })
@@ -2753,10 +2781,10 @@ impl DesktopDataPlane {
         self.start_mission_with(&secret_store, project_id, goal, now)
     }
 
-    /// Creates one durable Mission and, only when a release-pinned Runtime plus
-    /// explicit provider/model selection are available, runs its first bounded
-    /// local Context turn. Runtime completion never completes the Mission; a
-    /// completed agent message is adopted only as a reviewable draft.
+    /// Creates one durable Mission and, only when an exact ready Desktop
+    /// provider profile or legacy Runtime configuration is available, runs its
+    /// first bounded Context turn. Runtime completion never completes the
+    /// Mission; a completed agent message is adopted only as a reviewable draft.
     pub fn start_mission_and_run_os(
         &self,
         project_id: &ProjectId,
@@ -2764,7 +2792,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.start_mission_and_run_with(
             &secret_store,
             project_id,
@@ -3151,7 +3179,7 @@ impl DesktopDataPlane {
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.require_id_only_runtime_resume(&secret_store, project_id, mission_id)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.resume_mission_runtime_with(
             &secret_store,
             project_id,
@@ -3173,7 +3201,7 @@ impl DesktopDataPlane {
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.require_id_only_runtime_resume(&secret_store, project_id, mission_id)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.resume_mission_runtime_with_cancellation(
             &secret_store,
             project_id,
@@ -3196,7 +3224,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.resume_catalog_mission_runtime_with_cancellation(
             &secret_store,
             authority,
@@ -3284,7 +3312,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.continue_mission_and_run_with(
             &secret_store,
             request,
@@ -3303,7 +3331,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.continue_mission_and_run_with_cancellation(
             &secret_store,
             request,
@@ -3326,7 +3354,8 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopHumanCommandDispatch, DesktopDataError> {
         let secret_store = Arc::new(OsSecretStore::new(OS_SECRET_SERVICE)?);
-        let runtime = discover_runtime()
+        let runtime = self
+            .discover_runtime_with(secret_store.as_ref())
             .configuration
             .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration)));
         self.dispatch_mission_human_command_with(secret_store, request, runtime, cancellation, now)
@@ -3352,11 +3381,7 @@ impl DesktopDataPlane {
                     if configuration.artifact.is_none()
                         && configuration.provider == DEEPSEEK_PROVIDER_ID =>
                 {
-                    let connection =
-                        DeepSeekConnection::official("DEEPSEEK_API_KEY").map_err(|error| {
-                            DesktopDataError::CordisSessionPersistence(error.to_string())
-                        })?;
-                    DeepSeekAdapter::production(connection)
+                    production_native_deepseek_adapter(&configuration)?
                 }
                 #[cfg(any(test, feature = "native-journey"))]
                 Some(DesktopRuntimeSource::NativeDeepSeek { adapter, .. }) => adapter,
@@ -3432,7 +3457,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.continue_mission_and_run_with_cancellation(
             &secret_store,
             request,
@@ -5686,7 +5711,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<Option<DesktopMissionSubmission>, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
-        let runtime = discover_runtime();
+        let runtime = self.discover_runtime_with(&secret_store);
         self.run_idle_job_completion_followup_with(
             &secret_store,
             notice,
@@ -6984,6 +7009,54 @@ impl DesktopDataPlane {
         &self.data_root
     }
 
+    fn discover_runtime_with(&self, store: &impl SecretStore) -> DesktopRuntimeDiscovery {
+        discover_runtime_with_native_profile(store, &self.native_provider_profile_reference)
+    }
+
+    /// Stores the Cordis-native DeepSeek model and API key in one data-root
+    /// scoped OS-vault entry. The returned projection contains no credential
+    /// material and no provider request is made.
+    pub fn configure_native_deepseek_os(
+        &self,
+        model: impl Into<String>,
+        credential: Zeroizing<String>,
+    ) -> Result<DesktopRuntimeProjection, DesktopDataError> {
+        let store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.configure_native_deepseek_with(&store, model, credential)
+    }
+
+    fn configure_native_deepseek_with(
+        &self,
+        store: &impl SecretStore,
+        model: impl Into<String>,
+        credential: Zeroizing<String>,
+    ) -> Result<DesktopRuntimeProjection, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        put_native_deepseek_profile(
+            store,
+            &self.native_provider_profile_reference,
+            model,
+            credential,
+        )?;
+        Ok(self.discover_runtime_with(store).projection)
+    }
+
+    /// Removes the data-root scoped native profile. Absence is already the
+    /// cleared state; this never starts a Runtime or provider request.
+    pub fn clear_native_deepseek_os(&self) -> Result<DesktopRuntimeProjection, DesktopDataError> {
+        let store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.clear_native_deepseek_with(&store)
+    }
+
+    fn clear_native_deepseek_with(
+        &self,
+        store: &impl SecretStore,
+    ) -> Result<DesktopRuntimeProjection, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        clear_native_deepseek_profile(store, &self.native_provider_profile_reference)?;
+        Ok(self.discover_runtime_with(store).projection)
+    }
+
     fn waiting_approval_broker() -> EffectBroker {
         EffectBroker::new(
             EffectPolicy {
@@ -7046,7 +7119,7 @@ impl DesktopDataPlane {
             inventory,
             context_access,
             runtime_reconciliation,
-            runtime: discover_runtime().projection,
+            runtime: self.discover_runtime_with(secret_store).projection,
             runtime_activity: service.desktop_runtime_activity()?,
             product_evidence,
         })
@@ -8860,6 +8933,58 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-11T10:00:00Z")
             .expect("valid fixture time")
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn native_deepseek_profile_is_data_root_scoped_and_never_projected() {
+        let first_root = tempfile::tempdir().expect("first data root");
+        let second_root = tempfile::tempdir().expect("second data root");
+        let first = DesktopDataPlane::at_data_root(first_root.path().join("desktop-data"))
+            .expect("first plane");
+        let second = DesktopDataPlane::at_data_root(second_root.path().join("desktop-data"))
+            .expect("second plane");
+        assert_ne!(
+            first
+                .native_provider_profile_reference
+                .credential_id()
+                .expect("first reference"),
+            second
+                .native_provider_profile_reference
+                .credential_id()
+                .expect("second reference")
+        );
+
+        let store = MemorySecretStore::default();
+        let projection = first
+            .configure_native_deepseek_with(
+                &store,
+                "deepseek-chat",
+                Zeroizing::new("secret-deepseek-key".into()),
+            )
+            .expect("configure native profile");
+        assert_eq!(
+            projection.status,
+            DesktopRuntimeAvailabilityStatus::ReadyDistribution
+        );
+        assert_eq!(projection.provider.as_deref(), Some(DEEPSEEK_PROVIDER_ID));
+        assert_eq!(projection.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(store.entry_count().expect("entry count"), 1);
+        let stored = store
+            .get(&first.native_provider_profile_reference)
+            .expect("stored profile");
+        assert!(!format!("{stored:?}").contains("secret-deepseek-key"));
+        assert!(matches!(
+            store.get(&second.native_provider_profile_reference),
+            Err(SecretStoreError::SecretNotFound)
+        ));
+
+        first
+            .clear_native_deepseek_with(&store)
+            .expect("clear native profile");
+        first
+            .clear_native_deepseek_with(&store)
+            .expect("idempotent clear");
+        assert_eq!(store.entry_count().expect("entry count"), 0);
     }
 
     #[test]
