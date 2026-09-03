@@ -15076,6 +15076,7 @@ sleep 30"#;
             SessionCallConfig, SessionContentBlock, SessionEpochHeader, SessionEventKind,
             SessionFinishReason, SessionId, SessionMessageSource, SessionRequestHeaderReason,
             SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
+            SessionToolSchema,
         };
 
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -15153,6 +15154,24 @@ sleep 30"#;
                     crate::sandbox_provider::background_job_kill_schema(),
                     crate::sandbox_provider::background_job_list_schema(),
                     crate::sandbox_provider::background_job_output_schema(),
+                    SessionToolSchema {
+                        name: "subagent".into(),
+                        description: "Delegate a self-contained task to a fresh subagent working in its own context. The call waits for the result and returns only the final answer; the child does not see this conversation, so provide a complete standalone prompt.".into(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "The complete, self-contained task for the subagent. It does not share this conversation's context, so include everything it needs."
+                                }
+                            },
+                            "required": ["prompt"]
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    },
                 ]
             }),
         };

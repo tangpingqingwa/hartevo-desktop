@@ -2243,6 +2243,7 @@ fn encode_checkpoint(
                 .parent_session
                 .as_ref()
                 .map(|id| id.as_str().to_owned()),
+            delegation_depth: checkpoint.header.delegation_depth,
             seed_length: checkpoint.header.seed_length,
         },
         events: checkpoint
@@ -2460,6 +2461,7 @@ fn decode_checkpoint(
             .parent_session
             .map(SessionId::new)
             .transpose()?,
+        delegation_depth: checkpoint.header.delegation_depth,
         seed_length: checkpoint.header.seed_length,
     };
     let events = checkpoint
@@ -3323,11 +3325,11 @@ mod tests {
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
         OPENINTERPRETER, OneShotSubagentDescriptor, RuntimeBinding, SandboxError, SandboxMode,
         SandboxModeSource, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
-        SessionCallConfig, SessionCancelCause, SessionCompactionEnd, SessionCompactionStart,
-        SessionCompactionSummary, SessionContentBlock, SessionError, SessionEvent,
-        SessionEventKind, SessionFinishReason, SessionHandle, SessionId, SessionLlmFailure,
-        SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted, SessionMessage,
-        SessionMessageRole, SessionMessageSource, SessionSandboxMode, SessionStore,
+        SessionCallConfig, SessionCancelCause, SessionCheckpoint, SessionCompactionEnd,
+        SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionError,
+        SessionEvent, SessionEventKind, SessionFinishReason, SessionHandle, SessionHeader,
+        SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryMode, SessionLlmRetryStarted,
+        SessionMessage, SessionMessageRole, SessionMessageSource, SessionSandboxMode, SessionStore,
         SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionSurfaceOp,
         SessionToolSchema, SurfaceOwner, ToolCall, ToolDefinition, TurnEndReason,
         enforce_invariants, events, host_is_cordis_loop, invariant_missing,
@@ -3351,10 +3353,10 @@ mod tests {
         DesktopCordisSlot, DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
         DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
         DesktopHumanCommandDispatch, DesktopHumanCommandResult, DesktopSessionPersistenceError,
-        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_event,
+        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_checkpoint, decode_event,
         dispatch_live_domain_command, dispatch_live_effect_execution,
         dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
-        dispatch_live_runtime, encode_event, is_desktop_human_command,
+        dispatch_live_runtime, encode_checkpoint, encode_event, is_desktop_human_command,
         manual_compaction_failure_result, mount_cordis_host, openinterpreter_runtime_plugin,
         runtime_open_turn,
     };
@@ -5361,6 +5363,24 @@ mod tests {
                 "source": "delegation",
             })
         );
+    }
+
+    #[test]
+    fn session_header_codec_preserves_monotone_delegation_depth() {
+        let mut header = SessionHeader::new_at(SessionId::new("depth-child").unwrap(), 1).unwrap();
+        header.parent_session = Some(SessionId::new("depth-parent").unwrap());
+        header.delegation_depth = 3;
+        header.seed_length = Some(0);
+        let checkpoint = SessionCheckpoint {
+            header: header.clone(),
+            events: Vec::new(),
+        };
+
+        let persisted = encode_checkpoint(&checkpoint).unwrap();
+        assert_eq!(persisted.header.delegation_depth, 3);
+        let (decoded, events) = decode_checkpoint(persisted).unwrap();
+        assert_eq!(decoded, header);
+        assert!(events.is_empty());
     }
 
     #[test]

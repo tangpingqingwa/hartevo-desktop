@@ -92,6 +92,9 @@ pub struct SessionHeader {
     pub id: SessionId,
     pub created_at_ms: i64,
     pub parent_session: Option<SessionId>,
+    /// Monotone delegation depth; top-level and ordinary forked Sessions keep
+    /// zero unless their source is already a subagent.
+    pub delegation_depth: u32,
     pub seed_length: Option<u64>,
 }
 
@@ -109,6 +112,7 @@ impl SessionHeader {
             id,
             created_at_ms,
             parent_session: None,
+            delegation_depth: 0,
             seed_length: None,
         })
     }
@@ -3871,16 +3875,22 @@ impl SessionStore {
         if state.sessions.contains_key(&child_id) {
             return Err(SessionError::SessionAlreadyExists { id: child_id });
         }
-        if !state.sessions.contains_key(parent_id) {
-            return Err(SessionError::SessionNotFound {
+        let parent = state.sessions.get(parent_id).cloned().ok_or_else(|| {
+            SessionError::SessionNotFound {
                 id: parent_id.clone(),
-            });
-        }
+            }
+        })?;
+        let delegation_depth = parent
+            .header()?
+            .delegation_depth
+            .checked_add(1)
+            .ok_or(SessionError::DelegationDepthOverflow)?;
         let header = SessionHeader {
             version: SESSION_FORMAT_VERSION,
             id: child_id.clone(),
             created_at_ms: Utc::now().timestamp_millis(),
             parent_session: Some(parent_id.clone()),
+            delegation_depth,
             seed_length: Some(0),
         };
         let handle = SessionHandle::new(
@@ -3932,6 +3942,7 @@ impl SessionStore {
             }
         })?;
         let source_log = source.lock()?;
+        let delegation_depth = source_log.header().delegation_depth;
         let last_seq = source_log.events().last().map(|event| event.seq);
         let selected_boundary = boundary.or(last_seq);
         let seed = match selected_boundary {
@@ -3969,6 +3980,7 @@ impl SessionStore {
             id: child_id.clone(),
             created_at_ms: Utc::now().timestamp_millis(),
             parent_session: Some(source_id.clone()),
+            delegation_depth,
             seed_length: Some(seed_length),
         };
         let child_log = SessionLog::restore(header, seed)?;
@@ -4065,6 +4077,8 @@ pub enum SessionError {
     UnexpectedEventSequence { expected: u64, actual: u64 },
     #[error("session event sequence overflowed")]
     EventSequenceOverflow,
+    #[error("session delegation depth overflowed")]
+    DelegationDepthOverflow,
     #[error("session turn sequence overflowed")]
     TurnSequenceOverflow,
     #[error("session step sequence overflowed in turn {turn}")]

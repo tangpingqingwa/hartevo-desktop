@@ -45,6 +45,10 @@ pub const SPAWN_SUBAGENT_PROVIDER_NAME: &str = "spawn";
 /// Model-visible name of the first bounded foreground delegation tool.
 pub const SUBAGENT_TOOL_NAME: &str = "subagent";
 
+/// Absolute recursion cap for the built-in delegation tool. A top-level Agent
+/// is depth zero, so depths one through three are admitted.
+pub const DEFAULT_SUBAGENT_MAX_DEPTH: u32 = 3;
+
 /// Services required by the host-plane in-process provider.
 pub const SUBAGENT_SPAWN_IN_PROCESS_KEYS: &[&str] = &[keys::SUBAGENTS, keys::TOOLS];
 
@@ -355,6 +359,10 @@ pub enum SubagentError {
     ParentSessionRequired { provider: String },
     #[error("subagent provider `{provider}` was cancelled before child publication")]
     AbortedBeforePublication { provider: String },
+    #[error("subagent depth {attempted} exceeds max depth {max}")]
+    DepthExceeded { attempted: u32, max: u32 },
+    #[error("subagent child depth overflowed")]
+    DepthOverflow,
     #[error("subagent provider `{provider}` failed to start: {detail}")]
     ProviderStart { provider: String, detail: String },
 }
@@ -375,6 +383,8 @@ impl SubagentError {
             Self::HostDriverRequired { .. } => "HOST_DRIVER_REQUIRED",
             Self::ParentSessionRequired { .. } => "PARENT_SESSION_REQUIRED",
             Self::AbortedBeforePublication { .. } => "ABORTED",
+            Self::DepthExceeded { .. } => "DEPTH_EXCEEDED",
+            Self::DepthOverflow => "DEPTH_OVERFLOW",
             Self::ProviderStart { .. } => "PROVIDER_START_FAILED",
         }
     }
@@ -511,6 +521,7 @@ pub(crate) async fn run_foreground_subagent_tool(
     )
     .with_parent_session(tool.session_id().clone());
     request.cancellation = tool.cancellation().clone();
+    request.max_depth = Some(DEFAULT_SUBAGENT_MAX_DEPTH);
     let run = runtime
         .start_local(ctx, &provider, request, inherited_config)
         .await
@@ -625,7 +636,9 @@ impl SubagentProvider for SpawnInProcessSubagent {
     }
 
     fn capabilities(&self) -> SubagentCapabilities {
-        SubagentCapabilities::NONE.with(SubagentCapability::AgentOptions)
+        SubagentCapabilities::NONE
+            .with(SubagentCapability::AgentOptions)
+            .with(SubagentCapability::DepthLimit)
     }
 
     fn inherits_parent_context(&self) -> bool {
@@ -1130,6 +1143,24 @@ impl SubagentRuntime {
         let sessions = ctx
             .sessions::<SessionStore>()
             .ok_or_else(|| provider_start_failure(&provider, "SessionStore is unavailable"))?;
+        let parent = sessions
+            .get(&parent_session)
+            .map_err(|error| provider_start_failure(&provider, error))?
+            .ok_or_else(|| provider_start_failure(&provider, "parent Session is unavailable"))?;
+        let attempted_depth = parent
+            .header()
+            .map_err(|error| provider_start_failure(&provider, error))?
+            .delegation_depth
+            .checked_add(1)
+            .ok_or(SubagentError::DepthOverflow)?;
+        if let Some(max_depth) = prepared.request.max_depth
+            && attempted_depth > max_depth
+        {
+            return Err(SubagentError::DepthExceeded {
+                attempted: attempted_depth,
+                max: max_depth,
+            });
+        }
         let child_id = SessionId::new(Uuid::now_v7().to_string())
             .map_err(|error| provider_start_failure(&provider, error))?;
         let child = sessions
