@@ -21,8 +21,8 @@ use crate::data_plane::{
     ProjectContextAccessStatus,
 };
 use crate::{
-    DesktopBackendState, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection,
-    DesktopUiModel, Surface, VisualRuntimeFixtureState,
+    DesktopBackendState, DesktopNativeCredentialSource, DesktopRuntimeAvailabilityStatus,
+    DesktopRuntimeProjection, DesktopUiModel, Surface, VisualRuntimeFixtureState,
 };
 
 const SCENARIO_ENV: &str = "HARTEVO_DESKTOP_UI_SCENARIO";
@@ -570,6 +570,8 @@ fn fixture_snapshot(
             program_sha256: None,
             provider: settings_native.then(|| "deepseek-official".into()),
             model: settings_native.then(|| "deepseek-chat".into()),
+            native_credential_source: settings_native
+                .then_some(DesktopNativeCredentialSource::DesktopProfile),
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         },

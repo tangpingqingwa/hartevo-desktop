@@ -833,6 +833,7 @@ mod tests {
             program_sha256: Some("private-program-digest".into()),
             provider: None,
             model: None,
+            native_credential_source: None,
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         };
@@ -854,6 +855,7 @@ mod tests {
             program_sha256: None,
             provider: Some("deepseek-official".into()),
             model: None,
+            native_credential_source: None,
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         };

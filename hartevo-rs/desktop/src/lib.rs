@@ -63,7 +63,9 @@ use result_adoption_surface::{
     ResultSurfaceAction, SelectedResultProjection, action_matches_current_projection,
     selected_result_projection,
 };
-pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+pub use runtime_plane::{
+    DesktopNativeCredentialSource, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection,
+};
 use runtime_subscription::{
     DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE, DesktopRuntimeCommandIdentity,
     DesktopRuntimeCompletionDisposition, DesktopRuntimeExecutionLaunch,
@@ -8252,6 +8254,18 @@ fn OutcomesSurface(
     }
 }
 
+fn native_credential_source_label(runtime: Option<&DesktopRuntimeProjection>) -> &'static str {
+    let Some(runtime) = runtime else {
+        return "数据层未就绪";
+    };
+    match runtime.native_credential_source {
+        Some(DesktopNativeCredentialSource::DesktopProfile) => "桌面配置 · OS Secret Store",
+        Some(DesktopNativeCredentialSource::Environment) => "环境变量",
+        None if runtime.is_cordis_native() => "未配置",
+        None => "不适用",
+    }
+}
+
 #[component]
 fn SettingsSurface(
     runtime: Option<DesktopRuntimeProjection>,
@@ -8285,9 +8299,7 @@ fn SettingsSurface(
         .as_ref()
         .and_then(|runtime| runtime.model.as_deref())
         .unwrap_or("未配置");
-    let native_route = runtime
-        .as_ref()
-        .is_some_and(DesktopRuntimeProjection::is_cordis_native);
+    let credential_source = native_credential_source_label(runtime.as_ref());
     let can_save_native_provider = {
         let model = native_model.read();
         let credential = native_credential.read();
@@ -8352,6 +8364,7 @@ fn SettingsSurface(
                                 SettingsRow { title: "Runtime", detail: "来自 DesktopRuntimeProjection。", value: runtime_status }
                                 SettingsRow { title: "Provider", detail: "没有真实配置时不显示可用。", value: provider }
                                 SettingsRow { title: "Model", detail: "只展示当前生效投影。", value: model }
+                                SettingsRow { title: "凭据来源", detail: "仅展示来源类型，不回读凭据或 Secret Store 引用。", value: credential_source }
                             }
                         }
                         section { class: "settings-section",
@@ -8381,7 +8394,7 @@ fn SettingsSurface(
                                 }
                                 div { class: "settings-provider-actions",
                                     span {
-                                        strong { if native_route { "OS Secret Store" } else { "当前不是 Cordis 原生路由" } }
+                                        strong { "{credential_source}" }
                                         small { "清除桌面配置后，若存在受支持的环境变量配置，Runtime 会如实回退并继续显示。" }
                                     }
                                     div {
@@ -11750,6 +11763,33 @@ mod tests {
     }
 
     #[test]
+    fn native_credential_source_label_never_infers_secret_store_from_route() {
+        let mut runtime = DesktopRuntimeProjection {
+            status: DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+            target: Some("cordis-native".into()),
+            release: "deepseek-harness-cd5ef814/cordis-v1".into(),
+            program_sha256: None,
+            provider: Some("deepseek-official".into()),
+            model: Some("deepseek-chat".into()),
+            native_credential_source: Some(DesktopNativeCredentialSource::DesktopProfile),
+            distribution_signature_evidence: None,
+            exact_tokenizer_evidence: false,
+        };
+        assert_eq!(
+            native_credential_source_label(Some(&runtime)),
+            "桌面配置 · OS Secret Store"
+        );
+
+        runtime.native_credential_source = Some(DesktopNativeCredentialSource::Environment);
+        assert_eq!(native_credential_source_label(Some(&runtime)), "环境变量");
+        runtime.native_credential_source = None;
+        assert_eq!(native_credential_source_label(Some(&runtime)), "未配置");
+        runtime.target = Some("openinterpreter-target".into());
+        assert_eq!(native_credential_source_label(Some(&runtime)), "不适用");
+        assert_eq!(native_credential_source_label(None), "数据层未就绪");
+    }
+
+    #[test]
     fn model_settings_bind_only_to_native_configuration_seam() {
         let source = include_str!("lib.rs");
         let css = include_str!("../assets/prototype.css");
@@ -11761,7 +11801,9 @@ mod tests {
             "r#type: \"password\"",
             "autocomplete: \"new-password\"",
             "NO PROVIDER CALL",
-            "DesktopRuntimeProjection::is_cordis_native",
+            "native_credential_source_label",
+            "DesktopNativeCredentialSource::DesktopProfile",
+            "DesktopNativeCredentialSource::Environment",
         ] {
             assert!(
                 source.contains(contract),
