@@ -540,6 +540,7 @@ fn fixture_snapshot(
     projects: Vec<DesktopProjectProjection>,
     evidence: ProductEvidenceProjection,
 ) -> DesktopSnapshot {
+    let settings_native = requested_surface_id().as_deref() == Some("settings-models");
     DesktopSnapshot {
         inventory: DesktopInventoryProjection { projects },
         context_access: vec![ProjectContextAccessProjection {
@@ -559,12 +560,16 @@ fn fixture_snapshot(
             outbox_sequences: Vec::new(),
         },
         runtime: DesktopRuntimeProjection {
-            status: DesktopRuntimeAvailabilityStatus::NotConfigured,
-            target: None,
+            status: if settings_native {
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution
+            } else {
+                DesktopRuntimeAvailabilityStatus::NotConfigured
+            },
+            target: settings_native.then(|| "cordis-native".into()),
             release: "VISUAL_FIXTURE".into(),
             program_sha256: None,
-            provider: None,
-            model: None,
+            provider: settings_native.then(|| "deepseek-official".into()),
+            model: settings_native.then(|| "deepseek-chat".into()),
             distribution_signature_evidence: None,
             exact_tokenizer_evidence: false,
         },
@@ -610,7 +615,7 @@ pub(super) fn initial_surface() -> Option<Surface> {
         Some("connections") => Surface::Connections,
         Some("outcomes") => Surface::Outcomes,
         Some("capability-evidence") => Surface::CapabilityEvidence,
-        Some("settings") => Surface::Settings,
+        Some("settings" | "settings-models") => Surface::Settings,
         Some("state-coverage") => Surface::StateCoverage,
         Some(value) => panic!("unsupported visual fixture surface: {value}"),
     })
