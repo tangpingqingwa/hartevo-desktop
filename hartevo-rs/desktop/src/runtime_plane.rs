@@ -53,6 +53,10 @@ impl DesktopRuntimeProjection {
             exact_tokenizer_evidence: false,
         }
     }
+
+    pub(crate) fn is_cordis_native(&self) -> bool {
+        self.target.as_deref() == Some(CORDIS_NATIVE_TARGET)
+    }
 }
 
 pub(crate) struct DesktopRuntimeConfiguration {
@@ -77,11 +81,26 @@ pub(crate) struct DesktopRuntimeDiscovery {
     pub configuration: Option<DesktopRuntimeConfiguration>,
 }
 
-pub(crate) fn discover_runtime() -> DesktopRuntimeDiscovery {
-    if normalized_env(RUNTIME_PROVIDER_ENV).as_deref() == Some(DEEPSEEK_PROVIDER_ID) {
-        return discover_native_deepseek(normalized_env(RUNTIME_MODEL_ENV));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopRuntimeBackend {
+    CordisNative,
+    OpenInterpreter,
+}
+
+fn runtime_backend(provider: Option<&str>) -> DesktopRuntimeBackend {
+    match provider {
+        None | Some(DEEPSEEK_PROVIDER_ID) => DesktopRuntimeBackend::CordisNative,
+        Some(_) => DesktopRuntimeBackend::OpenInterpreter,
     }
-    discover_openinterpreter()
+}
+
+pub(crate) fn discover_runtime() -> DesktopRuntimeDiscovery {
+    match runtime_backend(normalized_env(RUNTIME_PROVIDER_ENV).as_deref()) {
+        DesktopRuntimeBackend::CordisNative => {
+            discover_native_deepseek(normalized_env(RUNTIME_MODEL_ENV))
+        }
+        DesktopRuntimeBackend::OpenInterpreter => discover_openinterpreter(),
+    }
 }
 
 fn discover_openinterpreter() -> DesktopRuntimeDiscovery {
@@ -331,6 +350,31 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn cordis_native_is_the_default_and_openinterpreter_requires_explicit_selection() {
+        assert_eq!(runtime_backend(None), DesktopRuntimeBackend::CordisNative);
+        assert_eq!(
+            runtime_backend(Some(DEEPSEEK_PROVIDER_ID)),
+            DesktopRuntimeBackend::CordisNative
+        );
+        assert_eq!(
+            runtime_backend(Some("openai")),
+            DesktopRuntimeBackend::OpenInterpreter
+        );
+
+        let missing_model = discover_native_deepseek(None);
+        assert_eq!(
+            missing_model.projection.status,
+            DesktopRuntimeAvailabilityStatus::ConfigurationRequired
+        );
+        assert!(missing_model.projection.is_cordis_native());
+        assert_eq!(
+            missing_model.projection.provider.as_deref(),
+            Some(DEEPSEEK_PROVIDER_ID)
+        );
+        assert!(missing_model.configuration.is_none());
+    }
 
     #[test]
     fn native_deepseek_discovery_needs_no_openinterpreter_artifact() {
