@@ -1,6 +1,6 @@
 //! Official TikTok Display API request and response boundary.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use url::Url;
 
@@ -12,9 +12,9 @@ use crate::transport::{
 use super::{
     DISPLAY_API_BASE_URL, EvidenceProvenance, ProviderId, TiktokAccountIdentity,
     TiktokApiOperation, TiktokCursor, TiktokError, TiktokFreshness, TiktokOAuthScope,
-    TiktokObservationEnvelope, TiktokPerformanceObservation, TiktokReadObservation,
-    TiktokReadScope, TiktokRevisionIdentity, TiktokVideoIdentity, TiktokVideoObservation,
-    TiktokVideoPage, USER_INFO_PATH, VIDEO_LIST_PATH, VIDEO_QUERY_PATH,
+    TiktokObservationEnvelope, TiktokPerformanceObservation, TiktokProviderResetObservation,
+    TiktokReadObservation, TiktokReadScope, TiktokRevisionIdentity, TiktokVideoIdentity,
+    TiktokVideoObservation, TiktokVideoPage, USER_INFO_PATH, VIDEO_LIST_PATH, VIDEO_QUERY_PATH,
     video_list_request_fingerprint,
 };
 
@@ -79,6 +79,40 @@ impl<T: ReadOnlyTransport> TiktokDisplayApiProvider<T> {
                 TransportError::Unavailable | TransportError::TimedOut => TiktokError::Disconnected,
             })
     }
+}
+
+pub(super) fn rate_limit_observation(
+    response: &ProviderResponse,
+) -> Result<Option<TiktokProviderResetObservation>, TiktokError> {
+    if response.status() != 429 {
+        return Ok(None);
+    }
+    let observed_at = response.observed_at();
+    let retry_after_seconds = response
+        .header("retry-after")
+        .and_then(|value| value.parse().ok());
+    let provider_reset_at = response
+        .header("x-ratelimit-reset")
+        .or_else(|| response.header("x-rate-limit-reset"))
+        .and_then(parse_epoch_seconds)
+        .filter(|reset| *reset > observed_at)
+        .or_else(|| {
+            retry_after_seconds
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| {
+                    i64::try_from(seconds).ok().and_then(|seconds| {
+                        observed_at.checked_add_signed(Duration::seconds(seconds))
+                    })
+                })
+        });
+    TiktokProviderResetObservation::new(
+        429,
+        observed_at,
+        response.body_digest(),
+        retry_after_seconds,
+        provider_reset_at,
+    )
+    .map(Some)
 }
 
 pub fn probe_request(credential: SecretReference) -> Result<ProviderReadRequest, TiktokError> {
@@ -441,6 +475,13 @@ fn sort_video_observations(
         return Err(TiktokError::CursorDrift);
     }
     Ok(())
+}
+
+fn parse_epoch_seconds(value: &str) -> Option<DateTime<Utc>> {
+    value
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
 }
 
 fn invalid_response(field: impl Into<String>) -> TiktokError {

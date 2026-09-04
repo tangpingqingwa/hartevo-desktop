@@ -9,8 +9,9 @@ use hartevo_channel_adapters::{
     BusinessId, EvidenceProvenance, HttpMethod, MissionTiktokReadConsumer, OAuthCredential,
     ProviderReadRequest, ProviderResponse, ReadOnlyTransport, SecretReference, TenantId,
     TiktokAccountId, TiktokApiOperation, TiktokAuthenticatedReadService, TiktokConnectionState,
-    TiktokCursor, TiktokError, TiktokFreshnessPolicy, TiktokOAuthScope, TiktokReadObservation,
-    TiktokReadScope, TiktokRevisionIdentity, TiktokVideoId, TiktokVideoListCursor, TransportError,
+    TiktokCursor, TiktokCursorInvalidationReason, TiktokCursorLifecycle, TiktokError,
+    TiktokFreshnessPolicy, TiktokOAuthScope, TiktokReadObservation, TiktokReadScope,
+    TiktokRevisionIdentity, TiktokVideoId, TiktokVideoListCursor, TransportError,
 };
 
 use hartevo_channel_adapters::tiktok::testkit::{
@@ -248,7 +249,7 @@ fn video_list_is_durable_cursor_pagination_with_performance_observations() {
 }
 
 #[test]
-fn video_list_cursor_checkpoint_is_credential_bound_before_provider_io() {
+fn video_list_cursor_checkpoint_is_credential_bound_and_rotation_invalidates() {
     let now = fixed_now();
     let read_scope = scope();
     let original = credential(&read_scope, now);
@@ -275,10 +276,35 @@ fn video_list_cursor_checkpoint_is_credential_bound_before_provider_io() {
         rotated_service
             .list_videos(&rotated, &mut restored, now, 20)
             .unwrap_err(),
-        TiktokError::CursorCredentialMismatch
+        TiktokError::CursorInvalidated {
+            reason: TiktokCursorInvalidationReason::CredentialRotated,
+        }
     );
     assert!(requests.borrow().is_empty());
-    assert_eq!(restored, before);
+    assert!(matches!(
+        restored.lifecycle(),
+        TiktokCursorLifecycle::Invalidated {
+            reason: TiktokCursorInvalidationReason::CredentialRotated,
+            ..
+        }
+    ));
+    assert_eq!(restored.generation(), before.generation());
+    assert_eq!(restored.next_cursor(), before.next_cursor());
+    assert_eq!(restored.accepted_page_count(), before.accepted_page_count());
+    assert_eq!(restored.evidence_root(), before.evidence_root());
+    assert!(restored.retry_after().is_none());
+    let mut reopened_invalidated =
+        TiktokVideoListCursor::from_checkpoint_json(&restored.checkpoint_json().unwrap()).unwrap();
+    assert_eq!(reopened_invalidated, restored);
+    assert_eq!(
+        rotated_service
+            .list_videos(&original, &mut reopened_invalidated, now, 20)
+            .unwrap_err(),
+        TiktokError::CursorInvalidated {
+            reason: TiktokCursorInvalidationReason::CredentialRotated,
+        }
+    );
+    assert!(requests.borrow().is_empty());
 
     let mut legacy_checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
     let legacy_object = legacy_checkpoint.as_object_mut().unwrap();
@@ -293,6 +319,259 @@ fn video_list_cursor_checkpoint_is_credential_bound_before_provider_io() {
         .unwrap_err(),
         TiktokError::CursorCheckpointIncompatible
     );
+}
+
+#[test]
+fn bound_cursor_revocation_and_unmount_are_permanent_and_transport_free() {
+    let now = fixed_now();
+    let read_scope = scope();
+    let original = credential(&read_scope, now);
+
+    let mut revoked_cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+    let mut revoked_seed = TiktokAuthenticatedReadService::fixture(
+        FixtureTransport::responses([first_video_page_response()]),
+        TiktokFreshnessPolicy::default(),
+    );
+    revoked_seed
+        .list_videos(&original, &mut revoked_cursor, now, 20)
+        .unwrap();
+    let revoked_generation = revoked_cursor.generation();
+    let revoked_root = revoked_cursor.evidence_root().to_owned();
+    let mut revoked = original.clone();
+    revoked.revoke(now);
+    let revoked_transport = FixtureTransport::responses([final_video_page_response()]);
+    let revoked_requests = Rc::clone(&revoked_transport.requests);
+    let mut revoked_service = TiktokAuthenticatedReadService::fixture(
+        revoked_transport,
+        TiktokFreshnessPolicy::default(),
+    );
+    assert_eq!(
+        revoked_service
+            .list_videos(&revoked, &mut revoked_cursor, now, 20)
+            .unwrap_err(),
+        TiktokError::CursorInvalidated {
+            reason: TiktokCursorInvalidationReason::CredentialRevoked,
+        }
+    );
+    assert!(revoked_requests.borrow().is_empty());
+    assert_eq!(revoked_cursor.generation(), revoked_generation);
+    assert_eq!(revoked_cursor.evidence_root(), revoked_root);
+
+    let mut unmounted_cursor = TiktokVideoListCursor::new(read_scope).unwrap();
+    let mut unmounted_seed = TiktokAuthenticatedReadService::fixture(
+        FixtureTransport::responses([first_video_page_response()]),
+        TiktokFreshnessPolicy::default(),
+    );
+    unmounted_seed
+        .list_videos(&original, &mut unmounted_cursor, now, 20)
+        .unwrap();
+    let unmounted_generation = unmounted_cursor.generation();
+    let unmounted_root = unmounted_cursor.evidence_root().to_owned();
+    let mut unmounted = original;
+    unmounted.unmount(now);
+    let unmounted_transport = FixtureTransport::responses([final_video_page_response()]);
+    let unmounted_requests = Rc::clone(&unmounted_transport.requests);
+    let mut unmounted_service = TiktokAuthenticatedReadService::fixture(
+        unmounted_transport,
+        TiktokFreshnessPolicy::default(),
+    );
+    assert_eq!(
+        unmounted_service
+            .list_videos(&unmounted, &mut unmounted_cursor, now, 20)
+            .unwrap_err(),
+        TiktokError::CursorInvalidated {
+            reason: TiktokCursorInvalidationReason::CredentialUnmounted,
+        }
+    );
+    assert!(unmounted_requests.borrow().is_empty());
+    assert_eq!(unmounted_cursor.generation(), unmounted_generation);
+    assert_eq!(unmounted_cursor.evidence_root(), unmounted_root);
+    assert_eq!(
+        unmounted_cursor.lifecycle(),
+        TiktokCursorLifecycle::Invalidated {
+            reason: TiktokCursorInvalidationReason::CredentialUnmounted,
+            at: now,
+        }
+    );
+}
+
+#[test]
+fn rate_limit_receipt_survives_reopen_and_resumes_once_after_reset() {
+    let now = fixed_now();
+    let read_scope = scope();
+    let read_credential = credential(&read_scope, now);
+    let transport =
+        FixtureTransport::responses([rate_limited_response(), first_video_page_response()]);
+    let requests = Rc::clone(&transport.requests);
+    let mut service =
+        TiktokAuthenticatedReadService::fixture(transport, TiktokFreshnessPolicy::default());
+    let mut cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+    let initial_root = cursor.evidence_root().to_owned();
+
+    assert_eq!(
+        service
+            .list_videos(&read_credential, &mut cursor, now, 20)
+            .unwrap_err(),
+        TiktokError::RateLimited {
+            operation: TiktokApiOperation::VideoList,
+            retry_after_seconds: Some(30),
+        }
+    );
+    let receipt = cursor.retry_after().unwrap();
+    assert_eq!(receipt.scope(), &read_scope);
+    assert_eq!(receipt.account(), read_scope.account());
+    assert_eq!(receipt.operation(), TiktokApiOperation::VideoList);
+    assert_eq!(receipt.cursor_generation(), 0);
+    assert_eq!(receipt.requested_cursor(), None);
+    assert_eq!(receipt.credential_generation(), 1);
+    assert_eq!(
+        receipt.provider_reset_at(),
+        Some(now + Duration::seconds(30))
+    );
+    assert_eq!(receipt.response_digest().len(), 64);
+    assert_eq!(cursor.generation(), 0);
+    assert_eq!(cursor.accepted_page_count(), 0);
+    assert_eq!(cursor.evidence_root(), initial_root);
+    assert_eq!(requests.borrow().len(), 1);
+
+    let rotated = credential_with(&read_scope, now, "keychain://tiktok/open01-rotated", 2);
+    let mut rotated_waiting = cursor.clone();
+    let rotated_transport = FixtureTransport::responses([]);
+    let rotated_requests = Rc::clone(&rotated_transport.requests);
+    let mut rotated_service = TiktokAuthenticatedReadService::fixture(
+        rotated_transport,
+        TiktokFreshnessPolicy::default(),
+    );
+    assert!(matches!(
+        rotated_service.list_videos(&rotated, &mut rotated_waiting, now, 20),
+        Err(TiktokError::CursorInvalidated {
+            reason: TiktokCursorInvalidationReason::CredentialRotated,
+        })
+    ));
+    assert!(rotated_waiting.retry_after().is_none());
+    assert_eq!(rotated_waiting.generation(), 0);
+    assert_eq!(rotated_waiting.evidence_root(), initial_root);
+    assert!(rotated_requests.borrow().is_empty());
+
+    let checkpoint = cursor.checkpoint_json().unwrap();
+    assert!(!checkpoint.contains(read_credential.secret_reference().as_str()));
+    let mut reopened = TiktokVideoListCursor::from_checkpoint_json(&checkpoint).unwrap();
+    assert_eq!(reopened, cursor);
+    assert_eq!(
+        service
+            .list_videos(
+                &read_credential,
+                &mut reopened,
+                now + Duration::seconds(1),
+                20,
+            )
+            .unwrap_err(),
+        TiktokError::RateLimited {
+            operation: TiktokApiOperation::VideoList,
+            retry_after_seconds: Some(30),
+        }
+    );
+    assert_eq!(requests.borrow().len(), 1);
+
+    let recovered = service
+        .list_videos(
+            &read_credential,
+            &mut reopened,
+            now + Duration::seconds(30),
+            20,
+        )
+        .unwrap();
+    assert_eq!(recovered.cursor_generation(), 1);
+    assert_eq!(reopened.generation(), 1);
+    assert_eq!(reopened.accepted_page_count(), 1);
+    assert!(reopened.retry_after().is_none());
+    assert_eq!(requests.borrow().len(), 2);
+}
+
+#[test]
+fn rate_limit_without_reset_metadata_does_not_invent_a_wait_window() {
+    let now = fixed_now();
+    let read_scope = scope();
+    let read_credential = credential(&read_scope, now);
+    let no_reset = ProviderResponse::new(
+        429,
+        [("content-type".to_owned(), "application/json".to_owned())],
+        r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+        now,
+    );
+    let transport = FixtureTransport::responses([no_reset, first_video_page_response()]);
+    let requests = Rc::clone(&transport.requests);
+    let mut service =
+        TiktokAuthenticatedReadService::fixture(transport, TiktokFreshnessPolicy::default());
+    let mut cursor = TiktokVideoListCursor::new(read_scope).unwrap();
+
+    assert_eq!(
+        service
+            .list_videos(&read_credential, &mut cursor, now, 20)
+            .unwrap_err(),
+        TiktokError::RateLimited {
+            operation: TiktokApiOperation::VideoList,
+            retry_after_seconds: None,
+        }
+    );
+    let receipt = cursor.retry_after().unwrap();
+    assert_eq!(receipt.retry_after_seconds(), None);
+    assert_eq!(receipt.provider_reset_at(), None);
+    assert!(receipt.retry_is_due(now));
+    assert_eq!(cursor.generation(), 0);
+
+    let page = service
+        .list_videos(&read_credential, &mut cursor, now, 20)
+        .unwrap();
+    assert_eq!(page.cursor_generation(), 1);
+    assert!(cursor.retry_after().is_none());
+    assert_eq!(requests.borrow().len(), 2);
+}
+
+#[test]
+fn older_rate_limit_deadline_cannot_replace_newer_durable_receipt() {
+    let now = fixed_now();
+    let read_scope = scope();
+    let read_credential = credential(&read_scope, now);
+    let first_limit = ProviderResponse::new(
+        429,
+        [("retry-after".to_owned(), "60".to_owned())],
+        r#"{"error":{"code":"rate_limit_exceeded","log_id":"first"}}"#,
+        now,
+    );
+    let stale_limit = ProviderResponse::new(
+        429,
+        [("retry-after".to_owned(), "5".to_owned())],
+        r#"{"error":{"code":"rate_limit_exceeded","log_id":"stale"}}"#,
+        now + Duration::seconds(10),
+    );
+    let transport = FixtureTransport::responses([first_limit, stale_limit]);
+    let requests = Rc::clone(&transport.requests);
+    let mut service =
+        TiktokAuthenticatedReadService::fixture(transport, TiktokFreshnessPolicy::default());
+    let mut cursor = TiktokVideoListCursor::new(read_scope).unwrap();
+
+    assert!(matches!(
+        service.list_videos(&read_credential, &mut cursor, now, 20),
+        Err(TiktokError::RateLimited {
+            retry_after_seconds: Some(60),
+            ..
+        })
+    ));
+    let before = cursor.clone();
+    assert_eq!(
+        service
+            .list_videos(
+                &read_credential,
+                &mut cursor,
+                now + Duration::seconds(60),
+                20,
+            )
+            .unwrap_err(),
+        TiktokError::CursorDrift
+    );
+    assert_eq!(cursor, before);
+    assert_eq!(requests.borrow().len(), 2);
 }
 
 #[test]
@@ -446,6 +725,19 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
     assert_eq!(revoked_error, TiktokError::CredentialRevoked);
     assert_eq!(
         revoked_error.connection_state(),
+        Some(TiktokConnectionState::Revoked)
+    );
+
+    let mut unmounted = credential(&read_scope, now);
+    unmounted.unmount(now);
+    let mut unmounted_service = TiktokAuthenticatedReadService::fixture(
+        FixtureTransport::responses([]),
+        TiktokFreshnessPolicy::default(),
+    );
+    let unmounted_error = unmounted_service.probe(&unmounted, now).unwrap_err();
+    assert_eq!(unmounted_error, TiktokError::CredentialUnmounted);
+    assert_eq!(
+        unmounted_error.connection_state(),
         Some(TiktokConnectionState::Revoked)
     );
 

@@ -23,11 +23,12 @@ pub use tiktok::{
     BusinessId, DEFAULT_VIDEO_PAGE_SIZE, EvidenceProvenance, MissionTiktokReadConsumer,
     OAuthCredential, SecretReference, TenantId, TiktokAccountId, TiktokAccountIdentity,
     TiktokApiOperation, TiktokAuthenticatedReadService, TiktokConnectionState, TiktokCursor,
-    TiktokCursorDisposition, TiktokDisplayApiProvider, TiktokError, TiktokFreshness,
-    TiktokFreshnessPolicy, TiktokMissionAcceptedRead, TiktokOAuthScope, TiktokObservationEnvelope,
-    TiktokPageSequence, TiktokQuotaLedger, TiktokReadObservation, TiktokReadScope,
-    TiktokRealReadGate, TiktokRevisionIdentity, TiktokVideoId, TiktokVideoListCursor,
-    TiktokVideoObservation, TiktokVideoPageEnvelope,
+    TiktokCursorDisposition, TiktokCursorInvalidationReason, TiktokCursorLifecycle,
+    TiktokDisplayApiProvider, TiktokError, TiktokFreshness, TiktokFreshnessPolicy,
+    TiktokMissionAcceptedRead, TiktokOAuthScope, TiktokObservationEnvelope, TiktokPageSequence,
+    TiktokProviderResetObservation, TiktokQuotaLedger, TiktokReadObservation, TiktokReadScope,
+    TiktokRealReadGate, TiktokRetryAfterReceipt, TiktokRevisionIdentity, TiktokVideoId,
+    TiktokVideoListCursor, TiktokVideoObservation, TiktokVideoPageEnvelope,
 };
 pub use transport::{
     AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderKind,

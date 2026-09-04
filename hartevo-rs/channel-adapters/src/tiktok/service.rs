@@ -6,13 +6,14 @@ use crate::transport::{ReadOnlyTransport, SecretReference};
 
 use super::provider::{
     TiktokDisplayApiProvider, parse_probe_response, parse_video_page_response,
-    parse_video_query_response, probe_request, video_list_request, video_query_request,
+    parse_video_query_response, probe_request, rate_limit_observation, video_list_request,
+    video_query_request,
 };
 use super::{
     EvidenceProvenance, OAuthCredential, REAL_READ_ENABLE_ENV, REAL_READ_SECRET_REFERENCE_ENV,
     TiktokApiOperation, TiktokError, TiktokFreshness, TiktokFreshnessPolicy,
-    TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope, TiktokVideoId,
-    TiktokVideoListCursor, TiktokVideoPage, TiktokVideoPageEnvelope,
+    TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope, TiktokRetryAfterReceipt,
+    TiktokVideoId, TiktokVideoListCursor, TiktokVideoPage, TiktokVideoPageEnvelope,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,10 +147,22 @@ impl<T> TiktokAuthenticatedReadService<T> {
         }
         cursor.require_page_size(max_count)?;
         let scope = cursor.scope().clone();
-        credential.require_for(TiktokApiOperation::VideoList, &scope, now)?;
+        let was_bound = cursor.credential_generation().is_some();
+        if was_bound {
+            cursor.bind_credential(credential, now)?;
+        }
         self.provider
             .require_credential_reference(credential.secret_reference())?;
-        cursor.bind_credential(credential)?;
+        if !was_bound {
+            cursor.bind_credential(credential, now)?;
+        }
+        credential.require_for(TiktokApiOperation::VideoList, &scope, now)?;
+        if let Some(receipt) = cursor.retry_after_if_waiting(now) {
+            return Err(TiktokError::RateLimited {
+                operation: TiktokApiOperation::VideoList,
+                retry_after_seconds: receipt.retry_after_seconds(),
+            });
+        }
         let request = video_list_request(
             credential.secret_reference().clone(),
             cursor.next_cursor(),
@@ -157,6 +170,21 @@ impl<T> TiktokAuthenticatedReadService<T> {
         )?;
         self.quota.reserve(TiktokApiOperation::VideoList, now)?;
         let response = self.provider.send(&request)?;
+        if let Some(observation) = rate_limit_observation(&response)? {
+            let retry_after_seconds = observation.retry_after_seconds();
+            let receipt = TiktokRetryAfterReceipt::from_observation(
+                scope,
+                cursor.generation(),
+                cursor.next_cursor(),
+                credential.generation(),
+                &observation,
+            )?;
+            cursor.record_retry_after(receipt)?;
+            return Err(TiktokError::RateLimited {
+                operation: TiktokApiOperation::VideoList,
+                retry_after_seconds,
+            });
+        }
         let generation = cursor
             .generation()
             .checked_add(1)
@@ -357,6 +385,124 @@ mod tests {
         assert_eq!(
             service.probe(&credential, now).unwrap_err(),
             TiktokError::CredentialReferenceMismatch
+        );
+    }
+
+    #[test]
+    fn production_service_invalidates_rotation_before_reference_rejection() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let original = OAuthCredential::new(
+            SecretReference::new("keychain://tiktok/open01").unwrap(),
+            read_scope.clone(),
+            [TiktokOAuthScope::VideoList]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            now + Duration::hours(1),
+            None,
+            1,
+        )
+        .unwrap();
+        let rotated = OAuthCredential::new(
+            SecretReference::new("keychain://tiktok/open01-rotated").unwrap(),
+            read_scope.clone(),
+            [TiktokOAuthScope::VideoList]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            now + Duration::hours(1),
+            None,
+            2,
+        )
+        .unwrap();
+        let mut cursor = TiktokVideoListCursor::new(read_scope).unwrap();
+        cursor.bind_credential(&original, now).unwrap();
+        let gate = TiktokRealReadGate::from_environment_values(
+            Some("1"),
+            Some("keychain://tiktok/open01"),
+        )
+        .unwrap();
+        let mut service = TiktokAuthenticatedReadService::production(
+            NoopTransport,
+            gate,
+            TiktokFreshnessPolicy::default(),
+        );
+
+        assert_eq!(
+            service
+                .list_videos(&rotated, &mut cursor, now, 20)
+                .unwrap_err(),
+            TiktokError::CursorInvalidated {
+                reason: super::super::TiktokCursorInvalidationReason::CredentialRotated,
+            }
+        );
+        assert!(matches!(
+            cursor.lifecycle(),
+            super::super::TiktokCursorLifecycle::Invalidated {
+                reason: super::super::TiktokCursorInvalidationReason::CredentialRotated,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn production_reference_rejection_does_not_bind_a_fresh_cursor() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let invalid = OAuthCredential::new(
+            SecretReference::new("keychain://tiktok/other").unwrap(),
+            read_scope.clone(),
+            [TiktokOAuthScope::VideoList]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            now + Duration::hours(1),
+            None,
+            1,
+        )
+        .unwrap();
+        let valid = OAuthCredential::new(
+            SecretReference::new("keychain://tiktok/open01").unwrap(),
+            read_scope.clone(),
+            [TiktokOAuthScope::VideoList]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            now + Duration::hours(1),
+            None,
+            1,
+        )
+        .unwrap();
+        let gate = TiktokRealReadGate::from_environment_values(
+            Some("1"),
+            Some("keychain://tiktok/open01"),
+        )
+        .unwrap();
+        let mut service = TiktokAuthenticatedReadService::production(
+            NoopTransport,
+            gate,
+            TiktokFreshnessPolicy::default(),
+        );
+        let mut cursor = TiktokVideoListCursor::new(read_scope).unwrap();
+
+        assert_eq!(
+            service
+                .list_videos(&invalid, &mut cursor, now, 20)
+                .unwrap_err(),
+            TiktokError::CredentialReferenceMismatch
+        );
+        assert_eq!(cursor.credential_generation(), None);
+        assert_eq!(
+            cursor.lifecycle(),
+            super::super::TiktokCursorLifecycle::Active
+        );
+        assert_eq!(
+            service
+                .list_videos(&valid, &mut cursor, now, 20)
+                .unwrap_err(),
+            TiktokError::Disconnected
+        );
+        assert_eq!(cursor.credential_generation(), Some(1));
+        assert_eq!(
+            cursor.lifecycle(),
+            super::super::TiktokCursorLifecycle::Active
         );
     }
 }
