@@ -36,9 +36,9 @@ use hartevo_cordis::{
     SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
     SessionRequestHeader, SessionRequestHeaderReason, SessionSandboxMode, SessionStore,
     SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
-    TurnEndReason, approval_events, bind_sandbox_workspace, compact_now, host_is_cordis_loop, keys,
-    register_llm_adapter, register_prompt_section, run_agent_turn as run_cordis_agent_turn,
-    session_events,
+    ToolRunContext, TurnEndReason, approval_events, bind_sandbox_workspace, compact_now,
+    host_is_cordis_loop, keys, register_llm_adapter, register_prompt_section,
+    run_agent_turn as run_cordis_agent_turn, session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -54,6 +54,9 @@ use thiserror::Error;
 use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 const IDLE_JOB_COMPLETION_WAKE_BUDGET: u8 = 3;
+
+type DesktopRuntimeBrowserReadHandler<'a> =
+    &'a (dyn Fn(&ToolRunContext) -> Result<serde_json::Value, String> + Send + Sync);
 
 /// Whether OpenInterpreter is configured as an optional runtime adapter.
 #[must_use]
@@ -1291,7 +1294,7 @@ impl DesktopCordisCoordinator {
     where
         A: LlmAdapter,
     {
-        self.run_agent_turn_with_permit(request, adapter, cancellation, None, None)
+        self.run_agent_turn_with_permit(request, adapter, cancellation, None, None, None)
             .await
     }
 
@@ -1315,6 +1318,33 @@ impl DesktopCordisCoordinator {
             cancellation,
             Some(permit),
             approval_bridge,
+            None,
+        )
+        .await
+    }
+
+    /// Add the native Runtime's borrowed Browser-read bridge for exactly this
+    /// request. The closure is never retained after the turn.
+    pub(crate) async fn run_authorized_runtime_agent_turn_with_browser_read<A, F>(
+        &mut self,
+        request: DesktopAgentTurnRequest,
+        adapter: A,
+        cancellation: &LifecycleCancellation,
+        permit: &RuntimeDispatchPermit,
+        approval_bridge: Option<&DesktopCordisApprovalBridge>,
+        browser_read: &F,
+    ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
+    where
+        A: LlmAdapter,
+        F: Fn(&ToolRunContext) -> Result<serde_json::Value, String> + Send + Sync,
+    {
+        self.run_agent_turn_with_permit(
+            request,
+            adapter,
+            cancellation,
+            Some(permit),
+            approval_bridge,
+            Some(browser_read),
         )
         .await
     }
@@ -1537,6 +1567,7 @@ impl DesktopCordisCoordinator {
         cancellation: &LifecycleCancellation,
         runtime_permit: Option<&RuntimeDispatchPermit>,
         approval_bridge: Option<&DesktopCordisApprovalBridge>,
+        runtime_browser_read: Option<DesktopRuntimeBrowserReadHandler<'_>>,
     ) -> Result<AgentTurnOutcome, DesktopAgentTurnError>
     where
         A: LlmAdapter,
@@ -1613,8 +1644,19 @@ impl DesktopCordisCoordinator {
                 return Err(error.into());
             }
         };
-        let outcome = match runtime_permit {
-            Some(permit) => {
+        let outcome = match (runtime_permit, runtime_browser_read) {
+            (Some(permit), Some(browser_read)) => {
+                self.host
+                    .run_authorized_runtime_agent_turn_with_browser_read(
+                        permit,
+                        &request.session_id,
+                        request.config,
+                        cancellation,
+                        browser_read,
+                    )
+                    .await
+            }
+            (Some(permit), None) => {
                 self.host
                     .run_authorized_runtime_agent_turn(
                         permit,
@@ -1624,7 +1666,7 @@ impl DesktopCordisCoordinator {
                     )
                     .await
             }
-            None => {
+            (None, None) => {
                 run_cordis_agent_turn(
                     self.host.context_mut(),
                     &request.session_id,
@@ -1633,6 +1675,7 @@ impl DesktopCordisCoordinator {
                 )
                 .await
             }
+            (None, Some(_)) => Err(CordisError::RuntimePermitMismatch),
         };
         registration.dispose();
         if let Some(registration) = prompt_registration.as_ref() {

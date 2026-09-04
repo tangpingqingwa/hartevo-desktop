@@ -64,8 +64,9 @@ pub use authority::{
     DomainCommandKind, DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding,
     EffectExecutionPermit, EffectReconciliationAuthority, EffectReconciliationBinding,
     EffectReconciliationPermit, EffectVerificationAuthority, EffectVerificationBinding,
-    EffectVerificationPermit, RuntimeAuthority, RuntimeBinding, RuntimeDispatchCompletion,
-    RuntimeDispatchPermit, RuntimeRecordBinding, RuntimeStatusCompletion,
+    EffectVerificationPermit, RuntimeAuthority, RuntimeBinding, RuntimeBrowserReadAuthority,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
+    RuntimeStatusCompletion,
 };
 pub use compaction::{
     COMPACTION_CHECKPOINT_PLUGIN, CompactionCheckpoint, CompactionId, CompactionLease,
@@ -112,7 +113,7 @@ pub use fiber::{
 };
 pub use host::{
     CordisHost, CordisHostTeardown, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID,
-    RuntimeAgentIdentity, host_is_cordis_loop, host_plugin_ids,
+    RUNTIME_BROWSER_READ_TOOL_NAME, RuntimeAgentIdentity, host_is_cordis_loop, host_plugin_ids,
 };
 pub use inbox::{AgentInbox, AgentInboxOutcome, AgentInboxTarget};
 pub use invariants::{

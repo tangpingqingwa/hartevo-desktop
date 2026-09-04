@@ -48,8 +48,8 @@ use hartevo_application::{
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserLeaseProof,
-    BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserProfile, BrowserProfileStatus,
-    BrowserReadHost, BrowserWorkspace, SemanticSnapshot,
+    BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget, BrowserProfile,
+    BrowserProfileStatus, BrowserReadHost, BrowserWorkspace, SemanticSnapshot,
 };
 #[cfg(unix)]
 use hartevo_browser_adapter::{ChromiumLaunchConfig, ManagedChromiumHost};
@@ -65,13 +65,14 @@ use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 use hartevo_cordis::{AgentsSurface, ApprovalPolicy, SUBAGENT_TOOL_NAME, SessionStore};
 use hartevo_cordis::{
     ApprovalRequestId, AuthorityDispatchError, AuthorityScope, BrowserReadBinding,
-    COMPACTION_INSTRUCTION, CordisError, DomainCommandBinding, DomainCommandKind,
-    EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding,
-    JobTerminalNotice, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
-    LlmGenerateRequest, LlmRequestPurpose, LlmResolvedModel, RuntimeBinding, RuntimeDispatchPermit,
-    RuntimeRecordBinding, SessionCallConfig, SessionCancelCause, SessionContentBlock,
-    SessionFinishReason, SessionId, SessionLlmFailure, SessionMessageRole, SessionMessageSource,
-    SessionStreamBlockType, SessionStreamChunk, TurnEndReason,
+    BrowserReadPermit, COMPACTION_INSTRUCTION, CordisError, DomainCommandBinding,
+    DomainCommandKind, EffectExecutionBinding, EffectReconciliationBinding,
+    EffectVerificationBinding, JobTerminalNotice, LifecycleCancellation, LlmAdapter,
+    LlmAdapterStream, LlmError, LlmGenerateRequest, LlmRequestPurpose, LlmResolvedModel,
+    RuntimeBinding, RuntimeBrowserReadAuthority, RuntimeDispatchPermit, RuntimeRecordBinding,
+    SessionCallConfig, SessionCancelCause, SessionContentBlock, SessionFinishReason, SessionId,
+    SessionLlmFailure, SessionMessageRole, SessionMessageSource, SessionStreamBlockType,
+    SessionStreamChunk, ToolRunContext, TurnEndReason,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -1441,6 +1442,12 @@ pub struct DesktopReadBrowserPublicSourceRequest {
     pub expected_revision: u64,
     pub expected_generation: u64,
     pub target_url: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesktopRuntimeBrowserReadArguments {
+    url: String,
 }
 
 impl fmt::Debug for DesktopReadBrowserPublicSourceRequest {
@@ -4175,34 +4182,24 @@ impl DesktopDataPlane {
             facts.approval.as_ref(),
             now,
             |permit| {
-                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
-                let binding = permit.binding();
-                if &current_scope != permit.scope()
-                    || binding.workspace_id() != workspace_id.as_str()
-                    || binding.workspace_revision() != expected_revision
-                    || binding.lease_generation() != expected_generation
-                    || binding.target_url_digest() != navigation_target.url_digest()
-                    || binding.target_origin_digest() != navigation_target.origin_digest()
-                    || binding.navigation_policy_digest() != navigation_policy.evidence_digest()
-                {
-                    return Err(CordisError::BrowserReadPermitMismatch.into());
-                }
-                self.synchronize_mounted_browser_host(&live, |host| {
-                    service.read_browser_public_source(
-                        host,
-                        ReadBrowserPublicSource {
-                            project_id,
-                            mission_id,
-                            expected_mission_revision,
-                            workspace_id,
-                            expected_revision,
-                            expected_generation,
-                            snapshot_id: BrowserSnapshotId::new(),
-                            target_url,
-                        },
-                        now,
-                    )
-                })
+                self.execute_authorized_browser_public_source_read(
+                    &mut service,
+                    permit,
+                    &live,
+                    ReadBrowserPublicSource {
+                        project_id,
+                        mission_id,
+                        expected_mission_revision,
+                        workspace_id,
+                        expected_revision,
+                        expected_generation,
+                        snapshot_id: BrowserSnapshotId::new(),
+                        target_url,
+                    },
+                    &navigation_policy,
+                    &navigation_target,
+                    now,
+                )
             },
         ))?;
         let product_evidence = load_product_evidence(now)?;
@@ -4216,6 +4213,97 @@ impl DesktopDataPlane {
         Ok(DesktopBrowserPublicSourceRead {
             snapshot,
             observation,
+        })
+    }
+
+    fn read_browser_public_source_for_runtime(
+        &self,
+        secret_store: &impl SecretStore,
+        authority: &RuntimeBrowserReadAuthority,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        target_url: String,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserPublicSourceObservation, DesktopDataError> {
+        let (navigation_policy, navigation_target) =
+            BrowserNavigationPolicy::for_exact_https_target(&target_url)
+                .map_err(|_| DesktopDataError::InvalidBrowserPublicSourceRead)?;
+        let (mut service, _runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, project_id, now)?;
+        let scope = mission_authority_scope(&service, project_id, mission_id)?;
+        let live = service
+            .load_live_browser_workspace_for_mission(project_id, mission_id)?
+            .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
+        if live.project_id != *project_id
+            || live.mission_id != *mission_id
+            || live.control_state != BrowserControlState::AgentControlled
+            || live.agent_lease_proof(now).is_err()
+        {
+            return Err(DesktopDataError::BrowserWorkspaceReadNotAgentHeld);
+        }
+        let binding = BrowserReadBinding::new(
+            live.id.as_str(),
+            live.revision,
+            live.lease_generation,
+            navigation_target.url_digest(),
+            navigation_target.origin_digest(),
+            navigation_target.policy_digest(),
+        )?;
+        let permit = authority.authorize_browser_read(&scope, binding)?;
+        let observation = self.execute_authorized_browser_public_source_read(
+            &mut service,
+            &permit,
+            &live,
+            ReadBrowserPublicSource {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                expected_mission_revision: scope.mission_revision(),
+                workspace_id: live.id.clone(),
+                expected_revision: live.revision,
+                expected_generation: live.lease_generation,
+                snapshot_id: BrowserSnapshotId::new(),
+                target_url,
+            },
+            &navigation_policy,
+            &navigation_target,
+            now,
+        )?;
+        authority.complete_browser_read(permit, observation.mission_revision)?;
+        Ok(observation)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared Browser boundary rechecks every authority, workspace, navigation, and time fence before one commit"
+    )]
+    fn execute_authorized_browser_public_source_read(
+        &self,
+        service: &mut ApplicationService,
+        permit: &BrowserReadPermit,
+        live: &BrowserWorkspace,
+        command: ReadBrowserPublicSource,
+        navigation_policy: &BrowserNavigationPolicy,
+        navigation_target: &BrowserNavigationTarget,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserPublicSourceObservation, DesktopDataError> {
+        let current_scope =
+            mission_authority_scope(service, &command.project_id, &command.mission_id)?;
+        let binding = permit.binding();
+        if current_scope != *permit.scope()
+            || live.id != command.workspace_id
+            || live.revision != command.expected_revision
+            || live.lease_generation != command.expected_generation
+            || binding.workspace_id() != command.workspace_id.as_str()
+            || binding.workspace_revision() != command.expected_revision
+            || binding.lease_generation() != command.expected_generation
+            || binding.target_url_digest() != navigation_target.url_digest()
+            || binding.target_origin_digest() != navigation_target.origin_digest()
+            || binding.navigation_policy_digest() != navigation_policy.evidence_digest()
+        {
+            return Err(CordisError::BrowserReadPermitMismatch.into());
+        }
+        self.synchronize_mounted_browser_host(live, |host| {
+            service.read_browser_public_source(host, command, now)
         })
     }
 
@@ -7085,6 +7173,25 @@ impl DesktopDataPlane {
         let cordis_approval = cancellation.map(DesktopRuntimeCancellation::cordis_approval_bridge);
         if let DesktopMissionProvider::NativeDeepSeek(adapter) = &mission_provider {
             let adapter = adapter.clone();
+            let browser_read_authority = permit.browser_read_authority()?;
+            let browser_project_id = project_id.clone();
+            let browser_mission_id = mission_id.clone();
+            let browser_read = |tool: &ToolRunContext| {
+                let arguments: DesktopRuntimeBrowserReadArguments =
+                    serde_json::from_value(tool.arguments().clone())
+                        .map_err(|error| format!("invalid Browser-read arguments: {error}"))?;
+                let observation = self
+                    .read_browser_public_source_for_runtime(
+                        secret_store,
+                        &browser_read_authority,
+                        &browser_project_id,
+                        &browser_mission_id,
+                        arguments.url,
+                        now + Duration::milliseconds(logical_millis + 1),
+                    )
+                    .map_err(|error| error.to_string())?;
+                serde_json::to_value(observation).map_err(|error| error.to_string())
+            };
             let (agent_result, checkpoint, message_id) = {
                 let mut cordis = self.cordis.checkout().map_err(|error| {
                     DesktopDataError::CordisSessionPersistence(error.to_string())
@@ -7142,13 +7249,16 @@ impl DesktopDataPlane {
                     .map_err(CordisError::from)?;
                     (request, message_id)
                 };
-                let result = futures_executor::block_on(cordis.run_authorized_runtime_agent_turn(
-                    request,
-                    adapter,
-                    &cordis_cancellation,
-                    permit,
-                    cordis_approval.as_ref(),
-                ));
+                let result = futures_executor::block_on(
+                    cordis.run_authorized_runtime_agent_turn_with_browser_read(
+                        request,
+                        adapter,
+                        &cordis_cancellation,
+                        permit,
+                        cordis_approval.as_ref(),
+                        &browser_read,
+                    ),
+                );
                 let checkpoint =
                     cordis
                         .session_checkpoint(mission.id.as_str())
@@ -7157,6 +7267,11 @@ impl DesktopDataPlane {
                         })?;
                 (result, checkpoint, message_id)
             };
+            if mission_authority_scope(&service, project_id, &mission_id)?
+                != permit.current_mission_scope()?
+            {
+                return Err(CordisError::AuthorityScopeMismatch.into());
+            }
             let outcome = match agent_result {
                 Ok(outcome) => match outcome.reason() {
                     TurnEndReason::Completed => {
@@ -11892,6 +12007,65 @@ sleep 30"#
                 &serde_json::json!({
                     "choices": [{
                         "delta": {"content": "parent adopted bounded child evidence"},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+        ]);
+        let adapter = DeepSeekAdapter::new(
+            DeepSeekConnection::new(
+                "https://api.deepseek.com",
+                "DEEPSEEK_API_KEY",
+                128_000,
+                8_192,
+                StdDuration::from_secs(5),
+            )
+            .unwrap(),
+            |name: &str| {
+                assert_eq!(name, "DEEPSEEK_API_KEY");
+                Ok(Zeroizing::new("desktop-mission-secret".into()))
+            },
+            MissionDeepSeekTransport {
+                outcome: MissionDeepSeekOutcome::Responses(Arc::new(Mutex::new(responses))),
+                calls,
+                requests,
+            },
+        );
+        DesktopRuntimeSource::NativeDeepSeek {
+            model: "deepseek-chat".into(),
+            adapter,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_deepseek_browser_read_mission_source(
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> DesktopRuntimeSource {
+        let responses = VecDeque::from([
+            native_mission_deepseek_response(
+                "desktop-mission-browser-read-1",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "desktop-mission-browser-read-call",
+                                "function": {
+                                    "name": hartevo_cordis::RUNTIME_BROWSER_READ_TOOL_NAME,
+                                    "arguments": r#"{"url":"https://example.com/research"}"#,
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                }),
+            ),
+            native_mission_deepseek_response(
+                "desktop-mission-browser-read-2",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": "Draft grounded in one bounded Browser observation."},
                         "finish_reason": "stop",
                     }],
                 }),
@@ -23730,6 +23904,184 @@ sleep 30"#;
         ));
         assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
         assert_eq!(observation_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused Desktop journey proves request-scoped Cordis tool exposure, exact Browser execution, content-free return, and draft adoption together"
+    )]
+    fn cordis_native_deepseek_reads_one_public_source_before_draft_adoption() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(6);
+        let mut mission_request = catalog_runtime_request(&project_id);
+        mission_request.title = Some("Cordis Browser-read Mission".into());
+        mission_request.goal =
+            "Read one public source through the active Desktop Browser before drafting".into();
+        let started = plane
+            .start_catalog_mission_execution_with(&secrets, mission_request, now)
+            .expect("Catalog Mission");
+        let mission_id = started.handle.mission_id().clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("Application");
+        let profile = service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("profile-cordis-browser-read"),
+                    project_id: project_id.clone(),
+                    credential_reference: "keychain://cordis-browser-read/profile".into(),
+                    provider: "fixture-provider".into(),
+                    account_id: AccountId::from("account-cordis-browser-read"),
+                    identity_digest: "1".repeat(64),
+                    probe_digest: "2".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("Browser profile");
+        let workspace = service
+            .create_browser_workspace(
+                CreateBrowserWorkspace {
+                    id: BrowserWorkspaceId::from("workspace-cordis-browser-read"),
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    profile_id: profile.id,
+                    initial_tab_id: BrowserTabId::from("tab-cordis-browser-read"),
+                    lease_id: BrowserControlLeaseId::from("lease-cordis-browser-read"),
+                    lease_expires_at: now + Duration::hours(1),
+                    evidence_digest: "3".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("Browser workspace");
+        let mission_revision_before_read = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before Browser read")
+            .revision;
+        drop(service);
+
+        let navigation_count = Arc::new(AtomicUsize::new(0));
+        let observation_count = Arc::new(AtomicUsize::new(0));
+        let host_navigation_count = Arc::clone(&navigation_count);
+        let host_observation_count = Arc::clone(&observation_count);
+        plane
+            .mount_browser_workspace_with(
+                &secrets,
+                DesktopBrowserWorkspaceControlRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    expected_revision: workspace.revision,
+                    expected_generation: workspace.lease_generation,
+                },
+                now + Duration::seconds(2),
+                move |_profile, workspace, _profile_root, _mounted_at| {
+                    Ok(RecordingDesktopBrowserReadHost {
+                        workspace: workspace.clone(),
+                        navigation_count: host_navigation_count,
+                        observation_count: host_observation_count,
+                        final_url_digest: None,
+                    })
+                },
+            )
+            .expect("mounted Browser Host");
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let submission = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                Some(native_deepseek_browser_read_mission_source(
+                    Arc::clone(&provider_calls),
+                    Arc::clone(&provider_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                now + Duration::seconds(3),
+            )
+            .expect("native Cordis Browser-read draft");
+        assert!(matches!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 1);
+
+        let requests = provider_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let browser_tool = requests[0]["tools"]
+            .as_array()
+            .expect("request-scoped tools")
+            .iter()
+            .find(|tool| tool["function"]["name"] == hartevo_cordis::RUNTIME_BROWSER_READ_TOOL_NAME)
+            .expect("request-scoped Browser-read tool");
+        assert_eq!(
+            browser_tool["function"]["parameters"]["required"],
+            serde_json::json!(["url"])
+        );
+        assert_eq!(
+            browser_tool["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        let tool_output = requests[1]["messages"]
+            .as_array()
+            .expect("continuation messages")
+            .iter()
+            .find(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "desktop-mission-browser-read-call"
+            })
+            .and_then(|message| message["content"].as_str())
+            .expect("Browser observation tool result");
+        let observation: BrowserPublicSourceObservation =
+            serde_json::from_str(tool_output).expect("typed Browser observation");
+        assert_eq!(observation.workspace_id, workspace.id);
+        assert_eq!(
+            observation.expected_mission_revision,
+            mission_revision_before_read
+        );
+        assert_eq!(
+            observation.mission_revision,
+            mission_revision_before_read + 1
+        );
+        assert!(observation.script_execution_disabled);
+        assert!(!observation.business_verified);
+        assert!(!tool_output.contains("example.com"));
+        assert!(!tool_output.contains("desktop-mission-secret"));
+        drop(requests);
+
+        plane.with_cordis_host(|host| {
+            let names = host
+                .context()
+                .tools::<hartevo_cordis::ToolsSurface>()
+                .expect("Tools surface")
+                .names();
+            assert!(
+                !names
+                    .iter()
+                    .any(|name| name == hartevo_cordis::RUNTIME_BROWSER_READ_TOOL_NAME)
+            );
+        });
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("reopen adopted state");
+        assert_eq!(
+            service
+                .load_latest_browser_public_source_observation(&project_id, &mission_id)
+                .expect("durable Browser observation"),
+            Some(observation)
+        );
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("adopted Mission");
+        assert_eq!(mission.work_products.len(), 1);
+        assert!(mission.effects.is_empty());
     }
 
     #[test]

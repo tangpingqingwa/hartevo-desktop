@@ -368,6 +368,59 @@ fn browser_read_is_exact_mutually_exclusive_drop_safe_and_teardown_revoked() {
 }
 
 #[test]
+fn runtime_browser_read_is_one_shot_exact_and_parent_revoked() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let runtime = runtime_scope("project-a", "mission-a", 3, 2, 'a');
+    host.bind_domain_kernel_scope(
+        runtime.clone(),
+        KernelConsentState::Missing,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let mut runtime_permit = host.authorize_runtime(&runtime).unwrap();
+    assert_eq!(
+        runtime_permit.browser_read_authority().unwrap_err(),
+        CordisError::RuntimePermitMismatch
+    );
+    runtime_permit.announce_started().unwrap();
+
+    let authority = runtime_permit.browser_read_authority().unwrap();
+    let same_parent = runtime_permit.browser_read_authority().unwrap();
+    assert_eq!(
+        authority
+            .authorize_browser_read(&runtime, browser_read("workspace-a"))
+            .unwrap_err(),
+        CordisError::BrowserReadRuntimeBound
+    );
+    let mission = domain_scope("project-a", "mission-a", 3);
+    let child = authority
+        .authorize_browser_read(&mission, browser_read("workspace-a"))
+        .unwrap();
+    authority.complete_browser_read(child, 4).unwrap();
+    let advanced = domain_scope("project-a", "mission-a", 4);
+    assert_eq!(runtime_permit.current_mission_scope().unwrap(), advanced);
+    assert_eq!(
+        same_parent
+            .authorize_browser_read(&advanced, browser_read("workspace-b"))
+            .unwrap_err(),
+        CordisError::BrowserReadDispatchBusy
+    );
+
+    host.finish_runtime(runtime_permit)
+        .unwrap()
+        .announce()
+        .unwrap();
+    assert_eq!(
+        authority
+            .authorize_browser_read(&advanced, browser_read("workspace-c"))
+            .unwrap_err(),
+        CordisError::RuntimePermitMismatch
+    );
+}
+
+#[test]
 fn effect_execution_requires_exact_approved_domain_scope() {
     let mut host = CordisHost::boot(false).unwrap();
     let scope = domain_scope("project-a", "mission-a", 3);

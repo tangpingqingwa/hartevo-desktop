@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 
 use crate::agent::{
     AgentLoop, AgentStep, AgentStepResult, AgentTurnOutcome, run_agent_step,
-    run_authorized_runtime_agent_turn,
+    run_authorized_runtime_agent_turn, run_authorized_runtime_agent_turn_with_browser_read,
 };
 use crate::authority::{
     AuthorityScope, BrowserReadBinding, BrowserReadLease, BrowserReadPermit, DomainCommandBinding,
@@ -34,16 +34,18 @@ use crate::loader::{
     EnvironmentOverlay, LoadReport, LoaderContext, PluginId, PluginSpec, load_plugins,
 };
 use crate::service::Service;
-use crate::session::{SessionCallConfig, SessionId, SessionStore};
+use crate::session::{
+    SessionCallConfig, SessionContentBlock, SessionId, SessionStore, SessionToolSchema,
+};
 use crate::subagent::{
     SUBAGENT_SPAWN_IN_PROCESS_PLUGIN_ID, SpawnInProcessSubagent, SubagentRun, SubagentRuntime,
     SubagentStartRequest,
 };
 use crate::surface::{
     AgentPublicationCommit, AgentRef, AgentStatus, AgentStatusChange, AgentsSurface,
-    DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces, LlmSurface,
-    RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolsSurface, events, map_surfaces,
-    rebind_hartevo_domain,
+    DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces, HostToolExecutor,
+    LlmSurface, RuntimeSurface, SurfaceOwner, SystemPromptSurface, ToolDefinition, ToolRunContext,
+    ToolsSurface, events, map_surfaces, rebind_hartevo_domain, register_tool_definition,
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
@@ -57,6 +59,39 @@ pub const HOST_PLUGIN_IDS: &[&str] = &[
 
 /// Optional OpenInterpreter adapter plugin id. Never the loop.
 pub const OPENINTERPRETER_PLUGIN_ID: &str = OPENINTERPRETER;
+
+/// The only Browser capability exposed to a native Runtime request.
+pub const RUNTIME_BROWSER_READ_TOOL_NAME: &str = "browser_read_public_source";
+
+fn runtime_browser_read_tool_definition() -> ToolDefinition {
+    ToolDefinition::new_host(
+        SessionToolSchema {
+            name: RUNTIME_BROWSER_READ_TOOL_NAME.into(),
+            description: "Read one exact public HTTPS page through the active Desktop Browser workspace and return content-free Candidate observation metadata. This does not verify a business outcome."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The exact public HTTPS URL to read."
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            })
+            .as_object()
+            .expect("the Runtime Browser-read schema is an object")
+            .clone(),
+        },
+        HostToolExecutor::RuntimeBrowserRead,
+    )
+    .with_output_renderer(|_, value| {
+        serde_json::to_string(value)
+            .map(|text| vec![SessionContentBlock::Text { text }])
+            .map_err(|error| error.to_string())
+    })
+}
 
 /// Live Cordis context owned by the desktop host.
 pub struct CordisHost {
@@ -575,6 +610,34 @@ impl CordisHost {
             cancellation,
         )
         .await
+    }
+
+    /// Drive one Runtime turn with the single request-scoped Desktop Browser
+    /// read tool. The executable bridge is borrowed only for this call and is
+    /// removed before returning, so Cordis retains no Secret Store, Browser,
+    /// SQLCipher, or DataPlane handle.
+    pub async fn run_authorized_runtime_agent_turn_with_browser_read(
+        &mut self,
+        permit: &RuntimeDispatchPermit,
+        session_id: &SessionId,
+        seed_config: SessionCallConfig,
+        cancellation: &LifecycleCancellation,
+        browser_read: &(dyn Fn(&ToolRunContext) -> Result<serde_json::Value, String> + Send + Sync),
+    ) -> Result<AgentTurnOutcome, CordisError> {
+        self.require_active_runtime_permit(permit)?;
+        let registration =
+            register_tool_definition(&mut self.ctx, runtime_browser_read_tool_definition())?;
+        let outcome = run_authorized_runtime_agent_turn_with_browser_read(
+            &mut self.ctx,
+            permit.agent(),
+            session_id,
+            seed_config,
+            cancellation,
+            Some(browser_read),
+        )
+        .await;
+        registration.dispose();
+        outcome
     }
 
     /// Establish and synchronously drive one fresh local child under the exact

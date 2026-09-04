@@ -30,9 +30,10 @@ use crate::surface::{
     AgentPreStep, AgentPreStepDecision, AgentRef, AgentRequest, AgentRequestError,
     AgentRequestErrorAction, AgentStatusChange, AgentTurnStopping, AgentsSurface, DomainSurface,
     EffectBrokerSurface, HostToolAccess, LlmChunkStream, LlmError, LlmGenerateRequest, LlmStream,
-    LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeSurface, ToolCall, ToolExecutionInput,
-    ToolExecutionPreparation, ToolExecutionResult, ToolPolicyPreparation, ToolsSurface,
-    aborted_before_dispatch_tool_result, assemble_system_prompt, denied_tool_dispatch_outcome,
+    LlmSurface, PreparedLlmCall, PromptAssembly, RuntimeBrowserReadHandler, RuntimeSurface,
+    ToolCall, ToolExecutionInput, ToolExecutionPreparation, ToolExecutionResult,
+    ToolPolicyPreparation, ToolsSurface, aborted_before_dispatch_tool_result,
+    assemble_system_prompt, denied_tool_dispatch_outcome,
     dispatch_host_tool_execution_with_cancellation, dispatch_tool_execution_with_cancellation,
     events, finalize_allowed_tool_policy, finalize_tool_execution, post_tool_execution,
     prepare_llm_call, prepare_tool_execution, prepare_tool_policy, register_agent,
@@ -863,6 +864,25 @@ pub(crate) async fn run_authorized_runtime_agent_turn(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
 ) -> Result<AgentTurnOutcome, CordisError> {
+    run_authorized_runtime_agent_turn_with_browser_read(
+        ctx,
+        agent,
+        session_id,
+        seed_config,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_authorized_runtime_agent_turn_with_browser_read(
+    ctx: &mut Context,
+    agent: &AgentRef,
+    session_id: &SessionId,
+    seed_config: SessionCallConfig,
+    cancellation: &LifecycleCancellation,
+    browser_read: Option<RuntimeBrowserReadHandler<'_>>,
+) -> Result<AgentTurnOutcome, CordisError> {
     run_agent_turn_with_invariants(
         ctx,
         agent,
@@ -870,7 +890,7 @@ pub(crate) async fn run_authorized_runtime_agent_turn(
         seed_config,
         cancellation,
         enforce_runtime_invariants,
-        HostToolAccess::RuntimeAuthorized,
+        HostToolAccess::RuntimeAuthorized { browser_read },
     )
     .await
 }
@@ -882,7 +902,7 @@ async fn run_agent_turn_with_invariants(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
     enforce: fn(&Context) -> Result<(), CordisError>,
-    host_tool_access: HostToolAccess,
+    host_tool_access: HostToolAccess<'_>,
 ) -> Result<AgentTurnOutcome, CordisError> {
     require_loop_surfaces(ctx)?;
     validate_agent_request_config(&seed_config)?;
@@ -950,7 +970,7 @@ async fn drive_agent_turn(
     seed_config: SessionCallConfig,
     cancellation: &LifecycleCancellation,
     current_step: &mut Option<u64>,
-    host_tool_access: HostToolAccess,
+    host_tool_access: HostToolAccess<'_>,
 ) -> Result<AgentTurnOutcome, CordisError> {
     let mut target = AgentInboxTarget::NextTurn;
     let mut steps = 0_u64;
@@ -1111,7 +1131,7 @@ async fn run_agent_turn_step(
     mut logged: LoggedAgentCall,
     request_state: &mut AgentRequestLogState,
     cancellation: &LifecycleCancellation,
-    host_tool_access: HostToolAccess,
+    host_tool_access: HostToolAccess<'_>,
 ) -> Result<Option<TurnEndReason>, CordisError> {
     let mut overflow_retries = 0_u64;
     loop {
@@ -1818,7 +1838,7 @@ async fn run_agent_tool_batch_with_approval(
     recorded: &mut RecordedAgentStream,
     max_parallel_tool_calls: usize,
     cancellation: &LifecycleCancellation,
-    host_tool_access: HostToolAccess,
+    host_tool_access: HostToolAccess<'_>,
 ) -> Result<AgentToolBatchOutcome, CordisError> {
     if max_parallel_tool_calls == 0 {
         return Err(invalid_stream_protocol("a positive parallel tool-call limit").into());
@@ -1892,7 +1912,7 @@ async fn run_host_tool_batch(
     policies: &mut [Option<ToolPolicyPreparation>],
     cancellation: &LifecycleCancellation,
     inherited_config: &SessionCallConfig,
-    host_tool_access: HostToolAccess,
+    host_tool_access: HostToolAccess<'_>,
 ) -> Result<Vec<ToolExecutionResult>, CordisError> {
     let mut results = Vec::with_capacity(inputs.len());
     for index in 0..inputs.len() {
