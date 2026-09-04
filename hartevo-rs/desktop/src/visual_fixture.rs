@@ -506,6 +506,7 @@ fn fixture_project_projection(
             active_key_version: 1,
             keyring_revision: 1,
         },
+        browser_profiles: Vec::new(),
         missions,
     }
 }

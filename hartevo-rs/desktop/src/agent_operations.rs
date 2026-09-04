@@ -10,7 +10,7 @@ use hartevo_application::{
     BrowserWorkspaceProjection as DurableBrowserWorkspaceProjection, DesktopProjectProjection,
     MissionProjection, MissionRuntimeProjection, WorkProductProjection,
 };
-use hartevo_browser_adapter::BrowserControlState;
+use hartevo_browser_adapter::{BrowserControlState, BrowserProfileStatus};
 use hartevo_domain_kernel::{
     BrowserWorkspaceId, MissionStage, RuntimeProcessClaimStatus, RuntimeRecoveryStatus,
     RuntimeTurnStatus, WorkProductStatus,
@@ -164,6 +164,7 @@ pub struct ApprovalEffectProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserWorkspaceProjection {
     pub status: OperationsStatus,
+    pub active_profile_count: usize,
     pub identity: String,
     pub control_owner: String,
     pub next_action: String,
@@ -235,7 +236,7 @@ impl AgentOperationsWorkbenchProjection {
             held_local_approval,
             held_cordis_approval,
         );
-        let browser = browser_projection(mission);
+        let browser = browser_projection(project, mission);
         let recovery = recovery_projection(runtime_activity);
         let quick_entry = QuickEntryProjection {
             status: if mission.is_some() {
@@ -684,40 +685,28 @@ fn approval_projection(
     }
 }
 
-fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspaceProjection {
+fn browser_projection(
+    project: Option<&DesktopProjectProjection>,
+    mission: Option<&MissionProjection>,
+) -> BrowserWorkspaceProjection {
+    let active_profile_count = active_browser_profile_count(project);
     let Some(mission) = mission else {
-        return BrowserWorkspaceProjection {
-            status: OperationsStatus::Empty,
-            identity: "No Mission-bound Browser Workspace".into(),
-            control_owner: "No owner".into(),
-            next_action: "Select a Mission".into(),
-            workspace_id: None,
-            revision: None,
-            lease_generation: None,
-            take_over_status: OperationsStatus::Empty,
-            continue_status: OperationsStatus::Empty,
-            pause_status: OperationsStatus::Empty,
-            resume_status: OperationsStatus::Empty,
-        };
+        return empty_browser_projection(active_profile_count, "Select a Mission");
     };
     let Some(workspace) = mission.browser_workspace.as_ref() else {
-        return BrowserWorkspaceProjection {
-            status: OperationsStatus::Empty,
-            identity: "No Mission-bound Browser Workspace".into(),
-            control_owner: "No owner".into(),
-            next_action: "Ownership controls stay empty until a durable workspace exists".into(),
-            workspace_id: None,
-            revision: None,
-            lease_generation: None,
-            take_over_status: OperationsStatus::Empty,
-            continue_status: OperationsStatus::Empty,
-            pause_status: OperationsStatus::Empty,
-            resume_status: OperationsStatus::Empty,
+        let next_action = if active_profile_count == 0 {
+            "Register and verify a Browser Profile before Workspace creation".into()
+        } else {
+            format!(
+                "{active_profile_count} active Browser Profile(s) persisted; Workspace creation remains NOT_IMPLEMENTED"
+            )
         };
+        return empty_browser_projection(active_profile_count, next_action);
     };
     match workspace.control_state {
         BrowserControlState::UserControlled => BrowserWorkspaceProjection {
             status: OperationsStatus::WaitingUser,
+            active_profile_count,
             identity: short_identity_digest(&workspace.identity_digest),
             control_owner: "User holds the current lease".into(),
             next_action: "Continue issues Application continue_browser_workspace".into(),
@@ -731,6 +720,7 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
         },
         BrowserControlState::AgentControlled => browser_workspace_view(
             workspace,
+            active_profile_count,
             OperationsStatus::Active,
             "Agent holds the current lease",
             "Take over issues Application take_over_browser_workspace",
@@ -741,6 +731,7 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
         ),
         BrowserControlState::PausedAgent => browser_workspace_view(
             workspace,
+            active_profile_count,
             OperationsStatus::WaitingUser,
             "Agent-owned workspace is paused",
             "Resume restores Agent ownership with a fresh lease",
@@ -751,6 +742,7 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
         ),
         BrowserControlState::PausedUser => browser_workspace_view(
             workspace,
+            active_profile_count,
             OperationsStatus::WaitingUser,
             "User-owned workspace is paused",
             "Resume restores User ownership",
@@ -763,6 +755,7 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
         | BrowserControlState::KeptForUser
         | BrowserControlState::Closed => browser_workspace_view(
             workspace,
+            active_profile_count,
             OperationsStatus::Empty,
             "Workspace is terminal",
             "Ownership actions do not reopen a closed workspace",
@@ -774,12 +767,43 @@ fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspacePr
     }
 }
 
+fn empty_browser_projection(
+    active_profile_count: usize,
+    next_action: impl Into<String>,
+) -> BrowserWorkspaceProjection {
+    BrowserWorkspaceProjection {
+        status: OperationsStatus::Empty,
+        active_profile_count,
+        identity: "No Mission-bound Browser Workspace".into(),
+        control_owner: "No owner".into(),
+        next_action: next_action.into(),
+        workspace_id: None,
+        revision: None,
+        lease_generation: None,
+        take_over_status: OperationsStatus::Empty,
+        continue_status: OperationsStatus::Empty,
+        pause_status: OperationsStatus::Empty,
+        resume_status: OperationsStatus::Empty,
+    }
+}
+
+fn active_browser_profile_count(project: Option<&DesktopProjectProjection>) -> usize {
+    project.map_or(0, |project| {
+        project
+            .browser_profiles
+            .iter()
+            .filter(|profile| profile.status == BrowserProfileStatus::Active)
+            .count()
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the constructor keeps four independent Browser action statuses explicit"
 )]
 fn browser_workspace_view(
     workspace: &DurableBrowserWorkspaceProjection,
+    active_profile_count: usize,
     status: OperationsStatus,
     control_owner: &str,
     next_action: &str,
@@ -790,6 +814,7 @@ fn browser_workspace_view(
 ) -> BrowserWorkspaceProjection {
     BrowserWorkspaceProjection {
         status,
+        active_profile_count,
         identity: short_identity_digest(&workspace.identity_digest),
         control_owner: control_owner.into(),
         next_action: next_action.into(),
@@ -888,6 +913,34 @@ fn humanize_checkpoint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project_with_active_browser_profile(
+        mission: &MissionProjection,
+    ) -> DesktopProjectProjection {
+        DesktopProjectProjection {
+            tenant_id: "tenant".into(),
+            project_id: "project".into(),
+            name: "Browser project".into(),
+            description: String::new(),
+            storage_mode: hartevo_domain_kernel::StorageMode::LocalExisting,
+            data_cell: None,
+            revision: 1,
+            workspace_root_count: 1,
+            encryption: hartevo_application::ProjectEncryptionReadiness::NotProvisioned,
+            browser_profiles: vec![hartevo_application::BrowserProfileProjection {
+                profile_id: "profile-held".into(),
+                source: hartevo_browser_adapter::BrowserProfileSource::Managed,
+                status: BrowserProfileStatus::Active,
+                identity_digest: "a".repeat(64),
+                probe_digest: "b".repeat(64),
+                identity_observed_at: "2026-08-11T09:00:00Z"
+                    .parse()
+                    .expect("profile observation time"),
+                revision: 1,
+            }],
+            missions: vec![mission.clone()],
+        }
+    }
 
     #[test]
     fn runtime_config_maps_missing_control_plane_fields_honestly() {
@@ -1073,8 +1126,15 @@ mod tests {
             creator_work: None,
             relationship_conversation: None,
         };
-        let empty = browser_projection(Some(&mission));
+        let project = project_with_active_browser_profile(&mission);
+        let empty = browser_projection(Some(&project), Some(&mission));
         assert_eq!(empty.status, OperationsStatus::Empty);
+        assert_eq!(empty.active_profile_count, 1);
+        assert!(
+            empty
+                .next_action
+                .contains("Workspace creation remains NOT_IMPLEMENTED")
+        );
         assert_eq!(empty.take_over_status, OperationsStatus::Empty);
         assert_eq!(empty.continue_status, OperationsStatus::Empty);
         assert_eq!(empty.pause_status, OperationsStatus::Empty);
@@ -1090,7 +1150,7 @@ mod tests {
             revision: 2,
             lease_generation: 2,
         });
-        let ready = browser_projection(Some(&held));
+        let ready = browser_projection(Some(&project), Some(&held));
         assert_eq!(ready.take_over_status, OperationsStatus::Empty);
         assert_eq!(ready.continue_status, OperationsStatus::Ready);
         assert_eq!(ready.pause_status, OperationsStatus::Ready);
@@ -1101,7 +1161,7 @@ mod tests {
             .as_mut()
             .expect("workspace")
             .control_state = BrowserControlState::AgentControlled;
-        let agent = browser_projection(Some(&held));
+        let agent = browser_projection(Some(&project), Some(&held));
         assert_eq!(agent.take_over_status, OperationsStatus::Ready);
         assert_eq!(agent.continue_status, OperationsStatus::Empty);
         assert_eq!(agent.pause_status, OperationsStatus::Ready);
@@ -1112,7 +1172,7 @@ mod tests {
             .as_mut()
             .expect("workspace")
             .control_state = BrowserControlState::PausedAgent;
-        let paused_agent = browser_projection(Some(&held));
+        let paused_agent = browser_projection(Some(&project), Some(&held));
         assert_eq!(paused_agent.take_over_status, OperationsStatus::Empty);
         assert_eq!(paused_agent.continue_status, OperationsStatus::Empty);
         assert_eq!(paused_agent.pause_status, OperationsStatus::Empty);
@@ -1123,7 +1183,7 @@ mod tests {
             .as_mut()
             .expect("workspace")
             .control_state = BrowserControlState::PausedUser;
-        let paused_user = browser_projection(Some(&held));
+        let paused_user = browser_projection(Some(&project), Some(&held));
         assert_eq!(paused_user.take_over_status, OperationsStatus::Empty);
         assert_eq!(paused_user.continue_status, OperationsStatus::Empty);
         assert_eq!(paused_user.pause_status, OperationsStatus::Empty);
