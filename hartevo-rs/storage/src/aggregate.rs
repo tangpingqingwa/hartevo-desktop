@@ -40,6 +40,7 @@ pub struct AtomicMutation {
 /// safely with sync or recovery inserting that record.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ApplicationSourceKind {
+    Project,
     Mission,
     Connection,
     IdentityLink,
@@ -47,6 +48,12 @@ pub enum ApplicationSourceKind {
     Company,
     Partner,
     Opportunity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutcomeLedgerSourceFence {
+    NotRequired,
+    Expected(Option<u64>),
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -275,6 +282,42 @@ impl ProjectStore {
         source_fences: &[ApplicationSourceRevisionFence],
         events: &[PendingEvent],
     ) -> Result<AtomicMutation, StorageError> {
+        self.update_mission_atomic_with_optional_outcome_ledger_fence(
+            mission,
+            expected_mission_revision,
+            OutcomeLedgerSourceFence::Expected(expected_outcome_ledger_revision),
+            source_fences,
+            events,
+        )
+    }
+
+    /// Updates a Mission while fencing only the exact Application sources it
+    /// inspected. This is for handlers whose Oracle inputs do not include the
+    /// project Outcome Ledger.
+    pub fn update_mission_atomic_with_application_source_fences_only(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        source_fences: &[ApplicationSourceRevisionFence],
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        self.update_mission_atomic_with_optional_outcome_ledger_fence(
+            mission,
+            expected_mission_revision,
+            OutcomeLedgerSourceFence::NotRequired,
+            source_fences,
+            events,
+        )
+    }
+
+    fn update_mission_atomic_with_optional_outcome_ledger_fence(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        outcome_ledger_fence: OutcomeLedgerSourceFence,
+        source_fences: &[ApplicationSourceRevisionFence],
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
         if mission.revision <= expected_mission_revision {
             return Err(StorageError::UnexpectedNewerRevision {
                 expected_revision: expected_mission_revision,
@@ -297,35 +340,39 @@ impl ProjectStore {
                 ));
             }
         }
-        let expected_source_revision = expected_outcome_ledger_revision
-            .map(|revision| {
-                i64::try_from(revision).map_err(|_| StorageError::RevisionOverflow(revision))
-            })
-            .transpose()?;
         let transaction = self.connection.transaction()?;
         ensure_project_scope(
             &transaction,
             mission.tenant_id.as_str(),
             mission.project_id.as_str(),
         )?;
-        let source = transaction
-            .query_row(
-                "SELECT tenant_id, revision FROM outcome_ledgers WHERE project_id = ?1",
-                [mission.project_id.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()?;
-        if source
-            .as_ref()
-            .is_some_and(|(tenant_id, _)| tenant_id != mission.tenant_id.as_str())
+        if let OutcomeLedgerSourceFence::Expected(expected_outcome_ledger_revision) =
+            outcome_ledger_fence
         {
-            return Err(StorageError::TenantScopeMismatch);
-        }
-        if source.as_ref().map(|(_, revision)| *revision) != expected_source_revision {
-            return Err(StorageError::OptimisticConflict {
-                aggregate: "outcome_ledger_source_fence".into(),
-                expected_revision: expected_outcome_ledger_revision.unwrap_or(0),
-            });
+            let expected_source_revision = expected_outcome_ledger_revision
+                .map(|revision| {
+                    i64::try_from(revision).map_err(|_| StorageError::RevisionOverflow(revision))
+                })
+                .transpose()?;
+            let source = transaction
+                .query_row(
+                    "SELECT tenant_id, revision FROM outcome_ledgers WHERE project_id = ?1",
+                    [mission.project_id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            if source
+                .as_ref()
+                .is_some_and(|(tenant_id, _)| tenant_id != mission.tenant_id.as_str())
+            {
+                return Err(StorageError::TenantScopeMismatch);
+            }
+            if source.as_ref().map(|(_, revision)| *revision) != expected_source_revision {
+                return Err(StorageError::OptimisticConflict {
+                    aggregate: "outcome_ledger_source_fence".into(),
+                    expected_revision: expected_outcome_ledger_revision.unwrap_or(0),
+                });
+            }
         }
         for fence in source_fences {
             require_application_source_fence(
@@ -361,6 +408,9 @@ pub(crate) fn require_application_source_fence(
     fence: &ApplicationSourceRevisionFence,
 ) -> Result<(), StorageError> {
     let query = match fence.kind {
+        ApplicationSourceKind::Project => {
+            "SELECT tenant_id, revision FROM projects WHERE id = ?1 AND id = ?2"
+        }
         ApplicationSourceKind::Mission => {
             "SELECT tenant_id, revision FROM missions WHERE project_id = ?1 AND id = ?2"
         }
@@ -415,6 +465,7 @@ pub(crate) fn require_application_source_fence(
 
 pub(crate) const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
     match kind {
+        ApplicationSourceKind::Project => "project",
         ApplicationSourceKind::Mission => "mission",
         ApplicationSourceKind::Connection => "connection",
         ApplicationSourceKind::IdentityLink => "identity_link",
@@ -698,6 +749,49 @@ mod tests {
             .events_for_mission(&project.id, &mission.id)
             .expect("events")
             .len();
+        let mut revised_project = project.clone();
+        revised_project
+            .update_metadata("Source fence revised", "")
+            .expect("revise project");
+        store
+            .update_project_atomic(
+                &revised_project,
+                project.revision,
+                &[PendingEvent::new(
+                    "project.metadata_updated",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            )
+            .expect("persist revised project");
+        assert!(matches!(
+            store.update_mission_atomic_with_application_source_fences(
+                &candidate,
+                mission.revision,
+                None,
+                &[ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Project,
+                    project.id.to_string(),
+                    project.revision,
+                )],
+                &[PendingEvent::new(
+                    "test.stale_project_must_rollback",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            ),
+            Err(StorageError::OptimisticConflict {
+                aggregate,
+                expected_revision,
+            }) if aggregate == "project_source_fence" && expected_revision == project.revision
+        ));
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &mission.id)
+                .expect("events after stale project conflict")
+                .len(),
+            event_count
+        );
         assert!(matches!(
             store.update_mission_atomic_with_application_source_fences(
                 &candidate,
@@ -851,6 +945,11 @@ mod tests {
                 mission.revision,
                 None,
                 &[
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Project,
+                        revised_project.id.to_string(),
+                        revised_project.revision,
+                    ),
                     ApplicationSourceRevisionFence::present(
                         ApplicationSourceKind::Company,
                         company.id.to_string(),

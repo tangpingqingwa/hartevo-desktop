@@ -15171,6 +15171,130 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one Desktop Journey proves VM-00 local identity routing, zero Runtime construction, SQLCipher durability, and content-free evidence after cold reopen"
+    )]
+    fn vm00_local_identity_survives_encrypted_desktop_reopen_without_runtime() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let private_goal = "PRIVATE-VM00-DESKTOP::resume only this encrypted local project";
+        let submission = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-00".into(),
+                    mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
+                    title: Some("Resume local project".into()),
+                    goal: private_goal.into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("VM-00 local identity must not construct a Runtime command")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("VM-00 local identity Desktop dispatch");
+        assert_eq!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "project_inventory".into(),
+                capability_id: "project.inventory".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from(["operating_state".into(), "truth".into()]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        assert!(plane.with_cordis_host(|host| host.bound_scope().is_none()));
+        let runtime_activity = submission
+            .snapshot
+            .runtime_activity
+            .iter()
+            .find(|activity| activity.mission_id == submission.mission_id)
+            .expect("content-free VM-00 Runtime projection");
+        assert!(runtime_activity.process_claim_status.is_none());
+        assert!(runtime_activity.recovery_status.is_none());
+        assert!(runtime_activity.turn_status.is_none());
+        assert_eq!(runtime_activity.process_cleanup_attempt_count, 0);
+        assert_eq!(runtime_activity.recovery_failure_count, 0);
+        assert_eq!(runtime_activity.turn_failure_count, 0);
+        assert_eq!(runtime_activity.turn_evidence_count, 0);
+        assert!(!runtime_activity.requires_reconciliation);
+        let projected = submission.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("VM-00 Desktop projection");
+        assert_eq!(projected.completed_checkpoint_count, 1);
+        assert_eq!(
+            projected.current_checkpoint_id.as_deref(),
+            Some("project_inventory")
+        );
+        assert_eq!(
+            projected.current_checkpoint_application_handler_status,
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+        );
+
+        let data_root = plane.data_root.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        drop(plane);
+        let reopened = DesktopDataPlane::at_data_root(data_root).expect("cold reopened plane");
+        let service = reopened
+            .open_read_application_from_secret(&database_secret)
+            .expect("encrypted Application after reopen");
+        let mission = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("durable VM-00 Mission");
+        assert!(mission.effects.is_empty());
+        let completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "identity.resolve")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable local identity completion");
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .expect("durable Application evidence");
+        assert_eq!(evidence.handler_id, "vm00.local-project-identity/v1");
+        assert!(
+            evidence
+                .sources
+                .iter()
+                .any(|source| source.source_kind == "project_scope")
+        );
+        let event_json = serde_json::to_string(
+            &service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("durable content-free events"),
+        )
+        .expect("event JSON");
+        assert!(event_json.contains("vm00.local-project-identity/v1"));
+        assert!(!event_json.contains(private_goal));
+        drop(directory);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the Desktop data-plane Journey proves eight deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, typed next-contract resolution, and zero Runtime construction"
     )]
     fn vm11_application_handlers_recover_and_advance_without_constructing_runtime() {

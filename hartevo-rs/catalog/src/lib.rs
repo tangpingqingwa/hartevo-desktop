@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 8, 44)
+            (52, 9, 43)
         );
         assert_eq!(
             catalog
