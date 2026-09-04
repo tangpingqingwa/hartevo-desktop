@@ -6,13 +6,14 @@ use crate::transport::{ReadOnlyTransport, SecretReference};
 
 use super::provider::{
     TiktokDisplayApiProvider, parse_probe_response, parse_video_page_response,
-    parse_video_query_response, probe_request, video_list_request, video_query_request,
+    parse_video_query_response, probe_request, rate_limit_observation, video_list_request,
+    video_query_request,
 };
 use super::{
     EvidenceProvenance, OAuthCredential, REAL_READ_ENABLE_ENV, REAL_READ_SECRET_REFERENCE_ENV,
     TiktokApiOperation, TiktokError, TiktokFreshness, TiktokFreshnessPolicy,
-    TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope, TiktokVideoId,
-    TiktokVideoListCursor, TiktokVideoPage, TiktokVideoPageEnvelope,
+    TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope, TiktokRetryAfterReceipt,
+    TiktokVideoId, TiktokVideoListCursor, TiktokVideoPage, TiktokVideoPageEnvelope,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,10 +147,16 @@ impl<T> TiktokAuthenticatedReadService<T> {
         }
         cursor.require_page_size(max_count)?;
         let scope = cursor.scope().clone();
-        credential.require_for(TiktokApiOperation::VideoList, &scope, now)?;
         self.provider
             .require_credential_reference(credential.secret_reference())?;
-        cursor.bind_credential(credential)?;
+        cursor.bind_credential(credential, now)?;
+        credential.require_for(TiktokApiOperation::VideoList, &scope, now)?;
+        if let Some(receipt) = cursor.retry_after_if_waiting(now) {
+            return Err(TiktokError::RateLimited {
+                operation: TiktokApiOperation::VideoList,
+                retry_after_seconds: receipt.retry_after_seconds(),
+            });
+        }
         let request = video_list_request(
             credential.secret_reference().clone(),
             cursor.next_cursor(),
@@ -157,6 +164,21 @@ impl<T> TiktokAuthenticatedReadService<T> {
         )?;
         self.quota.reserve(TiktokApiOperation::VideoList, now)?;
         let response = self.provider.send(&request)?;
+        if let Some(observation) = rate_limit_observation(&response)? {
+            let retry_after_seconds = observation.retry_after_seconds();
+            let receipt = TiktokRetryAfterReceipt::from_observation(
+                scope,
+                cursor.generation(),
+                cursor.next_cursor(),
+                credential.generation(),
+                &observation,
+            )?;
+            cursor.record_retry_after(receipt)?;
+            return Err(TiktokError::RateLimited {
+                operation: TiktokApiOperation::VideoList,
+                retry_after_seconds,
+            });
+        }
         let generation = cursor
             .generation()
             .checked_add(1)

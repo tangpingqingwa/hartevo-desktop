@@ -347,6 +347,8 @@ pub struct OAuthCredential {
     refresh_token_expires_at: Option<DateTime<Utc>>,
     generation: u64,
     revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    unmounted_at: Option<DateTime<Utc>>,
 }
 
 impl OAuthCredential {
@@ -372,6 +374,7 @@ impl OAuthCredential {
             refresh_token_expires_at,
             generation,
             revoked_at: None,
+            unmounted_at: None,
         })
     }
 
@@ -407,6 +410,14 @@ impl OAuthCredential {
         self.revoked_at
     }
 
+    pub fn unmount(&mut self, at: DateTime<Utc>) {
+        self.unmounted_at = Some(at);
+    }
+
+    pub const fn unmounted_at(&self) -> Option<DateTime<Utc>> {
+        self.unmounted_at
+    }
+
     pub fn require_for(
         &self,
         operation: TiktokApiOperation,
@@ -415,6 +426,12 @@ impl OAuthCredential {
     ) -> Result<(), TiktokError> {
         if &self.scope != expected_scope {
             return Err(TiktokError::ScopeMismatch);
+        }
+        if self
+            .unmounted_at
+            .is_some_and(|unmounted_at| unmounted_at <= now)
+        {
+            return Err(TiktokError::CredentialUnmounted);
         }
         if self.revoked_at.is_some_and(|revoked_at| revoked_at <= now) {
             return Err(TiktokError::CredentialRevoked);
@@ -678,6 +695,187 @@ impl TiktokPageSequence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TiktokCursorInvalidationReason {
+    CredentialRotated,
+    CredentialRevoked,
+    CredentialUnmounted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TiktokCursorLifecycle {
+    #[default]
+    Active,
+    Invalidated {
+        reason: TiktokCursorInvalidationReason,
+        at: DateTime<Utc>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TiktokProviderResetObservation {
+    status: u16,
+    observed_at: DateTime<Utc>,
+    response_digest: String,
+    retry_after_seconds: Option<u64>,
+    provider_reset_at: Option<DateTime<Utc>>,
+}
+
+impl TiktokProviderResetObservation {
+    pub(crate) fn new(
+        status: u16,
+        observed_at: DateTime<Utc>,
+        response_digest: String,
+        retry_after_seconds: Option<u64>,
+        provider_reset_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, TiktokError> {
+        if status != 429
+            || !is_sha256(&response_digest)
+            || provider_reset_at.is_some_and(|reset| reset <= observed_at)
+        {
+            return Err(TiktokError::InvalidResponse {
+                field: "rate_limit.reset_observation".to_owned(),
+            });
+        }
+        Ok(Self {
+            status,
+            observed_at,
+            response_digest,
+            retry_after_seconds,
+            provider_reset_at,
+        })
+    }
+
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    pub fn response_digest(&self) -> &str {
+        &self.response_digest
+    }
+
+    pub const fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
+    }
+
+    pub const fn provider_reset_at(&self) -> Option<DateTime<Utc>> {
+        self.provider_reset_at
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TiktokRetryAfterReceipt {
+    provider: ProviderId,
+    scope: TiktokReadScope,
+    account: TiktokAccountId,
+    operation: TiktokApiOperation,
+    cursor_generation: u64,
+    requested_cursor: Option<TiktokCursor>,
+    credential_generation: u64,
+    observed_at: DateTime<Utc>,
+    response_digest: String,
+    retry_after_seconds: Option<u64>,
+    provider_reset_at: Option<DateTime<Utc>>,
+}
+
+impl TiktokRetryAfterReceipt {
+    pub(crate) fn from_observation(
+        scope: TiktokReadScope,
+        cursor_generation: u64,
+        requested_cursor: Option<TiktokCursor>,
+        credential_generation: u64,
+        observation: &TiktokProviderResetObservation,
+    ) -> Result<Self, TiktokError> {
+        let receipt = Self {
+            provider: ProviderId::Tiktok,
+            account: scope.account().clone(),
+            scope,
+            operation: TiktokApiOperation::VideoList,
+            cursor_generation,
+            requested_cursor,
+            credential_generation,
+            observed_at: observation.observed_at(),
+            response_digest: observation.response_digest().to_owned(),
+            retry_after_seconds: observation.retry_after_seconds(),
+            provider_reset_at: observation.provider_reset_at(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub const fn provider(&self) -> ProviderId {
+        self.provider
+    }
+
+    pub const fn scope(&self) -> &TiktokReadScope {
+        &self.scope
+    }
+
+    pub const fn account(&self) -> &TiktokAccountId {
+        &self.account
+    }
+
+    pub const fn operation(&self) -> TiktokApiOperation {
+        self.operation
+    }
+
+    pub const fn cursor_generation(&self) -> u64 {
+        self.cursor_generation
+    }
+
+    pub const fn requested_cursor(&self) -> Option<TiktokCursor> {
+        self.requested_cursor
+    }
+
+    pub const fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    pub fn response_digest(&self) -> &str {
+        &self.response_digest
+    }
+
+    pub const fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
+    }
+
+    pub const fn provider_reset_at(&self) -> Option<DateTime<Utc>> {
+        self.provider_reset_at
+    }
+
+    pub fn retry_is_due(&self, now: DateTime<Utc>) -> bool {
+        self.provider_reset_at.is_none_or(|reset| now >= reset)
+    }
+
+    fn validate(&self) -> Result<(), TiktokError> {
+        if self.provider != ProviderId::Tiktok
+            || self.scope.provider() != ProviderId::Tiktok
+            || self.account != *self.scope.account()
+            || self.operation != TiktokApiOperation::VideoList
+            || self.credential_generation == 0
+            || !is_sha256(&self.response_digest)
+            || self
+                .provider_reset_at
+                .is_some_and(|reset| reset <= self.observed_at)
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct TiktokAcceptedPage {
@@ -701,6 +899,8 @@ pub struct TiktokVideoListCursor {
     credential_generation: Option<u64>,
     #[serde(default)]
     credential_reference_digest: Option<String>,
+    #[serde(default)]
+    lifecycle: TiktokCursorLifecycle,
     next_cursor: Option<TiktokCursor>,
     has_more: bool,
     request_fingerprint: String,
@@ -711,6 +911,8 @@ pub struct TiktokVideoListCursor {
     accepted_pages: BTreeMap<u64, TiktokAcceptedPage>,
     #[serde(default)]
     evidence_root: String,
+    #[serde(default)]
+    retry_after: Option<TiktokRetryAfterReceipt>,
 }
 
 impl TiktokVideoListCursor {
@@ -731,6 +933,7 @@ impl TiktokVideoListCursor {
             page_size,
             credential_generation: None,
             credential_reference_digest: None,
+            lifecycle: TiktokCursorLifecycle::Active,
             next_cursor: None,
             has_more: true,
             request_fingerprint: video_list_request_fingerprint(page_size),
@@ -739,6 +942,7 @@ impl TiktokVideoListCursor {
             freshness: None,
             accepted_pages: BTreeMap::new(),
             evidence_root,
+            retry_after: None,
         };
         cursor.validate()?;
         Ok(cursor)
@@ -764,6 +968,10 @@ impl TiktokVideoListCursor {
         self.credential_reference_digest.as_deref()
     }
 
+    pub const fn lifecycle(&self) -> TiktokCursorLifecycle {
+        self.lifecycle
+    }
+
     pub const fn next_cursor(&self) -> Option<TiktokCursor> {
         self.next_cursor
     }
@@ -782,29 +990,64 @@ impl TiktokVideoListCursor {
     pub(super) fn bind_credential(
         &mut self,
         credential: &OAuthCredential,
+        now: DateTime<Utc>,
     ) -> Result<(), TiktokError> {
         self.validate()?;
+        self.require_active()?;
+        if self.updated_at.is_some_and(|updated_at| now < updated_at) {
+            return Err(TiktokError::CursorDrift);
+        }
         if credential.scope() != &self.scope {
             return Err(TiktokError::ScopeMismatch);
         }
         let reference_digest = credential_reference_digest(credential);
-        match (
-            self.credential_generation,
-            self.credential_reference_digest.as_deref(),
-        ) {
-            (None, None) => {
-                self.credential_generation = Some(credential.generation());
-                self.credential_reference_digest = Some(reference_digest);
-                Ok(())
-            }
-            (Some(generation), Some(digest))
-                if generation == credential.generation() && digest == reference_digest =>
-            {
-                Ok(())
-            }
-            (Some(_), Some(_)) => Err(TiktokError::CursorCredentialMismatch),
-            _ => Err(TiktokError::CursorDrift),
+        let is_bound = self.credential_generation.is_some();
+        if is_bound
+            && (self.credential_generation != Some(credential.generation())
+                || self.credential_reference_digest.as_deref() != Some(&reference_digest))
+        {
+            self.invalidate(TiktokCursorInvalidationReason::CredentialRotated, now);
+            return Err(TiktokError::CursorInvalidated {
+                reason: TiktokCursorInvalidationReason::CredentialRotated,
+            });
         }
+        if is_bound
+            && credential
+                .unmounted_at()
+                .is_some_and(|unmounted_at| unmounted_at <= now)
+        {
+            self.invalidate(TiktokCursorInvalidationReason::CredentialUnmounted, now);
+            return Err(TiktokError::CursorInvalidated {
+                reason: TiktokCursorInvalidationReason::CredentialUnmounted,
+            });
+        }
+        if is_bound
+            && credential
+                .revoked_at()
+                .is_some_and(|revoked_at| revoked_at <= now)
+        {
+            self.invalidate(TiktokCursorInvalidationReason::CredentialRevoked, now);
+            return Err(TiktokError::CursorInvalidated {
+                reason: TiktokCursorInvalidationReason::CredentialRevoked,
+            });
+        }
+        if !is_bound {
+            if credential
+                .unmounted_at()
+                .is_some_and(|unmounted_at| unmounted_at <= now)
+            {
+                return Err(TiktokError::CredentialUnmounted);
+            }
+            if credential
+                .revoked_at()
+                .is_some_and(|revoked_at| revoked_at <= now)
+            {
+                return Err(TiktokError::CredentialRevoked);
+            }
+            self.credential_generation = Some(credential.generation());
+            self.credential_reference_digest = Some(reference_digest);
+        }
+        Ok(())
     }
 
     pub fn last_page_digest(&self) -> Option<&str> {
@@ -821,6 +1064,40 @@ impl TiktokVideoListCursor {
 
     pub fn evidence_root(&self) -> &str {
         &self.evidence_root
+    }
+
+    pub const fn retry_after(&self) -> Option<&TiktokRetryAfterReceipt> {
+        self.retry_after.as_ref()
+    }
+
+    pub(super) fn retry_after_if_waiting(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<&TiktokRetryAfterReceipt> {
+        self.retry_after
+            .as_ref()
+            .filter(|receipt| !receipt.retry_is_due(now))
+    }
+
+    pub(super) fn record_retry_after(
+        &mut self,
+        receipt: TiktokRetryAfterReceipt,
+    ) -> Result<(), TiktokError> {
+        self.require_active()?;
+        receipt.validate()?;
+        if receipt.scope() != &self.scope
+            || receipt.account() != self.scope.account()
+            || receipt.cursor_generation() != self.generation
+            || receipt.requested_cursor() != self.next_cursor
+            || self.credential_generation != Some(receipt.credential_generation())
+            || self
+                .updated_at
+                .is_some_and(|updated_at| receipt.observed_at() < updated_at)
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+        self.retry_after = Some(receipt);
+        Ok(())
     }
 
     pub fn require_fresh(&self, now: DateTime<Utc>) -> Result<TiktokFreshness, TiktokError> {
@@ -935,6 +1212,7 @@ impl TiktokVideoListCursor {
         self.updated_at = Some(page.observed_at);
         self.freshness = Some(page.freshness);
         self.evidence_root = evidence_root;
+        self.retry_after = None;
         Ok(TiktokCursorDisposition::Applied)
     }
 
@@ -1037,7 +1315,46 @@ impl TiktokVideoListCursor {
         {
             return Err(TiktokError::CursorDrift);
         }
+        self.validate_recovery_state()?;
         Ok(())
+    }
+
+    fn validate_recovery_state(&self) -> Result<(), TiktokError> {
+        if let Some(retry_after) = &self.retry_after {
+            retry_after.validate()?;
+            if !matches!(self.lifecycle, TiktokCursorLifecycle::Active)
+                || retry_after.scope() != &self.scope
+                || retry_after.account() != self.scope.account()
+                || retry_after.cursor_generation() != self.generation
+                || retry_after.requested_cursor() != self.next_cursor
+                || self.credential_generation != Some(retry_after.credential_generation())
+                || self
+                    .updated_at
+                    .is_some_and(|updated_at| retry_after.observed_at() < updated_at)
+            {
+                return Err(TiktokError::CursorDrift);
+            }
+        }
+        if let TiktokCursorLifecycle::Invalidated { at, .. } = self.lifecycle
+            && self.updated_at.is_some_and(|updated_at| at < updated_at)
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+        Ok(())
+    }
+
+    fn require_active(&self) -> Result<(), TiktokError> {
+        match self.lifecycle {
+            TiktokCursorLifecycle::Active => Ok(()),
+            TiktokCursorLifecycle::Invalidated { reason, .. } => {
+                Err(TiktokError::CursorInvalidated { reason })
+            }
+        }
+    }
+
+    fn invalidate(&mut self, reason: TiktokCursorInvalidationReason, at: DateTime<Utc>) {
+        self.lifecycle = TiktokCursorLifecycle::Invalidated { reason, at };
+        self.retry_after = None;
     }
 }
 
@@ -1380,6 +1697,8 @@ pub enum TiktokError {
     CredentialExpired,
     #[error("TikTok OAuth credential is revoked or invalid")]
     CredentialRevoked,
+    #[error("TikTok OAuth credential is unmounted")]
+    CredentialUnmounted,
     #[error("TikTok credential reference does not match the production gate")]
     CredentialReferenceMismatch,
     #[error("TikTok read scope does not match the exact tenant/business/account scope")]
@@ -1403,6 +1722,10 @@ pub enum TiktokError {
     CursorDrift,
     #[error("TikTok durable cursor credential binding does not match")]
     CursorCredentialMismatch,
+    #[error("TikTok durable cursor was invalidated: {reason:?}")]
+    CursorInvalidated {
+        reason: TiktokCursorInvalidationReason,
+    },
     #[error("TikTok durable cursor checkpoint predates credential-bound evidence history")]
     CursorCheckpointIncompatible,
     #[error("TikTok durable cursor has no more pages")]
@@ -1443,7 +1766,9 @@ impl TiktokError {
         match self {
             Self::Disconnected => Some(TiktokConnectionState::Disconnected),
             Self::CredentialExpired => Some(TiktokConnectionState::Expired),
-            Self::CredentialRevoked => Some(TiktokConnectionState::Revoked),
+            Self::CredentialRevoked | Self::CredentialUnmounted => {
+                Some(TiktokConnectionState::Revoked)
+            }
             Self::RateLimited { .. } | Self::QuotaExhausted { .. } => {
                 Some(TiktokConnectionState::RateLimited)
             }
