@@ -92,6 +92,22 @@ pub(crate) fn clear_tiktok_access_token(
     }
 }
 
+/// Confirms that one exact credential generation resolves to a valid token
+/// without returning the secret above the Desktop transport boundary.
+pub(crate) fn require_tiktok_access_token(
+    secret_store: &impl SecretStore,
+    project_id: &ProjectId,
+    credential: &OAuthCredential,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), SecretStoreError> {
+    let reference = validate_tiktok_credential(project_id, credential, now)?;
+    let secret = secret_store.get(&reference)?;
+    match std::str::from_utf8(secret.as_slice()) {
+        Ok(token) if valid_access_token(token) => Ok(()),
+        _ => Err(SecretStoreError::InvalidSecret),
+    }
+}
+
 fn validate_tiktok_credential(
     project_id: &ProjectId,
     credential: &OAuthCredential,
