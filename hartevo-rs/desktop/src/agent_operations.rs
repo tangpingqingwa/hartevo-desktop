@@ -165,6 +165,7 @@ pub struct ApprovalEffectProjection {
 pub struct BrowserWorkspaceProjection {
     pub status: OperationsStatus,
     pub active_profile_count: usize,
+    pub create_status: OperationsStatus,
     pub identity: String,
     pub control_owner: String,
     pub next_action: String,
@@ -691,22 +692,34 @@ fn browser_projection(
 ) -> BrowserWorkspaceProjection {
     let active_profile_count = active_browser_profile_count(project);
     let Some(mission) = mission else {
-        return empty_browser_projection(active_profile_count, "Select a Mission");
+        return empty_browser_projection(
+            active_profile_count,
+            OperationsStatus::Empty,
+            "Select a Mission",
+        );
     };
     let Some(workspace) = mission.browser_workspace.as_ref() else {
-        let next_action = if active_profile_count == 0 {
-            "Register and verify a Browser Profile before Workspace creation".into()
-        } else {
-            format!(
-                "{active_profile_count} active Browser Profile(s) persisted; Workspace creation remains NOT_IMPLEMENTED"
-            )
+        let (create_status, next_action) = match active_profile_count {
+            0 => (
+                OperationsStatus::Empty,
+                "Register and verify a Browser Profile before Workspace creation".into(),
+            ),
+            1 => (
+                OperationsStatus::Ready,
+                "Create a Mission-bound Workspace from the persisted active Profile".into(),
+            ),
+            count => (
+                OperationsStatus::Empty,
+                format!("Choose one of {count} active Browser Profiles before Workspace creation"),
+            ),
         };
-        return empty_browser_projection(active_profile_count, next_action);
+        return empty_browser_projection(active_profile_count, create_status, next_action);
     };
     match workspace.control_state {
         BrowserControlState::UserControlled => BrowserWorkspaceProjection {
             status: OperationsStatus::WaitingUser,
             active_profile_count,
+            create_status: OperationsStatus::Empty,
             identity: short_identity_digest(&workspace.identity_digest),
             control_owner: "User holds the current lease".into(),
             next_action: "Continue issues Application continue_browser_workspace".into(),
@@ -769,11 +782,13 @@ fn browser_projection(
 
 fn empty_browser_projection(
     active_profile_count: usize,
+    create_status: OperationsStatus,
     next_action: impl Into<String>,
 ) -> BrowserWorkspaceProjection {
     BrowserWorkspaceProjection {
-        status: OperationsStatus::Empty,
+        status: create_status,
         active_profile_count,
+        create_status,
         identity: "No Mission-bound Browser Workspace".into(),
         control_owner: "No owner".into(),
         next_action: next_action.into(),
@@ -815,6 +830,7 @@ fn browser_workspace_view(
     BrowserWorkspaceProjection {
         status,
         active_profile_count,
+        create_status: OperationsStatus::Empty,
         identity: short_identity_digest(&workspace.identity_digest),
         control_owner: control_owner.into(),
         next_action: next_action.into(),
@@ -1086,6 +1102,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one state-matrix test keeps Browser create and ownership controls mutually exclusive"
+    )]
     fn browser_ownership_controls_follow_durable_state() {
         let mission = MissionProjection {
             surface: "orchestrator".into(),
@@ -1128,18 +1148,33 @@ mod tests {
         };
         let project = project_with_active_browser_profile(&mission);
         let empty = browser_projection(Some(&project), Some(&mission));
-        assert_eq!(empty.status, OperationsStatus::Empty);
+        assert_eq!(empty.status, OperationsStatus::Ready);
         assert_eq!(empty.active_profile_count, 1);
+        assert_eq!(empty.create_status, OperationsStatus::Ready);
         assert!(
             empty
                 .next_action
-                .contains("Workspace creation remains NOT_IMPLEMENTED")
+                .contains("Create a Mission-bound Workspace")
         );
         assert_eq!(empty.take_over_status, OperationsStatus::Empty);
         assert_eq!(empty.continue_status, OperationsStatus::Empty);
         assert_eq!(empty.pause_status, OperationsStatus::Empty);
         assert_eq!(empty.resume_status, OperationsStatus::Empty);
         assert!(empty.workspace_id.is_none());
+
+        let mut no_profile = project.clone();
+        no_profile.browser_profiles.clear();
+        let unavailable = browser_projection(Some(&no_profile), Some(&mission));
+        assert_eq!(unavailable.create_status, OperationsStatus::Empty);
+        assert!(unavailable.next_action.contains("Register and verify"));
+
+        let mut ambiguous = project.clone();
+        let mut second_profile = ambiguous.browser_profiles[0].clone();
+        second_profile.profile_id = "profile-second".into();
+        ambiguous.browser_profiles.push(second_profile);
+        let refused = browser_projection(Some(&ambiguous), Some(&mission));
+        assert_eq!(refused.create_status, OperationsStatus::Empty);
+        assert!(refused.next_action.contains("Choose one of 2"));
 
         let mut held = mission.clone();
         held.browser_workspace = Some(DurableBrowserWorkspaceProjection {
@@ -1151,6 +1186,7 @@ mod tests {
             lease_generation: 2,
         });
         let ready = browser_projection(Some(&project), Some(&held));
+        assert_eq!(ready.create_status, OperationsStatus::Empty);
         assert_eq!(ready.take_over_status, OperationsStatus::Empty);
         assert_eq!(ready.continue_status, OperationsStatus::Ready);
         assert_eq!(ready.pause_status, OperationsStatus::Ready);

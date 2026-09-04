@@ -157,6 +157,7 @@ impl ProjectStore {
 
         let transaction = self.connection.transaction()?;
         validate_workspace_scope(&transaction, workspace)?;
+        require_no_live_workspace_for_mission(&transaction, workspace)?;
         insert_browser_workspace(&transaction, workspace)?;
         replace_workspace_tabs(&transaction, workspace)?;
         insert_control_transition(
@@ -359,6 +360,26 @@ fn validate_workspace_scope(
         || profile.identity.identity_digest != workspace.expected_identity_digest
     {
         return Err(StorageError::TenantScopeMismatch);
+    }
+    Ok(())
+}
+
+fn require_no_live_workspace_for_mission(
+    connection: &Connection,
+    workspace: &BrowserWorkspace,
+) -> Result<(), StorageError> {
+    let live_count = connection.query_row(
+        "SELECT COUNT(*) FROM browser_workspaces
+         WHERE project_id = ?1 AND mission_id = ?2
+           AND control_state NOT IN ('completed', 'kept_for_user', 'closed')",
+        params![workspace.project_id.as_str(), workspace.mission_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if live_count != 0 {
+        return Err(StorageError::ImmutableRecordMismatch {
+            kind: "browser workspace mission scope",
+            id: workspace.mission_id.to_string(),
+        });
     }
     Ok(())
 }
@@ -1378,6 +1399,15 @@ mod tests {
             None
         );
         persist_fixture(&mut fixture);
+        let mut replacement = fixture.workspace.clone();
+        replacement.id = BrowserWorkspaceId::from("workspace-browser-storage-replacement");
+        assert!(matches!(
+            fixture.store.create_browser_workspace_atomic(&replacement),
+            Err(StorageError::ImmutableRecordMismatch {
+                kind: "browser workspace mission scope",
+                ..
+            })
+        ));
         let loaded = fixture
             .store
             .load_live_browser_workspace_for_mission(
@@ -1411,6 +1441,22 @@ mod tests {
                 )
                 .expect("terminal workspace is not live"),
             None
+        );
+        fixture
+            .store
+            .create_browser_workspace_atomic(&replacement)
+            .expect("replacement after terminal Workspace");
+        assert_eq!(
+            fixture
+                .store
+                .load_live_browser_workspace_for_mission(
+                    &replacement.project_id,
+                    &replacement.mission_id
+                )
+                .expect("replacement live Workspace")
+                .expect("one replacement Workspace")
+                .id,
+            replacement.id
         );
     }
 

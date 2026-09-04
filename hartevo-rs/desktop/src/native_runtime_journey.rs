@@ -1366,6 +1366,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidWaitingApprovalGrant
         | DesktopDataError::InvalidApprovedEffectExecution
         | DesktopDataError::InvalidEffectReconciliation
+        | DesktopDataError::InvalidBrowserWorkspaceCreate
+        | DesktopDataError::BrowserWorkspaceAlreadyExists
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::InvalidBrowserWorkspaceTakeOver
         | DesktopDataError::BrowserWorkspaceUnavailable
