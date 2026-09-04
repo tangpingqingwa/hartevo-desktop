@@ -648,18 +648,69 @@ impl TiktokQuotaLedger {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TiktokPageSequence {
+    provider: ProviderId,
+    account: TiktokAccountId,
+    generation: u64,
+}
+
+impl TiktokPageSequence {
+    pub(crate) const fn new(account: TiktokAccountId, generation: u64) -> Self {
+        Self {
+            provider: ProviderId::Tiktok,
+            account,
+            generation,
+        }
+    }
+
+    pub const fn provider(&self) -> ProviderId {
+        self.provider
+    }
+
+    pub const fn account(&self) -> &TiktokAccountId {
+        &self.account
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct TiktokAcceptedPage {
+    sequence: TiktokPageSequence,
+    requested_cursor: Option<TiktokCursor>,
+    next_cursor: Option<TiktokCursor>,
+    has_more: bool,
+    page_digest: String,
+    observed_at: DateTime<Utc>,
+    video_ids: Vec<TiktokVideoId>,
+    evidence_root: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TiktokVideoListCursor {
     scope: TiktokReadScope,
     generation: u64,
     page_size: u8,
+    #[serde(default)]
+    credential_generation: Option<u64>,
+    #[serde(default)]
+    credential_reference_digest: Option<String>,
     next_cursor: Option<TiktokCursor>,
     has_more: bool,
     request_fingerprint: String,
     last_page_digest: Option<String>,
     updated_at: Option<DateTime<Utc>>,
     freshness: Option<TiktokFreshness>,
+    #[serde(default)]
+    accepted_pages: BTreeMap<u64, TiktokAcceptedPage>,
+    #[serde(default)]
+    evidence_root: String,
 }
 
 impl TiktokVideoListCursor {
@@ -673,16 +724,21 @@ impl TiktokVideoListCursor {
                 "TikTok video.list max_count must be one through twenty",
             ));
         }
+        let evidence_root = initial_evidence_root(&scope, page_size);
         let cursor = Self {
             scope,
             generation: 0,
             page_size,
+            credential_generation: None,
+            credential_reference_digest: None,
             next_cursor: None,
             has_more: true,
             request_fingerprint: video_list_request_fingerprint(page_size),
             last_page_digest: None,
             updated_at: None,
             freshness: None,
+            accepted_pages: BTreeMap::new(),
+            evidence_root,
         };
         cursor.validate()?;
         Ok(cursor)
@@ -700,6 +756,14 @@ impl TiktokVideoListCursor {
         self.page_size
     }
 
+    pub const fn credential_generation(&self) -> Option<u64> {
+        self.credential_generation
+    }
+
+    pub fn credential_reference_digest(&self) -> Option<&str> {
+        self.credential_reference_digest.as_deref()
+    }
+
     pub const fn next_cursor(&self) -> Option<TiktokCursor> {
         self.next_cursor
     }
@@ -715,12 +779,48 @@ impl TiktokVideoListCursor {
         Ok(())
     }
 
+    pub(super) fn bind_credential(
+        &mut self,
+        credential: &OAuthCredential,
+    ) -> Result<(), TiktokError> {
+        self.validate()?;
+        if credential.scope() != &self.scope {
+            return Err(TiktokError::ScopeMismatch);
+        }
+        let reference_digest = credential_reference_digest(credential);
+        match (
+            self.credential_generation,
+            self.credential_reference_digest.as_deref(),
+        ) {
+            (None, None) => {
+                self.credential_generation = Some(credential.generation());
+                self.credential_reference_digest = Some(reference_digest);
+                Ok(())
+            }
+            (Some(generation), Some(digest))
+                if generation == credential.generation() && digest == reference_digest =>
+            {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(TiktokError::CursorCredentialMismatch),
+            _ => Err(TiktokError::CursorDrift),
+        }
+    }
+
     pub fn last_page_digest(&self) -> Option<&str> {
         self.last_page_digest.as_deref()
     }
 
     pub const fn freshness(&self) -> Option<TiktokFreshness> {
         self.freshness
+    }
+
+    pub fn accepted_page_count(&self) -> usize {
+        self.accepted_pages.len()
+    }
+
+    pub fn evidence_root(&self) -> &str {
+        &self.evidence_root
     }
 
     pub fn require_fresh(&self, now: DateTime<Utc>) -> Result<TiktokFreshness, TiktokError> {
@@ -736,8 +836,18 @@ impl TiktokVideoListCursor {
     }
 
     pub fn from_checkpoint_json(value: &str) -> Result<Self, TiktokError> {
-        let cursor: Self = serde_json::from_str(value)
+        let mut cursor: Self = serde_json::from_str(value)
             .map_err(|_| TiktokError::InvalidRequest("invalid cursor checkpoint"))?;
+        if cursor.evidence_root.is_empty() && cursor.generation == 0 {
+            cursor.evidence_root = initial_evidence_root(&cursor.scope, cursor.page_size);
+        }
+        if cursor.generation > 0
+            && (cursor.credential_generation.is_none()
+                || cursor.evidence_root.is_empty()
+                || cursor.accepted_pages.is_empty())
+        {
+            return Err(TiktokError::CursorCheckpointIncompatible);
+        }
         cursor.validate()?;
         Ok(cursor)
     }
@@ -753,20 +863,24 @@ impl TiktokVideoListCursor {
     ) -> Result<TiktokCursorDisposition, TiktokError> {
         self.validate()?;
         page.validate()?;
-        if page.scope != self.scope
-            || page.request_fingerprint != self.request_fingerprint
-            || page.requested_cursor != self.next_cursor
-        {
+        if self.credential_generation.is_none() {
+            return Err(TiktokError::CursorCheckpointIncompatible);
+        }
+        if page.scope != self.scope || page.request_fingerprint != self.request_fingerprint {
             return Err(TiktokError::CursorDrift);
         }
-        if self
-            .last_page_digest
-            .as_deref()
-            .is_some_and(|digest| digest == page.page_digest)
+        if let Some(accepted) = self
+            .accepted_pages
+            .values()
+            .find(|accepted| accepted.page_digest == page.page_digest)
         {
-            return Ok(TiktokCursorDisposition::Duplicate);
+            if accepted.matches_page(page)? {
+                return Ok(TiktokCursorDisposition::Duplicate);
+            }
+            return Err(TiktokError::CursorDrift);
         }
-        if expected_generation != self.generation
+        if page.requested_cursor != self.next_cursor
+            || expected_generation != self.generation
             || self
                 .updated_at
                 .is_some_and(|updated| page.observed_at < updated)
@@ -784,21 +898,57 @@ impl TiktokVideoListCursor {
         } else if page.next_cursor.is_some() {
             return Err(TiktokError::CursorDrift);
         }
-        self.generation = self
+        let next_generation = self
             .generation
             .checked_add(1)
             .ok_or(TiktokError::CursorDrift)?;
+        if page.freshness.source_generation() != next_generation {
+            return Err(TiktokError::CursorDrift);
+        }
+        let video_ids = page_video_ids(&page.observations)?;
+        if self.accepted_pages.values().any(|accepted| {
+            video_ids
+                .iter()
+                .any(|video_id| accepted.video_ids.binary_search(video_id).is_ok())
+        }) {
+            return Err(TiktokError::CursorDrift);
+        }
+        let sequence = TiktokPageSequence::new(self.scope.account().clone(), next_generation);
+        let evidence_root = page_evidence_root(&self.evidence_root, page, next_generation)?;
+        self.accepted_pages.insert(
+            next_generation,
+            TiktokAcceptedPage {
+                sequence,
+                requested_cursor: page.requested_cursor,
+                next_cursor: page.next_cursor,
+                has_more: page.has_more,
+                page_digest: page.page_digest.clone(),
+                observed_at: page.observed_at,
+                video_ids,
+                evidence_root: evidence_root.clone(),
+            },
+        );
+        self.generation = next_generation;
         self.next_cursor = page.next_cursor;
         self.has_more = page.has_more;
         self.last_page_digest = Some(page.page_digest.clone());
         self.updated_at = Some(page.observed_at);
         self.freshness = Some(page.freshness);
+        self.evidence_root = evidence_root;
         Ok(TiktokCursorDisposition::Applied)
     }
 
     fn validate(&self) -> Result<(), TiktokError> {
+        let initial_root = initial_evidence_root(&self.scope, self.page_size);
         if !(1..=DEFAULT_VIDEO_PAGE_SIZE).contains(&self.page_size)
             || self.request_fingerprint != video_list_request_fingerprint(self.page_size)
+            || self.credential_generation.is_some() != self.credential_reference_digest.is_some()
+            || self.credential_generation == Some(0)
+            || self
+                .credential_reference_digest
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || !is_sha256(&self.evidence_root)
             || (self.generation == 0
                 && (self.last_page_digest.is_some()
                     || self.updated_at.is_some()
@@ -811,10 +961,92 @@ impl TiktokVideoListCursor {
         {
             return Err(TiktokError::CursorDrift);
         }
+        if self.generation > 0 && self.credential_generation.is_none() {
+            return Err(TiktokError::CursorCheckpointIncompatible);
+        }
         if self.generation > 0 && (self.updated_at.is_none() || self.freshness.is_none()) {
             return Err(TiktokError::CursorDrift);
         }
+        let generation_count =
+            usize::try_from(self.generation).map_err(|_| TiktokError::CursorDrift)?;
+        if self.accepted_pages.len() != generation_count {
+            return Err(TiktokError::CursorDrift);
+        }
+
+        let mut evidence_root = initial_root.clone();
+        let mut previous_cursor = None;
+        let mut previous_observed_at = None;
+        let mut previous_digest = None;
+        let mut seen_video_ids = BTreeSet::new();
+        for generation in 1..=self.generation {
+            let page = self
+                .accepted_pages
+                .get(&generation)
+                .ok_or(TiktokError::CursorDrift)?;
+            if page.sequence.provider() != ProviderId::Tiktok
+                || page.sequence.account() != self.scope.account()
+                || page.sequence.generation() != generation
+                || page.requested_cursor != previous_cursor
+                || page.has_more != page.next_cursor.is_some()
+                || generation < self.generation && !page.has_more
+                || matches!(
+                    (page.requested_cursor, page.next_cursor),
+                    (Some(requested), Some(next)) if next.value() <= requested.value()
+                )
+                || !is_sha256(&page.page_digest)
+                || !is_sha256(&page.evidence_root)
+                || previous_observed_at.is_some_and(|at| page.observed_at < at)
+                || page.video_ids.windows(2).any(|pair| pair[0] >= pair[1])
+                || page
+                    .video_ids
+                    .iter()
+                    .any(|video_id| !seen_video_ids.insert(video_id.clone()))
+            {
+                return Err(TiktokError::CursorDrift);
+            }
+            let expected_root = page_evidence_root_from_receipt(&evidence_root, page);
+            if expected_root != page.evidence_root {
+                return Err(TiktokError::CursorDrift);
+            }
+            previous_cursor = page.next_cursor;
+            previous_observed_at = Some(page.observed_at);
+            previous_digest = Some(page.page_digest.as_str());
+            evidence_root.clone_from(&page.evidence_root);
+        }
+
+        if self.generation == 0 {
+            if !self.accepted_pages.is_empty()
+                || self.last_page_digest.is_some()
+                || self.updated_at.is_some()
+                || self.freshness.is_some()
+                || self.next_cursor.is_some()
+                || !self.has_more
+                || self.evidence_root != initial_root
+            {
+                return Err(TiktokError::CursorDrift);
+            }
+        } else if self.evidence_root != evidence_root
+            || self.next_cursor != previous_cursor
+            || self.last_page_digest.as_deref() != previous_digest
+            || self.updated_at != previous_observed_at
+            || self.freshness.is_some_and(|freshness| {
+                freshness.source_generation() != self.generation
+                    || Some(freshness.observed_at()) != self.updated_at
+                    || freshness.validate_at(freshness.observed_at()).is_err()
+            })
+        {
+            return Err(TiktokError::CursorDrift);
+        }
         Ok(())
+    }
+}
+
+impl TiktokAcceptedPage {
+    fn matches_page(&self, page: &TiktokVideoPage) -> Result<bool, TiktokError> {
+        Ok(self.next_cursor == page.next_cursor
+            && self.has_more == page.has_more
+            && self.observed_at == page.observed_at
+            && self.video_ids == page_video_ids(&page.observations)?)
     }
 }
 
@@ -1021,7 +1253,9 @@ pub struct TiktokVideoPageEnvelope {
     next_cursor: Option<TiktokCursor>,
     has_more: bool,
     page_digest: String,
-    cursor_generation: u64,
+    sequence: TiktokPageSequence,
+    credential_generation: u64,
+    evidence_root: String,
     freshness: TiktokFreshness,
     provenance: EvidenceProvenance,
     observations: Vec<TiktokObservationEnvelope>,
@@ -1040,12 +1274,40 @@ impl TiktokVideoPageEnvelope {
         self.has_more
     }
 
+    pub const fn provider(&self) -> ProviderId {
+        self.provider
+    }
+
+    pub const fn scope(&self) -> &TiktokReadScope {
+        &self.scope
+    }
+
+    pub const fn account(&self) -> &TiktokAccountIdentity {
+        &self.account
+    }
+
+    pub const fn requested_cursor(&self) -> Option<TiktokCursor> {
+        self.requested_cursor
+    }
+
     pub fn page_digest(&self) -> &str {
         &self.page_digest
     }
 
+    pub const fn sequence(&self) -> &TiktokPageSequence {
+        &self.sequence
+    }
+
     pub const fn cursor_generation(&self) -> u64 {
-        self.cursor_generation
+        self.sequence.generation()
+    }
+
+    pub const fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+
+    pub fn evidence_root(&self) -> &str {
+        &self.evidence_root
     }
 
     pub const fn freshness(&self) -> TiktokFreshness {
@@ -1077,12 +1339,25 @@ impl TiktokVideoPage {
             .observations
             .first()
             .map(TiktokObservationEnvelope::provenance);
+        let page_ids = self
+            .observations
+            .iter()
+            .map(|observation| match observation.observation() {
+                TiktokReadObservation::Video(video) => Ok(video.identity().video_id().clone()),
+                TiktokReadObservation::Account(_) => Err(TiktokError::CursorDrift),
+            })
+            .collect::<Result<Vec<_>, _>>();
         if !is_sha256(&self.page_digest)
             || !is_sha256(&self.request_fingerprint)
+            || self.freshness.observed_at() != self.observed_at
             || self.observations.iter().any(|observation| {
                 observation.scope() != &self.scope
                     || provenance.is_some_and(|expected| observation.provenance() != expected)
             })
+            || page_ids.is_err()
+            || page_ids
+                .as_ref()
+                .is_ok_and(|video_ids| video_ids.windows(2).any(|pair| pair[0] >= pair[1]))
         {
             return Err(TiktokError::CursorDrift);
         }
@@ -1126,6 +1401,10 @@ pub enum TiktokError {
     QuotaExhausted { operation: TiktokApiOperation },
     #[error("TikTok durable cursor drifted")]
     CursorDrift,
+    #[error("TikTok durable cursor credential binding does not match")]
+    CursorCredentialMismatch,
+    #[error("TikTok durable cursor checkpoint predates credential-bound evidence history")]
+    CursorCheckpointIncompatible,
     #[error("TikTok durable cursor has no more pages")]
     CursorExhausted,
     #[error("TikTok freshness expired: valid until {valid_until}")]
@@ -1189,6 +1468,105 @@ fn video_list_request_fingerprint(page_size: u8) -> String {
             "share_count",
             "view_count"
         ]
+    }))
+}
+
+fn initial_evidence_root(scope: &TiktokReadScope, page_size: u8) -> String {
+    sha256_json(&serde_json::json!({
+        "kind": "tiktok-video-list-evidence-root-v1",
+        "provider": "tiktok",
+        "scope": scope,
+        "page_size": page_size,
+    }))
+}
+
+fn page_evidence_root(
+    previous_root: &str,
+    page: &TiktokVideoPage,
+    generation: u64,
+) -> Result<String, TiktokError> {
+    Ok(page_evidence_root_material(
+        previous_root,
+        PageEvidenceMaterial {
+            account: page.scope.account(),
+            generation,
+            requested_cursor: page.requested_cursor,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+            page_digest: &page.page_digest,
+            observed_at: page.observed_at,
+            video_ids: &page_video_ids(&page.observations)?,
+        },
+    ))
+}
+
+fn page_evidence_root_from_receipt(previous_root: &str, page: &TiktokAcceptedPage) -> String {
+    page_evidence_root_material(
+        previous_root,
+        PageEvidenceMaterial {
+            account: page.sequence.account(),
+            generation: page.sequence.generation(),
+            requested_cursor: page.requested_cursor,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+            page_digest: &page.page_digest,
+            observed_at: page.observed_at,
+            video_ids: &page.video_ids,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PageEvidenceMaterial<'a> {
+    account: &'a TiktokAccountId,
+    generation: u64,
+    requested_cursor: Option<TiktokCursor>,
+    next_cursor: Option<TiktokCursor>,
+    has_more: bool,
+    page_digest: &'a str,
+    observed_at: DateTime<Utc>,
+    video_ids: &'a [TiktokVideoId],
+}
+
+fn page_evidence_root_material(previous_root: &str, material: PageEvidenceMaterial<'_>) -> String {
+    sha256_json(&serde_json::json!({
+        "provider": "tiktok",
+        "account": material.account,
+        "previous_root": previous_root,
+        "generation": material.generation,
+        "requested_cursor": material.requested_cursor.map(TiktokCursor::value),
+        "next_cursor": material.next_cursor.map(TiktokCursor::value),
+        "has_more": material.has_more,
+        "page_digest": material.page_digest,
+        "observed_at": material.observed_at,
+        "video_ids": material
+            .video_ids
+            .iter()
+            .map(TiktokVideoId::as_str)
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn page_video_ids(
+    observations: &[TiktokObservationEnvelope],
+) -> Result<Vec<TiktokVideoId>, TiktokError> {
+    let mut video_ids = observations
+        .iter()
+        .map(|observation| match observation.observation() {
+            TiktokReadObservation::Video(video) => Ok(video.identity().video_id().clone()),
+            TiktokReadObservation::Account(_) => Err(TiktokError::CursorDrift),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    video_ids.sort();
+    if video_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(TiktokError::CursorDrift);
+    }
+    Ok(video_ids)
+}
+
+fn credential_reference_digest(credential: &OAuthCredential) -> String {
+    sha256_json(&serde_json::json!({
+        "secret_reference": credential.secret_reference().as_str(),
     }))
 }
 
