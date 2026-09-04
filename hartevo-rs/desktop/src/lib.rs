@@ -19,8 +19,8 @@ use hartevo_application::{
 use hartevo_browser_adapter::{BrowserProfileStatus, BrowserPromptRisk};
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_channel_adapters::{
-    BusinessId as TiktokBusinessId, DEFAULT_VIDEO_PAGE_SIZE, TenantId as TiktokTenantId,
-    TiktokAccountId, TiktokOAuthScope, TiktokReadScope,
+    BusinessId as TiktokBusinessId, DEFAULT_VIDEO_PAGE_SIZE, MAX_VIDEO_SEQUENCE_PAGES,
+    TenantId as TiktokTenantId, TiktokAccountId, TiktokOAuthScope, TiktokReadScope,
 };
 use hartevo_cordis::{LifecycleCancellation, SessionCancelCause};
 use hartevo_domain_kernel::{
@@ -67,10 +67,11 @@ use data_plane::{
     DesktopRegisterTiktokConnectionRequest, DesktopReviewCreatorDeliverableRequest,
     DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
     DesktopRuntimeTextStreamProjection, DesktopSnapshot, DesktopTakeOverBrowserWorkspaceRequest,
-    DesktopTiktokConnectionSetupOutcome, DesktopVm11NextContractResolutionRequest,
-    DesktopVm11OutcomeDecisionRequest, DesktopWaitingApprovalGrantRequest,
-    DesktopWorkProductAdoptionRequest, ProductEvidenceProjection, ProjectContextAccessProjection,
-    ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopTiktokConnectionReadOutcome, DesktopTiktokConnectionSetupOutcome,
+    DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
+    DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
+    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
+    RecoveryKitDraft,
 };
 use result_adoption_surface::{
     ResultSurfaceAction, SelectedResultProjection, action_matches_current_projection,
@@ -89,7 +90,7 @@ use runtime_subscription::{
 
 static MAIN_CSS: Asset = asset!("/assets/main.css");
 static PROTOTYPE_CSS: Asset = asset!("/assets/prototype.css");
-const DESKTOP_TIKTOK_READ_MAX_PAGES: u16 = 2;
+const DESKTOP_TIKTOK_READ_MAX_PAGES: u16 = MAX_VIDEO_SEQUENCE_PAGES;
 #[allow(
     dead_code,
     reason = "bundled source asset is used by the visual fixture surface"
@@ -1333,6 +1334,8 @@ pub fn App() -> Element {
     let mut tiktok_connection_read_busy = use_signal(|| false);
     let mut tiktok_connection_read_completed =
         use_signal(|| None::<(ProjectId, MissionId, ConnectionId)>);
+    let mut tiktok_connection_read_checkpointed =
+        use_signal(|| None::<(ProjectId, MissionId, ConnectionId, u64, u16)>);
     let mut pending_tiktok_connection_retry = use_signal(|| None::<PendingTiktokConnectionRetry>);
     use_effect(move || {
         if visual_fixture_mode {
@@ -1569,6 +1572,21 @@ pub fn App() -> Element {
                         project_id == &project.project_id && mission_id == &mission.mission_id
                     })
                     .map(|(_, _, connection_id)| connection_id.clone())
+            });
+    let tiktok_connection_read_checkpoint =
+        project
+            .as_ref()
+            .zip(mission.as_ref())
+            .and_then(|(project, mission)| {
+                tiktok_connection_read_checkpointed
+                    .read()
+                    .as_ref()
+                    .filter(|(project_id, mission_id, _, _, _)| {
+                        project_id == &project.project_id && mission_id == &mission.mission_id
+                    })
+                    .map(|(_, _, connection_id, accepted_pages, max_pages)| {
+                        (connection_id.clone(), *accepted_pages, *max_pages)
+                    })
             });
     let runtime_activity = view.current_runtime_activity().cloned();
     let project_name = project
@@ -2276,15 +2294,29 @@ pub fn App() -> Element {
                 .await;
                 tiktok_connection_read_busy.set(false);
                 match result {
-                    Ok(Ok(adoption)) => {
+                    Ok(Ok(DesktopTiktokConnectionReadOutcome::Pending {
+                        accepted_pages,
+                        max_pages,
+                    })) => {
+                        tiktok_connection_read_checkpointed.set(Some((
+                            completed_scope.0,
+                            completed_scope.1,
+                            completed_scope.2,
+                            accepted_pages,
+                            max_pages,
+                        )));
+                    }
+                    Ok(Ok(DesktopTiktokConnectionReadOutcome::Adopted(adoption))) => {
+                        let adoption = *adoption;
                         model.write().set_ready(adoption.snapshot, false);
+                        tiktok_connection_read_checkpointed.set(None);
                         tiktok_connection_read_completed.set(Some(completed_scope));
                     }
                     Ok(Err(error)) => model.write().set_notice(&error),
                     Err(_) => {
                         model.write().notice = Some(UiFailure::coded(
                             "TIKTOK_READ_COORDINATOR_FAILED",
-                            "TikTok 读取协调异常结束；不会自动重试，也未写入部分 Mission 证据。",
+                            "TikTok 读取协调异常结束；不会自动重试，已落盘的 SQLCipher 进度会在下次显式点击时恢复。",
                         ));
                     }
                 }
@@ -3760,6 +3792,7 @@ pub fn App() -> Element {
                                 setup_busy: tiktok_connection_setup_busy(),
                                 read_busy: tiktok_connection_read_busy(),
                                 read_completed_connection_id: tiktok_connection_read_completed_id.clone(),
+                                read_checkpoint: tiktok_connection_read_checkpoint.clone(),
                                 retry_connection: tiktok_connection_retry.clone(),
                                 on_setup_tiktok: request_setup_tiktok_connection,
                                 on_retry_tiktok: request_retry_tiktok_connection,
@@ -9709,6 +9742,7 @@ fn ConnectionsSurface(
     setup_busy: bool,
     read_busy: bool,
     read_completed_connection_id: Option<ConnectionId>,
+    read_checkpoint: Option<(ConnectionId, u64, u16)>,
     retry_connection: Option<DesktopConnectionProjection>,
     on_setup_tiktok: EventHandler<DesktopRegisterTiktokConnectionRequest>,
     on_retry_tiktok: EventHandler<()>,
@@ -9855,7 +9889,7 @@ fn ConnectionsSurface(
                 section { class: "surface-section",
                     div { class: "surface-section-head", h2 { "全部连接" } p { "Tenant / Project / Account scoped" } }
                     if let Some(mission) = &mission {
-                        p { class: "contract-disclaimer", "显式读取将绑定当前 Mission {mission.title} · revision {mission.revision}；每次点击只执行一个有界请求，不会自动重试。" }
+                        p { class: "contract-disclaimer", "显式读取将绑定当前 Mission {mission.title} · revision {mission.revision}；每次点击最多读取一页，进度只保存在 SQLCipher，不会自动重试。" }
                     } else {
                         p { class: "contract-disclaimer", "请先选择一个 Mission；未选择时不会显示读取动作，也不会启动 Provider 请求。" }
                     }
@@ -9887,6 +9921,14 @@ fn ConnectionsSurface(
                                 let read_completed = read_completed_connection_id
                                     .as_ref()
                                     == Some(&connection.connection_id);
+                                let read_progress = read_checkpoint
+                                    .as_ref()
+                                    .filter(|(connection_id, _, _)| {
+                                        connection_id == &connection.connection_id
+                                    })
+                                    .map(|(_, accepted_pages, max_pages)| {
+                                        (*accepted_pages, *max_pages)
+                                    });
                                 let read_request = mission
                                     .as_ref()
                                     .filter(|mission| {
@@ -9938,6 +9980,8 @@ fn ConnectionsSurface(
                                                         "读取中…"
                                                     } else if read_completed {
                                                         "已完成 · 再次读取"
+                                                    } else if let Some((accepted_pages, max_pages)) = read_progress {
+                                                        "已保存 {accepted_pages}/{max_pages} 页 · 继续读取"
                                                     } else {
                                                         "读取到当前 Mission"
                                                     }
@@ -13123,13 +13167,15 @@ mod tests {
             "read_and_adopt_tiktok_connection_mission_os",
             "tiktok_connection_read_busy",
             "tiktok_connection_read_completed",
+            "tiktok_connection_read_checkpointed",
             "视觉夹具不会读取 TikTok 内容",
             "expected_mission_revision: mission.revision",
             "page_size: DEFAULT_VIDEO_PAGE_SIZE",
             "max_pages: DESKTOP_TIKTOK_READ_MAX_PAGES",
             "on_read_tiktok",
             "读取到当前 Mission",
-            "不会自动重试，也未写入部分 Mission 证据",
+            "已保存 {accepted_pages}/{max_pages} 页 · 继续读取",
+            "进度只保存在 SQLCipher，不会自动重试",
         ] {
             assert!(source.contains(contract), "missing {contract}");
         }

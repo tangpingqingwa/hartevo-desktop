@@ -38,6 +38,7 @@ ureq.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+hartevo-channel-adapters = { path = "../channel-adapters", features = ["production-testkit"] }
 serde_json.workspace = true
 url.workspace = true
 

@@ -8,6 +8,18 @@ use chrono::{DateTime, Utc};
 
 use crate::transport::ProviderResponse;
 
+#[cfg(feature = "production-testkit")]
+use std::collections::VecDeque;
+
+#[cfg(feature = "production-testkit")]
+use crate::transport::{ProviderReadRequest, ReadOnlyTransport, TransportError};
+
+#[cfg(feature = "production-testkit")]
+use super::{
+    OAuthCredential, TiktokAuthenticatedReadService, TiktokError, TiktokFreshnessPolicy,
+    TiktokMissionPageProgress, TiktokReadScope, TiktokRealReadGate, TiktokVideoSequenceSession,
+};
+
 pub const FIXED_NOW_RFC3339: &str = "2026-01-02T03:04:05Z";
 
 pub fn fixed_now() -> DateTime<Utc> {
@@ -127,4 +139,74 @@ pub fn rate_limited_response() -> ProviderResponse {
         r#"{"error":{"code":"rate_limit_exceeded","message":"slow down","log_id":"fixture-rate"}}"#,
         fixed_now(),
     )
+}
+
+/// Build deterministic production-provenance checkpoints for downstream
+/// integration tests. This seam exists only behind the explicit test feature;
+/// production callers must use `execute_real_read_gate` and a native transport.
+#[cfg(feature = "production-testkit")]
+pub fn production_sequence_checkpoints(
+    scope: &TiktokReadScope,
+    credential: &OAuthCredential,
+    now: DateTime<Utc>,
+) -> Result<(String, String), TiktokError> {
+    struct SequenceTransport {
+        responses: VecDeque<ProviderResponse>,
+    }
+
+    impl ReadOnlyTransport for SequenceTransport {
+        fn send(
+            &mut self,
+            _request: &ProviderReadRequest,
+        ) -> Result<ProviderResponse, TransportError> {
+            self.responses
+                .pop_front()
+                .ok_or(TransportError::Unavailable)
+        }
+    }
+
+    fn at(response: &ProviderResponse, now: DateTime<Utc>) -> ProviderResponse {
+        ProviderResponse::new(
+            response.status(),
+            [("content-type".to_owned(), "application/json".to_owned())],
+            response
+                .json_value()
+                .expect("built-in TikTok fixture JSON is valid")
+                .to_string(),
+            now,
+        )
+    }
+
+    credential.require_for(super::TiktokApiOperation::VideoList, scope, now)?;
+    let gate = TiktokRealReadGate::from_environment_values(
+        Some("1"),
+        Some(credential.secret_reference().as_str()),
+    )?;
+    let mut service = TiktokAuthenticatedReadService::production(
+        SequenceTransport {
+            responses: [
+                at(&first_video_page_response(), now),
+                at(&final_video_page_response(), now),
+            ]
+            .into_iter()
+            .collect(),
+        },
+        gate,
+        TiktokFreshnessPolicy::default(),
+    );
+    let mut session = TiktokVideoSequenceSession::new(scope.clone(), 20)?;
+    if !matches!(
+        service.read_video_sequence_step(credential, &mut session, now)?,
+        TiktokMissionPageProgress::Pending { .. }
+    ) {
+        return Err(TiktokError::CursorCheckpointIncompatible);
+    }
+    let pending = session.checkpoint_json()?;
+    if !matches!(
+        service.read_video_sequence_step(credential, &mut session, now)?,
+        TiktokMissionPageProgress::Complete(_)
+    ) {
+        return Err(TiktokError::CursorCheckpointIncompatible);
+    }
+    Ok((pending, session.checkpoint_json()?))
 }

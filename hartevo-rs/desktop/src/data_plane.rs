@@ -59,13 +59,13 @@ use hartevo_browser_adapter::{ChromiumLaunchConfig, ManagedChromiumHost};
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
-use hartevo_channel_adapters::tiktok::ProviderId as TiktokProviderId;
+use hartevo_channel_adapters::tiktok::{ProviderId as TiktokProviderId, TiktokMissionPageProgress};
 use hartevo_channel_adapters::{
     BusinessId as TiktokBusinessId, EvidenceProvenance, MAX_VIDEO_SEQUENCE_PAGES, OAuthCredential,
     ReadOnlyTransport, SecretReference as ChannelSecretReference, TiktokAccountId,
     TiktokApiOperation, TiktokError, TiktokFreshnessPolicy, TiktokMissionAcceptedSequence,
     TiktokOAuthScope, TiktokObservationEnvelope, TiktokReadObservation, TiktokReadScope,
-    execute_real_read_gate,
+    TiktokVideoSequenceSession, execute_real_read_gate,
 };
 use hartevo_context_fabric::{
     ConservativeByteBudgetTokenizer, ContextAssemblyStatus, RuntimeContextEnvelope,
@@ -113,7 +113,7 @@ use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalA
 use hartevo_storage::{
     ContextMaterialStoreError, DatabaseKey, KeyMaterial, OsSecretStore, ProjectStore,
     ProviderRecoveryState, RuntimeTurnStartupReconciliation, SecretBytes, SecretReference,
-    SecretStore, SecretStoreError, StorageError,
+    SecretStore, SecretStoreError, StorageError, TiktokReadCheckpoint, TiktokReadCheckpointBinding,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1830,6 +1830,14 @@ pub struct DesktopTiktokEvidenceAdoption {
     pub snapshot: DesktopSnapshot,
     pub evidence_pack: ObservationEvidencePack,
     pub replayed: bool,
+}
+
+/// Content-free result of one explicit Desktop sequence step. Pending progress
+/// exposes only counts; accepted provider pages remain inside SQLCipher.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DesktopTiktokConnectionReadOutcome {
+    Pending { accepted_pages: u64, max_pages: u16 },
+    Adopted(Box<DesktopTiktokEvidenceAdoption>),
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -5263,26 +5271,312 @@ impl DesktopDataPlane {
         &self,
         request: DesktopReadTiktokConnectionMissionRequest,
         now: DateTime<Utc>,
-    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
+    ) -> Result<DesktopTiktokConnectionReadOutcome, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         let project_id = request.project_id.clone();
-        self.read_and_adopt_tiktok_connection_evidence_input_with(
+        self.read_and_adopt_tiktok_connection_step_with(
             &secret_store,
             request,
             now,
-            |credential, scope, page_size, max_pages| {
+            |credential, scope, session| {
                 let transport =
                     native_tiktok_read_transport(&secret_store, &project_id, scope, credential)
                         .map_err(|_| DesktopDataError::InvalidTiktokProviderRead)?;
                 let mut provider =
                     execute_real_read_gate(transport, TiktokFreshnessPolicy::default())?;
-                let sequence =
-                    provider.read_video_sequence(credential, scope, now, page_size, max_pages)?;
-                desktop_tiktok_evidence_input(&sequence, now)
+                match provider.read_video_sequence_step(credential, session, now)? {
+                    TiktokMissionPageProgress::Pending { .. }
+                    | TiktokMissionPageProgress::Complete(_) => Ok(()),
+                    TiktokMissionPageProgress::Duplicate(_) => Err(TiktokError::CursorDrift.into()),
+                }
             },
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the boundary keeps exact checkpoint restore, one Cordis-authorized provider step, SQLCipher CAS, and terminal adoption visibly ordered"
+    )]
+    fn read_and_adopt_tiktok_connection_step_with<Read>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopReadTiktokConnectionMissionRequest,
+        now: DateTime<Utc>,
+        read: Read,
+    ) -> Result<DesktopTiktokConnectionReadOutcome, DesktopDataError>
+    where
+        Read: FnOnce(
+            &OAuthCredential,
+            &TiktokReadScope,
+            &mut TiktokVideoSequenceSession,
+        ) -> Result<(), DesktopDataError>,
+    {
+        enum DurableStep {
+            Pending {
+                accepted_pages: u64,
+            },
+            Complete {
+                input: DesktopTiktokEvidenceInput,
+                checkpoint_digest: String,
+            },
+        }
+
+        let DesktopReadTiktokConnectionMissionRequest {
+            project_id,
+            mission_id,
+            expected_mission_revision,
+            connection_id,
+            page_size,
+            max_pages,
+        } = request;
+        if expected_mission_revision == 0
+            || !(1..=hartevo_channel_adapters::DEFAULT_VIDEO_PAGE_SIZE).contains(&page_size)
+            || !(1..=MAX_VIDEO_SEQUENCE_PAGES).contains(&max_pages)
+        {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+
+        let database_secret = self.database_secret(secret_store)?;
+        let (mut service, _runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.revision != expected_mission_revision {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+        let connection = service
+            .load_connection(&project_id, &connection_id)
+            .map_err(|_| DesktopDataError::InvalidTiktokProviderRead)?;
+        let credential =
+            tiktok_credential_for_connection(&connection, &project_id, &mission.tenant_id, now)
+                .ok_or(DesktopDataError::InvalidTiktokProviderRead)?;
+        let provider_scope = credential.scope().clone();
+        credential.require_for(TiktokApiOperation::VideoList, &provider_scope, now)?;
+        let provider_scope_digest = canonical_json_digest(&provider_scope)?;
+        let credential_reference_digest = sha256_text(credential.secret_reference().as_str());
+        let checkpoint_binding = TiktokReadCheckpointBinding {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            connection_id: connection_id.clone(),
+            mission_revision: expected_mission_revision,
+            connection_revision: connection.revision(),
+            provider_scope_digest: provider_scope_digest.clone(),
+            credential_reference_digest: credential_reference_digest.clone(),
+            credential_generation: credential.generation(),
+            page_size,
+            max_pages,
+        };
+        let persisted = service.load_tiktok_read_checkpoint(&checkpoint_binding)?;
+        let persisted_digest = persisted
+            .as_ref()
+            .map(|checkpoint| checkpoint.checkpoint_digest().to_owned());
+        let mut session = match persisted.as_ref() {
+            Some(checkpoint) => {
+                let session = TiktokVideoSequenceSession::from_checkpoint_json(
+                    checkpoint.checkpoint_json(),
+                    &credential,
+                    now,
+                )?;
+                if session.generation() != checkpoint.page_generation() {
+                    return Err(DesktopDataError::InvalidTiktokProviderRead);
+                }
+                session
+            }
+            None => TiktokVideoSequenceSession::new(provider_scope.clone(), page_size)?,
+        };
+        if session.scope() != &provider_scope
+            || session.page_size() != page_size
+            || session.generation() > u64::from(max_pages)
+        {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+
+        let step = if session.is_complete() {
+            let sequence = session
+                .accepted_sequence(now)?
+                .ok_or(DesktopDataError::InvalidTiktokProviderRead)?;
+            let checkpoint_digest = persisted_digest
+                .clone()
+                .ok_or(DesktopDataError::InvalidTiktokProviderRead)?;
+            DurableStep::Complete {
+                input: desktop_tiktok_evidence_input(&sequence, now)?,
+                checkpoint_digest,
+            }
+        } else {
+            if session.generation() >= u64::from(max_pages) {
+                return Err(TiktokError::PageBudgetExhausted { max_pages }.into());
+            }
+            let authority_scope = authority_scope_for_mission(&mission, &project_id, &mission_id)?;
+            let checkpoint_binding_digest = checkpoint_binding.digest()?;
+            let initial_checkpoint_json = session.checkpoint_json()?;
+            let initial_checkpoint_digest = sha256_text(&initial_checkpoint_json);
+            if persisted_digest
+                .as_ref()
+                .is_some_and(|digest| digest != &initial_checkpoint_digest)
+            {
+                return Err(DesktopDataError::InvalidTiktokProviderRead);
+            }
+            let read_digest = canonical_json_digest(&serde_json::json!({
+                "kind": "tiktok_mission_video_sequence_read_step",
+                "provider": "tiktok",
+                "operation": "video_list",
+                "connectionId": connection_id.as_str(),
+                "connectionRevision": connection.revision(),
+                "providerScopeDigest": provider_scope_digest,
+                "credentialReferenceDigest": credential_reference_digest,
+                "credentialGeneration": credential.generation(),
+                "pageSize": page_size,
+                "maxPages": max_pages,
+                "checkpointBindingDigest": checkpoint_binding_digest,
+                "checkpointDigest": initial_checkpoint_digest,
+                "acceptedPages": session.generation(),
+            }))?;
+            let read_id = format!("tiktok-video-sequence-read-step-{read_digest}");
+            let command = DomainCommandBinding::read_provider_observation(
+                read_id.clone(),
+                read_digest.clone(),
+            )?;
+            let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+            let expected_source_identity_digest = canonical_json_digest(&serde_json::json!({
+                "provider": "tiktok",
+                "tenantId": provider_scope.tenant().as_str(),
+                "businessId": provider_scope.business().as_str(),
+                "accountId": provider_scope.account().as_str(),
+            }))?;
+            map_domain_command_dispatch_result(dispatch_live_domain_command(
+                &self.cordis,
+                DesktopDomainCommandAuthorization::new(authority_scope.clone(), command),
+                &facts.consent,
+                facts.record.as_ref(),
+                facts.approval.as_ref(),
+                now,
+                |permit| {
+                    let current_scope =
+                        mission_authority_scope(&service, &project_id, &mission_id)?;
+                    let current_connection =
+                        service
+                            .load_connection(&project_id, &connection_id)
+                            .map_err(|_| DesktopDataError::InvalidTiktokProviderRead)?;
+                    let current_credential = tiktok_credential_for_connection(
+                        &current_connection,
+                        &project_id,
+                        &mission.tenant_id,
+                        now,
+                    )
+                    .ok_or(DesktopDataError::InvalidTiktokProviderRead)?;
+                    if current_scope != authority_scope
+                        || permit.scope() != &authority_scope
+                        || permit.command().kind() != DomainCommandKind::ReadProviderObservation
+                        || permit.command().provider_read_id() != Some(read_id.as_str())
+                        || permit.command().provider_read_digest() != Some(read_digest.as_str())
+                        || permit.command().proposal_digest().is_some()
+                        || permit.command().approval_scope_digest().is_some()
+                        || permit.command().observation_id().is_some()
+                        || permit.command().observation_digest().is_some()
+                        || !same_tiktok_read_credential(&current_credential, &credential)
+                    {
+                        return Err(CordisError::DomainCommandPermitMismatch.into());
+                    }
+
+                    let progress = read(&credential, &provider_scope, &mut session);
+                    let checkpoint_json = session.checkpoint_json()?;
+                    let checkpoint_digest = sha256_text(&checkpoint_json);
+                    if checkpoint_digest != initial_checkpoint_digest {
+                        let checkpoint = TiktokReadCheckpoint::new(
+                            checkpoint_binding.clone(),
+                            session.generation(),
+                            checkpoint_json,
+                            now,
+                        )?;
+                        service.persist_tiktok_read_checkpoint(
+                            &checkpoint,
+                            persisted_digest.as_deref(),
+                        )?;
+                    }
+                    progress?;
+                    match session.accepted_sequence(now)? {
+                        None => Ok(DurableStep::Pending {
+                            accepted_pages: session.generation(),
+                        }),
+                        Some(sequence) => {
+                            let input = desktop_tiktok_evidence_input(&sequence, now)?;
+                            validate_desktop_tiktok_evidence_input(&input, now)?;
+                            if input.tenant_id != mission.tenant_id.as_str()
+                                || input.source_identity_digest != expected_source_identity_digest
+                                || input.credential_generation != credential.generation()
+                                || input.page_size != page_size
+                                || input.page_count > u64::from(max_pages)
+                            {
+                                return Err(DesktopDataError::InvalidTiktokProviderRead);
+                            }
+                            Ok(DurableStep::Complete {
+                                input,
+                                checkpoint_digest,
+                            })
+                        }
+                    }
+                },
+            ))?
+        };
+
+        let current_connection = service
+            .load_connection(&project_id, &connection_id)
+            .map_err(|_| DesktopDataError::InvalidTiktokProviderRead)?;
+        let current_credential = tiktok_credential_for_connection(
+            &current_connection,
+            &project_id,
+            &mission.tenant_id,
+            now,
+        )
+        .ok_or(DesktopDataError::InvalidTiktokProviderRead)?;
+        if !same_tiktok_read_credential(&current_credential, &credential) {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+
+        match step {
+            DurableStep::Pending { accepted_pages } => {
+                Ok(DesktopTiktokConnectionReadOutcome::Pending {
+                    accepted_pages,
+                    max_pages,
+                })
+            }
+            DurableStep::Complete {
+                input,
+                checkpoint_digest,
+            } => {
+                drop(service);
+                let adoption = self.adopt_tiktok_evidence_input_with(
+                    secret_store,
+                    &project_id,
+                    &mission_id,
+                    expected_mission_revision,
+                    input,
+                    now,
+                )?;
+                match self.open_read_application_from_secret(&database_secret) {
+                    Ok(mut cleanup_service) => {
+                        if let Err(error) = cleanup_service
+                            .delete_tiktok_read_checkpoint(&checkpoint_binding, &checkpoint_digest)
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "adopted TikTok sequence retained its exact stale checkpoint"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "adopted TikTok sequence could not reopen checkpoint cleanup"
+                    ),
+                }
+                Ok(DesktopTiktokConnectionReadOutcome::Adopted(Box::new(
+                    adoption,
+                )))
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn read_and_adopt_tiktok_connection_evidence_input_with<Read>(
         &self,
         secret_store: &impl SecretStore,
@@ -26595,6 +26889,237 @@ sleep 30"#;
             Err(DesktopDataError::InvalidTiktokProviderRead)
         ));
         assert_eq!(stale_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused restart proof keeps pending persistence, complete crash recovery, zero-call adoption, and exact cleanup in one visible sequence"
+    )]
+    fn tiktok_connection_read_resumes_sqlcipher_checkpoint_and_adopts_complete_without_replay() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(&secrets, &project_id, "Resume a TikTok sequence", now)
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission");
+        let private_request =
+            tiktok_provider_read_request(&mut service, &project_id, &mission, now);
+        drop(service);
+        let request = DesktopReadTiktokConnectionMissionRequest {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            expected_mission_revision: mission.revision,
+            connection_id: private_request.connection_id.clone(),
+            page_size: private_request.page_size,
+            max_pages: 4,
+        };
+        let (pending_checkpoint, complete_checkpoint) =
+            hartevo_channel_adapters::tiktok::testkit::production_sequence_checkpoints(
+                &private_request.scope,
+                &private_request.credential,
+                now,
+            )
+            .expect("production checkpoint fixtures");
+        assert!(!pending_checkpoint.contains("keychain://"));
+        assert!(!complete_checkpoint.contains("keychain://"));
+        let binding = TiktokReadCheckpointBinding {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            connection_id: private_request.connection_id.clone(),
+            mission_revision: mission.revision,
+            connection_revision: private_request.credential.generation(),
+            provider_scope_digest: canonical_json_digest(&private_request.scope).unwrap(),
+            credential_reference_digest: sha256_text(
+                private_request.credential.secret_reference().as_str(),
+            ),
+            credential_generation: private_request.credential.generation(),
+            page_size: request.page_size,
+            max_pages: request.max_pages,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let first_checkpoint = pending_checkpoint.clone();
+        let first = plane
+            .read_and_adopt_tiktok_connection_step_with(
+                &secrets,
+                request.clone(),
+                now,
+                move |credential, scope, session| {
+                    assert_eq!(session.generation(), 0);
+                    assert_eq!(scope, credential.scope());
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    *session = TiktokVideoSequenceSession::from_checkpoint_json(
+                        &first_checkpoint,
+                        credential,
+                        now,
+                    )?;
+                    Ok(())
+                },
+            )
+            .expect("persist first page");
+        assert_eq!(
+            first,
+            DesktopTiktokConnectionReadOutcome::Pending {
+                accepted_pages: 1,
+                max_pages: 4,
+            }
+        );
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("checkpoint application");
+        assert_eq!(
+            service
+                .load_tiktok_read_checkpoint(&binding)
+                .expect("load pending checkpoint")
+                .expect("pending checkpoint")
+                .page_generation(),
+            1
+        );
+        drop(service);
+
+        let data_root = plane.data_root.clone();
+        drop(plane);
+        let reopened = DesktopDataPlane::at_data_root(&data_root).expect("cold reopened plane");
+        let second_calls = Arc::clone(&calls);
+        let second_checkpoint = complete_checkpoint.clone();
+        let interrupted = reopened.read_and_adopt_tiktok_connection_step_with(
+            &secrets,
+            request.clone(),
+            now,
+            move |credential, scope, session| {
+                assert_eq!(scope, credential.scope());
+                assert_eq!(session.generation(), 1);
+                assert_eq!(
+                    session
+                        .next_cursor()
+                        .map(hartevo_channel_adapters::TiktokCursor::value),
+                    Some(1_767_301_445_000)
+                );
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                *session = TiktokVideoSequenceSession::from_checkpoint_json(
+                    &second_checkpoint,
+                    credential,
+                    now,
+                )?;
+                Err(TiktokError::Disconnected.into())
+            },
+        );
+        assert!(matches!(
+            interrupted,
+            Err(DesktopDataError::Tiktok(TiktokError::Disconnected))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        drop(reopened);
+        let recovered = DesktopDataPlane::at_data_root(&data_root).expect("second cold reopen");
+        let forbidden_calls = Arc::clone(&calls);
+        let outcome = recovered
+            .read_and_adopt_tiktok_connection_step_with(&secrets, request, now, move |_, _, _| {
+                forbidden_calls.fetch_add(1, Ordering::SeqCst);
+                unreachable!("complete checkpoint must adopt without provider I/O")
+            })
+            .expect("adopt restored complete checkpoint");
+        let DesktopTiktokConnectionReadOutcome::Adopted(adoption) = outcome else {
+            panic!("complete checkpoint must be adopted")
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            adoption.evidence_pack.expected_mission_revision,
+            mission.revision
+        );
+        assert_eq!(
+            adoption.evidence_pack.mission_revision,
+            mission.revision + 1
+        );
+        let (mut service, _) = recovered
+            .open_application_from_secret(&database_secret, now)
+            .expect("post-adoption application");
+        assert!(
+            !service
+                .delete_tiktok_read_checkpoint(&binding, &sha256_text(&complete_checkpoint))
+                .expect("exact checkpoint already removed")
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn tiktok_connection_checkpoint_page_budget_blocks_provider_replay() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(&secrets, &project_id, "Bound a TikTok sequence", now)
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission");
+        let private_request =
+            tiktok_provider_read_request(&mut service, &project_id, &mission, now);
+        drop(service);
+        let request = DesktopReadTiktokConnectionMissionRequest {
+            project_id,
+            mission_id,
+            expected_mission_revision: mission.revision,
+            connection_id: private_request.connection_id,
+            page_size: 20,
+            max_pages: 1,
+        };
+        let (pending_checkpoint, _) =
+            hartevo_channel_adapters::tiktok::testkit::production_sequence_checkpoints(
+                &private_request.scope,
+                &private_request.credential,
+                now,
+            )
+            .expect("pending checkpoint fixture");
+        plane
+            .read_and_adopt_tiktok_connection_step_with(
+                &secrets,
+                request.clone(),
+                now,
+                move |credential, _, session| {
+                    *session = TiktokVideoSequenceSession::from_checkpoint_json(
+                        &pending_checkpoint,
+                        credential,
+                        now,
+                    )?;
+                    Ok(())
+                },
+            )
+            .expect("persist bounded first page");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let blocked_calls = Arc::clone(&calls);
+        assert!(matches!(
+            plane.read_and_adopt_tiktok_connection_step_with(
+                &secrets,
+                request,
+                now,
+                move |_, _, _| {
+                    blocked_calls.fetch_add(1, Ordering::SeqCst);
+                    unreachable!("exhausted page budget must block before provider")
+                },
+            ),
+            Err(DesktopDataError::Tiktok(TiktokError::PageBudgetExhausted {
+                max_pages: 1
+            }))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
