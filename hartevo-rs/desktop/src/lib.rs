@@ -20,8 +20,8 @@ use hartevo_browser_adapter::{BrowserProfileStatus, BrowserPromptRisk};
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_cordis::{LifecycleCancellation, SessionCancelCause};
 use hartevo_domain_kernel::{
-    AcceptanceCheck, CadenceTriggerKind, ConversationState, CreatorTaskStatus, KpiContract,
-    KpiDirection, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+    AcceptanceCheck, CadenceTriggerKind, ConnectionStatus, ConversationState, CreatorTaskStatus,
+    KpiContract, KpiDirection, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
     MissionCheckpointStatus, MissionConversationMessageId, MissionConversationMessageKind,
     MissionConversationRole, MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode,
     OutcomeDecision, OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
@@ -51,9 +51,10 @@ use cordis_host::{
 };
 use data_plane::{
     DesktopBrowserWorkspaceControlRequest, DesktopCatalogMissionRequest,
-    DesktopContinueBrowserWorkspaceRequest, DesktopCreateBrowserWorkspaceRequest, DesktopDataError,
-    DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
-    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
+    DesktopConnectionProjection, DesktopContinueBrowserWorkspaceRequest,
+    DesktopCreateBrowserWorkspaceRequest, DesktopDataError, DesktopDataPlane,
+    DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest, DesktopLoadState,
+    DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopOpenConversationRequest,
     DesktopReadBrowserPublicSourceRequest, DesktopReviewCreatorDeliverableRequest,
     DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
@@ -785,6 +786,20 @@ impl DesktopUiModel {
         snapshot.context_access_for(project_id)
     }
 
+    fn current_connections(&self) -> Vec<DesktopConnectionProjection> {
+        let DesktopBackendState::Ready(snapshot) = &self.backend else {
+            return Vec::new();
+        };
+        let Some(project_id) = self.selected_project_id.as_ref() else {
+            return Vec::new();
+        };
+        snapshot
+            .connections_for(project_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     fn current_runtime_activity(&self) -> Option<&MissionRuntimeProjection> {
         let DesktopBackendState::Ready(snapshot) = &self.backend else {
             return None;
@@ -1340,6 +1355,7 @@ pub fn App() -> Element {
     let project = view.current_project().cloned();
     let mission = view.current_mission().cloned();
     let context_access = view.current_context_access().cloned();
+    let connections = view.current_connections();
     let runtime_activity = view.current_runtime_activity().cloned();
     let project_name = project
         .as_ref()
@@ -3308,7 +3324,11 @@ pub fn App() -> Element {
                                 on_review_creator_deliverable: request_partners_review_creator_deliverable,
                             }
                         } else if current_surface == Surface::Connections {
-                            ConnectionsSurface { project: project.clone(), context_access: context_access.clone() }
+                            ConnectionsSurface {
+                                project: project.clone(),
+                                context_access: context_access.clone(),
+                                connections: connections.clone(),
+                            }
                         } else if current_surface == Surface::Outcomes {
                             OutcomesSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Settings {
@@ -9223,10 +9243,31 @@ fn SettingsRow(
     }
 }
 
+const fn connection_status_label(status: &ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::PendingAuth => "PENDING_AUTH",
+        ConnectionStatus::Probing => "PROBING",
+        ConnectionStatus::Connected => "CONNECTED",
+        ConnectionStatus::Degraded => "DEGRADED",
+        ConnectionStatus::Expired => "EXPIRED",
+        ConnectionStatus::Revoked => "REVOKED",
+        ConnectionStatus::WrongAccount => "WRONG_ACCOUNT",
+        ConnectionStatus::MissingScopes => "MISSING_SCOPES",
+    }
+}
+
+fn connection_time_label(value: Option<&chrono::DateTime<Utc>>, empty: &str) -> String {
+    value.map_or_else(
+        || empty.to_owned(),
+        |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
+    )
+}
+
 #[component]
 fn ConnectionsSurface(
     project: Option<DesktopProjectProjection>,
     context_access: Option<ProjectContextAccessProjection>,
+    connections: Vec<DesktopConnectionProjection>,
 ) -> Element {
     #[cfg(feature = "visual-fixtures")]
     if let Some(page) = visual_fixture::page("connections") {
@@ -9246,6 +9287,12 @@ fn ConnectionsSurface(
         return rsx! { EmptyState { code: "EMPTY", title: "没有项目连接范围", detail: "连接必须绑定 Tenant/Project/Account；未选择项目时不会展示假连接。" } };
     };
     let revision = project.revision;
+    let connection_count = connections.len();
+    let connected_count = connections
+        .iter()
+        .filter(|connection| connection.status == ConnectionStatus::Connected)
+        .count();
+    let attention_count = connection_count.saturating_sub(connected_count);
     rsx! {
         div { class: "surface-scroll business-surface connections-surface",
             header { class: "surface-head",
@@ -9271,12 +9318,21 @@ fn ConnectionsSurface(
                         EncryptionReadinessCard { encryption: project.encryption.clone() }
                         ContextAccessCard { access: context_access }
                         section { class: "surface-section",
-                            div { class: "surface-section-head", h2 { "Mission 需要的连接" } p { "Provider Probe" } }
-                            div { class: "state-canvas compact",
-                                UiIcon { name: UiIconName::Plug, size: 22 }
-                                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
-                                h3 { "尚无 Connection Projection" }
-                                p { "当前 Desktop 数据面没有读取 Provider 凭据，也没有把 Catalog 中的 Provider 目标声明为 Connected。" }
+                            div { class: "surface-section-head", h2 { "当前项目的连接状态" } p { "Provider Probe" } }
+                            if connection_count == 0 {
+                                div { class: "state-canvas compact",
+                                    UiIcon { name: UiIconName::Plug, size: 22 }
+                                    span { class: "honesty-badge", "EMPTY" }
+                                    h3 { "当前项目尚无 durable Connection" }
+                                    p { "Desktop 已接通只读 Connection 投影；这里不会从 Catalog 目标或已保存凭据推断 Connected。" }
+                                }
+                            } else {
+                                div { class: "state-canvas compact",
+                                    UiIcon { name: UiIconName::Plug, size: 22 }
+                                    span { class: "honesty-badge", "DURABLE" }
+                                    h3 { "{connection_count} 条真实 Connection" }
+                                    p { "{connected_count} 条当前有效，{attention_count} 条等待授权、探测或修复；状态来自 Domain effective_status。" }
+                                }
                             }
                         }
                     }
@@ -9292,8 +9348,52 @@ fn ConnectionsSurface(
             } else if active_tab() == "all" {
                 section { class: "surface-section",
                     div { class: "surface-section-head", h2 { "全部连接" } p { "Tenant / Project / Account scoped" } }
-                    div { class: "connection-table-header", span { "服务与账号" } span { "用途" } span { "Scope" } span { "状态" } span { "最近验证" } }
-                    div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "没有可展示的真实 Connection" } p { "Provider Adapter 与 Secret Store 投影接线后才会出现行。" } }
+                    div { class: "connection-table-header", span { "服务与连接" } span { "边界" } span { "Scope" } span { "状态" } span { "最近验证" } }
+                    if connections.is_empty() {
+                        div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "当前项目尚无 durable Connection" } p { "只有 Application 返回的真实项目连接才会出现；不会读取 Secret Store 或生成演示行。" } }
+                    } else {
+                        for connection in connections.clone() {
+                            {
+                                let connection_id = connection.connection_id.as_str().to_owned();
+                                let required_scope_count = connection.required_scopes.len();
+                                let granted_scope_count = connection.granted_scopes.len();
+                                let required_scopes = connection
+                                    .required_scopes
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(" · ");
+                                let last_probe = connection_time_label(
+                                    connection.last_probed_at.as_ref(),
+                                    "尚未探测",
+                                );
+                                let valid_until = connection_time_label(
+                                    connection.valid_until.as_ref(),
+                                    "无有效窗口",
+                                );
+                                let connection_revision = connection.revision;
+                                let connection_status = connection_status_label(&connection.status);
+                                rsx! {
+                                    div { class: "connection-table-row",
+                                        span {
+                                            strong { "{connection.provider}" }
+                                            small { "Connection {short_digest(&connection_id)} · 账号标识已隐藏" }
+                                        }
+                                        span { strong { "Project scoped" } small { "无新增 Cordis 权限" } }
+                                        span {
+                                            strong { "{granted_scope_count}/{required_scope_count} granted" }
+                                            small { "{required_scopes}" }
+                                        }
+                                        span {
+                                            span { class: "honesty-badge", "{connection_status}" }
+                                            small { "revision {connection_revision}" }
+                                        }
+                                        span { strong { "{last_probe}" } small { "有效至 {valid_until}" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             } else if active_tab() == "policies" {
                 section { class: "surface-section",
@@ -9340,12 +9440,16 @@ fn ConnectionsSurface(
                             }
                         } else if flow_step() == 3 {
                             h2 { "确认真实账号" }
-                            p { "OAuth callback、state/nonce 和实时 Probe 尚未接入 Desktop；不能选择或声称账号已连接。" }
-                            div { class: "state-canvas compact", span { class: "honesty-badge", "BLOCKED_ENV" } h3 { "Provider 授权环境未配置" } }
+                            p { "Desktop TikTok 核心已能用显式凭据注册 PendingAuth Connection；OAuth callback、state/nonce 与凭据输入界面仍未接入。" }
+                            div { class: "state-canvas compact", span { class: "honesty-badge", "CORE_READY" } h3 { "注册边界已就绪，授权界面待接入" } }
                         } else {
                             h2 { "独立验证" }
                             p { "只有实时 Probe 返回匹配的 tenant/project/provider/account 与最小 Scope，连接才能显示 Connected。" }
-                            div { class: "state-canvas compact", span { class: "honesty-badge", "NOT_IMPLEMENTED" } h3 { "尚无 Probe Receipt" } }
+                            if connection_count == 0 {
+                                div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "TikTok 生产 Probe 已接入，当前项目尚无结果" } }
+                            } else {
+                                div { class: "state-canvas compact", span { class: "honesty-badge", "DURABLE" } h3 { "已读取 {connection_count} 条 durable Probe 状态" } }
+                            }
                         }
                     }
                     footer {
@@ -12245,6 +12349,44 @@ mod tests {
         assert!(data_plane.contains("Conversation::open"));
         assert!(!data_plane.contains("prepare_conversation_reply_effect"));
         assert!(data_plane.contains("ConversationAlreadyOpen"));
+    }
+
+    #[test]
+    fn connections_surface_renders_only_the_selected_projects_content_free_projection() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("let connections = view.current_connections();"));
+        assert!(source.contains("connections: connections.clone()"));
+        let start = source
+            .find("fn ConnectionsSurface(")
+            .expect("Connection surface");
+        let end = source[start..]
+            .find("fn CapabilityEvidenceSurface(")
+            .expect("next surface boundary");
+        let surface = &source[start..start + end];
+        for contract in [
+            "connections: Vec<DesktopConnectionProjection>",
+            "账号标识已隐藏",
+            "Domain effective_status",
+            "connection.last_probed_at.as_ref()",
+            "生产 Probe 已接入",
+        ] {
+            assert!(surface.contains(contract), "missing {contract}");
+        }
+        for stale_or_private in [
+            "尚无 Connection Projection",
+            "尚无 Probe Receipt",
+            "OAuth callback、state/nonce 和实时 Probe 尚未接入 Desktop",
+            ".account_id",
+            "expected_external_account_id",
+            "evidence_digest",
+            "access_token",
+            "keychain://",
+        ] {
+            assert!(
+                !surface.contains(stale_or_private),
+                "unexpected {stale_or_private}"
+            );
+        }
     }
 
     #[test]

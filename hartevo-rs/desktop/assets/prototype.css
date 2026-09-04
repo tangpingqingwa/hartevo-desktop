@@ -2691,6 +2691,38 @@ body.resizing-workpad {
   padding: 0 10px;
 }
 
+.connection-table-row {
+  display: grid;
+  min-height: 62px;
+  grid-template-columns: 1.3fr 0.8fr 1fr 0.7fr 0.8fr;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-2);
+}
+
+.connection-table-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 8px 10px;
+}
+
+.connection-table-row strong,
+.connection-table-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-table-row strong {
+  font-size: 9px;
+}
+
+.connection-table-row small {
+  color: #85868b;
+  font-size: 8px;
+}
+
 .overlay-backdrop,
 .overlay-dismiss {
   position: fixed;

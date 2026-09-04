@@ -176,10 +176,28 @@ pub struct ProductEvidenceProjection {
     pub missions: Vec<MissionContractEvidenceProjection>,
 }
 
+/// Content-free read model for one durable Domain Connection. Provider account
+/// identifiers and probe evidence remain below the Desktop projection boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopConnectionProjection {
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub connection_id: ConnectionId,
+    pub provider: String,
+    pub required_scopes: BTreeSet<String>,
+    pub granted_scopes: BTreeSet<String>,
+    pub status: ConnectionStatus,
+    pub revision: u64,
+    pub last_probed_at: Option<DateTime<Utc>>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesktopSnapshot {
     pub inventory: DesktopInventoryProjection,
     pub context_access: Vec<ProjectContextAccessProjection>,
+    pub connections: Vec<DesktopConnectionProjection>,
     pub runtime_reconciliation: RuntimeTurnStartupReconciliation,
     pub runtime: DesktopRuntimeProjection,
     pub runtime_activity: Vec<MissionRuntimeProjection>,
@@ -2770,6 +2788,47 @@ impl DesktopSnapshot {
             .iter()
             .find(|projection| &projection.project_id == project_id)
     }
+
+    pub fn connections_for(&self, project_id: &ProjectId) -> Vec<&DesktopConnectionProjection> {
+        self.connections
+            .iter()
+            .filter(|projection| &projection.project_id == project_id)
+            .collect()
+    }
+}
+
+fn desktop_connection_projection(
+    expected_tenant_id: &TenantId,
+    expected_project_id: &ProjectId,
+    connection: &Connection,
+    now: DateTime<Utc>,
+) -> Result<DesktopConnectionProjection, DesktopDataError> {
+    if connection.tenant_id() != expected_tenant_id
+        || connection.project_id() != expected_project_id
+    {
+        return Err(DesktopDataError::InvalidConnectionProjection);
+    }
+    let status = connection.effective_status(now);
+    let snapshot = connection.snapshot();
+    let (last_probed_at, valid_until) = snapshot.last_probe.map_or((None, None), |probe| {
+        (
+            Some(probe.probed_at),
+            Some(probe.valid_until.min(probe.credential_expires_at)),
+        )
+    });
+    Ok(DesktopConnectionProjection {
+        tenant_id: snapshot.tenant_id,
+        project_id: snapshot.project_id,
+        connection_id: snapshot.id,
+        provider: snapshot.provider,
+        required_scopes: snapshot.required_scopes,
+        granted_scopes: snapshot.granted_scopes,
+        status,
+        revision: snapshot.revision,
+        last_probed_at,
+        valid_until,
+        updated_at: snapshot.updated_at,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9232,6 +9291,29 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopSnapshot, DesktopDataError> {
         let mut inventory = service.desktop_inventory()?;
+        let mut connections = Vec::new();
+        for project in &inventory.projects {
+            for connection in service.list_connections(&project.project_id)? {
+                connections.push(desktop_connection_projection(
+                    &project.tenant_id,
+                    &project.project_id,
+                    &connection,
+                    now,
+                )?);
+            }
+        }
+        connections.sort_by(|left, right| {
+            left.tenant_id
+                .as_str()
+                .cmp(right.tenant_id.as_str())
+                .then_with(|| left.project_id.as_str().cmp(right.project_id.as_str()))
+                .then_with(|| left.provider.cmp(&right.provider))
+                .then_with(|| {
+                    left.connection_id
+                        .as_str()
+                        .cmp(right.connection_id.as_str())
+                })
+        });
         let context_access = inventory
             .projects
             .iter_mut()
@@ -9240,6 +9322,7 @@ impl DesktopDataPlane {
         Ok(DesktopSnapshot {
             inventory,
             context_access,
+            connections,
             runtime_reconciliation,
             runtime: self.discover_runtime_with(secret_store).projection,
             runtime_activity: service.desktop_runtime_activity()?,
@@ -11261,6 +11344,8 @@ pub enum DesktopDataError {
         "TikTok Connection registration requires an exact Project, tenant/account scope, Connection id, and initial credential generation"
     )]
     InvalidTiktokConnectionRegistration,
+    #[error("Desktop Connection projection does not match its exact Tenant and Project scope")]
+    InvalidConnectionProjection,
     #[error(
         "TikTok Connection persistence failed and its newly installed credential generation could not be removed; reconciliation is required"
     )]
@@ -25737,6 +25822,142 @@ sleep 30"#;
             Err(DesktopDataError::InvalidTiktokConnectionRegistration)
         ));
         assert_eq!(rejected_calls.load(Ordering::SeqCst), 0);
+        drop(directory);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused test proves exact scope, effective expiry, ordering, and content-free diagnostics"
+    )]
+    fn desktop_snapshot_projects_durable_connections_without_account_or_evidence_content() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let project = service
+            .list_projects()
+            .expect("Project inventory")
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .expect("exact Project");
+
+        let pending_id = ConnectionId::from("connection-zeta-pending");
+        service
+            .register_connection(
+                Connection::register(
+                    pending_id.clone(),
+                    project.tenant_id.clone(),
+                    project_id.clone(),
+                    "zeta-provider",
+                    AccountId::from("account-zeta-private"),
+                    "external-zeta-private",
+                    ["zeta.read".to_owned()],
+                    now,
+                )
+                .expect("pending Connection"),
+                now,
+            )
+            .expect("persist pending Connection");
+
+        let expired_id = ConnectionId::from("connection-alpha-expired");
+        let expired_scopes = BTreeSet::from(["alpha.read".to_owned()]);
+        let evidence_digest = "f".repeat(64);
+        service
+            .register_connection(
+                Connection::register(
+                    expired_id.clone(),
+                    project.tenant_id.clone(),
+                    project_id.clone(),
+                    "alpha-provider",
+                    AccountId::from("account-alpha-private"),
+                    "external-alpha-private",
+                    expired_scopes.clone(),
+                    now,
+                )
+                .expect("expiring Connection"),
+                now,
+            )
+            .expect("persist expiring Connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &expired_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "external-alpha-private".into(),
+                    granted_scopes: expired_scopes.clone(),
+                    probed_at: now + Duration::seconds(1),
+                    valid_until: now + Duration::minutes(2),
+                    credential_expires_at: now + Duration::minutes(1),
+                    evidence_digest: evidence_digest.clone(),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("persist successful probe");
+        drop(service);
+
+        let snapshot_at = now + Duration::minutes(3);
+        let DesktopLoadState::Ready(snapshot) = plane
+            .load_with(&secrets, snapshot_at)
+            .expect("load projected Connection inventory")
+        else {
+            panic!("initialized fixture must remain ready");
+        };
+        let projections = snapshot.connections_for(&project_id);
+        assert_eq!(projections.len(), 2);
+        assert_eq!(projections[0].connection_id, expired_id);
+        assert_eq!(projections[0].status, ConnectionStatus::Expired);
+        assert_eq!(projections[0].required_scopes, expired_scopes);
+        assert_eq!(
+            projections[0].last_probed_at,
+            Some(now + Duration::seconds(1))
+        );
+        assert_eq!(projections[0].valid_until, Some(now + Duration::minutes(1)));
+        assert_eq!(projections[1].connection_id, pending_id);
+        assert_eq!(projections[1].status, ConnectionStatus::PendingAuth);
+        assert!(
+            snapshot
+                .connections_for(&ProjectId::from("another-project"))
+                .is_empty()
+        );
+
+        let diagnostics = format!("{:?}", snapshot.connections);
+        for private in [
+            "account-zeta-private",
+            "external-zeta-private",
+            "account-alpha-private",
+            "external-alpha-private",
+            evidence_digest.as_str(),
+            "keychain://",
+        ] {
+            assert!(!diagnostics.contains(private), "leaked {private}");
+        }
+
+        let mismatched = Connection::register(
+            ConnectionId::from("connection-wrong-tenant"),
+            TenantId::from("tenant-wrong-private"),
+            project_id.clone(),
+            "alpha-provider",
+            AccountId::from("account-wrong-private"),
+            "external-wrong-private",
+            ["alpha.read".to_owned()],
+            now,
+        )
+        .expect("valid but mismatched Connection");
+        assert!(matches!(
+            desktop_connection_projection(
+                &project.tenant_id,
+                &project_id,
+                &mismatched,
+                snapshot_at,
+            ),
+            Err(DesktopDataError::InvalidConnectionProjection)
+        ));
         drop(directory);
     }
 

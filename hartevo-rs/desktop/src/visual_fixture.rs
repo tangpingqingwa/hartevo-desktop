@@ -552,6 +552,7 @@ fn fixture_snapshot(
                 readable_key_versions: vec![1],
             },
         }],
+        connections: Vec::new(),
         runtime_reconciliation: RuntimeTurnStartupReconciliation {
             scanned_attempts: 0,
             failed_before_dispatch: 0,
