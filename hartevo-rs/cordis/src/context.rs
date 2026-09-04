@@ -18,6 +18,7 @@ use crate::event::{
 };
 use crate::fiber::{Fiber, FiberState, FiberUid};
 use crate::loader::{PluginFactory, PluginFactoryId};
+use crate::logger::{Logger, LoggerConfig, LoggerExporter, LoggerService, hyphenate_logger_name};
 use crate::registry::{PendingEntry, Registry};
 use crate::service::{
     Service, ServiceAssociation, ServiceCaller, ServiceHandle, ServiceIntercept, ServiceLookup,
@@ -513,6 +514,7 @@ pub struct Context {
     vars: ConfigValue,
     effects: Vec<Registration>,
     events: EventBus,
+    logger: LoggerService,
     reserved_services: HashSet<String>,
     root: Fiber,
     current_fiber: FiberUid,
@@ -975,6 +977,7 @@ impl Context {
             vars: ConfigValue::default(),
             effects: Vec::new(),
             events: EventBus::new(),
+            logger: LoggerService::new(),
             reserved_services: HashSet::new(),
             current_fiber: root.uid(),
             fibers: HashMap::new(),
@@ -998,6 +1001,76 @@ impl Context {
     #[must_use]
     pub fn root(&self) -> Fiber {
         self.root_fiber()
+    }
+
+    /// Resolve the logger attributed to the current Fiber.
+    #[must_use]
+    pub fn logger(&self) -> Logger {
+        self.resolve_logger(None, LoggerConfig::default(), None, self.current_fiber)
+    }
+
+    /// Resolve an explicitly named logger attributed to the current Fiber.
+    #[must_use]
+    pub fn logger_named(&self, name: impl Into<String>) -> Logger {
+        self.resolve_logger(
+            Some(name.into()),
+            LoggerConfig::default(),
+            None,
+            self.current_fiber,
+        )
+    }
+
+    /// Shared read/configuration view of this Context's logger state.
+    #[must_use]
+    pub fn logger_service(&self) -> LoggerService {
+        self.logger.clone()
+    }
+
+    /// Register one exporter owned by the current Fiber.
+    pub fn logger_exporter(&mut self, exporter: LoggerExporter) -> RegistrationHandle {
+        if self.ensure_owner_active(self.current_fiber).is_err() {
+            return RegistrationHandle::noop();
+        }
+        let exporter_id = self.logger.add_exporter(exporter);
+        let logger = self.logger.clone();
+        self.effect(move || {
+            logger.remove_exporter(exporter_id);
+        })
+    }
+
+    pub(crate) fn resolve_logger(
+        &self,
+        explicit_name: Option<String>,
+        config: LoggerConfig,
+        service_name: Option<String>,
+        fiber_uid: FiberUid,
+    ) -> Logger {
+        let name = explicit_name
+            .or(config.name)
+            .or_else(|| service_name.map(|name| hyphenate_logger_name(&name)))
+            .unwrap_or_else(|| {
+                let fiber_name = if fiber_uid == self.root.uid() {
+                    self.root.namespace()
+                } else {
+                    self.fibers
+                        .get(&fiber_uid)
+                        .map_or_else(|| "root".to_string(), Fiber::namespace)
+                };
+                hyphenate_logger_name(&fiber_name)
+            });
+        self.logger.logger(name, config.level, Some(fiber_uid))
+    }
+
+    pub(crate) fn logger_name_for_origin(&self, origin: &ServiceOrigin) -> Option<String> {
+        self.providers
+            .iter()
+            .find(|(key, record)| {
+                key.namespace == origin.namespace()
+                    && record.provider_id == origin.provider_id()
+                    && record.owner_uid == origin.fiber_uid()
+                    && record.generation == origin.generation()
+            })
+            .map(|(key, _)| key.key.clone())
     }
 
     /// Allocate a child Fiber with a distinct monotonic uid.
@@ -3151,6 +3224,7 @@ impl Context {
         self.services.clear();
         self.providers.clear();
         self.reserved_services.clear();
+        self.logger.reset();
         self.vars = ConfigValue::default();
         if let Some(payload) = self.events.clear()
             && first_panic.is_none()
@@ -3219,6 +3293,30 @@ impl ContextView<'_> {
     #[must_use]
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Resolve this Fiber view's logger, including ordered `logger`
+    /// interception layers.
+    #[must_use]
+    pub fn logger(&self) -> Option<Logger> {
+        let (lookup, _) = self.service_lookup()?;
+        Some(
+            self.context
+                .resolve_logger(None, lookup.logger_config(), None, self.fiber.uid()),
+        )
+    }
+
+    /// Resolve an explicitly named logger. Explicit names take precedence
+    /// over interception layers.
+    #[must_use]
+    pub fn logger_named(&self, name: impl Into<String>) -> Option<Logger> {
+        let (lookup, _) = self.service_lookup()?;
+        Some(self.context.resolve_logger(
+            Some(name.into()),
+            lookup.logger_config(),
+            None,
+            self.fiber.uid(),
+        ))
     }
 
     #[must_use]
@@ -3486,6 +3584,15 @@ impl ContextView<'_> {
         }
         self.context
             .with_current_fiber(self.fiber.uid(), |ctx| ctx.effect(dispose))
+    }
+
+    /// Register one exporter owned by this view's exact Fiber.
+    pub fn logger_exporter(&mut self, exporter: LoggerExporter) -> RegistrationHandle {
+        if !self.is_active() {
+            return RegistrationHandle::noop();
+        }
+        self.context
+            .with_current_fiber(self.fiber.uid(), |ctx| ctx.logger_exporter(exporter))
     }
 
     pub fn set_var(&mut self, key: impl Into<String>, value: impl Into<ConfigValue>) {

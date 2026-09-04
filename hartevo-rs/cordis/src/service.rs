@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::config::ConfigValue;
 use crate::context::{Context, CordisError, ProviderId};
 use crate::fiber::FiberUid;
+use crate::logger::{Logger, LoggerConfig};
 
 /// Existing consuming plugin contract. N3 deliberately keeps this source
 /// compatible while adding service handles alongside it.
@@ -331,6 +332,12 @@ impl ServiceLookup {
         }
         layers
     }
+
+    pub(crate) fn logger_config(&self) -> LoggerConfig {
+        LoggerConfig::from_value(&merge_service_config(
+            &self.config_layers("logger", None, None),
+        ))
+    }
 }
 
 /// Typed service value plus its caller/shadow trace.
@@ -506,6 +513,40 @@ impl<'ctx> ServiceCall<'ctx> {
     #[must_use]
     pub fn shadow(&self) -> Option<&ServiceShadow> {
         self.shadow.as_ref()
+    }
+
+    /// Resolve a logger from this call's exact caller/shadow provenance.
+    /// An outer `logger` interception layer overrides the derived service name.
+    #[must_use]
+    pub fn logger(&self) -> Logger {
+        self.resolve_logger(None)
+    }
+
+    /// Resolve an explicitly named logger for this call.
+    #[must_use]
+    pub fn logger_named(&self, name: impl Into<String>) -> Logger {
+        self.resolve_logger(Some(name.into()))
+    }
+
+    fn resolve_logger(&self, explicit_name: Option<String>) -> Logger {
+        let service_name = self.shadow.as_ref().map_or_else(
+            || {
+                self.caller
+                    .origin()
+                    .and_then(|origin| self.context.logger_name_for_origin(origin))
+            },
+            |_| Some(self.service_key.clone()),
+        );
+        let fiber_uid = self
+            .shadow
+            .as_ref()
+            .map_or_else(|| self.caller.fiber_uid(), ServiceShadow::fiber_uid);
+        self.context.resolve_logger(
+            explicit_name,
+            self.lookup.logger_config(),
+            service_name,
+            fiber_uid,
+        )
     }
 
     fn nested_caller(&self) -> ServiceCaller {
