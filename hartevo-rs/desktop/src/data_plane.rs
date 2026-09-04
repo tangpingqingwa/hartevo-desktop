@@ -1436,6 +1436,7 @@ pub struct DesktopBrowserWorkspaceControlRequest {
 pub struct DesktopReadBrowserPublicSourceRequest {
     pub project_id: ProjectId,
     pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
     pub workspace_id: BrowserWorkspaceId,
     pub expected_revision: u64,
     pub expected_generation: u64,
@@ -1448,6 +1449,7 @@ impl fmt::Debug for DesktopReadBrowserPublicSourceRequest {
             .debug_struct("DesktopReadBrowserPublicSourceRequest")
             .field("project_id", &self.project_id)
             .field("mission_id", &self.mission_id)
+            .field("expected_mission_revision", &self.expected_mission_revision)
             .field("workspace_id", &self.workspace_id)
             .field("expected_revision", &self.expected_revision)
             .field("expected_generation", &self.expected_generation)
@@ -1457,6 +1459,12 @@ impl fmt::Debug for DesktopReadBrowserPublicSourceRequest {
             )
             .finish()
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesktopBrowserPublicSourceRead {
+    pub snapshot: DesktopSnapshot,
+    pub observation: BrowserPublicSourceObservation,
 }
 
 /// Window Open Conversation for one Mission-bound CRM identity. Person,
@@ -4090,7 +4098,7 @@ impl DesktopDataPlane {
         &self,
         request: DesktopReadBrowserPublicSourceRequest,
         now: DateTime<Utc>,
-    ) -> Result<BrowserPublicSourceObservation, DesktopDataError> {
+    ) -> Result<DesktopBrowserPublicSourceRead, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.read_browser_public_source_with(&secret_store, request, now)
     }
@@ -4100,8 +4108,9 @@ impl DesktopDataPlane {
         secret_store: &impl SecretStore,
         request: DesktopReadBrowserPublicSourceRequest,
         now: DateTime<Utc>,
-    ) -> Result<BrowserPublicSourceObservation, DesktopDataError> {
-        if request.expected_revision == 0
+    ) -> Result<DesktopBrowserPublicSourceRead, DesktopDataError> {
+        if request.expected_mission_revision == 0
+            || request.expected_revision == 0
             || request.expected_generation == 0
             || request.workspace_id.as_str().trim().is_empty()
             || BrowserNavigationPolicy::for_exact_https_target(&request.target_url).is_err()
@@ -4109,7 +4118,7 @@ impl DesktopDataPlane {
             return Err(DesktopDataError::InvalidBrowserPublicSourceRead);
         }
         let project_id = request.project_id.clone();
-        let (service, _runtime_reconciliation, _context_session) =
+        let (mut service, runtime_reconciliation, _context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
         let live = service
             .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
@@ -4127,12 +4136,13 @@ impl DesktopDataPlane {
         {
             return Err(DesktopDataError::BrowserWorkspaceReadNotAgentHeld);
         }
-        self.synchronize_mounted_browser_host(&live, |host| {
+        let observation = self.synchronize_mounted_browser_host(&live, |host| {
             service.read_browser_public_source(
                 host,
                 ReadBrowserPublicSource {
                     project_id,
                     mission_id: request.mission_id,
+                    expected_mission_revision: request.expected_mission_revision,
                     workspace_id: request.workspace_id,
                     expected_revision: request.expected_revision,
                     expected_generation: request.expected_generation,
@@ -4141,6 +4151,18 @@ impl DesktopDataPlane {
                 },
                 now,
             )
+        })?;
+        let product_evidence = load_product_evidence(now)?;
+        let snapshot = self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )?;
+        Ok(DesktopBrowserPublicSourceRead {
+            snapshot,
+            observation,
         })
     }
 
@@ -23437,6 +23459,7 @@ sleep 30"#;
             )
             .expect("mission");
         let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let mission_revision = started.inventory.projects[0].missions[0].revision;
         let database_secret = secrets
             .get(plane.database_key_reference())
             .expect("database secret");
@@ -23476,6 +23499,7 @@ sleep 30"#;
         let read_request = DesktopReadBrowserPublicSourceRequest {
             project_id: project_id.clone(),
             mission_id: mission_id.clone(),
+            expected_mission_revision: mission_revision,
             workspace_id: workspace.id.clone(),
             expected_revision: workspace.revision,
             expected_generation: workspace.lease_generation,
@@ -23542,13 +23566,14 @@ sleep 30"#;
             })
         );
 
-        let observation = plane
+        let read = plane
             .read_browser_public_source_with(
                 &secrets,
                 read_request.clone(),
                 now + Duration::seconds(4),
             )
             .expect("public-source observation");
+        let observation = read.observation;
         assert_eq!(observation.workspace_id, workspace.id);
         assert_eq!(observation.workspace_revision, workspace.revision);
         assert_eq!(observation.lease_generation, workspace.lease_generation);
@@ -23559,6 +23584,34 @@ sleep 30"#;
         assert_eq!(observation_count.load(Ordering::SeqCst), 1);
         assert!(!format!("{read_request:?}").contains("private"));
         assert!(!format!("{observation:?}").contains("private"));
+        let projected_observation = read.snapshot.inventory.projects[0].missions[0]
+            .browser_public_source_observation
+            .as_ref()
+            .expect("durable Browser observation projection");
+        assert_eq!(projected_observation, &observation);
+        assert_eq!(
+            read.snapshot.inventory.projects[0].missions[0].revision,
+            observation.mission_revision
+        );
+        let restarted = DesktopDataPlane::at_data_root(&plane.data_root).expect("restart plane");
+        let restarted_snapshot = restarted
+            .initialize_with(&secrets, now + Duration::seconds(5))
+            .expect("restart snapshot");
+        assert_eq!(
+            restarted_snapshot.inventory.projects[0].missions[0]
+                .browser_public_source_observation
+                .as_ref(),
+            Some(&observation)
+        );
+        assert!(!restarted.browser_workspace_host_mounted(
+            &DesktopBrowserWorkspaceControlRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace.id.clone(),
+                expected_revision: workspace.revision,
+                expected_generation: workspace.lease_generation,
+            }
+        ));
 
         let taken = plane
             .take_over_browser_workspace_with(
@@ -23582,6 +23635,7 @@ sleep 30"#;
             DesktopReadBrowserPublicSourceRequest {
                 project_id,
                 mission_id,
+                expected_mission_revision: taken.inventory.projects[0].missions[0].revision,
                 workspace_id: user_held.workspace_id.clone(),
                 expected_revision: user_held.revision,
                 expected_generation: user_held.lease_generation,

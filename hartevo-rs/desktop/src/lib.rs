@@ -2166,6 +2166,7 @@ pub fn App() -> Element {
         let request = DesktopReadBrowserPublicSourceRequest {
             project_id,
             mission_id: mission.mission_id,
+            expected_mission_revision: mission.revision,
             workspace_id: workspace.workspace_id.clone(),
             expected_revision: workspace.revision,
             expected_generation: workspace.lease_generation,
@@ -2187,9 +2188,9 @@ pub fn App() -> Element {
             })
             .await;
             match result {
-                Ok(Ok(observation)) => {
-                    browser_public_source_observation.set(Some(observation));
-                    model.write().notice = None;
+                Ok(Ok(read)) => {
+                    browser_public_source_observation.set(Some(read.observation));
+                    model.write().set_ready(read.snapshot, false);
                 }
                 Ok(Err(error)) => model.write().set_notice(&error),
                 Err(_) => {
@@ -3202,7 +3203,10 @@ pub fn App() -> Element {
                                 browser_workspace_create_pending: browser_workspace_create_pending(),
                                 browser_workspace_mount_pending: browser_workspace_mount_pending(),
                                 browser_public_source_read_pending: browser_public_source_read_pending(),
-                                browser_public_source_observation: browser_public_source_observation(),
+                                browser_public_source_observation: mission
+                                    .as_ref()
+                                    .and_then(|mission| mission.browser_public_source_observation.clone())
+                                    .or(browser_public_source_observation()),
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
@@ -6706,14 +6710,14 @@ fn AgentOperationsWorkbench(
                         div { class: "operations-browser-observation", role: "status", aria_live: "polite",
                             strong {
                                 if observation.prompt_risk == BrowserPromptRisk::None {
-                                    "READ ONLY · OBSERVED"
+                                    "READ ONLY · DURABLE"
                                 } else {
-                                    "READ ONLY · PROMPT RISK BLOCKED"
+                                    "READ ONLY · DURABLE · PROMPT RISK BLOCKED"
                                 }
                             }
                             span { "Snapshot {short_digest(observation.snapshot_id.as_str())} · document {observation.document_generation} · {observation.element_ref_count} semantic refs" }
                             span { "URL {short_digest(&observation.url_digest)} · content {short_digest(&observation.content_digest)} · navigation {short_digest(&observation.navigation_evidence_digest)}" }
-                            small { "Scripts disabled: {observation.script_execution_disabled} · requests: {observation.allowed_request_count} · business verified: {observation.business_verified}" }
+                            small { "Mission revision {observation.mission_revision} · observation {short_digest(&observation.observation_digest)} · scripts disabled: {observation.script_execution_disabled} · requests: {observation.allowed_request_count} · business verified: {observation.business_verified}" }
                         }
                     }
                 }
@@ -12202,7 +12206,9 @@ mod tests {
         assert!(source.contains("format!(\"Mount · {}\""));
         assert!(source.contains("Mount · RUNNING"));
         assert!(source.contains("Read · RUNNING"));
-        assert!(source.contains("READ ONLY · PROMPT RISK BLOCKED"));
+        assert!(source.contains("READ ONLY · DURABLE · PROMPT RISK BLOCKED"));
+        assert!(source.contains("expected_mission_revision: mission.revision"));
+        assert!(source.contains("observation.mission_revision"));
         assert!(source.contains("business verified: {observation.business_verified}"));
         assert!(source.contains("format!(\"Take over · {}\""));
         assert!(source.contains("format!(\"Continue · {}\""));

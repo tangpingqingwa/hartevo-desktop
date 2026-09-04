@@ -2761,12 +2761,17 @@ pub struct CreateBrowserWorkspace {
     pub evidence_digest: String,
 }
 
+const BROWSER_PUBLIC_SOURCE_OBSERVATION_SCHEMA_VERSION: u32 = 1;
+const BROWSER_PUBLIC_SOURCE_OBSERVATION_COMMITTED_EVENT: &str =
+    "browser.public_source_observation_committed";
+
 /// One read-only public HTTPS navigation bound to the exact durable Browser
 /// Workspace projection. The raw URL is intentionally redacted from Debug.
 #[derive(Clone)]
 pub struct ReadBrowserPublicSource {
     pub project_id: ProjectId,
     pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
     pub workspace_id: BrowserWorkspaceId,
     pub expected_revision: u64,
     pub expected_generation: u64,
@@ -2780,6 +2785,7 @@ impl fmt::Debug for ReadBrowserPublicSource {
             .debug_struct("ReadBrowserPublicSource")
             .field("project_id", &self.project_id)
             .field("mission_id", &self.mission_id)
+            .field("expected_mission_revision", &self.expected_mission_revision)
             .field("workspace_id", &self.workspace_id)
             .field("expected_revision", &self.expected_revision)
             .field("expected_generation", &self.expected_generation)
@@ -2789,12 +2795,19 @@ impl fmt::Debug for ReadBrowserPublicSource {
     }
 }
 
-/// Content-free evidence from a real read-only Browser navigation and AX
-/// observation. This is process-local evidence, not a business Verification.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Content-free, durable evidence from a real read-only Browser navigation and
+/// AX observation. This remains Candidate evidence, not a business
+/// Verification.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrowserPublicSourceObservation {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub mission_revision: u64,
+    pub evidence_id: EvidenceId,
     pub workspace_id: BrowserWorkspaceId,
     pub workspace_revision: u64,
     pub tab_id: BrowserTabId,
@@ -2812,6 +2825,62 @@ pub struct BrowserPublicSourceObservation {
     pub script_execution_disabled: bool,
     pub business_verified: bool,
     pub observed_at: DateTime<Utc>,
+    pub observation_digest: String,
+}
+
+impl BrowserPublicSourceObservation {
+    fn calculate_digest(&self) -> Result<String, ApplicationError> {
+        let mut unsigned = self.clone();
+        unsigned.observation_digest.clear();
+        Ok(sha256(&serde_json::to_vec(&unsigned)?))
+    }
+
+    fn seal(mut self) -> Result<Self, ApplicationError> {
+        self.observation_digest = self.calculate_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<(), ApplicationError> {
+        if self.schema_version != BROWSER_PUBLIC_SOURCE_OBSERVATION_SCHEMA_VERSION
+            || self.tenant_id.as_str().trim().is_empty()
+            || self.project_id.as_str().trim().is_empty()
+            || self.mission_id.as_str().trim().is_empty()
+            || self.expected_mission_revision == 0
+            || self
+                .expected_mission_revision
+                .checked_add(1)
+                .is_none_or(|revision| revision != self.mission_revision)
+            || self.evidence_id.as_str().trim().is_empty()
+            || self.workspace_id.as_str().trim().is_empty()
+            || self.workspace_revision == 0
+            || self.tab_id.as_str().trim().is_empty()
+            || self.snapshot_id.as_str().trim().is_empty()
+            || self.lease_generation == 0
+            || self.document_generation == 0
+            || !is_sha256_text(&self.url_digest)
+            || !is_sha256_text(&self.origin_digest)
+            || !is_sha256_text(&self.content_digest)
+            || !is_sha256_text(&self.redaction_digest)
+            || !is_sha256_text(&self.navigation_evidence_digest)
+            || self.allowed_request_count == 0
+            || !self.script_execution_disabled
+            || self.business_verified
+            || !is_sha256_text(&self.observation_digest)
+            || self.observation_digest != self.calculate_digest()?
+        {
+            return Err(BrowserError::InvalidSnapshot.into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PersistedBrowserPublicSourceObservation {
+    schema_version: u32,
+    observation: BrowserPublicSourceObservation,
+    evidence: Evidence,
 }
 
 #[derive(Clone, Debug)]
@@ -4985,6 +5054,8 @@ pub struct MissionProjection {
     pub current_checkpoint_completion_policy: Option<MissionCheckpointCompletionPolicy>,
     #[serde(default)]
     pub browser_workspace: Option<BrowserWorkspaceProjection>,
+    #[serde(default)]
+    pub browser_public_source_observation: Option<BrowserPublicSourceObservation>,
     pub completed_checkpoint_count: usize,
     pub checkpoint_count: usize,
     pub cycle: u64,
@@ -5482,17 +5553,40 @@ impl ApplicationService {
     }
 
     /// Navigates and observes one public HTTPS page through the exact mounted
-    /// Host. No durable state, Effect, Verification, or Mission status changes.
+    /// Host, then atomically records content-free Candidate evidence on the
+    /// Mission. No Effect, Verification, or Mission status transition occurs.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the read boundary keeps Mission/Workspace/lease/navigation/snapshot fences and the atomic content-free commit visible together"
+    )]
     pub fn read_browser_public_source(
-        &self,
+        &mut self,
         host: &mut impl BrowserReadHost,
         command: ReadBrowserPublicSource,
         now: DateTime<Utc>,
     ) -> Result<BrowserPublicSourceObservation, ApplicationError> {
+        let (policy, target) =
+            BrowserNavigationPolicy::for_exact_https_target(&command.target_url)?;
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.project_id != command.project_id
+            || mission.id != command.mission_id
+            || mission.stage != MissionStage::Running
+        {
+            return Err(BrowserError::ScopeMismatch.into());
+        }
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
         let workspace = self
             .store
             .load_browser_workspace(&command.project_id, &command.workspace_id)?;
-        if workspace.project_id != command.project_id
+        if workspace.tenant_id != mission.tenant_id
+            || workspace.project_id != command.project_id
             || workspace.mission_id != command.mission_id
             || workspace.id != command.workspace_id
             || workspace.revision != command.expected_revision
@@ -5502,8 +5596,6 @@ impl ApplicationService {
             return Err(BrowserError::ScopeMismatch.into());
         }
         let proof = workspace.agent_lease_proof(now)?;
-        let (policy, target) =
-            BrowserNavigationPolicy::for_exact_https_target(&command.target_url)?;
         let navigation =
             host.navigate_allowlisted(&workspace.active_tab_id, &proof, &policy, &target, now)?;
         let navigation_evidence_digest = navigation.evidence_digest()?;
@@ -5532,9 +5624,23 @@ impl ApplicationService {
         {
             return Err(BrowserError::StaleSnapshot.into());
         }
-        Ok(BrowserPublicSourceObservation {
+        let evidence_id = EvidenceId::from_stable(format!(
+            "browser-public-observation:{}:{}",
+            workspace.id.as_str(),
+            snapshot.id.as_str()
+        ));
+        let mission_revision = command
+            .expected_mission_revision
+            .checked_add(1)
+            .ok_or(MissionError::RevisionOverflow)?;
+        let observation = BrowserPublicSourceObservation {
+            schema_version: BROWSER_PUBLIC_SOURCE_OBSERVATION_SCHEMA_VERSION,
+            tenant_id: mission.tenant_id.clone(),
             project_id: command.project_id,
             mission_id: command.mission_id,
+            expected_mission_revision: command.expected_mission_revision,
+            mission_revision,
+            evidence_id: evidence_id.clone(),
             workspace_id: workspace.id,
             workspace_revision: workspace.revision,
             tab_id: snapshot.tab_id,
@@ -5552,7 +5658,30 @@ impl ApplicationService {
             script_execution_disabled: navigation.script_execution_disabled,
             business_verified: false,
             observed_at: snapshot.created_at,
-        })
+            observation_digest: String::new(),
+        }
+        .seal()?;
+        let evidence = browser_public_source_evidence(&observation);
+        mission.record_evidence(evidence.clone(), observation.observed_at)?;
+        if mission.revision != observation.mission_revision {
+            return Err(BrowserError::InvalidSnapshot.into());
+        }
+        let persisted = PersistedBrowserPublicSourceObservation {
+            schema_version: BROWSER_PUBLIC_SOURCE_OBSERVATION_SCHEMA_VERSION,
+            observation: observation.clone(),
+            evidence,
+        };
+        validate_persisted_browser_public_source_observation(&persisted, &mission)?;
+        self.store.update_mission_atomic(
+            &mission,
+            command.expected_mission_revision,
+            &[PendingEvent::new(
+                BROWSER_PUBLIC_SOURCE_OBSERVATION_COMMITTED_EVENT,
+                serde_json::to_value(persisted)?,
+                observation.observed_at,
+            )],
+        )?;
+        Ok(observation)
     }
 
     /// Restrictive control transitions fence the Host first. If persistence
@@ -5706,6 +5835,15 @@ impl ApplicationService {
         Ok(self
             .store
             .load_live_browser_workspace_for_mission(project_id, mission_id)?)
+    }
+
+    pub fn load_latest_browser_public_source_observation(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<Option<BrowserPublicSourceObservation>, ApplicationError> {
+        let mission = self.store.load_mission(project_id, mission_id)?;
+        latest_browser_public_source_observation(&self.store, &mission)
     }
 
     pub fn acknowledge_browser_batch_receipt(
@@ -19928,6 +20066,62 @@ impl ApplicationService {
     }
 }
 
+fn browser_public_source_evidence(observation: &BrowserPublicSourceObservation) -> Evidence {
+    Evidence {
+        id: observation.evidence_id.clone(),
+        title: format!("Browser public observation {}", observation.snapshot_id),
+        source_uri: format!("browser-public://sha256/{}", observation.url_digest),
+        observed_at: observation.observed_at,
+        confidence: 0.5,
+        status: EvidenceStatus::Candidate,
+        content_digest: observation.content_digest.clone(),
+    }
+}
+
+fn validate_persisted_browser_public_source_observation(
+    persisted: &PersistedBrowserPublicSourceObservation,
+    mission: &Mission,
+) -> Result<(), ApplicationError> {
+    persisted.observation.validate()?;
+    if persisted.schema_version != BROWSER_PUBLIC_SOURCE_OBSERVATION_SCHEMA_VERSION
+        || persisted.observation.tenant_id != mission.tenant_id
+        || persisted.observation.project_id != mission.project_id
+        || persisted.observation.mission_id != mission.id
+        || persisted.observation.mission_revision > mission.revision
+        || persisted.evidence != browser_public_source_evidence(&persisted.observation)
+        || !mission
+            .evidence
+            .iter()
+            .any(|evidence| evidence == &persisted.evidence)
+    {
+        return Err(BrowserError::InvalidSnapshot.into());
+    }
+    Ok(())
+}
+
+fn latest_browser_public_source_observation(
+    store: &ProjectStore,
+    mission: &Mission,
+) -> Result<Option<BrowserPublicSourceObservation>, ApplicationError> {
+    let mut latest = None;
+    for event in store.events_for_mission(&mission.project_id, &mission.id)? {
+        if event.event_type != BROWSER_PUBLIC_SOURCE_OBSERVATION_COMMITTED_EVENT {
+            continue;
+        }
+        let persisted: PersistedBrowserPublicSourceObservation =
+            serde_json::from_value(event.payload)?;
+        if event.project_id != mission.project_id
+            || event.mission_id.as_ref() != Some(&mission.id)
+            || event.recorded_at != persisted.observation.observed_at
+        {
+            return Err(BrowserError::InvalidSnapshot.into());
+        }
+        validate_persisted_browser_public_source_observation(&persisted, mission)?;
+        latest = Some(persisted.observation);
+    }
+    Ok(latest)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the projection exhaustively validates and redacts all Mission, Conversation, checkpoint, Work Product, Effect, and Outcome fields"
@@ -20096,6 +20290,8 @@ fn mission_projection(
     let vm11_outcome_review = vm11_outcome_review_decision_projection(store, &mission)?;
     let creator_work = creator_work_projection(store, &mission)?;
     let relationship_conversation = relationship_conversation_projection(store, &mission)?;
+    let browser_public_source_observation =
+        latest_browser_public_source_observation(store, &mission)?;
     let browser_workspace = store
         .load_live_browser_workspace_for_mission(&mission.project_id, &mission.id)?
         .map(|workspace| BrowserWorkspaceProjection {
@@ -20145,6 +20341,7 @@ fn mission_projection(
         current_checkpoint_oracle_ids,
         current_checkpoint_completion_policy,
         browser_workspace,
+        browser_public_source_observation,
         completed_checkpoint_count,
         checkpoint_count,
         cycle,
@@ -42701,7 +42898,7 @@ sleep 30"#
             StorageMode::LocalExisting,
         )
         .expect("project");
-        let mission = Mission::compile(
+        let mut mission = Mission::compile(
             project.tenant_id.clone(),
             mission_id.clone(),
             project_id.clone(),
@@ -42714,6 +42911,17 @@ sleep 30"#
             now(),
         )
         .expect("mission");
+        mission
+            .start_research(
+                [Task {
+                    id: TaskId::from("task-browser-application"),
+                    title: "Read public Browser evidence".into(),
+                    status: TaskStatus::Running,
+                    capability: "browser.read".into(),
+                }],
+                now(),
+            )
+            .expect("start Browser mission");
         store.save_project(&project).expect("save project");
         store.save_mission(&mission).expect("save mission");
         let mut service = ApplicationService::new(store);
@@ -42877,12 +43085,21 @@ sleep 30"#
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one safety-boundary test proves durable success, content redaction, stale Mission refusal, snapshot mismatch, and stale Workspace refusal together"
+    )]
     fn public_browser_read_is_exact_content_free_and_surfaces_prompt_risk() {
         let directory = tempfile::tempdir().expect("application browser read directory");
         let database_path = directory.path().join("application-browser-read.sqlite3");
         let key = hartevo_storage::DatabaseKey::new([79; 32]).expect("database key");
         let store = ProjectStore::open(&database_path, &key).expect("encrypted store");
-        let fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let mut fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let expected_mission_revision = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("Browser Mission")
+            .revision;
         let mut host = RecordingBrowserReadHost::new(
             fixture.workspace.clone(),
             BrowserPromptRisk::SuspectedInjection,
@@ -42894,6 +43111,7 @@ sleep 30"#
                 ReadBrowserPublicSource {
                     project_id: fixture.project_id.clone(),
                     mission_id: fixture.mission_id.clone(),
+                    expected_mission_revision,
                     workspace_id: fixture.workspace.id.clone(),
                     expected_revision: fixture.workspace.revision,
                     expected_generation: fixture.workspace.lease_generation,
@@ -42905,6 +43123,8 @@ sleep 30"#
             .expect("read-only Browser observation");
         assert_eq!(result.project_id, fixture.project_id);
         assert_eq!(result.mission_id, fixture.mission_id);
+        assert_eq!(result.expected_mission_revision, expected_mission_revision);
+        assert_eq!(result.mission_revision, expected_mission_revision + 1);
         assert_eq!(result.workspace_id, fixture.workspace.id);
         assert_eq!(result.workspace_revision, fixture.workspace.revision);
         assert_eq!(result.lease_generation, fixture.workspace.lease_generation);
@@ -42917,6 +43137,57 @@ sleep 30"#
         assert_eq!(host.navigation_count, 1);
         assert_eq!(host.observation_count, 1);
         assert!(!format!("{result:?}").contains("private"));
+        assert_eq!(
+            fixture
+                .service
+                .load_latest_browser_public_source_observation(
+                    &fixture.project_id,
+                    &fixture.mission_id,
+                )
+                .expect("durable Browser observation"),
+            Some(result.clone())
+        );
+        let persisted_events = fixture
+            .service
+            .store
+            .events_for_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("Browser Mission events");
+        let persisted_json = serde_json::to_string(&persisted_events)
+            .expect("serialize content-free Browser events");
+        assert!(!persisted_json.contains("private"));
+        assert!(!persisted_json.contains("https://example.com/research"));
+        let persisted_mission = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("persisted Browser Mission");
+        assert_eq!(persisted_mission.revision, result.mission_revision);
+        assert!(persisted_mission.evidence.iter().any(|evidence| {
+            evidence.id == result.evidence_id
+                && evidence.status == EvidenceStatus::Candidate
+                && evidence.content_digest == result.content_digest
+        }));
+
+        let stale_mission = fixture.service.read_browser_public_source(
+            &mut host,
+            ReadBrowserPublicSource {
+                project_id: fixture.project_id.clone(),
+                mission_id: fixture.mission_id.clone(),
+                expected_mission_revision,
+                workspace_id: fixture.workspace.id.clone(),
+                expected_revision: fixture.workspace.revision,
+                expected_generation: fixture.workspace.lease_generation,
+                snapshot_id: BrowserSnapshotId::from("snapshot-browser-public-stale-mission"),
+                target_url: "https://example.com/stale-mission".into(),
+            },
+            now(),
+        );
+        assert!(matches!(
+            stale_mission,
+            Err(ApplicationError::MissionRevisionMismatch { expected, actual })
+                if expected == expected_mission_revision && actual == result.mission_revision
+        ));
+        assert_eq!(host.navigation_count, 1);
+        assert_eq!(host.observation_count, 1);
 
         host.observation_document_generation = 3;
         let mismatched = fixture.service.read_browser_public_source(
@@ -42924,6 +43195,7 @@ sleep 30"#
             ReadBrowserPublicSource {
                 project_id: fixture.project_id.clone(),
                 mission_id: fixture.mission_id.clone(),
+                expected_mission_revision: result.mission_revision,
                 workspace_id: fixture.workspace.id.clone(),
                 expected_revision: fixture.workspace.revision,
                 expected_generation: fixture.workspace.lease_generation,
@@ -42943,6 +43215,7 @@ sleep 30"#
             ReadBrowserPublicSource {
                 project_id: fixture.project_id,
                 mission_id: fixture.mission_id,
+                expected_mission_revision: result.mission_revision,
                 workspace_id: fixture.workspace.id,
                 expected_revision: fixture.workspace.revision.saturating_add(1),
                 expected_generation: fixture.workspace.lease_generation,
@@ -42957,6 +43230,69 @@ sleep 30"#
         ));
         assert_eq!(host.navigation_count, 2);
         assert_eq!(host.observation_count, 2);
+    }
+
+    #[test]
+    fn persisted_public_browser_observation_tamper_fails_closed() {
+        let directory = tempfile::tempdir().expect("application browser tamper directory");
+        let database_path = directory.path().join("application-browser-tamper.sqlite3");
+        let key = hartevo_storage::DatabaseKey::new([81; 32]).expect("database key");
+        let store = ProjectStore::open(&database_path, &key).expect("encrypted store");
+        let mut fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let expected_mission_revision = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("Browser Mission")
+            .revision;
+        let mut host =
+            RecordingBrowserReadHost::new(fixture.workspace.clone(), BrowserPromptRisk::None);
+        let observation = fixture
+            .service
+            .read_browser_public_source(
+                &mut host,
+                ReadBrowserPublicSource {
+                    project_id: fixture.project_id.clone(),
+                    mission_id: fixture.mission_id.clone(),
+                    expected_mission_revision,
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: fixture.workspace.revision,
+                    expected_generation: fixture.workspace.lease_generation,
+                    snapshot_id: BrowserSnapshotId::from("snapshot-browser-public-tamper"),
+                    target_url: "https://example.com/tamper".into(),
+                },
+                now(),
+            )
+            .expect("durable Browser observation");
+        let mut tampered = fixture
+            .service
+            .store
+            .events_for_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("Browser events")
+            .into_iter()
+            .find(|event| event.event_type == BROWSER_PUBLIC_SOURCE_OBSERVATION_COMMITTED_EVENT)
+            .expect("Browser observation event")
+            .payload;
+        tampered["observation"]["contentDigest"] = serde_json::Value::String("f".repeat(64));
+        fixture
+            .service
+            .store
+            .append_event(
+                &fixture.project_id,
+                Some(&fixture.mission_id),
+                BROWSER_PUBLIC_SOURCE_OBSERVATION_COMMITTED_EVENT,
+                &tampered,
+                observation.observed_at,
+            )
+            .expect("inject tampered Browser observation event");
+        assert!(matches!(
+            fixture
+                .service
+                .load_latest_browser_public_source_observation(
+                    &fixture.project_id,
+                    &fixture.mission_id,
+                ),
+            Err(ApplicationError::Browser(BrowserError::InvalidSnapshot))
+        ));
     }
 
     fn signed_application_recipe_release(

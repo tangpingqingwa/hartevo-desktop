@@ -1182,6 +1182,7 @@ mod tests {
             current_checkpoint_oracle_ids: std::collections::BTreeSet::default(),
             current_checkpoint_completion_policy: None,
             browser_workspace: None,
+            browser_public_source_observation: None,
             completed_checkpoint_count: 0,
             checkpoint_count: 0,
             cycle: 1,
