@@ -1,7 +1,7 @@
 //! Rust Cordis kernel: service container, plugin inject/apply, reversible
-//! effects, typed events, loader/overlay interpolation, Hartevo surface mapping,
-//! a Cordis-hosted agent loop, a fail-closed Domain Kernel invariant gate, and
-//! the desktop host that mounts those three services.
+//! effects, structured logging, typed events, loader/overlay interpolation,
+//! Hartevo surface mapping, a Cordis-hosted agent loop, a fail-closed Domain
+//! Kernel invariant gate, and the desktop host that mounts those three services.
 //!
 //! Typed events integrate with synchronous [`Context`], its borrowed
 //! [`ContextView`], Desktop prepared lifecycle notifications, and an N2B
@@ -31,6 +31,7 @@ mod invariants;
 mod jobs;
 mod kernel;
 mod loader;
+mod logger;
 mod registry;
 mod retry;
 mod sandbox;
@@ -133,6 +134,11 @@ pub use loader::{
     EnvironmentOverlay, IntoPluginResult, LoadReport, Loader, LoaderContext, OverlayAction,
     OverlayLayer, PluginEntry, PluginFactory, PluginFactoryId, PluginId, PluginSpec,
     ResolvedPlugin, interpolate_plugin_config, load_plugins, load_plugins_pending,
+};
+pub use logger::{
+    DEFAULT_LOGGER_BUFFER_CAPACITY, Logger, LoggerBuffer, LoggerDispatchReport, LoggerExportError,
+    LoggerExportFailure, LoggerExporter, LoggerExporterId, LoggerLevel, LoggerMessage,
+    LoggerService, LoggerType,
 };
 pub use registry::{
     LifecycleContextView, LifecycleEventDispatcher, LifecycleHandle, LifecycleProviderHandle,
