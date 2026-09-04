@@ -3187,6 +3187,7 @@ pub struct MissionCheckpointDispatch {
     pub state: MissionCheckpointDispatchState,
 }
 
+const VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID: &str = "vm00.local-project-identity/v1";
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
@@ -3200,6 +3201,7 @@ const VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID: &str =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledApplicationCheckpointHandler {
+    LocalProjectIdentity,
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
@@ -3213,6 +3215,7 @@ enum CompiledApplicationCheckpointHandler {
 impl CompiledApplicationCheckpointHandler {
     fn handler_id(self) -> &'static str {
         match self {
+            Self::LocalProjectIdentity => VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID,
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
@@ -3224,8 +3227,9 @@ impl CompiledApplicationCheckpointHandler {
         }
     }
 
-    fn outcome_source_kind(self) -> &'static str {
+    fn primary_source_kind(self) -> &'static str {
         match self {
+            Self::LocalProjectIdentity => "project_scope",
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
@@ -3483,6 +3487,9 @@ fn compiled_application_checkpoint_handler(
     handler_id: &str,
 ) -> Option<CompiledApplicationCheckpointHandler> {
     match handler_id {
+        VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::LocalProjectIdentity)
+        }
         VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
         VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::NormalizeDedupeOrder)
@@ -3819,6 +3826,214 @@ fn blocked_application_checkpoint_replay(
         outcome_ledger_revision,
         replayed: true,
     }))
+}
+
+fn vm00_local_project_identity_application_evidence(
+    mission: &Mission,
+    project: &Project,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if project.tenant_id != mission.tenant_id || project.id != mission.project_id {
+        return Err(StorageError::TenantScopeMismatch.into());
+    }
+    if definition.manifest_id != "VM-00"
+        || definition.manifest_version != 3
+        || checkpoint.id != "identity.resolve"
+        || project.revision == 0
+        || matches!(&project.storage_mode, StorageMode::Cloud)
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    // Bind only non-content project scope. Names, descriptions and workspace
+    // paths stay in the encrypted Project aggregate and never enter evidence.
+    let project_scope_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm00-local-project-scope/v1",
+        "tenantId": project.tenant_id,
+        "projectId": project.id,
+        "revision": project.revision,
+        "storageMode": project.storage_mode,
+        "dataCell": project.data_cell,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_contract".into(),
+                source_id: mission.id.to_string(),
+                source_revision: command.expected_mission_revision,
+                projection_digest: contract_digest,
+                oracle_ids: BTreeSet::from(["goal".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "project_scope".into(),
+                source_id: project.id.to_string(),
+                source_revision: project.revision,
+                projection_digest: project_scope_digest,
+                oracle_ids: BTreeSet::from(["truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+fn execute_vm00_local_project_identity(
+    store: &mut ProjectStore,
+    mut mission: Mission,
+    command: ExecuteApplicationMissionCheckpoint,
+    dispatch: &MissionCheckpointDispatch,
+    now: DateTime<Utc>,
+) -> Result<ApplicationMissionCheckpointExecution, ApplicationError> {
+    let project = store.load_project(&command.project_id)?;
+    let expected_mission_revision = mission.revision;
+    if mission.stage == MissionStage::Blocked {
+        mission.resume(now)?;
+    }
+    mission.begin_checkpoint_verification(&command.checkpoint_id, now)?;
+    let route = mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        })
+        .and_then(|checkpoint| checkpoint.route.clone())
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let application_evidence = vm00_local_project_identity_application_evidence(
+        &mission, &project, &route, &command, now,
+    )?;
+    validate_application_evidence_against_registry(&application_evidence)?;
+    let evidence_digest = application_evidence.digest();
+    mission.complete_checkpoint(
+        &command.checkpoint_id,
+        MissionCheckpointCompletion {
+            oracle_ids: route.oracle_ids.clone(),
+            work_product_ids: BTreeSet::new(),
+            effect_ids: BTreeSet::new(),
+            application_evidence: Some(application_evidence),
+            evidence_digest: evidence_digest.clone(),
+            verified_at: now,
+        },
+    )?;
+    let completed_checkpoint_revision = mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        })
+        .map(|checkpoint| checkpoint.revision)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
+    let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
+    let mut events = vec![PendingEvent::new(
+        "mission.application_checkpoint_completed",
+        serde_json::json!({
+            "missionId": mission.id,
+            "checkpointId": command.checkpoint_id,
+            "checkpointRevision": completed_checkpoint_revision,
+            "capabilityId": dispatch.capability_id,
+            "handlerId": VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID,
+            "oracleIds": dispatch.oracle_ids,
+            "sourceKind": "project_scope",
+            "sourceRevision": project.revision,
+            "sourceFenceCount": 1,
+            "evidenceDigest": evidence_digest,
+        }),
+        now,
+    )];
+    if let Some((checkpoint_id, checkpoint_revision, capability_id, executor, task_id, cycle)) =
+        next_started
+    {
+        events.push(PendingEvent::new(
+            "mission.checkpoint_started",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": checkpoint_id,
+                "checkpointRevision": checkpoint_revision,
+                "capabilityId": capability_id,
+                "executor": executor,
+                "cycle": cycle,
+                "taskId": task_id,
+            }),
+            now,
+        ));
+    }
+    store.update_mission_atomic_with_application_source_fences_only(
+        &mission,
+        expected_mission_revision,
+        &[ApplicationSourceRevisionFence::present(
+            ApplicationSourceKind::Project,
+            project.id.to_string(),
+            project.revision,
+        )],
+        &events,
+    )?;
+    Ok(ApplicationMissionCheckpointExecution::Completed {
+        completed_checkpoint_id: command.checkpoint_id,
+        completion_evidence_digest: evidence_digest,
+        outcome_ledger_revision: project.revision,
+        replayed: false,
+        next_dispatch,
+    })
 }
 
 fn vm11_event_ingest_application_evidence(
@@ -9665,7 +9880,7 @@ impl ApplicationService {
                 &mission,
                 &command,
                 replay_handler.handler_id(),
-                replay_handler.outcome_source_kind(),
+                replay_handler.primary_source_kind(),
             )? {
                 return Ok(replay);
             }
@@ -9717,6 +9932,16 @@ impl ApplicationService {
             );
         };
         let handler_id = compiled_handler.handler_id();
+
+        if compiled_handler == CompiledApplicationCheckpointHandler::LocalProjectIdentity {
+            return execute_vm00_local_project_identity(
+                &mut self.store,
+                mission,
+                command,
+                &dispatch,
+                now,
+            );
+        }
 
         let outcome_ledger = match self.store.load_outcome_ledger(&command.project_id) {
             Ok(ledger) => Some(ledger),
@@ -10553,6 +10778,9 @@ impl ApplicationService {
             .as_ref()
             .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
         let application_evidence = match compiled_handler {
+            CompiledApplicationCheckpointHandler::LocalProjectIdentity => {
+                unreachable!("VM-00 route returned before the generic VM-11 pipeline")
+            }
             CompiledApplicationCheckpointHandler::EventIngest => {
                 vm11_event_ingest_application_evidence(
                     &mission,
@@ -10678,6 +10906,9 @@ impl ApplicationService {
         let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
         let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
         let source_metrics = match compiled_handler {
+            CompiledApplicationCheckpointHandler::LocalProjectIdentity => {
+                unreachable!("VM-00 route returned before the generic VM-11 pipeline")
+            }
             CompiledApplicationCheckpointHandler::EventIngest
             | CompiledApplicationCheckpointHandler::NormalizeDedupeOrder => {
                 serde_json::json!({
@@ -10824,7 +11055,7 @@ impl ApplicationService {
                 "capabilityId": dispatch.capability_id,
                 "handlerId": handler_id,
                 "oracleIds": dispatch.oracle_ids,
-                "sourceKind": compiled_handler.outcome_source_kind(),
+                "sourceKind": compiled_handler.primary_source_kind(),
                 "sourceRevision": outcome_ledger.revision,
                 "sourceMetrics": source_metrics,
                 "sourceFenceCount": application_source_fences.len(),
@@ -25729,6 +25960,186 @@ mod tests {
         assert!(catalog.application_handlers.handlers.iter().all(|handler| {
             compiled_application_checkpoint_handler(&handler.handler_id).is_some()
         }));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one VM-00 contract test proves dispatch, project fencing, content-free evidence, atomic handoff, exact replay, and stale-command refusal"
+    )]
+    fn vm00_local_identity_is_project_fenced_replayable_and_advances_without_outcome() {
+        let workspace = tempfile::tempdir().expect("project workspace");
+        let private_workspace = workspace.path().to_string_lossy().into_owned();
+        let private_project_name = "PRIVATE-VM00-PROJECT::local customer workspace";
+        let private_project_description = "PRIVATE-VM00-DESCRIPTION::never enter evidence";
+        let private_goal = "PRIVATE-VM00-GOAL::resume the exact local project";
+        let project_id = ProjectId::from("vm00-local-identity-project");
+        let mission_id = MissionId::from("vm00-local-identity-mission");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("vm00-local-identity-tenant"),
+                    id: project_id.clone(),
+                    name: private_project_name.into(),
+                    description: private_project_description.into(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("local project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm00-local-identity-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-00".into(),
+                    mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
+                    title: Some("Current local state".into()),
+                    goal: private_goal.into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now() + Duration::milliseconds(1),
+            )
+            .expect("VM-00 Mission");
+
+        let dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::milliseconds(2),
+            )
+            .expect("identity dispatch");
+        assert_eq!(dispatch.checkpoint_id, "identity.resolve");
+        assert_eq!(
+            dispatch.application_handler_status,
+            Some(ApplicationCheckpointHandlerStatus::Implemented)
+        );
+        assert_eq!(
+            dispatch.application_handler_id.as_deref(),
+            Some(VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID)
+        );
+        let command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: dispatch.checkpoint_id.clone(),
+            expected_mission_revision: dispatch.mission_revision,
+            expected_checkpoint_revision: dispatch.checkpoint_revision,
+        };
+        let execution = service
+            .execute_application_mission_checkpoint(
+                command.clone(),
+                now() + Duration::milliseconds(3),
+            )
+            .expect("local identity completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            outcome_ledger_revision,
+            replayed,
+            next_dispatch: Some(next_dispatch),
+            ..
+        } = execution
+        else {
+            panic!("VM-00 identity must complete and advance")
+        };
+        assert_eq!(outcome_ledger_revision, 1);
+        assert!(!replayed);
+        assert_eq!(next_dispatch.checkpoint_id, "project_inventory");
+        assert_eq!(
+            next_dispatch.executor,
+            MissionCheckpointExecutor::Application
+        );
+        assert_eq!(
+            next_dispatch.application_handler_status,
+            Some(ApplicationCheckpointHandlerStatus::NotImplemented)
+        );
+
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("advanced VM-00 Mission");
+        let completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "identity.resolve")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("identity completion");
+        assert!(completion.work_product_ids.is_empty());
+        assert!(completion.effect_ids.is_empty());
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .expect("content-free Application evidence");
+        assert_eq!(evidence.handler_id, VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID);
+        assert_eq!(
+            evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mission_checkpoint", "mission_contract", "project_scope"])
+        );
+        assert_eq!(
+            evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "project_scope")
+                .map(|source| source.source_revision),
+            Some(1)
+        );
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free Mission events");
+        let event_json = serde_json::to_string(&events).expect("event JSON");
+        for private_value in [
+            private_project_name,
+            private_project_description,
+            private_goal,
+            private_workspace.as_str(),
+        ] {
+            assert!(!event_json.contains(private_value));
+        }
+
+        let event_count = events.len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    command.clone(),
+                    now() + Duration::milliseconds(4),
+                )
+                .expect("exact replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after replay")
+                .len(),
+            event_count
+        );
+        assert!(matches!(
+            service.execute_application_mission_checkpoint(
+                ExecuteApplicationMissionCheckpoint {
+                    expected_checkpoint_revision: command
+                        .expected_checkpoint_revision
+                        .saturating_add(1),
+                    ..command
+                },
+                now() + Duration::milliseconds(5),
+            ),
+            Err(ApplicationError::ApplicationCheckpointReplayMismatch)
+        ));
     }
 
     #[test]
