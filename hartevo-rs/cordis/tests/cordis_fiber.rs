@@ -32,6 +32,41 @@ fn six_states_and_deterministic_activation_epoch_are_public() {
 }
 
 #[tokio::test]
+async fn lifecycle_shutdown_acknowledges_supervisor_exit_and_join_once() {
+    let registry = LifecycleRegistry::new();
+    let exit = registry.supervisor_exit_handle();
+    assert_eq!(exit.snapshot().started(), 0);
+
+    registry.shutdown().await.unwrap();
+    let acknowledged = exit.snapshot();
+    assert_eq!(acknowledged.started(), 1);
+    assert_eq!(acknowledged.exited(), 1);
+    assert_eq!(acknowledged.joined(), 1);
+    assert!(acknowledged.is_acknowledged());
+
+    registry.shutdown().await.unwrap();
+    assert_eq!(exit.snapshot(), acknowledged);
+}
+
+#[tokio::test]
+async fn registry_drop_joins_an_idle_started_supervisor() {
+    let exit = {
+        let registry = LifecycleRegistry::new();
+        let exit = registry.supervisor_exit_handle();
+        registry.begin_shutdown().unwrap().await.unwrap();
+        assert_eq!(exit.snapshot().started(), 1);
+        assert_eq!(exit.snapshot().joined(), 0);
+        exit
+    };
+
+    let acknowledged = exit.snapshot();
+    assert_eq!(acknowledged.started(), 1);
+    assert_eq!(acknowledged.exited(), 1);
+    assert_eq!(acknowledged.joined(), 1);
+    assert!(acknowledged.is_acknowledged());
+}
+
+#[tokio::test]
 async fn same_owner_generation_zero_reprovide_rebinds_loading_without_reload() {
     let starts = Arc::new(AtomicUsize::new(0));
     let cleanup_calls = Arc::new(AtomicUsize::new(0));

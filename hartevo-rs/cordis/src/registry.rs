@@ -111,8 +111,82 @@ impl Drop for DriverRuntimeSentinel {
     }
 }
 
+#[derive(Default)]
+struct SupervisorLifecycle {
+    started: AtomicU64,
+    exited: AtomicU64,
+    joined: AtomicU64,
+}
+
+/// Read-only acknowledgement that lifecycle-supervisor threads have exited
+/// and their OS join handles have been consumed.
+#[derive(Clone)]
+pub struct SupervisorExitHandle {
+    lifecycle: Arc<SupervisorLifecycle>,
+}
+
+impl SupervisorExitHandle {
+    #[must_use]
+    pub fn snapshot(&self) -> SupervisorExitSnapshot {
+        SupervisorExitSnapshot {
+            started: self.lifecycle.started.load(Ordering::Acquire),
+            exited: self.lifecycle.exited.load(Ordering::Acquire),
+            joined: self.lifecycle.joined.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl fmt::Debug for SupervisorExitHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SupervisorExitHandle")
+            .field(&self.snapshot())
+            .finish()
+    }
+}
+
+/// Cumulative lifecycle state for the registry's lazy supervisor generations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SupervisorExitSnapshot {
+    started: u64,
+    exited: u64,
+    joined: u64,
+}
+
+impl SupervisorExitSnapshot {
+    #[must_use]
+    pub const fn started(&self) -> u64 {
+        self.started
+    }
+
+    #[must_use]
+    pub const fn exited(&self) -> u64 {
+        self.exited
+    }
+
+    #[must_use]
+    pub const fn joined(&self) -> u64 {
+        self.joined
+    }
+
+    #[must_use]
+    pub const fn is_acknowledged(&self) -> bool {
+        self.started != 0 && self.started == self.exited && self.exited == self.joined
+    }
+}
+
+struct SupervisorExitGuard(Arc<SupervisorLifecycle>);
+
+impl Drop for SupervisorExitGuard {
+    fn drop(&mut self) {
+        self.0.exited.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 struct RegistrySupervisor {
-    sender: mpsc::UnboundedSender<SupervisorCommand>,
+    sender: Option<mpsc::UnboundedSender<SupervisorCommand>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    lifecycle: Arc<SupervisorLifecycle>,
 }
 
 struct SupervisorReservation {
@@ -125,12 +199,14 @@ struct SupervisorCommand {
 }
 
 impl RegistrySupervisor {
-    fn start() -> Result<Self, CordisError> {
+    fn start(lifecycle: Arc<SupervisorLifecycle>) -> Result<Self, CordisError> {
         let (sender, mut receiver) = mpsc::unbounded_channel::<SupervisorCommand>();
         let (started, ready) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let thread_lifecycle = lifecycle.clone();
+        let join = std::thread::Builder::new()
             .name("cordis-lifecycle-supervisor".to_string())
             .spawn(move || {
+                let _exit = SupervisorExitGuard(thread_lifecycle);
                 let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -155,16 +231,25 @@ impl RegistrySupervisor {
                 });
             })
             .map_err(|_| CordisError::AsyncRuntimeUnavailable)?;
+        lifecycle.started.fetch_add(1, Ordering::AcqRel);
+        let mut supervisor = Self {
+            sender: Some(sender),
+            join: Some(join),
+            lifecycle,
+        };
         if ready.recv().ok() != Some(true) {
+            let _ = supervisor.stop_and_join();
             return Err(CordisError::AsyncRuntimeUnavailable);
         }
-        Ok(Self { sender })
+        Ok(supervisor)
     }
 
     fn reserve(&self) -> Result<SupervisorReservation, CordisError> {
         let (operation, receiver) = oneshot::channel();
         let (accepted, ready) = std::sync::mpsc::sync_channel(1);
         self.sender
+            .as_ref()
+            .ok_or(CordisError::AsyncRuntimeUnavailable)?
             .send(SupervisorCommand {
                 operation: receiver,
                 accepted,
@@ -174,6 +259,35 @@ impl RegistrySupervisor {
             .recv()
             .map_err(|_| CordisError::AsyncRuntimeUnavailable)?;
         Ok(SupervisorReservation { operation })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sender
+            .as_ref()
+            .is_none_or(mpsc::UnboundedSender::is_closed)
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), CordisError> {
+        self.sender.take();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        if join.thread().id() == std::thread::current().id() {
+            return Err(CordisError::CleanupPanicked {
+                message: "lifecycle supervisor cannot join its own thread".to_string(),
+            });
+        }
+        let result = join.join();
+        self.lifecycle.joined.fetch_add(1, Ordering::AcqRel);
+        result.map_err(|payload| CordisError::CleanupPanicked {
+            message: panic_payload_message(payload.as_ref()),
+        })
+    }
+}
+
+impl Drop for RegistrySupervisor {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 
@@ -518,6 +632,7 @@ struct LifecycleRegistryInner {
     events: EventBus,
     state: Mutex<LifecycleRegistryState>,
     driver_bindings: Mutex<HashMap<TokioRuntimeId, Weak<DriverRuntimeState>>>,
+    supervisor_lifecycle: Arc<SupervisorLifecycle>,
     supervisor: Mutex<Option<RegistrySupervisor>>,
     shutdown_operation: Mutex<Option<SharedUnitOperation>>,
     #[cfg(test)]
@@ -637,6 +752,9 @@ impl fmt::Debug for LifecycleRegistry {
 
 impl Drop for LifecycleRegistryInner {
     fn drop(&mut self) {
+        if let Some(mut supervisor) = lock(&self.supervisor).take() {
+            let _ = supervisor.stop_and_join();
+        }
         let mut recoveries = Vec::new();
         {
             let state = lock(&self.state);
@@ -674,6 +792,7 @@ impl LifecycleRegistry {
     pub fn new() -> Self {
         let id = NEXT_LIFECYCLE_REGISTRY_ID.fetch_add(1, Ordering::Relaxed);
         let root = Fiber::root(id);
+        let supervisor_lifecycle = Arc::new(SupervisorLifecycle::default());
         Self {
             inner: Arc::new(LifecycleRegistryInner {
                 id,
@@ -688,6 +807,7 @@ impl LifecycleRegistry {
                     shutting_down: false,
                 }),
                 driver_bindings: Mutex::new(HashMap::new()),
+                supervisor_lifecycle,
                 supervisor: Mutex::new(None),
                 shutdown_operation: Mutex::new(None),
                 #[cfg(test)]
@@ -699,6 +819,15 @@ impl LifecycleRegistry {
     #[must_use]
     pub fn root_fiber(&self) -> Fiber {
         self.inner.root.clone()
+    }
+
+    /// Capture a read-only supervisor exit/join acknowledgement handle. The
+    /// handle remains observable after the registry itself is dropped.
+    #[must_use]
+    pub fn supervisor_exit_handle(&self) -> SupervisorExitHandle {
+        SupervisorExitHandle {
+            lifecycle: self.inner.supervisor_lifecycle.clone(),
+        }
     }
 
     #[must_use]
@@ -739,12 +868,15 @@ impl LifecycleRegistry {
         let mut supervisor = lock(&self.inner.supervisor);
         if supervisor
             .as_ref()
-            .is_some_and(|supervisor| supervisor.sender.is_closed())
+            .is_some_and(RegistrySupervisor::is_closed)
+            && let Some(mut stopped) = supervisor.take()
         {
-            *supervisor = None;
+            stopped.stop_and_join()?;
         }
         if supervisor.is_none() {
-            *supervisor = Some(RegistrySupervisor::start()?);
+            *supervisor = Some(RegistrySupervisor::start(
+                self.inner.supervisor_lifecycle.clone(),
+            )?);
         }
         supervisor
             .as_ref()
@@ -1544,7 +1676,17 @@ impl LifecycleRegistry {
     }
 
     pub async fn shutdown(&self) -> Result<(), CordisError> {
-        self.begin_shutdown()?.await
+        let operation = self.begin_shutdown()?.await;
+        let supervisor = self.stop_supervisor();
+        operation.and(supervisor)
+    }
+
+    fn stop_supervisor(&self) -> Result<(), CordisError> {
+        let mut slot = lock(&self.inner.supervisor);
+        let Some(mut supervisor) = slot.take() else {
+            return Ok(());
+        };
+        supervisor.stop_and_join()
     }
 
     fn validate_provider_handle(
