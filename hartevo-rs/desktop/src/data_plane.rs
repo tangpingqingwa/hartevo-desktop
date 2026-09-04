@@ -4624,21 +4624,69 @@ impl DesktopDataPlane {
         ) -> Result<DesktopTiktokConnectionProbeInput, DesktopDataError>,
     {
         let registration = self.register_tiktok_connection_with(secret_store, request, now)?;
-        let retry_registration = registration.clone();
-        Ok(
-            match self.probe_tiktok_connection_with(
-                secret_store,
-                registration.into_probe_request(),
-                now,
-                probe,
-            ) {
-                Ok(probe) => DesktopTiktokConnectionSetupOutcome::Connected(probe),
-                Err(error) => DesktopTiktokConnectionSetupOutcome::ProbeFailed {
+        Ok(self.probe_tiktok_connection_outcome_with(
+            secret_store,
+            registration.into_probe_request(),
+            now,
+            probe,
+        ))
+    }
+
+    /// Explicitly retry one failed initial TikTok probe while retaining the
+    /// same registration authority after every ordinary failure. This method
+    /// performs exactly one provider attempt and never schedules a replay.
+    pub fn retry_tiktok_connection_probe_os(
+        &self,
+        request: DesktopProbeTiktokConnectionRequest,
+        now: DateTime<Utc>,
+    ) -> DesktopTiktokConnectionSetupOutcome {
+        let retry_registration = request.registration.clone();
+        let secret_store = match OsSecretStore::new(OS_SECRET_SERVICE) {
+            Ok(secret_store) => secret_store,
+            Err(error) => {
+                return DesktopTiktokConnectionSetupOutcome::ProbeFailed {
                     registration: retry_registration,
-                    error,
-                },
+                    error: error.into(),
+                };
+            }
+        };
+        self.probe_tiktok_connection_outcome_with(
+            &secret_store,
+            request,
+            now,
+            |project_id, credential, probed_at| {
+                native_tiktok_connection_probe_input(
+                    &secret_store,
+                    project_id,
+                    credential,
+                    probed_at,
+                )
             },
         )
+    }
+
+    fn probe_tiktok_connection_outcome_with<Probe>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopProbeTiktokConnectionRequest,
+        now: DateTime<Utc>,
+        probe: Probe,
+    ) -> DesktopTiktokConnectionSetupOutcome
+    where
+        Probe: FnOnce(
+            &ProjectId,
+            &OAuthCredential,
+            DateTime<Utc>,
+        ) -> Result<DesktopTiktokConnectionProbeInput, DesktopDataError>,
+    {
+        let retry_registration = request.registration.clone();
+        match self.probe_tiktok_connection_with(secret_store, request, now, probe) {
+            Ok(probe) => DesktopTiktokConnectionSetupOutcome::Connected(probe),
+            Err(error) => DesktopTiktokConnectionSetupOutcome::ProbeFailed {
+                registration: retry_registration,
+                error,
+            },
+        }
     }
 
     /// Probe one exact initial TikTok registration through the native
@@ -25766,13 +25814,26 @@ sleep 30"#;
         assert!(!failed_debug.contains("setup-retry-token-private"));
         assert!(!failed_debug.contains("keychain://"));
 
+        let failed_again = plane.probe_tiktok_connection_outcome_with(
+            &secrets,
+            failed
+                .into_retry_request()
+                .expect("exact retained retry request"),
+            now,
+            |_, _, _| Err(TiktokError::Disconnected.into()),
+        );
+        assert!(matches!(
+            &failed_again,
+            DesktopTiktokConnectionSetupOutcome::ProbeFailed { .. }
+        ));
+        let second_retry_request = failed_again
+            .into_retry_request()
+            .expect("failure preserves a fresh exact retry request");
         let observed_retry_scope = retry_scope.clone();
         let retried = plane
-            .probe_tiktok_connection_with(
+            .probe_tiktok_connection_outcome_with(
                 &secrets,
-                failed
-                    .into_retry_request()
-                    .expect("exact retained retry request"),
+                second_retry_request,
                 now,
                 move |_, credential, probed_at| {
                     Ok(DesktopTiktokConnectionProbeInput {
@@ -25789,7 +25850,8 @@ sleep 30"#;
                     })
                 },
             )
-            .expect("explicit retry through exact N149 boundary");
+            .into_connected()
+            .expect("later explicit retry through exact N149 boundary");
         assert_eq!(
             retried.connection().snapshot().status,
             ConnectionStatus::Connected
