@@ -529,6 +529,52 @@ fn rate_limit_without_reset_metadata_does_not_invent_a_wait_window() {
 }
 
 #[test]
+fn older_rate_limit_deadline_cannot_replace_newer_durable_receipt() {
+    let now = fixed_now();
+    let read_scope = scope();
+    let read_credential = credential(&read_scope, now);
+    let first_limit = ProviderResponse::new(
+        429,
+        [("retry-after".to_owned(), "60".to_owned())],
+        r#"{"error":{"code":"rate_limit_exceeded","log_id":"first"}}"#,
+        now,
+    );
+    let stale_limit = ProviderResponse::new(
+        429,
+        [("retry-after".to_owned(), "5".to_owned())],
+        r#"{"error":{"code":"rate_limit_exceeded","log_id":"stale"}}"#,
+        now + Duration::seconds(10),
+    );
+    let transport = FixtureTransport::responses([first_limit, stale_limit]);
+    let requests = Rc::clone(&transport.requests);
+    let mut service =
+        TiktokAuthenticatedReadService::fixture(transport, TiktokFreshnessPolicy::default());
+    let mut cursor = TiktokVideoListCursor::new(read_scope).unwrap();
+
+    assert!(matches!(
+        service.list_videos(&read_credential, &mut cursor, now, 20),
+        Err(TiktokError::RateLimited {
+            retry_after_seconds: Some(60),
+            ..
+        })
+    ));
+    let before = cursor.clone();
+    assert_eq!(
+        service
+            .list_videos(
+                &read_credential,
+                &mut cursor,
+                now + Duration::seconds(60),
+                20,
+            )
+            .unwrap_err(),
+        TiktokError::CursorDrift
+    );
+    assert_eq!(cursor, before);
+    assert_eq!(requests.borrow().len(), 2);
+}
+
+#[test]
 fn video_list_sorts_typed_identities_and_rejects_page_duplicates() {
     let now = fixed_now();
     let read_scope = scope();

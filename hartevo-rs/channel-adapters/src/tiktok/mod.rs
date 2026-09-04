@@ -1096,6 +1096,18 @@ impl TiktokVideoListCursor {
         {
             return Err(TiktokError::CursorDrift);
         }
+        if self.retry_after.as_ref().is_some_and(|current| {
+            receipt.observed_at() < current.observed_at()
+                || matches!(
+                    (current.provider_reset_at(), receipt.provider_reset_at()),
+                    (Some(current_reset), Some(next_reset)) if next_reset < current_reset
+                )
+                || current.provider_reset_at().is_some_and(|current_reset| {
+                    receipt.provider_reset_at().is_none() && receipt.observed_at() < current_reset
+                })
+        }) {
+            return Err(TiktokError::CursorDrift);
+        }
         self.retry_after = Some(receipt);
         Ok(())
     }
