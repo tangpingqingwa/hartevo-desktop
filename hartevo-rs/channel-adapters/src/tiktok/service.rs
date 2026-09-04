@@ -310,7 +310,11 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
-    use crate::tiktok::{BusinessId, TenantId, TiktokAccountId, TiktokOAuthScope};
+    use crate::tiktok::testkit::{final_video_page_response, first_video_page_response, response};
+    use crate::tiktok::{
+        BusinessId, MissionTiktokVideoSequenceConsumer, TenantId, TiktokAccountId,
+        TiktokMissionPageProgress, TiktokOAuthScope,
+    };
     use crate::transport::{ProviderReadRequest, ProviderResponse, TransportError};
 
     struct NoopTransport;
@@ -329,6 +333,127 @@ mod tests {
             TenantId::new("tenant-01").unwrap(),
             BusinessId::new("business-01").unwrap(),
             TiktokAccountId::new("open01").unwrap(),
+        )
+    }
+
+    fn video_credential(
+        scope: &super::super::TiktokReadScope,
+        now: DateTime<Utc>,
+        generation: u64,
+    ) -> OAuthCredential {
+        OAuthCredential::new(
+            SecretReference::new("keychain://tiktok/open01").unwrap(),
+            scope.clone(),
+            [TiktokOAuthScope::VideoList]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            now + Duration::hours(1),
+            None,
+            generation,
+        )
+        .unwrap()
+    }
+
+    fn video_page(
+        scope: &super::super::TiktokReadScope,
+        credential: &OAuthCredential,
+        cursor: &mut TiktokVideoListCursor,
+        response: &ProviderResponse,
+        provenance: EvidenceProvenance,
+    ) -> TiktokVideoPageEnvelope {
+        let generation = cursor.generation().checked_add(1).unwrap();
+        let freshness = TiktokFreshness::new(
+            response.observed_at(),
+            response.observed_at() + Duration::minutes(2),
+            generation,
+        )
+        .unwrap();
+        let page = parse_video_page_response(
+            scope,
+            cursor.next_cursor(),
+            cursor.page_size(),
+            response,
+            freshness,
+            provenance,
+        )
+        .unwrap();
+        cursor.apply_page(cursor.generation(), &page).unwrap();
+        video_page_envelope(&page, cursor, credential.generation(), provenance)
+    }
+
+    fn unapplied_video_page(
+        scope: &super::super::TiktokReadScope,
+        credential: &OAuthCredential,
+        cursor: &TiktokVideoListCursor,
+        response: &ProviderResponse,
+    ) -> TiktokVideoPageEnvelope {
+        let generation = cursor.generation().checked_add(1).unwrap();
+        let freshness = TiktokFreshness::new(
+            response.observed_at(),
+            response.observed_at() + Duration::minutes(2),
+            generation,
+        )
+        .unwrap();
+        let page = parse_video_page_response(
+            scope,
+            cursor.next_cursor(),
+            cursor.page_size(),
+            response,
+            freshness,
+            EvidenceProvenance::ProductionProvider,
+        )
+        .unwrap();
+        let evidence_root =
+            super::super::page_evidence_root(cursor.evidence_root(), &page, generation).unwrap();
+        let account = page.observations.first().map_or_else(
+            || super::super::TiktokAccountIdentity {
+                open_id: page.scope.account().clone(),
+                display_name: None,
+                username: None,
+            },
+            |observation| observation.account().clone(),
+        );
+        TiktokVideoPageEnvelope {
+            provider: super::super::ProviderId::Tiktok,
+            scope: page.scope.clone(),
+            account,
+            requested_cursor: page.requested_cursor,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+            page_digest: page.page_digest,
+            sequence: super::super::TiktokPageSequence::new(
+                page.scope.account().clone(),
+                generation,
+            ),
+            credential_generation: credential.generation(),
+            evidence_root,
+            freshness: page.freshness,
+            provenance: EvidenceProvenance::ProductionProvider,
+            observations: page.observations,
+        }
+    }
+
+    fn repeated_video_page_response() -> ProviderResponse {
+        response(
+            200,
+            r#"{
+              "data":{
+                "videos":[{
+                  "id":"7340000000000000001",
+                  "create_time":1767300445,
+                  "title":"Repeated fixture video",
+                  "video_description":"Must not cross the Mission boundary twice",
+                  "share_url":"https://www.tiktok.com/@creator/video/7340000000000000001",
+                  "like_count":12,
+                  "comment_count":4,
+                  "share_count":5,
+                  "view_count":202
+                }],
+                "cursor":1767300445000,
+                "has_more":false
+              },
+              "error":{"code":"ok","message":"","log_id":"fixture-list-repeat"}
+            }"#,
         )
     }
 
@@ -504,5 +629,169 @@ mod tests {
             cursor.lifecycle(),
             super::super::TiktokCursorLifecycle::Active
         );
+    }
+
+    #[test]
+    fn mission_closes_only_an_exact_production_page_sequence() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let credential = video_credential(&read_scope, now, 1);
+        let mut cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+        cursor.bind_credential(&credential, now).unwrap();
+        let first = video_page(
+            &read_scope,
+            &credential,
+            &mut cursor,
+            &first_video_page_response(),
+            EvidenceProvenance::ProductionProvider,
+        );
+        let final_page = video_page(
+            &read_scope,
+            &credential,
+            &mut cursor,
+            &final_video_page_response(),
+            EvidenceProvenance::ProductionProvider,
+        );
+
+        let mut mission = MissionTiktokVideoSequenceConsumer::new(read_scope.clone(), 20).unwrap();
+        assert!(matches!(
+            mission
+                .accept_page(first.clone(), &credential, now)
+                .unwrap(),
+            TiktokMissionPageProgress::Pending {
+                sequence,
+                next_cursor: Some(_),
+                ..
+            } if sequence.generation() == 1
+        ));
+        let accepted = match mission
+            .accept_page(final_page.clone(), &credential, now)
+            .unwrap()
+        {
+            TiktokMissionPageProgress::Complete(accepted) => accepted,
+            progress => panic!("expected complete sequence, got {progress:?}"),
+        };
+        assert_eq!(accepted.provider(), super::super::ProviderId::Tiktok);
+        assert_eq!(accepted.scope(), &read_scope);
+        assert_eq!(accepted.credential_generation(), credential.generation());
+        assert_eq!(accepted.page_count(), 2);
+        assert_eq!(accepted.pages(), &[first.clone(), final_page.clone()]);
+        assert_eq!(accepted.evidence_root(), cursor.evidence_root());
+        assert!(mission.is_closed());
+
+        let before_duplicate = mission.clone();
+        let receipt = match mission.accept_page(first, &credential, now).unwrap() {
+            TiktokMissionPageProgress::Duplicate(receipt) => receipt,
+            progress => panic!("expected duplicate receipt, got {progress:?}"),
+        };
+        assert_eq!(receipt.provider(), super::super::ProviderId::Tiktok);
+        assert_eq!(receipt.scope(), &read_scope);
+        assert_eq!(receipt.sequence().generation(), 1);
+        assert_eq!(receipt.credential_generation(), credential.generation());
+        assert_eq!(receipt.evidence_root(), accepted.pages()[0].evidence_root());
+        assert_eq!(mission, before_duplicate);
+
+        let mut new_after_close = final_page;
+        new_after_close.page_digest = "f".repeat(64);
+        assert_eq!(
+            mission
+                .accept_page(new_after_close, &credential, now)
+                .unwrap_err(),
+            TiktokError::PageSequenceClosed
+        );
+    }
+
+    #[test]
+    fn mission_rejects_untrusted_or_drifting_pages_without_state_change() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let credential = video_credential(&read_scope, now, 1);
+
+        let mut production_cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+        production_cursor.bind_credential(&credential, now).unwrap();
+        let first = video_page(
+            &read_scope,
+            &credential,
+            &mut production_cursor,
+            &first_video_page_response(),
+            EvidenceProvenance::ProductionProvider,
+        );
+        let final_page = video_page(
+            &read_scope,
+            &credential,
+            &mut production_cursor,
+            &final_video_page_response(),
+            EvidenceProvenance::ProductionProvider,
+        );
+
+        let mut fixture_cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+        fixture_cursor.bind_credential(&credential, now).unwrap();
+        let fixture = video_page(
+            &read_scope,
+            &credential,
+            &mut fixture_cursor,
+            &first_video_page_response(),
+            EvidenceProvenance::Fixture,
+        );
+        let mut mission = MissionTiktokVideoSequenceConsumer::new(read_scope.clone(), 20).unwrap();
+        let initial = mission.clone();
+        assert_eq!(
+            mission.accept_page(fixture, &credential, now).unwrap_err(),
+            TiktokError::ProvenanceRejected
+        );
+        assert_eq!(mission, initial);
+        assert_eq!(
+            mission
+                .accept_page(final_page.clone(), &credential, now)
+                .unwrap_err(),
+            TiktokError::CursorDrift
+        );
+        assert_eq!(mission, initial);
+
+        let mut wrong_generation = first.clone();
+        wrong_generation.credential_generation = 2;
+        assert_eq!(
+            mission
+                .accept_page(wrong_generation, &credential, now)
+                .unwrap_err(),
+            TiktokError::CursorCredentialMismatch
+        );
+        assert_eq!(mission, initial);
+
+        let mut wrong_root = first.clone();
+        wrong_root.evidence_root = "0".repeat(64);
+        assert_eq!(
+            mission
+                .accept_page(wrong_root, &credential, now)
+                .unwrap_err(),
+            TiktokError::EvidenceRootMismatch
+        );
+        assert_eq!(mission, initial);
+
+        mission
+            .accept_page(first.clone(), &credential, now)
+            .unwrap();
+        let accepted_first = mission.clone();
+        let mut altered_replay = first;
+        altered_replay.evidence_root = "1".repeat(64);
+        assert_eq!(
+            mission
+                .accept_page(altered_replay, &credential, now)
+                .unwrap_err(),
+            TiktokError::CursorDrift
+        );
+        assert_eq!(mission, accepted_first);
+
+        let repeated = unapplied_video_page(
+            &read_scope,
+            &credential,
+            &fixture_cursor,
+            &repeated_video_page_response(),
+        );
+        assert_eq!(
+            mission.accept_page(repeated, &credential, now).unwrap_err(),
+            TiktokError::CursorDrift
+        );
+        assert_eq!(mission, accepted_first);
     }
 }

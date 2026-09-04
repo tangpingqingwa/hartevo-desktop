@@ -14,7 +14,10 @@ mod service;
 
 pub mod testkit;
 
-pub use consumer::{MissionTiktokReadConsumer, TiktokMissionAcceptedRead};
+pub use consumer::{
+    MissionTiktokReadConsumer, MissionTiktokVideoSequenceConsumer, TiktokMissionAcceptedRead,
+    TiktokMissionAcceptedSequence, TiktokMissionDuplicatePageReceipt, TiktokMissionPageProgress,
+};
 pub use provider::TiktokDisplayApiProvider;
 pub use service::{TiktokAuthenticatedReadService, TiktokRealReadGate, execute_real_read_gate};
 
@@ -1646,6 +1649,65 @@ impl TiktokVideoPageEnvelope {
     pub const fn provenance(&self) -> EvidenceProvenance {
         self.provenance
     }
+
+    pub(crate) fn validate_at(&self, now: DateTime<Utc>) -> Result<(), TiktokError> {
+        if self.provider != ProviderId::Tiktok
+            || self.scope.account() != self.account.open_id()
+            || self.sequence.provider() != ProviderId::Tiktok
+            || self.sequence.account() != self.account.open_id()
+            || self.sequence.generation() == 0
+            || self.credential_generation == 0
+            || self.freshness.source_generation() != self.sequence.generation()
+            || !is_sha256(&self.page_digest)
+            || !is_sha256(&self.evidence_root)
+            || self.has_more != self.next_cursor.is_some()
+            || self.observations.iter().any(|observation| {
+                observation.scope() != &self.scope
+                    || observation.account().open_id() != self.account.open_id()
+                    || observation.provenance() != self.provenance
+                    || observation.freshness() != self.freshness
+                    || observation.validate_at(now).is_err()
+            })
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+        let page_ids = self
+            .observations
+            .iter()
+            .map(|observation| match observation.observation() {
+                TiktokReadObservation::Video(video) => Ok(video.identity().video_id().clone()),
+                TiktokReadObservation::Account(_) => Err(TiktokError::CursorDrift),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if page_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || page_video_ids(&self.observations)? != page_ids
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+        self.freshness.validate_at(now)?;
+        Ok(())
+    }
+
+    pub(crate) fn expected_evidence_root(
+        &self,
+        previous_root: &str,
+    ) -> Result<String, TiktokError> {
+        self.validate_at(self.freshness.observed_at())?;
+        let video_ids = page_video_ids(&self.observations)?;
+        Ok(page_evidence_root_material(
+            previous_root,
+            PageEvidenceMaterial {
+                account: self.scope.account(),
+                generation: self.sequence.generation(),
+                requested_cursor: self.requested_cursor,
+                next_cursor: self.next_cursor,
+                has_more: self.has_more,
+                page_digest: &self.page_digest,
+                observed_at: self.freshness.observed_at(),
+                video_ids: &video_ids,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1757,6 +1819,10 @@ pub enum TiktokError {
     MissionRevisionMismatch,
     #[error("TikTok observation revision was already admitted")]
     DuplicateRevision,
+    #[error("TikTok page evidence root does not close the Mission sequence")]
+    EvidenceRootMismatch,
+    #[error("TikTok Mission page sequence is already closed")]
+    PageSequenceClosed,
 }
 
 impl From<crate::transport::ChannelAdapterError> for TiktokError {
