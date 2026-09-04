@@ -1376,6 +1376,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::BrowserHostRegistryUnavailable
         | DesktopDataError::ManagedBrowserExecutableUnavailable
         | DesktopDataError::InvalidBrowserPublicSourceRead
+        | DesktopDataError::InvalidTiktokEvidenceAdoption
         | DesktopDataError::BrowserWorkspaceReadNotAgentHeld
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::InvalidBrowserWorkspaceTakeOver
@@ -1412,6 +1413,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::EffectExecutionDispatch(_)
         | DesktopDataError::EffectReconciliationDispatch(_)
         | DesktopDataError::CordisSessionPersistence(_)
+        | DesktopDataError::ObservationPipeline(_)
+        | DesktopDataError::Tiktok(_)
         | DesktopDataError::Cordis(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
     };
     NativeJourneyError::new(code)

@@ -17,6 +17,7 @@ futures-util.workspace = true
 hartevo-application = { path = "../application" }
 hartevo-browser-adapter = { path = "../browser-adapter" }
 hartevo-catalog = { path = "../catalog" }
+hartevo-channel-adapters = { path = "../channel-adapters" }
 hartevo-context-fabric = { path = "../context-fabric" }
 hartevo-cordis = { path = "../cordis" }
 hartevo-domain-kernel = { path = "../domain-kernel" }
@@ -26,7 +27,7 @@ hartevo-storage = { path = "../storage" }
 hex.workspace = true
 rust_decimal.workspace = true
 sha2.workspace = true
-serde = { workspace = true, optional = true }
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
@@ -42,8 +43,8 @@ serde_json.workspace = true
 default = ["desktop"]
 desktop = ["dioxus/desktop"]
 bundle = []
-native-journey = ["dep:serde"]
-visual-fixtures = ["dep:serde"]
+native-journey = []
+visual-fixtures = []
 
 [lints]
 workspace = true

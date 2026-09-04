@@ -297,6 +297,7 @@ impl MissionTiktokVideoSequenceConsumer {
                 TiktokMissionAcceptedSequence {
                     scope: self.scope.clone(),
                     provider: super::ProviderId::Tiktok,
+                    page_size: self.page_size,
                     credential_generation: credential.generation(),
                     evidence_root: self.evidence_root.clone(),
                     pages: self.pages.values().cloned().collect(),
@@ -310,6 +311,7 @@ impl MissionTiktokVideoSequenceConsumer {
 pub struct TiktokMissionAcceptedSequence {
     scope: TiktokReadScope,
     provider: super::ProviderId,
+    page_size: u8,
     credential_generation: u64,
     evidence_root: String,
     pages: Vec<TiktokVideoPageEnvelope>,
@@ -322,6 +324,10 @@ impl TiktokMissionAcceptedSequence {
 
     pub const fn scope(&self) -> &TiktokReadScope {
         &self.scope
+    }
+
+    pub const fn page_size(&self) -> u8 {
+        self.page_size
     }
 
     pub const fn credential_generation(&self) -> u64 {
@@ -338,6 +344,68 @@ impl TiktokMissionAcceptedSequence {
 
     pub fn page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Revalidate the closed sequence at the Desktop adoption boundary.
+    ///
+    /// The accepted value is immutable, but the second check makes the
+    /// credential, cursor, provenance, time, identity, and evidence-root
+    /// assumptions explicit before durable Mission persistence.
+    pub fn validate_at(&self, now: DateTime<Utc>) -> Result<(), TiktokError> {
+        if self.provider != super::ProviderId::Tiktok
+            || self.scope.provider() != super::ProviderId::Tiktok
+            || !(1..=super::DEFAULT_VIDEO_PAGE_SIZE).contains(&self.page_size)
+            || self.credential_generation == 0
+            || self.pages.is_empty()
+            || !super::is_sha256(&self.evidence_root)
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+
+        let mut expected_cursor = None;
+        let mut evidence_root = super::initial_evidence_root(&self.scope, self.page_size);
+        let mut previous_observed_at = None;
+        let mut seen_video_ids = BTreeSet::new();
+        let page_count = self.pages.len();
+        for (index, page) in self.pages.iter().enumerate() {
+            page.validate_at(now)?;
+            let generation = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or(TiktokError::CursorDrift)?;
+            let terminal = index + 1 == page_count;
+            if page.provider() != self.provider
+                || page.scope() != &self.scope
+                || page.account().open_id() != self.scope.account()
+                || page.sequence().generation() != generation
+                || page.requested_cursor() != expected_cursor
+                || page.credential_generation() != self.credential_generation
+                || page.provenance() != EvidenceProvenance::ProductionProvider
+                || page.has_more() == terminal
+                || previous_observed_at
+                    .is_some_and(|observed_at| page.freshness().observed_at() < observed_at)
+            {
+                return Err(TiktokError::CursorDrift);
+            }
+            if page.expected_evidence_root(&evidence_root)? != page.evidence_root() {
+                return Err(TiktokError::EvidenceRootMismatch);
+            }
+            for observation in page.observations() {
+                let TiktokReadObservation::Video(video) = observation.observation() else {
+                    return Err(TiktokError::CursorDrift);
+                };
+                if !seen_video_ids.insert(video.identity().video_id().clone()) {
+                    return Err(TiktokError::CursorDrift);
+                }
+            }
+            expected_cursor = page.next_cursor();
+            previous_observed_at = Some(page.freshness().observed_at());
+            page.evidence_root().clone_into(&mut evidence_root);
+        }
+        if expected_cursor.is_some() || evidence_root != self.evidence_root {
+            return Err(TiktokError::EvidenceRootMismatch);
+        }
+        Ok(())
     }
 }
 

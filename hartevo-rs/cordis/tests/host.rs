@@ -145,6 +145,46 @@ fn effect_proposal_command_is_exact_and_domain_only() {
 }
 
 #[test]
+fn provider_observation_adoption_reuses_the_one_shot_domain_boundary() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 3);
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let digest = "d".repeat(64);
+    let command = DomainCommandBinding::adopt_provider_observation(
+        "tiktok-video-sequence-evidence-a",
+        digest.clone(),
+    )
+    .unwrap();
+    let permit = host
+        .authorize_domain_command(&scope, command.clone())
+        .unwrap();
+    assert_eq!(permit.scope(), &scope);
+    assert_eq!(permit.command(), &command);
+    assert_eq!(
+        permit.command().kind(),
+        DomainCommandKind::AdoptProviderObservation
+    );
+    assert_eq!(
+        permit.command().observation_id(),
+        Some("tiktok-video-sequence-evidence-a")
+    );
+    assert_eq!(permit.command().observation_digest(), Some(digest.as_str()));
+    assert_eq!(
+        host.authorize_domain_command(&scope, command).unwrap_err(),
+        CordisError::DomainCommandDispatchBusy
+    );
+    host.finish_domain_command(permit).unwrap();
+    assert!(host.active_domain_command_scope().is_none());
+}
+
+#[test]
 fn domain_command_requires_and_preserves_exact_bound_scope() {
     let mut host = CordisHost::boot(false).unwrap();
     let scope = domain_scope("project-a", "mission-a", 3);

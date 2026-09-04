@@ -673,10 +673,12 @@ mod tests {
         };
         assert_eq!(accepted.provider(), super::super::ProviderId::Tiktok);
         assert_eq!(accepted.scope(), &read_scope);
+        assert_eq!(accepted.page_size(), 20);
         assert_eq!(accepted.credential_generation(), credential.generation());
         assert_eq!(accepted.page_count(), 2);
         assert_eq!(accepted.pages(), &[first.clone(), final_page.clone()]);
         assert_eq!(accepted.evidence_root(), cursor.evidence_root());
+        accepted.validate_at(now).unwrap();
         assert!(mission.is_closed());
 
         let before_duplicate = mission.clone();
