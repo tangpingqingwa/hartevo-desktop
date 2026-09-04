@@ -44,11 +44,11 @@ use chrono::{DateTime, Duration, Utc};
 use hartevo_browser_adapter::{
     BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost,
     BrowserControlState, BrowserError, BrowserFileGrant, BrowserFileType, BrowserIdentity,
-    BrowserLeaseProof, BrowserLocatorResolution, BrowserProfile, BrowserProfileSource,
-    BrowserProfileStatus, BrowserRecipeActivation, BrowserRecipeCandidate,
-    BrowserRecipePreparedPlan, BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace,
-    FileBroker, FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle,
-    TrustedBrowserRecipeKey,
+    BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserProfile,
+    BrowserProfileSource, BrowserProfileStatus, BrowserPromptRisk, BrowserReadHost,
+    BrowserRecipeActivation, BrowserRecipeCandidate, BrowserRecipePreparedPlan,
+    BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace, FileBroker,
+    FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle, TrustedBrowserRecipeKey,
 };
 use hartevo_catalog::{CapabilityManifest, Catalog, CatalogError, MissionManifest};
 use hartevo_cloud_storage::{
@@ -69,26 +69,27 @@ use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, ApprovalPolicy,
     AttributionRecord, AutomatedReplyAuthorization, AutonomyLevel, BrowserActionBatchId,
     BrowserControlLeaseId, BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId,
-    BrowserRecipeId, BrowserTabId, BrowserWorkspaceId, Cadence, CadenceTriggerKind, Campaign,
-    CampaignId, CampaignSendAuthorization, CommissionId, CommissionRecord, Company, CompanyId,
-    Connection, ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
-    ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint, ContactChannel,
-    ContextAssemblyId, ContextBranch, ContextBranchId, ContextBranchMerge, ContextBranchMergeId,
-    ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleId, ContextCapsuleStatus,
-    ContextCheckpoint, ContextCheckpointId, ContextCompactionRecord, ContextCompactionRecordId,
-    ContextContinuationLedgerId, ContextDataPolicy, ContextError, ContextFactGrant,
-    ContextFoundationSnapshot, ContextInputRefs, ContextMergePolicy, ContextReturnContract,
-    ContextReturnReceipt, ContextWorkerMailboxId, ContextWorkerMessage, ContextWorkerMessageId,
-    ContextWorkerMessageKind, ContextWorkingItem, ContextWorkingSet, ContextWorkingSetId,
-    ContextWorkspace, ContextWorkspaceId, ContinuationEntry, ContinuationEntryInput,
-    ContinuationEntryKind, ContinuationLedger, Conversation, ConversationEffectGuard,
-    ConversationId, ConversationIdentitySnapshot, ConversationState, CreatorApplicationId,
-    CreatorApplicationInput, CreatorCandidate, CreatorContactEffectGuard, CreatorDeliverableInput,
-    CreatorEligibility, CreatorExternalProof, CreatorHiring, CreatorHiringError, CreatorHiringId,
-    CreatorHiringSpec, CreatorId, CreatorIdentitySnapshot, CreatorMilestoneId,
-    CreatorPayoutConfirmation, CreatorTask, CreatorTaskId, CreatorTaskSpec, CreatorTaskStatus,
-    CreatorWorkError, CurrencyCode, DeletionError, DeletionId, DeletionReason, DeletionTombstone,
-    DeliverableId, DeliverableReviewInput, DeliverableStatus, DeviceAttachment, DeviceAttachmentId,
+    BrowserRecipeId, BrowserSnapshotId, BrowserTabId, BrowserWorkspaceId, Cadence,
+    CadenceTriggerKind, Campaign, CampaignId, CampaignSendAuthorization, CommissionId,
+    CommissionRecord, Company, CompanyId, Connection, ConnectionError, ConnectionId,
+    ConnectionProbe, ConnectionSnapshot, ConsentPurpose, ConsentRecord, ConsentRecordId,
+    ConsentRequirement, ConsentState, Constraint, ContactChannel, ContextAssemblyId, ContextBranch,
+    ContextBranchId, ContextBranchMerge, ContextBranchMergeId, ContextBranchStatus, ContextBudget,
+    ContextCapsule, ContextCapsuleId, ContextCapsuleStatus, ContextCheckpoint, ContextCheckpointId,
+    ContextCompactionRecord, ContextCompactionRecordId, ContextContinuationLedgerId,
+    ContextDataPolicy, ContextError, ContextFactGrant, ContextFoundationSnapshot, ContextInputRefs,
+    ContextMergePolicy, ContextReturnContract, ContextReturnReceipt, ContextWorkerMailboxId,
+    ContextWorkerMessage, ContextWorkerMessageId, ContextWorkerMessageKind, ContextWorkingItem,
+    ContextWorkingSet, ContextWorkingSetId, ContextWorkspace, ContextWorkspaceId,
+    ContinuationEntry, ContinuationEntryInput, ContinuationEntryKind, ContinuationLedger,
+    Conversation, ConversationEffectGuard, ConversationId, ConversationIdentitySnapshot,
+    ConversationState, CreatorApplicationId, CreatorApplicationInput, CreatorCandidate,
+    CreatorContactEffectGuard, CreatorDeliverableInput, CreatorEligibility, CreatorExternalProof,
+    CreatorHiring, CreatorHiringError, CreatorHiringId, CreatorHiringSpec, CreatorId,
+    CreatorIdentitySnapshot, CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask,
+    CreatorTaskId, CreatorTaskSpec, CreatorTaskStatus, CreatorWorkError, CurrencyCode,
+    DeletionError, DeletionId, DeletionReason, DeletionTombstone, DeliverableId,
+    DeliverableReviewInput, DeliverableStatus, DeviceAttachment, DeviceAttachmentId,
     DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
     DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
@@ -2760,6 +2761,59 @@ pub struct CreateBrowserWorkspace {
     pub evidence_digest: String,
 }
 
+/// One read-only public HTTPS navigation bound to the exact durable Browser
+/// Workspace projection. The raw URL is intentionally redacted from Debug.
+#[derive(Clone)]
+pub struct ReadBrowserPublicSource {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub expected_generation: u64,
+    pub snapshot_id: BrowserSnapshotId,
+    pub target_url: String,
+}
+
+impl fmt::Debug for ReadBrowserPublicSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadBrowserPublicSource")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("expected_revision", &self.expected_revision)
+            .field("expected_generation", &self.expected_generation)
+            .field("snapshot_id", &self.snapshot_id)
+            .field("target_url_digest", &sha256(self.target_url.as_bytes()))
+            .finish()
+    }
+}
+
+/// Content-free evidence from a real read-only Browser navigation and AX
+/// observation. This is process-local evidence, not a business Verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserPublicSourceObservation {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub workspace_revision: u64,
+    pub tab_id: BrowserTabId,
+    pub snapshot_id: BrowserSnapshotId,
+    pub lease_generation: u64,
+    pub document_generation: u64,
+    pub url_digest: String,
+    pub origin_digest: String,
+    pub content_digest: String,
+    pub redaction_digest: String,
+    pub navigation_evidence_digest: String,
+    pub prompt_risk: BrowserPromptRisk,
+    pub element_ref_count: usize,
+    pub allowed_request_count: u32,
+    pub script_execution_disabled: bool,
+    pub business_verified: bool,
+    pub observed_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TakeOverBrowserWorkspace {
     pub project_id: ProjectId,
@@ -5425,6 +5479,80 @@ impl ApplicationService {
         )?;
         self.store.create_browser_workspace_atomic(&workspace)?;
         Ok(workspace)
+    }
+
+    /// Navigates and observes one public HTTPS page through the exact mounted
+    /// Host. No durable state, Effect, Verification, or Mission status changes.
+    pub fn read_browser_public_source(
+        &self,
+        host: &mut impl BrowserReadHost,
+        command: ReadBrowserPublicSource,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserPublicSourceObservation, ApplicationError> {
+        let workspace = self
+            .store
+            .load_browser_workspace(&command.project_id, &command.workspace_id)?;
+        if workspace.project_id != command.project_id
+            || workspace.mission_id != command.mission_id
+            || workspace.id != command.workspace_id
+            || workspace.revision != command.expected_revision
+            || workspace.lease_generation != command.expected_generation
+            || workspace.control_state != BrowserControlState::AgentControlled
+        {
+            return Err(BrowserError::ScopeMismatch.into());
+        }
+        let proof = workspace.agent_lease_proof(now)?;
+        let (policy, target) =
+            BrowserNavigationPolicy::for_exact_https_target(&command.target_url)?;
+        let navigation =
+            host.navigate_allowlisted(&workspace.active_tab_id, &proof, &policy, &target, now)?;
+        let navigation_evidence_digest = navigation.evidence_digest()?;
+        if navigation.workspace_id != workspace.id
+            || navigation.tab_id != workspace.active_tab_id
+            || navigation.lease_generation != workspace.lease_generation
+            || navigation.requested_url_digest != target.url_digest()
+            || navigation.final_origin_digest != target.origin_digest()
+            || navigation.policy_digest != policy.evidence_digest()
+        {
+            return Err(BrowserError::ScopeMismatch.into());
+        }
+        workspace.validate_agent_lease(&proof, navigation.completed_at)?;
+        let snapshot = host.observe_ax(
+            &workspace.active_tab_id,
+            &proof,
+            command.snapshot_id.clone(),
+            navigation.completed_at,
+        )?;
+        snapshot.validate_for(&workspace)?;
+        if snapshot.id != command.snapshot_id
+            || snapshot.tab_id != navigation.tab_id
+            || snapshot.lease_generation != navigation.lease_generation
+            || snapshot.document_generation != navigation.document_generation
+            || snapshot.url_digest != navigation.final_url_digest
+        {
+            return Err(BrowserError::StaleSnapshot.into());
+        }
+        Ok(BrowserPublicSourceObservation {
+            project_id: command.project_id,
+            mission_id: command.mission_id,
+            workspace_id: workspace.id,
+            workspace_revision: workspace.revision,
+            tab_id: snapshot.tab_id,
+            snapshot_id: snapshot.id,
+            lease_generation: snapshot.lease_generation,
+            document_generation: snapshot.document_generation,
+            url_digest: snapshot.url_digest,
+            origin_digest: navigation.final_origin_digest,
+            content_digest: snapshot.content_digest,
+            redaction_digest: snapshot.redaction_digest,
+            navigation_evidence_digest,
+            prompt_risk: snapshot.prompt_risk,
+            element_ref_count: snapshot.element_refs.len(),
+            allowed_request_count: navigation.allowed_request_count,
+            script_execution_disabled: navigation.script_execution_disabled,
+            business_verified: false,
+            observed_at: snapshot.created_at,
+        })
     }
 
     /// Restrictive control transitions fence the Host first. If persistence
@@ -42654,6 +42782,181 @@ sleep 30"#
         host.register_workspace(profile.clone(), workspace.clone(), vec![browser_page()])
             .expect("register browser host");
         host
+    }
+
+    struct RecordingBrowserReadHost {
+        workspace: BrowserWorkspace,
+        prompt_risk: BrowserPromptRisk,
+        final_url_digest: Option<String>,
+        navigation_count: usize,
+        observation_count: usize,
+        observation_document_generation: u64,
+    }
+
+    impl RecordingBrowserReadHost {
+        fn new(workspace: BrowserWorkspace, prompt_risk: BrowserPromptRisk) -> Self {
+            Self {
+                workspace,
+                prompt_risk,
+                final_url_digest: None,
+                navigation_count: 0,
+                observation_count: 0,
+                observation_document_generation: 2,
+            }
+        }
+    }
+
+    impl BrowserControlHost for RecordingBrowserReadHost {
+        fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+            self.workspace = workspace.clone();
+            Ok(())
+        }
+    }
+
+    impl BrowserReadHost for RecordingBrowserReadHost {
+        fn navigate_allowlisted(
+            &mut self,
+            tab_id: &BrowserTabId,
+            proof: &BrowserLeaseProof,
+            policy: &BrowserNavigationPolicy,
+            target: &hartevo_browser_adapter::BrowserNavigationTarget,
+            now: DateTime<Utc>,
+        ) -> Result<hartevo_browser_adapter::BrowserNavigationReceipt, BrowserError> {
+            self.workspace.validate_agent_lease(proof, now)?;
+            if tab_id != &self.workspace.active_tab_id
+                || target.policy_digest() != policy.evidence_digest()
+            {
+                return Err(BrowserError::ScopeMismatch);
+            }
+            self.navigation_count = self.navigation_count.saturating_add(1);
+            self.final_url_digest = Some(target.url_digest().to_owned());
+            Ok(hartevo_browser_adapter::BrowserNavigationReceipt {
+                schema_version: 2,
+                workspace_id: self.workspace.id.clone(),
+                tab_id: tab_id.clone(),
+                lease_generation: proof.generation,
+                document_generation: 2,
+                requested_url_digest: target.url_digest().to_owned(),
+                final_url_digest: target.url_digest().to_owned(),
+                final_origin_digest: target.origin_digest().to_owned(),
+                policy_digest: policy.evidence_digest().to_owned(),
+                frame_id_digest: "8".repeat(64),
+                loader_id_digest: Some("9".repeat(64)),
+                allowed_request_count: 1,
+                script_execution_disabled: true,
+                started_at: now,
+                completed_at: now,
+            })
+        }
+
+        fn observe_ax(
+            &mut self,
+            tab_id: &BrowserTabId,
+            proof: &BrowserLeaseProof,
+            snapshot_id: BrowserSnapshotId,
+            now: DateTime<Utc>,
+        ) -> Result<hartevo_browser_adapter::SemanticSnapshot, BrowserError> {
+            self.workspace.validate_agent_lease(proof, now)?;
+            self.observation_count = self.observation_count.saturating_add(1);
+            hartevo_browser_adapter::SemanticSnapshot::new(
+                snapshot_id,
+                &self.workspace,
+                tab_id.clone(),
+                self.observation_document_generation,
+                self.workspace.expected_identity_digest.clone(),
+                self.final_url_digest
+                    .clone()
+                    .ok_or(BrowserError::NavigationFailed)?,
+                "a".repeat(64),
+                "b".repeat(64),
+                self.prompt_risk,
+                Vec::new(),
+                now,
+            )
+        }
+    }
+
+    #[test]
+    fn public_browser_read_is_exact_content_free_and_surfaces_prompt_risk() {
+        let directory = tempfile::tempdir().expect("application browser read directory");
+        let database_path = directory.path().join("application-browser-read.sqlite3");
+        let key = hartevo_storage::DatabaseKey::new([79; 32]).expect("database key");
+        let store = ProjectStore::open(&database_path, &key).expect("encrypted store");
+        let fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let mut host = RecordingBrowserReadHost::new(
+            fixture.workspace.clone(),
+            BrowserPromptRisk::SuspectedInjection,
+        );
+        let result = fixture
+            .service
+            .read_browser_public_source(
+                &mut host,
+                ReadBrowserPublicSource {
+                    project_id: fixture.project_id.clone(),
+                    mission_id: fixture.mission_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: fixture.workspace.revision,
+                    expected_generation: fixture.workspace.lease_generation,
+                    snapshot_id: BrowserSnapshotId::from("snapshot-browser-public-read"),
+                    target_url: "https://example.com/research?q=private".into(),
+                },
+                now(),
+            )
+            .expect("read-only Browser observation");
+        assert_eq!(result.project_id, fixture.project_id);
+        assert_eq!(result.mission_id, fixture.mission_id);
+        assert_eq!(result.workspace_id, fixture.workspace.id);
+        assert_eq!(result.workspace_revision, fixture.workspace.revision);
+        assert_eq!(result.lease_generation, fixture.workspace.lease_generation);
+        assert_eq!(result.document_generation, 2);
+        assert_eq!(result.prompt_risk, BrowserPromptRisk::SuspectedInjection);
+        assert_eq!(result.element_ref_count, 0);
+        assert_eq!(result.allowed_request_count, 1);
+        assert!(result.script_execution_disabled);
+        assert!(!result.business_verified);
+        assert_eq!(host.navigation_count, 1);
+        assert_eq!(host.observation_count, 1);
+        assert!(!format!("{result:?}").contains("private"));
+
+        host.observation_document_generation = 3;
+        let mismatched = fixture.service.read_browser_public_source(
+            &mut host,
+            ReadBrowserPublicSource {
+                project_id: fixture.project_id.clone(),
+                mission_id: fixture.mission_id.clone(),
+                workspace_id: fixture.workspace.id.clone(),
+                expected_revision: fixture.workspace.revision,
+                expected_generation: fixture.workspace.lease_generation,
+                snapshot_id: BrowserSnapshotId::from("snapshot-browser-public-mismatch"),
+                target_url: "https://example.com/mismatch".into(),
+            },
+            now(),
+        );
+        assert!(matches!(
+            mismatched,
+            Err(ApplicationError::Browser(BrowserError::StaleSnapshot))
+        ));
+        host.observation_document_generation = 2;
+
+        let stale = fixture.service.read_browser_public_source(
+            &mut host,
+            ReadBrowserPublicSource {
+                project_id: fixture.project_id,
+                mission_id: fixture.mission_id,
+                workspace_id: fixture.workspace.id,
+                expected_revision: fixture.workspace.revision.saturating_add(1),
+                expected_generation: fixture.workspace.lease_generation,
+                snapshot_id: BrowserSnapshotId::from("snapshot-browser-public-stale"),
+                target_url: "https://example.com/stale".into(),
+            },
+            now(),
+        );
+        assert!(matches!(
+            stale,
+            Err(ApplicationError::Browser(BrowserError::ScopeMismatch))
+        ));
+        assert_eq!(host.navigation_count, 2);
+        assert_eq!(host.observation_count, 2);
     }
 
     fn signed_application_recipe_release(

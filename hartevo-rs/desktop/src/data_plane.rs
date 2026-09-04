@@ -28,16 +28,17 @@ use hartevo_application::llm_deepseek::{
 use hartevo_application::{
     AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
     AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
-    ApplicationService, ApproveProposedEffect, CatalogMissionExecutionHandle,
-    ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace, CordisMissionDraft,
-    CordisMissionTurnPlan, CreateBrowserWorkspace, CreateProject, DecideVm11OutcomeReview,
-    DesktopInventoryProjection, DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
-    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
-    ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
-    KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
-    ObserveContextRuntimeTurn, PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext,
-    PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProposePreviewEffect, ProvisionProjectEncryption, ReconcileUncertainEffect,
+    ApplicationService, ApproveProposedEffect, BrowserPublicSourceObservation,
+    CatalogMissionExecutionHandle, ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace,
+    CordisMissionDraft, CordisMissionTurnPlan, CreateBrowserWorkspace, CreateProject,
+    DecideVm11OutcomeReview, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
+    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
+    ExecuteApplicationMissionCheckpoint, ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn,
+    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
+    MissionRuntimeProjection, ObserveContextRuntimeTurn, PauseBrowserWorkspace,
+    PrepareLocalMissionRuntimeContext, PreparedLocalMissionRuntimeContext,
+    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProposePreviewEffect,
+    ProvisionProjectEncryption, ReadBrowserPublicSource, ReconcileUncertainEffect,
     RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
     ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
     ResumeBrowserWorkspace, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
@@ -46,8 +47,9 @@ use hartevo_application::{
     VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
-    BrowserControlHost, BrowserControlState, BrowserError, BrowserProfile, BrowserProfileStatus,
-    BrowserWorkspace,
+    BrowserControlHost, BrowserControlState, BrowserError, BrowserLeaseProof,
+    BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserProfile, BrowserProfileStatus,
+    BrowserReadHost, BrowserWorkspace, SemanticSnapshot,
 };
 #[cfg(unix)]
 use hartevo_browser_adapter::{ChromiumLaunchConfig, ManagedChromiumHost};
@@ -73,10 +75,10 @@ use hartevo_cordis::{
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
-    BrowserProfileId, BrowserTabId, BrowserWorkspaceId, CompanyId, ConnectionId, ConsentRecord,
-    ConsentState, ConsentStatus, ContactChannel, Conversation, ConversationId, CreatorTaskId,
-    CurrencyCode, DeliverableId, DeviceId, Effect, EffectClass, EffectId, EffectStatus,
-    KeyManagementError, KeyRecipient, KpiContract, MessagingGateway, Mission,
+    BrowserProfileId, BrowserSnapshotId, BrowserTabId, BrowserWorkspaceId, CompanyId, ConnectionId,
+    ConsentRecord, ConsentState, ConsentStatus, ContactChannel, Conversation, ConversationId,
+    CreatorTaskId, CurrencyCode, DeliverableId, DeviceId, Effect, EffectClass, EffectId,
+    EffectStatus, KeyManagementError, KeyRecipient, KpiContract, MessagingGateway, Mission,
     MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
     MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
     OperatingMode, OutcomeDecision, PersonId, ProjectEncryptionMode, ProjectId, ProjectKeyring,
@@ -1427,6 +1429,36 @@ pub struct DesktopBrowserWorkspaceControlRequest {
     pub expected_generation: u64,
 }
 
+/// One process-local, read-only public HTTPS Browser operation. The exact
+/// durable Workspace fence is explicit and the raw target is redacted from
+/// Debug because its query may contain private user input.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopReadBrowserPublicSourceRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub expected_generation: u64,
+    pub target_url: String,
+}
+
+impl fmt::Debug for DesktopReadBrowserPublicSourceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopReadBrowserPublicSourceRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("expected_revision", &self.expected_revision)
+            .field("expected_generation", &self.expected_generation)
+            .field(
+                "target_url_digest",
+                &format!("{:x}", Sha256::digest(self.target_url.as_bytes())),
+            )
+            .finish()
+    }
+}
+
 /// Window Open Conversation for one Mission-bound CRM identity. Person,
 /// Connection, gateway, and route digest must come from SQLCipher; Desktop
 /// never invents a Conversation or treats Open as Effect or Verification.
@@ -2419,7 +2451,7 @@ struct DesktopBrowserHostEntry {
     project_id: ProjectId,
     mission_id: MissionId,
     workspace: BrowserWorkspace,
-    host: Box<dyn BrowserControlHost + Send>,
+    host: Box<dyn BrowserReadHost + Send>,
 }
 
 impl DesktopBrowserHostEntry {
@@ -2435,6 +2467,30 @@ impl BrowserControlHost for DesktopBrowserHostEntry {
         self.host.sync_workspace(workspace)?;
         self.workspace = workspace.clone();
         Ok(())
+    }
+}
+
+impl BrowserReadHost for DesktopBrowserHostEntry {
+    fn navigate_allowlisted(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        policy: &BrowserNavigationPolicy,
+        target: &hartevo_browser_adapter::BrowserNavigationTarget,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserNavigationReceipt, BrowserError> {
+        self.host
+            .navigate_allowlisted(tab_id, proof, policy, target, now)
+    }
+
+    fn observe_ax(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        snapshot_id: BrowserSnapshotId,
+        now: DateTime<Utc>,
+    ) -> Result<SemanticSnapshot, BrowserError> {
+        self.host.observe_ax(tab_id, proof, snapshot_id, now)
     }
 }
 
@@ -2463,6 +2519,31 @@ impl BrowserControlHost for DesktopManagedBrowserHost {
             self.tab_attached = true;
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl BrowserReadHost for DesktopManagedBrowserHost {
+    fn navigate_allowlisted(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        policy: &BrowserNavigationPolicy,
+        target: &hartevo_browser_adapter::BrowserNavigationTarget,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserNavigationReceipt, BrowserError> {
+        self.host
+            .navigate_allowlisted(tab_id, proof, policy, target, now)
+    }
+
+    fn observe_ax(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        snapshot_id: BrowserSnapshotId,
+        now: DateTime<Utc>,
+    ) -> Result<SemanticSnapshot, BrowserError> {
+        self.host.observe_ax(tab_id, proof, snapshot_id, now)
     }
 }
 
@@ -3927,7 +4008,7 @@ impl DesktopDataPlane {
         ) -> Result<Host, BrowserError>,
     ) -> Result<DesktopSnapshot, DesktopDataError>
     where
-        Host: BrowserControlHost + Send + 'static,
+        Host: BrowserReadHost + Send + 'static,
     {
         if !valid_browser_workspace_control_request(&request) {
             return Err(DesktopDataError::InvalidBrowserWorkspaceMount);
@@ -4002,6 +4083,64 @@ impl DesktopDataPlane {
                 && entry.mission_id == request.mission_id
                 && entry.workspace.revision == request.expected_revision
                 && entry.workspace.lease_generation == request.expected_generation
+        })
+    }
+
+    pub fn read_browser_public_source_os(
+        &self,
+        request: DesktopReadBrowserPublicSourceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserPublicSourceObservation, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.read_browser_public_source_with(&secret_store, request, now)
+    }
+
+    pub fn read_browser_public_source_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopReadBrowserPublicSourceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserPublicSourceObservation, DesktopDataError> {
+        if request.expected_revision == 0
+            || request.expected_generation == 0
+            || request.workspace_id.as_str().trim().is_empty()
+            || BrowserNavigationPolicy::for_exact_https_target(&request.target_url).is_err()
+        {
+            return Err(DesktopDataError::InvalidBrowserPublicSourceRead);
+        }
+        let project_id = request.project_id.clone();
+        let (service, _runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
+            .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
+        if live.id != request.workspace_id
+            || live.project_id != project_id
+            || live.mission_id != request.mission_id
+            || live.revision != request.expected_revision
+            || live.lease_generation != request.expected_generation
+        {
+            return Err(DesktopDataError::InvalidBrowserPublicSourceRead);
+        }
+        if live.control_state != BrowserControlState::AgentControlled
+            || live.agent_lease_proof(now).is_err()
+        {
+            return Err(DesktopDataError::BrowserWorkspaceReadNotAgentHeld);
+        }
+        self.synchronize_mounted_browser_host(&live, |host| {
+            service.read_browser_public_source(
+                host,
+                ReadBrowserPublicSource {
+                    project_id,
+                    mission_id: request.mission_id,
+                    workspace_id: request.workspace_id,
+                    expected_revision: request.expected_revision,
+                    expected_generation: request.expected_generation,
+                    snapshot_id: BrowserSnapshotId::new(),
+                    target_url: request.target_url,
+                },
+                now,
+            )
         })
     }
 
@@ -9426,6 +9565,12 @@ pub enum DesktopDataError {
     BrowserHostRegistryUnavailable,
     #[error("no allowlisted managed Chrome or Chromium executable is available")]
     ManagedBrowserExecutableUnavailable,
+    #[error(
+        "Browser public-source Read requires an exact Agent-held Workspace and a valid public HTTPS target"
+    )]
+    InvalidBrowserPublicSourceRead,
+    #[error("Browser public-source Read requires the current Agent-held lease")]
+    BrowserWorkspaceReadNotAgentHeld,
     #[error(
         "Browser Workspace Continue requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
     )]
@@ -22947,6 +23092,106 @@ sleep 30"#;
         }
     }
 
+    impl BrowserReadHost for TestBrowserControlHost {
+        fn navigate_allowlisted(
+            &mut self,
+            _tab_id: &BrowserTabId,
+            _proof: &BrowserLeaseProof,
+            _policy: &BrowserNavigationPolicy,
+            _target: &hartevo_browser_adapter::BrowserNavigationTarget,
+            _now: DateTime<Utc>,
+        ) -> Result<BrowserNavigationReceipt, BrowserError> {
+            Err(BrowserError::ProtocolUnavailable)
+        }
+
+        fn observe_ax(
+            &mut self,
+            _tab_id: &BrowserTabId,
+            _proof: &BrowserLeaseProof,
+            _snapshot_id: BrowserSnapshotId,
+            _now: DateTime<Utc>,
+        ) -> Result<SemanticSnapshot, BrowserError> {
+            Err(BrowserError::ProtocolUnavailable)
+        }
+    }
+
+    struct RecordingDesktopBrowserReadHost {
+        workspace: BrowserWorkspace,
+        navigation_count: Arc<AtomicUsize>,
+        observation_count: Arc<AtomicUsize>,
+        final_url_digest: Option<String>,
+    }
+
+    impl BrowserControlHost for RecordingDesktopBrowserReadHost {
+        fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+            self.workspace = workspace.clone();
+            Ok(())
+        }
+    }
+
+    impl BrowserReadHost for RecordingDesktopBrowserReadHost {
+        fn navigate_allowlisted(
+            &mut self,
+            tab_id: &BrowserTabId,
+            proof: &BrowserLeaseProof,
+            policy: &BrowserNavigationPolicy,
+            target: &hartevo_browser_adapter::BrowserNavigationTarget,
+            now: DateTime<Utc>,
+        ) -> Result<BrowserNavigationReceipt, BrowserError> {
+            self.workspace.validate_agent_lease(proof, now)?;
+            if tab_id != &self.workspace.active_tab_id
+                || target.policy_digest() != policy.evidence_digest()
+            {
+                return Err(BrowserError::ScopeMismatch);
+            }
+            self.navigation_count.fetch_add(1, Ordering::SeqCst);
+            self.final_url_digest = Some(target.url_digest().to_owned());
+            Ok(BrowserNavigationReceipt {
+                schema_version: 2,
+                workspace_id: self.workspace.id.clone(),
+                tab_id: tab_id.clone(),
+                lease_generation: proof.generation,
+                document_generation: 2,
+                requested_url_digest: target.url_digest().to_owned(),
+                final_url_digest: target.url_digest().to_owned(),
+                final_origin_digest: target.origin_digest().to_owned(),
+                policy_digest: policy.evidence_digest().to_owned(),
+                frame_id_digest: "8".repeat(64),
+                loader_id_digest: Some("9".repeat(64)),
+                allowed_request_count: 1,
+                script_execution_disabled: true,
+                started_at: now,
+                completed_at: now,
+            })
+        }
+
+        fn observe_ax(
+            &mut self,
+            tab_id: &BrowserTabId,
+            proof: &BrowserLeaseProof,
+            snapshot_id: BrowserSnapshotId,
+            now: DateTime<Utc>,
+        ) -> Result<SemanticSnapshot, BrowserError> {
+            self.workspace.validate_agent_lease(proof, now)?;
+            self.observation_count.fetch_add(1, Ordering::SeqCst);
+            SemanticSnapshot::new(
+                snapshot_id,
+                &self.workspace,
+                tab_id.clone(),
+                2,
+                self.workspace.expected_identity_digest.clone(),
+                self.final_url_digest
+                    .clone()
+                    .ok_or(BrowserError::NavigationFailed)?,
+                "a".repeat(64),
+                "b".repeat(64),
+                hartevo_browser_adapter::BrowserPromptRisk::None,
+                Vec::new(),
+                now,
+            )
+        }
+    }
+
     fn mount_test_browser_host(
         plane: &DesktopDataPlane,
         secrets: &MemorySecretStore,
@@ -23173,6 +23418,183 @@ sleep 30"#;
                 0o700
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one read boundary test keeps unmounted, invalid URL, exact success, and user-held refusal together"
+    )]
+    fn browser_public_source_read_uses_exact_mounted_agent_host() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(5);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "Desktop 通过同一 Host 读取公开 HTTPS 页面",
+                now,
+            )
+            .expect("mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("application");
+        let profile = service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("profile-desktop-public-read"),
+                    project_id: project_id.clone(),
+                    credential_reference: "keychain://desktop-public-read/profile".into(),
+                    provider: "fixture-provider".into(),
+                    account_id: AccountId::from("account-desktop-public-read"),
+                    identity_digest: "1".repeat(64),
+                    probe_digest: "2".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("profile");
+        let workspace = service
+            .create_browser_workspace(
+                CreateBrowserWorkspace {
+                    id: BrowserWorkspaceId::from("workspace-desktop-public-read"),
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    profile_id: profile.id,
+                    initial_tab_id: BrowserTabId::from("tab-desktop-public-read"),
+                    lease_id: BrowserControlLeaseId::from("lease-desktop-public-read-1"),
+                    lease_expires_at: now + Duration::hours(1),
+                    evidence_digest: "3".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("workspace");
+        drop(service);
+        let read_request = DesktopReadBrowserPublicSourceRequest {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            workspace_id: workspace.id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+            target_url: "https://example.com/research?q=private".into(),
+        };
+
+        let unmounted = plane.read_browser_public_source_with(
+            &secrets,
+            read_request.clone(),
+            now + Duration::seconds(2),
+        );
+        assert!(matches!(
+            unmounted,
+            Err(DesktopDataError::BrowserWorkspaceHostUnavailable)
+        ));
+
+        let navigation_count = Arc::new(AtomicUsize::new(0));
+        let observation_count = Arc::new(AtomicUsize::new(0));
+        let host_navigation_count = Arc::clone(&navigation_count);
+        let host_observation_count = Arc::clone(&observation_count);
+        plane
+            .mount_browser_workspace_with(
+                &secrets,
+                DesktopBrowserWorkspaceControlRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    expected_revision: workspace.revision,
+                    expected_generation: workspace.lease_generation,
+                },
+                now + Duration::seconds(2),
+                move |_profile, workspace, _profile_root, _mounted_at| {
+                    Ok(RecordingDesktopBrowserReadHost {
+                        workspace: workspace.clone(),
+                        navigation_count: host_navigation_count,
+                        observation_count: host_observation_count,
+                        final_url_digest: None,
+                    })
+                },
+            )
+            .expect("mount read Host");
+
+        let invalid = plane.read_browser_public_source_with(
+            &secrets,
+            DesktopReadBrowserPublicSourceRequest {
+                target_url: "http://example.com/not-allowed".into(),
+                ..read_request.clone()
+            },
+            now + Duration::seconds(3),
+        );
+        assert!(matches!(
+            invalid,
+            Err(DesktopDataError::InvalidBrowserPublicSourceRead)
+        ));
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 0);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 0);
+        assert!(
+            plane.browser_workspace_host_mounted(&DesktopBrowserWorkspaceControlRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace.id.clone(),
+                expected_revision: workspace.revision,
+                expected_generation: workspace.lease_generation,
+            })
+        );
+
+        let observation = plane
+            .read_browser_public_source_with(
+                &secrets,
+                read_request.clone(),
+                now + Duration::seconds(4),
+            )
+            .expect("public-source observation");
+        assert_eq!(observation.workspace_id, workspace.id);
+        assert_eq!(observation.workspace_revision, workspace.revision);
+        assert_eq!(observation.lease_generation, workspace.lease_generation);
+        assert_eq!(observation.document_generation, 2);
+        assert!(observation.script_execution_disabled);
+        assert!(!observation.business_verified);
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 1);
+        assert!(!format!("{read_request:?}").contains("private"));
+        assert!(!format!("{observation:?}").contains("private"));
+
+        let taken = plane
+            .take_over_browser_workspace_with(
+                &secrets,
+                DesktopTakeOverBrowserWorkspaceRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    expected_revision: workspace.revision,
+                    expected_generation: workspace.lease_generation,
+                },
+                now + Duration::seconds(5),
+            )
+            .expect("user takeover");
+        let user_held = taken.inventory.projects[0].missions[0]
+            .browser_workspace
+            .as_ref()
+            .expect("user-held workspace");
+        let refused = plane.read_browser_public_source_with(
+            &secrets,
+            DesktopReadBrowserPublicSourceRequest {
+                project_id,
+                mission_id,
+                workspace_id: user_held.workspace_id.clone(),
+                expected_revision: user_held.revision,
+                expected_generation: user_held.lease_generation,
+                target_url: "https://example.com/user-held".into(),
+            },
+            now + Duration::seconds(6),
+        );
+        assert!(matches!(
+            refused,
+            Err(DesktopDataError::BrowserWorkspaceReadNotAgentHeld)
+        ));
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -1375,6 +1375,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::BrowserWorkspaceHostReconciliationRequired
         | DesktopDataError::BrowserHostRegistryUnavailable
         | DesktopDataError::ManagedBrowserExecutableUnavailable
+        | DesktopDataError::InvalidBrowserPublicSourceRead
+        | DesktopDataError::BrowserWorkspaceReadNotAgentHeld
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::InvalidBrowserWorkspaceTakeOver
         | DesktopDataError::BrowserWorkspaceUnavailable

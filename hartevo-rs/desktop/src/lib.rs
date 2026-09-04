@@ -12,11 +12,11 @@ use dioxus_icons::lucide::{
     WalletCards, Workflow, X,
 };
 use hartevo_application::{
-    ApplicationCheckpointHandlerStatus, ApplicationError, CreatorWorkProjection,
-    DesktopProjectProjection, MissionProjection, MissionRuntimeProjection,
+    ApplicationCheckpointHandlerStatus, ApplicationError, BrowserPublicSourceObservation,
+    CreatorWorkProjection, DesktopProjectProjection, MissionProjection, MissionRuntimeProjection,
     ProjectEncryptionReadiness,
 };
-use hartevo_browser_adapter::BrowserProfileStatus;
+use hartevo_browser_adapter::{BrowserProfileStatus, BrowserPromptRisk};
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_cordis::{LifecycleCancellation, SessionCancelCause};
 use hartevo_domain_kernel::{
@@ -54,9 +54,9 @@ use data_plane::{
     DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
     DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopOpenConversationRequest,
-    DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
-    DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
-    DesktopSnapshot, DesktopTakeOverBrowserWorkspaceRequest,
+    DesktopReadBrowserPublicSourceRequest, DesktopReviewCreatorDeliverableRequest,
+    DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
+    DesktopRuntimeTextStreamProjection, DesktopSnapshot, DesktopTakeOverBrowserWorkspaceRequest,
     DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
     DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
     ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
@@ -465,6 +465,7 @@ impl UiFailure {
             | DesktopDataError::InvalidBrowserWorkspaceMount
             | DesktopDataError::BrowserWorkspaceMountUnavailable
             | DesktopDataError::BrowserWorkspaceHostAlreadyMounted
+            | DesktopDataError::InvalidBrowserPublicSourceRead
             | DesktopDataError::InvalidBrowserWorkspaceContinue
             | DesktopDataError::InvalidBrowserWorkspaceTakeOver
             | DesktopDataError::InvalidBrowserWorkspaceControl
@@ -502,6 +503,7 @@ impl UiFailure {
             ),
             DesktopDataError::BrowserWorkspaceContinueNotHeld
             | DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld
+            | DesktopDataError::BrowserWorkspaceReadNotAgentHeld
             | DesktopDataError::BrowserWorkspacePauseUnavailable
             | DesktopDataError::BrowserWorkspaceResumeUnavailable => Self::coded(
                 "STALE_SELECTION",
@@ -1110,6 +1112,11 @@ pub fn App() -> Element {
     let mut result_action_pending = use_signal(|| false);
     let mut browser_workspace_create_pending = use_signal(|| false);
     let mut browser_workspace_mount_pending = use_signal(|| false);
+    let mut browser_public_source_read_pending = use_signal(|| false);
+    let mut browser_public_source_read_scope =
+        use_signal(|| None::<DesktopBrowserWorkspaceControlRequest>);
+    let mut browser_public_source_observation =
+        use_signal(|| None::<BrowserPublicSourceObservation>);
     let mut vm11_outcome_action = use_signal(|| None::<(MissionId, OutcomeDecision)>);
     let mut workpad_open = use_signal(initial_workpad_open);
     let mut global_search_query = use_signal(String::new);
@@ -1861,8 +1868,15 @@ pub fn App() -> Element {
                 browser_workspace_control_request(&project.project_id, mission)
             })
             .is_some_and(|request| {
-                DesktopDataPlane::persistent()
-                    .is_ok_and(|plane| plane.browser_workspace_host_mounted(&request))
+                if browser_public_source_read_pending() {
+                    browser_public_source_read_scope
+                        .read()
+                        .as_ref()
+                        .is_some_and(|scope| scope == &request)
+                } else {
+                    DesktopDataPlane::persistent()
+                        .is_ok_and(|plane| plane.browser_workspace_host_mounted(&request))
+                }
             });
     let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
         project.as_ref(),
@@ -2122,6 +2136,72 @@ pub fn App() -> Element {
                 }
             }
             browser_workspace_mount_pending.set(false);
+        });
+    };
+    let request_operations_read_browser = move |target_url: String| {
+        if browser_public_source_read_pending() {
+            return;
+        }
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可读取的 Mission Browser Workspace。".into(),
+            });
+            return;
+        };
+        let Some(workspace) = mission.browser_workspace.as_ref() else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前 Mission 没有持久 Browser Workspace；未执行导航或观察。".into(),
+            });
+            return;
+        };
+        let request = DesktopReadBrowserPublicSourceRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+            target_url,
+        };
+        browser_public_source_read_scope.set(Some(DesktopBrowserWorkspaceControlRequest {
+            project_id: request.project_id.clone(),
+            mission_id: request.mission_id.clone(),
+            workspace_id: request.workspace_id.clone(),
+            expected_revision: request.expected_revision,
+            expected_generation: request.expected_generation,
+        }));
+        browser_public_source_observation.set(None);
+        browser_public_source_read_pending.set(true);
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.read_browser_public_source_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(observation)) => {
+                    browser_public_source_observation.set(Some(observation));
+                    model.write().notice = None;
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_READ_COORDINATOR_FAILED".into(),
+                        message: "Browser 只读协调异常结束；未执行写动作、Effect 或 Verification。"
+                            .into(),
+                    });
+                }
+            }
+            browser_public_source_read_scope.set(None);
+            browser_public_source_read_pending.set(false);
         });
     };
     let request_operations_take_over_browser = move |()| {
@@ -3121,6 +3201,8 @@ pub fn App() -> Element {
                                 result_action_pending: result_action_pending(),
                                 browser_workspace_create_pending: browser_workspace_create_pending(),
                                 browser_workspace_mount_pending: browser_workspace_mount_pending(),
+                                browser_public_source_read_pending: browser_public_source_read_pending(),
+                                browser_public_source_observation: browser_public_source_observation(),
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
@@ -3142,6 +3224,7 @@ pub fn App() -> Element {
                                 on_interrupt: request_operations_interrupt,
                                 on_create_browser_workspace: request_operations_create_browser,
                                 on_mount_browser_workspace: request_operations_mount_browser,
+                                on_read_browser_public_source: request_operations_read_browser,
                                 on_take_over_browser_workspace: request_operations_take_over_browser,
                                 on_continue_browser_workspace: request_operations_continue_browser,
                                 on_pause_browser_workspace: request_operations_pause_browser,
@@ -6140,12 +6223,15 @@ fn AgentOperationsWorkbench(
     result_action_pending: bool,
     browser_workspace_create_pending: bool,
     browser_workspace_mount_pending: bool,
+    browser_public_source_read_pending: bool,
+    browser_public_source_observation: Option<BrowserPublicSourceObservation>,
     interrupt_available: bool,
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
     on_create_browser_workspace: EventHandler<()>,
     on_mount_browser_workspace: EventHandler<()>,
+    on_read_browser_public_source: EventHandler<String>,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_pause_browser_workspace: EventHandler<()>,
@@ -6155,6 +6241,7 @@ fn AgentOperationsWorkbench(
     on_reject_cordis: EventHandler<()>,
     on_result_action: EventHandler<ResultSurfaceAction>,
 ) -> Element {
+    let mut browser_public_source_url = use_signal(String::new);
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
     let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
     let interrupt_label = if recovery_required {
@@ -6166,6 +6253,12 @@ fn AgentOperationsWorkbench(
     } else {
         "没有可中断 turn"
     };
+    let browser_public_source_observation =
+        browser_public_source_observation.filter(|observation| {
+            projection.browser.workspace_id.as_ref() == Some(&observation.workspace_id)
+                && projection.browser.revision == Some(observation.workspace_revision)
+                && projection.browser.lease_generation == Some(observation.lease_generation)
+        });
     rsx! {
         article {
             class: "agent-operations-workbench",
@@ -6502,7 +6595,41 @@ fn AgentOperationsWorkbench(
                             }
                         }
                         {
-                            let take_over_ready = projection.browser.take_over_status == OperationsStatus::Ready;
+                            let read_ready = projection.browser.read_status == OperationsStatus::Ready
+                                && !browser_public_source_read_pending
+                                && !browser_public_source_url().is_empty();
+                            let read_label = if browser_public_source_read_pending {
+                                "Read · RUNNING".to_owned()
+                            } else {
+                                format!("Read · {}", projection.browser.read_status.code())
+                            };
+                            rsx! {
+                                label { class: "operations-browser-read",
+                                    span { "Public HTTPS target" }
+                                    input {
+                                        r#type: "url",
+                                        value: "{browser_public_source_url}",
+                                        disabled: projection.browser.read_status != OperationsStatus::Ready
+                                            || browser_public_source_read_pending,
+                                        autocomplete: "off",
+                                        spellcheck: "false",
+                                        placeholder: "https://example.com/research",
+                                        aria_label: "Browser 只读 HTTPS 地址",
+                                        oninput: move |event| browser_public_source_url.set(event.value()),
+                                    }
+                                    button {
+                                        disabled: !read_ready,
+                                        aria_label: "读取公开 HTTPS 页面",
+                                        title: "仅执行同源 HTTPS 导航与脱敏语义观察；不点击、不写入、不声明 Verification",
+                                        onclick: move |_| on_read_browser_public_source.call(browser_public_source_url()),
+                                        "{read_label}"
+                                    }
+                                }
+                            }
+                        }
+                        {
+                            let take_over_ready = projection.browser.take_over_status == OperationsStatus::Ready
+                                && !browser_public_source_read_pending;
                             let take_over_title = match projection.browser.take_over_status {
                                 OperationsStatus::Ready => "通过 Application take_over_browser_workspace 切换为用户持有",
                                 OperationsStatus::Empty => "当前没有 Agent 持有的 Browser Workspace",
@@ -6520,7 +6647,8 @@ fn AgentOperationsWorkbench(
                             }
                         }
                         {
-                            let continue_ready = projection.browser.continue_status == OperationsStatus::Ready;
+                            let continue_ready = projection.browser.continue_status == OperationsStatus::Ready
+                                && !browser_public_source_read_pending;
                             let continue_title = match projection.browser.continue_status {
                                 OperationsStatus::Ready => "通过 Application continue_browser_workspace 签发新 Agent lease",
                                 OperationsStatus::Empty => "当前 Mission 没有用户持有的 Browser Workspace",
@@ -6538,7 +6666,8 @@ fn AgentOperationsWorkbench(
                             }
                         }
                         {
-                            let pause_ready = projection.browser.pause_status == OperationsStatus::Ready;
+                            let pause_ready = projection.browser.pause_status == OperationsStatus::Ready
+                                && !browser_public_source_read_pending;
                             let pause_title = match projection.browser.pause_status {
                                 OperationsStatus::Ready => "通过 Application pause_browser_workspace 收紧 Host 后持久化暂停",
                                 _ => "当前 Browser Workspace 不可暂停",
@@ -6555,7 +6684,8 @@ fn AgentOperationsWorkbench(
                             }
                         }
                         {
-                            let resume_ready = projection.browser.resume_status == OperationsStatus::Ready;
+                            let resume_ready = projection.browser.resume_status == OperationsStatus::Ready
+                                && !browser_public_source_read_pending;
                             let resume_title = match projection.browser.resume_status {
                                 OperationsStatus::Ready => "通过 Application resume_browser_workspace 恢复原所有者",
                                 _ => "当前 Browser Workspace 不可恢复",
@@ -6570,6 +6700,20 @@ fn AgentOperationsWorkbench(
                                     "{resume_label}"
                                 }
                             }
+                        }
+                    }
+                    if let Some(observation) = browser_public_source_observation {
+                        div { class: "operations-browser-observation", role: "status", aria_live: "polite",
+                            strong {
+                                if observation.prompt_risk == BrowserPromptRisk::None {
+                                    "READ ONLY · OBSERVED"
+                                } else {
+                                    "READ ONLY · PROMPT RISK BLOCKED"
+                                }
+                            }
+                            span { "Snapshot {short_digest(observation.snapshot_id.as_str())} · document {observation.document_generation} · {observation.element_ref_count} semantic refs" }
+                            span { "URL {short_digest(&observation.url_digest)} · content {short_digest(&observation.content_digest)} · navigation {short_digest(&observation.navigation_evidence_digest)}" }
+                            small { "Scripts disabled: {observation.script_execution_disabled} · requests: {observation.allowed_request_count} · business verified: {observation.business_verified}" }
                         }
                     }
                 }
@@ -6639,12 +6783,15 @@ fn OrchestratorSurface(
     result_action_pending: bool,
     browser_workspace_create_pending: bool,
     browser_workspace_mount_pending: bool,
+    browser_public_source_read_pending: bool,
+    browser_public_source_observation: Option<BrowserPublicSourceObservation>,
     context_access: Option<ProjectContextAccessProjection>,
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
     interrupt_requested: bool,
     on_create_browser_workspace: EventHandler<()>,
     on_mount_browser_workspace: EventHandler<()>,
+    on_read_browser_public_source: EventHandler<String>,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_pause_browser_workspace: EventHandler<()>,
@@ -6747,12 +6894,15 @@ fn OrchestratorSurface(
                             result_action_pending,
                             browser_workspace_create_pending,
                             browser_workspace_mount_pending,
+                            browser_public_source_read_pending,
+                            browser_public_source_observation: browser_public_source_observation.clone(),
                             interrupt_available: false,
                             interrupt_requested: false,
                             on_quick_entry,
                             on_interrupt,
                             on_create_browser_workspace,
                             on_mount_browser_workspace,
+                            on_read_browser_public_source,
                             on_take_over_browser_workspace,
                             on_continue_browser_workspace,
                             on_pause_browser_workspace,
@@ -6884,12 +7034,15 @@ fn OrchestratorSurface(
                         result_action_pending,
                         browser_workspace_create_pending,
                         browser_workspace_mount_pending,
+                        browser_public_source_read_pending,
+                        browser_public_source_observation,
                         interrupt_available,
                         interrupt_requested,
                         on_quick_entry,
                         on_interrupt,
                         on_create_browser_workspace,
                         on_mount_browser_workspace,
+                        on_read_browser_public_source,
                         on_take_over_browser_workspace,
                         on_continue_browser_workspace,
                         on_pause_browser_workspace,
@@ -12035,6 +12188,8 @@ mod tests {
         assert!(source.contains("DesktopCreateBrowserWorkspaceRequest"));
         assert!(source.contains("mount_browser_workspace_os"));
         assert!(source.contains("browser_workspace_host_mounted"));
+        assert!(source.contains("read_browser_public_source_os"));
+        assert!(source.contains("DesktopReadBrowserPublicSourceRequest"));
         assert!(source.contains("take_over_browser_workspace_os"));
         assert!(source.contains("DesktopTakeOverBrowserWorkspaceRequest"));
         assert!(source.contains("continue_browser_workspace_os"));
@@ -12046,6 +12201,9 @@ mod tests {
         assert!(source.contains("Create · RUNNING"));
         assert!(source.contains("format!(\"Mount · {}\""));
         assert!(source.contains("Mount · RUNNING"));
+        assert!(source.contains("Read · RUNNING"));
+        assert!(source.contains("READ ONLY · PROMPT RISK BLOCKED"));
+        assert!(source.contains("business verified: {observation.business_verified}"));
         assert!(source.contains("format!(\"Take over · {}\""));
         assert!(source.contains("format!(\"Continue · {}\""));
         assert!(source.contains("format!(\"Pause · {}\""));
@@ -12054,6 +12212,8 @@ mod tests {
         assert!(source.contains("browser_workspace_create_pending"));
         assert!(source.contains("on_mount_browser_workspace"));
         assert!(source.contains("browser_workspace_mount_pending"));
+        assert!(source.contains("on_read_browser_public_source"));
+        assert!(source.contains("browser_public_source_read_pending"));
         assert!(source.contains("on_take_over_browser_workspace"));
         assert!(source.contains("on_continue_browser_workspace"));
         assert!(source.contains("on_pause_browser_workspace"));
