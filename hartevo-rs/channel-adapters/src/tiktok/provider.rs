@@ -214,12 +214,13 @@ pub fn parse_video_page_response(
         None
     };
     let account = account_for_scope(expected_scope);
-    let observations = videos
+    let mut observations = videos
         .iter()
         .map(|video| {
             parse_video_observation(expected_scope, &account, video, freshness, provenance)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    sort_video_observations(&mut observations)?;
     Ok(TiktokVideoPage {
         scope: expected_scope.clone(),
         requested_cursor,
@@ -403,6 +404,43 @@ fn parse_timestamp(value: &Value) -> Result<DateTime<Utc>, TiktokError> {
         .as_i64()
         .ok_or_else(|| invalid_response("create_time"))?;
     DateTime::from_timestamp(seconds, 0).ok_or_else(|| invalid_response("create_time"))
+}
+
+fn sort_video_observations(
+    observations: &mut [TiktokObservationEnvelope],
+) -> Result<(), TiktokError> {
+    if observations
+        .iter()
+        .any(|observation| matches!(observation.observation(), TiktokReadObservation::Account(_)))
+    {
+        return Err(TiktokError::CursorDrift);
+    }
+    observations.sort_by(|left, right| {
+        let TiktokReadObservation::Video(left_video) = left.observation() else {
+            return std::cmp::Ordering::Equal;
+        };
+        let TiktokReadObservation::Video(right_video) = right.observation() else {
+            return std::cmp::Ordering::Equal;
+        };
+        left_video
+            .identity()
+            .video_id()
+            .cmp(right_video.identity().video_id())
+    });
+    if observations.windows(2).any(|pair| {
+        let left = match pair[0].observation() {
+            TiktokReadObservation::Video(video) => video.identity().video_id(),
+            TiktokReadObservation::Account(_) => return true,
+        };
+        let right = match pair[1].observation() {
+            TiktokReadObservation::Video(video) => video.identity().video_id(),
+            TiktokReadObservation::Account(_) => return true,
+        };
+        left == right
+    }) {
+        return Err(TiktokError::CursorDrift);
+    }
+    Ok(())
 }
 
 fn invalid_response(field: impl Into<String>) -> TiktokError {

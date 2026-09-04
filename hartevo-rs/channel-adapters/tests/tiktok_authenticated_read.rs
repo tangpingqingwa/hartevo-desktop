@@ -58,15 +58,24 @@ fn scope() -> TiktokReadScope {
 }
 
 fn credential(scope: &TiktokReadScope, now: chrono::DateTime<Utc>) -> OAuthCredential {
+    credential_with(scope, now, "keychain://tiktok/open01", 1)
+}
+
+fn credential_with(
+    scope: &TiktokReadScope,
+    now: chrono::DateTime<Utc>,
+    secret_reference: &str,
+    generation: u64,
+) -> OAuthCredential {
     OAuthCredential::new(
-        SecretReference::new("keychain://tiktok/open01").unwrap(),
+        SecretReference::new(secret_reference).unwrap(),
         scope.clone(),
         [TiktokOAuthScope::UserInfoBasic, TiktokOAuthScope::VideoList]
             .into_iter()
             .collect::<BTreeSet<_>>(),
         now + Duration::hours(1),
         Some(now + Duration::days(30)),
-        1,
+        generation,
     )
     .unwrap()
 }
@@ -153,6 +162,7 @@ fn video_list_is_durable_cursor_pagination_with_performance_observations() {
     let mut service =
         TiktokAuthenticatedReadService::fixture(transport, TiktokFreshnessPolicy::default());
     let mut cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+    let initial_evidence_root = cursor.evidence_root().to_owned();
 
     let first = service
         .list_videos(&read_credential, &mut cursor, now, 20)
@@ -160,6 +170,11 @@ fn video_list_is_durable_cursor_pagination_with_performance_observations() {
     assert_eq!(first.provenance(), EvidenceProvenance::Fixture);
     assert!(first.has_more());
     assert_eq!(first.cursor_generation(), 1);
+    assert_eq!(first.sequence().account(), read_scope.account());
+    assert_eq!(first.sequence().generation(), 1);
+    assert_eq!(first.credential_generation(), read_credential.generation());
+    assert_ne!(first.evidence_root(), initial_evidence_root);
+    assert_eq!(first.evidence_root(), cursor.evidence_root());
     assert_eq!(first.observations().len(), 1);
     let first_observation = &first.observations()[0];
     assert!(matches!(
@@ -170,12 +185,28 @@ fn video_list_is_durable_cursor_pagination_with_performance_observations() {
     ));
     assert_eq!(cursor.next_cursor().unwrap().value(), 1_767_301_445_000);
     assert_eq!(cursor.generation(), 1);
+    assert_eq!(cursor.accepted_page_count(), 1);
+    assert_eq!(cursor.credential_generation(), Some(1));
+    assert_eq!(cursor.credential_reference_digest().unwrap().len(), 64);
     cursor.require_fresh(now).unwrap();
 
     let checkpoint = cursor.checkpoint_json().unwrap();
+    assert!(!checkpoint.contains("keychain://tiktok/open01"));
     let restored = TiktokVideoListCursor::from_checkpoint_json(&checkpoint).unwrap();
     assert_eq!(restored, cursor);
     assert_eq!(restored.durable_digest(), cursor.durable_digest());
+    let mut tampered_checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+    tampered_checkpoint["accepted_pages"]["1"]["evidence_root"] =
+        serde_json::Value::String("0".repeat(64));
+    assert_eq!(
+        TiktokVideoListCursor::from_checkpoint_json(
+            &serde_json::to_string(&tampered_checkpoint).unwrap()
+        )
+        .unwrap_err(),
+        TiktokError::CursorDrift
+    );
+    cursor = restored;
+    let first_evidence_root = cursor.evidence_root().to_owned();
 
     assert_eq!(
         service.list_videos(&read_credential, &mut cursor, now, 10),
@@ -188,6 +219,7 @@ fn video_list_is_durable_cursor_pagination_with_performance_observations() {
     assert_eq!(duplicate.cursor_generation(), 1);
     assert_eq!(duplicate.page_digest(), first.page_digest());
     assert_eq!(cursor.generation(), 1);
+    assert_eq!(cursor.evidence_root(), first_evidence_root);
 
     let final_page = service
         .list_videos(&read_credential, &mut cursor, now, 20)
@@ -195,8 +227,12 @@ fn video_list_is_durable_cursor_pagination_with_performance_observations() {
     assert!(!final_page.has_more());
     assert_eq!(final_page.next_cursor(), None);
     assert_eq!(final_page.cursor_generation(), 2);
+    assert_eq!(final_page.sequence().generation(), 2);
+    assert_ne!(final_page.evidence_root(), first_evidence_root);
+    assert_eq!(final_page.evidence_root(), cursor.evidence_root());
     assert!(!cursor.has_more());
     assert_eq!(cursor.generation(), 2);
+    assert_eq!(cursor.accepted_page_count(), 2);
     assert_eq!(
         service.list_videos(&read_credential, &mut cursor, now, 20),
         Err(TiktokError::CursorExhausted)
@@ -209,6 +245,125 @@ fn video_list_is_durable_cursor_pagination_with_performance_observations() {
     assert_eq!(requests[0].url().path(), "/v2/video/list/");
     assert_eq!(requests[0].body().unwrap()["max_count"], 20);
     assert_eq!(requests[1].body().unwrap()["cursor"], 1_767_301_445_000_i64);
+}
+
+#[test]
+fn video_list_cursor_checkpoint_is_credential_bound_before_provider_io() {
+    let now = fixed_now();
+    let read_scope = scope();
+    let original = credential(&read_scope, now);
+    let mut seed_service = TiktokAuthenticatedReadService::fixture(
+        FixtureTransport::responses([first_video_page_response()]),
+        TiktokFreshnessPolicy::default(),
+    );
+    let mut cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+    seed_service
+        .list_videos(&original, &mut cursor, now, 20)
+        .unwrap();
+
+    let checkpoint = cursor.checkpoint_json().unwrap();
+    assert!(!checkpoint.contains(original.secret_reference().as_str()));
+    let mut restored = TiktokVideoListCursor::from_checkpoint_json(&checkpoint).unwrap();
+    let before = restored.clone();
+    let rotated = credential_with(&read_scope, now, "keychain://tiktok/open01-rotated", 2);
+    let transport = FixtureTransport::responses([final_video_page_response()]);
+    let requests = Rc::clone(&transport.requests);
+    let mut rotated_service =
+        TiktokAuthenticatedReadService::fixture(transport, TiktokFreshnessPolicy::default());
+
+    assert_eq!(
+        rotated_service
+            .list_videos(&rotated, &mut restored, now, 20)
+            .unwrap_err(),
+        TiktokError::CursorCredentialMismatch
+    );
+    assert!(requests.borrow().is_empty());
+    assert_eq!(restored, before);
+
+    let mut legacy_checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+    let legacy_object = legacy_checkpoint.as_object_mut().unwrap();
+    legacy_object.remove("credential_generation");
+    legacy_object.remove("credential_reference_digest");
+    legacy_object.remove("accepted_pages");
+    legacy_object.remove("evidence_root");
+    assert_eq!(
+        TiktokVideoListCursor::from_checkpoint_json(
+            &serde_json::to_string(&legacy_checkpoint).unwrap()
+        )
+        .unwrap_err(),
+        TiktokError::CursorCheckpointIncompatible
+    );
+}
+
+#[test]
+fn video_list_sorts_typed_identities_and_rejects_page_duplicates() {
+    let now = fixed_now();
+    let read_scope = scope();
+    let read_credential = credential(&read_scope, now);
+    let unsorted = response(
+        200,
+        r#"{
+          "data":{
+            "videos":[
+              {"id":"7340000000000000002","view_count":2},
+              {"id":"7340000000000000001","view_count":1}
+            ],
+            "cursor":1767301445000,
+            "has_more":false
+          },
+          "error":{"code":"ok"}
+        }"#,
+    );
+    let mut sorted_service = TiktokAuthenticatedReadService::fixture(
+        FixtureTransport::responses([unsorted]),
+        TiktokFreshnessPolicy::default(),
+    );
+    let mut sorted_cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
+    let sorted_page = sorted_service
+        .list_videos(&read_credential, &mut sorted_cursor, now, 20)
+        .unwrap();
+    let sorted_ids = sorted_page
+        .observations()
+        .iter()
+        .map(|observation| match observation.observation() {
+            TiktokReadObservation::Video(video) => video.identity().video_id().as_str(),
+            TiktokReadObservation::Account(_) => "account",
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sorted_ids,
+        vec!["7340000000000000001", "7340000000000000002"]
+    );
+
+    let repeated_within_page = response(
+        200,
+        r#"{
+          "data":{
+            "videos":[
+              {"id":"7340000000000000001","view_count":1},
+              {"id":"7340000000000000001","view_count":2}
+            ],
+            "cursor":1767301445000,
+            "has_more":false
+          },
+          "error":{"code":"ok"}
+        }"#,
+    );
+    let mut duplicate_service = TiktokAuthenticatedReadService::fixture(
+        FixtureTransport::responses([repeated_within_page]),
+        TiktokFreshnessPolicy::default(),
+    );
+    let mut duplicate_cursor = TiktokVideoListCursor::new(read_scope).unwrap();
+    let initial_root = duplicate_cursor.evidence_root().to_owned();
+    assert_eq!(
+        duplicate_service
+            .list_videos(&read_credential, &mut duplicate_cursor, now, 20)
+            .unwrap_err(),
+        TiktokError::CursorDrift
+    );
+    assert_eq!(duplicate_cursor.generation(), 0);
+    assert_eq!(duplicate_cursor.accepted_page_count(), 0);
+    assert_eq!(duplicate_cursor.evidence_root(), initial_root);
 }
 
 #[test]
@@ -368,8 +523,8 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
               "title":"Drifted page",
               "like_count":999
             }],
-            "cursor":1767301445000,
-            "has_more":true
+            "cursor":1767301445001,
+            "has_more":false
           },
           "error":{"code":"ok"}
         }"#,
@@ -383,13 +538,15 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
     drifted
         .list_videos(&read_credential, &mut drift_cursor, now, 20)
         .unwrap();
+    let before_drift = drift_cursor.clone();
     assert_eq!(
         drifted
             .list_videos(&read_credential, &mut drift_cursor, now, 20)
             .unwrap_err(),
         TiktokError::CursorDrift
     );
-    assert_eq!(drift_cursor.generation(), 1);
+    assert_eq!(drift_cursor, before_drift);
+    assert_eq!(drift_cursor.accepted_page_count(), 1);
 }
 
 #[test]

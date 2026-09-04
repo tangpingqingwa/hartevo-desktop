@@ -149,6 +149,7 @@ impl<T> TiktokAuthenticatedReadService<T> {
         credential.require_for(TiktokApiOperation::VideoList, &scope, now)?;
         self.provider
             .require_credential_reference(credential.secret_reference())?;
+        cursor.bind_credential(credential)?;
         let request = video_list_request(
             credential.secret_reference().clone(),
             cursor.next_cursor(),
@@ -173,7 +174,8 @@ impl<T> TiktokAuthenticatedReadService<T> {
         cursor.apply_page(cursor.generation(), &page)?;
         Ok(video_page_envelope(
             &page,
-            cursor.generation(),
+            cursor,
+            credential.generation(),
             self.provenance(),
         ))
     }
@@ -244,7 +246,8 @@ where
 
 fn video_page_envelope(
     page: &TiktokVideoPage,
-    cursor_generation: u64,
+    cursor: &TiktokVideoListCursor,
+    credential_generation: u64,
     provenance: EvidenceProvenance,
 ) -> TiktokVideoPageEnvelope {
     let account = page.observations.first().map_or_else(
@@ -263,7 +266,9 @@ fn video_page_envelope(
         next_cursor: page.next_cursor,
         has_more: page.has_more,
         page_digest: page.page_digest.clone(),
-        cursor_generation,
+        sequence: super::TiktokPageSequence::new(page.scope.account().clone(), cursor.generation()),
+        credential_generation,
+        evidence_root: cursor.evidence_root().to_owned(),
         freshness: page.freshness,
         provenance,
         observations: page.observations.clone(),
