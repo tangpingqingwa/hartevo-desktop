@@ -185,6 +185,54 @@ fn provider_observation_adoption_reuses_the_one_shot_domain_boundary() {
 }
 
 #[test]
+fn provider_observation_read_reuses_the_one_shot_domain_boundary() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 3);
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::NotRequired,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let digest = "e".repeat(64);
+    let command = DomainCommandBinding::read_provider_observation(
+        "tiktok-video-sequence-read-a",
+        digest.clone(),
+    )
+    .unwrap();
+    let permit = host
+        .authorize_domain_command(&scope, command.clone())
+        .unwrap();
+    assert_eq!(permit.scope(), &scope);
+    assert_eq!(permit.command(), &command);
+    assert_eq!(
+        permit.command().kind(),
+        DomainCommandKind::ReadProviderObservation
+    );
+    assert_eq!(
+        permit.command().provider_read_id(),
+        Some("tiktok-video-sequence-read-a")
+    );
+    assert_eq!(
+        permit.command().provider_read_digest(),
+        Some(digest.as_str())
+    );
+    assert_eq!(permit.command().effect_id(), "tiktok-video-sequence-read-a");
+    assert_eq!(permit.command().proposal_digest(), None);
+    assert_eq!(permit.command().approval_scope_digest(), None);
+    assert_eq!(permit.command().observation_id(), None);
+    assert_eq!(permit.command().observation_digest(), None);
+    assert_eq!(
+        host.authorize_domain_command(&scope, command).unwrap_err(),
+        CordisError::DomainCommandDispatchBusy
+    );
+    host.finish_domain_command(permit).unwrap();
+    assert!(host.active_domain_command_scope().is_none());
+}
+
+#[test]
 fn domain_command_requires_and_preserves_exact_bound_scope() {
     let mut host = CordisHost::boot(false).unwrap();
     let scope = domain_scope("project-a", "mission-a", 3);

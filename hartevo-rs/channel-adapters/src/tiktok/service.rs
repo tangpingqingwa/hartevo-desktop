@@ -10,10 +10,12 @@ use super::provider::{
     video_query_request,
 };
 use super::{
-    EvidenceProvenance, OAuthCredential, REAL_READ_ENABLE_ENV, REAL_READ_SECRET_REFERENCE_ENV,
-    TiktokApiOperation, TiktokError, TiktokFreshness, TiktokFreshnessPolicy,
-    TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope, TiktokRetryAfterReceipt,
-    TiktokVideoId, TiktokVideoListCursor, TiktokVideoPage, TiktokVideoPageEnvelope,
+    EvidenceProvenance, MAX_VIDEO_SEQUENCE_PAGES, MissionTiktokVideoSequenceConsumer,
+    OAuthCredential, REAL_READ_ENABLE_ENV, REAL_READ_SECRET_REFERENCE_ENV, TiktokApiOperation,
+    TiktokError, TiktokFreshness, TiktokFreshnessPolicy, TiktokMissionAcceptedSequence,
+    TiktokMissionPageProgress, TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope,
+    TiktokRetryAfterReceipt, TiktokVideoId, TiktokVideoListCursor, TiktokVideoPage,
+    TiktokVideoPageEnvelope,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -208,6 +210,48 @@ impl<T> TiktokAuthenticatedReadService<T> {
         ))
     }
 
+    /// Read one fresh, bounded production `video.list` sequence and admit it
+    /// through the Mission sequence consumer. This method never sleeps or
+    /// retries: rate limits, duplicate pages, drift, and budget exhaustion
+    /// remain explicit failures for the caller to reconcile.
+    pub fn read_video_sequence(
+        &mut self,
+        credential: &OAuthCredential,
+        scope: &TiktokReadScope,
+        now: DateTime<Utc>,
+        page_size: u8,
+        max_pages: u16,
+    ) -> Result<TiktokMissionAcceptedSequence, TiktokError>
+    where
+        T: ReadOnlyTransport,
+    {
+        if !(1..=MAX_VIDEO_SEQUENCE_PAGES).contains(&max_pages) {
+            return Err(TiktokError::InvalidRequest(
+                "TikTok video sequence max_pages must be one through one hundred",
+            ));
+        }
+        if self.provenance() != EvidenceProvenance::ProductionProvider {
+            return Err(TiktokError::ProvenanceRejected);
+        }
+        credential.require_for(TiktokApiOperation::VideoList, scope, now)?;
+        self.provider
+            .require_credential_reference(credential.secret_reference())?;
+
+        let mut cursor = TiktokVideoListCursor::new_with_page_size(scope.clone(), page_size)?;
+        let mut consumer = MissionTiktokVideoSequenceConsumer::new(scope.clone(), page_size)?;
+        for _ in 0..max_pages {
+            let page = self.list_videos(credential, &mut cursor, now, page_size)?;
+            match consumer.accept_page(page, credential, now)? {
+                TiktokMissionPageProgress::Complete(sequence) => return Ok(sequence),
+                TiktokMissionPageProgress::Pending { .. } => {}
+                TiktokMissionPageProgress::Duplicate(_) => {
+                    return Err(TiktokError::CursorDrift);
+                }
+            }
+        }
+        Err(TiktokError::PageBudgetExhausted { max_pages })
+    }
+
     pub fn query_videos(
         &mut self,
         credential: &OAuthCredential,
@@ -305,7 +349,7 @@ fn video_page_envelope(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
 
     use chrono::Duration;
 
@@ -325,6 +369,29 @@ mod tests {
             _request: &ProviderReadRequest,
         ) -> Result<ProviderResponse, TransportError> {
             Err(TransportError::Unavailable)
+        }
+    }
+
+    struct SequenceTransport {
+        responses: VecDeque<ProviderResponse>,
+    }
+
+    impl SequenceTransport {
+        fn new(responses: impl IntoIterator<Item = ProviderResponse>) -> Self {
+            Self {
+                responses: responses.into_iter().collect(),
+            }
+        }
+    }
+
+    impl ReadOnlyTransport for SequenceTransport {
+        fn send(
+            &mut self,
+            _request: &ProviderReadRequest,
+        ) -> Result<ProviderResponse, TransportError> {
+            self.responses
+                .pop_front()
+                .ok_or(TransportError::Unavailable)
         }
     }
 
@@ -510,6 +577,74 @@ mod tests {
         assert_eq!(
             service.probe(&credential, now).unwrap_err(),
             TiktokError::CredentialReferenceMismatch
+        );
+    }
+
+    #[test]
+    fn production_service_reads_one_bounded_terminal_video_sequence() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let credential = video_credential(&read_scope, now, 1);
+        let gate = TiktokRealReadGate::from_environment_values(
+            Some("1"),
+            Some("keychain://tiktok/open01"),
+        )
+        .unwrap();
+        let mut service = TiktokAuthenticatedReadService::production(
+            SequenceTransport::new([first_video_page_response(), final_video_page_response()]),
+            gate,
+            TiktokFreshnessPolicy::default(),
+        );
+
+        let accepted = service
+            .read_video_sequence(&credential, &read_scope, now, 20, 2)
+            .unwrap();
+
+        assert_eq!(accepted.scope(), &read_scope);
+        assert_eq!(accepted.page_count(), 2);
+        assert_eq!(accepted.credential_generation(), 1);
+        accepted.validate_at(now).unwrap();
+    }
+
+    #[test]
+    fn production_service_fails_closed_when_video_sequence_exceeds_budget() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let credential = video_credential(&read_scope, now, 1);
+        let gate = TiktokRealReadGate::from_environment_values(
+            Some("1"),
+            Some("keychain://tiktok/open01"),
+        )
+        .unwrap();
+        let mut service = TiktokAuthenticatedReadService::production(
+            SequenceTransport::new([first_video_page_response()]),
+            gate,
+            TiktokFreshnessPolicy::default(),
+        );
+
+        assert_eq!(
+            service
+                .read_video_sequence(&credential, &read_scope, now, 20, 1)
+                .unwrap_err(),
+            TiktokError::PageBudgetExhausted { max_pages: 1 }
+        );
+    }
+
+    #[test]
+    fn non_production_service_cannot_drive_mission_video_sequence() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let credential = video_credential(&read_scope, now, 1);
+        let mut service = TiktokAuthenticatedReadService::fixture(
+            SequenceTransport::new([first_video_page_response()]),
+            TiktokFreshnessPolicy::default(),
+        );
+
+        assert_eq!(
+            service
+                .read_video_sequence(&credential, &read_scope, now, 20, 2)
+                .unwrap_err(),
+            TiktokError::ProvenanceRejected
         );
     }
 
