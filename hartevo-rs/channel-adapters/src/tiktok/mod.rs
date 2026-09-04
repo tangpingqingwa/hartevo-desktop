@@ -17,6 +17,7 @@ pub mod testkit;
 pub use consumer::{
     MissionTiktokReadConsumer, MissionTiktokVideoSequenceConsumer, TiktokMissionAcceptedRead,
     TiktokMissionAcceptedSequence, TiktokMissionDuplicatePageReceipt, TiktokMissionPageProgress,
+    TiktokVideoSequenceSession,
 };
 pub use provider::TiktokDisplayApiProvider;
 pub use service::{TiktokAuthenticatedReadService, TiktokRealReadGate, execute_real_read_gate};
@@ -453,7 +454,7 @@ impl OAuthCredential {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceProvenance {
     Fixture,
@@ -1474,8 +1475,8 @@ pub enum TiktokReadObservation {
     Video(TiktokVideoObservation),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct TiktokObservationEnvelope {
     provider: ProviderId,
     scope: TiktokReadScope,
@@ -1576,8 +1577,8 @@ impl TiktokObservationEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct TiktokVideoPageEnvelope {
     provider: ProviderId,
     scope: TiktokReadScope,

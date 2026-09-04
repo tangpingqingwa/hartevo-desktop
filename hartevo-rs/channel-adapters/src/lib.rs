@@ -29,7 +29,8 @@ pub use tiktok::{
     TiktokOAuthScope, TiktokObservationEnvelope, TiktokPageSequence,
     TiktokProviderResetObservation, TiktokQuotaLedger, TiktokReadObservation, TiktokReadScope,
     TiktokRealReadGate, TiktokRetryAfterReceipt, TiktokRevisionIdentity, TiktokVideoId,
-    TiktokVideoListCursor, TiktokVideoObservation, TiktokVideoPageEnvelope, execute_real_read_gate,
+    TiktokVideoListCursor, TiktokVideoObservation, TiktokVideoPageEnvelope,
+    TiktokVideoSequenceSession, execute_real_read_gate,
 };
 pub use transport::{
     AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderKind,

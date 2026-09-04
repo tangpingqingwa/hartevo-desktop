@@ -1,14 +1,197 @@
 //! Mission-side admission for exact TikTok read evidence.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use super::{
     EvidenceProvenance, OAuthCredential, TiktokError, TiktokObservationEnvelope,
     TiktokPageSequence, TiktokReadObservation, TiktokReadScope, TiktokRevisionIdentity,
-    TiktokVideoId, TiktokVideoPageEnvelope,
+    TiktokVideoId, TiktokVideoListCursor, TiktokVideoPageEnvelope,
 };
+
+const VIDEO_SEQUENCE_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+
+/// One resumable provider cursor and Mission admission sequence.
+///
+/// The session owns no credential or transport. Its serialized checkpoint
+/// contains the credential-reference digest already held by the cursor and the
+/// accepted provider envelopes needed to reconstruct Mission admission, but
+/// never the opaque credential reference itself.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TiktokVideoSequenceSession {
+    cursor: TiktokVideoListCursor,
+    consumer: MissionTiktokVideoSequenceConsumer,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct TiktokVideoSequenceCheckpointRecord {
+    schema_version: u32,
+    cursor: TiktokVideoListCursor,
+    pages: Vec<TiktokVideoPageEnvelope>,
+}
+
+impl fmt::Debug for TiktokVideoSequenceSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TiktokVideoSequenceSession")
+            .field("page_size", &self.page_size())
+            .field("generation", &self.generation())
+            .field("next_cursor", &self.next_cursor())
+            .field("credential_generation", &self.credential_generation())
+            .field("evidence_root", &self.evidence_root())
+            .field("complete", &self.is_complete())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TiktokVideoSequenceSession {
+    pub fn new(scope: TiktokReadScope, page_size: u8) -> Result<Self, TiktokError> {
+        let cursor = TiktokVideoListCursor::new_with_page_size(scope.clone(), page_size)?;
+        let consumer = MissionTiktokVideoSequenceConsumer::new(scope, page_size)?;
+        Ok(Self { cursor, consumer })
+    }
+
+    pub const fn scope(&self) -> &TiktokReadScope {
+        self.cursor.scope()
+    }
+
+    pub const fn page_size(&self) -> u8 {
+        self.cursor.page_size()
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.cursor.generation()
+    }
+
+    pub const fn next_cursor(&self) -> Option<super::TiktokCursor> {
+        self.cursor.next_cursor()
+    }
+
+    pub const fn credential_generation(&self) -> Option<u64> {
+        self.cursor.credential_generation()
+    }
+
+    pub fn evidence_root(&self) -> &str {
+        self.cursor.evidence_root()
+    }
+
+    pub const fn is_complete(&self) -> bool {
+        self.consumer.is_closed()
+    }
+
+    pub fn accepted_sequence(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<TiktokMissionAcceptedSequence>, TiktokError> {
+        self.validate_alignment()?;
+        if !self.consumer.closed {
+            return Ok(None);
+        }
+        let credential_generation = self
+            .consumer
+            .credential_generation
+            .ok_or(TiktokError::CursorCheckpointIncompatible)?;
+        let sequence = TiktokMissionAcceptedSequence {
+            scope: self.consumer.scope.clone(),
+            provider: super::ProviderId::Tiktok,
+            page_size: self.consumer.page_size,
+            credential_generation,
+            evidence_root: self.consumer.evidence_root.clone(),
+            pages: self.consumer.pages.values().cloned().collect(),
+        };
+        sequence.validate_at(now)?;
+        Ok(Some(sequence))
+    }
+
+    pub fn checkpoint_json(&self) -> Result<String, TiktokError> {
+        self.validate_alignment()?;
+        serde_json::to_string(&TiktokVideoSequenceCheckpointRecord {
+            schema_version: VIDEO_SEQUENCE_CHECKPOINT_SCHEMA_VERSION,
+            cursor: self.cursor.clone(),
+            pages: self.consumer.pages.values().cloned().collect(),
+        })
+        .map_err(|_| TiktokError::InvalidRequest("video sequence checkpoint serialization failed"))
+    }
+
+    pub fn from_checkpoint_json(
+        value: &str,
+        credential: &OAuthCredential,
+        now: DateTime<Utc>,
+    ) -> Result<Self, TiktokError> {
+        let record: TiktokVideoSequenceCheckpointRecord = serde_json::from_str(value)
+            .map_err(|_| TiktokError::InvalidRequest("invalid video sequence checkpoint"))?;
+        if record.schema_version != VIDEO_SEQUENCE_CHECKPOINT_SCHEMA_VERSION {
+            return Err(TiktokError::CursorCheckpointIncompatible);
+        }
+
+        let cursor_json = serde_json::to_string(&record.cursor)
+            .map_err(|_| TiktokError::InvalidRequest("invalid video sequence cursor"))?;
+        let mut cursor = TiktokVideoListCursor::from_checkpoint_json(&cursor_json)?;
+        credential.require_for(super::TiktokApiOperation::VideoList, cursor.scope(), now)?;
+        cursor.bind_credential(credential, now)?;
+        let mut session = Self::new(cursor.scope().clone(), cursor.page_size())?;
+        for (index, page) in record.pages.into_iter().enumerate() {
+            let last_page = index + 1
+                == usize::try_from(cursor.generation())
+                    .map_err(|_| TiktokError::CursorCheckpointIncompatible)?;
+            match session.consumer.accept_page(page, credential, now)? {
+                TiktokMissionPageProgress::Pending { .. } if !last_page || cursor.has_more() => {}
+                TiktokMissionPageProgress::Complete(_) if last_page && !cursor.has_more() => {}
+                TiktokMissionPageProgress::Pending { .. }
+                | TiktokMissionPageProgress::Complete(_)
+                | TiktokMissionPageProgress::Duplicate(_) => {
+                    return Err(TiktokError::CursorCheckpointIncompatible);
+                }
+            }
+        }
+        session.cursor = cursor;
+        session.validate_alignment()?;
+        Ok(session)
+    }
+
+    pub(crate) fn cursor_mut(&mut self) -> &mut TiktokVideoListCursor {
+        &mut self.cursor
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), TiktokError> {
+        self.validate_alignment()
+    }
+
+    pub(crate) fn accept_page(
+        &mut self,
+        page: TiktokVideoPageEnvelope,
+        credential: &OAuthCredential,
+        now: DateTime<Utc>,
+    ) -> Result<TiktokMissionPageProgress, TiktokError> {
+        let progress = self.consumer.accept_page(page, credential, now)?;
+        self.validate_alignment()?;
+        Ok(progress)
+    }
+
+    fn validate_alignment(&self) -> Result<(), TiktokError> {
+        self.cursor.checkpoint_json()?;
+        let accepted_page_count = usize::try_from(self.cursor.generation())
+            .map_err(|_| TiktokError::CursorCheckpointIncompatible)?;
+        if self.cursor.scope() != self.consumer.scope()
+            || self.cursor.page_size() != self.consumer.page_size()
+            || self.cursor.generation().checked_add(1) != Some(self.consumer.next_generation())
+            || self.cursor.next_cursor() != self.consumer.expected_cursor()
+            || self.cursor.evidence_root() != self.consumer.evidence_root()
+            || self.cursor.accepted_page_count() != accepted_page_count
+            || self.consumer.pages.len() != accepted_page_count
+            || (accepted_page_count > 0
+                && self.cursor.credential_generation() != self.consumer.credential_generation())
+            || self.cursor.has_more() == self.consumer.is_closed()
+        {
+            return Err(TiktokError::CursorCheckpointIncompatible);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionTiktokReadConsumer {
