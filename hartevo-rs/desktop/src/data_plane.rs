@@ -1688,6 +1688,63 @@ impl fmt::Debug for DesktopTiktokConnectionProbe {
     }
 }
 
+/// Redacted result of one registration-plus-probe setup attempt. Registration
+/// errors are returned directly; a later probe error retains the exact
+/// registration handle so a caller can explicitly retry through N149's
+/// fail-closed validation boundary.
+pub enum DesktopTiktokConnectionSetupOutcome {
+    Connected(DesktopTiktokConnectionProbe),
+    ProbeFailed {
+        registration: DesktopTiktokConnectionRegistration,
+        error: DesktopDataError,
+    },
+}
+
+impl DesktopTiktokConnectionSetupOutcome {
+    pub fn probe_error(&self) -> Option<&DesktopDataError> {
+        match self {
+            Self::Connected(_) => None,
+            Self::ProbeFailed { error, .. } => Some(error),
+        }
+    }
+
+    pub fn into_connected(self) -> Option<DesktopTiktokConnectionProbe> {
+        match self {
+            Self::Connected(probe) => Some(probe),
+            Self::ProbeFailed { .. } => None,
+        }
+    }
+
+    pub fn into_retry_request(self) -> Option<DesktopProbeTiktokConnectionRequest> {
+        match self {
+            Self::Connected(_) => None,
+            Self::ProbeFailed { registration, .. } => Some(registration.into_probe_request()),
+        }
+    }
+}
+
+impl fmt::Debug for DesktopTiktokConnectionSetupOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("DesktopTiktokConnectionSetupOutcome");
+        match self {
+            Self::Connected(probe) => debug
+                .field("connection_id", probe.connection().id())
+                .field("provider", &"tiktok")
+                .field("status", &probe.connection().snapshot().status)
+                .field("revision", &probe.connection().revision())
+                .field("credential", &"[REDACTED]")
+                .finish(),
+            Self::ProbeFailed { registration, .. } => debug
+                .field("connection_id", registration.connection().id())
+                .field("provider", &"tiktok")
+                .field("outcome", &"probe_failed")
+                .field("registration", &"[REDACTED]")
+                .field("probe_error", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
 struct DesktopTiktokConnectionProbeInput {
     scope: TiktokReadScope,
     observed_external_account_id: String,
@@ -4401,6 +4458,31 @@ impl DesktopDataPlane {
         self.adopt_tiktok_mission_sequence_with(&secret_store, request, now)
     }
 
+    /// Register and probe one TikTok Connection through the existing exact
+    /// Desktop boundaries. A post-registration probe failure is returned as a
+    /// redacted outcome with an explicit retry handle rather than hidden as if
+    /// no durable setup progress occurred.
+    pub fn setup_tiktok_connection_os(
+        &self,
+        request: DesktopRegisterTiktokConnectionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokConnectionSetupOutcome, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.setup_tiktok_connection_with(
+            &secret_store,
+            request,
+            now,
+            |project_id, credential, probed_at| {
+                native_tiktok_connection_probe_input(
+                    &secret_store,
+                    project_id,
+                    credential,
+                    probed_at,
+                )
+            },
+        )
+    }
+
     /// Register one exact initial TikTok Connection and install its generation
     /// one access token. The Connection remains PendingAuth until a later
     /// provider probe proves the expected account and scope.
@@ -4468,6 +4550,38 @@ impl DesktopDataPlane {
         }
     }
 
+    fn setup_tiktok_connection_with<Probe>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopRegisterTiktokConnectionRequest,
+        now: DateTime<Utc>,
+        probe: Probe,
+    ) -> Result<DesktopTiktokConnectionSetupOutcome, DesktopDataError>
+    where
+        Probe: FnOnce(
+            &ProjectId,
+            &OAuthCredential,
+            DateTime<Utc>,
+        ) -> Result<DesktopTiktokConnectionProbeInput, DesktopDataError>,
+    {
+        let registration = self.register_tiktok_connection_with(secret_store, request, now)?;
+        let retry_registration = registration.clone();
+        Ok(
+            match self.probe_tiktok_connection_with(
+                secret_store,
+                registration.into_probe_request(),
+                now,
+                probe,
+            ) {
+                Ok(probe) => DesktopTiktokConnectionSetupOutcome::Connected(probe),
+                Err(error) => DesktopTiktokConnectionSetupOutcome::ProbeFailed {
+                    registration: retry_registration,
+                    error,
+                },
+            },
+        )
+    }
+
     /// Probe one exact initial TikTok registration through the native
     /// generation-bound keyring transport. Only a fresh production account
     /// observation can publish the Connected revision.
@@ -4482,18 +4596,12 @@ impl DesktopDataPlane {
             request,
             now,
             |project_id, credential, probed_at| {
-                let probe_credential = tiktok_user_info_credential(credential)?;
-                let transport = native_tiktok_read_transport(
+                native_tiktok_connection_probe_input(
                     &secret_store,
                     project_id,
-                    probe_credential.scope(),
-                    &probe_credential,
+                    credential,
+                    probed_at,
                 )
-                .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
-                let mut provider =
-                    execute_real_read_gate(transport, TiktokFreshnessPolicy::default())?;
-                let observation = provider.probe(&probe_credential, probed_at)?;
-                desktop_tiktok_connection_probe_input(&observation)
             },
         )
     }
@@ -9703,6 +9811,25 @@ fn tiktok_user_info_credential(
         source.generation(),
     )
     .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)
+}
+
+fn native_tiktok_connection_probe_input(
+    secret_store: &impl SecretStore,
+    project_id: &ProjectId,
+    credential: &OAuthCredential,
+    probed_at: DateTime<Utc>,
+) -> Result<DesktopTiktokConnectionProbeInput, DesktopDataError> {
+    let probe_credential = tiktok_user_info_credential(credential)?;
+    let transport = native_tiktok_read_transport(
+        secret_store,
+        project_id,
+        probe_credential.scope(),
+        &probe_credential,
+    )
+    .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+    let mut provider = execute_real_read_gate(transport, TiktokFreshnessPolicy::default())?;
+    let observation = provider.probe(&probe_credential, probed_at)?;
+    desktop_tiktok_connection_probe_input(&observation)
 }
 
 fn desktop_tiktok_connection_probe_input(
@@ -25418,6 +25545,198 @@ sleep 30"#;
             restored.credential(),
             &expected_credential
         ));
+        drop(directory);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused test proves successful composition, single-attempt failure, retained retry authority, redaction, and registration fail-closed behavior"
+    )]
+    fn tiktok_connection_setup_composes_one_attempt_and_retains_exact_retry() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let project = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("application")
+            .list_projects()
+            .expect("Project inventory")
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .expect("exact Project");
+        let request =
+            |connection_id: &str, scope: TiktokReadScope, generation: u64, access_token: &str| {
+                DesktopRegisterTiktokConnectionRequest {
+                    connection_id: ConnectionId::from_stable(connection_id),
+                    credential: DesktopConfigureTiktokCredentialRequest {
+                        project_id: project_id.clone(),
+                        scope,
+                        access_token_expires_at: now + Duration::hours(1),
+                        refresh_token_expires_at: Some(now + Duration::days(30)),
+                        generation,
+                        access_token: Zeroizing::new(access_token.to_owned()),
+                    },
+                }
+            };
+
+        let connected_scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(project.tenant_id.as_str()).unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-setup-connected-private").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("account-setup-connected-private")
+                .unwrap(),
+        );
+        let connected_id = ConnectionId::from_stable("desktop-tiktok-setup-connected");
+        let connected_calls = Arc::new(AtomicUsize::new(0));
+        let observed_connected_calls = Arc::clone(&connected_calls);
+        let observed_connected_scope = connected_scope.clone();
+        let observed_connected_project_id = project_id.clone();
+        let outcome = plane
+            .setup_tiktok_connection_with(
+                &secrets,
+                request(
+                    connected_id.as_str(),
+                    connected_scope.clone(),
+                    1,
+                    "setup-connected-token-private",
+                ),
+                now,
+                move |seen_project_id, credential, probed_at| {
+                    observed_connected_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(seen_project_id, &observed_connected_project_id);
+                    assert_eq!(credential.scope(), &observed_connected_scope);
+                    assert_eq!(credential.generation(), 1);
+                    Ok(DesktopTiktokConnectionProbeInput {
+                        scope: observed_connected_scope.clone(),
+                        observed_external_account_id: observed_connected_scope
+                            .account()
+                            .as_str()
+                            .into(),
+                        source_generation: credential.generation(),
+                        probed_at,
+                        valid_until: probed_at + Duration::minutes(2),
+                        evidence_digest: "a".repeat(64),
+                        provenance: EvidenceProvenance::ProductionProvider,
+                    })
+                },
+            )
+            .expect("single-attempt connected setup");
+        assert_eq!(connected_calls.load(Ordering::SeqCst), 1);
+        assert!(outcome.probe_error().is_none());
+        let outcome_debug = format!("{outcome:?}");
+        assert!(outcome_debug.contains("[REDACTED]"));
+        assert!(!outcome_debug.contains("business-setup-connected-private"));
+        assert!(!outcome_debug.contains("account-setup-connected-private"));
+        assert!(!outcome_debug.contains("setup-connected-token-private"));
+        assert!(!outcome_debug.contains("keychain://"));
+        let connected = outcome.into_connected().expect("connected setup result");
+        assert_eq!(connected.connection().id(), &connected_id);
+        assert_eq!(
+            connected.connection().snapshot().status,
+            ConnectionStatus::Connected
+        );
+        assert_eq!(connected.connection().revision(), 3);
+        assert_eq!(connected.credential().generation(), 3);
+
+        let retry_scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(project.tenant_id.as_str()).unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-setup-retry-private").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("account-setup-retry-private").unwrap(),
+        );
+        let retry_id = ConnectionId::from_stable("desktop-tiktok-setup-retry");
+        let failed_calls = Arc::new(AtomicUsize::new(0));
+        let observed_failed_calls = Arc::clone(&failed_calls);
+        let failed = plane
+            .setup_tiktok_connection_with(
+                &secrets,
+                request(
+                    retry_id.as_str(),
+                    retry_scope.clone(),
+                    1,
+                    "setup-retry-token-private",
+                ),
+                now,
+                move |_, _, _| {
+                    observed_failed_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(TiktokError::Disconnected.into())
+                },
+            )
+            .expect("registration progress survives provider failure");
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            &failed,
+            DesktopTiktokConnectionSetupOutcome::ProbeFailed { .. }
+        ));
+        assert!(matches!(
+            failed.probe_error(),
+            Some(DesktopDataError::Tiktok(TiktokError::Disconnected))
+        ));
+        let failed_debug = format!("{failed:?}");
+        assert!(failed_debug.contains("[REDACTED]"));
+        assert!(!failed_debug.contains("Disconnected"));
+        assert!(!failed_debug.contains("business-setup-retry-private"));
+        assert!(!failed_debug.contains("account-setup-retry-private"));
+        assert!(!failed_debug.contains("setup-retry-token-private"));
+        assert!(!failed_debug.contains("keychain://"));
+
+        let observed_retry_scope = retry_scope.clone();
+        let retried = plane
+            .probe_tiktok_connection_with(
+                &secrets,
+                failed
+                    .into_retry_request()
+                    .expect("exact retained retry request"),
+                now,
+                move |_, credential, probed_at| {
+                    Ok(DesktopTiktokConnectionProbeInput {
+                        scope: observed_retry_scope.clone(),
+                        observed_external_account_id: observed_retry_scope
+                            .account()
+                            .as_str()
+                            .into(),
+                        source_generation: credential.generation(),
+                        probed_at,
+                        valid_until: probed_at + Duration::minutes(2),
+                        evidence_digest: "b".repeat(64),
+                        provenance: EvidenceProvenance::ProductionProvider,
+                    })
+                },
+            )
+            .expect("explicit retry through exact N149 boundary");
+        assert_eq!(
+            retried.connection().snapshot().status,
+            ConnectionStatus::Connected
+        );
+        assert_eq!(retried.connection().revision(), 3);
+
+        let rejected_calls = Arc::new(AtomicUsize::new(0));
+        let observed_rejected_calls = Arc::clone(&rejected_calls);
+        let rejected_scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(project.tenant_id.as_str()).unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-setup-rejected-private").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("account-setup-rejected-private")
+                .unwrap(),
+        );
+        assert!(matches!(
+            plane.setup_tiktok_connection_with(
+                &secrets,
+                request(
+                    "desktop-tiktok-setup-rejected",
+                    rejected_scope,
+                    2,
+                    "setup-rejected-token-private",
+                ),
+                now,
+                move |_, _, _| {
+                    observed_rejected_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(DesktopDataError::InvalidTiktokConnectionProbe)
+                },
+            ),
+            Err(DesktopDataError::InvalidTiktokConnectionRegistration)
+        ));
+        assert_eq!(rejected_calls.load(Ordering::SeqCst), 0);
         drop(directory);
     }
 
