@@ -17,6 +17,7 @@ use hartevo_domain_kernel::{
 };
 
 use crate::cordis_host::DesktopHeldCordisApproval;
+use crate::result_adoption_surface::{ResultBinding, selected_result_projection};
 use crate::{DesktopHeldLocalApproval, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +142,7 @@ pub struct ArtifactProjection {
     pub evidence_count: usize,
     pub status: OperationsStatus,
     pub actions: ArtifactActionsProjection,
+    pub(crate) adopt_binding: Option<ResultBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,7 +219,13 @@ impl AgentOperationsWorkbenchProjection {
             mission
                 .work_products
                 .iter()
-                .map(artifact_projection)
+                .map(|product| {
+                    let adopt_binding = project.and_then(|project| {
+                        selected_result_projection(project, mission, Some(&product.work_product_id))
+                            .map(|projection| projection.binding)
+                    });
+                    artifact_projection(product, adopt_binding)
+                })
                 .collect()
         });
         let approvals = approval_projection(
@@ -553,7 +561,17 @@ fn process_claim_lease(status: RuntimeProcessClaimStatus) -> String {
     }
 }
 
-fn artifact_projection(product: &WorkProductProjection) -> ArtifactProjection {
+fn artifact_projection(
+    product: &WorkProductProjection,
+    adopt_binding: Option<ResultBinding>,
+) -> ArtifactProjection {
+    let adopt_binding = adopt_binding
+        .filter(|_| matches!(product.adoption_status, WorkProductStatus::ReadyForReview));
+    let adopt_status = if adopt_binding.is_some() {
+        OperationsStatus::Ready
+    } else {
+        OperationsStatus::Empty
+    };
     ArtifactProjection {
         title: product.title.clone(),
         kind: humanize_checkpoint(product.work_product_type.as_str()),
@@ -570,10 +588,11 @@ fn artifact_projection(product: &WorkProductProjection) -> ArtifactProjection {
         status: artifact_status(&product.adoption_status),
         actions: ArtifactActionsProjection {
             diff: OperationsStatus::NotImplemented,
-            adopt: OperationsStatus::NotImplemented,
+            adopt: adopt_status,
             reject: OperationsStatus::NotImplemented,
             rollback: OperationsStatus::NotImplemented,
         },
+        adopt_binding,
     }
 }
 
@@ -1106,8 +1125,8 @@ mod tests {
     }
 
     #[test]
-    fn artifact_mutations_are_disabled_until_the_owner_api_exists() {
-        let product = WorkProductProjection {
+    fn artifact_adopt_uses_only_an_exact_ready_for_review_binding() {
+        let mut product = WorkProductProjection {
             work_product_id: "work-product".into(),
             title: "Typed output".into(),
             work_product_type: "research_packet".into(),
@@ -1117,14 +1136,45 @@ mod tests {
             preview_text: "preview".into(),
             preview_digest: "preview-digest".into(),
             manifest_digest: "manifest-digest".into(),
-            adoption_status: WorkProductStatus::Draft,
+            adoption_status: WorkProductStatus::ReadyForReview,
             editable_scope_count: 0,
             evidence_count: 1,
         };
-        let artifact = artifact_projection(&product);
-        assert_eq!(artifact.actions.adopt, OperationsStatus::NotImplemented);
+        let binding = ResultBinding {
+            tenant_id: "tenant".into(),
+            project_id: "project".into(),
+            mission_id: "mission".into(),
+            result_id: product.work_product_id.clone(),
+            result_revision: product.work_product_revision,
+            mission_revision: 3,
+            manifest_version: product.manifest_version,
+        };
+        let artifact = artifact_projection(&product, Some(binding.clone()));
+        assert_eq!(artifact.actions.adopt, OperationsStatus::Ready);
+        assert_eq!(artifact.adopt_binding, Some(binding));
         assert_eq!(artifact.actions.reject, OperationsStatus::NotImplemented);
         assert_eq!(artifact.actions.rollback, OperationsStatus::NotImplemented);
+
+        product.adoption_status = WorkProductStatus::Accepted;
+        let accepted = artifact_projection(
+            &product,
+            Some(ResultBinding {
+                tenant_id: "tenant".into(),
+                project_id: "project".into(),
+                mission_id: "mission".into(),
+                result_id: product.work_product_id.clone(),
+                result_revision: product.work_product_revision,
+                mission_revision: 3,
+                manifest_version: product.manifest_version,
+            }),
+        );
+        assert_eq!(accepted.actions.adopt, OperationsStatus::Empty);
+        assert!(accepted.adopt_binding.is_none());
+
+        product.adoption_status = WorkProductStatus::ReadyForReview;
+        let unbound = artifact_projection(&product, None);
+        assert_eq!(unbound.actions.adopt, OperationsStatus::Empty);
+        assert!(unbound.adopt_binding.is_none());
     }
 
     #[test]

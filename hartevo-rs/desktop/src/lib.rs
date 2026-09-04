@@ -5984,6 +5984,7 @@ fn ProjectDispatcherSurface(
 #[component]
 fn AgentOperationsWorkbench(
     projection: AgentOperationsWorkbenchProjection,
+    result_action_pending: bool,
     interrupt_available: bool,
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
@@ -5995,6 +5996,7 @@ fn AgentOperationsWorkbench(
     on_approve_local_runtime: EventHandler<()>,
     on_allow_cordis_once: EventHandler<()>,
     on_reject_cordis: EventHandler<()>,
+    on_result_action: EventHandler<ResultSurfaceAction>,
 ) -> Element {
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
     let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
@@ -6163,9 +6165,21 @@ fn AgentOperationsWorkbench(
                                         "Diff · {artifact.actions.diff.code()}"
                                     }
                                     button {
-                                        disabled: artifact.actions.adopt != OperationsStatus::Ready,
-                                        aria_label: "采用 Artifact",
-                                        title: "等待 Artifact owner API",
+                                        disabled: artifact.actions.adopt != OperationsStatus::Ready || result_action_pending,
+                                        aria_label: if result_action_pending { "正在采用 Artifact" } else { "采用 Artifact" },
+                                        title: if artifact.actions.adopt == OperationsStatus::Ready {
+                                            "通过现有 Application accept_work_product 采用此精确 revision"
+                                        } else {
+                                            "仅 Ready for review 的持久 Work Product 可采用"
+                                        },
+                                        onclick: {
+                                            let adopt_binding = artifact.adopt_binding.clone();
+                                            move |_| {
+                                                if let Some(binding) = adopt_binding.clone() {
+                                                    on_result_action.call(ResultSurfaceAction::Adopt(binding));
+                                                }
+                                            }
+                                        },
                                         "Adopt · {artifact.actions.adopt.code()}"
                                     }
                                     button {
@@ -6494,6 +6508,7 @@ fn OrchestratorSurface(
                     div { class: "surface-scroll",
                         AgentOperationsWorkbench {
                             projection: operations.clone(),
+                            result_action_pending,
                             interrupt_available: false,
                             interrupt_requested: false,
                             on_quick_entry,
@@ -6505,6 +6520,7 @@ fn OrchestratorSurface(
                             on_approve_local_runtime,
                             on_allow_cordis_once,
                             on_reject_cordis,
+                            on_result_action,
                         }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
@@ -6625,6 +6641,7 @@ fn OrchestratorSurface(
                     },
                     AgentOperationsWorkbench {
                         projection: operations,
+                        result_action_pending,
                         interrupt_available,
                         interrupt_requested,
                         on_quick_entry,
@@ -6636,6 +6653,7 @@ fn OrchestratorSurface(
                         on_approve_local_runtime,
                         on_allow_cordis_once,
                         on_reject_cordis,
+                        on_result_action,
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
