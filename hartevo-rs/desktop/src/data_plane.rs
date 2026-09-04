@@ -1555,6 +1555,17 @@ pub struct DesktopRegisterTiktokConnectionRequest {
     pub credential: DesktopConfigureTiktokCredentialRequest,
 }
 
+/// Explicit cold-start recovery input for one durable initial TikTok
+/// Connection. The expiry is re-confirmed by the user because it is not
+/// persisted in the content-free PendingAuth projection; token bytes remain in
+/// the exact generation-one OS Secret Store entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopRecoverPendingTiktokConnectionRequest {
+    pub project_id: ProjectId,
+    pub connection_id: ConnectionId,
+    pub credential_expires_at: DateTime<Utc>,
+}
+
 impl fmt::Debug for DesktopRegisterTiktokConnectionRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -4630,6 +4641,130 @@ impl DesktopDataPlane {
             now,
             probe,
         ))
+    }
+
+    /// Recover one durable initial PendingAuth registration after process
+    /// restart, then perform exactly one explicit provider probe. This never
+    /// creates another Connection, rewrites a token, or schedules a replay.
+    pub fn recover_pending_tiktok_connection_probe_os(
+        &self,
+        request: &DesktopRecoverPendingTiktokConnectionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokConnectionSetupOutcome, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.recover_pending_tiktok_connection_probe_with(
+            &secret_store,
+            request,
+            now,
+            |project_id, credential, probed_at| {
+                native_tiktok_connection_probe_input(
+                    &secret_store,
+                    project_id,
+                    credential,
+                    probed_at,
+                )
+            },
+        )
+    }
+
+    fn recover_pending_tiktok_connection_probe_with<Probe>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: &DesktopRecoverPendingTiktokConnectionRequest,
+        now: DateTime<Utc>,
+        probe: Probe,
+    ) -> Result<DesktopTiktokConnectionSetupOutcome, DesktopDataError>
+    where
+        Probe: FnOnce(
+            &ProjectId,
+            &OAuthCredential,
+            DateTime<Utc>,
+        ) -> Result<DesktopTiktokConnectionProbeInput, DesktopDataError>,
+    {
+        let registration =
+            self.recover_pending_tiktok_connection_registration_with(secret_store, request, now)?;
+        Ok(self.probe_tiktok_connection_outcome_with(
+            secret_store,
+            registration.into_probe_request(),
+            now,
+            probe,
+        ))
+    }
+
+    fn recover_pending_tiktok_connection_registration_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: &DesktopRecoverPendingTiktokConnectionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokConnectionRegistration, DesktopDataError> {
+        if request.credential_expires_at <= now {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        let project = service
+            .list_projects()?
+            .into_iter()
+            .find(|project| project.id == request.project_id)
+            .ok_or_else(|| DesktopDataError::ProjectNotFound(request.project_id.clone()))?;
+        let connection = service
+            .load_connection(&request.project_id, &request.connection_id)
+            .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+        let snapshot = connection.snapshot();
+        let required_scopes = BTreeSet::from([TiktokOAuthScope::VideoList.as_str().to_owned()]);
+        if snapshot.is_initial_snapshot().ok() != Some(true)
+            || connection.project_id() != &request.project_id
+            || connection.tenant_id() != &project.tenant_id
+            || connection.provider() != "tiktok"
+            || snapshot.required_scopes != required_scopes
+        {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+        let scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(connection.tenant_id().as_str())
+                .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?,
+            TiktokBusinessId::new(connection.account_id().as_str())
+                .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?,
+            TiktokAccountId::new(snapshot.expected_external_account_id)
+                .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?,
+        );
+        let credential = OAuthCredential::new(
+            ChannelSecretReference::new(format!("keychain://tiktok/{}", scope.account().as_str()))
+                .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?,
+            scope,
+            [TiktokOAuthScope::VideoList].into_iter().collect(),
+            request.credential_expires_at,
+            None,
+            1,
+        )
+        .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+        credential
+            .require_for(TiktokApiOperation::VideoList, credential.scope(), now)
+            .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+        let target_reference = crate::tiktok_read::tiktok_access_token_reference(
+            &request.project_id,
+            credential.scope(),
+            3,
+        )?;
+        match secret_store.get(&target_reference) {
+            Ok(_) => {
+                return Err(DesktopDataError::TiktokConnectionProbeReconciliationRequired);
+            }
+            Err(SecretStoreError::SecretNotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match require_tiktok_access_token(secret_store, &request.project_id, &credential, now) {
+            Ok(()) => Ok(DesktopTiktokConnectionRegistration {
+                connection,
+                credential,
+            }),
+            Err(
+                SecretStoreError::InvalidSecret
+                | SecretStoreError::InvalidReference
+                | SecretStoreError::SecretNotFound,
+            ) => Err(DesktopDataError::InvalidTiktokConnectionProbe),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Explicitly retry one failed initial TikTok probe while retaining the
@@ -25483,6 +25618,167 @@ sleep 30"#;
                 .expect("original Connection remains exact"),
             registered.connection().clone()
         );
+        drop(directory);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused test proves cold PendingAuth reconstruction, user-confirmed expiry, uncertain-generation fencing, and a single exact provider attempt"
+    )]
+    fn tiktok_pending_auth_recovery_rebuilds_only_exact_cold_generation_one() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let project = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("application")
+            .list_projects()
+            .expect("Project inventory")
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .expect("exact Project");
+        let scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(project.tenant_id.as_str()).unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-recovery-private").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("account-recovery-private").unwrap(),
+        );
+        let connection_id = ConnectionId::from_stable("desktop-tiktok-pending-recovery");
+        let expires_at = now + Duration::hours(1);
+        let registered = plane
+            .register_tiktok_connection_with(
+                &secrets,
+                DesktopRegisterTiktokConnectionRequest {
+                    connection_id: connection_id.clone(),
+                    credential: DesktopConfigureTiktokCredentialRequest {
+                        project_id: project_id.clone(),
+                        scope: scope.clone(),
+                        access_token_expires_at: expires_at,
+                        refresh_token_expires_at: None,
+                        generation: 1,
+                        access_token: Zeroizing::new("recovery-token-private".into()),
+                    },
+                },
+                now,
+            )
+            .expect("durable initial registration");
+        let initial = registered.connection().clone();
+        let initial_credential = registered.credential().clone();
+        let generation_one =
+            crate::tiktok_read::tiktok_access_token_reference(&project_id, &scope, 1).unwrap();
+        let generation_three =
+            crate::tiktok_read::tiktok_access_token_reference(&project_id, &scope, 3).unwrap();
+        let data_root = plane.data_root.clone();
+        drop(plane);
+
+        let reopened = DesktopDataPlane::at_data_root(data_root).expect("cold reopened plane");
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let expired_calls = Arc::clone(&provider_calls);
+        assert!(matches!(
+            reopened.recover_pending_tiktok_connection_probe_with(
+                &secrets,
+                &DesktopRecoverPendingTiktokConnectionRequest {
+                    project_id: project_id.clone(),
+                    connection_id: connection_id.clone(),
+                    credential_expires_at: now,
+                },
+                now,
+                move |_, _, _| {
+                    expired_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(TiktokError::Disconnected.into())
+                },
+            ),
+            Err(DesktopDataError::InvalidTiktokConnectionProbe)
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+
+        assert!(
+            copy_tiktok_access_token_generation(
+                &secrets,
+                &project_id,
+                &initial_credential,
+                3,
+                now,
+            )
+            .expect("stage uncertain target generation")
+        );
+        let uncertain_calls = Arc::clone(&provider_calls);
+        assert!(matches!(
+            reopened.recover_pending_tiktok_connection_probe_with(
+                &secrets,
+                &DesktopRecoverPendingTiktokConnectionRequest {
+                    project_id: project_id.clone(),
+                    connection_id: connection_id.clone(),
+                    credential_expires_at: expires_at,
+                },
+                now,
+                move |_, _, _| {
+                    uncertain_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(TiktokError::Disconnected.into())
+                },
+            ),
+            Err(DesktopDataError::TiktokConnectionProbeReconciliationRequired)
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        clear_tiktok_access_token(&secrets, &project_id, &scope, 3)
+            .expect("remove staged uncertain target generation");
+
+        let successful_calls = Arc::clone(&provider_calls);
+        let observed_scope = scope.clone();
+        let observed_project_id = project_id.clone();
+        let outcome = reopened
+            .recover_pending_tiktok_connection_probe_with(
+                &secrets,
+                &DesktopRecoverPendingTiktokConnectionRequest {
+                    project_id: project_id.clone(),
+                    connection_id: connection_id.clone(),
+                    credential_expires_at: expires_at,
+                },
+                now + Duration::seconds(1),
+                move |seen_project_id, credential, probed_at| {
+                    successful_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(seen_project_id, &observed_project_id);
+                    assert_eq!(credential.scope(), &observed_scope);
+                    assert_eq!(credential.generation(), 1);
+                    assert_eq!(credential.access_token_expires_at(), expires_at);
+                    assert!(credential.refresh_token_expires_at().is_none());
+                    Ok(DesktopTiktokConnectionProbeInput {
+                        scope: observed_scope.clone(),
+                        observed_external_account_id: observed_scope.account().as_str().into(),
+                        source_generation: 1,
+                        probed_at,
+                        valid_until: probed_at + Duration::minutes(2),
+                        evidence_digest: "c".repeat(64),
+                        provenance: EvidenceProvenance::ProductionProvider,
+                    })
+                },
+            )
+            .expect("recover exact cold PendingAuth handle");
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        let connected = outcome.into_connected().expect("single recovery probe");
+        assert_eq!(connected.connection().revision(), 3);
+        assert_eq!(
+            connected.connection().snapshot().status,
+            ConnectionStatus::Connected
+        );
+        assert!(matches!(
+            secrets.get(&generation_one),
+            Err(SecretStoreError::SecretNotFound)
+        ));
+        assert_eq!(
+            secrets.get(&generation_three).unwrap().as_slice(),
+            b"recovery-token-private"
+        );
+        let service = reopened
+            .open_read_application_from_secret(&database_secret)
+            .expect("application after recovery");
+        let durable = service
+            .load_connection(&project_id, &connection_id)
+            .expect("one durable recovered Connection");
+        assert_ne!(durable, initial);
+        assert_eq!(durable, connected.connection().clone());
         drop(directory);
     }
 
