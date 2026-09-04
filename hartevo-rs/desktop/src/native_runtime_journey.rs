@@ -1379,6 +1379,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidTiktokEvidenceAdoption
         | DesktopDataError::InvalidTiktokProviderRead
         | DesktopDataError::InvalidTiktokCredentialConfiguration
+        | DesktopDataError::InvalidTiktokConnectionRegistration
+        | DesktopDataError::TiktokConnectionRegistrationCompensationFailed
         | DesktopDataError::TiktokCredentialGenerationAlreadyConfigured
         | DesktopDataError::TiktokCredentialCoordinatorUnavailable
         | DesktopDataError::BrowserWorkspaceReadNotAgentHeld
