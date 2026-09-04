@@ -1695,7 +1695,19 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 9, 43)
+            (52, 10, 42)
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-00", 3, "identity.resolve")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm00.local-project-identity/v1")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-00", 3, "project_inventory")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm00.local-project-inventory/v1")
         );
         assert_eq!(
             catalog

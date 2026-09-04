@@ -144,13 +144,13 @@
       "claimId": "DMT-APP-REGISTRY-VERSION-01",
       "factId": "handler_registry_version",
       "status": "current",
-      "expectedValue": "desktop-2026-09-05-v9"
+      "expectedValue": "desktop-2026-09-05-v10"
     },
     {
       "claimId": "DMT-APP-REGISTRY-COUNT-01",
       "factId": "handler_count",
       "status": "current",
-      "expectedValue": 9
+      "expectedValue": 10
     },
     {
       "claimId": "DMT-APP-ROUTE-COUNT-01",
@@ -162,7 +162,7 @@
       "claimId": "DMT-APP-NOT-IMPLEMENTED-COUNT-01",
       "factId": "not_implemented_route_count",
       "status": "current",
-      "expectedValue": 43
+      "expectedValue": 42
     },
     {
       "claimId": "DMT-REL-PASSED-01",
