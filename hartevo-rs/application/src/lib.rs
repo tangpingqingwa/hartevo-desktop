@@ -541,7 +541,10 @@ pub fn cordis_mission_user_message_id(mission_id: &MissionId, generation: u64) -
 #[derive(Clone, Debug)]
 pub enum CordisMissionTurnPlan {
     Adopt(CordisMissionDraft),
-    Dispatch { user_message_id: String },
+    Dispatch {
+        user_message_id: String,
+        attempt: u64,
+    },
 }
 
 impl CordisMissionTurnPlan {
@@ -561,6 +564,7 @@ impl CordisMissionTurnPlan {
         let Some(checkpoint) = checkpoint else {
             return Ok(Self::Dispatch {
                 user_message_id: cordis_mission_user_message_id(mission_id, generation),
+                attempt: 1,
             });
         };
         SessionLog::restore(checkpoint.header.clone(), checkpoint.events.clone())
@@ -651,6 +655,7 @@ impl CordisMissionTurnPlan {
                 generation,
                 next_attempt,
             ),
+            attempt: next_attempt,
         })
     }
 }
@@ -1585,6 +1590,22 @@ impl LocalMissionRuntimeIds {
 
     pub fn for_compaction(mission_id: &MissionId, generation: u64) -> Self {
         Self::scoped("local-compaction-runtime", mission_id, generation)
+    }
+
+    fn for_mission_attempt(mission_id: &MissionId, generation: u64, attempt: u64) -> Self {
+        let mut ids = Self::for_mission(mission_id, generation);
+        if attempt > 1 {
+            let scoped = |kind: &str| {
+                format!(
+                    "local-runtime:{kind}:{}:{generation}:attempt:{attempt}",
+                    mission_id.as_str()
+                )
+            };
+            ids.compaction_id = ContextCompactionRecordId::from_stable(scoped("compaction"));
+            ids.checkpoint_id = ContextCheckpointId::from_stable(scoped("checkpoint"));
+            ids.assembly_id = ContextAssemblyId::from_stable(scoped("assembly"));
+        }
+        ids
     }
 
     fn scoped(scope: &str, mission_id: &MissionId, generation: u64) -> Self {
@@ -13436,14 +13457,16 @@ impl ApplicationService {
             &user_message_id,
             &command.mission_id,
             command.generation,
-        )?;
-        if command.generation == 0
-            || session_id != command.mission_id.as_str()
-            || user_message_attempt.is_none()
-        {
+        )?
+        .ok_or(ApplicationError::CordisDraftScopeMismatch)?;
+        if command.generation == 0 || session_id != command.mission_id.as_str() {
             return Err(ApplicationError::CordisDraftScopeMismatch);
         }
-        let ids = LocalMissionRuntimeIds::for_mission(&command.mission_id, command.generation);
+        let ids = LocalMissionRuntimeIds::for_mission_attempt(
+            &command.mission_id,
+            command.generation,
+            user_message_attempt,
+        );
         let capsule = self
             .store
             .load_context_capsule(&command.project_id, &ids.capsule_id)?;
@@ -15019,7 +15042,30 @@ impl ApplicationService {
         tokenizer: &impl ContextTokenizer,
         now: DateTime<Utc>,
     ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
-        self.prepare_local_mission_runtime_context_scoped(command, session, tokenizer, false, now)
+        self.prepare_local_mission_runtime_context_scoped(
+            command, session, tokenizer, false, 1, now,
+        )
+    }
+
+    /// Refresh the exact Mission foundation for a closed native Cordis retry
+    /// while retaining the generation's bounded worker authority. Each attempt
+    /// gets an append-only compaction/checkpoint/assembly identity, so a Mission
+    /// change committed by a successful tool call cannot silently reuse the
+    /// preceding attempt's stale prompt.
+    pub fn prepare_local_mission_runtime_retry_context(
+        &mut self,
+        command: PrepareLocalMissionRuntimeContext,
+        attempt: u64,
+        session: &ProjectContextMaterialSession,
+        tokenizer: &impl ContextTokenizer,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
+        if attempt < 2 {
+            return Err(ApplicationError::LocalRuntimeContextScopeMismatch);
+        }
+        self.prepare_local_mission_runtime_context_scoped(
+            command, session, tokenizer, false, attempt, now,
+        )
     }
 
     /// Prepare a reusable auxiliary Context/worker authority for Cordis
@@ -15031,7 +15077,7 @@ impl ApplicationService {
         tokenizer: &impl ContextTokenizer,
         now: DateTime<Utc>,
     ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
-        self.prepare_local_mission_runtime_context_scoped(command, session, tokenizer, true, now)
+        self.prepare_local_mission_runtime_context_scoped(command, session, tokenizer, true, 1, now)
     }
 
     /// Reopen the exact existing Mission worker for a same-Agent background
@@ -15144,9 +15190,14 @@ impl ApplicationService {
         session: &ProjectContextMaterialSession,
         tokenizer: &impl ContextTokenizer,
         compaction: bool,
+        context_attempt: u64,
         now: DateTime<Utc>,
     ) -> Result<PreparedLocalMissionRuntimeContext, ApplicationError> {
-        if command.generation == 0 || session.project_id() != &command.project_id {
+        if command.generation == 0
+            || context_attempt == 0
+            || (compaction && context_attempt != 1)
+            || session.project_id() != &command.project_id
+        {
             return Err(ApplicationError::LocalRuntimeContextScopeMismatch);
         }
         let mission = self
@@ -15214,7 +15265,11 @@ impl ApplicationService {
         let ids = if compaction {
             LocalMissionRuntimeIds::for_compaction(&mission.id, context_generation)
         } else {
-            LocalMissionRuntimeIds::for_mission(&mission.id, context_generation)
+            LocalMissionRuntimeIds::for_mission_attempt(
+                &mission.id,
+                context_generation,
+                context_attempt,
+            )
         };
         let policy_version = if compaction {
             "desktop-cordis-compaction-runtime/v1"
@@ -15315,7 +15370,12 @@ impl ApplicationService {
                 {
                     return Err(ApplicationError::LocalRuntimeContextConflict);
                 }
-                self.context_foundation_snapshot(&command.project_id, &ids.workspace_id, 1, now)?
+                self.context_foundation_snapshot(
+                    &command.project_id,
+                    &ids.workspace_id,
+                    context_attempt,
+                    now,
+                )?
             }
             Err(StorageError::ScopedRecordNotFound { .. }) => {
                 let working_set = self
@@ -15341,11 +15401,13 @@ impl ApplicationService {
                         checkpoint_id: ids.checkpoint_id.clone(),
                         expected_working_set_revision: working_set.revision,
                         expected_continuation_ledger_revision: continuation.revision,
-                        source_first_sequence: 1,
-                        source_last_sequence: 1,
+                        source_first_sequence: context_attempt,
+                        source_last_sequence: context_attempt,
                         source_trace_digest: sha256(source.as_bytes()),
                         source_token_count,
-                        retained_tail_start: 2,
+                        retained_tail_start: context_attempt
+                            .checked_add(1)
+                            .ok_or(ApplicationError::LocalRuntimeContextScopeMismatch)?,
                         summary_ref: summary_descriptor.storage_ref.clone(),
                         summary_digest: summary_descriptor.content_digest.clone(),
                         summary_byte_len: summary_descriptor.byte_len,
@@ -15355,9 +15417,13 @@ impl ApplicationService {
                         provider_route_digest,
                         config_digest: sha256(policy_version.as_bytes()),
                         worker_graph_digest: sha256(&serde_json::to_vec(&ids)?),
-                        resume_cursor_digest: sha256(b"hartevo.local-runtime-cursor/0"),
-                        trace_tail_sequence: 2,
-                        sync_version: 1,
+                        resume_cursor_digest: sha256(
+                            format!("hartevo.local-runtime-cursor/{context_attempt}").as_bytes(),
+                        ),
+                        trace_tail_sequence: context_attempt
+                            .checked_add(1)
+                            .ok_or(ApplicationError::LocalRuntimeContextScopeMismatch)?,
+                        sync_version: context_attempt,
                     },
                     now,
                 )?

@@ -7117,11 +7117,23 @@ impl DesktopDataPlane {
             mission_id: mission_id.clone(),
             generation: resume_plan.generation,
         };
+        let native_context_attempt = native_turn_plan.as_ref().and_then(|plan| match plan {
+            CordisMissionTurnPlan::Dispatch { attempt, .. } => Some(*attempt),
+            CordisMissionTurnPlan::Adopt(_) => None,
+        });
         let prepared = if native_deepseek && is_followup {
             None
         } else if is_followup {
             Some(service.prepare_local_mission_runtime_followup_context(
                 &prepare_command,
+                now + Duration::milliseconds(logical_millis),
+            )?)
+        } else if let Some(attempt) = native_context_attempt.filter(|attempt| *attempt > 1) {
+            Some(service.prepare_local_mission_runtime_retry_context(
+                prepare_command,
+                attempt,
+                context_session,
+                &tokenizer,
                 now + Duration::milliseconds(logical_millis),
             )?)
         } else {
@@ -7232,6 +7244,7 @@ impl DesktopDataPlane {
                     let user_body = Self::runtime_session_user_body(&service, &mission)?;
                     let Some(CordisMissionTurnPlan::Dispatch {
                         user_message_id: message_id,
+                        ..
                     }) = native_turn_plan
                     else {
                         return Err(ApplicationError::CordisDraftScopeMismatch.into());
@@ -11911,6 +11924,11 @@ sleep 30"#
         Response(DeepSeekWireResponse),
         #[cfg(target_os = "macos")]
         Responses(Arc<Mutex<VecDeque<DeepSeekWireResponse>>>),
+        #[cfg(target_os = "macos")]
+        ResponseThenFailure {
+            response: DeepSeekWireResponse,
+            failure: SessionLlmFailure,
+        },
         Failure(SessionLlmFailure),
     }
 
@@ -11925,7 +11943,7 @@ sleep 30"#
             assert_eq!(connection.base_url().as_str(), "https://api.deepseek.com/");
             assert_eq!(api_key, "desktop-mission-secret");
             assert!(!cancellation.is_cancelled());
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
             self.requests.lock().unwrap().push(request.clone());
             match &self.outcome {
                 MissionDeepSeekOutcome::Response(response) => Ok(response.clone()),
@@ -11935,6 +11953,14 @@ sleep 30"#
                     .unwrap()
                     .pop_front()
                     .expect("one native Mission response per parent or child step")),
+                #[cfg(target_os = "macos")]
+                MissionDeepSeekOutcome::ResponseThenFailure { response, failure } => {
+                    if call == 0 {
+                        Ok(response.clone())
+                    } else {
+                        Err(failure.clone())
+                    }
+                }
                 MissionDeepSeekOutcome::Failure(failure) => Err(failure.clone()),
             }
         }
@@ -12086,6 +12112,63 @@ sleep 30"#
             },
             MissionDeepSeekTransport {
                 outcome: MissionDeepSeekOutcome::Responses(Arc::new(Mutex::new(responses))),
+                calls,
+                requests,
+            },
+        );
+        DesktopRuntimeSource::NativeDeepSeek {
+            model: "deepseek-chat".into(),
+            adapter,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_deepseek_browser_read_then_fail_mission_source(
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> DesktopRuntimeSource {
+        let response = native_mission_deepseek_response(
+            "desktop-mission-browser-read-before-failure",
+            &serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "desktop-mission-browser-read-before-failure-call",
+                            "function": {
+                                "name": hartevo_cordis::RUNTIME_BROWSER_READ_TOOL_NAME,
+                                "arguments": r#"{"url":"https://example.com/recovery"}"#,
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            }),
+        );
+        let adapter = DeepSeekAdapter::new(
+            DeepSeekConnection::new(
+                "https://api.deepseek.com",
+                "DEEPSEEK_API_KEY",
+                128_000,
+                8_192,
+                StdDuration::from_secs(5),
+            )
+            .unwrap(),
+            |name: &str| {
+                assert_eq!(name, "DEEPSEEK_API_KEY");
+                Ok(Zeroizing::new("desktop-mission-secret".into()))
+            },
+            MissionDeepSeekTransport {
+                outcome: MissionDeepSeekOutcome::ResponseThenFailure {
+                    response,
+                    failure: SessionLlmFailure {
+                        message: "provider failed after the Browser observation committed".into(),
+                        code: "FIXTURE_FAILURE".into(),
+                        status: Some(503),
+                        provider_retry_after_ms: None,
+                        request_id: Some("browser-read-post-commit-failure".into()),
+                    },
+                },
                 calls,
                 requests,
             },
@@ -24080,6 +24163,197 @@ sleep 30"#;
         let mission = service
             .load_mission(&project_id, &mission_id)
             .expect("adopted Mission");
+        assert_eq!(mission.work_products.len(), 1);
+        assert!(mission.effects.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one recovery journey proves a committed Browser observation survives provider failure and cold retry without Browser replay"
+    )]
+    fn cordis_browser_read_survives_provider_failure_without_replay() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(7);
+        let mut mission_request = catalog_runtime_request(&project_id);
+        mission_request.title = Some("Recover Cordis Browser-read Mission".into());
+        mission_request.goal =
+            "Keep one committed Browser observation across a provider failure".into();
+        let started = plane
+            .start_catalog_mission_execution_with(&secrets, mission_request, now)
+            .expect("Catalog Mission");
+        let mission_id = started.handle.mission_id().clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("Application");
+        let profile = service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("profile-cordis-browser-recovery"),
+                    project_id: project_id.clone(),
+                    credential_reference: "keychain://cordis-browser-recovery/profile".into(),
+                    provider: "fixture-provider".into(),
+                    account_id: AccountId::from("account-cordis-browser-recovery"),
+                    identity_digest: "1".repeat(64),
+                    probe_digest: "2".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("Browser profile");
+        let workspace = service
+            .create_browser_workspace(
+                CreateBrowserWorkspace {
+                    id: BrowserWorkspaceId::from("workspace-cordis-browser-recovery"),
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    profile_id: profile.id,
+                    initial_tab_id: BrowserTabId::from("tab-cordis-browser-recovery"),
+                    lease_id: BrowserControlLeaseId::from("lease-cordis-browser-recovery"),
+                    lease_expires_at: now + Duration::hours(1),
+                    evidence_digest: "3".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("Browser workspace");
+        drop(service);
+
+        let navigation_count = Arc::new(AtomicUsize::new(0));
+        let observation_count = Arc::new(AtomicUsize::new(0));
+        let host_navigation_count = Arc::clone(&navigation_count);
+        let host_observation_count = Arc::clone(&observation_count);
+        plane
+            .mount_browser_workspace_with(
+                &secrets,
+                DesktopBrowserWorkspaceControlRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    workspace_id: workspace.id.clone(),
+                    expected_revision: workspace.revision,
+                    expected_generation: workspace.lease_generation,
+                },
+                now + Duration::seconds(2),
+                move |_profile, workspace, _profile_root, _mounted_at| {
+                    Ok(RecordingDesktopBrowserReadHost {
+                        workspace: workspace.clone(),
+                        navigation_count: host_navigation_count,
+                        observation_count: host_observation_count,
+                        final_url_digest: None,
+                    })
+                },
+            )
+            .expect("mounted Browser Host");
+
+        let failed_calls = Arc::new(AtomicUsize::new(0));
+        let failed_requests = Arc::new(Mutex::new(Vec::new()));
+        let failed = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                Some(native_deepseek_browser_read_then_fail_mission_source(
+                    Arc::clone(&failed_calls),
+                    Arc::clone(&failed_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                now + Duration::seconds(3),
+            )
+            .expect("closed post-Browser provider failure");
+        assert_eq!(failed.runtime_outcome, DesktopMissionRuntimeOutcome::Failed);
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 1);
+        plane.with_cordis_host(|host| {
+            assert!(
+                !host
+                    .context()
+                    .tools::<hartevo_cordis::ToolsSurface>()
+                    .expect("Tools surface")
+                    .names()
+                    .iter()
+                    .any(|name| name == hartevo_cordis::RUNTIME_BROWSER_READ_TOOL_NAME)
+            );
+        });
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("reopen failed attempt state");
+        let observation = service
+            .load_latest_browser_public_source_observation(&project_id, &mission_id)
+            .expect("durable Browser observation")
+            .expect("committed Browser observation");
+        assert!(!observation.business_verified);
+        drop(service);
+
+        drop(plane);
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(&secrets, now + Duration::seconds(5))
+                .expect("restore failed Cordis turn"),
+            DesktopLoadState::Ready(_)
+        ));
+        assert!(
+            !cold.browser_workspace_host_mounted(&DesktopBrowserWorkspaceControlRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace.id.clone(),
+                expected_revision: workspace.revision,
+                expected_generation: workspace.lease_generation,
+            })
+        );
+
+        let retry_calls = Arc::new(AtomicUsize::new(0));
+        let retry_requests = Arc::new(Mutex::new(Vec::new()));
+        let retried = cold
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                Some(native_deepseek_mission_source(
+                    "Recovered draft from the durable Browser observation.",
+                    Arc::clone(&retry_calls),
+                    Arc::clone(&retry_requests),
+                )),
+                DesktopRuntimeAvailabilityStatus::ReadyDistribution,
+                now + Duration::seconds(6),
+            )
+            .expect("cold retry without Browser replay");
+        assert!(matches!(
+            retried.runtime_outcome,
+            DesktopMissionRuntimeOutcome::DraftReady { .. }
+        ));
+        assert_eq!(retry_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 1);
+        let retry_requests = retry_requests.lock().unwrap();
+        assert!(
+            retry_requests[0]["messages"]
+                .as_array()
+                .expect("retry messages")
+                .iter()
+                .any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"]
+                            == "desktop-mission-browser-read-before-failure-call"
+                })
+        );
+        drop(retry_requests);
+
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, now + Duration::seconds(7))
+            .expect("reopen recovered state");
+        assert_eq!(
+            service
+                .load_latest_browser_public_source_observation(&project_id, &mission_id)
+                .expect("unchanged Browser observation"),
+            Some(observation)
+        );
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("recovered Mission");
         assert_eq!(mission.work_products.len(), 1);
         assert!(mission.effects.is_empty());
     }
