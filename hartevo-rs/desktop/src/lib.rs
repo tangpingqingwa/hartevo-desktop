@@ -62,13 +62,14 @@ use data_plane::{
     DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopOpenConversationRequest,
     DesktopProbeTiktokConnectionRequest, DesktopReadBrowserPublicSourceRequest,
-    DesktopRegisterTiktokConnectionRequest, DesktopReviewCreatorDeliverableRequest,
-    DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
-    DesktopRuntimeTextStreamProjection, DesktopSnapshot, DesktopTakeOverBrowserWorkspaceRequest,
-    DesktopTiktokConnectionSetupOutcome, DesktopVm11NextContractResolutionRequest,
-    DesktopVm11OutcomeDecisionRequest, DesktopWaitingApprovalGrantRequest,
-    DesktopWorkProductAdoptionRequest, ProductEvidenceProjection, ProjectContextAccessProjection,
-    ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopRecoverPendingTiktokConnectionRequest, DesktopRegisterTiktokConnectionRequest,
+    DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
+    DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
+    DesktopSnapshot, DesktopTakeOverBrowserWorkspaceRequest, DesktopTiktokConnectionSetupOutcome,
+    DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
+    DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
+    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
+    RecoveryKitDraft,
 };
 use result_adoption_surface::{
     ResultSurfaceAction, SelectedResultProjection, action_matches_current_projection,
@@ -448,12 +449,7 @@ fn parse_tiktok_connection_setup(
     let tenant = TiktokTenantId::new(tenant_id.as_str()).ok()?;
     let business = TiktokBusinessId::new(business_id).ok()?;
     let account = TiktokAccountId::new(expected_open_id).ok()?;
-    let expires_at = DateTime::parse_from_rfc3339(expires_at)
-        .ok()?
-        .with_timezone(&Utc);
-    if expires_at <= now {
-        return None;
-    }
+    let expires_at = parse_future_tiktok_expiry(expires_at, now)?;
     let mut connection_digest = Sha256::new();
     for value in [
         tenant_id.as_str(),
@@ -473,6 +469,13 @@ fn parse_tiktok_connection_setup(
         scope: TiktokReadScope::new(tenant, business, account),
         expires_at,
     })
+}
+
+fn parse_future_tiktok_expiry(value: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let expires_at = DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .with_timezone(&Utc);
+    (expires_at > now).then_some(expires_at)
 }
 
 struct PendingTiktokConnectionRetry {
@@ -2164,6 +2167,50 @@ pub fn App() -> Element {
             }
         });
     };
+    let request_recover_pending_tiktok_connection =
+        move |request: DesktopRecoverPendingTiktokConnectionRequest| {
+            if visual_fixture_mode {
+                model.write().notice = Some(UiFailure::coded(
+                    "VISUAL_FIXTURE",
+                    "视觉夹具不会恢复 TikTok 凭据句柄或启动 Provider 探测。",
+                ));
+                return;
+            }
+            if tiktok_connection_setup_busy() {
+                return;
+            }
+            pending_tiktok_connection_retry.set(None);
+            tiktok_connection_setup_busy.set(true);
+            spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let plane = DesktopDataPlane::persistent()?;
+                    let outcome =
+                        plane.recover_pending_tiktok_connection_probe_os(&request, Utc::now())?;
+                    let refreshed = plane.load_os(Utc::now());
+                    Ok::<_, DesktopDataError>((outcome, refreshed))
+                })
+                .await;
+                tiktok_connection_setup_busy.set(false);
+                match result {
+                    Ok(Ok((outcome, refreshed))) => {
+                        let (retry, probe_error) = tiktok_retry_state(outcome, &refreshed);
+                        pending_tiktok_connection_retry.set(retry);
+                        let mut current = model.write();
+                        apply_tiktok_connection_refresh(&mut current, refreshed);
+                        if let Some(error) = probe_error {
+                            current.set_notice(&error);
+                        }
+                    }
+                    Ok(Err(error)) => model.write().set_notice(&error),
+                    Err(_) => {
+                        model.write().notice = Some(UiFailure::coded(
+                            "TIKTOK_CONNECTION_RECOVERY_COORDINATOR_FAILED",
+                            "TikTok 冷启动恢复协调异常结束；未重复注册，也不会自动重放。请刷新 durable Connection 后再试。",
+                        ));
+                    }
+                }
+            });
+        };
     let live_runtime_cancellation = runtime_execution_paint
         .read()
         .live_cancellation_for_selection(
@@ -3634,6 +3681,7 @@ pub fn App() -> Element {
                                 retry_connection: tiktok_connection_retry.clone(),
                                 on_setup_tiktok: request_setup_tiktok_connection,
                                 on_retry_tiktok: request_retry_tiktok_connection,
+                                on_recover_tiktok: request_recover_pending_tiktok_connection,
                             }
                         } else if current_surface == Surface::Outcomes {
                             OutcomesSurface { project: project.clone(), mission: mission.clone() }
@@ -9578,6 +9626,7 @@ fn ConnectionsSurface(
     retry_connection: Option<DesktopConnectionProjection>,
     on_setup_tiktok: EventHandler<DesktopRegisterTiktokConnectionRequest>,
     on_retry_tiktok: EventHandler<()>,
+    on_recover_tiktok: EventHandler<DesktopRecoverPendingTiktokConnectionRequest>,
 ) -> Element {
     #[cfg(feature = "visual-fixtures")]
     if let Some(page) = visual_fixture::page("connections") {
@@ -9608,9 +9657,14 @@ fn ConnectionsSurface(
         .filter(|connection| connection.status == ConnectionStatus::Connected)
         .count();
     let attention_count = connection_count.saturating_sub(connected_count);
-    let unresolved_tiktok_connection = connections.iter().any(|connection| {
-        connection.provider == "tiktok" && connection.status == ConnectionStatus::PendingAuth
-    });
+    let unresolved_tiktok_connections = connections
+        .iter()
+        .filter(|connection| {
+            connection.provider == "tiktok" && connection.status == ConnectionStatus::PendingAuth
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let unresolved_tiktok_connection = !unresolved_tiktok_connections.is_empty();
     let retry_available = retry_connection
         .as_ref()
         .is_some_and(|connection| connection.status == ConnectionStatus::PendingAuth);
@@ -9625,6 +9679,7 @@ fn ConnectionsSurface(
             Utc::now(),
         )
         .is_some();
+    let recovery_expiry = parse_future_tiktok_expiry(tiktok_expiry().as_str(), Utc::now());
     let submitted_connection = submitted_connection_id
         .read()
         .as_ref()
@@ -9635,6 +9690,20 @@ fn ConnectionsSurface(
         })
         .cloned()
         .or_else(|| retry_connection.clone());
+    let recovery_connections = unresolved_tiktok_connections
+        .iter()
+        .filter(|connection| {
+            retry_connection.as_ref().is_none_or(|retry| {
+                retry.project_id != connection.project_id
+                    || retry.connection_id != connection.connection_id
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let show_recovery = !recovery_connections.is_empty()
+        && submitted_connection
+            .as_ref()
+            .is_none_or(|connection| connection.status == ConnectionStatus::PendingAuth);
     rsx! {
         div { class: "surface-scroll business-surface connections-surface",
             header { class: "surface-head",
@@ -9846,16 +9915,58 @@ fn ConnectionsSurface(
                             p { "TikTok 生产 Probe 已接入；只有实时结果匹配 tenant、project、provider、账号与最小 Scope，连接才能显示 Connected。" }
                             if setup_busy {
                                 div { class: "state-canvas compact", span { class: "honesty-badge", "RUNNING" } h3 { "正在执行一次生产 Probe" } p { "窗口保持响应；不会并发提交或自动追加尝试。" } }
-                            } else if let Some(connection) = &submitted_connection {
-                                if connection.status == ConnectionStatus::PendingAuth && retry_available {
-                                    div { class: "state-canvas compact", span { class: "honesty-badge", "{connection_status_label(&connection.status)}" } h3 { "首次探测未通过" } p { "durable Connection 已确认仍为 PendingAuth；检查网络与 TikTok 状态后，可显式重试同一注册句柄。" } }
-                                } else if connection.status == ConnectionStatus::PendingAuth {
-                                    div { class: "state-canvas compact", span { class: "honesty-badge", "RECOVERY_REQUIRED" } h3 { "PendingAuth 需要恢复" } p { "没有经过 durable 状态确认的安全重试入口；不会重复注册或猜测凭据代次。" } }
-                                } else {
-                                    div { class: "state-canvas compact", span { class: "honesty-badge", "{connection_status_label(&connection.status)}" } h3 { "已刷新 durable Connection" } p { "revision {connection.revision} · durable 状态优先于进程内尝试结果；账号标识与探测证据未进入 UI。" } }
+                            } else if show_recovery {
+                                div { class: "state-canvas compact",
+                                    span { class: "honesty-badge", "PENDING_AUTH" }
+                                    h3 { "恢复重启前留下的连接" }
+                                    p { "重新确认原 token 的 RFC 3339 过期时间；Desktop 只核验 keychain 中的 generation 1，不会重复注册、改写 token 或自动重试。" }
+                                    if retry_available {
+                                        p { "当前进程内失败句柄仍可通过底部按钮单独重试；下面只列出其他 PendingAuth Connection。" }
+                                    }
+                                    input {
+                                        value: "{tiktok_expiry}",
+                                        disabled: setup_busy,
+                                        autocomplete: "off",
+                                        spellcheck: "false",
+                                        placeholder: "2026-12-31T23:59:59Z",
+                                        aria_label: "TikTok recovery token expiry",
+                                        oninput: move |event| tiktok_expiry.set(event.value()),
+                                    }
+                                    for connection in recovery_connections.clone() {
+                                        {
+                                            let connection_id = connection.connection_id.clone();
+                                            let connection_label = short_digest(connection_id.as_str());
+                                            let project_id = project.project_id.clone();
+                                            rsx! {
+                                                button {
+                                                    class: "surface-button primary",
+                                                    disabled: setup_busy || recovery_expiry.is_none(),
+                                                    onclick: move |_| {
+                                                        let Some(credential_expires_at) = parse_future_tiktok_expiry(
+                                                            tiktok_expiry().as_str(),
+                                                            Utc::now(),
+                                                        ) else {
+                                                            return;
+                                                        };
+                                                        submitted_connection_id.set(Some(connection_id.clone()));
+                                                        on_recover_tiktok.call(DesktopRecoverPendingTiktokConnectionRequest {
+                                                            project_id: project_id.clone(),
+                                                            connection_id: connection_id.clone(),
+                                                            credential_expires_at,
+                                                        });
+                                                    },
+                                                    "恢复并探测 {connection_label}"
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                            } else if unresolved_tiktok_connection {
-                                div { class: "state-canvas compact", span { class: "honesty-badge", "RECOVERY_REQUIRED" } h3 { "发现重启前留下的 PendingAuth" } p { "当前进程没有原始重试句柄，因此不会重复注册或猜测凭据代次；冷启动恢复将在下一小步接入。" } }
+                            } else if retry_available {
+                                if let Some(connection) = &submitted_connection {
+                                    div { class: "state-canvas compact", span { class: "honesty-badge", "{connection_status_label(&connection.status)}" } h3 { "首次探测未通过" } p { "durable Connection 已确认仍为 PendingAuth；检查网络与 TikTok 状态后，可显式重试同一注册句柄。" } }
+                                }
+                            } else if let Some(connection) = &submitted_connection {
+                                div { class: "state-canvas compact", span { class: "honesty-badge", "{connection_status_label(&connection.status)}" } h3 { "已刷新 durable Connection" } p { "revision {connection.revision} · durable 状态优先于进程内尝试结果；账号标识与探测证据未进入 UI。" } }
                             } else {
                                 div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "尚未提交有效接入请求" } p { "请返回账号步骤检查输入；没有 Provider 请求在后台自动运行。" } }
                             }
@@ -12839,16 +12950,22 @@ mod tests {
     }
 
     #[test]
-    fn connections_surface_dispatches_one_explicit_tiktok_setup_or_retry() {
+    fn connections_surface_dispatches_one_explicit_tiktok_setup_retry_or_recovery() {
         let source = include_str!("lib.rs");
         for contract in [
             "setup_tiktok_connection_os",
             "retry_tiktok_connection_probe_os",
+            "recover_pending_tiktok_connection_probe_os",
             "tokio::task::spawn_blocking",
             "plane.load_os(Utc::now())",
             "on_setup_tiktok",
             "on_retry_tiktok",
+            "on_recover_tiktok",
             "不会自动重试",
+            "不会重复注册、改写 token 或自动重试",
+            "retry.project_id != connection.project_id",
+            "retry.connection_id != connection.connection_id",
+            "下面只列出其他 PendingAuth Connection",
             "r#type: \"password\"",
             "autocomplete: \"new-password\"",
         ] {
@@ -12856,6 +12973,7 @@ mod tests {
         }
         assert!(source.contains("视觉夹具不会写入 TikTok 凭据"));
         assert!(source.contains("视觉夹具不会读取 TikTok 凭据"));
+        assert!(source.contains("视觉夹具不会恢复 TikTok 凭据句柄"));
         assert!(!source.contains(
             "retry_tiktok_connection_probe_os(request, Utc::now());\n                loop"
         ));
@@ -13156,6 +13274,12 @@ mod tests {
         assert_eq!(request.credential.access_token_expires_at, expires_at);
         assert_eq!(request.credential.generation, 1);
         assert!(request.credential.refresh_token_expires_at.is_none());
+        assert_eq!(
+            parse_future_tiktok_expiry("2026-09-04T13:00:00Z", now),
+            Some(expires_at)
+        );
+        assert!(parse_future_tiktok_expiry("2026-09-04T12:00:00Z", now).is_none());
+        assert!(parse_future_tiktok_expiry("not-rfc3339", now).is_none());
         let diagnostics = format!("{request:?}");
         for private in [
             "business-tiktok-ui-private",
