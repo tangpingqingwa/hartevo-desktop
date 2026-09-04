@@ -1380,6 +1380,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidTiktokProviderRead
         | DesktopDataError::InvalidTiktokCredentialConfiguration
         | DesktopDataError::InvalidTiktokConnectionRegistration
+        | DesktopDataError::InvalidConnectionProjection
         | DesktopDataError::TiktokConnectionRegistrationCompensationFailed
         | DesktopDataError::InvalidTiktokConnectionProbe
         | DesktopDataError::TiktokConnectionProbeCompensationFailed
