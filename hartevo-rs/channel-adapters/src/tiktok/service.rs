@@ -772,6 +772,18 @@ mod tests {
             .accept_page(first.clone(), &credential, now)
             .unwrap();
         let accepted_first = mission.clone();
+
+        let mut backward_cursor = final_page;
+        backward_cursor.has_more = true;
+        backward_cursor.next_cursor = Some(super::super::TiktokCursor::new(1).unwrap());
+        assert_eq!(
+            mission
+                .accept_page(backward_cursor, &credential, now)
+                .unwrap_err(),
+            TiktokError::CursorDrift
+        );
+        assert_eq!(mission, accepted_first);
+
         let mut altered_replay = first;
         altered_replay.evidence_root = "1".repeat(64);
         assert_eq!(

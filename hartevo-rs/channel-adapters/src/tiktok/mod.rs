@@ -1661,6 +1661,10 @@ impl TiktokVideoPageEnvelope {
             || !is_sha256(&self.page_digest)
             || !is_sha256(&self.evidence_root)
             || self.has_more != self.next_cursor.is_some()
+            || matches!(
+                (self.requested_cursor, self.next_cursor),
+                (Some(requested), Some(next)) if next.value() <= requested.value()
+            )
             || self.observations.iter().any(|observation| {
                 observation.scope() != &self.scope
                     || observation.account().open_id() != self.account.open_id()
