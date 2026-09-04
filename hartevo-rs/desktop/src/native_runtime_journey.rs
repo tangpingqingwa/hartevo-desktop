@@ -1378,6 +1378,9 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidBrowserPublicSourceRead
         | DesktopDataError::InvalidTiktokEvidenceAdoption
         | DesktopDataError::InvalidTiktokProviderRead
+        | DesktopDataError::InvalidTiktokCredentialConfiguration
+        | DesktopDataError::TiktokCredentialGenerationAlreadyConfigured
+        | DesktopDataError::TiktokCredentialCoordinatorUnavailable
         | DesktopDataError::BrowserWorkspaceReadNotAgentHeld
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::InvalidBrowserWorkspaceTakeOver

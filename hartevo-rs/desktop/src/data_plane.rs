@@ -61,9 +61,10 @@ use hartevo_catalog::{
 };
 use hartevo_channel_adapters::tiktok::ProviderId as TiktokProviderId;
 use hartevo_channel_adapters::{
-    MAX_VIDEO_SEQUENCE_PAGES, OAuthCredential, ReadOnlyTransport, TiktokApiOperation, TiktokError,
-    TiktokFreshnessPolicy, TiktokMissionAcceptedSequence, TiktokReadObservation, TiktokReadScope,
-    execute_real_read_gate,
+    MAX_VIDEO_SEQUENCE_PAGES, OAuthCredential, ReadOnlyTransport,
+    SecretReference as ChannelSecretReference, TiktokApiOperation, TiktokError,
+    TiktokFreshnessPolicy, TiktokMissionAcceptedSequence, TiktokOAuthScope, TiktokReadObservation,
+    TiktokReadScope, execute_real_read_gate,
 };
 use hartevo_context_fabric::{
     ConservativeByteBudgetTokenizer, ContextAssemblyStatus, RuntimeContextEnvelope,
@@ -142,7 +143,9 @@ use crate::shopify_readback::{
     dispatch_os_keyring_shopify_readback, dispatch_os_keyring_shopify_readback_identity_metadata,
     dispatch_os_keyring_shopify_readback_metadata, prepare_shopify_readback_broker,
 };
-use crate::tiktok_read::native_tiktok_read_transport;
+use crate::tiktok_read::{
+    clear_tiktok_access_token, native_tiktok_read_transport, provision_tiktok_access_token,
+};
 
 const DATA_DIRECTORY_ENV: &str = "HARTEVO_DESKTOP_DATA_DIR";
 const DATABASE_FILE_NAME: &str = "hartevo.sqlite3";
@@ -150,6 +153,7 @@ const OS_SECRET_SERVICE: &str = "com.hartevo.desktop";
 
 /// One process-wide Cordis/DataPlane coordinator for all production UI paths.
 static DESKTOP_DATA_PLANE: OnceLock<DesktopDataPlane> = OnceLock::new();
+static TIKTOK_CREDENTIAL_WRITES: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionContractEvidenceProjection {
@@ -1509,6 +1513,64 @@ pub struct DesktopReadAndAdoptTiktokMissionSequenceRequest {
     pub credential: OAuthCredential,
     pub page_size: u8,
     pub max_pages: u16,
+}
+
+/// Move-only input for one explicit Desktop TikTok credential installation.
+/// Debug output intentionally excludes both the provider scope and token.
+pub struct DesktopConfigureTiktokCredentialRequest {
+    pub project_id: ProjectId,
+    pub scope: TiktokReadScope,
+    pub access_token_expires_at: DateTime<Utc>,
+    pub refresh_token_expires_at: Option<DateTime<Utc>>,
+    pub generation: u64,
+    pub access_token: Zeroizing<String>,
+}
+
+impl fmt::Debug for DesktopConfigureTiktokCredentialRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopConfigureTiktokCredentialRequest")
+            .field("project_id", &self.project_id)
+            .field("scope", &"[REDACTED]")
+            .field("access_token_expires_at", &self.access_token_expires_at)
+            .field("refresh_token_expires_at", &self.refresh_token_expires_at)
+            .field("generation", &self.generation)
+            .field("access_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Content-free result of a successful credential installation. The opaque
+/// provider credential can be moved directly into the existing N145 request.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopTiktokCredentialConfiguration {
+    credential: OAuthCredential,
+}
+
+impl DesktopTiktokCredentialConfiguration {
+    pub const fn credential(&self) -> &OAuthCredential {
+        &self.credential
+    }
+
+    pub fn into_credential(self) -> OAuthCredential {
+        self.credential
+    }
+}
+
+impl fmt::Debug for DesktopTiktokCredentialConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopTiktokCredentialConfiguration")
+            .field("provider", &"tiktok")
+            .field("scope", &"[REDACTED]")
+            .field("credential_reference", &"[REDACTED]")
+            .field("generation", &self.credential.generation())
+            .field(
+                "access_token_expires_at",
+                &self.credential.access_token_expires_at(),
+            )
+            .finish()
+    }
 }
 
 impl fmt::Debug for DesktopReadAndAdoptTiktokMissionSequenceRequest {
@@ -4211,6 +4273,124 @@ impl DesktopDataPlane {
     ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.adopt_tiktok_mission_sequence_with(&secret_store, request, now)
+    }
+
+    /// Install one exact TikTok access-token generation into the OS Secret
+    /// Store. This performs no provider request, Cordis step, Domain command,
+    /// Runtime turn, or Effect.
+    pub fn configure_tiktok_access_token_os(
+        &self,
+        request: DesktopConfigureTiktokCredentialRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokCredentialConfiguration, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.configure_tiktok_access_token_with(&secret_store, request, now)
+    }
+
+    fn configure_tiktok_access_token_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopConfigureTiktokCredentialRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokCredentialConfiguration, DesktopDataError> {
+        let _write_guard = TIKTOK_CREDENTIAL_WRITES
+            .lock()
+            .map_err(|_| DesktopDataError::TiktokCredentialCoordinatorUnavailable)?;
+        let DesktopConfigureTiktokCredentialRequest {
+            project_id,
+            scope,
+            access_token_expires_at,
+            refresh_token_expires_at,
+            generation,
+            access_token,
+        } = request;
+        self.require_tiktok_project_scope(secret_store, &project_id, &scope)?;
+        if refresh_token_expires_at
+            .is_some_and(|expires_at| expires_at <= now || expires_at < access_token_expires_at)
+        {
+            return Err(DesktopDataError::InvalidTiktokCredentialConfiguration);
+        }
+        let secret_reference =
+            ChannelSecretReference::new(format!("keychain://tiktok/{}", scope.account().as_str()))
+                .map_err(|_| DesktopDataError::InvalidTiktokCredentialConfiguration)?;
+        let credential = OAuthCredential::new(
+            secret_reference,
+            scope,
+            [TiktokOAuthScope::VideoList].into_iter().collect(),
+            access_token_expires_at,
+            refresh_token_expires_at,
+            generation,
+        )
+        .map_err(|_| DesktopDataError::InvalidTiktokCredentialConfiguration)?;
+        credential
+            .require_for(TiktokApiOperation::VideoList, credential.scope(), now)
+            .map_err(|_| DesktopDataError::InvalidTiktokCredentialConfiguration)?;
+        match provision_tiktok_access_token(
+            secret_store,
+            &project_id,
+            &credential,
+            &access_token,
+            now,
+        ) {
+            Ok(true) => Ok(DesktopTiktokCredentialConfiguration { credential }),
+            Ok(false) => Err(DesktopDataError::TiktokCredentialGenerationAlreadyConfigured),
+            Err(SecretStoreError::InvalidSecret | SecretStoreError::InvalidReference) => {
+                Err(DesktopDataError::InvalidTiktokCredentialConfiguration)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Clear one exact TikTok access-token generation. Missing is idempotent;
+    /// no other Project, scope, or generation can be removed by this call.
+    pub fn clear_tiktok_access_token_os(
+        &self,
+        project_id: &ProjectId,
+        scope: &TiktokReadScope,
+        credential_generation: u64,
+    ) -> Result<(), DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.clear_tiktok_access_token_with(&secret_store, project_id, scope, credential_generation)
+    }
+
+    fn clear_tiktok_access_token_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        scope: &TiktokReadScope,
+        credential_generation: u64,
+    ) -> Result<(), DesktopDataError> {
+        let _write_guard = TIKTOK_CREDENTIAL_WRITES
+            .lock()
+            .map_err(|_| DesktopDataError::TiktokCredentialCoordinatorUnavailable)?;
+        self.require_tiktok_project_scope(secret_store, project_id, scope)?;
+        clear_tiktok_access_token(secret_store, project_id, scope, credential_generation).map_err(
+            |error| match error {
+                SecretStoreError::InvalidReference => {
+                    DesktopDataError::InvalidTiktokCredentialConfiguration
+                }
+                other => other.into(),
+            },
+        )
+    }
+
+    fn require_tiktok_project_scope(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        scope: &TiktokReadScope,
+    ) -> Result<(), DesktopDataError> {
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        let project = service
+            .list_projects()?
+            .into_iter()
+            .find(|project| &project.id == project_id)
+            .ok_or_else(|| DesktopDataError::ProjectNotFound(project_id.clone()))?;
+        if project.tenant_id.as_str() != scope.tenant().as_str() {
+            return Err(DesktopDataError::InvalidTiktokCredentialConfiguration);
+        }
+        Ok(())
     }
 
     /// Execute one live, read-only TikTok sequence behind an exact Cordis
@@ -10324,6 +10504,14 @@ pub enum DesktopDataError {
         "TikTok provider Read requires exact Mission scope, credential authority, page bounds, and Cordis authorization"
     )]
     InvalidTiktokProviderRead,
+    #[error(
+        "TikTok credential configuration requires an exact Project, tenant/account scope, valid expiry, positive generation, and bounded token"
+    )]
+    InvalidTiktokCredentialConfiguration,
+    #[error("the exact TikTok credential generation is already configured")]
+    TiktokCredentialGenerationAlreadyConfigured,
+    #[error("the TikTok credential configuration coordinator is unavailable")]
+    TiktokCredentialCoordinatorUnavailable,
     #[error("Browser public-source Read requires the current Agent-held lease")]
     BrowserWorkspaceReadNotAgentHeld,
     #[error(
@@ -24068,6 +24256,122 @@ sleep 30"#;
         assert!(!debug.contains(request.scope.business().as_str()));
         assert!(!debug.contains(request.scope.account().as_str()));
         assert!(!debug.contains(request.credential.secret_reference().as_str()));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused test proves project scope, immutable generation, redaction, and exact idempotent clearing together"
+    )]
+    fn tiktok_credential_configuration_is_project_scoped_immutable_and_redacted() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let project = service
+            .list_projects()
+            .expect("Project inventory")
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .expect("exact Project");
+        drop(service);
+        let scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(project.tenant_id.as_str()).unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-private").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("account-private").unwrap(),
+        );
+        let request = DesktopConfigureTiktokCredentialRequest {
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            access_token_expires_at: now + Duration::hours(1),
+            refresh_token_expires_at: Some(now + Duration::days(30)),
+            generation: 4,
+            access_token: Zeroizing::new("access-token-private".into()),
+        };
+        let request_debug = format!("{request:?}");
+        assert!(request_debug.contains("[REDACTED]"));
+        assert!(!request_debug.contains("business-private"));
+        assert!(!request_debug.contains("account-private"));
+        assert!(!request_debug.contains("access-token-private"));
+
+        let configured = plane
+            .configure_tiktok_access_token_with(&secrets, request, now)
+            .expect("configure exact generation");
+        assert_eq!(configured.credential().generation(), 4);
+        let configured_debug = format!("{configured:?}");
+        assert!(configured_debug.contains("[REDACTED]"));
+        assert!(!configured_debug.contains("business-private"));
+        assert!(!configured_debug.contains("account-private"));
+        assert!(!configured_debug.contains("keychain://"));
+        let generation_four =
+            crate::tiktok_read::tiktok_access_token_reference(&project_id, &scope, 4).unwrap();
+        assert_eq!(
+            secrets.get(&generation_four).unwrap().as_slice(),
+            b"access-token-private"
+        );
+
+        assert!(matches!(
+            plane.configure_tiktok_access_token_with(
+                &secrets,
+                DesktopConfigureTiktokCredentialRequest {
+                    project_id: project_id.clone(),
+                    scope: scope.clone(),
+                    access_token_expires_at: now + Duration::hours(1),
+                    refresh_token_expires_at: None,
+                    generation: 4,
+                    access_token: Zeroizing::new("replacement-must-not-win".into()),
+                },
+                now,
+            ),
+            Err(DesktopDataError::TiktokCredentialGenerationAlreadyConfigured)
+        ));
+        assert_eq!(
+            secrets.get(&generation_four).unwrap().as_slice(),
+            b"access-token-private"
+        );
+
+        let wrong_tenant_scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new("wrong-tenant").unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-private").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("account-private").unwrap(),
+        );
+        assert!(matches!(
+            plane.configure_tiktok_access_token_with(
+                &secrets,
+                DesktopConfigureTiktokCredentialRequest {
+                    project_id: project_id.clone(),
+                    scope: wrong_tenant_scope.clone(),
+                    access_token_expires_at: now + Duration::hours(1),
+                    refresh_token_expires_at: None,
+                    generation: 5,
+                    access_token: Zeroizing::new("wrong-tenant-token".into()),
+                },
+                now,
+            ),
+            Err(DesktopDataError::InvalidTiktokCredentialConfiguration)
+        ));
+        let wrong_tenant_reference =
+            crate::tiktok_read::tiktok_access_token_reference(&project_id, &wrong_tenant_scope, 5)
+                .unwrap();
+        assert!(matches!(
+            secrets.get(&wrong_tenant_reference),
+            Err(SecretStoreError::SecretNotFound)
+        ));
+
+        plane
+            .clear_tiktok_access_token_with(&secrets, &project_id, &scope, 4)
+            .expect("clear exact generation");
+        plane
+            .clear_tiktok_access_token_with(&secrets, &project_id, &scope, 4)
+            .expect("clear remains idempotent");
+        assert!(matches!(
+            secrets.get(&generation_four),
+            Err(SecretStoreError::SecretNotFound)
+        ));
     }
 
     #[test]
