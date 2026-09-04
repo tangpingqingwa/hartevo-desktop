@@ -38,6 +38,7 @@ mod runtime_recovery_store;
 mod runtime_turn_store;
 mod secure_store;
 mod sync_store;
+mod tiktok_read_checkpoint_store;
 mod work_product_outcome_store;
 mod work_product_store;
 pub use aggregate::{
@@ -86,6 +87,7 @@ pub use sync_store::{
     LocalInboundSyncStageOutcome, LocalInboundSyncStatus, LocalSyncOperation,
     LocalSyncPrepareOutcome, LocalSyncStatus,
 };
+pub use tiktok_read_checkpoint_store::{TiktokReadCheckpoint, TiktokReadCheckpointBinding};
 
 use std::fmt;
 use std::fs;
@@ -101,7 +103,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 50;
+pub const STORAGE_SCHEMA_VERSION: i64 = 51;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4444,8 +4446,16 @@ impl ProjectStore {
             record_migration(&transaction, 50)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 51 {
+            let transaction = self.connection.transaction()?;
+            tiktok_read_checkpoint_store::install_tiktok_read_checkpoint_schema(&transaction)?;
+            tiktok_read_checkpoint_store::verify_tiktok_read_checkpoint_schema(&transaction)?;
+            record_migration(&transaction, 51)?;
+            transaction.commit()?;
+        }
         provider_recovery_store::verify_provider_recovery_schema(&self.connection)?;
         cordis_session_store::verify_cordis_session_schema(&self.connection)?;
+        tiktok_read_checkpoint_store::verify_tiktok_read_checkpoint_schema(&self.connection)?;
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4652,6 +4662,8 @@ pub enum StorageError {
     DomainDecode(String),
     #[error("Cordis Session checkpoint is invalid: {0}")]
     InvalidSessionCheckpoint(&'static str),
+    #[error("TikTok read checkpoint is invalid: {0}")]
+    InvalidTiktokReadCheckpoint(&'static str),
     #[error("key bootstrap operation is malformed or has an invalid terminal state")]
     InvalidKeyBootstrapOperation,
     #[error("key bootstrap operation cannot make the requested revision transition")]

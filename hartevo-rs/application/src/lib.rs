@@ -154,7 +154,7 @@ use hartevo_storage::{
     LocalProjectCloudRegistrationPrepareOutcome, LocalSyncOperation, LocalSyncPrepareOutcome,
     LocalSyncStatus, PendingEvent, ProjectCloudRegistrationStatus, ProjectKeySecretReference,
     ProjectStore, RuntimeTurnStartupReconciliation, SecretBytes, SecretReference, SecretStore,
-    SecretStoreError, StorageError,
+    SecretStoreError, StorageError, TiktokReadCheckpoint, TiktokReadCheckpointBinding,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -8587,6 +8587,38 @@ impl ApplicationService {
         connection_id: &ConnectionId,
     ) -> Result<Connection, ApplicationError> {
         Ok(self.store.load_connection(project_id, connection_id)?)
+    }
+
+    /// Load only the exact SQLCipher-backed TikTok sequence checkpoint named
+    /// by its current Mission, Connection, credential, and page-budget fence.
+    pub fn load_tiktok_read_checkpoint(
+        &self,
+        binding: &TiktokReadCheckpointBinding,
+    ) -> Result<Option<TiktokReadCheckpoint>, ApplicationError> {
+        Ok(self.store.load_tiktok_read_checkpoint(binding)?)
+    }
+
+    /// Persist one private TikTok sequence checkpoint behind an exact prior
+    /// digest. Provider content never enters an Application projection.
+    pub fn persist_tiktok_read_checkpoint(
+        &mut self,
+        checkpoint: &TiktokReadCheckpoint,
+        expected_previous_digest: Option<&str>,
+    ) -> Result<bool, ApplicationError> {
+        Ok(self
+            .store
+            .persist_tiktok_read_checkpoint(checkpoint, expected_previous_digest)?)
+    }
+
+    /// Remove only the exact checkpoint already adopted into Mission evidence.
+    pub fn delete_tiktok_read_checkpoint(
+        &mut self,
+        binding: &TiktokReadCheckpointBinding,
+        expected_checkpoint_digest: &str,
+    ) -> Result<bool, ApplicationError> {
+        Ok(self
+            .store
+            .delete_tiktok_read_checkpoint(binding, expected_checkpoint_digest)?)
     }
 
     pub fn list_missions(&self, project_id: &ProjectId) -> Result<Vec<Mission>, ApplicationError> {

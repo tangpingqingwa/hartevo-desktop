@@ -91,7 +91,7 @@ impl<T> TiktokAuthenticatedReadService<T> {
         }
     }
 
-    fn production(
+    pub(crate) fn production(
         transport: T,
         gate: TiktokRealReadGate,
         freshness_policy: TiktokFreshnessPolicy,
