@@ -1521,6 +1521,19 @@ pub struct DesktopAdoptTiktokMissionSequenceRequest {
     pub sequence: TiktokMissionAcceptedSequence,
 }
 
+/// Content-free Desktop selection for one Connected TikTok read. Provider
+/// account identity and opaque credential metadata are reconstructed from the
+/// current durable Connection below the caller boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopReadTiktokConnectionMissionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub connection_id: ConnectionId,
+    pub page_size: u8,
+    pub max_pages: u16,
+}
+
 /// Read one bounded TikTok `video.list` sequence under exact Cordis authority,
 /// then atomically adopt its terminal evidence into the same Mission revision.
 /// Credential bytes are never part of this request; only an opaque reference
@@ -5241,6 +5254,95 @@ impl DesktopDataPlane {
             return Err(DesktopDataError::InvalidTiktokCredentialConfiguration);
         }
         Ok(())
+    }
+
+    /// Reconstruct one private TikTok provider binding from a content-free
+    /// Desktop selection, then execute the existing Cordis-authorized native
+    /// read and atomic evidence adoption path.
+    pub fn read_and_adopt_tiktok_connection_mission_os(
+        &self,
+        request: DesktopReadTiktokConnectionMissionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let project_id = request.project_id.clone();
+        self.read_and_adopt_tiktok_connection_evidence_input_with(
+            &secret_store,
+            request,
+            now,
+            |credential, scope, page_size, max_pages| {
+                let transport =
+                    native_tiktok_read_transport(&secret_store, &project_id, scope, credential)
+                        .map_err(|_| DesktopDataError::InvalidTiktokProviderRead)?;
+                let mut provider =
+                    execute_real_read_gate(transport, TiktokFreshnessPolicy::default())?;
+                let sequence =
+                    provider.read_video_sequence(credential, scope, now, page_size, max_pages)?;
+                desktop_tiktok_evidence_input(&sequence, now)
+            },
+        )
+    }
+
+    fn read_and_adopt_tiktok_connection_evidence_input_with<Read>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopReadTiktokConnectionMissionRequest,
+        now: DateTime<Utc>,
+        read: Read,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError>
+    where
+        Read: FnOnce(
+            &OAuthCredential,
+            &TiktokReadScope,
+            u8,
+            u16,
+        ) -> Result<DesktopTiktokEvidenceInput, DesktopDataError>,
+    {
+        let DesktopReadTiktokConnectionMissionRequest {
+            project_id,
+            mission_id,
+            expected_mission_revision,
+            connection_id,
+            page_size,
+            max_pages,
+        } = request;
+        if expected_mission_revision == 0
+            || !(1..=hartevo_channel_adapters::DEFAULT_VIDEO_PAGE_SIZE).contains(&page_size)
+            || !(1..=MAX_VIDEO_SEQUENCE_PAGES).contains(&max_pages)
+        {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.revision != expected_mission_revision {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+        let connection = service
+            .load_connection(&project_id, &connection_id)
+            .map_err(|_| DesktopDataError::InvalidTiktokProviderRead)?;
+        let credential =
+            tiktok_credential_for_connection(&connection, &project_id, &mission.tenant_id, now)
+                .ok_or(DesktopDataError::InvalidTiktokProviderRead)?;
+        let scope = credential.scope().clone();
+        drop(service);
+
+        self.read_and_adopt_tiktok_evidence_input_with(
+            secret_store,
+            DesktopReadAndAdoptTiktokMissionSequenceRequest {
+                project_id,
+                mission_id,
+                expected_mission_revision,
+                connection_id,
+                scope,
+                credential,
+                page_size,
+                max_pages,
+            },
+            now,
+            read,
+        )
     }
 
     /// Execute one live, read-only TikTok sequence behind an exact Cordis
@@ -26393,6 +26495,106 @@ sleep 30"#;
             Err(DesktopDataError::InvalidTiktokCredentialConfiguration)
         ));
         drop(directory);
+    }
+
+    #[test]
+    fn tiktok_connection_read_reconstructs_private_binding_below_content_free_request() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "Read TikTok through one durable Connection",
+                now,
+            )
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission");
+        let private_request =
+            tiktok_provider_read_request(&mut service, &project_id, &mission, now);
+        drop(service);
+        plane
+            .configure_tiktok_access_token_with(
+                &secrets,
+                DesktopConfigureTiktokCredentialRequest {
+                    project_id: project_id.clone(),
+                    scope: private_request.scope.clone(),
+                    access_token_expires_at: private_request.credential.access_token_expires_at(),
+                    refresh_token_expires_at: None,
+                    generation: private_request.credential.generation(),
+                    access_token: Zeroizing::new("connection-read-token-private".into()),
+                },
+                now,
+            )
+            .expect("configure exact Connection generation");
+        let request = DesktopReadTiktokConnectionMissionRequest {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            expected_mission_revision: mission.revision,
+            connection_id: private_request.connection_id.clone(),
+            page_size: private_request.page_size,
+            max_pages: private_request.max_pages,
+        };
+        let debug = format!("{request:?}");
+        for private in [
+            "business-01",
+            "open01",
+            "keychain://",
+            "connection-read-token-private",
+        ] {
+            assert!(!debug.contains(private), "leaked {private}");
+        }
+
+        let input = tiktok_provider_read_evidence_input(&private_request, now);
+        let expected_credential = private_request.credential.clone();
+        let expected_scope = private_request.scope.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read_calls = Arc::clone(&calls);
+        let adopted = plane
+            .read_and_adopt_tiktok_connection_evidence_input_with(
+                &secrets,
+                request.clone(),
+                now,
+                move |credential, scope, page_size, max_pages| {
+                    assert_eq!(credential, &expected_credential);
+                    assert_eq!(scope, &expected_scope);
+                    assert_eq!((page_size, max_pages), (20, 2));
+                    read_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(input)
+                },
+            )
+            .expect("content-free Connection read and adoption");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!adopted.replayed);
+        assert_eq!(
+            adopted.evidence_pack.expected_mission_revision,
+            mission.revision
+        );
+
+        let stale_calls = Arc::new(AtomicUsize::new(0));
+        let observed_stale_calls = Arc::clone(&stale_calls);
+        assert!(matches!(
+            plane.read_and_adopt_tiktok_connection_evidence_input_with(
+                &secrets,
+                request,
+                now,
+                move |_, _, _, _| {
+                    observed_stale_calls.fetch_add(1, Ordering::SeqCst);
+                    unreachable!("stale Mission must fail before provider read")
+                },
+            ),
+            Err(DesktopDataError::InvalidTiktokProviderRead)
+        ));
+        assert_eq!(stale_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
