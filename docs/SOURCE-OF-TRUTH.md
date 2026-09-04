@@ -73,10 +73,10 @@
   "claims": [
     {"claimId": "DMT-REL-SCHEMA-01", "value": "2.3.0"},
     {"claimId": "DMT-REL-SCHEMA-STAGE-01", "value": "2.3.0"},
-    {"claimId": "DMT-APP-REGISTRY-VERSION-01", "value": "desktop-2026-09-05-v9"},
-    {"claimId": "DMT-APP-REGISTRY-COUNT-01", "value": 9},
+    {"claimId": "DMT-APP-REGISTRY-VERSION-01", "value": "desktop-2026-09-05-v10"},
+    {"claimId": "DMT-APP-REGISTRY-COUNT-01", "value": 10},
     {"claimId": "DMT-APP-ROUTE-COUNT-01", "value": 52},
-    {"claimId": "DMT-APP-NOT-IMPLEMENTED-COUNT-01", "value": 43},
+    {"claimId": "DMT-APP-NOT-IMPLEMENTED-COUNT-01", "value": 42},
     {"claimId": "DMT-REL-PASSED-01", "value": false},
     {
       "claimId": "DMT-GM01-ISSUES-01",

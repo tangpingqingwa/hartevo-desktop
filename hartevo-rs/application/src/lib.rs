@@ -3188,6 +3188,7 @@ pub struct MissionCheckpointDispatch {
 }
 
 const VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID: &str = "vm00.local-project-identity/v1";
+const VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID: &str = "vm00.local-project-inventory/v1";
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
@@ -3202,6 +3203,7 @@ const VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID: &str =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledApplicationCheckpointHandler {
     LocalProjectIdentity,
+    LocalProjectInventory,
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
@@ -3216,6 +3218,7 @@ impl CompiledApplicationCheckpointHandler {
     fn handler_id(self) -> &'static str {
         match self {
             Self::LocalProjectIdentity => VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID,
+            Self::LocalProjectInventory => VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID,
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
@@ -3230,6 +3233,7 @@ impl CompiledApplicationCheckpointHandler {
     fn primary_source_kind(self) -> &'static str {
         match self {
             Self::LocalProjectIdentity => "project_scope",
+            Self::LocalProjectInventory => "project_inventory",
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
@@ -3489,6 +3493,9 @@ fn compiled_application_checkpoint_handler(
     match handler_id {
         VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::LocalProjectIdentity)
+        }
+        VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::LocalProjectInventory)
         }
         VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
         VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
@@ -3931,11 +3938,122 @@ fn vm00_local_project_identity_application_evidence(
     })
 }
 
-fn execute_vm00_local_project_identity(
+fn vm00_local_project_inventory_application_evidence(
+    mission: &Mission,
+    project: &Project,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if project.tenant_id != mission.tenant_id || project.id != mission.project_id {
+        return Err(StorageError::TenantScopeMismatch.into());
+    }
+    if definition.manifest_id != "VM-00"
+        || definition.manifest_version != 3
+        || checkpoint.id != "project_inventory"
+        || project.revision == 0
+        || matches!(&project.storage_mode, StorageMode::Cloud)
+        || project.workspace_roots.is_empty()
+        || project
+            .workspace_roots
+            .iter()
+            .any(|root| !root.is_absolute())
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let mut workspace_roots = project.workspace_roots.iter().collect::<Vec<_>>();
+    workspace_roots.sort();
+    if workspace_roots.windows(2).any(|roots| roots[0] == roots[1]) {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    // Hash the exact persisted root set in deterministic order. Raw paths,
+    // Project metadata, and Mission content never enter evidence or events.
+    let project_inventory_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm00-local-project-inventory/v1",
+        "tenantId": project.tenant_id,
+        "projectId": project.id,
+        "revision": project.revision,
+        "storageMode": project.storage_mode,
+        "dataCell": project.data_cell,
+        "workspaceRoots": workspace_roots,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "project_inventory".into(),
+                source_id: project.id.to_string(),
+                source_revision: project.revision,
+                projection_digest: project_inventory_digest,
+                oracle_ids: BTreeSet::from(["truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the shared VM-00 Project transaction keeps evidence, completion, next-route start, source fence, and events in one atomic boundary"
+)]
+fn execute_vm00_local_project_checkpoint(
     store: &mut ProjectStore,
     mut mission: Mission,
     command: ExecuteApplicationMissionCheckpoint,
     dispatch: &MissionCheckpointDispatch,
+    handler: CompiledApplicationCheckpointHandler,
     now: DateTime<Utc>,
 ) -> Result<ApplicationMissionCheckpointExecution, ApplicationError> {
     let project = store.load_project(&command.project_id)?;
@@ -3955,9 +4073,19 @@ fn execute_vm00_local_project_identity(
         })
         .and_then(|checkpoint| checkpoint.route.clone())
         .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
-    let application_evidence = vm00_local_project_identity_application_evidence(
-        &mission, &project, &route, &command, now,
-    )?;
+    let application_evidence = match handler {
+        CompiledApplicationCheckpointHandler::LocalProjectIdentity => {
+            vm00_local_project_identity_application_evidence(
+                &mission, &project, &route, &command, now,
+            )?
+        }
+        CompiledApplicationCheckpointHandler::LocalProjectInventory => {
+            vm00_local_project_inventory_application_evidence(
+                &mission, &project, &route, &command, now,
+            )?
+        }
+        _ => return Err(ApplicationError::ApplicationCheckpointCommandMismatch),
+    };
     validate_application_evidence_against_registry(&application_evidence)?;
     let evidence_digest = application_evidence.digest();
     mission.complete_checkpoint(
@@ -3991,9 +4119,9 @@ fn execute_vm00_local_project_identity(
             "checkpointId": command.checkpoint_id,
             "checkpointRevision": completed_checkpoint_revision,
             "capabilityId": dispatch.capability_id,
-            "handlerId": VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID,
+            "handlerId": handler.handler_id(),
             "oracleIds": dispatch.oracle_ids,
-            "sourceKind": "project_scope",
+            "sourceKind": handler.primary_source_kind(),
             "sourceRevision": project.revision,
             "sourceFenceCount": 1,
             "evidenceDigest": evidence_digest,
@@ -9933,12 +10061,17 @@ impl ApplicationService {
         };
         let handler_id = compiled_handler.handler_id();
 
-        if compiled_handler == CompiledApplicationCheckpointHandler::LocalProjectIdentity {
-            return execute_vm00_local_project_identity(
+        if matches!(
+            compiled_handler,
+            CompiledApplicationCheckpointHandler::LocalProjectIdentity
+                | CompiledApplicationCheckpointHandler::LocalProjectInventory
+        ) {
+            return execute_vm00_local_project_checkpoint(
                 &mut self.store,
                 mission,
                 command,
                 &dispatch,
+                compiled_handler,
                 now,
             );
         }
@@ -10778,7 +10911,8 @@ impl ApplicationService {
             .as_ref()
             .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
         let application_evidence = match compiled_handler {
-            CompiledApplicationCheckpointHandler::LocalProjectIdentity => {
+            CompiledApplicationCheckpointHandler::LocalProjectIdentity
+            | CompiledApplicationCheckpointHandler::LocalProjectInventory => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest => {
@@ -10906,7 +11040,8 @@ impl ApplicationService {
         let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
         let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
         let source_metrics = match compiled_handler {
-            CompiledApplicationCheckpointHandler::LocalProjectIdentity => {
+            CompiledApplicationCheckpointHandler::LocalProjectIdentity
+            | CompiledApplicationCheckpointHandler::LocalProjectInventory => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest
@@ -25965,9 +26100,10 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one VM-00 contract test proves dispatch, project fencing, content-free evidence, atomic handoff, exact replay, and stale-command refusal"
+        reason = "one VM-00 contract test proves both local Project checkpoints, project fencing, content-free evidence, atomic handoffs, exact replay, and stale-command refusal"
     )]
-    fn vm00_local_identity_is_project_fenced_replayable_and_advances_without_outcome() {
+    fn vm00_local_identity_and_inventory_are_project_fenced_replayable_and_advance_without_outcome()
+    {
         let workspace = tempfile::tempdir().expect("project workspace");
         let private_workspace = workspace.path().to_string_lossy().into_owned();
         let private_project_name = "PRIVATE-VM00-PROJECT::local customer workspace";
@@ -26058,7 +26194,11 @@ mod tests {
         );
         assert_eq!(
             next_dispatch.application_handler_status,
-            Some(ApplicationCheckpointHandlerStatus::NotImplemented)
+            Some(ApplicationCheckpointHandlerStatus::Implemented)
+        );
+        assert_eq!(
+            next_dispatch.application_handler_id.as_deref(),
+            Some(VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID)
         );
 
         let mission = service
@@ -26140,6 +26280,245 @@ mod tests {
             ),
             Err(ApplicationError::ApplicationCheckpointReplayMismatch)
         ));
+
+        let inventory_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: next_dispatch.checkpoint_id,
+            expected_mission_revision: next_dispatch.mission_revision,
+            expected_checkpoint_revision: next_dispatch.checkpoint_revision,
+        };
+        let inventory_execution = service
+            .execute_application_mission_checkpoint(
+                inventory_command.clone(),
+                now() + Duration::milliseconds(6),
+            )
+            .expect("local Project inventory completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            outcome_ledger_revision,
+            replayed,
+            next_dispatch: Some(encryption_dispatch),
+            ..
+        } = inventory_execution
+        else {
+            panic!("VM-00 Project inventory must complete and advance")
+        };
+        assert_eq!(outcome_ledger_revision, 1);
+        assert!(!replayed);
+        assert_eq!(
+            encryption_dispatch.checkpoint_id,
+            "encryption_workspace_ready"
+        );
+        assert_eq!(
+            encryption_dispatch.executor,
+            MissionCheckpointExecutor::Application
+        );
+        assert_eq!(
+            encryption_dispatch.application_handler_status,
+            Some(ApplicationCheckpointHandlerStatus::NotImplemented)
+        );
+
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("VM-00 Mission after inventory");
+        let inventory_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "project_inventory")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("Project inventory completion");
+        assert!(inventory_completion.work_product_ids.is_empty());
+        assert!(inventory_completion.effect_ids.is_empty());
+        let inventory_evidence = inventory_completion
+            .application_evidence
+            .as_ref()
+            .expect("content-free Project inventory evidence");
+        assert_eq!(
+            inventory_evidence.handler_id,
+            VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID
+        );
+        assert_eq!(
+            inventory_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mission_checkpoint", "project_inventory"])
+        );
+        assert_eq!(
+            inventory_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "project_inventory")
+                .map(|source| source.source_revision),
+            Some(1)
+        );
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free Project inventory events");
+        let event_json = serde_json::to_string(&events).expect("event JSON");
+        assert!(event_json.contains(VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID));
+        for private_value in [
+            private_project_name,
+            private_project_description,
+            private_goal,
+            private_workspace.as_str(),
+        ] {
+            assert!(!event_json.contains(private_value));
+        }
+
+        let event_count = events.len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    inventory_command.clone(),
+                    now() + Duration::milliseconds(7),
+                )
+                .expect("exact inventory replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after inventory replay")
+                .len(),
+            event_count
+        );
+        assert!(matches!(
+            service.execute_application_mission_checkpoint(
+                ExecuteApplicationMissionCheckpoint {
+                    expected_mission_revision: inventory_command
+                        .expected_mission_revision
+                        .saturating_add(1),
+                    ..inventory_command
+                },
+                now() + Duration::milliseconds(8),
+            ),
+            Err(ApplicationError::ApplicationCheckpointReplayMismatch)
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the negative VM-00 Journey proves malformed persisted inventory cannot partially advance Mission state or append events"
+    )]
+    fn vm00_project_inventory_rejects_invalid_roots_without_partial_advance() {
+        let workspace = tempfile::tempdir().expect("project workspace");
+        let project_id = ProjectId::from("vm00-invalid-inventory-project");
+        let mission_id = MissionId::from("vm00-invalid-inventory-mission");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("vm00-invalid-inventory-tenant"),
+                    id: project_id.clone(),
+                    name: "Invalid inventory fixture".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalExisting,
+                },
+                now(),
+            )
+            .expect("local project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm00-invalid-inventory-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-00".into(),
+                    mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
+                    title: None,
+                    goal: "Verify only a valid local inventory".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now() + Duration::milliseconds(1),
+            )
+            .expect("VM-00 Mission");
+        let identity_dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::milliseconds(2),
+            )
+            .expect("identity dispatch");
+        let identity_execution = service
+            .execute_application_mission_checkpoint(
+                ExecuteApplicationMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    checkpoint_id: identity_dispatch.checkpoint_id,
+                    expected_mission_revision: identity_dispatch.mission_revision,
+                    expected_checkpoint_revision: identity_dispatch.checkpoint_revision,
+                },
+                now() + Duration::milliseconds(3),
+            )
+            .expect("identity completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            next_dispatch: Some(inventory_dispatch),
+            ..
+        } = identity_execution
+        else {
+            panic!("identity must advance to inventory")
+        };
+
+        let mut invalid_project = service
+            .store
+            .load_project(&project_id)
+            .expect("persisted project");
+        invalid_project.workspace_roots = vec![PathBuf::from("relative-workspace")];
+        invalid_project.revision = invalid_project.revision.saturating_add(1);
+        service
+            .store
+            .save_project(&invalid_project)
+            .expect("persist invalid legacy-compatible inventory fixture");
+        let mission_before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before invalid inventory");
+        let event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before invalid inventory")
+            .len();
+        let invalid_execution = service.execute_application_mission_checkpoint(
+            ExecuteApplicationMissionCheckpoint {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                checkpoint_id: inventory_dispatch.checkpoint_id,
+                expected_mission_revision: inventory_dispatch.mission_revision,
+                expected_checkpoint_revision: inventory_dispatch.checkpoint_revision,
+            },
+            now() + Duration::milliseconds(4),
+        );
+        assert!(
+            matches!(
+                &invalid_execution,
+                Err(ApplicationError::ApplicationCheckpointCommandMismatch)
+            ),
+            "unexpected invalid inventory result: {invalid_execution:?}"
+        );
+        let mission_after = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission after invalid inventory");
+        assert_eq!(mission_after.revision, mission_before.revision);
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after invalid inventory")
+                .len(),
+            event_count
+        );
     }
 
     #[test]

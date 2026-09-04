@@ -15171,9 +15171,9 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves VM-00 local identity routing, zero Runtime construction, SQLCipher durability, and content-free evidence after cold reopen"
+        reason = "one Desktop Journey proves both VM-00 local Project checkpoints, zero Runtime construction, SQLCipher durability, and content-free evidence after cold reopen"
     )]
-    fn vm00_local_identity_survives_encrypted_desktop_reopen_without_runtime() {
+    fn vm00_local_identity_and_inventory_survive_encrypted_desktop_reopen_without_runtime() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
         let private_goal = "PRIVATE-VM00-DESKTOP::resume only this encrypted local project";
         let submission = plane
@@ -15243,13 +15243,55 @@ sleep 30"#;
         );
         assert_eq!(
             projected.current_checkpoint_application_handler_status,
-            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented)
         );
 
-        let data_root = plane.data_root.clone();
         let database_secret = secrets
             .get(plane.database_key_reference())
             .expect("database secret");
+        let (mut service, runtime_reconciliation) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("mutable encrypted Application");
+        let inventory_submission = plane
+            .advance_application_checkpoint_before_runtime(
+                &mut service,
+                &secrets,
+                &runtime_reconciliation,
+                &project_id,
+                &submission.mission_id,
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("Desktop Project inventory dispatch")
+            .expect("Application-owned Project inventory submission");
+        assert_eq!(
+            inventory_submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "encryption_workspace_ready".into(),
+                capability_id: "encryption.initialize".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from(["operating_state".into(), "truth".into()]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let projected = inventory_submission.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("VM-00 Desktop inventory projection");
+        assert_eq!(projected.completed_checkpoint_count, 2);
+        assert_eq!(
+            projected.current_checkpoint_id.as_deref(),
+            Some("encryption_workspace_ready")
+        );
+        assert_eq!(
+            projected.current_checkpoint_application_handler_status,
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+        );
+        assert!(plane.with_cordis_host(|host| host.bound_scope().is_none()));
+        drop(service);
+
+        let data_root = plane.data_root.clone();
         drop(plane);
         let reopened = DesktopDataPlane::at_data_root(data_root).expect("cold reopened plane");
         let service = reopened
@@ -15281,6 +15323,31 @@ sleep 30"#;
                 .iter()
                 .any(|source| source.source_kind == "project_scope")
         );
+        let inventory_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "project_inventory")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable Project inventory completion");
+        let inventory_evidence = inventory_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable Project inventory evidence");
+        assert_eq!(
+            inventory_evidence.handler_id,
+            "vm00.local-project-inventory/v1"
+        );
+        assert!(
+            inventory_evidence
+                .sources
+                .iter()
+                .any(|source| source.source_kind == "project_inventory")
+        );
         let event_json = serde_json::to_string(
             &service
                 .mission_events(&project_id, &submission.mission_id)
@@ -15288,6 +15355,7 @@ sleep 30"#;
         )
         .expect("event JSON");
         assert!(event_json.contains("vm00.local-project-identity/v1"));
+        assert!(event_json.contains("vm00.local-project-inventory/v1"));
         assert!(!event_json.contains(private_goal));
         drop(directory);
     }
