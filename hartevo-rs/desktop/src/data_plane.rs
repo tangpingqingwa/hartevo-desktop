@@ -64,14 +64,14 @@ use hartevo_cordis::{AgentStep, AgentStepResult, CordisHost};
 #[cfg(all(test, target_os = "macos"))]
 use hartevo_cordis::{AgentsSurface, ApprovalPolicy, SUBAGENT_TOOL_NAME, SessionStore};
 use hartevo_cordis::{
-    ApprovalRequestId, AuthorityDispatchError, AuthorityScope, COMPACTION_INSTRUCTION, CordisError,
-    DomainCommandBinding, DomainCommandKind, EffectExecutionBinding, EffectReconciliationBinding,
-    EffectVerificationBinding, JobTerminalNotice, LifecycleCancellation, LlmAdapter,
-    LlmAdapterStream, LlmError, LlmGenerateRequest, LlmRequestPurpose, LlmResolvedModel,
-    RuntimeBinding, RuntimeDispatchPermit, RuntimeRecordBinding, SessionCallConfig,
-    SessionCancelCause, SessionContentBlock, SessionFinishReason, SessionId, SessionLlmFailure,
-    SessionMessageRole, SessionMessageSource, SessionStreamBlockType, SessionStreamChunk,
-    TurnEndReason,
+    ApprovalRequestId, AuthorityDispatchError, AuthorityScope, BrowserReadBinding,
+    COMPACTION_INSTRUCTION, CordisError, DomainCommandBinding, DomainCommandKind,
+    EffectExecutionBinding, EffectReconciliationBinding, EffectVerificationBinding,
+    JobTerminalNotice, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
+    LlmGenerateRequest, LlmRequestPurpose, LlmResolvedModel, RuntimeBinding, RuntimeDispatchPermit,
+    RuntimeRecordBinding, SessionCallConfig, SessionCancelCause, SessionContentBlock,
+    SessionFinishReason, SessionId, SessionLlmFailure, SessionMessageRole, SessionMessageSource,
+    SessionStreamBlockType, SessionStreamChunk, TurnEndReason,
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
@@ -107,14 +107,14 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::cordis_host::{
-    DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisApprovalBridge,
-    DesktopCordisApprovalDecisionError, DesktopCordisSlot, DesktopDomainCommandAuthorization,
-    DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
-    DesktopEffectVerificationAuthorization, DesktopHeldCordisApproval, DesktopHumanCommandDispatch,
-    DesktopRuntimeSessionTranscript, dispatch_idle_job_completion_runtime,
-    dispatch_live_domain_command, dispatch_live_effect_execution,
-    dispatch_live_effect_reconciliation, dispatch_live_effect_verification, dispatch_live_runtime,
-    mount_cordis_host,
+    DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopBrowserReadAuthorization,
+    DesktopCordisApprovalBridge, DesktopCordisApprovalDecisionError, DesktopCordisSlot,
+    DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
+    DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
+    DesktopHeldCordisApproval, DesktopHumanCommandDispatch, DesktopRuntimeSessionTranscript,
+    dispatch_idle_job_completion_runtime, dispatch_live_browser_read, dispatch_live_domain_command,
+    dispatch_live_effect_execution, dispatch_live_effect_reconciliation,
+    dispatch_live_effect_verification, dispatch_live_runtime, mount_cordis_host,
 };
 #[cfg(test)]
 use crate::cordis_host::{
@@ -4103,31 +4103,53 @@ impl DesktopDataPlane {
         self.read_browser_public_source_with(&secret_store, request, now)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the boundary keeps durable Browser fences and the exact Cordis permit check visible together"
+    )]
     pub fn read_browser_public_source_with(
         &self,
         secret_store: &impl SecretStore,
         request: DesktopReadBrowserPublicSourceRequest,
         now: DateTime<Utc>,
     ) -> Result<DesktopBrowserPublicSourceRead, DesktopDataError> {
-        if request.expected_mission_revision == 0
-            || request.expected_revision == 0
-            || request.expected_generation == 0
-            || request.workspace_id.as_str().trim().is_empty()
-            || BrowserNavigationPolicy::for_exact_https_target(&request.target_url).is_err()
+        let DesktopReadBrowserPublicSourceRequest {
+            project_id,
+            mission_id,
+            expected_mission_revision,
+            workspace_id,
+            expected_revision,
+            expected_generation,
+            target_url,
+        } = request;
+        if expected_mission_revision == 0
+            || expected_revision == 0
+            || expected_generation == 0
+            || workspace_id.as_str().trim().is_empty()
         {
             return Err(DesktopDataError::InvalidBrowserPublicSourceRead);
         }
-        let project_id = request.project_id.clone();
+        let (navigation_policy, navigation_target) =
+            BrowserNavigationPolicy::for_exact_https_target(&target_url)
+                .map_err(|_| DesktopDataError::InvalidBrowserPublicSourceRead)?;
         let (mut service, runtime_reconciliation, _context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+        if scope.mission_revision() != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: scope.mission_revision(),
+            }
+            .into());
+        }
         let live = service
-            .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
+            .load_live_browser_workspace_for_mission(&project_id, &mission_id)?
             .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
-        if live.id != request.workspace_id
+        if live.id != workspace_id
             || live.project_id != project_id
-            || live.mission_id != request.mission_id
-            || live.revision != request.expected_revision
-            || live.lease_generation != request.expected_generation
+            || live.mission_id != mission_id
+            || live.revision != expected_revision
+            || live.lease_generation != expected_generation
         {
             return Err(DesktopDataError::InvalidBrowserPublicSourceRead);
         }
@@ -4136,22 +4158,53 @@ impl DesktopDataPlane {
         {
             return Err(DesktopDataError::BrowserWorkspaceReadNotAgentHeld);
         }
-        let observation = self.synchronize_mounted_browser_host(&live, |host| {
-            service.read_browser_public_source(
-                host,
-                ReadBrowserPublicSource {
-                    project_id,
-                    mission_id: request.mission_id,
-                    expected_mission_revision: request.expected_mission_revision,
-                    workspace_id: request.workspace_id,
-                    expected_revision: request.expected_revision,
-                    expected_generation: request.expected_generation,
-                    snapshot_id: BrowserSnapshotId::new(),
-                    target_url: request.target_url,
-                },
-                now,
-            )
-        })?;
+        let browser_binding = BrowserReadBinding::new(
+            live.id.as_str(),
+            expected_revision,
+            expected_generation,
+            navigation_target.url_digest(),
+            navigation_target.origin_digest(),
+            navigation_target.policy_digest(),
+        )?;
+        let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+        let observation = map_browser_read_dispatch_result(dispatch_live_browser_read(
+            &self.cordis,
+            DesktopBrowserReadAuthorization::new(scope, browser_binding),
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+                let binding = permit.binding();
+                if &current_scope != permit.scope()
+                    || binding.workspace_id() != workspace_id.as_str()
+                    || binding.workspace_revision() != expected_revision
+                    || binding.lease_generation() != expected_generation
+                    || binding.target_url_digest() != navigation_target.url_digest()
+                    || binding.target_origin_digest() != navigation_target.origin_digest()
+                    || binding.navigation_policy_digest() != navigation_policy.evidence_digest()
+                {
+                    return Err(CordisError::BrowserReadPermitMismatch.into());
+                }
+                self.synchronize_mounted_browser_host(&live, |host| {
+                    service.read_browser_public_source(
+                        host,
+                        ReadBrowserPublicSource {
+                            project_id,
+                            mission_id,
+                            expected_mission_revision,
+                            workspace_id,
+                            expected_revision,
+                            expected_generation,
+                            snapshot_id: BrowserSnapshotId::new(),
+                            target_url,
+                        },
+                        now,
+                    )
+                })
+            },
+        ))?;
         let product_evidence = load_product_evidence(now)?;
         let snapshot = self.build_snapshot(
             &service,
@@ -9449,6 +9502,19 @@ fn map_domain_command_dispatch_result<T>(
     }
 }
 
+fn map_browser_read_dispatch_result<T>(
+    result: Result<T, AuthorityDispatchError<DesktopDataError>>,
+) -> Result<T, DesktopDataError> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(AuthorityDispatchError::Cordis(error)) => Err((*error).into()),
+        Err(AuthorityDispatchError::Authority(error)) => Err(error),
+        Err(error @ AuthorityDispatchError::Combined(_)) => {
+            Err(DesktopDataError::BrowserReadDispatch(Box::new(error)))
+        }
+    }
+}
+
 fn map_effect_execution_dispatch_result<T>(
     result: Result<T, AuthorityDispatchError<DesktopDataError>>,
 ) -> Result<T, DesktopDataError> {
@@ -9673,6 +9739,8 @@ pub enum DesktopDataError {
     RuntimeDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error("Cordis Domain command dispatch failed across phases: {0}")]
     DomainCommandDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
+    #[error("Cordis Browser read dispatch failed across phases: {0}")]
+    BrowserReadDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error("Cordis Effect execution failed across phases: {0}")]
     EffectExecutionDispatch(#[source] Box<AuthorityDispatchError<DesktopDataError>>),
     #[error("Cordis Effect reconciliation failed across phases: {0}")]
@@ -23593,6 +23661,19 @@ sleep 30"#;
             read.snapshot.inventory.projects[0].missions[0].revision,
             observation.mission_revision
         );
+        let stale_mission = plane.read_browser_public_source_with(
+            &secrets,
+            read_request.clone(),
+            now + Duration::seconds(5),
+        );
+        assert!(matches!(
+            stale_mission,
+            Err(DesktopDataError::Application(
+                ApplicationError::MissionRevisionMismatch { .. }
+            ))
+        ));
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 1);
         let restarted = DesktopDataPlane::at_data_root(&plane.data_root).expect("restart plane");
         let restarted_snapshot = restarted
             .initialize_with(&secrets, now + Duration::seconds(5))

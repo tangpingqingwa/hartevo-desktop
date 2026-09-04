@@ -1,15 +1,16 @@
 use chrono::{Duration, TimeZone, Utc};
 use hartevo_cordis::{
     AgentRef, AgentStatus, AgentStatusChange, AgentStep, AgentTurnStopping, AgentsSurface,
-    AuthorityScope, BailOutcome, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
-    DomainSurface, EffectBrokerSurface, EffectExecutionBinding, EffectReconciliationBinding,
-    EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate, KernelApproval, KernelApprovalDecision,
-    KernelConsentRecord, KernelConsentState, KernelConsentStatus, LifecycleCancellation,
-    LoaderContext, NonBail, OPENINTERPRETER, OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding,
-    RuntimeSurface, SessionCallConfig, SessionContentBlock, SessionFinishReason, SessionId,
-    SessionMessage, SessionMessageRole, SessionMessageSource, SessionStore, SessionStreamChunk,
-    SurfaceOwner, ToolCall, TurnEndReason, enforce_invariants, events, host_is_cordis_loop,
-    host_plugin_ids, invariant_missing, keys, register_agent,
+    AuthorityScope, BailOutcome, BrowserReadBinding, CordisError, CordisHost, DomainCommandBinding,
+    DomainCommandKind, DomainSurface, EffectBrokerSurface, EffectExecutionBinding,
+    EffectReconciliationBinding, EnvironmentOverlay, HOST_PLUGIN_IDS, InvariantGate,
+    KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
+    KernelConsentStatus, LifecycleCancellation, LoaderContext, NonBail, OPENINTERPRETER,
+    OPENINTERPRETER_PLUGIN_ID, PluginId, RuntimeBinding, RuntimeSurface, SessionCallConfig,
+    SessionContentBlock, SessionFinishReason, SessionId, SessionMessage, SessionMessageRole,
+    SessionMessageSource, SessionStore, SessionStreamChunk, SurfaceOwner, ToolCall, TurnEndReason,
+    enforce_invariants, events, host_is_cordis_loop, host_plugin_ids, invariant_missing, keys,
+    register_agent,
 };
 
 fn now() -> chrono::DateTime<Utc> {
@@ -68,6 +69,18 @@ fn approval_command(effect: &str, digest_byte: char) -> DomainCommandBinding {
 
 fn proposal_command(effect: &str, digest_byte: char) -> DomainCommandBinding {
     DomainCommandBinding::propose_effect(effect, digest_byte.to_string().repeat(64)).unwrap()
+}
+
+fn browser_read(workspace: &str) -> BrowserReadBinding {
+    BrowserReadBinding::new(
+        workspace,
+        5,
+        7,
+        "a".repeat(64),
+        "b".repeat(64),
+        "c".repeat(64),
+    )
+    .unwrap()
 }
 
 fn effect_execution(
@@ -256,6 +269,102 @@ fn abandoned_domain_command_permit_releases_active_slot() {
         .authorize_domain_command(&scope, approval_command("effect-a", 'a'))
         .unwrap();
     host.finish_domain_command(permit).unwrap();
+}
+
+#[test]
+fn browser_read_is_exact_mutually_exclusive_drop_safe_and_teardown_revoked() {
+    let mut host = CordisHost::boot(false).unwrap();
+    let scope = domain_scope("project-a", "mission-a", 3);
+    assert_eq!(
+        host.authorize_browser_read(&scope, browser_read("workspace-a"))
+            .unwrap_err(),
+        CordisError::AuthorityScopeUnbound
+    );
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::Missing,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let other = domain_scope("project-a", "mission-b", 3);
+    assert_eq!(
+        host.authorize_browser_read(&other, browser_read("workspace-a"))
+            .unwrap_err(),
+        CordisError::AuthorityScopeMismatch
+    );
+
+    let binding = browser_read("workspace-a");
+    let permit = host
+        .authorize_browser_read(&scope, binding.clone())
+        .unwrap();
+    assert_eq!(permit.scope(), &scope);
+    assert_eq!(permit.binding(), &binding);
+    assert_eq!(host.active_browser_read_scope(), Some(&scope));
+    assert_eq!(
+        host.authorize_browser_read(&scope, binding.clone())
+            .unwrap_err(),
+        CordisError::BrowserReadDispatchBusy
+    );
+    assert_eq!(
+        host.authorize_domain_command(&scope, approval_command("effect-a", 'd'))
+            .unwrap_err(),
+        CordisError::BrowserReadDispatchBusy
+    );
+    assert_eq!(
+        host.authorize_effect_reconciliation(&scope, effect_reconciliation("effect-a", 'd', 'e'),)
+            .unwrap_err(),
+        CordisError::BrowserReadDispatchBusy
+    );
+    assert_eq!(
+        host.bind_domain_kernel_scope(
+            scope.clone(),
+            KernelConsentState::Missing,
+            None,
+            None,
+            now(),
+        )
+        .unwrap_err(),
+        CordisError::BrowserReadDispatchBusy
+    );
+    drop(permit);
+    assert_eq!(host.active_browser_read_scope(), None);
+
+    host.bind_domain_kernel_scope(
+        scope.clone(),
+        KernelConsentState::Missing,
+        None,
+        None,
+        now(),
+    )
+    .unwrap();
+    let permit = host.authorize_browser_read(&scope, binding).unwrap();
+    host.teardown();
+    assert_eq!(host.active_browser_read_scope(), None);
+    assert_eq!(host.bound_scope(), None);
+    assert_eq!(
+        host.finish_browser_read(permit).unwrap_err(),
+        CordisError::BrowserReadPermitMismatch
+    );
+
+    let runtime = runtime_scope("project-a", "mission-a", 4, 2, 'f');
+    let mut runtime_host = CordisHost::boot(false).unwrap();
+    runtime_host
+        .bind_domain_kernel_scope(
+            runtime.clone(),
+            KernelConsentState::Missing,
+            None,
+            None,
+            now(),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime_host
+            .authorize_browser_read(&runtime, browser_read("workspace-a"))
+            .unwrap_err(),
+        CordisError::BrowserReadRuntimeBound
+    );
 }
 
 #[test]

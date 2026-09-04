@@ -1,7 +1,8 @@
 //! Desktop-facing Cordis host. Mounts SurfaceMapping, automatic compaction,
 //! AgentLoop, the local spawn provider, and InvariantGate, and issues typed
-//! Domain-command and Runtime permits. The symbolic AgentLoop is not Desktop
-//! Runtime authority; OpenInterpreter remains an optional adapter.
+//! Browser-read, Domain-command, Effect, and Runtime permits. The symbolic
+//! AgentLoop is not Desktop Runtime authority; OpenInterpreter remains an
+//! optional adapter.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,12 +14,13 @@ use crate::agent::{
     run_authorized_runtime_agent_turn,
 };
 use crate::authority::{
-    AuthorityScope, DomainCommandBinding, DomainCommandLease, DomainCommandPermit,
-    EffectExecutionBinding, EffectExecutionLease, EffectExecutionPermit,
-    EffectReconciliationBinding, EffectReconciliationLease, EffectReconciliationPermit,
-    EffectVerificationBinding, EffectVerificationLease, EffectVerificationPermit,
-    RuntimeAgentRetention, RuntimeDispatchCompletion, RuntimeDispatchLease,
-    RuntimeDispatchNotifications, RuntimeDispatchPermit, RuntimeStatusCompletion,
+    AuthorityScope, BrowserReadBinding, BrowserReadLease, BrowserReadPermit, DomainCommandBinding,
+    DomainCommandLease, DomainCommandPermit, EffectExecutionBinding, EffectExecutionLease,
+    EffectExecutionPermit, EffectReconciliationBinding, EffectReconciliationLease,
+    EffectReconciliationPermit, EffectVerificationBinding, EffectVerificationLease,
+    EffectVerificationPermit, RuntimeAgentRetention, RuntimeDispatchCompletion,
+    RuntimeDispatchLease, RuntimeDispatchNotifications, RuntimeDispatchPermit,
+    RuntimeStatusCompletion,
 };
 use crate::compaction_automation::CompactionAutomation;
 use crate::context::{Context, CordisError, TeardownPermit, TeardownTransaction, keys};
@@ -60,6 +62,8 @@ pub const OPENINTERPRETER_PLUGIN_ID: &str = OPENINTERPRETER;
 pub struct CordisHost {
     ctx: Context,
     bound_scope: Option<AuthorityScope>,
+    active_browser_read: Option<ActiveBrowserRead>,
+    next_browser_read_serial: u64,
     active_domain_command: Option<ActiveDomainCommand>,
     next_domain_command_serial: u64,
     active_effect_execution: Option<ActiveEffectExecution>,
@@ -72,6 +76,14 @@ pub struct CordisHost {
     runtime_agents: HashMap<RuntimeAgentKey, RetainedRuntimeAgent>,
     deferred_runtime_status: Vec<RuntimeStatusCompletion>,
     next_runtime_serial: u64,
+}
+
+#[derive(Debug)]
+struct ActiveBrowserRead {
+    serial: u64,
+    scope: AuthorityScope,
+    binding: BrowserReadBinding,
+    lease: std::sync::Arc<BrowserReadLease>,
 }
 
 #[derive(Debug)]
@@ -276,6 +288,8 @@ impl std::fmt::Debug for CordisHost {
         f.debug_struct("CordisHost")
             .field("ctx", &self.ctx)
             .field("bound_scope", &self.bound_scope)
+            .field("active_browser_read", &self.active_browser_read)
+            .field("next_browser_read_serial", &self.next_browser_read_serial)
             .field("active_domain_command", &self.active_domain_command)
             .field(
                 "next_domain_command_serial",
@@ -329,6 +343,8 @@ impl CordisHost {
         Ok(Self {
             ctx,
             bound_scope: None,
+            active_browser_read: None,
+            next_browser_read_serial: 0,
             active_domain_command: None,
             next_domain_command_serial: 0,
             active_effect_execution: None,
@@ -391,6 +407,8 @@ impl CordisHost {
             Self {
                 ctx,
                 bound_scope: None,
+                active_browser_read: None,
+                next_browser_read_serial: 0,
                 active_domain_command: None,
                 next_domain_command_serial: 0,
                 active_effect_execution: None,
@@ -436,11 +454,10 @@ impl CordisHost {
         &mut self,
         scope: &AuthorityScope,
     ) -> Result<RuntimeDispatchPermit, CordisError> {
-        self.reap_abandoned_domain_command();
-        self.reap_abandoned_effect_execution();
-        self.reap_abandoned_effect_reconciliation();
-        self.reap_abandoned_effect_verification();
-        self.reap_abandoned_runtime();
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
@@ -646,6 +663,80 @@ impl CordisHost {
         Ok(permit.complete())
     }
 
+    /// Issue a one-shot permit for one exact read-only Browser operation.
+    ///
+    /// Cordis admits only Mission/Workspace fences and canonical target
+    /// digests. Desktop must release its mutex before invoking the real
+    /// Browser Host and Application persistence boundary.
+    pub fn authorize_browser_read(
+        &mut self,
+        scope: &AuthorityScope,
+        binding: BrowserReadBinding,
+    ) -> Result<BrowserReadPermit, CordisError> {
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
+        if self.active_domain_command.is_some() {
+            return Err(CordisError::DomainCommandDispatchBusy);
+        }
+        if self.active_runtime.is_some() {
+            return Err(CordisError::RuntimeDispatchBusy);
+        }
+        if self.active_effect_execution.is_some() {
+            return Err(CordisError::EffectExecutionDispatchBusy);
+        }
+        if self.active_effect_reconciliation.is_some() {
+            return Err(CordisError::EffectReconciliationDispatchBusy);
+        }
+        if self.active_effect_verification.is_some() {
+            return Err(CordisError::EffectVerificationDispatchBusy);
+        }
+        if scope.runtime().is_some() {
+            return Err(CordisError::BrowserReadRuntimeBound);
+        }
+        let Some(bound_scope) = self.bound_scope.as_ref() else {
+            return Err(CordisError::AuthorityScopeUnbound);
+        };
+        if bound_scope != scope {
+            return Err(CordisError::AuthorityScopeMismatch);
+        }
+        host_is_cordis_loop(self)?;
+        enforce_runtime_invariants(&self.ctx)?;
+
+        let serial = self
+            .next_browser_read_serial
+            .checked_add(1)
+            .ok_or(CordisError::BrowserReadSerialOverflow)?;
+        let (permit, lease) = BrowserReadPermit::issue(serial, scope.clone(), binding.clone());
+        self.next_browser_read_serial = serial;
+        self.active_browser_read = Some(ActiveBrowserRead {
+            serial,
+            scope: scope.clone(),
+            binding,
+            lease,
+        });
+        Ok(permit)
+    }
+
+    /// Settle one exact Browser read after Desktop/Application returns.
+    pub fn finish_browser_read(&mut self, permit: BrowserReadPermit) -> Result<(), CordisError> {
+        self.reap_abandoned_browser_read();
+        let Some(active) = self.active_browser_read.as_ref() else {
+            return Err(CordisError::BrowserReadPermitMismatch);
+        };
+        if active.serial != permit.serial()
+            || active.scope != *permit.scope()
+            || active.binding != *permit.binding()
+            || !permit.owns_lease(&active.lease)
+        {
+            return Err(CordisError::BrowserReadPermitMismatch);
+        }
+        self.active_browser_read = None;
+        permit.complete();
+        Ok(())
+    }
+
     /// Issue a one-shot permit for one exact Application-owned Domain command.
     ///
     /// This admits scope only. Application/Domain Kernel still validate and
@@ -656,11 +747,10 @@ impl CordisHost {
         scope: &AuthorityScope,
         command: DomainCommandBinding,
     ) -> Result<DomainCommandPermit, CordisError> {
-        self.reap_abandoned_domain_command();
-        self.reap_abandoned_effect_execution();
-        self.reap_abandoned_effect_reconciliation();
-        self.reap_abandoned_effect_verification();
-        self.reap_abandoned_runtime();
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
         if self.active_runtime.is_some() {
             return Err(CordisError::RuntimeDispatchBusy);
         }
@@ -734,11 +824,10 @@ impl CordisHost {
         scope: &AuthorityScope,
         binding: EffectExecutionBinding,
     ) -> Result<EffectExecutionPermit, CordisError> {
-        self.reap_abandoned_domain_command();
-        self.reap_abandoned_effect_execution();
-        self.reap_abandoned_effect_reconciliation();
-        self.reap_abandoned_effect_verification();
-        self.reap_abandoned_runtime();
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
@@ -812,11 +901,10 @@ impl CordisHost {
         scope: &AuthorityScope,
         binding: EffectReconciliationBinding,
     ) -> Result<EffectReconciliationPermit, CordisError> {
-        self.reap_abandoned_domain_command();
-        self.reap_abandoned_effect_execution();
-        self.reap_abandoned_effect_reconciliation();
-        self.reap_abandoned_effect_verification();
-        self.reap_abandoned_runtime();
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
@@ -889,11 +977,10 @@ impl CordisHost {
         scope: &AuthorityScope,
         binding: EffectVerificationBinding,
     ) -> Result<EffectVerificationPermit, CordisError> {
-        self.reap_abandoned_domain_command();
-        self.reap_abandoned_effect_execution();
-        self.reap_abandoned_effect_reconciliation();
-        self.reap_abandoned_effect_verification();
-        self.reap_abandoned_runtime();
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
@@ -976,11 +1063,10 @@ impl CordisHost {
         approval: Option<KernelApproval>,
         now: DateTime<Utc>,
     ) -> Result<(), CordisError> {
-        self.reap_abandoned_domain_command();
-        self.reap_abandoned_effect_execution();
-        self.reap_abandoned_effect_reconciliation();
-        self.reap_abandoned_effect_verification();
-        self.reap_abandoned_runtime();
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
@@ -1009,11 +1095,10 @@ impl CordisHost {
         approval: Option<KernelApproval>,
         now: DateTime<Utc>,
     ) -> Result<(), CordisError> {
-        self.reap_abandoned_domain_command();
-        self.reap_abandoned_effect_execution();
-        self.reap_abandoned_effect_reconciliation();
-        self.reap_abandoned_effect_verification();
-        self.reap_abandoned_runtime();
+        self.reap_abandoned_authorities();
+        if self.active_browser_read.is_some() {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
         if self.active_domain_command.is_some() {
             return Err(CordisError::DomainCommandDispatchBusy);
         }
@@ -1058,6 +1143,14 @@ impl CordisHost {
     #[must_use]
     pub fn active_runtime_scope(&self) -> Option<&AuthorityScope> {
         self.active_runtime
+            .as_ref()
+            .filter(|active| active.lease.is_active())
+            .map(|active| &active.scope)
+    }
+
+    #[must_use]
+    pub fn active_browser_read_scope(&self) -> Option<&AuthorityScope> {
+        self.active_browser_read
             .as_ref()
             .filter(|active| active.lease.is_active())
             .map(|active| &active.scope)
@@ -1156,6 +1249,9 @@ impl CordisHost {
         };
         self.reap_abandoned_runtime();
         let mut statuses = std::mem::take(&mut self.deferred_runtime_status);
+        if let Some(active) = self.active_browser_read.take() {
+            active.lease.release();
+        }
         if let Some(active) = self.active_domain_command.take() {
             active.lease.release();
         }
@@ -1222,6 +1318,15 @@ impl CordisHost {
         std::mem::take(&mut self.deferred_runtime_status)
     }
 
+    fn reap_abandoned_authorities(&mut self) {
+        self.reap_abandoned_browser_read();
+        self.reap_abandoned_domain_command();
+        self.reap_abandoned_effect_execution();
+        self.reap_abandoned_effect_reconciliation();
+        self.reap_abandoned_effect_verification();
+        self.reap_abandoned_runtime();
+    }
+
     fn reap_abandoned_runtime(&mut self) {
         if self
             .active_runtime
@@ -1245,6 +1350,16 @@ impl CordisHost {
             .is_some_and(|active| !active.lease.is_active())
         {
             self.active_domain_command = None;
+        }
+    }
+
+    fn reap_abandoned_browser_read(&mut self) {
+        if self
+            .active_browser_read
+            .as_ref()
+            .is_some_and(|active| !active.lease.is_active())
+        {
+            self.active_browser_read = None;
         }
     }
 

@@ -1408,6 +1408,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::CordisToolApprovalMismatch
         | DesktopDataError::RuntimeDispatch(_)
         | DesktopDataError::DomainCommandDispatch(_)
+        | DesktopDataError::BrowserReadDispatch(_)
         | DesktopDataError::EffectExecutionDispatch(_)
         | DesktopDataError::EffectReconciliationDispatch(_)
         | DesktopDataError::CordisSessionPersistence(_)
