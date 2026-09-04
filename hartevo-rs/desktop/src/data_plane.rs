@@ -30,8 +30,8 @@ use hartevo_application::{
     AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
     ApplicationService, ApproveProposedEffect, CatalogMissionExecutionHandle,
     ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace, CordisMissionDraft,
-    CordisMissionTurnPlan, CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
-    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
+    CordisMissionTurnPlan, CreateBrowserWorkspace, CreateProject, DecideVm11OutcomeReview,
+    DesktopInventoryProjection, DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
     KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
@@ -46,7 +46,8 @@ use hartevo_application::{
     VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
-    BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
+    BrowserControlHost, BrowserControlState, BrowserError, BrowserProfile, BrowserProfileStatus,
+    BrowserWorkspace,
 };
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
@@ -70,17 +71,17 @@ use hartevo_cordis::{
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
-    BrowserWorkspaceId, CompanyId, ConnectionId, ConsentRecord, ConsentState, ConsentStatus,
-    ContactChannel, Conversation, ConversationId, CreatorTaskId, CurrencyCode, DeliverableId,
-    DeviceId, Effect, EffectClass, EffectId, EffectStatus, KeyManagementError, KeyRecipient,
-    KpiContract, MessagingGateway, Mission, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionConversationMessageId, MissionConversationMessageKind,
-    MissionConversationRole, MissionId, MissionStage, Money, OperatingMode, OutcomeDecision,
-    PersonId, ProjectEncryptionMode, ProjectId, ProjectKeyring, Receipt, ReceiptId, ReviewDecision,
-    ReviewId, RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy,
-    RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnPrivateMessage, RuntimeTurnStatus,
-    StorageMode, TaskId, TenantId, VerificationId, VerificationStatus, WorkProductId,
-    WorkerHandleStatus,
+    BrowserProfileId, BrowserTabId, BrowserWorkspaceId, CompanyId, ConnectionId, ConsentRecord,
+    ConsentState, ConsentStatus, ContactChannel, Conversation, ConversationId, CreatorTaskId,
+    CurrencyCode, DeliverableId, DeviceId, Effect, EffectClass, EffectId, EffectStatus,
+    KeyManagementError, KeyRecipient, KpiContract, MessagingGateway, Mission,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
+    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
+    OperatingMode, OutcomeDecision, PersonId, ProjectEncryptionMode, ProjectId, ProjectKeyring,
+    Receipt, ReceiptId, ReviewDecision, ReviewId, RuntimeRecoveryAttempt, RuntimeRecoveryStatus,
+    RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnPrivateMessage,
+    RuntimeTurnStatus, StorageMode, TaskId, TenantId, VerificationId, VerificationStatus,
+    WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
     BrokerResult, DurableReceiptReconciliation, EffectBroker, EffectExecutor, EffectPolicy,
@@ -1376,6 +1377,17 @@ impl fmt::Debug for DesktopPreviewEffectProposalRequest {
             .field("proposal", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Window creation of one Mission-bound Browser Workspace from an exact
+/// SQLCipher-projected active Browser Profile. Desktop revalidates the Profile
+/// revision and Mission scope before generating any Workspace or lease id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopCreateBrowserWorkspaceRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub profile_id: BrowserProfileId,
+    pub expected_profile_revision: u64,
 }
 
 /// Window Continue for one Mission-bound Browser Workspace. The ids, revision
@@ -3732,6 +3744,75 @@ impl DesktopDataPlane {
             runtime_reconciliation,
             mission_id,
             runtime_outcome,
+            now,
+        )
+    }
+
+    /// Creates one agent-held Browser Workspace through Application from an
+    /// exact active Browser Profile projected by the current Desktop snapshot.
+    /// Creation is durable only; it does not attach a Host or execute a browser
+    /// action.
+    pub fn create_browser_workspace_os(
+        &self,
+        request: DesktopCreateBrowserWorkspaceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.create_browser_workspace_with(&secret_store, request, now)
+    }
+
+    pub fn create_browser_workspace_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopCreateBrowserWorkspaceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let DesktopCreateBrowserWorkspaceRequest {
+            project_id,
+            mission_id,
+            profile_id,
+            expected_profile_revision,
+        } = request;
+        if expected_profile_revision == 0 || profile_id.as_str().trim().is_empty() {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceCreate);
+        }
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let profile = service.load_browser_profile(&project_id, &profile_id)?;
+        if profile.id != profile_id
+            || profile.project_id != project_id
+            || profile.status != BrowserProfileStatus::Active
+            || profile.revision != expected_profile_revision
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceCreate);
+        }
+        if service
+            .load_live_browser_workspace_for_mission(&project_id, &mission_id)?
+            .is_some()
+        {
+            return Err(DesktopDataError::BrowserWorkspaceAlreadyExists);
+        }
+        let evidence_digest =
+            create_browser_workspace_evidence_digest(&project_id, &mission_id, &profile, now);
+        service.create_browser_workspace(
+            CreateBrowserWorkspace {
+                id: BrowserWorkspaceId::new(),
+                project_id,
+                mission_id,
+                profile_id: profile.id.clone(),
+                initial_tab_id: BrowserTabId::new(),
+                lease_id: BrowserControlLeaseId::new(),
+                lease_expires_at: now + Duration::hours(1),
+                evidence_digest,
+            },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
             now,
         )
     }
@@ -8610,6 +8691,30 @@ fn open_conversation_route_digest(
     format!("{:x}", hasher.finalize())
 }
 
+fn create_browser_workspace_evidence_digest(
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+    profile: &BrowserProfile,
+    now: DateTime<Utc>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"desktop.browser_workspace.create\0");
+    hasher.update(project_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(mission_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(profile.id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(profile.revision.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(profile.identity.identity_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(profile.identity.probe_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_rfc3339().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn continue_browser_workspace_evidence_digest(
     workspace: &BrowserWorkspace,
     now: DateTime<Utc>,
@@ -9065,6 +9170,12 @@ pub enum DesktopDataError {
         "Effect proposal requires a typed payload, canonical digest, stable idempotency key, positive expiry, and exact Mission CAS revision"
     )]
     InvalidEffectProposal,
+    #[error(
+        "Browser Workspace Create requires an exact active Project-scoped Browser Profile and revision from SQLCipher"
+    )]
+    InvalidBrowserWorkspaceCreate,
+    #[error("the Mission already has a live Browser Workspace")]
+    BrowserWorkspaceAlreadyExists,
     #[error(
         "Browser Workspace Continue requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
     )]
@@ -22412,6 +22523,162 @@ sleep 30"#;
         assert!(!debug.contains("provider"));
         assert!(!debug.contains("idempotency"));
         assert!(!debug.contains("payload"));
+    }
+
+    #[test]
+    fn create_browser_workspace_uses_exact_active_profile_and_refuses_stale_or_duplicate() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(2);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "从持久 Browser Profile 创建 Mission Workspace",
+                now,
+            )
+            .expect("mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("application");
+        let profile = service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("profile-desktop-create"),
+                    project_id: project_id.clone(),
+                    credential_reference: "keychain://desktop-create/profile".into(),
+                    provider: "fixture-provider".into(),
+                    account_id: AccountId::from("account-desktop-create"),
+                    identity_digest: "1".repeat(64),
+                    probe_digest: "2".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("profile");
+        drop(service);
+
+        let stale = plane.create_browser_workspace_with(
+            &secrets,
+            DesktopCreateBrowserWorkspaceRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                profile_id: profile.id.clone(),
+                expected_profile_revision: profile.revision.saturating_add(1),
+            },
+            now + Duration::seconds(2),
+        );
+        assert!(matches!(
+            stale,
+            Err(DesktopDataError::InvalidBrowserWorkspaceCreate)
+        ));
+
+        let created = plane
+            .create_browser_workspace_with(
+                &secrets,
+                DesktopCreateBrowserWorkspaceRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    profile_id: profile.id.clone(),
+                    expected_profile_revision: profile.revision,
+                },
+                now + Duration::seconds(3),
+            )
+            .expect("durable Browser Workspace");
+        let projected = created.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .and_then(|mission| mission.browser_workspace.as_ref())
+            .expect("projected Workspace");
+        assert_eq!(projected.profile_id, profile.id);
+        assert_eq!(
+            projected.control_state,
+            BrowserControlState::AgentControlled
+        );
+        assert_eq!(projected.revision, 1);
+        assert_eq!(projected.lease_generation, 1);
+
+        let duplicate = plane.create_browser_workspace_with(
+            &secrets,
+            DesktopCreateBrowserWorkspaceRequest {
+                project_id,
+                mission_id,
+                profile_id: profile.id,
+                expected_profile_revision: profile.revision,
+            },
+            now + Duration::seconds(4),
+        );
+        assert!(matches!(
+            duplicate,
+            Err(DesktopDataError::BrowserWorkspaceAlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn create_browser_workspace_refuses_a_revoked_profile() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "撤销的 Browser Profile 不能创建 Workspace",
+                now,
+            )
+            .expect("mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("application");
+        let profile = service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("profile-desktop-revoked"),
+                    project_id: project_id.clone(),
+                    credential_reference: "keychain://desktop-create/revoked".into(),
+                    provider: "fixture-provider".into(),
+                    account_id: AccountId::from("account-desktop-revoked"),
+                    identity_digest: "3".repeat(64),
+                    probe_digest: "4".repeat(64),
+                },
+                now + Duration::seconds(1),
+            )
+            .expect("profile");
+        drop(service);
+        let database_key = DatabaseKey::from_secret(&database_secret).expect("database key");
+        let mut store =
+            ProjectStore::open(&plane.database_path, &database_key).expect("project store");
+        let mut revoked = store
+            .load_browser_profile(&project_id, &profile.id)
+            .expect("profile before revocation");
+        revoked
+            .revoke(1, "5".repeat(64), now + Duration::seconds(2))
+            .expect("revoke profile");
+        store
+            .update_browser_profile_atomic(&revoked, 1)
+            .expect("persist revocation");
+        drop(store);
+
+        let refused = plane.create_browser_workspace_with(
+            &secrets,
+            DesktopCreateBrowserWorkspaceRequest {
+                project_id,
+                mission_id,
+                profile_id: revoked.id,
+                expected_profile_revision: revoked.revision,
+            },
+            now + Duration::seconds(3),
+        );
+        assert!(matches!(
+            refused,
+            Err(DesktopDataError::InvalidBrowserWorkspaceCreate)
+        ));
     }
 
     fn persist_user_held_browser_workspace(

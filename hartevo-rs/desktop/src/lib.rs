@@ -16,6 +16,7 @@ use hartevo_application::{
     DesktopProjectProjection, MissionProjection, MissionRuntimeProjection,
     ProjectEncryptionReadiness,
 };
+use hartevo_browser_adapter::BrowserProfileStatus;
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_cordis::{LifecycleCancellation, SessionCancelCause};
 use hartevo_domain_kernel::{
@@ -49,9 +50,9 @@ use cordis_host::{
 };
 use data_plane::{
     DesktopBrowserWorkspaceControlRequest, DesktopCatalogMissionRequest,
-    DesktopContinueBrowserWorkspaceRequest, DesktopDataError, DesktopDataPlane,
-    DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest, DesktopLoadState,
-    DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
+    DesktopContinueBrowserWorkspaceRequest, DesktopCreateBrowserWorkspaceRequest, DesktopDataError,
+    DesktopDataPlane, DesktopHeldLocalApproval, DesktopHumanCheckpointConfirmationRequest,
+    DesktopLoadState, DesktopMissionContinuationRequest, DesktopMissionHumanCommandRequest,
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopOpenConversationRequest,
     DesktopReviewCreatorDeliverableRequest, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
@@ -459,6 +460,8 @@ impl UiFailure {
             | DesktopDataError::InvalidWaitingApprovalGrant
             | DesktopDataError::InvalidApprovedEffectExecution
             | DesktopDataError::InvalidEffectReconciliation
+            | DesktopDataError::InvalidBrowserWorkspaceCreate
+            | DesktopDataError::BrowserWorkspaceAlreadyExists
             | DesktopDataError::InvalidBrowserWorkspaceContinue
             | DesktopDataError::InvalidBrowserWorkspaceTakeOver
             | DesktopDataError::InvalidBrowserWorkspaceControl
@@ -1085,6 +1088,7 @@ pub fn App() -> Element {
     let mut selected_result_id = use_signal(|| None::<WorkProductId>);
     let mut selected_result_scope = use_signal(|| None::<(ProjectId, MissionId)>);
     let mut result_action_pending = use_signal(|| false);
+    let mut browser_workspace_create_pending = use_signal(|| false);
     let mut vm11_outcome_action = use_signal(|| None::<(MissionId, OutcomeDecision)>);
     let mut workpad_open = use_signal(initial_workpad_open);
     let mut global_search_query = use_signal(String::new);
@@ -1974,6 +1978,77 @@ pub fn App() -> Element {
         if let Err(error) = control.reject_held_cordis_tool(held.id()) {
             model.write().set_notice(&error);
         }
+    };
+    let request_operations_create_browser = move |()| {
+        if browser_workspace_create_pending() {
+            return;
+        }
+        let selection = {
+            let current = model.read();
+            current
+                .current_project()
+                .cloned()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Project / Mission；未发明 Browser Profile 或 Workspace。"
+                    .into(),
+            });
+            return;
+        };
+        if mission.browser_workspace.is_some() {
+            model.write().notice = Some(UiFailure {
+                code: "BROWSER_WORKSPACE_EXISTS".into(),
+                message: "当前 Mission 已有持久 Browser Workspace；未创建重复 Workspace。".into(),
+            });
+            return;
+        }
+        let mut active_profiles = project
+            .browser_profiles
+            .iter()
+            .filter(|profile| profile.status == BrowserProfileStatus::Active);
+        let Some(profile) = active_profiles.next() else {
+            model.write().notice = Some(UiFailure {
+                code: "BROWSER_PROFILE_REQUIRED".into(),
+                message: "当前 Project 没有活跃 Browser Profile；未创建 Workspace。".into(),
+            });
+            return;
+        };
+        if active_profiles.next().is_some() {
+            model.write().notice = Some(UiFailure {
+                code: "BROWSER_PROFILE_SELECTION_REQUIRED".into(),
+                message: "当前 Project 有多个活跃 Browser Profile；请先明确选择，未自动代选。"
+                    .into(),
+            });
+            return;
+        }
+        let request = DesktopCreateBrowserWorkspaceRequest {
+            project_id: project.project_id.clone(),
+            mission_id: mission.mission_id.clone(),
+            profile_id: profile.profile_id.clone(),
+            expected_profile_revision: profile.revision,
+        };
+        browser_workspace_create_pending.set(true);
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.create_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => model.write().set_ready(snapshot, false),
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_WORKSPACE_CREATE_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Create 协调异常结束；未启动浏览器、执行 Effect 或声明 Verification。".into(),
+                    });
+                }
+            }
+            browser_workspace_create_pending.set(false);
+        });
     };
     let request_operations_take_over_browser = move |()| {
         let selection = {
@@ -2970,6 +3045,7 @@ pub fn App() -> Element {
                                 runtime_has_unseen: rendered_runtime_has_unseen,
                                 selected_result: selected_result.clone(),
                                 result_action_pending: result_action_pending(),
+                                browser_workspace_create_pending: browser_workspace_create_pending(),
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
@@ -2989,6 +3065,7 @@ pub fn App() -> Element {
                                     restore_ui_focus("mission-composer-input");
                                 },
                                 on_interrupt: request_operations_interrupt,
+                                on_create_browser_workspace: request_operations_create_browser,
                                 on_take_over_browser_workspace: request_operations_take_over_browser,
                                 on_continue_browser_workspace: request_operations_continue_browser,
                                 on_pause_browser_workspace: request_operations_pause_browser,
@@ -5985,10 +6062,12 @@ fn ProjectDispatcherSurface(
 fn AgentOperationsWorkbench(
     projection: AgentOperationsWorkbenchProjection,
     result_action_pending: bool,
+    browser_workspace_create_pending: bool,
     interrupt_available: bool,
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_create_browser_workspace: EventHandler<()>,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_pause_browser_workspace: EventHandler<()>,
@@ -6295,6 +6374,31 @@ fn AgentOperationsWorkbench(
                     }
                     div { class: "operations-artifact-actions",
                         {
+                            let create_ready = projection.browser.create_status == OperationsStatus::Ready
+                                && !browser_workspace_create_pending;
+                            let create_title = match projection.browser.create_status {
+                                OperationsStatus::Ready => "通过 Application create_browser_workspace 创建持久 Mission Workspace",
+                                OperationsStatus::Empty if projection.browser.workspace_id.is_some() => "当前 Mission 已有持久 Browser Workspace",
+                                OperationsStatus::Empty if projection.browser.active_profile_count > 1 => "需要先明确选择一个活跃 Browser Profile",
+                                OperationsStatus::Empty => "当前没有唯一活跃 Browser Profile，或 Mission 已有 Workspace",
+                                _ => "当前状态不允许创建 Browser Workspace",
+                            };
+                            let create_label = if browser_workspace_create_pending {
+                                "Create · RUNNING".into()
+                            } else {
+                                format!("Create · {}", projection.browser.create_status.code())
+                            };
+                            rsx! {
+                                button {
+                                    disabled: !create_ready,
+                                    aria_label: "创建 Browser Workspace",
+                                    title: "{create_title}",
+                                    onclick: move |_| on_create_browser_workspace.call(()),
+                                    "{create_label}"
+                                }
+                            }
+                        }
+                        {
                             let take_over_ready = projection.browser.take_over_status == OperationsStatus::Ready;
                             let take_over_title = match projection.browser.take_over_status {
                                 OperationsStatus::Ready => "通过 Application take_over_browser_workspace 切换为用户持有",
@@ -6430,10 +6534,12 @@ fn OrchestratorSurface(
     runtime_has_unseen: bool,
     selected_result: Option<SelectedResultProjection>,
     result_action_pending: bool,
+    browser_workspace_create_pending: bool,
     context_access: Option<ProjectContextAccessProjection>,
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
     interrupt_requested: bool,
+    on_create_browser_workspace: EventHandler<()>,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_pause_browser_workspace: EventHandler<()>,
@@ -6534,10 +6640,12 @@ fn OrchestratorSurface(
                         AgentOperationsWorkbench {
                             projection: operations.clone(),
                             result_action_pending,
+                            browser_workspace_create_pending,
                             interrupt_available: false,
                             interrupt_requested: false,
                             on_quick_entry,
                             on_interrupt,
+                            on_create_browser_workspace,
                             on_take_over_browser_workspace,
                             on_continue_browser_workspace,
                             on_pause_browser_workspace,
@@ -6667,10 +6775,12 @@ fn OrchestratorSurface(
                     AgentOperationsWorkbench {
                         projection: operations,
                         result_action_pending,
+                        browser_workspace_create_pending,
                         interrupt_available,
                         interrupt_requested,
                         on_quick_entry,
                         on_interrupt,
+                        on_create_browser_workspace,
                         on_take_over_browser_workspace,
                         on_continue_browser_workspace,
                         on_pause_browser_workspace,
@@ -11796,6 +11906,8 @@ mod tests {
     #[test]
     fn operations_browser_ownership_calls_application_transitions() {
         let source = include_str!("lib.rs");
+        assert!(source.contains("create_browser_workspace_os"));
+        assert!(source.contains("DesktopCreateBrowserWorkspaceRequest"));
         assert!(source.contains("take_over_browser_workspace_os"));
         assert!(source.contains("DesktopTakeOverBrowserWorkspaceRequest"));
         assert!(source.contains("continue_browser_workspace_os"));
@@ -11803,10 +11915,14 @@ mod tests {
         assert!(source.contains("pause_browser_workspace_os"));
         assert!(source.contains("resume_browser_workspace_os"));
         assert!(source.contains("DesktopBrowserWorkspaceControlRequest"));
+        assert!(source.contains("format!(\"Create · {}\""));
+        assert!(source.contains("Create · RUNNING"));
         assert!(source.contains("format!(\"Take over · {}\""));
         assert!(source.contains("format!(\"Continue · {}\""));
         assert!(source.contains("format!(\"Pause · {}\""));
         assert!(source.contains("format!(\"Resume · {}\""));
+        assert!(source.contains("on_create_browser_workspace"));
+        assert!(source.contains("browser_workspace_create_pending"));
         assert!(source.contains("on_take_over_browser_workspace"));
         assert!(source.contains("on_continue_browser_workspace"));
         assert!(source.contains("on_pause_browser_workspace"));
