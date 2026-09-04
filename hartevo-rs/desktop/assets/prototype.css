@@ -2723,6 +2723,13 @@ body.resizing-workpad {
   font-size: 8px;
 }
 
+.connection-table-row .connection-read-action {
+  min-height: 24px;
+  justify-self: start;
+  padding: 0 7px;
+  font-size: 8px;
+}
+
 .overlay-backdrop,
 .overlay-dismiss {
   position: fixed;
