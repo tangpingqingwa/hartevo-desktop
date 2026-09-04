@@ -21,6 +21,18 @@ pub struct BrowserNavigationPolicy {
 }
 
 impl BrowserNavigationPolicy {
+    /// Builds the narrowest production policy for one user-selected HTTPS
+    /// target. Subresources remain restricted to that target's exact origin.
+    pub fn for_exact_https_target(
+        target_url: impl AsRef<str>,
+    ) -> Result<(Self, BrowserNavigationTarget), BrowserError> {
+        let target_url = target_url.as_ref();
+        let (_, origin) = canonical_http_url(target_url, false)?;
+        let policy = Self::https_only([origin])?;
+        let target = policy.authorize(target_url)?;
+        Ok((policy, target))
+    }
+
     pub fn https_only<I, S>(origins: I) -> Result<Self, BrowserError>
     where
         I: IntoIterator<Item = S>,
@@ -363,6 +375,30 @@ mod tests {
         assert!(
             policy
                 .authorize("https://example.com/path#same-document")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_https_target_derives_one_origin_and_rejects_hostile_input() {
+        let (policy, target) = BrowserNavigationPolicy::for_exact_https_target(
+            "https://Example.com:443/research?q=private",
+        )
+        .expect("exact target policy");
+        assert_eq!(
+            target.url_digest(),
+            &digest(b"https://example.com/research?q=private")
+        );
+        assert_eq!(target.origin_digest(), &digest(b"https://example.com"));
+        assert!(policy.authorize("https://example.com/next").is_ok());
+        assert!(policy.authorize("https://other.example/next").is_err());
+        assert!(BrowserNavigationPolicy::for_exact_https_target("http://example.com/").is_err());
+        assert!(
+            BrowserNavigationPolicy::for_exact_https_target("https://user:secret@example.com/")
+                .is_err()
+        );
+        assert!(
+            BrowserNavigationPolicy::for_exact_https_target("https://example.com/#fragment")
                 .is_err()
         );
     }

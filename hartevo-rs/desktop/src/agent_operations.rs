@@ -168,6 +168,7 @@ pub struct BrowserWorkspaceProjection {
     pub create_status: OperationsStatus,
     pub host_mounted: bool,
     pub mount_status: OperationsStatus,
+    pub read_status: OperationsStatus,
     pub identity: String,
     pub control_owner: String,
     pub next_action: String,
@@ -733,6 +734,7 @@ fn browser_projection(
             create_status: OperationsStatus::Empty,
             host_mounted: true,
             mount_status: OperationsStatus::Empty,
+            read_status: OperationsStatus::Empty,
             identity: short_identity_digest(&workspace.identity_digest),
             control_owner: "User holds the current lease".into(),
             next_action: "Continue issues Application continue_browser_workspace".into(),
@@ -750,8 +752,9 @@ fn browser_projection(
             OperationsStatus::Active,
             true,
             OperationsStatus::Empty,
+            OperationsStatus::Ready,
             "Agent holds the current lease",
-            "Take over issues Application take_over_browser_workspace",
+            "Read one public HTTPS page or take over control",
             OperationsStatus::Ready,
             OperationsStatus::Empty,
             OperationsStatus::Ready,
@@ -762,6 +765,7 @@ fn browser_projection(
             active_profile_count,
             OperationsStatus::WaitingUser,
             true,
+            OperationsStatus::Empty,
             OperationsStatus::Empty,
             "Agent-owned workspace is paused",
             "Resume restores Agent ownership with a fresh lease",
@@ -775,6 +779,7 @@ fn browser_projection(
             active_profile_count,
             OperationsStatus::WaitingUser,
             true,
+            OperationsStatus::Empty,
             OperationsStatus::Empty,
             "User-owned workspace is paused",
             "Resume restores User ownership",
@@ -790,6 +795,7 @@ fn browser_projection(
             active_profile_count,
             OperationsStatus::Empty,
             false,
+            OperationsStatus::Empty,
             OperationsStatus::Empty,
             "Workspace is terminal",
             "Ownership actions do not reopen a closed workspace",
@@ -811,6 +817,7 @@ fn disconnected_browser_workspace_view(
         OperationsStatus::WaitingUser,
         false,
         OperationsStatus::Ready,
+        OperationsStatus::Empty,
         "Durable owner retained; local Host disconnected",
         "Mount the exact persisted Workspace Host",
         OperationsStatus::Empty,
@@ -831,6 +838,7 @@ fn empty_browser_projection(
         create_status,
         host_mounted: false,
         mount_status: OperationsStatus::Empty,
+        read_status: OperationsStatus::Empty,
         identity: "No Mission-bound Browser Workspace".into(),
         control_owner: "No owner".into(),
         next_action: next_action.into(),
@@ -856,7 +864,7 @@ fn active_browser_profile_count(project: Option<&DesktopProjectProjection>) -> u
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the constructor keeps Host and four independent Browser action statuses explicit"
+    reason = "the constructor keeps Host and independent Browser action statuses explicit"
 )]
 fn browser_workspace_view(
     workspace: &DurableBrowserWorkspaceProjection,
@@ -864,6 +872,7 @@ fn browser_workspace_view(
     status: OperationsStatus,
     host_mounted: bool,
     mount_status: OperationsStatus,
+    read_status: OperationsStatus,
     control_owner: &str,
     next_action: &str,
     take_over_status: OperationsStatus,
@@ -877,6 +886,7 @@ fn browser_workspace_view(
         create_status: OperationsStatus::Empty,
         host_mounted,
         mount_status,
+        read_status,
         identity: short_identity_digest(&workspace.identity_digest),
         control_owner: control_owner.into(),
         next_action: next_action.into(),
@@ -1199,6 +1209,7 @@ mod tests {
         assert_eq!(empty.create_status, OperationsStatus::Ready);
         assert!(!empty.host_mounted);
         assert_eq!(empty.mount_status, OperationsStatus::Empty);
+        assert_eq!(empty.read_status, OperationsStatus::Empty);
         assert!(
             empty
                 .next_action
@@ -1237,6 +1248,7 @@ mod tests {
         assert_eq!(disconnected.create_status, OperationsStatus::Empty);
         assert!(!disconnected.host_mounted);
         assert_eq!(disconnected.mount_status, OperationsStatus::Ready);
+        assert_eq!(disconnected.read_status, OperationsStatus::Empty);
         assert_eq!(disconnected.take_over_status, OperationsStatus::Empty);
         assert_eq!(disconnected.continue_status, OperationsStatus::Empty);
         assert_eq!(disconnected.pause_status, OperationsStatus::Empty);
@@ -1247,6 +1259,7 @@ mod tests {
         let ready = browser_projection(Some(&project), Some(&held), true);
         assert!(ready.host_mounted);
         assert_eq!(ready.mount_status, OperationsStatus::Empty);
+        assert_eq!(ready.read_status, OperationsStatus::Empty);
         assert_eq!(ready.continue_status, OperationsStatus::Ready);
         assert_eq!(ready.pause_status, OperationsStatus::Ready);
 
@@ -1255,17 +1268,19 @@ mod tests {
             .expect("workspace")
             .control_state = BrowserControlState::AgentControlled;
         let agent = browser_projection(Some(&project), Some(&held), true);
+        assert_eq!(agent.read_status, OperationsStatus::Ready);
         assert_eq!(agent.take_over_status, OperationsStatus::Ready);
         assert_eq!(agent.continue_status, OperationsStatus::Empty);
         assert_eq!(agent.pause_status, OperationsStatus::Ready);
         assert_eq!(agent.resume_status, OperationsStatus::Empty);
-        assert!(agent.next_action.contains("take_over_browser_workspace"));
+        assert!(agent.next_action.contains("Read one public HTTPS"));
 
         held.browser_workspace
             .as_mut()
             .expect("workspace")
             .control_state = BrowserControlState::PausedAgent;
         let paused_agent = browser_projection(Some(&project), Some(&held), true);
+        assert_eq!(paused_agent.read_status, OperationsStatus::Empty);
         assert_eq!(paused_agent.take_over_status, OperationsStatus::Empty);
         assert_eq!(paused_agent.continue_status, OperationsStatus::Empty);
         assert_eq!(paused_agent.pause_status, OperationsStatus::Empty);
@@ -1277,6 +1292,7 @@ mod tests {
             .expect("workspace")
             .control_state = BrowserControlState::PausedUser;
         let paused_user = browser_projection(Some(&project), Some(&held), true);
+        assert_eq!(paused_user.read_status, OperationsStatus::Empty);
         assert_eq!(paused_user.take_over_status, OperationsStatus::Empty);
         assert_eq!(paused_user.continue_status, OperationsStatus::Empty);
         assert_eq!(paused_user.pause_status, OperationsStatus::Empty);
@@ -1289,6 +1305,7 @@ mod tests {
             .control_state = BrowserControlState::Closed;
         let terminal = browser_projection(Some(&project), Some(&held), false);
         assert_eq!(terminal.mount_status, OperationsStatus::Empty);
+        assert_eq!(terminal.read_status, OperationsStatus::Empty);
         assert_eq!(terminal.resume_status, OperationsStatus::Empty);
     }
 

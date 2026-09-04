@@ -121,6 +121,52 @@ pub trait BrowserControlHost {
     fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError>;
 }
 
+/// Narrow read-only Host boundary used by Application orchestration. It grants
+/// only allowlisted navigation and a redacted semantic observation; external
+/// input and arbitrary protocol access remain outside this trait.
+pub trait BrowserReadHost: BrowserControlHost {
+    fn navigate_allowlisted(
+        &mut self,
+        tab_id: &hartevo_domain_kernel::BrowserTabId,
+        proof: &BrowserLeaseProof,
+        policy: &BrowserNavigationPolicy,
+        target: &BrowserNavigationTarget,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<BrowserNavigationReceipt, BrowserError>;
+
+    fn observe_ax(
+        &mut self,
+        tab_id: &hartevo_domain_kernel::BrowserTabId,
+        proof: &BrowserLeaseProof,
+        snapshot_id: hartevo_domain_kernel::BrowserSnapshotId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SemanticSnapshot, BrowserError>;
+}
+
+#[cfg(unix)]
+impl BrowserReadHost for ManagedChromiumHost {
+    fn navigate_allowlisted(
+        &mut self,
+        tab_id: &hartevo_domain_kernel::BrowserTabId,
+        proof: &BrowserLeaseProof,
+        policy: &BrowserNavigationPolicy,
+        target: &BrowserNavigationTarget,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<BrowserNavigationReceipt, BrowserError> {
+        ManagedChromiumHost::navigate_allowlisted(self, tab_id, proof, policy, target, now)
+    }
+
+    fn observe_ax(
+        &mut self,
+        tab_id: &hartevo_domain_kernel::BrowserTabId,
+        proof: &BrowserLeaseProof,
+        snapshot_id: hartevo_domain_kernel::BrowserSnapshotId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SemanticSnapshot, BrowserError> {
+        ManagedChromiumHost::observe_ax(self, tab_id, proof, snapshot_id, now)
+    }
+}
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

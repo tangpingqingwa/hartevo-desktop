@@ -2502,6 +2502,55 @@ textarea:focus-visible {
   cursor: not-allowed;
 }
 
+.operations-browser-read {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) auto;
+  gap: 5px;
+  align-items: end;
+  flex: 1 1 100%;
+}
+
+.operations-browser-read span {
+  grid-column: 1 / -1;
+  color: #7b8a82;
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.operations-browser-read input {
+  min-width: 0;
+  height: 28px;
+  padding: 5px 8px;
+  color: #31443a;
+  background: #fff;
+  border: 1px solid #dce4dc;
+  border-radius: 7px;
+  font-size: 8px;
+}
+
+.operations-browser-observation {
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+  color: #526159;
+  background: #f4f8f4;
+  border: 1px solid #dce7de;
+  border-radius: 8px;
+  font-size: 8px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.operations-browser-observation strong {
+  color: #245a43;
+}
+
+.operations-browser-observation small {
+  color: #7b8a82;
+}
+
 .operations-approval-card,
 .operations-browser-card,
 .operations-recovery-card {
