@@ -59,13 +59,13 @@ pub use approval::{
     set_approval_policy,
 };
 pub use authority::{
-    AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, DomainCommandAuthority,
-    DomainCommandBinding, DomainCommandKind, DomainCommandPermit, EffectExecutionAuthority,
-    EffectExecutionBinding, EffectExecutionPermit, EffectReconciliationAuthority,
-    EffectReconciliationBinding, EffectReconciliationPermit, EffectVerificationAuthority,
-    EffectVerificationBinding, EffectVerificationPermit, RuntimeAuthority, RuntimeBinding,
-    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeRecordBinding,
-    RuntimeStatusCompletion,
+    AuthorityDispatchError, AuthorityDispatchFailures, AuthorityScope, BrowserReadAuthority,
+    BrowserReadBinding, BrowserReadPermit, DomainCommandAuthority, DomainCommandBinding,
+    DomainCommandKind, DomainCommandPermit, EffectExecutionAuthority, EffectExecutionBinding,
+    EffectExecutionPermit, EffectReconciliationAuthority, EffectReconciliationBinding,
+    EffectReconciliationPermit, EffectVerificationAuthority, EffectVerificationBinding,
+    EffectVerificationPermit, RuntimeAuthority, RuntimeBinding, RuntimeDispatchCompletion,
+    RuntimeDispatchPermit, RuntimeRecordBinding, RuntimeStatusCompletion,
 };
 pub use compaction::{
     COMPACTION_CHECKPOINT_PLUGIN, CompactionCheckpoint, CompactionId, CompactionLease,

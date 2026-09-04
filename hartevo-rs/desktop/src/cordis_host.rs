@@ -1,4 +1,4 @@
-//! One-call-site Cordis mount and typed Domain/Effect/Runtime adapters for Desktop.
+//! One-call-site Cordis mount and typed Browser/Domain/Effect/Runtime adapters for Desktop.
 //!
 //! Production Runtime enters through [`dispatch_live_runtime`]: Cordis issues
 //! a short-lived scoped permit, Desktop releases the host lock, and the real
@@ -16,28 +16,29 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use hartevo_cordis::{
     AgentInboxOutcome, AgentInboxTarget, AgentTurnOutcome, ApprovalOutcome, ApprovalPrompt,
-    ApprovalRequestId, AuthorityDispatchError, AuthorityScope, BailOutcome, CompactionResult,
-    CordisError, CordisHost, DomainCommandAuthority, DomainCommandBinding, DomainCommandPermit,
-    EffectExecutionAuthority, EffectExecutionBinding, EffectExecutionPermit,
-    EffectReconciliationAuthority, EffectReconciliationBinding, EffectReconciliationPermit,
-    EffectVerificationAuthority, EffectVerificationBinding, EffectVerificationPermit, EventOptions,
-    Fiber, FiberState, FiberUid, JobId, JobTerminalNotice, JobsSurface, KernelApproval,
-    KernelApprovalDecision, KernelConsentRecord, KernelConsentState, KernelConsentStatus,
-    LifecycleCancellation, ListenerHandle, LlmAdapter, LlmAdapterStream, LlmError,
-    LlmGenerateRequest, LlmResolvedModel, ManualCompactionError, ManualCompactionErrorCode,
-    NonBail, OneShotSubagentDescriptor, PromptSection, RegistrationHandle, RuntimeAgentIdentity,
-    RuntimeAuthority, RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeStatusCompletion,
-    SandboxError, SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy,
-    SessionCallConfig, SessionCancelCause, SessionCheckpoint, SessionCompactionEnd,
-    SessionCompactionStart, SessionCompactionSummary, SessionContentBlock, SessionEpochHeader,
-    SessionError, SessionEvent, SessionEventKind, SessionEventRecord, SessionFinishReason,
-    SessionHandle, SessionHeader, SessionId, SessionLlmFailure, SessionLlmRetry,
-    SessionLlmRetryStarted, SessionLog, SessionMessage, SessionMessageRole, SessionMessageSource,
-    SessionRequestContext, SessionRequestHeader, SessionRequestHeaderReason, SessionSandboxMode,
-    SessionStore, SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent,
-    SessionToolError, TurnEndReason, approval_events, bind_sandbox_workspace, compact_now,
-    host_is_cordis_loop, keys, register_llm_adapter, register_prompt_section,
-    run_agent_turn as run_cordis_agent_turn, session_events,
+    ApprovalRequestId, AuthorityDispatchError, AuthorityScope, BailOutcome, BrowserReadAuthority,
+    BrowserReadBinding, BrowserReadPermit, CompactionResult, CordisError, CordisHost,
+    DomainCommandAuthority, DomainCommandBinding, DomainCommandPermit, EffectExecutionAuthority,
+    EffectExecutionBinding, EffectExecutionPermit, EffectReconciliationAuthority,
+    EffectReconciliationBinding, EffectReconciliationPermit, EffectVerificationAuthority,
+    EffectVerificationBinding, EffectVerificationPermit, EventOptions, Fiber, FiberState, FiberUid,
+    JobId, JobTerminalNotice, JobsSurface, KernelApproval, KernelApprovalDecision,
+    KernelConsentRecord, KernelConsentState, KernelConsentStatus, LifecycleCancellation,
+    ListenerHandle, LlmAdapter, LlmAdapterStream, LlmError, LlmGenerateRequest, LlmResolvedModel,
+    ManualCompactionError, ManualCompactionErrorCode, NonBail, OneShotSubagentDescriptor,
+    PromptSection, RegistrationHandle, RuntimeAgentIdentity, RuntimeAuthority,
+    RuntimeDispatchCompletion, RuntimeDispatchPermit, RuntimeStatusCompletion, SandboxError,
+    SessionApprovalAsked, SessionApprovalDecided, SessionApprovalPolicy, SessionCallConfig,
+    SessionCancelCause, SessionCheckpoint, SessionCompactionEnd, SessionCompactionStart,
+    SessionCompactionSummary, SessionContentBlock, SessionEpochHeader, SessionError, SessionEvent,
+    SessionEventKind, SessionEventRecord, SessionFinishReason, SessionHandle, SessionHeader,
+    SessionId, SessionLlmFailure, SessionLlmRetry, SessionLlmRetryStarted, SessionLog,
+    SessionMessage, SessionMessageRole, SessionMessageSource, SessionRequestContext,
+    SessionRequestHeader, SessionRequestHeaderReason, SessionSandboxMode, SessionStore,
+    SessionStreamBlockType, SessionStreamChunk, SessionSurfaceIntent, SessionToolError,
+    TurnEndReason, approval_events, bind_sandbox_workspace, compact_now, host_is_cordis_loop, keys,
+    register_llm_adapter, register_prompt_section, run_agent_turn as run_cordis_agent_turn,
+    session_events,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -538,6 +539,13 @@ impl DesktopCordisSlotError {
         match self {
             Self::CheckedOut => CordisError::DomainCommandDispatchBusy,
             Self::Poisoned => CordisError::DomainCommandCoordinatorPoisoned,
+        }
+    }
+
+    const fn browser_read(self) -> CordisError {
+        match self {
+            Self::CheckedOut => CordisError::BrowserReadDispatchBusy,
+            Self::Poisoned => CordisError::BrowserReadCoordinatorPoisoned,
         }
     }
 
@@ -1940,6 +1948,15 @@ impl DesktopCordisCoordinator {
         self.host.authorize_domain_command(&scope, command)
     }
 
+    fn authorize_bound_browser_read(
+        &mut self,
+        binding: DesktopCordisBindingReceipt,
+        browser: BrowserReadBinding,
+    ) -> Result<BrowserReadPermit, CordisError> {
+        let scope = self.consume_binding(binding)?;
+        self.host.authorize_browser_read(&scope, browser)
+    }
+
     fn authorize_bound_effect_execution(
         &mut self,
         binding: DesktopCordisBindingReceipt,
@@ -1990,6 +2007,19 @@ impl DesktopCordisCoordinator {
     ) -> Result<DomainCommandPermit, CordisError> {
         let binding = self.bind_domain_kernel_scope(scope, consent, record, approval, now)?;
         self.authorize_bound_domain_command(binding, command)
+    }
+
+    fn bind_and_authorize_browser_read(
+        &mut self,
+        scope: AuthorityScope,
+        consent: KernelConsentState,
+        record: Option<KernelConsentRecord>,
+        approval: Option<KernelApproval>,
+        browser: BrowserReadBinding,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserReadPermit, CordisError> {
+        let binding = self.bind_domain_kernel_scope(scope, consent, record, approval, now)?;
+        self.authorize_bound_browser_read(binding, browser)
     }
 
     fn bind_and_authorize_effect_execution(
@@ -2044,6 +2074,10 @@ impl DesktopCordisCoordinator {
 
     fn finish_domain_command(&mut self, permit: DomainCommandPermit) -> Result<(), CordisError> {
         self.host.finish_domain_command(permit)
+    }
+
+    fn finish_browser_read(&mut self, permit: BrowserReadPermit) -> Result<(), CordisError> {
+        self.host.finish_browser_read(permit)
     }
 
     fn finish_effect_execution(
@@ -2908,6 +2942,29 @@ where
     }
 }
 
+/// Private Desktop adapter for one Cordis-authorized Browser read.
+struct DesktopBrowserReadAuthority<Read> {
+    read: Read,
+}
+
+impl<Read> DesktopBrowserReadAuthority<Read> {
+    fn new(read: Read) -> Self {
+        Self { read }
+    }
+}
+
+impl<Read, Output, AdapterError> BrowserReadAuthority for DesktopBrowserReadAuthority<Read>
+where
+    Read: FnOnce(&BrowserReadPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn read(self, permit: &BrowserReadPermit) -> Result<Self::Output, Self::Error> {
+        (self.read)(permit)
+    }
+}
+
 /// Private Desktop adapter for one Cordis-authorized Domain command.
 struct DesktopDomainCommandAuthority<Execute> {
     execute: Execute,
@@ -3013,6 +3070,18 @@ pub(crate) struct DesktopDomainCommandAuthorization {
 impl DesktopDomainCommandAuthorization {
     pub(crate) fn new(scope: AuthorityScope, command: DomainCommandBinding) -> Self {
         Self { scope, command }
+    }
+}
+
+/// Exact Cordis scope plus one immutable, content-free Browser read fence.
+pub(crate) struct DesktopBrowserReadAuthorization {
+    scope: AuthorityScope,
+    browser: BrowserReadBinding,
+}
+
+impl DesktopBrowserReadAuthorization {
+    pub(crate) fn new(scope: AuthorityScope, browser: BrowserReadBinding) -> Self {
+        Self { scope, browser }
     }
 }
 
@@ -3188,6 +3257,53 @@ where
     } else {
         output.map(Some).ok_or_else(|| {
             AuthorityDispatchError::Cordis(Box::new(CordisError::RuntimePermitMismatch))
+        })
+    }
+}
+
+/// Bind exact live facts, issue a one-shot Browser-read permit, release the
+/// coordinator lock for the real Browser/Application operation, then settle
+/// under a second short lock. Cordis receives no raw URL, page content,
+/// Browser Host, storage handle, or resulting observation.
+pub(crate) fn dispatch_live_browser_read<Read, Output, AdapterError>(
+    cordis: &Arc<DesktopCordisSlot>,
+    authorization: DesktopBrowserReadAuthorization,
+    consent: &ConsentState,
+    record: Option<&ConsentRecord>,
+    approval: Option<&Approval>,
+    now: DateTime<Utc>,
+    read: Read,
+) -> Result<Output, AuthorityDispatchError<AdapterError>>
+where
+    Read: FnOnce(&BrowserReadPermit) -> Result<Output, AdapterError>,
+{
+    let DesktopBrowserReadAuthorization { scope, browser } = authorization;
+    let permit = {
+        let mut host = cordis
+            .lock()
+            .map_err(DesktopCordisSlotError::browser_read)?;
+        host.bind_and_authorize_browser_read(
+            scope,
+            kernel_consent_state(consent),
+            record.map(kernel_consent_record),
+            approval.map(kernel_approval),
+            browser,
+            now,
+        )?
+    };
+    let (output, authority) = match DesktopBrowserReadAuthority::new(read).read(&permit) {
+        Ok(output) => (Some(output), None),
+        Err(error) => (None, Some(error)),
+    };
+    let finish = match cordis.lock() {
+        Ok(mut host) => host.finish_browser_read(permit).err(),
+        Err(error) => Some(error.browser_read()),
+    };
+    if let Some(error) = AuthorityDispatchError::from_phases(None, authority, finish, None) {
+        Err(error)
+    } else {
+        output.ok_or_else(|| {
+            AuthorityDispatchError::Cordis(Box::new(CordisError::BrowserReadPermitMismatch))
         })
     }
 }
@@ -3408,9 +3524,9 @@ mod tests {
     use hartevo_cordis::{
         AgentInboxOutcome, AgentInboxTarget, AgentRef, AgentStatus, AgentStatusChange, AgentStep,
         AgentsSurface, ApprovalOutcome, ApprovalPolicy, ApprovalPolicySource, ApprovalRequestId,
-        AuthorityDispatchError, AuthorityScope, CompactionCheckpoint, CompactionId,
-        CompactionSummaryDraft, CordisError, CordisHost, DomainCommandBinding, DomainCommandKind,
-        DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
+        AuthorityDispatchError, AuthorityScope, BrowserReadBinding, CompactionCheckpoint,
+        CompactionId, CompactionSummaryDraft, CordisError, CordisHost, DomainCommandBinding,
+        DomainCommandKind, DomainSurface, EffectExecutionBinding, EffectReconciliationBinding,
         EffectVerificationBinding, FiberState, KernelApproval, KernelApprovalDecision,
         KernelConsentState, LifecycleCancellation, LlmAdapter, LlmAdapterStream, LlmError,
         LlmGenerateRequest, LlmResolvedModel, LlmSurface, ManualCompactionErrorCode,
@@ -3443,11 +3559,12 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopCordisApprovalBridge,
-        DesktopCordisSlot, DesktopDomainCommandAuthorization, DesktopEffectExecutionAuthorization,
-        DesktopEffectReconciliationAuthorization, DesktopEffectVerificationAuthorization,
-        DesktopHumanCommandDispatch, DesktopHumanCommandResult, DesktopSessionPersistenceError,
-        bind_live_domain_kernel, bind_live_domain_kernel_scope, decode_checkpoint, decode_event,
+        DesktopAgentTurnError, DesktopAgentTurnRequest, DesktopBrowserReadAuthorization,
+        DesktopCordisApprovalBridge, DesktopCordisSlot, DesktopDomainCommandAuthorization,
+        DesktopEffectExecutionAuthorization, DesktopEffectReconciliationAuthorization,
+        DesktopEffectVerificationAuthorization, DesktopHumanCommandDispatch,
+        DesktopHumanCommandResult, DesktopSessionPersistenceError, bind_live_domain_kernel,
+        bind_live_domain_kernel_scope, decode_checkpoint, decode_event, dispatch_live_browser_read,
         dispatch_live_domain_command, dispatch_live_effect_execution,
         dispatch_live_effect_reconciliation, dispatch_live_effect_verification,
         dispatch_live_runtime, encode_checkpoint, encode_event, is_desktop_human_command,
@@ -6269,6 +6386,18 @@ mod tests {
         DomainCommandBinding::approve_proposed_effect("effect-a", "a".repeat(64)).unwrap()
     }
 
+    fn browser_read() -> BrowserReadBinding {
+        BrowserReadBinding::new(
+            "workspace-a",
+            5,
+            7,
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+        )
+        .unwrap()
+    }
+
     fn effect_execution() -> EffectExecutionBinding {
         EffectExecutionBinding::new("effect-a", "a".repeat(64), "b".repeat(64)).unwrap()
     }
@@ -6812,6 +6941,59 @@ mod tests {
         assert_eq!(output, "application-domain-command");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(host.lock().unwrap().active_domain_command_scope().is_none());
+    }
+
+    #[test]
+    fn desktop_browser_read_releases_lock_and_calls_application_once() {
+        let host = Arc::new(DesktopCordisSlot::new(
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap(),
+        ));
+        let probe = Arc::clone(&host);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let expected_scope = domain_scope();
+        let expected_binding = browser_read();
+
+        let output = dispatch_live_browser_read(
+            &host,
+            DesktopBrowserReadAuthorization::new(expected_scope.clone(), expected_binding.clone()),
+            &ConsentState::NotRequired,
+            None,
+            None,
+            now(),
+            move |permit| {
+                assert_eq!(permit.scope(), &expected_scope);
+                assert_eq!(permit.binding(), &expected_binding);
+                assert!(
+                    probe.try_lock().is_ok(),
+                    "Browser/Application must run without the Cordis coordinator lock"
+                );
+                let nested = dispatch_live_browser_read(
+                    &probe,
+                    DesktopBrowserReadAuthorization::new(
+                        permit.scope().clone(),
+                        permit.binding().clone(),
+                    ),
+                    &ConsentState::NotRequired,
+                    None,
+                    None,
+                    now(),
+                    |_| Ok::<_, &'static str>(()),
+                );
+                assert_eq!(
+                    nested.unwrap_err(),
+                    AuthorityDispatchError::Cordis(Box::new(CordisError::BrowserReadDispatchBusy))
+                );
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, &'static str>("application-browser-read")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, "application-browser-read");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(host.lock().unwrap().active_browser_read_scope().is_none());
     }
 
     #[test]

@@ -343,6 +343,16 @@ pub enum CordisError {
     DomainCommandSerialOverflow,
     #[error("Cordis Domain command coordinator mutex is poisoned")]
     DomainCommandCoordinatorPoisoned,
+    #[error("Cordis Browser read scope must not carry Runtime authority")]
+    BrowserReadRuntimeBound,
+    #[error("Cordis Browser read dispatch is already active")]
+    BrowserReadDispatchBusy,
+    #[error("Cordis Browser read permit does not match the active operation")]
+    BrowserReadPermitMismatch,
+    #[error("Cordis Browser read serial overflowed")]
+    BrowserReadSerialOverflow,
+    #[error("Cordis Browser read coordinator mutex is poisoned")]
+    BrowserReadCoordinatorPoisoned,
     #[error("Cordis Effect execution scope must not carry Runtime authority")]
     EffectExecutionRuntimeBound,
     #[error("Cordis Effect execution dispatch is already active")]

@@ -161,6 +161,97 @@ impl AuthorityScope {
     }
 }
 
+/// Content-minimized fence for one exact read-only Browser navigation.
+///
+/// Mission identity and revision stay in [`AuthorityScope`]. Cordis receives
+/// only the durable Workspace identity/fences and canonical digests derived
+/// from the allowlisted target. The raw URL, Browser Host, page content,
+/// credentials, and persistence handles remain Desktop/Application-owned.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct BrowserReadBinding {
+    workspace_id: String,
+    workspace_revision: u64,
+    lease_generation: u64,
+    target_url_digest: String,
+    target_origin_digest: String,
+    navigation_policy_digest: String,
+}
+
+impl BrowserReadBinding {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        workspace_revision: u64,
+        lease_generation: u64,
+        target_url_digest: impl Into<String>,
+        target_origin_digest: impl Into<String>,
+        navigation_policy_digest: impl Into<String>,
+    ) -> Result<Self, CordisError> {
+        positive_revision(workspace_revision, "browser_read_workspace_revision")?;
+        positive_revision(lease_generation, "browser_read_lease_generation")?;
+        Ok(Self {
+            workspace_id: normalized_id(workspace_id.into(), "browser_read_workspace_id")?,
+            workspace_revision,
+            lease_generation,
+            target_url_digest: canonical_digest(
+                target_url_digest.into(),
+                "browser_read_target_url_digest",
+            )?,
+            target_origin_digest: canonical_digest(
+                target_origin_digest.into(),
+                "browser_read_target_origin_digest",
+            )?,
+            navigation_policy_digest: canonical_digest(
+                navigation_policy_digest.into(),
+                "browser_read_navigation_policy_digest",
+            )?,
+        })
+    }
+
+    #[must_use]
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    #[must_use]
+    pub const fn workspace_revision(&self) -> u64 {
+        self.workspace_revision
+    }
+
+    #[must_use]
+    pub const fn lease_generation(&self) -> u64 {
+        self.lease_generation
+    }
+
+    #[must_use]
+    pub fn target_url_digest(&self) -> &str {
+        &self.target_url_digest
+    }
+
+    #[must_use]
+    pub fn target_origin_digest(&self) -> &str {
+        &self.target_origin_digest
+    }
+
+    #[must_use]
+    pub fn navigation_policy_digest(&self) -> &str {
+        &self.navigation_policy_digest
+    }
+}
+
+impl fmt::Debug for BrowserReadBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserReadBinding")
+            .field("workspace_id", &self.workspace_id)
+            .field("workspace_revision", &self.workspace_revision)
+            .field("lease_generation", &self.lease_generation)
+            .field("target_url_digest", &"[DIGEST]")
+            .field("target_origin_digest", &"[DIGEST]")
+            .field("navigation_policy_digest", &"[DIGEST]")
+            .finish()
+    }
+}
+
 /// Exact Domain command kind currently admitted through the Desktop host.
 ///
 /// Approval records remain Application/Domain Kernel state. This enum only
@@ -520,6 +611,111 @@ fn canonical_digest(value: String, field: &'static str) -> Result<String, Cordis
         return Err(CordisError::InvalidAuthorityDigest { field });
     }
     Ok(value)
+}
+
+/// Unforgeable, one-shot proof that Cordis admitted one exact Browser read.
+///
+/// Only [`crate::CordisHost`] can issue it. Desktop releases the coordinator
+/// lock before invoking the real Browser/Application path, then returns this
+/// permit for settlement.
+pub struct BrowserReadPermit {
+    serial: u64,
+    scope: AuthorityScope,
+    binding: BrowserReadBinding,
+    lease: Arc<BrowserReadLease>,
+    settled: bool,
+}
+
+impl BrowserReadPermit {
+    pub(crate) fn issue(
+        serial: u64,
+        scope: AuthorityScope,
+        binding: BrowserReadBinding,
+    ) -> (Self, Arc<BrowserReadLease>) {
+        let lease = Arc::new(BrowserReadLease::new());
+        (
+            Self {
+                serial,
+                scope,
+                binding,
+                lease: Arc::clone(&lease),
+                settled: false,
+            },
+            lease,
+        )
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &AuthorityScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &BrowserReadBinding {
+        &self.binding
+    }
+
+    pub(crate) const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    pub(crate) fn owns_lease(&self, lease: &Arc<BrowserReadLease>) -> bool {
+        Arc::ptr_eq(&self.lease, lease)
+    }
+
+    pub(crate) fn complete(mut self) {
+        self.lease.release();
+        self.settled = true;
+    }
+}
+
+impl fmt::Debug for BrowserReadPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserReadPermit")
+            .field("serial", &self.serial)
+            .field("scope", &self.scope)
+            .field("binding", &self.binding)
+            .field("settled", &self.settled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for BrowserReadPermit {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.lease.release();
+        }
+    }
+}
+
+pub(crate) struct BrowserReadLease {
+    active: AtomicBool,
+}
+
+impl BrowserReadLease {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn release(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for BrowserReadLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserReadLease")
+            .field("active", &self.is_active())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Unforgeable, one-shot proof that Cordis admitted one exact Domain command.
@@ -1319,6 +1515,30 @@ where
     }
 }
 
+/// One-shot typed adapter for a Desktop/Application-owned Browser read.
+///
+/// The permit contains only immutable, content-free fences. The concrete
+/// adapter remains the sole holder of the raw target, Browser Host, SQLCipher
+/// state, and resulting durable observation.
+pub trait BrowserReadAuthority {
+    type Output;
+    type Error;
+
+    fn read(self, permit: &BrowserReadPermit) -> Result<Self::Output, Self::Error>;
+}
+
+impl<F, Output, AdapterError> BrowserReadAuthority for F
+where
+    F: FnOnce(&BrowserReadPermit) -> Result<Output, AdapterError>,
+{
+    type Output = Output;
+    type Error = AdapterError;
+
+    fn read(self, permit: &BrowserReadPermit) -> Result<Self::Output, Self::Error> {
+        self(permit)
+    }
+}
+
 /// One-shot typed adapter for an Application-owned Domain command.
 ///
 /// The permit proves Cordis scope admission only. The concrete Application
@@ -1568,8 +1788,8 @@ mod tests {
     use std::fmt::{self, Display};
 
     use super::{
-        AuthorityDispatchError, AuthorityScope, DomainCommandBinding, DomainCommandKind,
-        RuntimeBinding, RuntimeRecordBinding,
+        AuthorityDispatchError, AuthorityScope, BrowserReadBinding, DomainCommandBinding,
+        DomainCommandKind, RuntimeBinding, RuntimeRecordBinding,
     };
     use crate::CordisError;
 
@@ -1640,6 +1860,78 @@ mod tests {
         assert_eq!(binding.generation(), 2);
         assert_eq!(binding.recovery().unwrap().revision(), 4);
         assert_eq!(binding.turn().unwrap().id(), "turn");
+    }
+
+    #[test]
+    fn browser_read_binding_is_content_minimized_and_exact() {
+        assert_eq!(
+            BrowserReadBinding::new("", 1, 1, "a".repeat(64), "b".repeat(64), "c".repeat(64))
+                .unwrap_err(),
+            CordisError::InvalidAuthorityScope {
+                field: "browser_read_workspace_id"
+            }
+        );
+        assert_eq!(
+            BrowserReadBinding::new(
+                "workspace-a",
+                0,
+                1,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+            )
+            .unwrap_err(),
+            CordisError::InvalidAuthorityRevision {
+                field: "browser_read_workspace_revision"
+            }
+        );
+        assert_eq!(
+            BrowserReadBinding::new(
+                "workspace-a",
+                2,
+                0,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+            )
+            .unwrap_err(),
+            CordisError::InvalidAuthorityRevision {
+                field: "browser_read_lease_generation"
+            }
+        );
+        assert_eq!(
+            BrowserReadBinding::new(
+                "workspace-a",
+                2,
+                3,
+                "https://example.com/private?q=secret",
+                "b".repeat(64),
+                "c".repeat(64),
+            )
+            .unwrap_err(),
+            CordisError::InvalidAuthorityDigest {
+                field: "browser_read_target_url_digest"
+            }
+        );
+
+        let binding = BrowserReadBinding::new(
+            "workspace-a",
+            2,
+            3,
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+        )
+        .unwrap();
+        assert_eq!(binding.workspace_id(), "workspace-a");
+        assert_eq!(binding.workspace_revision(), 2);
+        assert_eq!(binding.lease_generation(), 3);
+        assert_eq!(binding.target_url_digest(), "a".repeat(64));
+        assert_eq!(binding.target_origin_digest(), "b".repeat(64));
+        assert_eq!(binding.navigation_policy_digest(), "c".repeat(64));
+        let debug = format!("{binding:?}");
+        assert!(!debug.contains(&"a".repeat(64)));
+        assert!(!debug.contains("https://"));
     }
 
     #[test]
