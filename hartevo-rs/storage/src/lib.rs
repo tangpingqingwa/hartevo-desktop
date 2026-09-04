@@ -4501,6 +4501,14 @@ fn verify_sqlcipher(connection: &Connection) -> Result<(), StorageError> {
 
 fn configure_connection(connection: &Connection) -> Result<(), StorageError> {
     connection.busy_timeout(StdDuration::from_secs(5))?;
+    // GitHub's Linux test runners have a small locked-memory limit. SQLCipher
+    // still attempts every lock, but warning once per overflow allocation can
+    // produce gigabytes of duplicate CI output. Keep production WARN logging
+    // and memory security unchanged; debug CI reports only SQLCipher errors.
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if std::env::var_os("CI").is_some() {
+        connection.execute_batch("PRAGMA cipher_log_level = ERROR;")?;
+    }
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA trusted_schema = OFF;
