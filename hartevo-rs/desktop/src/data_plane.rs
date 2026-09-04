@@ -61,10 +61,11 @@ use hartevo_catalog::{
 };
 use hartevo_channel_adapters::tiktok::ProviderId as TiktokProviderId;
 use hartevo_channel_adapters::{
-    BusinessId as TiktokBusinessId, MAX_VIDEO_SEQUENCE_PAGES, OAuthCredential, ReadOnlyTransport,
-    SecretReference as ChannelSecretReference, TiktokAccountId, TiktokApiOperation, TiktokError,
-    TiktokFreshnessPolicy, TiktokMissionAcceptedSequence, TiktokOAuthScope, TiktokReadObservation,
-    TiktokReadScope, execute_real_read_gate,
+    BusinessId as TiktokBusinessId, EvidenceProvenance, MAX_VIDEO_SEQUENCE_PAGES, OAuthCredential,
+    ReadOnlyTransport, SecretReference as ChannelSecretReference, TiktokAccountId,
+    TiktokApiOperation, TiktokError, TiktokFreshnessPolicy, TiktokMissionAcceptedSequence,
+    TiktokOAuthScope, TiktokObservationEnvelope, TiktokReadObservation, TiktokReadScope,
+    execute_real_read_gate,
 };
 use hartevo_context_fabric::{
     ConservativeByteBudgetTokenizer, ContextAssemblyStatus, RuntimeContextEnvelope,
@@ -87,16 +88,17 @@ use hartevo_cordis::{
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
     BrowserProfileId, BrowserSnapshotId, BrowserTabId, BrowserWorkspaceId, CompanyId, Connection,
-    ConnectionId, ConsentRecord, ConsentState, ConsentStatus, ContactChannel, Conversation,
-    ConversationId, CreatorTaskId, CurrencyCode, DeliverableId, DeviceId, Effect, EffectClass,
-    EffectId, EffectStatus, KeyManagementError, KeyRecipient, KpiContract, MessagingGateway,
-    Mission, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
-    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, PersonId,
-    ProjectEncryptionMode, ProjectId, ProjectKeyring, Receipt, ReceiptId, ReviewDecision, ReviewId,
-    RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
-    RuntimeTurnAttemptId, RuntimeTurnPrivateMessage, RuntimeTurnStatus, StorageMode, TaskId,
-    TenantId, VerificationId, VerificationStatus, WorkProductId, WorkerHandleStatus,
+    ConnectionId, ConnectionProbe, ConnectionStatus, ConsentRecord, ConsentState, ConsentStatus,
+    ContactChannel, Conversation, ConversationId, CreatorTaskId, CurrencyCode, DeliverableId,
+    DeviceId, Effect, EffectClass, EffectId, EffectStatus, KeyManagementError, KeyRecipient,
+    KpiContract, MessagingGateway, Mission, MissionCheckpointCompletionPolicy,
+    MissionCheckpointExecutor, MissionConversationMessageId, MissionConversationMessageKind,
+    MissionConversationRole, MissionId, MissionStage, Money, OperatingMode, OutcomeDecision,
+    PersonId, ProbeOutcome, ProjectEncryptionMode, ProjectId, ProjectKeyring, Receipt, ReceiptId,
+    ReviewDecision, ReviewId, RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy,
+    RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnPrivateMessage, RuntimeTurnStatus,
+    StorageMode, TaskId, TenantId, VerificationId, VerificationStatus, WorkProductId,
+    WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
     BrokerResult, DurableReceiptReconciliation, EffectBroker, EffectExecutor, EffectPolicy,
@@ -144,8 +146,8 @@ use crate::shopify_readback::{
     dispatch_os_keyring_shopify_readback_metadata, prepare_shopify_readback_broker,
 };
 use crate::tiktok_read::{
-    clear_tiktok_access_token, native_tiktok_read_transport, provision_tiktok_access_token,
-    require_tiktok_access_token,
+    clear_tiktok_access_token, copy_tiktok_access_token_generation, native_tiktok_read_transport,
+    provision_tiktok_access_token, require_tiktok_access_token,
 };
 
 const DATA_DIRECTORY_ENV: &str = "HARTEVO_DESKTOP_DATA_DIR";
@@ -1618,6 +1620,10 @@ impl DesktopTiktokConnectionRegistration {
     pub const fn credential(&self) -> &OAuthCredential {
         &self.credential
     }
+
+    pub fn into_probe_request(self) -> DesktopProbeTiktokConnectionRequest {
+        DesktopProbeTiktokConnectionRequest { registration: self }
+    }
 }
 
 impl fmt::Debug for DesktopTiktokConnectionRegistration {
@@ -1632,6 +1638,64 @@ impl fmt::Debug for DesktopTiktokConnectionRegistration {
             .field("credential", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Move-only request for proving one exact N148 registration against TikTok.
+/// The nested account and credential metadata remain deliberately private.
+pub struct DesktopProbeTiktokConnectionRequest {
+    registration: DesktopTiktokConnectionRegistration,
+}
+
+impl fmt::Debug for DesktopProbeTiktokConnectionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopProbeTiktokConnectionRequest")
+            .field("project_id", self.registration.connection.project_id())
+            .field("connection_id", self.registration.connection.id())
+            .field("registration", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Redacted result of a fresh production identity probe and credential
+/// generation transition.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopTiktokConnectionProbe {
+    connection: Connection,
+    credential: OAuthCredential,
+}
+
+impl DesktopTiktokConnectionProbe {
+    pub const fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub const fn credential(&self) -> &OAuthCredential {
+        &self.credential
+    }
+}
+
+impl fmt::Debug for DesktopTiktokConnectionProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopTiktokConnectionProbe")
+            .field("connection_id", self.connection.id())
+            .field("provider", &"tiktok")
+            .field("status", &self.connection.snapshot().status)
+            .field("revision", &self.connection.revision())
+            .field("credential", &"[REDACTED]")
+            .finish()
+    }
+}
+
+struct DesktopTiktokConnectionProbeInput {
+    scope: TiktokReadScope,
+    observed_external_account_id: String,
+    source_generation: u64,
+    probed_at: DateTime<Utc>,
+    valid_until: DateTime<Utc>,
+    evidence_digest: String,
+    provenance: EvidenceProvenance,
 }
 
 impl fmt::Debug for DesktopReadAndAdoptTiktokMissionSequenceRequest {
@@ -4402,6 +4466,256 @@ impl DesktopDataPlane {
                 Err(error.into())
             }
         }
+    }
+
+    /// Probe one exact initial TikTok registration through the native
+    /// generation-bound keyring transport. Only a fresh production account
+    /// observation can publish the Connected revision.
+    pub fn probe_tiktok_connection_os(
+        &self,
+        request: DesktopProbeTiktokConnectionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokConnectionProbe, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.probe_tiktok_connection_with(
+            &secret_store,
+            request,
+            now,
+            |project_id, credential, probed_at| {
+                let probe_credential = tiktok_user_info_credential(credential)?;
+                let transport = native_tiktok_read_transport(
+                    &secret_store,
+                    project_id,
+                    probe_credential.scope(),
+                    &probe_credential,
+                )
+                .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+                let mut provider =
+                    execute_real_read_gate(transport, TiktokFreshnessPolicy::default())?;
+                let observation = provider.probe(&probe_credential, probed_at)?;
+                desktop_tiktok_connection_probe_input(&observation)
+            },
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the private seam keeps exact registration validation, provider evidence fencing, token-generation publication, and failure compensation in one auditable boundary"
+    )]
+    fn probe_tiktok_connection_with<Probe>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopProbeTiktokConnectionRequest,
+        now: DateTime<Utc>,
+        probe: Probe,
+    ) -> Result<DesktopTiktokConnectionProbe, DesktopDataError>
+    where
+        Probe: FnOnce(
+            &ProjectId,
+            &OAuthCredential,
+            DateTime<Utc>,
+        ) -> Result<DesktopTiktokConnectionProbeInput, DesktopDataError>,
+    {
+        let _write_guard = TIKTOK_CREDENTIAL_WRITES
+            .lock()
+            .map_err(|_| DesktopDataError::TiktokCredentialCoordinatorUnavailable)?;
+        let DesktopProbeTiktokConnectionRequest { registration } = request;
+        let DesktopTiktokConnectionRegistration {
+            connection: supplied_connection,
+            credential,
+        } = registration;
+        let project_id = supplied_connection.project_id().clone();
+        let scope = credential.scope().clone();
+        let required_scopes = BTreeSet::from([TiktokOAuthScope::VideoList.as_str().to_owned()]);
+        let required_credential_scopes = BTreeSet::from([TiktokOAuthScope::VideoList]);
+        let supplied_snapshot = supplied_connection.snapshot();
+        if supplied_snapshot.is_initial_snapshot().ok() != Some(true)
+            || supplied_connection.provider() != "tiktok"
+            || supplied_connection.account_id()
+                != &AccountId::from_stable(scope.business().as_str())
+            || supplied_snapshot.expected_external_account_id != scope.account().as_str()
+            || supplied_snapshot.required_scopes != required_scopes
+            || credential.generation() != supplied_connection.revision()
+            || credential.generation() != 1
+            || credential.granted_scopes() != &required_credential_scopes
+            || credential
+                .require_for(TiktokApiOperation::VideoList, &scope, now)
+                .is_err()
+        {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+
+        let database_secret = self.database_secret(secret_store)?;
+        let mut service = self.open_read_application_from_secret(&database_secret)?;
+        let project = service
+            .list_projects()?
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .ok_or_else(|| DesktopDataError::ProjectNotFound(project_id.clone()))?;
+        if project.tenant_id.as_str() != scope.tenant().as_str()
+            || supplied_connection.tenant_id() != &project.tenant_id
+        {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+        let durable_initial = service
+            .load_connection(&project_id, supplied_connection.id())
+            .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+        if durable_initial != supplied_connection {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+        match require_tiktok_access_token(secret_store, &project_id, &credential, now) {
+            Ok(()) => {}
+            Err(
+                SecretStoreError::InvalidSecret
+                | SecretStoreError::InvalidReference
+                | SecretStoreError::SecretNotFound,
+            ) => return Err(DesktopDataError::InvalidTiktokConnectionProbe),
+            Err(error) => return Err(error.into()),
+        }
+
+        let input = probe(&project_id, &credential, now)?;
+        let transition_at = if input.probed_at > now {
+            input.probed_at
+        } else {
+            now
+        };
+        let valid_until = input.valid_until.min(credential.access_token_expires_at());
+        if input.provenance != EvidenceProvenance::ProductionProvider
+            || input.scope != scope
+            || input.observed_external_account_id != scope.account().as_str()
+            || input.source_generation != credential.generation()
+            || input.probed_at < supplied_snapshot.updated_at
+            || valid_until <= transition_at
+            || credential
+                .require_for(TiktokApiOperation::VideoList, &scope, transition_at)
+                .is_err()
+        {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+        let current = service
+            .load_connection(&project_id, supplied_connection.id())
+            .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+        if current != durable_initial {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+
+        let domain_probe = ConnectionProbe {
+            outcome: ProbeOutcome::Successful,
+            observed_external_account_id: input.observed_external_account_id,
+            granted_scopes: required_scopes,
+            probed_at: input.probed_at,
+            valid_until,
+            credential_expires_at: credential.access_token_expires_at(),
+            evidence_digest: input.evidence_digest,
+        };
+        let mut projected = current.clone();
+        projected
+            .begin_probe(transition_at)
+            .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+        let projected_status = projected
+            .apply_probe(domain_probe.clone(), transition_at)
+            .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+        let target_generation = projected.revision();
+        if projected_status != ConnectionStatus::Connected
+            || target_generation != credential.generation().saturating_add(2)
+        {
+            return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+        }
+        let connected_credential = OAuthCredential::new(
+            credential.secret_reference().clone(),
+            scope.clone(),
+            required_credential_scopes,
+            credential.access_token_expires_at(),
+            None,
+            target_generation,
+        )
+        .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)?;
+
+        match copy_tiktok_access_token_generation(
+            secret_store,
+            &project_id,
+            &credential,
+            target_generation,
+            transition_at,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(DesktopDataError::TiktokConnectionProbeReconciliationRequired);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(error) = require_tiktok_access_token(
+            secret_store,
+            &project_id,
+            &connected_credential,
+            transition_at,
+        ) {
+            if clear_tiktok_access_token(secret_store, &project_id, &scope, target_generation)
+                .is_err()
+            {
+                return Err(DesktopDataError::TiktokConnectionProbeCompensationFailed);
+            }
+            return Err(error.into());
+        }
+
+        let connected = match service.record_connection_probe(
+            &project_id,
+            supplied_connection.id(),
+            domain_probe,
+            transition_at,
+        ) {
+            Ok(connection) => connection,
+            Err(error) => {
+                match service.load_connection(&project_id, supplied_connection.id()) {
+                    Ok(after) if after == durable_initial => {
+                        if clear_tiktok_access_token(
+                            secret_store,
+                            &project_id,
+                            &scope,
+                            target_generation,
+                        )
+                        .is_err()
+                        {
+                            return Err(DesktopDataError::TiktokConnectionProbeCompensationFailed);
+                        }
+                        return Err(error.into());
+                    }
+                    Ok(after) if after.revision() < target_generation => {
+                        if clear_tiktok_access_token(
+                            secret_store,
+                            &project_id,
+                            &scope,
+                            target_generation,
+                        )
+                        .is_err()
+                        {
+                            return Err(DesktopDataError::TiktokConnectionProbeCompensationFailed);
+                        }
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+                return Err(DesktopDataError::TiktokConnectionProbeReconciliationRequired);
+            }
+        };
+        if connected != projected {
+            return Err(DesktopDataError::TiktokConnectionProbeReconciliationRequired);
+        }
+        if clear_tiktok_access_token(secret_store, &project_id, &scope, credential.generation())
+            .is_err()
+        {
+            return Err(DesktopDataError::TiktokConnectionProbeRetirementFailed);
+        }
+        require_tiktok_access_token(
+            secret_store,
+            &project_id,
+            &connected_credential,
+            transition_at,
+        )
+        .map_err(|_| DesktopDataError::TiktokConnectionProbeReconciliationRequired)?;
+        Ok(DesktopTiktokConnectionProbe {
+            connection: connected,
+            credential: connected_credential,
+        })
     }
 
     /// Install one exact TikTok access-token generation into the OS Secret
@@ -9377,6 +9691,43 @@ fn mission_authority_scope(
     authority_scope_for_mission(&mission, project_id, mission_id)
 }
 
+fn tiktok_user_info_credential(
+    source: &OAuthCredential,
+) -> Result<OAuthCredential, DesktopDataError> {
+    OAuthCredential::new(
+        source.secret_reference().clone(),
+        source.scope().clone(),
+        [TiktokOAuthScope::UserInfoBasic].into_iter().collect(),
+        source.access_token_expires_at(),
+        None,
+        source.generation(),
+    )
+    .map_err(|_| DesktopDataError::InvalidTiktokConnectionProbe)
+}
+
+fn desktop_tiktok_connection_probe_input(
+    observation: &TiktokObservationEnvelope,
+) -> Result<DesktopTiktokConnectionProbeInput, DesktopDataError> {
+    let TiktokReadObservation::Account(account) = observation.observation() else {
+        return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+    };
+    if observation.provider() != TiktokProviderId::Tiktok
+        || account.identity().open_id() != observation.account().open_id()
+    {
+        return Err(DesktopDataError::InvalidTiktokConnectionProbe);
+    }
+    let freshness = observation.freshness();
+    Ok(DesktopTiktokConnectionProbeInput {
+        scope: observation.scope().clone(),
+        observed_external_account_id: observation.account().open_id().as_str().to_owned(),
+        source_generation: freshness.source_generation(),
+        probed_at: freshness.observed_at(),
+        valid_until: freshness.valid_until(),
+        evidence_digest: observation.revision().digest().to_owned(),
+        provenance: observation.provenance(),
+    })
+}
+
 fn tiktok_credential_for_connection(
     connection: &Connection,
     project_id: &ProjectId,
@@ -10787,6 +11138,22 @@ pub enum DesktopDataError {
         "TikTok Connection persistence failed and its newly installed credential generation could not be removed; reconciliation is required"
     )]
     TiktokConnectionRegistrationCompensationFailed,
+    #[error(
+        "TikTok Connection probe requires the exact initial registration, fresh production account evidence, and matching credential generation"
+    )]
+    InvalidTiktokConnectionProbe,
+    #[error(
+        "TikTok Connection probe persistence failed and its newly copied credential generation could not be removed; reconciliation is required"
+    )]
+    TiktokConnectionProbeCompensationFailed,
+    #[error(
+        "TikTok Connection probe left a durable or credential-generation transition that requires reconciliation"
+    )]
+    TiktokConnectionProbeReconciliationRequired,
+    #[error(
+        "TikTok Connection is Connected but its previous credential generation could not be retired; reconciliation is required"
+    )]
+    TiktokConnectionProbeRetirementFailed,
     #[error("the exact TikTok credential generation is already configured")]
     TiktokCredentialGenerationAlreadyConfigured,
     #[error("the TikTok credential configuration coordinator is unavailable")]
@@ -24856,6 +25223,201 @@ sleep 30"#;
                 .expect("original Connection remains exact"),
             registered.connection().clone()
         );
+        drop(directory);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused test proves production-only probing, failure immutability, exact token-generation transition, redaction, and cold restoration"
+    )]
+    fn tiktok_connection_probe_is_production_bound_rotated_and_cold_restorable() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let project = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("application")
+            .list_projects()
+            .expect("Project inventory")
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .expect("exact Project");
+        let scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(project.tenant_id.as_str()).unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-probe-private").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("account-probe-private").unwrap(),
+        );
+        let connection_id = ConnectionId::from_stable("desktop-tiktok-probe");
+        let registered = plane
+            .register_tiktok_connection_with(
+                &secrets,
+                DesktopRegisterTiktokConnectionRequest {
+                    connection_id: connection_id.clone(),
+                    credential: DesktopConfigureTiktokCredentialRequest {
+                        project_id: project_id.clone(),
+                        scope: scope.clone(),
+                        access_token_expires_at: now + Duration::hours(1),
+                        refresh_token_expires_at: Some(now + Duration::days(30)),
+                        generation: 1,
+                        access_token: Zeroizing::new("probe-access-token-private".into()),
+                    },
+                },
+                now,
+            )
+            .expect("initial TikTok registration");
+        let initial = registered.connection().clone();
+        let generation_one =
+            crate::tiktok_read::tiktok_access_token_reference(&project_id, &scope, 1).unwrap();
+        let generation_three =
+            crate::tiktok_read::tiktok_access_token_reference(&project_id, &scope, 3).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let failed_calls = Arc::clone(&calls);
+        assert!(matches!(
+            plane.probe_tiktok_connection_with(
+                &secrets,
+                registered.clone().into_probe_request(),
+                now,
+                move |_, _, _| {
+                    failed_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(TiktokError::Disconnected.into())
+                },
+            ),
+            Err(DesktopDataError::Tiktok(TiktokError::Disconnected))
+        ));
+
+        let controlled_calls = Arc::clone(&calls);
+        let controlled_scope = scope.clone();
+        assert!(matches!(
+            plane.probe_tiktok_connection_with(
+                &secrets,
+                registered.clone().into_probe_request(),
+                now,
+                move |_, credential, _| {
+                    controlled_calls.fetch_add(1, Ordering::SeqCst);
+                    let probe_credential = tiktok_user_info_credential(credential).unwrap();
+                    assert_eq!(
+                        probe_credential.granted_scopes(),
+                        &BTreeSet::from([TiktokOAuthScope::UserInfoBasic])
+                    );
+                    Ok(DesktopTiktokConnectionProbeInput {
+                        scope: controlled_scope.clone(),
+                        observed_external_account_id: controlled_scope.account().as_str().into(),
+                        source_generation: credential.generation(),
+                        probed_at: now + Duration::seconds(1),
+                        valid_until: now + Duration::minutes(2),
+                        evidence_digest: "e".repeat(64),
+                        provenance: EvidenceProvenance::ControlledProvider,
+                    })
+                },
+            ),
+            Err(DesktopDataError::InvalidTiktokConnectionProbe)
+        ));
+        let service = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("application after refused probes");
+        assert_eq!(
+            service
+                .load_connection(&project_id, &connection_id)
+                .expect("initial Connection remains"),
+            initial
+        );
+        assert_eq!(
+            secrets.get(&generation_one).unwrap().as_slice(),
+            b"probe-access-token-private"
+        );
+        assert!(matches!(
+            secrets.get(&generation_three),
+            Err(SecretStoreError::SecretNotFound)
+        ));
+        drop(service);
+
+        let request = registered.into_probe_request();
+        let request_debug = format!("{request:?}");
+        assert!(request_debug.contains("[REDACTED]"));
+        assert!(!request_debug.contains("business-probe-private"));
+        assert!(!request_debug.contains("account-probe-private"));
+        assert!(!request_debug.contains("keychain://"));
+        assert!(!request_debug.contains("probe-access-token-private"));
+        let successful_calls = Arc::clone(&calls);
+        let successful_scope = scope.clone();
+        let successful_project_id = project_id.clone();
+        let probed = plane
+            .probe_tiktok_connection_with(
+                &secrets,
+                request,
+                now,
+                move |seen_project_id, credential, _| {
+                    successful_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(seen_project_id, &successful_project_id);
+                    assert_eq!(credential.generation(), 1);
+                    assert_eq!(credential.scope(), &successful_scope);
+                    Ok(DesktopTiktokConnectionProbeInput {
+                        scope: successful_scope.clone(),
+                        observed_external_account_id: successful_scope.account().as_str().into(),
+                        source_generation: credential.generation(),
+                        probed_at: now + Duration::seconds(1),
+                        valid_until: now + Duration::minutes(2),
+                        evidence_digest: "f".repeat(64),
+                        provenance: EvidenceProvenance::ProductionProvider,
+                    })
+                },
+            )
+            .expect("production TikTok Connection probe");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let snapshot = probed.connection().snapshot();
+        assert_eq!(snapshot.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot.revision, 3);
+        assert_eq!(
+            snapshot.granted_scopes,
+            BTreeSet::from([TiktokOAuthScope::VideoList.as_str().to_owned()])
+        );
+        let last_probe = snapshot.last_probe.expect("durable provider probe");
+        assert_eq!(last_probe.outcome, ProbeOutcome::Successful);
+        assert_eq!(
+            last_probe.observed_external_account_id,
+            scope.account().as_str()
+        );
+        assert_eq!(last_probe.evidence_digest, "f".repeat(64));
+        assert_eq!(probed.credential().generation(), snapshot.revision);
+        assert_eq!(
+            probed.credential().granted_scopes(),
+            &BTreeSet::from([TiktokOAuthScope::VideoList])
+        );
+        let result_debug = format!("{probed:?}");
+        assert!(result_debug.contains("[REDACTED]"));
+        assert!(!result_debug.contains("business-probe-private"));
+        assert!(!result_debug.contains("account-probe-private"));
+        assert!(!result_debug.contains("keychain://"));
+        assert!(!result_debug.contains("probe-access-token-private"));
+        assert!(matches!(
+            secrets.get(&generation_one),
+            Err(SecretStoreError::SecretNotFound)
+        ));
+        assert_eq!(
+            secrets.get(&generation_three).unwrap().as_slice(),
+            b"probe-access-token-private"
+        );
+
+        let data_root = plane.data_root.clone();
+        let expected_credential = probed.credential().clone();
+        drop(plane);
+        let reopened = DesktopDataPlane::at_data_root(data_root).expect("cold reopened plane");
+        let restored = reopened
+            .restore_tiktok_connection_credential_with(
+                &secrets,
+                &project_id,
+                &connection_id,
+                now + Duration::seconds(1),
+            )
+            .expect("restore generation-three credential");
+        assert!(same_tiktok_read_credential(
+            restored.credential(),
+            &expected_credential
+        ));
         drop(directory);
     }
 
