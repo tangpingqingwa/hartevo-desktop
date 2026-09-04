@@ -1368,6 +1368,13 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidEffectReconciliation
         | DesktopDataError::InvalidBrowserWorkspaceCreate
         | DesktopDataError::BrowserWorkspaceAlreadyExists
+        | DesktopDataError::InvalidBrowserWorkspaceMount
+        | DesktopDataError::BrowserWorkspaceMountUnavailable
+        | DesktopDataError::BrowserWorkspaceHostAlreadyMounted
+        | DesktopDataError::BrowserWorkspaceHostUnavailable
+        | DesktopDataError::BrowserWorkspaceHostReconciliationRequired
+        | DesktopDataError::BrowserHostRegistryUnavailable
+        | DesktopDataError::ManagedBrowserExecutableUnavailable
         | DesktopDataError::InvalidBrowserWorkspaceContinue
         | DesktopDataError::InvalidBrowserWorkspaceTakeOver
         | DesktopDataError::BrowserWorkspaceUnavailable
