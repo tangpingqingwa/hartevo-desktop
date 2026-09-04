@@ -77,6 +77,36 @@ pub(crate) fn provision_tiktok_access_token(
     Ok(true)
 }
 
+/// Copies one valid immutable access-token generation to a new positive
+/// generation without returning token bytes above this native secret helper.
+/// `Ok(false)` means the destination already exists and was left untouched.
+pub(crate) fn copy_tiktok_access_token_generation(
+    secret_store: &impl SecretStore,
+    project_id: &ProjectId,
+    credential: &OAuthCredential,
+    destination_generation: u64,
+    now: chrono::DateTime<Utc>,
+) -> Result<bool, SecretStoreError> {
+    let source_reference = validate_tiktok_credential(project_id, credential, now)?;
+    if destination_generation == 0 || destination_generation == credential.generation() {
+        return Err(SecretStoreError::InvalidReference);
+    }
+    let destination_reference =
+        tiktok_access_token_reference(project_id, credential.scope(), destination_generation)?;
+    match secret_store.get(&destination_reference) {
+        Ok(_) => return Ok(false),
+        Err(SecretStoreError::SecretNotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let secret = secret_store.get(&source_reference)?;
+    match std::str::from_utf8(secret.as_slice()) {
+        Ok(token) if valid_access_token(token) => {}
+        _ => return Err(SecretStoreError::InvalidSecret),
+    }
+    secret_store.put(&destination_reference, &secret)?;
+    Ok(true)
+}
+
 /// Clears only one exact scope/generation. A missing generation is already
 /// the desired state and therefore succeeds.
 pub(crate) fn clear_tiktok_access_token(
