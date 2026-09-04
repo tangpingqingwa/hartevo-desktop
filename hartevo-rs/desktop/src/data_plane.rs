@@ -49,6 +49,8 @@ use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserProfile, BrowserProfileStatus,
     BrowserWorkspace,
 };
+#[cfg(unix)]
+use hartevo_browser_adapter::{ChromiumLaunchConfig, ManagedChromiumHost};
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
@@ -2413,6 +2415,57 @@ pub struct RecoveryKitDraft {
     encoded_key: Zeroizing<String>,
 }
 
+struct DesktopBrowserHostEntry {
+    project_id: ProjectId,
+    mission_id: MissionId,
+    workspace: BrowserWorkspace,
+    host: Box<dyn BrowserControlHost + Send>,
+}
+
+impl DesktopBrowserHostEntry {
+    fn matches(&self, workspace: &BrowserWorkspace) -> bool {
+        self.project_id == workspace.project_id
+            && self.mission_id == workspace.mission_id
+            && self.workspace == *workspace
+    }
+}
+
+impl BrowserControlHost for DesktopBrowserHostEntry {
+    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+        self.host.sync_workspace(workspace)?;
+        self.workspace = workspace.clone();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DesktopBrowserHostRegistry {
+    hosts: Mutex<BTreeMap<BrowserWorkspaceId, DesktopBrowserHostEntry>>,
+}
+
+#[cfg(unix)]
+struct DesktopManagedBrowserHost {
+    host: ManagedChromiumHost,
+    tab_attached: bool,
+}
+
+#[cfg(unix)]
+impl BrowserControlHost for DesktopManagedBrowserHost {
+    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+        self.host.sync_workspace(workspace)?;
+        if workspace.control_state == BrowserControlState::AgentControlled && !self.tab_attached {
+            let proof = workspace.agent_lease_proof(workspace.updated_at)?;
+            self.host.attach_about_blank_tab(
+                &workspace.active_tab_id,
+                &proof,
+                workspace.updated_at,
+            )?;
+            self.tab_attached = true;
+        }
+        Ok(())
+    }
+}
+
 impl RecoveryKitDraft {
     pub fn generate() -> Result<Self, DesktopDataError> {
         let key = KeyMaterial::generate()?;
@@ -2445,6 +2498,7 @@ pub struct DesktopDataPlane {
     native_provider_profile_reference: SecretReference,
     device_id: DeviceId,
     cordis: Arc<DesktopCordisSlot>,
+    browser_hosts: Arc<DesktopBrowserHostRegistry>,
 }
 
 impl DesktopDataPlane {
@@ -2620,6 +2674,7 @@ impl DesktopDataPlane {
             native_provider_profile_reference,
             device_id,
             cordis,
+            browser_hosts: Arc::new(DesktopBrowserHostRegistry::default()),
         })
     }
 
@@ -3817,6 +3872,167 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Mounts the exact durable Browser Workspace into the existing managed
+    /// Chromium boundary. The Host remains process-local and no navigation,
+    /// observation, Effect, Receipt, or Verification is performed.
+    pub fn mount_browser_workspace_os(
+        &self,
+        request: DesktopBrowserWorkspaceControlRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        #[cfg(unix)]
+        {
+            let executable = discover_managed_browser_executable()
+                .map_err(|_| DesktopDataError::ManagedBrowserExecutableUnavailable)?;
+            self.mount_browser_workspace_with(
+                &secret_store,
+                request,
+                now,
+                move |profile, workspace, profile_root, mounted_at| {
+                    let config =
+                        ChromiumLaunchConfig::new(&executable, profile_root.to_path_buf(), false)?;
+                    let mut host =
+                        ManagedChromiumHost::spawn(profile.clone(), workspace.clone(), &config)?;
+                    let tab_attached = if workspace.control_state
+                        == BrowserControlState::AgentControlled
+                    {
+                        let proof = workspace.agent_lease_proof(mounted_at)?;
+                        host.attach_about_blank_tab(&workspace.active_tab_id, &proof, mounted_at)?;
+                        true
+                    } else {
+                        false
+                    };
+                    Ok(DesktopManagedBrowserHost { host, tab_attached })
+                },
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (secret_store, request, now);
+            Err(DesktopDataError::ManagedBrowserExecutableUnavailable)
+        }
+    }
+
+    pub fn mount_browser_workspace_with<Host>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopBrowserWorkspaceControlRequest,
+        now: DateTime<Utc>,
+        mount: impl FnOnce(
+            &BrowserProfile,
+            &BrowserWorkspace,
+            &Path,
+            DateTime<Utc>,
+        ) -> Result<Host, BrowserError>,
+    ) -> Result<DesktopSnapshot, DesktopDataError>
+    where
+        Host: BrowserControlHost + Send + 'static,
+    {
+        if !valid_browser_workspace_control_request(&request) {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceMount);
+        }
+        let project_id = request.project_id.clone();
+        let (service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .load_live_browser_workspace_for_mission(&project_id, &request.mission_id)?
+            .ok_or(DesktopDataError::BrowserWorkspaceUnavailable)?;
+        if !browser_workspace_request_matches(&request, &live) {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceMount);
+        }
+        if live.control_state.is_terminal() {
+            return Err(DesktopDataError::BrowserWorkspaceMountUnavailable);
+        }
+        let profile = service.load_browser_profile(&project_id, &live.profile_id)?;
+        if profile.project_id != project_id
+            || profile.id != live.profile_id
+            || profile.status != BrowserProfileStatus::Active
+            || profile.identity.identity_digest != live.expected_identity_digest
+        {
+            return Err(DesktopDataError::InvalidBrowserWorkspaceMount);
+        }
+        if live.control_state == BrowserControlState::AgentControlled {
+            live.agent_lease_proof(now)
+                .map_err(ApplicationError::from)?;
+        }
+        let profile_root = self.browser_profile_root()?;
+        let mut hosts = self
+            .browser_hosts
+            .hosts
+            .lock()
+            .map_err(|_| DesktopDataError::BrowserHostRegistryUnavailable)?;
+        if let Some(existing) = hosts.get(&live.id) {
+            if existing.matches(&live) {
+                return Err(DesktopDataError::BrowserWorkspaceHostAlreadyMounted);
+            }
+            hosts.remove(&live.id);
+            return Err(DesktopDataError::BrowserWorkspaceHostReconciliationRequired);
+        }
+        let host = mount(&profile, &live, &profile_root, now).map_err(ApplicationError::from)?;
+        hosts.insert(
+            live.id.clone(),
+            DesktopBrowserHostEntry {
+                project_id: project_id.clone(),
+                mission_id: request.mission_id,
+                workspace: live,
+                host: Box::new(host),
+            },
+        );
+        drop(hosts);
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    pub fn browser_workspace_host_mounted(
+        &self,
+        request: &DesktopBrowserWorkspaceControlRequest,
+    ) -> bool {
+        let Ok(hosts) = self.browser_hosts.hosts.lock() else {
+            return false;
+        };
+        hosts.get(&request.workspace_id).is_some_and(|entry| {
+            entry.project_id == request.project_id
+                && entry.mission_id == request.mission_id
+                && entry.workspace.revision == request.expected_revision
+                && entry.workspace.lease_generation == request.expected_generation
+        })
+    }
+
+    fn synchronize_mounted_browser_host<T>(
+        &self,
+        workspace: &BrowserWorkspace,
+        operation: impl FnOnce(&mut DesktopBrowserHostEntry) -> Result<T, ApplicationError>,
+    ) -> Result<T, DesktopDataError> {
+        let mut hosts = self
+            .browser_hosts
+            .hosts
+            .lock()
+            .map_err(|_| DesktopDataError::BrowserHostRegistryUnavailable)?;
+        if !hosts
+            .get(&workspace.id)
+            .is_some_and(|entry| entry.matches(workspace))
+        {
+            hosts.remove(&workspace.id);
+            return Err(DesktopDataError::BrowserWorkspaceHostUnavailable);
+        }
+        let result = operation(
+            hosts
+                .get_mut(&workspace.id)
+                .expect("exact mounted Browser Host was just verified"),
+        );
+        if result.is_err() {
+            hosts.remove(&workspace.id);
+        }
+        result.map_err(DesktopDataError::from)
+    }
+
     /// Takes one agent-held Browser Workspace through Application
     /// `take_over_browser_workspace` and a real BrowserControlHost. The Host
     /// fence runs before persistence; no browser action or Effect is executed.
@@ -3862,19 +4078,20 @@ impl DesktopDataPlane {
             return Err(DesktopDataError::InvalidBrowserWorkspaceTakeOver);
         }
         let evidence_digest = take_over_browser_workspace_evidence_digest(&live, now);
-        let mut host = DesktopBrowserControlHost::attach(&live)?;
-        service.take_over_browser_workspace(
-            &mut host,
-            TakeOverBrowserWorkspace {
-                project_id,
-                workspace_id: request.workspace_id,
-                expected_revision: request.expected_revision,
-                expected_generation: request.expected_generation,
-                new_lease_id: BrowserControlLeaseId::new(),
-                evidence_digest,
-            },
-            now,
-        )?;
+        self.synchronize_mounted_browser_host(&live, |host| {
+            service.take_over_browser_workspace(
+                host,
+                TakeOverBrowserWorkspace {
+                    project_id,
+                    workspace_id: request.workspace_id,
+                    expected_revision: request.expected_revision,
+                    expected_generation: request.expected_generation,
+                    new_lease_id: BrowserControlLeaseId::new(),
+                    evidence_digest,
+                },
+                now,
+            )
+        })?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -3931,20 +4148,21 @@ impl DesktopDataPlane {
             return Err(DesktopDataError::InvalidBrowserWorkspaceContinue);
         }
         let evidence_digest = continue_browser_workspace_evidence_digest(&live, now);
-        let mut host = DesktopBrowserControlHost::attach(&live)?;
-        service.continue_browser_workspace(
-            &mut host,
-            ContinueBrowserWorkspace {
-                project_id,
-                workspace_id: request.workspace_id,
-                expected_revision: request.expected_revision,
-                expected_generation: request.expected_generation,
-                new_lease_id: BrowserControlLeaseId::new(),
-                lease_expires_at: now + Duration::hours(1),
-                evidence_digest,
-            },
-            now,
-        )?;
+        self.synchronize_mounted_browser_host(&live, |host| {
+            service.continue_browser_workspace(
+                host,
+                ContinueBrowserWorkspace {
+                    project_id,
+                    workspace_id: request.workspace_id,
+                    expected_revision: request.expected_revision,
+                    expected_generation: request.expected_generation,
+                    new_lease_id: BrowserControlLeaseId::new(),
+                    lease_expires_at: now + Duration::hours(1),
+                    evidence_digest,
+                },
+                now,
+            )
+        })?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -3990,19 +4208,21 @@ impl DesktopDataPlane {
         ) {
             return Err(DesktopDataError::BrowserWorkspacePauseUnavailable);
         }
-        let mut host = DesktopBrowserControlHost::attach(&live)?;
-        service.pause_browser_workspace(
-            &mut host,
-            PauseBrowserWorkspace {
-                project_id,
-                workspace_id: request.workspace_id,
-                expected_revision: request.expected_revision,
-                expected_generation: request.expected_generation,
-                new_lease_id: BrowserControlLeaseId::new(),
-                evidence_digest: browser_workspace_control_evidence_digest("pause", &live, now),
-            },
-            now,
-        )?;
+        let evidence_digest = browser_workspace_control_evidence_digest("pause", &live, now);
+        self.synchronize_mounted_browser_host(&live, |host| {
+            service.pause_browser_workspace(
+                host,
+                PauseBrowserWorkspace {
+                    project_id,
+                    workspace_id: request.workspace_id,
+                    expected_revision: request.expected_revision,
+                    expected_generation: request.expected_generation,
+                    new_lease_id: BrowserControlLeaseId::new(),
+                    evidence_digest,
+                },
+                now,
+            )
+        })?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -4047,20 +4267,22 @@ impl DesktopDataPlane {
             BrowserControlState::PausedUser => None,
             _ => return Err(DesktopDataError::BrowserWorkspaceResumeUnavailable),
         };
-        let mut host = DesktopBrowserControlHost::attach(&live)?;
-        service.resume_browser_workspace(
-            &mut host,
-            ResumeBrowserWorkspace {
-                project_id,
-                workspace_id: request.workspace_id,
-                expected_revision: request.expected_revision,
-                expected_generation: request.expected_generation,
-                new_lease_id: BrowserControlLeaseId::new(),
-                agent_lease_expires_at,
-                evidence_digest: browser_workspace_control_evidence_digest("resume", &live, now),
-            },
-            now,
-        )?;
+        let evidence_digest = browser_workspace_control_evidence_digest("resume", &live, now);
+        self.synchronize_mounted_browser_host(&live, |host| {
+            service.resume_browser_workspace(
+                host,
+                ResumeBrowserWorkspace {
+                    project_id,
+                    workspace_id: request.workspace_id,
+                    expected_revision: request.expected_revision,
+                    expected_generation: request.expected_generation,
+                    new_lease_id: BrowserControlLeaseId::new(),
+                    agent_lease_expires_at,
+                    evidence_digest,
+                },
+                now,
+            )
+        })?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -7840,6 +8062,32 @@ impl DesktopDataPlane {
         Ok(workspace.canonicalize()?)
     }
 
+    fn browser_profile_root(&self) -> Result<PathBuf, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let root = self.data_root.join("browser-profiles");
+        reject_symlink(&root)?;
+        match fs::create_dir(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        reject_symlink(&root)?;
+        let metadata = fs::metadata(&root)?;
+        if !metadata.is_dir() {
+            return Err(DesktopDataError::InvalidDataRoot(root));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
+        let canonical = root.canonicalize()?;
+        if canonical.parent() != Some(self.data_root.as_path()) {
+            return Err(DesktopDataError::InvalidDataRoot(canonical));
+        }
+        Ok(canonical)
+    }
+
     #[cfg(test)]
     fn database_key_reference(&self) -> &SecretReference {
         &self.database_key_reference
@@ -8632,41 +8880,6 @@ fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation 
     }
 }
 
-/// Process-local BrowserControlHost for Desktop ownership transitions.
-///
-/// Restrictive transitions fence this Host before persistence; permissive
-/// transitions persist the new lease before this Host adopts it. A
-/// non-successor fails as `BrowserHostReconciliationRequired`. This is not a
-/// Fake Host test helper and does not execute Effects.
-struct DesktopBrowserControlHost {
-    workspace: BrowserWorkspace,
-}
-
-impl DesktopBrowserControlHost {
-    fn attach(workspace: &BrowserWorkspace) -> Result<Self, DesktopDataError> {
-        workspace
-            .validate()
-            .map_err(ApplicationError::from)
-            .map_err(DesktopDataError::from)?;
-        Ok(Self {
-            workspace: workspace.clone(),
-        })
-    }
-}
-
-impl BrowserControlHost for DesktopBrowserControlHost {
-    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
-        if *workspace == self.workspace {
-            return Ok(());
-        }
-        if !workspace.is_valid_successor_of(&self.workspace)? {
-            return Err(BrowserError::ScopeMismatch);
-        }
-        self.workspace = workspace.clone();
-        Ok(())
-    }
-}
-
 fn open_conversation_route_digest(
     live: &RelationshipConversationProjection,
     now: DateTime<Utc>,
@@ -8867,6 +9080,27 @@ fn reject_symlink(path: &Path) -> Result<(), DesktopDataError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn discover_managed_browser_executable() -> Result<PathBuf, BrowserError> {
+    const CANDIDATES: [&str; 2] = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    CANDIDATES
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| {
+            fs::symlink_metadata(candidate)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        })
+        .ok_or(BrowserError::InvalidExecutable)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn discover_managed_browser_executable() -> Result<PathBuf, BrowserError> {
+    Err(BrowserError::InvalidExecutable)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9176,6 +9410,22 @@ pub enum DesktopDataError {
     InvalidBrowserWorkspaceCreate,
     #[error("the Mission already has a live Browser Workspace")]
     BrowserWorkspaceAlreadyExists,
+    #[error(
+        "Browser Workspace Mount requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
+    )]
+    InvalidBrowserWorkspaceMount,
+    #[error("the Browser Workspace is terminal and cannot mount a Host")]
+    BrowserWorkspaceMountUnavailable,
+    #[error("the exact Browser Workspace already has a process-local Host")]
+    BrowserWorkspaceHostAlreadyMounted,
+    #[error("the exact Browser Workspace has no matching process-local Host")]
+    BrowserWorkspaceHostUnavailable,
+    #[error("the process-local Browser Host no longer matches durable Workspace state")]
+    BrowserWorkspaceHostReconciliationRequired,
+    #[error("the process-local Browser Host registry is unavailable")]
+    BrowserHostRegistryUnavailable,
+    #[error("no allowlisted managed Chrome or Chromium executable is available")]
+    ManagedBrowserExecutableUnavailable,
     #[error(
         "Browser Workspace Continue requires the exact Mission-bound workspace id, revision, and generation from SQLCipher"
     )]
@@ -22681,6 +22931,47 @@ sleep 30"#;
         ));
     }
 
+    struct TestBrowserControlHost {
+        workspace: BrowserWorkspace,
+        sync_count: Arc<AtomicUsize>,
+    }
+
+    impl BrowserControlHost for TestBrowserControlHost {
+        fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+            assert_eq!(workspace.id, self.workspace.id);
+            assert_eq!(workspace.project_id, self.workspace.project_id);
+            assert_eq!(workspace.mission_id, self.workspace.mission_id);
+            self.workspace = workspace.clone();
+            self.sync_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn mount_test_browser_host(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        request: DesktopBrowserWorkspaceControlRequest,
+        now: DateTime<Utc>,
+    ) -> Arc<AtomicUsize> {
+        let sync_count = Arc::new(AtomicUsize::new(0));
+        let host_sync_count = Arc::clone(&sync_count);
+        plane
+            .mount_browser_workspace_with(
+                secrets,
+                request,
+                now,
+                move |_profile, workspace, profile_root, _mounted_at| {
+                    assert_eq!(profile_root.parent(), Some(plane.data_root.as_path()));
+                    Ok(TestBrowserControlHost {
+                        workspace: workspace.clone(),
+                        sync_count: host_sync_count,
+                    })
+                },
+            )
+            .expect("mount exact test Browser Host");
+        sync_count
+    }
+
     fn persist_user_held_browser_workspace(
         plane: &DesktopDataPlane,
         secrets: &MemorySecretStore,
@@ -22756,6 +23047,132 @@ sleep 30"#;
             .expect("user-held lease");
         assert_eq!(taken.control_state, BrowserControlState::UserControlled);
         (taken.id, taken.revision, taken.lease_generation)
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one mount boundary test keeps stale, duplicate, clone, restart, and filesystem assertions together"
+    )]
+    fn browser_workspace_mount_is_exact_shared_and_process_local() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(4);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "显式挂载持久 Browser Workspace Host",
+                now,
+            )
+            .expect("mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let (workspace_id, revision, generation) = persist_user_held_browser_workspace(
+            &plane,
+            &secrets,
+            &project_id,
+            &mission_id,
+            now + Duration::seconds(1),
+        );
+        let request = DesktopBrowserWorkspaceControlRequest {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            workspace_id: workspace_id.clone(),
+            expected_revision: revision,
+            expected_generation: generation,
+        };
+        let mount_calls = Arc::new(AtomicUsize::new(0));
+        let sync_count = Arc::new(AtomicUsize::new(0));
+
+        let stale_calls = Arc::clone(&mount_calls);
+        let stale_sync_count = Arc::clone(&sync_count);
+        let stale = plane.mount_browser_workspace_with(
+            &secrets,
+            DesktopBrowserWorkspaceControlRequest {
+                expected_revision: revision.saturating_add(1),
+                ..request.clone()
+            },
+            now + Duration::seconds(3),
+            move |_profile, workspace, _profile_root, _mounted_at| {
+                stale_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(TestBrowserControlHost {
+                    workspace: workspace.clone(),
+                    sync_count: stale_sync_count,
+                })
+            },
+        );
+        assert!(matches!(
+            stale,
+            Err(DesktopDataError::InvalidBrowserWorkspaceMount)
+        ));
+        assert_eq!(mount_calls.load(Ordering::SeqCst), 0);
+
+        let exact_calls = Arc::clone(&mount_calls);
+        let exact_sync_count = Arc::clone(&sync_count);
+        let expected_profile_parent = plane.data_root.clone();
+        plane
+            .mount_browser_workspace_with(
+                &secrets,
+                request.clone(),
+                now + Duration::seconds(3),
+                move |_profile, workspace, profile_root, _mounted_at| {
+                    exact_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        profile_root.parent(),
+                        Some(expected_profile_parent.as_path())
+                    );
+                    Ok(TestBrowserControlHost {
+                        workspace: workspace.clone(),
+                        sync_count: exact_sync_count,
+                    })
+                },
+            )
+            .expect("exact mount");
+        assert!(plane.browser_workspace_host_mounted(&request));
+        assert!(plane.clone().browser_workspace_host_mounted(&request));
+        assert_eq!(mount_calls.load(Ordering::SeqCst), 1);
+
+        let duplicate_calls = Arc::clone(&mount_calls);
+        let duplicate_sync_count = Arc::clone(&sync_count);
+        let duplicate = plane.mount_browser_workspace_with(
+            &secrets,
+            request.clone(),
+            now + Duration::seconds(4),
+            move |_profile, workspace, _profile_root, _mounted_at| {
+                duplicate_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(TestBrowserControlHost {
+                    workspace: workspace.clone(),
+                    sync_count: duplicate_sync_count,
+                })
+            },
+        );
+        assert!(matches!(
+            duplicate,
+            Err(DesktopDataError::BrowserWorkspaceHostAlreadyMounted)
+        ));
+        assert_eq!(mount_calls.load(Ordering::SeqCst), 1);
+
+        let restarted = DesktopDataPlane::at_data_root(&plane.data_root).expect("restart plane");
+        assert!(!restarted.browser_workspace_host_mounted(&request));
+        let profile_root = plane.data_root.join("browser-profiles");
+        assert!(profile_root.is_dir());
+        assert!(
+            !fs::symlink_metadata(&profile_root)
+                .expect("profile root metadata")
+                .file_type()
+                .is_symlink()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(profile_root)
+                    .expect("profile root permissions")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]
@@ -22891,6 +23308,34 @@ sleep 30"#;
         assert_eq!(unchanged.lease_generation, workspace.lease_generation);
         drop(service);
 
+        let unmounted = plane.take_over_browser_workspace_with(
+            &secrets,
+            DesktopTakeOverBrowserWorkspaceRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace.id.clone(),
+                expected_revision: workspace.revision,
+                expected_generation: workspace.lease_generation,
+            },
+            now + Duration::seconds(4),
+        );
+        assert!(matches!(
+            unmounted,
+            Err(DesktopDataError::BrowserWorkspaceHostUnavailable)
+        ));
+        let sync_count = mount_test_browser_host(
+            &plane,
+            &secrets,
+            DesktopBrowserWorkspaceControlRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace.id.clone(),
+                expected_revision: workspace.revision,
+                expected_generation: workspace.lease_generation,
+            },
+            now + Duration::seconds(4),
+        );
+
         let taken = plane
             .take_over_browser_workspace_with(
                 &secrets,
@@ -22901,7 +23346,7 @@ sleep 30"#;
                     expected_revision: workspace.revision,
                     expected_generation: workspace.lease_generation,
                 },
-                now + Duration::seconds(4),
+                now + Duration::seconds(5),
             )
             .expect("Take over through Application");
         let user_held = taken.inventory.projects[0]
@@ -22930,7 +23375,7 @@ sleep 30"#;
                     expected_revision: user_held.revision,
                     expected_generation: user_held.lease_generation,
                 },
-                now + Duration::seconds(5),
+                now + Duration::seconds(6),
             )
             .expect("Continue through Application");
         let agent_held = continued.inventory.projects[0]
@@ -22950,6 +23395,7 @@ sleep 30"#;
             agent_held.lease_generation,
             workspace.lease_generation.saturating_add(2)
         );
+        assert_eq!(sync_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -22971,6 +23417,18 @@ sleep 30"#;
             &project_id,
             &mission_id,
             now + Duration::seconds(1),
+        );
+        let sync_count = mount_test_browser_host(
+            &plane,
+            &secrets,
+            DesktopBrowserWorkspaceControlRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace_id.clone(),
+                expected_revision: revision,
+                expected_generation: generation,
+            },
+            now + Duration::seconds(2),
         );
         let continued = plane
             .continue_browser_workspace_with(
@@ -23011,6 +23469,7 @@ sleep 30"#;
             .expect("durable continued workspace");
         assert_eq!(durable.control_state, BrowserControlState::AgentControlled);
         assert_eq!(durable.lease_generation, generation.saturating_add(1));
+        assert_eq!(sync_count.load(Ordering::SeqCst), 1);
         assert!(
             durable
                 .agent_lease_proof(now + Duration::seconds(4))
@@ -23058,6 +23517,18 @@ sleep 30"#;
             stale,
             Err(DesktopDataError::InvalidBrowserWorkspaceControl)
         ));
+        let sync_count = mount_test_browser_host(
+            &plane,
+            &secrets,
+            DesktopBrowserWorkspaceControlRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                workspace_id: workspace_id.clone(),
+                expected_revision: revision,
+                expected_generation: generation,
+            },
+            now + Duration::seconds(2),
+        );
 
         let paused_user = plane
             .pause_browser_workspace_with(
@@ -23184,6 +23655,7 @@ sleep 30"#;
         assert_eq!(durable.control_state, BrowserControlState::AgentControlled);
         assert_eq!(durable.revision, revision.saturating_add(5));
         assert_eq!(durable.lease_generation, generation.saturating_add(5));
+        assert_eq!(sync_count.load(Ordering::SeqCst), 5);
         assert!(
             durable
                 .agent_lease_proof(now + Duration::seconds(8))

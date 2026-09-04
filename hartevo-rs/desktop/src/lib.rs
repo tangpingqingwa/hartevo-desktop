@@ -462,6 +462,9 @@ impl UiFailure {
             | DesktopDataError::InvalidEffectReconciliation
             | DesktopDataError::InvalidBrowserWorkspaceCreate
             | DesktopDataError::BrowserWorkspaceAlreadyExists
+            | DesktopDataError::InvalidBrowserWorkspaceMount
+            | DesktopDataError::BrowserWorkspaceMountUnavailable
+            | DesktopDataError::BrowserWorkspaceHostAlreadyMounted
             | DesktopDataError::InvalidBrowserWorkspaceContinue
             | DesktopDataError::InvalidBrowserWorkspaceTakeOver
             | DesktopDataError::InvalidBrowserWorkspaceControl
@@ -480,6 +483,22 @@ impl UiFailure {
             DesktopDataError::BrowserWorkspaceUnavailable => Self::coded(
                 "EMPTY",
                 "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行所有权控制。",
+            ),
+            DesktopDataError::BrowserWorkspaceHostUnavailable => Self::coded(
+                "EMPTY",
+                "当前持久 Browser Workspace 尚未挂载本机 Host；请先显式 Mount，未执行所有权控制。",
+            ),
+            DesktopDataError::BrowserWorkspaceHostReconciliationRequired => Self::coded(
+                "RECOVERY_REQUIRED",
+                "本机 Browser Host 与持久 Workspace 已不一致；旧 Host 已停止，请重新挂载后再继续。",
+            ),
+            DesktopDataError::BrowserHostRegistryUnavailable => Self::coded(
+                "RECOVERY_REQUIRED",
+                "本机 Browser Host 注册表暂不可用；已停止浏览器控制，未执行 Effect。",
+            ),
+            DesktopDataError::ManagedBrowserExecutableUnavailable => Self::coded(
+                "BLOCKED_ENV",
+                "未找到允许的 Google Chrome 或 Chromium 可执行文件；未启动任意路径中的程序。",
             ),
             DesktopDataError::BrowserWorkspaceContinueNotHeld
             | DesktopDataError::BrowserWorkspaceTakeOverNotAgentHeld
@@ -573,10 +592,11 @@ impl UiFailure {
                 "冻结 digest 或 CAS revision 已变化；请刷新后重新审阅，旧提交未被写入或重放，也未执行 Effect。",
             ),
             DesktopDataError::Application(
-                ApplicationError::BrowserHostReconciliationRequired { .. },
+                ApplicationError::BrowserHostReconciliationRequired { .. }
+                | ApplicationError::BrowserPersistenceReconciliationRequired { .. },
             ) => Self::coded(
                 "RECOVERY_REQUIRED",
-                "Browser Workspace 已持久签发新 Agent lease，但 Host 仍更受限；需要显式 Host reconciliation，未执行 Effect，也未声明 Verification。",
+                "Browser Workspace 的 Host 与持久状态未能原子同步；旧 Host 已停止，需要显式重新挂载或恢复，未执行 Effect，也未声明 Verification。",
             ),
             _ => Self::coded(
                 "INTEGRITY_ERROR",
@@ -1089,6 +1109,7 @@ pub fn App() -> Element {
     let mut selected_result_scope = use_signal(|| None::<(ProjectId, MissionId)>);
     let mut result_action_pending = use_signal(|| false);
     let mut browser_workspace_create_pending = use_signal(|| false);
+    let mut browser_workspace_mount_pending = use_signal(|| false);
     let mut vm11_outcome_action = use_signal(|| None::<(MissionId, OutcomeDecision)>);
     let mut workpad_open = use_signal(initial_workpad_open);
     let mut global_search_query = use_signal(String::new);
@@ -1832,6 +1853,17 @@ pub fn App() -> Element {
     let held_cordis_approval = live_runtime_cancellation
         .as_ref()
         .and_then(DesktopRuntimeCancellation::held_cordis_approval);
+    let browser_host_mounted = !visual_fixture_mode
+        && project
+            .as_ref()
+            .zip(mission.as_ref())
+            .and_then(|(project, mission)| {
+                browser_workspace_control_request(&project.project_id, mission)
+            })
+            .is_some_and(|request| {
+                DesktopDataPlane::persistent()
+                    .is_ok_and(|plane| plane.browser_workspace_host_mounted(&request))
+            });
     let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
         project.as_ref(),
         mission.as_ref(),
@@ -1839,6 +1871,7 @@ pub fn App() -> Element {
         runtime_projection.as_ref(),
         held_local_approval.as_ref(),
         held_cordis_approval.as_ref(),
+        browser_host_mounted,
     );
     let operations_interrupt_available = runtime_busy && runtime_stop_available;
     let operations_interrupt_requested = runtime_stop_requested();
@@ -2048,6 +2081,47 @@ pub fn App() -> Element {
                 }
             }
             browser_workspace_create_pending.set(false);
+        });
+    };
+    let request_operations_mount_browser = move |()| {
+        if browser_workspace_mount_pending() {
+            return;
+        }
+        let request = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .as_ref()
+                .zip(current.current_mission())
+                .and_then(|(project_id, mission)| {
+                    browser_workspace_control_request(project_id, mission)
+                })
+        };
+        let Some(request) = request else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可挂载的持久 Browser Workspace；未启动浏览器。".into(),
+            });
+            return;
+        };
+        browser_workspace_mount_pending.set(true);
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.mount_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => model.write().set_ready(snapshot, false),
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_WORKSPACE_MOUNT_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Mount 协调异常结束；本机 Host 未登记，也未执行导航、Effect 或 Verification。".into(),
+                    });
+                }
+            }
+            browser_workspace_mount_pending.set(false);
         });
     };
     let request_operations_take_over_browser = move |()| {
@@ -3046,6 +3120,7 @@ pub fn App() -> Element {
                                 selected_result: selected_result.clone(),
                                 result_action_pending: result_action_pending(),
                                 browser_workspace_create_pending: browser_workspace_create_pending(),
+                                browser_workspace_mount_pending: browser_workspace_mount_pending(),
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
@@ -3066,6 +3141,7 @@ pub fn App() -> Element {
                                 },
                                 on_interrupt: request_operations_interrupt,
                                 on_create_browser_workspace: request_operations_create_browser,
+                                on_mount_browser_workspace: request_operations_mount_browser,
                                 on_take_over_browser_workspace: request_operations_take_over_browser,
                                 on_continue_browser_workspace: request_operations_continue_browser,
                                 on_pause_browser_workspace: request_operations_pause_browser,
@@ -6063,11 +6139,13 @@ fn AgentOperationsWorkbench(
     projection: AgentOperationsWorkbenchProjection,
     result_action_pending: bool,
     browser_workspace_create_pending: bool,
+    browser_workspace_mount_pending: bool,
     interrupt_available: bool,
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
     on_create_browser_workspace: EventHandler<()>,
+    on_mount_browser_workspace: EventHandler<()>,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_pause_browser_workspace: EventHandler<()>,
@@ -6369,6 +6447,7 @@ fn AgentOperationsWorkbench(
                     div { class: "operations-definition-grid",
                         div { small { "Active profiles" } strong { "{projection.browser.active_profile_count}" } }
                         div { small { "Identity" } strong { "{projection.browser.identity}" } }
+                        div { small { "Host" } strong { if projection.browser.host_mounted { "MOUNTED" } else { "DISCONNECTED" } } }
                         div { small { "Control owner" } strong { "{projection.browser.control_owner}" } }
                         div { small { "Next action" } strong { "{projection.browser.next_action}" } }
                     }
@@ -6395,6 +6474,30 @@ fn AgentOperationsWorkbench(
                                     title: "{create_title}",
                                     onclick: move |_| on_create_browser_workspace.call(()),
                                     "{create_label}"
+                                }
+                            }
+                        }
+                        {
+                            let mount_ready = projection.browser.mount_status == OperationsStatus::Ready
+                                && !browser_workspace_mount_pending;
+                            let mount_title = match projection.browser.mount_status {
+                                OperationsStatus::Ready => "启动允许的本机 Chromium，并挂载当前持久 Workspace",
+                                OperationsStatus::Empty if projection.browser.workspace_id.is_some() => "当前 Workspace 已挂载，或已进入终态",
+                                OperationsStatus::Empty => "当前 Mission 没有可挂载的持久 Browser Workspace",
+                                _ => "当前状态不允许挂载 Browser Workspace",
+                            };
+                            let mount_label = if browser_workspace_mount_pending {
+                                "Mount · RUNNING".into()
+                            } else {
+                                format!("Mount · {}", projection.browser.mount_status.code())
+                            };
+                            rsx! {
+                                button {
+                                    disabled: !mount_ready,
+                                    aria_label: "挂载 Browser Workspace Host",
+                                    title: "{mount_title}",
+                                    onclick: move |_| on_mount_browser_workspace.call(()),
+                                    "{mount_label}"
                                 }
                             }
                         }
@@ -6535,11 +6638,13 @@ fn OrchestratorSurface(
     selected_result: Option<SelectedResultProjection>,
     result_action_pending: bool,
     browser_workspace_create_pending: bool,
+    browser_workspace_mount_pending: bool,
     context_access: Option<ProjectContextAccessProjection>,
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
     interrupt_requested: bool,
     on_create_browser_workspace: EventHandler<()>,
+    on_mount_browser_workspace: EventHandler<()>,
     on_take_over_browser_workspace: EventHandler<()>,
     on_continue_browser_workspace: EventHandler<()>,
     on_pause_browser_workspace: EventHandler<()>,
@@ -6641,11 +6746,13 @@ fn OrchestratorSurface(
                             projection: operations.clone(),
                             result_action_pending,
                             browser_workspace_create_pending,
+                            browser_workspace_mount_pending,
                             interrupt_available: false,
                             interrupt_requested: false,
                             on_quick_entry,
                             on_interrupt,
                             on_create_browser_workspace,
+                            on_mount_browser_workspace,
                             on_take_over_browser_workspace,
                             on_continue_browser_workspace,
                             on_pause_browser_workspace,
@@ -6776,11 +6883,13 @@ fn OrchestratorSurface(
                         projection: operations,
                         result_action_pending,
                         browser_workspace_create_pending,
+                        browser_workspace_mount_pending,
                         interrupt_available,
                         interrupt_requested,
                         on_quick_entry,
                         on_interrupt,
                         on_create_browser_workspace,
+                        on_mount_browser_workspace,
                         on_take_over_browser_workspace,
                         on_continue_browser_workspace,
                         on_pause_browser_workspace,
@@ -10001,6 +10110,22 @@ fn desktop_scope_is_selected(
         && current.selected_mission_id.as_ref() == Some(mission_id)
 }
 
+fn browser_workspace_control_request(
+    project_id: &ProjectId,
+    mission: &MissionProjection,
+) -> Option<DesktopBrowserWorkspaceControlRequest> {
+    mission
+        .browser_workspace
+        .as_ref()
+        .map(|workspace| DesktopBrowserWorkspaceControlRequest {
+            project_id: project_id.clone(),
+            mission_id: mission.mission_id.clone(),
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+        })
+}
+
 fn update_runtime_text_stream(
     projection: Option<DesktopRuntimeTextStreamProjection>,
     mut stream: Signal<Option<DesktopRuntimeTextStreamProjection>>,
@@ -11908,6 +12033,8 @@ mod tests {
         let source = include_str!("lib.rs");
         assert!(source.contains("create_browser_workspace_os"));
         assert!(source.contains("DesktopCreateBrowserWorkspaceRequest"));
+        assert!(source.contains("mount_browser_workspace_os"));
+        assert!(source.contains("browser_workspace_host_mounted"));
         assert!(source.contains("take_over_browser_workspace_os"));
         assert!(source.contains("DesktopTakeOverBrowserWorkspaceRequest"));
         assert!(source.contains("continue_browser_workspace_os"));
@@ -11917,17 +12044,22 @@ mod tests {
         assert!(source.contains("DesktopBrowserWorkspaceControlRequest"));
         assert!(source.contains("format!(\"Create · {}\""));
         assert!(source.contains("Create · RUNNING"));
+        assert!(source.contains("format!(\"Mount · {}\""));
+        assert!(source.contains("Mount · RUNNING"));
         assert!(source.contains("format!(\"Take over · {}\""));
         assert!(source.contains("format!(\"Continue · {}\""));
         assert!(source.contains("format!(\"Pause · {}\""));
         assert!(source.contains("format!(\"Resume · {}\""));
         assert!(source.contains("on_create_browser_workspace"));
         assert!(source.contains("browser_workspace_create_pending"));
+        assert!(source.contains("on_mount_browser_workspace"));
+        assert!(source.contains("browser_workspace_mount_pending"));
         assert!(source.contains("on_take_over_browser_workspace"));
         assert!(source.contains("on_continue_browser_workspace"));
         assert!(source.contains("on_pause_browser_workspace"));
         assert!(source.contains("on_resume_browser_workspace"));
         assert!(source.contains("BrowserHostReconciliationRequired"));
+        assert!(source.contains("BrowserPersistenceReconciliationRequired"));
     }
 
     #[test]

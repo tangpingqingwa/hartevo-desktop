@@ -166,6 +166,8 @@ pub struct BrowserWorkspaceProjection {
     pub status: OperationsStatus,
     pub active_profile_count: usize,
     pub create_status: OperationsStatus,
+    pub host_mounted: bool,
+    pub mount_status: OperationsStatus,
     pub identity: String,
     pub control_owner: String,
     pub next_action: String,
@@ -212,6 +214,7 @@ impl AgentOperationsWorkbenchProjection {
         runtime: Option<&DesktopRuntimeProjection>,
         held_local_approval: Option<&DesktopHeldLocalApproval>,
         held_cordis_approval: Option<&DesktopHeldCordisApproval>,
+        browser_host_mounted: bool,
     ) -> Self {
         let project_name =
             project.map_or_else(|| "未选择 Project".into(), |project| project.name.clone());
@@ -237,7 +240,7 @@ impl AgentOperationsWorkbenchProjection {
             held_local_approval,
             held_cordis_approval,
         );
-        let browser = browser_projection(project, mission);
+        let browser = browser_projection(project, mission, browser_host_mounted);
         let recovery = recovery_projection(runtime_activity);
         let quick_entry = QuickEntryProjection {
             status: if mission.is_some() {
@@ -686,9 +689,14 @@ fn approval_projection(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one projection keeps every durable Browser owner state and disconnected Host gate visible"
+)]
 fn browser_projection(
     project: Option<&DesktopProjectProjection>,
     mission: Option<&MissionProjection>,
+    host_mounted: bool,
 ) -> BrowserWorkspaceProjection {
     let active_profile_count = active_browser_profile_count(project);
     let Some(mission) = mission else {
@@ -715,11 +723,16 @@ fn browser_projection(
         };
         return empty_browser_projection(active_profile_count, create_status, next_action);
     };
+    if !workspace.control_state.is_terminal() && !host_mounted {
+        return disconnected_browser_workspace_view(workspace, active_profile_count);
+    }
     match workspace.control_state {
         BrowserControlState::UserControlled => BrowserWorkspaceProjection {
             status: OperationsStatus::WaitingUser,
             active_profile_count,
             create_status: OperationsStatus::Empty,
+            host_mounted: true,
+            mount_status: OperationsStatus::Empty,
             identity: short_identity_digest(&workspace.identity_digest),
             control_owner: "User holds the current lease".into(),
             next_action: "Continue issues Application continue_browser_workspace".into(),
@@ -735,6 +748,8 @@ fn browser_projection(
             workspace,
             active_profile_count,
             OperationsStatus::Active,
+            true,
+            OperationsStatus::Empty,
             "Agent holds the current lease",
             "Take over issues Application take_over_browser_workspace",
             OperationsStatus::Ready,
@@ -746,6 +761,8 @@ fn browser_projection(
             workspace,
             active_profile_count,
             OperationsStatus::WaitingUser,
+            true,
+            OperationsStatus::Empty,
             "Agent-owned workspace is paused",
             "Resume restores Agent ownership with a fresh lease",
             OperationsStatus::Empty,
@@ -757,6 +774,8 @@ fn browser_projection(
             workspace,
             active_profile_count,
             OperationsStatus::WaitingUser,
+            true,
+            OperationsStatus::Empty,
             "User-owned workspace is paused",
             "Resume restores User ownership",
             OperationsStatus::Empty,
@@ -770,6 +789,8 @@ fn browser_projection(
             workspace,
             active_profile_count,
             OperationsStatus::Empty,
+            false,
+            OperationsStatus::Empty,
             "Workspace is terminal",
             "Ownership actions do not reopen a closed workspace",
             OperationsStatus::Empty,
@@ -778,6 +799,25 @@ fn browser_projection(
             OperationsStatus::Empty,
         ),
     }
+}
+
+fn disconnected_browser_workspace_view(
+    workspace: &DurableBrowserWorkspaceProjection,
+    active_profile_count: usize,
+) -> BrowserWorkspaceProjection {
+    browser_workspace_view(
+        workspace,
+        active_profile_count,
+        OperationsStatus::WaitingUser,
+        false,
+        OperationsStatus::Ready,
+        "Durable owner retained; local Host disconnected",
+        "Mount the exact persisted Workspace Host",
+        OperationsStatus::Empty,
+        OperationsStatus::Empty,
+        OperationsStatus::Empty,
+        OperationsStatus::Empty,
+    )
 }
 
 fn empty_browser_projection(
@@ -789,6 +829,8 @@ fn empty_browser_projection(
         status: create_status,
         active_profile_count,
         create_status,
+        host_mounted: false,
+        mount_status: OperationsStatus::Empty,
         identity: "No Mission-bound Browser Workspace".into(),
         control_owner: "No owner".into(),
         next_action: next_action.into(),
@@ -814,12 +856,14 @@ fn active_browser_profile_count(project: Option<&DesktopProjectProjection>) -> u
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the constructor keeps four independent Browser action statuses explicit"
+    reason = "the constructor keeps Host and four independent Browser action statuses explicit"
 )]
 fn browser_workspace_view(
     workspace: &DurableBrowserWorkspaceProjection,
     active_profile_count: usize,
     status: OperationsStatus,
+    host_mounted: bool,
+    mount_status: OperationsStatus,
     control_owner: &str,
     next_action: &str,
     take_over_status: OperationsStatus,
@@ -831,6 +875,8 @@ fn browser_workspace_view(
         status,
         active_profile_count,
         create_status: OperationsStatus::Empty,
+        host_mounted,
+        mount_status,
         identity: short_identity_digest(&workspace.identity_digest),
         control_owner: control_owner.into(),
         next_action: next_action.into(),
@@ -1147,10 +1193,12 @@ mod tests {
             relationship_conversation: None,
         };
         let project = project_with_active_browser_profile(&mission);
-        let empty = browser_projection(Some(&project), Some(&mission));
+        let empty = browser_projection(Some(&project), Some(&mission), false);
         assert_eq!(empty.status, OperationsStatus::Ready);
         assert_eq!(empty.active_profile_count, 1);
         assert_eq!(empty.create_status, OperationsStatus::Ready);
+        assert!(!empty.host_mounted);
+        assert_eq!(empty.mount_status, OperationsStatus::Empty);
         assert!(
             empty
                 .next_action
@@ -1164,7 +1212,7 @@ mod tests {
 
         let mut no_profile = project.clone();
         no_profile.browser_profiles.clear();
-        let unavailable = browser_projection(Some(&no_profile), Some(&mission));
+        let unavailable = browser_projection(Some(&no_profile), Some(&mission), false);
         assert_eq!(unavailable.create_status, OperationsStatus::Empty);
         assert!(unavailable.next_action.contains("Register and verify"));
 
@@ -1172,7 +1220,7 @@ mod tests {
         let mut second_profile = ambiguous.browser_profiles[0].clone();
         second_profile.profile_id = "profile-second".into();
         ambiguous.browser_profiles.push(second_profile);
-        let refused = browser_projection(Some(&ambiguous), Some(&mission));
+        let refused = browser_projection(Some(&ambiguous), Some(&mission), false);
         assert_eq!(refused.create_status, OperationsStatus::Empty);
         assert!(refused.next_action.contains("Choose one of 2"));
 
@@ -1185,19 +1233,28 @@ mod tests {
             revision: 2,
             lease_generation: 2,
         });
-        let ready = browser_projection(Some(&project), Some(&held));
-        assert_eq!(ready.create_status, OperationsStatus::Empty);
-        assert_eq!(ready.take_over_status, OperationsStatus::Empty);
+        let disconnected = browser_projection(Some(&project), Some(&held), false);
+        assert_eq!(disconnected.create_status, OperationsStatus::Empty);
+        assert!(!disconnected.host_mounted);
+        assert_eq!(disconnected.mount_status, OperationsStatus::Ready);
+        assert_eq!(disconnected.take_over_status, OperationsStatus::Empty);
+        assert_eq!(disconnected.continue_status, OperationsStatus::Empty);
+        assert_eq!(disconnected.pause_status, OperationsStatus::Empty);
+        assert_eq!(disconnected.resume_status, OperationsStatus::Empty);
+        assert_eq!(disconnected.status, OperationsStatus::WaitingUser);
+        assert!(disconnected.next_action.contains("Mount the exact"));
+
+        let ready = browser_projection(Some(&project), Some(&held), true);
+        assert!(ready.host_mounted);
+        assert_eq!(ready.mount_status, OperationsStatus::Empty);
         assert_eq!(ready.continue_status, OperationsStatus::Ready);
         assert_eq!(ready.pause_status, OperationsStatus::Ready);
-        assert_eq!(ready.resume_status, OperationsStatus::Empty);
-        assert_eq!(ready.status, OperationsStatus::WaitingUser);
 
         held.browser_workspace
             .as_mut()
             .expect("workspace")
             .control_state = BrowserControlState::AgentControlled;
-        let agent = browser_projection(Some(&project), Some(&held));
+        let agent = browser_projection(Some(&project), Some(&held), true);
         assert_eq!(agent.take_over_status, OperationsStatus::Ready);
         assert_eq!(agent.continue_status, OperationsStatus::Empty);
         assert_eq!(agent.pause_status, OperationsStatus::Ready);
@@ -1208,7 +1265,7 @@ mod tests {
             .as_mut()
             .expect("workspace")
             .control_state = BrowserControlState::PausedAgent;
-        let paused_agent = browser_projection(Some(&project), Some(&held));
+        let paused_agent = browser_projection(Some(&project), Some(&held), true);
         assert_eq!(paused_agent.take_over_status, OperationsStatus::Empty);
         assert_eq!(paused_agent.continue_status, OperationsStatus::Empty);
         assert_eq!(paused_agent.pause_status, OperationsStatus::Empty);
@@ -1219,12 +1276,20 @@ mod tests {
             .as_mut()
             .expect("workspace")
             .control_state = BrowserControlState::PausedUser;
-        let paused_user = browser_projection(Some(&project), Some(&held));
+        let paused_user = browser_projection(Some(&project), Some(&held), true);
         assert_eq!(paused_user.take_over_status, OperationsStatus::Empty);
         assert_eq!(paused_user.continue_status, OperationsStatus::Empty);
         assert_eq!(paused_user.pause_status, OperationsStatus::Empty);
         assert_eq!(paused_user.resume_status, OperationsStatus::Ready);
         assert!(paused_user.control_owner.contains("User-owned"));
+
+        held.browser_workspace
+            .as_mut()
+            .expect("workspace")
+            .control_state = BrowserControlState::Closed;
+        let terminal = browser_projection(Some(&project), Some(&held), false);
+        assert_eq!(terminal.mount_status, OperationsStatus::Empty);
+        assert_eq!(terminal.resume_status, OperationsStatus::Empty);
     }
 
     #[test]
