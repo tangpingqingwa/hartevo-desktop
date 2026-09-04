@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v10",
+  "registryVersion": "desktop-2026-09-05-v11",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -29,6 +29,21 @@
       "sourceOracleBindings": {
         "mission_checkpoint": ["operating_state"],
         "project_inventory": ["truth"]
+      },
+      "oracleIds": ["truth", "operating_state"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm00.local-encryption-workspace-ready/v1",
+      "missionId": "VM-00",
+      "missionVersion": 3,
+      "checkpointId": "encryption_workspace_ready",
+      "capabilityId": "encryption.initialize",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "project_keyring"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "project_keyring": ["truth"]
       },
       "oracleIds": ["truth", "operating_state"],
       "implementationCrate": "hartevo-application"

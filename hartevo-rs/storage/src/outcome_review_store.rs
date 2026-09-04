@@ -861,6 +861,7 @@ fn validate_decision_conversation(
 
 fn parse_application_source_kind(value: &str) -> Result<ApplicationSourceKind, StorageError> {
     match value {
+        "project_keyring" => Ok(ApplicationSourceKind::ProjectKeyring),
         "mission" => Ok(ApplicationSourceKind::Mission),
         "connection" => Ok(ApplicationSourceKind::Connection),
         "identity_link" => Ok(ApplicationSourceKind::IdentityLink),

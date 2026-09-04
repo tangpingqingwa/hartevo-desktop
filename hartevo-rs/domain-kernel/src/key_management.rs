@@ -999,6 +999,22 @@ impl ProjectKeyring {
         canonical_digest(self)
     }
 
+    /// Returns whether the persisted keyring has a usable, mode-specific
+    /// long-lived recipient set at this exact observation time. This proves
+    /// keyring readiness only; opening an OS/Vault wrapping key remains a
+    /// separate device-local authorization boundary.
+    pub fn is_workspace_ready_at(&self, now: DateTime<Utc>) -> Result<bool, KeyManagementError> {
+        self.validate()?;
+        Ok(!self.rotation_required
+            && self.updated_at <= now
+            && required_recipient_set_is_available(
+                &self.mode,
+                &self.envelopes,
+                self.active_key_version,
+                now,
+            ))
+    }
+
     pub fn follows(&self, previous: &Self) -> Result<bool, KeyManagementError> {
         self.validate()?;
         previous.validate()?;
@@ -1624,6 +1640,59 @@ mod tests {
                 .active_envelope_for(&device, now() + Duration::minutes(2))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn workspace_readiness_is_mode_specific_time_aware_and_rotation_closed() {
+        let expires_at = now() + Duration::minutes(1);
+        let mut personal = ProjectKeyring::initialize(
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            ProjectEncryptionMode::PersonalE2ee,
+            vec![
+                envelope(
+                    "device-ready",
+                    1,
+                    KeyRecipient::Device(DeviceId::from("device-1")),
+                    Some(expires_at),
+                ),
+                envelope(
+                    "recovery-ready",
+                    1,
+                    KeyRecipient::Recovery("recovery-kit-1".into()),
+                    Some(expires_at),
+                ),
+            ],
+            now(),
+        )
+        .expect("personal keyring");
+        assert!(personal.is_workspace_ready_at(now()).expect("ready now"));
+        assert!(
+            !personal
+                .is_workspace_ready_at(now() + Duration::minutes(2))
+                .expect("expired recipient set")
+        );
+        personal.rotation_required = true;
+        assert!(
+            !personal
+                .is_workspace_ready_at(now())
+                .expect("rotation closes readiness")
+        );
+
+        let team = ProjectKeyring::initialize(
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            ProjectEncryptionMode::TeamEnvelope,
+            vec![envelope(
+                "member-ready",
+                1,
+                KeyRecipient::Member(MemberId::from("member-1")),
+                None,
+            )],
+            now(),
+        )
+        .expect("team keyring");
+        assert!(team.is_workspace_ready_at(now()).expect("team ready"));
     }
 
     #[test]

@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 10, 42)
+            (52, 11, 41)
         );
         assert_eq!(
             catalog
@@ -1708,6 +1708,12 @@ mod tests {
                 .application_handler("VM-00", 3, "project_inventory")
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm00.local-project-inventory/v1")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-00", 3, "encryption_workspace_ready")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm00.local-encryption-workspace-ready/v1")
         );
         assert_eq!(
             catalog

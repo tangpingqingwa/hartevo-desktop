@@ -3189,6 +3189,8 @@ pub struct MissionCheckpointDispatch {
 
 const VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID: &str = "vm00.local-project-identity/v1";
 const VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID: &str = "vm00.local-project-inventory/v1";
+const VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID: &str =
+    "vm00.local-encryption-workspace-ready/v1";
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
@@ -3204,6 +3206,7 @@ const VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID: &str =
 enum CompiledApplicationCheckpointHandler {
     LocalProjectIdentity,
     LocalProjectInventory,
+    LocalEncryptionWorkspaceReady,
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
@@ -3219,6 +3222,7 @@ impl CompiledApplicationCheckpointHandler {
         match self {
             Self::LocalProjectIdentity => VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID,
             Self::LocalProjectInventory => VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID,
+            Self::LocalEncryptionWorkspaceReady => VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID,
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
@@ -3234,6 +3238,7 @@ impl CompiledApplicationCheckpointHandler {
         match self {
             Self::LocalProjectIdentity => "project_scope",
             Self::LocalProjectInventory => "project_inventory",
+            Self::LocalEncryptionWorkspaceReady => "project_keyring",
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
@@ -3496,6 +3501,9 @@ fn compiled_application_checkpoint_handler(
         }
         VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::LocalProjectInventory)
+        }
+        VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady)
         }
         VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
         VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
@@ -4044,6 +4052,161 @@ fn vm00_local_project_inventory_application_evidence(
     })
 }
 
+fn vm00_local_encryption_workspace_ready_application_evidence(
+    mission: &Mission,
+    keyring: &ProjectKeyring,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if keyring.tenant_id != mission.tenant_id || keyring.project_id != mission.project_id {
+        return Err(StorageError::TenantScopeMismatch.into());
+    }
+    if definition.manifest_id != "VM-00"
+        || definition.manifest_version != 3
+        || checkpoint.id != "encryption_workspace_ready"
+        || keyring.revision == 0
+        || keyring.active_key_version == 0
+        || !keyring.is_workspace_ready_at(now)?
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    // Consume the exact keyring transiently but persist only its canonical
+    // digest and public readiness coordinates. Envelope ciphertext, recipient
+    // identifiers and wrapping-key references never enter Mission evidence.
+    let project_keyring_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm00-project-keyring-readiness/v1",
+        "tenantId": keyring.tenant_id,
+        "projectId": keyring.project_id,
+        "mode": keyring.mode,
+        "activeKeyVersion": keyring.active_key_version,
+        "remoteExecutionOptIn": keyring.remote_execution_opt_in,
+        "rotationRequired": keyring.rotation_required,
+        "keyringRevision": keyring.revision,
+        "keyringDigest": keyring.canonical_digest()?,
+        "observedAt": now,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "project_keyring".into(),
+                source_id: keyring.project_id.to_string(),
+                source_revision: keyring.revision,
+                projection_digest: project_keyring_digest,
+                oracle_ids: BTreeSet::from(["truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_vm00_project_keyring_block(
+    store: &mut ProjectStore,
+    mission: &mut Mission,
+    expected_mission_revision: u64,
+    command: &ExecuteApplicationMissionCheckpoint,
+    dispatch: &MissionCheckpointDispatch,
+    code: &str,
+    detail: &str,
+    source_revision: u64,
+    source_fence: ApplicationSourceRevisionFence,
+    now: DateTime<Utc>,
+) -> Result<ApplicationMissionCheckpointExecution, ApplicationError> {
+    if mission.stage == MissionStage::Blocked {
+        mission.resume(now)?;
+    }
+    let block = hartevo_domain_kernel::MissionBlock {
+        code: code.into(),
+        detail: detail.into(),
+        recoverable: true,
+        observed_at: now,
+    };
+    mission.block_checkpoint(&command.checkpoint_id, &block, MissionStage::Blocked)?;
+    store.update_mission_atomic_with_application_source_fences_only(
+        mission,
+        expected_mission_revision,
+        &[source_fence],
+        &[PendingEvent::new(
+            "mission.application_checkpoint_blocked",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": command.checkpoint_id,
+                "capabilityId": dispatch.capability_id,
+                "handlerId": VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID,
+                "dispatchMissionRevision": command.expected_mission_revision,
+                "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+                "code": code,
+                "recoverable": true,
+                "outcomeLedgerRevision": source_revision,
+                "sourceKind": "project_keyring",
+                "sourceRevision": source_revision,
+                "sourceFenceCount": 1,
+            }),
+            now,
+        )],
+    )?;
+    Ok(ApplicationMissionCheckpointExecution::Blocked {
+        checkpoint_id: command.checkpoint_id.clone(),
+        code: code.into(),
+        outcome_ledger_revision: source_revision,
+        replayed: false,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the shared VM-00 Project transaction keeps evidence, completion, next-route start, source fence, and events in one atomic boundary"
@@ -4056,7 +4219,6 @@ fn execute_vm00_local_project_checkpoint(
     handler: CompiledApplicationCheckpointHandler,
     now: DateTime<Utc>,
 ) -> Result<ApplicationMissionCheckpointExecution, ApplicationError> {
-    let project = store.load_project(&command.project_id)?;
     let expected_mission_revision = mission.revision;
     if mission.stage == MissionStage::Blocked {
         mission.resume(now)?;
@@ -4073,16 +4235,109 @@ fn execute_vm00_local_project_checkpoint(
         })
         .and_then(|checkpoint| checkpoint.route.clone())
         .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
-    let application_evidence = match handler {
+    let (application_evidence, source_revision, source_fences) = match handler {
         CompiledApplicationCheckpointHandler::LocalProjectIdentity => {
-            vm00_local_project_identity_application_evidence(
+            let project = store.load_project(&command.project_id)?;
+            let evidence = vm00_local_project_identity_application_evidence(
                 &mission, &project, &route, &command, now,
-            )?
+            )?;
+            let revision = project.revision;
+            (
+                evidence,
+                revision,
+                vec![ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Project,
+                    project.id.to_string(),
+                    revision,
+                )],
+            )
         }
         CompiledApplicationCheckpointHandler::LocalProjectInventory => {
-            vm00_local_project_inventory_application_evidence(
+            let project = store.load_project(&command.project_id)?;
+            let evidence = vm00_local_project_inventory_application_evidence(
                 &mission, &project, &route, &command, now,
-            )?
+            )?;
+            let revision = project.revision;
+            (
+                evidence,
+                revision,
+                vec![ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Project,
+                    project.id.to_string(),
+                    revision,
+                )],
+            )
+        }
+        CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady => {
+            let keyring = match store.load_project_keyring(&command.project_id) {
+                Ok(keyring) => keyring,
+                Err(StorageError::ScopedRecordNotFound {
+                    kind: "project keyring",
+                    ..
+                }) => {
+                    return persist_vm00_project_keyring_block(
+                        store,
+                        &mut mission,
+                        expected_mission_revision,
+                        &command,
+                        dispatch,
+                        "project_encryption_not_provisioned",
+                        "Project encryption must be explicitly provisioned before this Mission can continue.",
+                        0,
+                        ApplicationSourceRevisionFence::absent(
+                            ApplicationSourceKind::ProjectKeyring,
+                            command.project_id.to_string(),
+                        ),
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if keyring.tenant_id != mission.tenant_id || keyring.project_id != mission.project_id {
+                return Err(StorageError::TenantScopeMismatch.into());
+            }
+            if !keyring.is_workspace_ready_at(now)? {
+                let (code, detail) = if keyring.rotation_required {
+                    (
+                        "project_encryption_rotation_required",
+                        "Project encryption requires an explicit key rotation before this Mission can continue.",
+                    )
+                } else {
+                    (
+                        "project_encryption_recipient_unavailable",
+                        "Project encryption has no currently available mode-required recipient set.",
+                    )
+                };
+                return persist_vm00_project_keyring_block(
+                    store,
+                    &mut mission,
+                    expected_mission_revision,
+                    &command,
+                    dispatch,
+                    code,
+                    detail,
+                    keyring.revision,
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::ProjectKeyring,
+                        keyring.project_id.to_string(),
+                        keyring.revision,
+                    ),
+                    now,
+                );
+            }
+            let evidence = vm00_local_encryption_workspace_ready_application_evidence(
+                &mission, &keyring, &route, &command, now,
+            )?;
+            let revision = keyring.revision;
+            (
+                evidence,
+                revision,
+                vec![ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::ProjectKeyring,
+                    keyring.project_id.to_string(),
+                    revision,
+                )],
+            )
         }
         _ => return Err(ApplicationError::ApplicationCheckpointCommandMismatch),
     };
@@ -4122,8 +4377,8 @@ fn execute_vm00_local_project_checkpoint(
             "handlerId": handler.handler_id(),
             "oracleIds": dispatch.oracle_ids,
             "sourceKind": handler.primary_source_kind(),
-            "sourceRevision": project.revision,
-            "sourceFenceCount": 1,
+            "sourceRevision": source_revision,
+            "sourceFenceCount": source_fences.len(),
             "evidenceDigest": evidence_digest,
         }),
         now,
@@ -4148,17 +4403,13 @@ fn execute_vm00_local_project_checkpoint(
     store.update_mission_atomic_with_application_source_fences_only(
         &mission,
         expected_mission_revision,
-        &[ApplicationSourceRevisionFence::present(
-            ApplicationSourceKind::Project,
-            project.id.to_string(),
-            project.revision,
-        )],
+        &source_fences,
         &events,
     )?;
     Ok(ApplicationMissionCheckpointExecution::Completed {
         completed_checkpoint_id: command.checkpoint_id,
         completion_evidence_digest: evidence_digest,
-        outcome_ledger_revision: project.revision,
+        outcome_ledger_revision: source_revision,
         replayed: false,
         next_dispatch,
     })
@@ -10065,6 +10316,7 @@ impl ApplicationService {
             compiled_handler,
             CompiledApplicationCheckpointHandler::LocalProjectIdentity
                 | CompiledApplicationCheckpointHandler::LocalProjectInventory
+                | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady
         ) {
             return execute_vm00_local_project_checkpoint(
                 &mut self.store,
@@ -10912,7 +11164,8 @@ impl ApplicationService {
             .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
         let application_evidence = match compiled_handler {
             CompiledApplicationCheckpointHandler::LocalProjectIdentity
-            | CompiledApplicationCheckpointHandler::LocalProjectInventory => {
+            | CompiledApplicationCheckpointHandler::LocalProjectInventory
+            | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest => {
@@ -11041,7 +11294,8 @@ impl ApplicationService {
         let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
         let source_metrics = match compiled_handler {
             CompiledApplicationCheckpointHandler::LocalProjectIdentity
-            | CompiledApplicationCheckpointHandler::LocalProjectInventory => {
+            | CompiledApplicationCheckpointHandler::LocalProjectInventory
+            | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest
@@ -26100,11 +26354,13 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one VM-00 contract test proves both local Project checkpoints, project fencing, content-free evidence, atomic handoffs, exact replay, and stale-command refusal"
+        reason = "one VM-00 contract test proves three local Project checkpoints, Project/Keyring fencing, recoverable provisioning, content-free evidence, atomic handoffs, exact replay, and stale-command refusal"
     )]
-    fn vm00_local_identity_and_inventory_are_project_fenced_replayable_and_advance_without_outcome()
-    {
+    fn vm00_local_identity_inventory_and_encryption_are_fenced_replayable_and_advance_without_outcome()
+     {
         let workspace = tempfile::tempdir().expect("project workspace");
+        let secrets = MemorySecretStore::default();
+        let device_id = DeviceId::from("vm00-local-encryption-device");
         let private_workspace = workspace.path().to_string_lossy().into_owned();
         let private_project_name = "PRIVATE-VM00-PROJECT::local customer workspace";
         let private_project_description = "PRIVATE-VM00-DESCRIPTION::never enter evidence";
@@ -26315,7 +26571,11 @@ mod tests {
         );
         assert_eq!(
             encryption_dispatch.application_handler_status,
-            Some(ApplicationCheckpointHandlerStatus::NotImplemented)
+            Some(ApplicationCheckpointHandlerStatus::Implemented)
+        );
+        assert_eq!(
+            encryption_dispatch.application_handler_id.as_deref(),
+            Some(VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID)
         );
 
         let mission = service
@@ -26401,6 +26661,353 @@ mod tests {
             ),
             Err(ApplicationError::ApplicationCheckpointReplayMismatch)
         ));
+
+        let encryption_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: encryption_dispatch.checkpoint_id,
+            expected_mission_revision: encryption_dispatch.mission_revision,
+            expected_checkpoint_revision: encryption_dispatch.checkpoint_revision,
+        };
+        let missing = service
+            .execute_application_mission_checkpoint(
+                encryption_command.clone(),
+                now() + Duration::milliseconds(9),
+            )
+            .expect("missing encryption is a recoverable block");
+        assert!(matches!(
+            missing,
+            ApplicationMissionCheckpointExecution::Blocked {
+                code,
+                outcome_ledger_revision: 0,
+                replayed: false,
+                ..
+            } if code == "project_encryption_not_provisioned"
+        ));
+        let blocked_event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after missing encryption")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    encryption_command,
+                    now() + Duration::milliseconds(10),
+                )
+                .expect("exact blocked replay"),
+            ApplicationMissionCheckpointExecution::Blocked { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after blocked replay")
+                .len(),
+            blocked_event_count
+        );
+
+        service
+            .provision_project_encryption(
+                &secrets,
+                ProvisionProjectEncryption {
+                    project_id: project_id.clone(),
+                    mode: ProjectEncryptionMode::TeamEnvelope,
+                    primary_recipient: KeyRecipient::Device(device_id.clone()),
+                    recovery_recipient_id: None,
+                },
+                now() + Duration::milliseconds(11),
+            )
+            .expect("explicit project encryption provisioning");
+        let recovered_dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::milliseconds(12),
+            )
+            .expect("blocked encryption dispatch after provisioning");
+        assert_eq!(
+            recovered_dispatch.checkpoint_id,
+            "encryption_workspace_ready"
+        );
+        assert_eq!(
+            recovered_dispatch.state,
+            MissionCheckpointDispatchState::Blocked
+        );
+        let recovered_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: recovered_dispatch.checkpoint_id,
+            expected_mission_revision: recovered_dispatch.mission_revision,
+            expected_checkpoint_revision: recovered_dispatch.checkpoint_revision,
+        };
+        let recovered = service
+            .execute_application_mission_checkpoint(
+                recovered_command.clone(),
+                now() + Duration::milliseconds(13),
+            )
+            .expect("ready encryption completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            outcome_ledger_revision,
+            replayed,
+            next_dispatch: Some(entitlement_dispatch),
+            ..
+        } = recovered
+        else {
+            panic!("VM-00 encryption readiness must complete and advance")
+        };
+        assert_eq!(outcome_ledger_revision, 1);
+        assert!(!replayed);
+        assert_eq!(entitlement_dispatch.checkpoint_id, "entitlement_and_wallet");
+        assert_eq!(
+            entitlement_dispatch.executor,
+            MissionCheckpointExecutor::EffectBroker
+        );
+        assert_eq!(
+            entitlement_dispatch.state,
+            MissionCheckpointDispatchState::Ready
+        );
+
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("VM-00 Mission after encryption readiness");
+        assert!(mission.effects.is_empty());
+        let encryption_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "encryption_workspace_ready")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("encryption readiness completion");
+        assert!(encryption_completion.work_product_ids.is_empty());
+        assert!(encryption_completion.effect_ids.is_empty());
+        let encryption_evidence = encryption_completion
+            .application_evidence
+            .as_ref()
+            .expect("content-free encryption evidence");
+        assert_eq!(
+            encryption_evidence.handler_id,
+            VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID
+        );
+        assert_eq!(
+            encryption_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mission_checkpoint", "project_keyring"])
+        );
+        assert_eq!(
+            encryption_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "project_keyring")
+                .map(|source| source.source_revision),
+            Some(1)
+        );
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free encryption events");
+        let event_json = serde_json::to_string(&events).expect("event JSON");
+        assert!(event_json.contains(VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID));
+        assert!(!event_json.contains(device_id.as_str()));
+        for private_value in [
+            private_project_name,
+            private_project_description,
+            private_goal,
+            private_workspace.as_str(),
+        ] {
+            assert!(!event_json.contains(private_value));
+        }
+        let event_count = events.len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    recovered_command,
+                    now() + Duration::milliseconds(14),
+                )
+                .expect("exact encryption replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after encryption replay")
+                .len(),
+            event_count
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused failure-path test proves revoked active recipients force rotation, preserve the current checkpoint, and emit no partial effect"
+    )]
+    fn vm00_encryption_rotation_required_blocks_without_partial_advance() {
+        let workspace = tempfile::tempdir().expect("project workspace");
+        let secrets = MemorySecretStore::default();
+        let device_id = DeviceId::from("vm00-rotation-device");
+        let project_id = ProjectId::from("vm00-rotation-project");
+        let mission_id = MissionId::from("vm00-rotation-mission");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("vm00-rotation-tenant"),
+                    id: project_id.clone(),
+                    name: "Rotation-required VM-00".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("local project");
+        service
+            .provision_project_encryption(
+                &secrets,
+                ProvisionProjectEncryption {
+                    project_id: project_id.clone(),
+                    mode: ProjectEncryptionMode::TeamEnvelope,
+                    primary_recipient: KeyRecipient::Device(device_id.clone()),
+                    recovery_recipient_id: None,
+                },
+                now() + Duration::milliseconds(1),
+            )
+            .expect("project keyring");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm00-rotation-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-00".into(),
+                    mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
+                    title: None,
+                    goal: "Stop when encryption needs rotation".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "UTC".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now() + Duration::milliseconds(2),
+            )
+            .expect("VM-00 Mission");
+
+        for offset in [3_i64, 4] {
+            let dispatch = service
+                .dispatch_current_mission_checkpoint(
+                    &project_id,
+                    &mission_id,
+                    now() + Duration::milliseconds(offset),
+                )
+                .expect("VM-00 Application dispatch");
+            assert!(matches!(
+                service
+                    .execute_application_mission_checkpoint(
+                        ExecuteApplicationMissionCheckpoint {
+                            project_id: project_id.clone(),
+                            mission_id: mission_id.clone(),
+                            checkpoint_id: dispatch.checkpoint_id,
+                            expected_mission_revision: dispatch.mission_revision,
+                            expected_checkpoint_revision: dispatch.checkpoint_revision,
+                        },
+                        now() + Duration::milliseconds(offset),
+                    )
+                    .expect("VM-00 Application completion"),
+                ApplicationMissionCheckpointExecution::Completed {
+                    replayed: false,
+                    ..
+                }
+            ));
+        }
+
+        let mut keyring = service
+            .store
+            .load_project_keyring(&project_id)
+            .expect("ready keyring");
+        let expected_keyring_revision = keyring.revision;
+        keyring
+            .revoke_recipient(
+                &KeyRecipient::Device(device_id.clone()),
+                now() + Duration::milliseconds(5),
+            )
+            .expect("revoke active device");
+        service
+            .store
+            .update_project_keyring(
+                &keyring,
+                expected_keyring_revision,
+                "project_keyring.recipient_revoked",
+                &serde_json::json!({"rotationRequired": true}),
+                now() + Duration::milliseconds(5),
+            )
+            .expect("persist rotation requirement");
+
+        let dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::milliseconds(6),
+            )
+            .expect("encryption dispatch");
+        assert_eq!(dispatch.checkpoint_id, "encryption_workspace_ready");
+        let mission_before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before rotation block");
+        let event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before rotation block")
+            .len();
+        let blocked = service
+            .execute_application_mission_checkpoint(
+                ExecuteApplicationMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    checkpoint_id: dispatch.checkpoint_id,
+                    expected_mission_revision: dispatch.mission_revision,
+                    expected_checkpoint_revision: dispatch.checkpoint_revision,
+                },
+                now() + Duration::milliseconds(6),
+            )
+            .expect("rotation-required block");
+        assert!(matches!(
+            blocked,
+            ApplicationMissionCheckpointExecution::Blocked {
+                code,
+                outcome_ledger_revision: 2,
+                replayed: false,
+                ..
+            } if code == "project_encryption_rotation_required"
+        ));
+        let mission_after = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission after rotation block");
+        assert!(mission_after.revision > mission_before.revision);
+        assert_eq!(mission_after.stage, MissionStage::Blocked);
+        assert!(mission_after.effects.is_empty());
+        assert!(
+            mission_after
+                .definition
+                .as_ref()
+                .and_then(|definition| definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| { checkpoint.id == "encryption_workspace_ready" }))
+                .is_some_and(|checkpoint| checkpoint.completion.is_none())
+        );
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after rotation block");
+        assert_eq!(events.len(), event_count + 1);
+        let event_json = serde_json::to_string(&events).expect("event JSON");
+        assert!(event_json.contains("project_encryption_rotation_required"));
+        assert!(!event_json.contains(device_id.as_str()));
     }
 
     #[test]
