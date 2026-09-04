@@ -6159,6 +6159,27 @@ fn AgentOperationsWorkbench(
                                 pre { class: "operations-preview", "{artifact.preview}" }
                                 div { class: "operations-artifact-actions", aria_label: "Artifact actions",
                                     button {
+                                        disabled: artifact.actions.open != OperationsStatus::Ready || result_action_pending,
+                                        aria_label: "在 Workpad 打开 Artifact",
+                                        title: if artifact.actions.open == OperationsStatus::Ready {
+                                            "在现有 Workpad 打开此精确 Work Product"
+                                        } else {
+                                            "当前 Project / Mission 没有可验证的精确绑定"
+                                        },
+                                        onclick: {
+                                            let result_binding = artifact
+                                                .result_binding
+                                                .clone()
+                                                .filter(|_| artifact.actions.open == OperationsStatus::Ready);
+                                            move |_| {
+                                                if let Some(binding) = result_binding.clone() {
+                                                    on_result_action.call(ResultSurfaceAction::OpenArtifact(binding));
+                                                }
+                                            }
+                                        },
+                                        "Open · {artifact.actions.open.code()}"
+                                    }
+                                    button {
                                         disabled: artifact.actions.diff != OperationsStatus::Ready,
                                         aria_label: "查看 Artifact diff",
                                         title: "等待 Artifact owner API",
@@ -6173,7 +6194,10 @@ fn AgentOperationsWorkbench(
                                             "仅 Ready for review 的持久 Work Product 可采用"
                                         },
                                         onclick: {
-                                            let adopt_binding = artifact.adopt_binding.clone();
+                                            let adopt_binding = artifact
+                                                .result_binding
+                                                .clone()
+                                                .filter(|_| artifact.actions.adopt == OperationsStatus::Ready);
                                             move |_| {
                                                 if let Some(binding) = adopt_binding.clone() {
                                                     on_result_action.call(ResultSurfaceAction::Adopt(binding));
