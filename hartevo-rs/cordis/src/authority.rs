@@ -159,6 +159,16 @@ impl AuthorityScope {
     pub const fn runtime(&self) -> Option<&RuntimeBinding> {
         self.runtime.as_ref()
     }
+
+    fn mission_scope_at(&self, mission_revision: u64) -> Self {
+        Self {
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            mission_id: self.mission_id.clone(),
+            mission_revision,
+            runtime: None,
+        }
+    }
 }
 
 /// Content-minimized fence for one exact read-only Browser navigation.
@@ -718,6 +728,125 @@ impl fmt::Debug for BrowserReadLease {
     }
 }
 
+/// One request-scoped Browser-read capability subordinate to a live Runtime.
+///
+/// Clones are deliberately omitted. Multiple handles derived from the parent
+/// permit still share the same one-shot state, so callers cannot widen the
+/// single-read boundary. Raw URLs, Browser handles, and persistence state stay
+/// in the Desktop callback.
+pub struct RuntimeBrowserReadAuthority {
+    scope: AuthorityScope,
+    runtime_lease: Arc<RuntimeDispatchLease>,
+    state: Arc<Mutex<RuntimeBrowserReadState>>,
+}
+
+#[derive(Debug)]
+struct RuntimeBrowserReadState {
+    mission_revision: u64,
+    issued: bool,
+    active: Option<ActiveRuntimeBrowserRead>,
+}
+
+#[derive(Debug)]
+struct ActiveRuntimeBrowserRead {
+    serial: u64,
+    scope: AuthorityScope,
+    binding: BrowserReadBinding,
+    lease: Arc<BrowserReadLease>,
+}
+
+impl RuntimeBrowserReadAuthority {
+    /// Issue the only Browser read permitted inside this Runtime operation.
+    pub fn authorize_browser_read(
+        &self,
+        scope: &AuthorityScope,
+        binding: BrowserReadBinding,
+    ) -> Result<BrowserReadPermit, CordisError> {
+        if !self.runtime_lease.is_active() {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        if scope.runtime().is_some() {
+            return Err(CordisError::BrowserReadRuntimeBound);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CordisError::BrowserReadCoordinatorPoisoned)?;
+        if *scope != self.scope.mission_scope_at(state.mission_revision) {
+            return Err(CordisError::AuthorityScopeMismatch);
+        }
+        if state.issued {
+            return Err(CordisError::BrowserReadDispatchBusy);
+        }
+        let serial = 1;
+        let (permit, lease) = BrowserReadPermit::issue(serial, scope.clone(), binding.clone());
+        state.issued = true;
+        state.active = Some(ActiveRuntimeBrowserRead {
+            serial,
+            scope: scope.clone(),
+            binding,
+            lease,
+        });
+        Ok(permit)
+    }
+
+    /// Settle an atomically committed observation and advance the parent
+    /// Runtime's tracked Mission revision by exactly one.
+    pub fn complete_browser_read(
+        &self,
+        permit: BrowserReadPermit,
+        mission_revision: u64,
+    ) -> Result<(), CordisError> {
+        if !self.runtime_lease.is_active() {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CordisError::BrowserReadCoordinatorPoisoned)?;
+        let Some(active) = state.active.as_ref() else {
+            return Err(CordisError::BrowserReadPermitMismatch);
+        };
+        if active.serial != permit.serial()
+            || active.scope != *permit.scope()
+            || active.binding != *permit.binding()
+            || !permit.owns_lease(&active.lease)
+            || active
+                .scope
+                .mission_revision()
+                .checked_add(1)
+                .is_none_or(|expected| expected != mission_revision)
+        {
+            return Err(CordisError::BrowserReadPermitMismatch);
+        }
+        state.active = None;
+        state.mission_revision = mission_revision;
+        permit.complete();
+        Ok(())
+    }
+
+    fn current_mission_scope(&self) -> Result<AuthorityScope, CordisError> {
+        if !self.runtime_lease.is_active() {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CordisError::BrowserReadCoordinatorPoisoned)?;
+        Ok(self.scope.mission_scope_at(state.mission_revision))
+    }
+}
+
+impl fmt::Debug for RuntimeBrowserReadAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeBrowserReadAuthority")
+            .field("scope", &self.scope)
+            .field("runtime_active", &self.runtime_lease.is_active())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Unforgeable, one-shot proof that Cordis admitted one exact Domain command.
 ///
 /// Only [`crate::CordisHost`] can issue it. Desktop releases the coordinator
@@ -1147,6 +1276,7 @@ pub struct RuntimeDispatchPermit {
     scope: AuthorityScope,
     agent: AgentRef,
     lease: Arc<RuntimeDispatchLease>,
+    browser_read: Arc<Mutex<RuntimeBrowserReadState>>,
     unpublished: Option<UnpublishedAgent>,
     notifications: RuntimeDispatchNotifications,
     started_attempted: bool,
@@ -1225,12 +1355,18 @@ impl RuntimeDispatchPermit {
             retention,
             retained_publication,
         ));
+        let browser_read = Arc::new(Mutex::new(RuntimeBrowserReadState {
+            mission_revision: scope.mission_revision(),
+            issued: false,
+            active: None,
+        }));
         (
             Self {
                 serial,
                 scope,
                 agent,
                 lease: Arc::clone(&lease),
+                browser_read,
                 unpublished,
                 notifications,
                 started_attempted: false,
@@ -1279,6 +1415,30 @@ impl RuntimeDispatchPermit {
     #[must_use]
     pub const fn agent(&self) -> &AgentRef {
         &self.agent
+    }
+
+    /// Derive a Runtime-child Browser capability only after this exact Agent
+    /// publication is live. Every derived handle shares one one-shot state.
+    pub fn browser_read_authority(&self) -> Result<RuntimeBrowserReadAuthority, CordisError> {
+        if !self.has_live_publication() {
+            return Err(CordisError::RuntimePermitMismatch);
+        }
+        Ok(RuntimeBrowserReadAuthority {
+            scope: self.scope.mission_scope_at(self.scope.mission_revision()),
+            runtime_lease: Arc::clone(&self.lease),
+            state: Arc::clone(&self.browser_read),
+        })
+    }
+
+    /// Exact Mission scope after every successfully settled child Browser
+    /// read in this Runtime operation.
+    pub fn current_mission_scope(&self) -> Result<AuthorityScope, CordisError> {
+        RuntimeBrowserReadAuthority {
+            scope: self.scope.mission_scope_at(self.scope.mission_revision()),
+            runtime_lease: Arc::clone(&self.lease),
+            state: Arc::clone(&self.browser_read),
+        }
+        .current_mission_scope()
     }
 
     pub(crate) const fn serial(&self) -> u64 {

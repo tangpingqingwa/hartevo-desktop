@@ -630,14 +630,35 @@ pub enum ToolExecutionMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HostToolExecutor {
     ForegroundSubagent { provider: String },
+    RuntimeBrowserRead,
 }
 
 /// Sealed admission carried only by the complete Agent driver. Public and
 /// legacy tool entry points never receive the Runtime-authorized variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HostToolAccess {
+pub(crate) type RuntimeBrowserReadHandler<'a> =
+    &'a (dyn Fn(&ToolRunContext) -> Result<serde_json::Value, String> + Send + Sync);
+
+#[derive(Clone, Copy)]
+pub(crate) enum HostToolAccess<'a> {
     Denied,
-    RuntimeAuthorized,
+    RuntimeAuthorized {
+        browser_read: Option<RuntimeBrowserReadHandler<'a>>,
+    },
+}
+
+impl<'a> HostToolAccess<'a> {
+    const fn is_runtime_authorized(self) -> bool {
+        matches!(self, Self::RuntimeAuthorized { .. })
+    }
+
+    const fn browser_read(self) -> Option<RuntimeBrowserReadHandler<'a>> {
+        match self {
+            Self::Denied | Self::RuntimeAuthorized { browser_read: None } => None,
+            Self::RuntimeAuthorized {
+                browser_read: Some(browser_read),
+            } => Some(browser_read),
+        }
+    }
 }
 
 /// One call admitted through ordered policy and guards for later dispatch.
@@ -4044,7 +4065,7 @@ pub(crate) async fn dispatch_host_tool_execution_with_cancellation(
     prepared: PreparedToolExecution,
     cancellation: &LifecycleCancellation,
     inherited_config: SessionCallConfig,
-    access: HostToolAccess,
+    access: HostToolAccess<'_>,
 ) -> Result<ToolDispatchOutcome, CordisError> {
     let Some(expected_host_executor) = prepared.host_executor.clone() else {
         return dispatch_tool_execution_with_cancellation(ctx, prepared, cancellation);
@@ -4084,7 +4105,7 @@ pub(crate) async fn dispatch_host_tool_execution_with_cancellation(
         }
         expected_host_executor
     };
-    if access != HostToolAccess::RuntimeAuthorized {
+    if !access.is_runtime_authorized() {
         return Ok(tool_dispatch_failure(
             input,
             "host-local tool requires an authorized Runtime agent driver",
@@ -4093,17 +4114,33 @@ pub(crate) async fn dispatch_host_tool_execution_with_cancellation(
     }
 
     let run = ToolRunContext::new(input, cancellation.clone(), prepared.approval);
-    let execution = match host_executor {
+    let result = match host_executor {
         HostToolExecutor::ForegroundSubagent { provider } => {
-            run_foreground_subagent_tool(ctx, &run, provider, inherited_config)
+            let execution = run_foreground_subagent_tool(ctx, &run, provider, inherited_config);
+            match AssertUnwindSafe(execution).catch_unwind().await {
+                Ok(Ok(value)) => ToolDispatchResult::Success { value },
+                Ok(Err(message)) => ToolDispatchResult::Failure { message },
+                Err(_) => ToolDispatchResult::Failure {
+                    message: format!("tool \"{}\" panicked", run.name()),
+                },
+            }
         }
-    };
-    let result = match AssertUnwindSafe(execution).catch_unwind().await {
-        Ok(Ok(value)) => ToolDispatchResult::Success { value },
-        Ok(Err(message)) => ToolDispatchResult::Failure { message },
-        Err(_) => ToolDispatchResult::Failure {
-            message: format!("tool \"{}\" panicked", run.name()),
-        },
+        HostToolExecutor::RuntimeBrowserRead => {
+            let Some(browser_read) = access.browser_read() else {
+                return Ok(tool_dispatch_failure(
+                    run.input,
+                    "Runtime Browser-read tool requires its request-scoped Desktop bridge",
+                    result_projection,
+                ));
+            };
+            match catch_unwind(AssertUnwindSafe(|| browser_read(&run))) {
+                Ok(Ok(value)) => ToolDispatchResult::Success { value },
+                Ok(Err(message)) => ToolDispatchResult::Failure { message },
+                Err(_) => ToolDispatchResult::Failure {
+                    message: format!("tool \"{}\" panicked", run.name()),
+                },
+            }
+        }
     };
     let (input, additional_contexts, concludes_turn) = run.into_parts();
     Ok(ToolDispatchOutcome {
