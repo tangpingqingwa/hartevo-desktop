@@ -34,10 +34,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ureq.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+url.workspace = true
 
 [features]
 default = ["desktop"]

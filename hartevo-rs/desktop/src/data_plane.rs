@@ -142,6 +142,7 @@ use crate::shopify_readback::{
     dispatch_os_keyring_shopify_readback, dispatch_os_keyring_shopify_readback_identity_metadata,
     dispatch_os_keyring_shopify_readback_metadata, prepare_shopify_readback_broker,
 };
+use crate::tiktok_read::native_tiktok_read_transport;
 
 const DATA_DIRECTORY_ENV: &str = "HARTEVO_DESKTOP_DATA_DIR";
 const DATABASE_FILE_NAME: &str = "hartevo.sqlite3";
@@ -4238,6 +4239,24 @@ impl DesktopDataPlane {
                 desktop_tiktok_evidence_input(&sequence, now)
             },
         )
+    }
+
+    /// Select the Desktop OS keyring and bounded native HTTPS transport for
+    /// one exact N144 Cordis-authorized TikTok read-and-adopt operation.
+    pub fn read_and_adopt_tiktok_mission_sequence_os(
+        &self,
+        request: DesktopReadAndAdoptTiktokMissionSequenceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let transport = native_tiktok_read_transport(
+            &secret_store,
+            &request.project_id,
+            &request.scope,
+            &request.credential,
+        )
+        .map_err(|_| DesktopDataError::InvalidTiktokProviderRead)?;
+        self.read_and_adopt_tiktok_mission_sequence_with(&secret_store, transport, request, now)
     }
 
     #[allow(
