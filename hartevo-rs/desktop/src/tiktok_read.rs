@@ -13,11 +13,13 @@ use hartevo_channel_adapters::tiktok::{
 use hartevo_channel_adapters::transport::CredentialKind;
 use hartevo_channel_adapters::{
     HttpMethod, OAuthCredential, ProviderKind, ProviderReadRequest, ProviderResponse,
-    ReadOnlyTransport, ReadOperation, SecretReference as ChannelSecretReference, TiktokOAuthScope,
-    TiktokReadScope, TransportError,
+    ReadOnlyTransport, ReadOperation, SecretReference as ChannelSecretReference,
+    TiktokApiOperation, TiktokOAuthScope, TiktokReadScope, TransportError,
 };
 use hartevo_domain_kernel::{ProjectId, TenantId};
-use hartevo_storage::{SecretReference as StorageSecretReference, SecretStore, SecretStoreError};
+use hartevo_storage::{
+    SecretBytes, SecretReference as StorageSecretReference, SecretStore, SecretStoreError,
+};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -50,6 +52,70 @@ pub fn tiktok_access_token_reference(
     };
     reference.credential_id()?;
     Ok(reference)
+}
+
+/// Installs one immutable TikTok access-token generation. `Ok(false)` means
+/// that exact generation already exists and was left untouched.
+pub(crate) fn provision_tiktok_access_token(
+    secret_store: &impl SecretStore,
+    project_id: &ProjectId,
+    credential: &OAuthCredential,
+    access_token: &Zeroizing<String>,
+    now: chrono::DateTime<Utc>,
+) -> Result<bool, SecretStoreError> {
+    let storage_reference = validate_tiktok_credential(project_id, credential, now)?;
+    if !valid_access_token(access_token.as_str()) {
+        return Err(SecretStoreError::InvalidSecret);
+    }
+    match secret_store.get(&storage_reference) {
+        Ok(_) => return Ok(false),
+        Err(SecretStoreError::SecretNotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let secret = SecretBytes::new(access_token.as_bytes().to_vec())?;
+    secret_store.put(&storage_reference, &secret)?;
+    Ok(true)
+}
+
+/// Clears only one exact scope/generation. A missing generation is already
+/// the desired state and therefore succeeds.
+pub(crate) fn clear_tiktok_access_token(
+    secret_store: &impl SecretStore,
+    project_id: &ProjectId,
+    scope: &TiktokReadScope,
+    credential_generation: u64,
+) -> Result<(), SecretStoreError> {
+    let reference = tiktok_access_token_reference(project_id, scope, credential_generation)?;
+    match secret_store.delete(&reference) {
+        Ok(()) | Err(SecretStoreError::SecretNotFound) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_tiktok_credential(
+    project_id: &ProjectId,
+    credential: &OAuthCredential,
+    now: chrono::DateTime<Utc>,
+) -> Result<StorageSecretReference, SecretStoreError> {
+    credential
+        .require_for(TiktokApiOperation::VideoList, credential.scope(), now)
+        .map_err(|_| SecretStoreError::InvalidReference)?;
+    let expected = ChannelSecretReference::new(format!(
+        "keychain://tiktok/{}",
+        credential.scope().account().as_str()
+    ))
+    .map_err(|_| SecretStoreError::InvalidReference)?;
+    if credential.secret_reference() != &expected {
+        return Err(SecretStoreError::InvalidReference);
+    }
+    tiktok_access_token_reference(project_id, credential.scope(), credential.generation())
+}
+
+fn valid_access_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 4_096
+        && token == token.trim()
+        && !token.chars().any(char::is_control)
 }
 
 pub(crate) fn native_tiktok_read_transport<'a>(
@@ -139,12 +205,7 @@ where
             .map_err(|_| TransportError::Unavailable)?;
         let access_token = std::str::from_utf8(secret.as_slice())
             .ok()
-            .filter(|token| {
-                !token.is_empty()
-                    && token.len() <= 4_096
-                    && token == &token.trim()
-                    && !token.chars().any(char::is_control)
-            })
+            .filter(|token| valid_access_token(token))
             .ok_or(TransportError::Unavailable)?;
         self.executor.execute(request, access_token)
     }
@@ -342,7 +403,7 @@ mod tests {
         SecretReference as ChannelSecretReference, TenantId as ChannelTenantId, TiktokAccountId,
         TiktokAuthenticatedReadService, TiktokFreshnessPolicy, TiktokVideoListCursor,
     };
-    use hartevo_storage::SecretBytes;
+    use hartevo_storage::{MemorySecretStore, SecretBytes};
     use url::Url;
 
     use super::*;
@@ -536,6 +597,140 @@ mod tests {
         );
         assert!(!debug.contains("token-123"));
         assert!(!debug.contains("keychain://tiktok/open01"));
+    }
+
+    #[test]
+    fn provisioned_generations_feed_native_transport_and_clear_exactly() {
+        let project_id = ProjectId::from("project-01");
+        let scope = scope();
+        let first = credential(&scope);
+        let second = OAuthCredential::new(
+            first.secret_reference().clone(),
+            scope.clone(),
+            [TiktokOAuthScope::VideoList].into_iter().collect(),
+            now() + ChronoDuration::hours(2),
+            None,
+            5,
+        )
+        .expect("next credential generation");
+        let store = MemorySecretStore::default();
+
+        assert!(
+            provision_tiktok_access_token(
+                &store,
+                &project_id,
+                &first,
+                &Zeroizing::new("token-generation-four".into()),
+                now(),
+            )
+            .expect("provision first generation")
+        );
+        assert!(
+            !provision_tiktok_access_token(
+                &store,
+                &project_id,
+                &first,
+                &Zeroizing::new("must-not-overwrite".into()),
+                now(),
+            )
+            .expect("same generation remains immutable")
+        );
+        let first_reference =
+            tiktok_access_token_reference(&project_id, &scope, first.generation()).unwrap();
+        assert_eq!(
+            store.get(&first_reference).unwrap().as_slice(),
+            b"token-generation-four"
+        );
+
+        let response = ProviderResponse::new(
+            200,
+            [("content-type".into(), "application/json".into())],
+            serde_json::json!({
+                "data": {"videos": [], "cursor": 0, "has_more": false},
+                "error": {"code": "ok"},
+            })
+            .to_string(),
+            now(),
+        );
+        let (executor, calls, token_digest) = executor(WireOutcome::Response(response));
+        let mut transport = TiktokReadTransport::new(&store, &project_id, &scope, &first, executor)
+            .expect("native transport");
+        transport
+            .send(&exact_request(first.secret_reference().clone()))
+            .expect("read with provisioned token");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            token_digest.lock().unwrap().as_deref(),
+            Some(format!("{:x}", Sha256::digest(b"token-generation-four")).as_str())
+        );
+
+        assert!(
+            provision_tiktok_access_token(
+                &store,
+                &project_id,
+                &second,
+                &Zeroizing::new("token-generation-five".into()),
+                now(),
+            )
+            .expect("provision next generation")
+        );
+        assert_eq!(store.entry_count().unwrap(), 2);
+        clear_tiktok_access_token(&store, &project_id, &scope, first.generation()).unwrap();
+        clear_tiktok_access_token(&store, &project_id, &scope, first.generation()).unwrap();
+        assert!(matches!(
+            store.get(&first_reference),
+            Err(SecretStoreError::SecretNotFound)
+        ));
+        let second_reference =
+            tiktok_access_token_reference(&project_id, &scope, second.generation()).unwrap();
+        assert_eq!(
+            store.get(&second_reference).unwrap().as_slice(),
+            b"token-generation-five"
+        );
+    }
+
+    #[test]
+    fn malformed_or_mismatched_provisioning_never_mutates_the_store() {
+        let project_id = ProjectId::from("project-01");
+        let scope = scope();
+        let store = MemorySecretStore::default();
+        for token in [
+            String::new(),
+            " token".into(),
+            "token\nvalue".into(),
+            "x".repeat(4_097),
+        ] {
+            assert!(matches!(
+                provision_tiktok_access_token(
+                    &store,
+                    &project_id,
+                    &credential(&scope),
+                    &Zeroizing::new(token),
+                    now(),
+                ),
+                Err(SecretStoreError::InvalidSecret)
+            ));
+        }
+        let wrong_reference = OAuthCredential::new(
+            ChannelSecretReference::new("keychain://tiktok/other").unwrap(),
+            scope.clone(),
+            [TiktokOAuthScope::VideoList].into_iter().collect(),
+            now() + ChronoDuration::hours(1),
+            None,
+            4,
+        )
+        .unwrap();
+        assert!(matches!(
+            provision_tiktok_access_token(
+                &store,
+                &project_id,
+                &wrong_reference,
+                &Zeroizing::new("token".into()),
+                now(),
+            ),
+            Err(SecretStoreError::InvalidReference)
+        ));
+        assert_eq!(store.entry_count().unwrap(), 0);
     }
 
     #[test]
