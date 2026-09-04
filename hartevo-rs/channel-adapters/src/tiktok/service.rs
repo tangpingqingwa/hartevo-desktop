@@ -10,12 +10,12 @@ use super::provider::{
     video_query_request,
 };
 use super::{
-    EvidenceProvenance, MAX_VIDEO_SEQUENCE_PAGES, MissionTiktokVideoSequenceConsumer,
-    OAuthCredential, REAL_READ_ENABLE_ENV, REAL_READ_SECRET_REFERENCE_ENV, TiktokApiOperation,
-    TiktokError, TiktokFreshness, TiktokFreshnessPolicy, TiktokMissionAcceptedSequence,
-    TiktokMissionPageProgress, TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope,
-    TiktokRetryAfterReceipt, TiktokVideoId, TiktokVideoListCursor, TiktokVideoPage,
-    TiktokVideoPageEnvelope,
+    EvidenceProvenance, MAX_VIDEO_SEQUENCE_PAGES, OAuthCredential, REAL_READ_ENABLE_ENV,
+    REAL_READ_SECRET_REFERENCE_ENV, TiktokApiOperation, TiktokError, TiktokFreshness,
+    TiktokFreshnessPolicy, TiktokMissionAcceptedSequence, TiktokMissionPageProgress,
+    TiktokObservationEnvelope, TiktokQuotaLedger, TiktokReadScope, TiktokRetryAfterReceipt,
+    TiktokVideoId, TiktokVideoListCursor, TiktokVideoPage, TiktokVideoPageEnvelope,
+    TiktokVideoSequenceSession,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,12 +236,9 @@ impl<T> TiktokAuthenticatedReadService<T> {
         credential.require_for(TiktokApiOperation::VideoList, scope, now)?;
         self.provider
             .require_credential_reference(credential.secret_reference())?;
-
-        let mut cursor = TiktokVideoListCursor::new_with_page_size(scope.clone(), page_size)?;
-        let mut consumer = MissionTiktokVideoSequenceConsumer::new(scope.clone(), page_size)?;
+        let mut session = TiktokVideoSequenceSession::new(scope.clone(), page_size)?;
         for _ in 0..max_pages {
-            let page = self.list_videos(credential, &mut cursor, now, page_size)?;
-            match consumer.accept_page(page, credential, now)? {
+            match self.read_video_sequence_step(credential, &mut session, now)? {
                 TiktokMissionPageProgress::Complete(sequence) => return Ok(sequence),
                 TiktokMissionPageProgress::Pending { .. } => {}
                 TiktokMissionPageProgress::Duplicate(_) => {
@@ -250,6 +247,28 @@ impl<T> TiktokAuthenticatedReadService<T> {
             }
         }
         Err(TiktokError::PageBudgetExhausted { max_pages })
+    }
+
+    /// Advance one resumable production `video.list` sequence by at most one
+    /// provider request. The caller owns the session checkpoint and therefore
+    /// decides when and where to persist it; this method never sleeps, retries,
+    /// or creates a second authority path.
+    pub fn read_video_sequence_step(
+        &mut self,
+        credential: &OAuthCredential,
+        session: &mut TiktokVideoSequenceSession,
+        now: DateTime<Utc>,
+    ) -> Result<TiktokMissionPageProgress, TiktokError>
+    where
+        T: ReadOnlyTransport,
+    {
+        session.validate()?;
+        if self.provenance() != EvidenceProvenance::ProductionProvider {
+            return Err(TiktokError::ProvenanceRejected);
+        }
+        let page_size = session.page_size();
+        let page = self.list_videos(credential, session.cursor_mut(), now, page_size)?;
+        session.accept_page(page, credential, now)
     }
 
     pub fn query_videos(
@@ -349,7 +368,9 @@ fn video_page_envelope(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{BTreeSet, VecDeque};
+    use std::rc::Rc;
 
     use chrono::Duration;
 
@@ -389,6 +410,35 @@ mod tests {
             &mut self,
             _request: &ProviderReadRequest,
         ) -> Result<ProviderResponse, TransportError> {
+            self.responses
+                .pop_front()
+                .ok_or(TransportError::Unavailable)
+        }
+    }
+
+    struct RecordingSequenceTransport {
+        responses: VecDeque<ProviderResponse>,
+        requests: Rc<RefCell<Vec<ProviderReadRequest>>>,
+    }
+
+    impl RecordingSequenceTransport {
+        fn new(
+            responses: impl IntoIterator<Item = ProviderResponse>,
+            requests: Rc<RefCell<Vec<ProviderReadRequest>>>,
+        ) -> Self {
+            Self {
+                responses: responses.into_iter().collect(),
+                requests,
+            }
+        }
+    }
+
+    impl ReadOnlyTransport for RecordingSequenceTransport {
+        fn send(
+            &mut self,
+            request: &ProviderReadRequest,
+        ) -> Result<ProviderResponse, TransportError> {
+            self.requests.borrow_mut().push(request.clone());
             self.responses
                 .pop_front()
                 .ok_or(TransportError::Unavailable)
@@ -604,6 +654,114 @@ mod tests {
         assert_eq!(accepted.page_count(), 2);
         assert_eq!(accepted.credential_generation(), 1);
         accepted.validate_at(now).unwrap();
+    }
+
+    #[test]
+    fn production_sequence_session_resumes_exact_next_page_after_checkpoint() {
+        let now = crate::tiktok::testkit::fixed_now();
+        let read_scope = scope();
+        let credential = video_credential(&read_scope, now, 1);
+        let gate = TiktokRealReadGate::from_environment_values(
+            Some("1"),
+            Some("keychain://tiktok/open01"),
+        )
+        .unwrap();
+        let mut first_service = TiktokAuthenticatedReadService::production(
+            SequenceTransport::new([first_video_page_response()]),
+            gate.clone(),
+            TiktokFreshnessPolicy::default(),
+        );
+        let mut session = TiktokVideoSequenceSession::new(read_scope.clone(), 20).unwrap();
+
+        assert!(matches!(
+            first_service
+                .read_video_sequence_step(&credential, &mut session, now)
+                .unwrap(),
+            TiktokMissionPageProgress::Pending { .. }
+        ));
+        assert_eq!(session.generation(), 1);
+        assert_eq!(
+            session.next_cursor().map(super::super::TiktokCursor::value),
+            Some(1_767_301_445_000)
+        );
+        let checkpoint = session.checkpoint_json().unwrap();
+        assert!(!checkpoint.contains(credential.secret_reference().as_str()));
+        assert!(!format!("{session:?}").contains(credential.secret_reference().as_str()));
+
+        let rotated = video_credential(&read_scope, now, 2);
+        assert_eq!(
+            TiktokVideoSequenceSession::from_checkpoint_json(&checkpoint, &rotated, now)
+                .unwrap_err(),
+            TiktokError::CursorInvalidated {
+                reason: super::super::TiktokCursorInvalidationReason::CredentialRotated,
+            }
+        );
+
+        let mut wrong_version: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+        wrong_version["schema_version"] = serde_json::json!(2);
+        assert_eq!(
+            TiktokVideoSequenceSession::from_checkpoint_json(
+                &serde_json::to_string(&wrong_version).unwrap(),
+                &credential,
+                now,
+            )
+            .unwrap_err(),
+            TiktokError::CursorCheckpointIncompatible
+        );
+        let mut tampered: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+        tampered["pages"][0]["evidence_root"] = serde_json::Value::String("0".repeat(64));
+        assert_eq!(
+            TiktokVideoSequenceSession::from_checkpoint_json(
+                &serde_json::to_string(&tampered).unwrap(),
+                &credential,
+                now,
+            )
+            .unwrap_err(),
+            TiktokError::EvidenceRootMismatch
+        );
+
+        let mut restored =
+            TiktokVideoSequenceSession::from_checkpoint_json(&checkpoint, &credential, now)
+                .unwrap();
+        assert_eq!(restored, session);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let transport =
+            RecordingSequenceTransport::new([final_video_page_response()], Rc::clone(&requests));
+        let mut resumed_service = TiktokAuthenticatedReadService::production(
+            transport,
+            gate,
+            TiktokFreshnessPolicy::default(),
+        );
+        let completed = match resumed_service
+            .read_video_sequence_step(&credential, &mut restored, now)
+            .unwrap()
+        {
+            TiktokMissionPageProgress::Complete(sequence) => sequence,
+            other => panic!("expected complete sequence, got {other:?}"),
+        };
+
+        assert_eq!(completed.page_count(), 2);
+        assert_eq!(
+            restored.accepted_sequence(now).unwrap(),
+            Some(completed.clone())
+        );
+        let completed_checkpoint = restored.checkpoint_json().unwrap();
+        let reopened_complete = TiktokVideoSequenceSession::from_checkpoint_json(
+            &completed_checkpoint,
+            &credential,
+            now,
+        )
+        .unwrap();
+        assert!(reopened_complete.is_complete());
+        assert_eq!(
+            reopened_complete.accepted_sequence(now).unwrap(),
+            Some(completed)
+        );
+        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(
+            requests.borrow()[0].body().unwrap()["cursor"],
+            serde_json::json!(1_767_301_445_000_i64)
+        );
     }
 
     #[test]
