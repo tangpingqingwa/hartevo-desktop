@@ -270,6 +270,7 @@ impl fmt::Debug for BrowserReadBinding {
 pub enum DomainCommandKind {
     ProposeEffect,
     ApproveProposedEffect,
+    AdoptProviderObservation,
 }
 
 impl DomainCommandKind {
@@ -278,26 +279,28 @@ impl DomainCommandKind {
         match self {
             Self::ProposeEffect => "propose_effect",
             Self::ApproveProposedEffect => "approve_proposed_effect",
+            Self::AdoptProviderObservation => "adopt_provider_observation",
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 enum DomainCommandDigest {
     Proposal(String),
     ApprovalScope(String),
+    Observation(String),
 }
 
 /// Content-minimized binding for one exact Domain command.
 ///
-/// Mission identity and revision stay in [`AuthorityScope`]. Proposal and
-/// approval-scope digests are distinct variants so neither command can be
-/// mistaken for the other. Neither digest is a Receipt, Verification,
-/// provider lease, or execution capability.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// Mission identity and revision stay in [`AuthorityScope`]. Proposal,
+/// approval-scope, and provider-observation digests are distinct variants so
+/// no command can be mistaken for another. None is a Receipt, Verification,
+/// provider lease, credential, or execution capability.
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct DomainCommandBinding {
     kind: DomainCommandKind,
-    effect_id: String,
+    subject_id: String,
     digest: DomainCommandDigest,
 }
 
@@ -548,7 +551,7 @@ impl DomainCommandBinding {
     ) -> Result<Self, CordisError> {
         Ok(Self {
             kind: DomainCommandKind::ProposeEffect,
-            effect_id: normalized_id(effect_id.into(), "domain_command_effect_id")?,
+            subject_id: normalized_id(effect_id.into(), "domain_command_effect_id")?,
             digest: DomainCommandDigest::Proposal(canonical_digest(
                 proposal_digest.into(),
                 "domain_command_proposal_digest",
@@ -562,10 +565,27 @@ impl DomainCommandBinding {
     ) -> Result<Self, CordisError> {
         Ok(Self {
             kind: DomainCommandKind::ApproveProposedEffect,
-            effect_id: normalized_id(effect_id.into(), "domain_command_effect_id")?,
+            subject_id: normalized_id(effect_id.into(), "domain_command_effect_id")?,
             digest: DomainCommandDigest::ApprovalScope(canonical_digest(
                 approval_scope_digest.into(),
                 "domain_command_approval_scope_digest",
+            )?),
+        })
+    }
+
+    /// Bind one already-admitted provider observation to an exact Mission
+    /// mutation. The digest is opaque to Cordis and carries no provider,
+    /// credential, persistence, Effect, or Verification authority.
+    pub fn adopt_provider_observation(
+        observation_id: impl Into<String>,
+        observation_digest: impl Into<String>,
+    ) -> Result<Self, CordisError> {
+        Ok(Self {
+            kind: DomainCommandKind::AdoptProviderObservation,
+            subject_id: normalized_id(observation_id.into(), "domain_command_observation_id")?,
+            digest: DomainCommandDigest::Observation(canonical_digest(
+                observation_digest.into(),
+                "domain_command_observation_digest",
             )?),
         })
     }
@@ -577,23 +597,53 @@ impl DomainCommandBinding {
 
     #[must_use]
     pub fn effect_id(&self) -> &str {
-        &self.effect_id
+        &self.subject_id
+    }
+
+    #[must_use]
+    pub fn observation_id(&self) -> Option<&str> {
+        (self.kind == DomainCommandKind::AdoptProviderObservation)
+            .then_some(self.subject_id.as_str())
     }
 
     #[must_use]
     pub fn proposal_digest(&self) -> Option<&str> {
         match &self.digest {
             DomainCommandDigest::Proposal(digest) => Some(digest),
-            DomainCommandDigest::ApprovalScope(_) => None,
+            DomainCommandDigest::ApprovalScope(_) | DomainCommandDigest::Observation(_) => None,
         }
     }
 
     #[must_use]
     pub fn approval_scope_digest(&self) -> Option<&str> {
         match &self.digest {
-            DomainCommandDigest::Proposal(_) => None,
+            DomainCommandDigest::Proposal(_) | DomainCommandDigest::Observation(_) => None,
             DomainCommandDigest::ApprovalScope(digest) => Some(digest),
         }
+    }
+
+    #[must_use]
+    pub fn observation_digest(&self) -> Option<&str> {
+        match &self.digest {
+            DomainCommandDigest::Observation(digest) => Some(digest),
+            DomainCommandDigest::Proposal(_) | DomainCommandDigest::ApprovalScope(_) => None,
+        }
+    }
+}
+
+impl fmt::Debug for DomainCommandBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let subject = if self.kind == DomainCommandKind::AdoptProviderObservation {
+            "[OBSERVATION_ID]"
+        } else {
+            self.subject_id.as_str()
+        };
+        formatter
+            .debug_struct("DomainCommandBinding")
+            .field("kind", &self.kind)
+            .field("subject_id", &subject)
+            .field("digest", &"[DIGEST]")
+            .finish()
     }
 }
 
@@ -2148,6 +2198,34 @@ mod tests {
         assert_eq!(proposal.effect_id(), "effect-a");
         assert_eq!(proposal.proposal_digest(), Some(proposal_digest.as_str()));
         assert_eq!(proposal.approval_scope_digest(), None);
+
+        assert_eq!(
+            DomainCommandBinding::adopt_provider_observation("", "d".repeat(64)).unwrap_err(),
+            CordisError::InvalidAuthorityScope {
+                field: "domain_command_observation_id"
+            }
+        );
+        let observation_digest = "d".repeat(64);
+        let observation = DomainCommandBinding::adopt_provider_observation(
+            "tiktok-sequence-a",
+            observation_digest.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            observation.kind(),
+            DomainCommandKind::AdoptProviderObservation
+        );
+        assert_eq!(observation.kind().as_str(), "adopt_provider_observation");
+        assert_eq!(observation.observation_id(), Some("tiktok-sequence-a"));
+        assert_eq!(
+            observation.observation_digest(),
+            Some(observation_digest.as_str())
+        );
+        assert_eq!(observation.proposal_digest(), None);
+        assert_eq!(observation.approval_scope_digest(), None);
+        let debug = format!("{observation:?}");
+        assert!(!debug.contains(&observation_digest));
+        assert!(!debug.contains("tiktok-sequence-a"));
     }
 
     #[test]

@@ -35,15 +35,18 @@ use hartevo_application::{
     DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
     ExecuteApplicationMissionCheckpoint, ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn,
     InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
-    MissionRuntimeProjection, ObserveContextRuntimeTurn, PauseBrowserWorkspace,
-    PrepareLocalMissionRuntimeContext, PreparedLocalMissionRuntimeContext,
-    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProposePreviewEffect,
-    ProvisionProjectEncryption, ReadBrowserPublicSource, ReconcileUncertainEffect,
-    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, RelationshipConversationProjection,
-    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
-    ResumeBrowserWorkspace, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
-    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission, TakeOverBrowserWorkspace,
+    MissionRuntimeProjection, ObservationClassification, ObservationEvidencePack,
+    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
+    ObservationPlanBinding, ObservationSourceBinding, ObservationSourceKind,
+    ObserveContextRuntimeTurn, PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext,
+    PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
+    ProposePreviewEffect, ProvisionProjectEncryption, ReadBrowserPublicSource,
+    ReconcileUncertainEffect, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
+    RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
+    RespondContextRuntimeLocalApproval, ResumeBrowserWorkspace, RetryContextWorkerRuntime,
+    ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor,
+    RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition, StartCatalogMission,
+    StartMission, TakeOverBrowserWorkspace, TypedRuntimeObservation,
     VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
@@ -56,6 +59,8 @@ use hartevo_browser_adapter::{ChromiumLaunchConfig, ManagedChromiumHost};
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
+use hartevo_channel_adapters::tiktok::ProviderId as TiktokProviderId;
+use hartevo_channel_adapters::{TiktokError, TiktokMissionAcceptedSequence, TiktokReadObservation};
 use hartevo_context_fabric::{
     ConservativeByteBudgetTokenizer, ContextAssemblyStatus, RuntimeContextEnvelope,
 };
@@ -1472,6 +1477,69 @@ impl fmt::Debug for DesktopReadBrowserPublicSourceRequest {
 pub struct DesktopBrowserPublicSourceRead {
     pub snapshot: DesktopSnapshot,
     pub observation: BrowserPublicSourceObservation,
+}
+
+/// Adopt one terminal N142 TikTok sequence into an exact Desktop Mission.
+///
+/// `Debug` deliberately omits the sequence because its pages can contain
+/// provider text and public URLs. Credentials are not part of this request.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopAdoptTiktokMissionSequenceRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub sequence: TiktokMissionAcceptedSequence,
+}
+
+impl fmt::Debug for DesktopAdoptTiktokMissionSequenceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopAdoptTiktokMissionSequenceRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field("sequence", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesktopTiktokEvidenceAdoption {
+    pub snapshot: DesktopSnapshot,
+    pub evidence_pack: ObservationEvidencePack,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct DesktopTiktokEvidenceInput {
+    tenant_id: String,
+    source_identity_digest: String,
+    observed_at: DateTime<Utc>,
+    credential_generation: u64,
+    page_size: u8,
+    page_count: u64,
+    video_count: u64,
+    evidence_root: String,
+    model_visible_content: String,
+    content_digest: String,
+}
+
+impl fmt::Debug for DesktopTiktokEvidenceInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopTiktokEvidenceInput")
+            .field("tenant_id", &self.tenant_id)
+            .field("source_identity_digest", &"[DIGEST]")
+            .field("observed_at", &self.observed_at)
+            .field("credential_generation", &self.credential_generation)
+            .field("page_size", &self.page_size)
+            .field("page_count", &self.page_count)
+            .field("video_count", &self.video_count)
+            .field("evidence_root", &"[DIGEST]")
+            .field("model_visible_content", &"[REDACTED]")
+            .field("content_digest", &"[DIGEST]")
+            .finish()
+    }
 }
 
 /// Window Open Conversation for one Mission-bound CRM identity. Person,
@@ -4098,6 +4166,167 @@ impl DesktopDataPlane {
                 && entry.mission_id == request.mission_id
                 && entry.workspace.revision == request.expected_revision
                 && entry.workspace.lease_generation == request.expected_generation
+        })
+    }
+
+    pub fn adopt_tiktok_mission_sequence_os(
+        &self,
+        request: DesktopAdoptTiktokMissionSequenceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.adopt_tiktok_mission_sequence_with(&secret_store, request, now)
+    }
+
+    /// Commit one already-closed TikTok provider sequence through Cordis and
+    /// the existing atomic Application observation boundary.
+    pub fn adopt_tiktok_mission_sequence_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopAdoptTiktokMissionSequenceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
+        let DesktopAdoptTiktokMissionSequenceRequest {
+            project_id,
+            mission_id,
+            expected_mission_revision,
+            sequence,
+        } = request;
+        if expected_mission_revision == 0 {
+            return Err(DesktopDataError::InvalidTiktokEvidenceAdoption);
+        }
+        let input = desktop_tiktok_evidence_input(&sequence, now)?;
+        self.adopt_tiktok_evidence_input_with(
+            secret_store,
+            &project_id,
+            &mission_id,
+            expected_mission_revision,
+            input,
+            now,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private seam exposes the exact replay fence to focused tests without making accepted TikTok evidence forgeable"
+    )]
+    fn adopt_tiktok_evidence_input_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        expected_mission_revision: u64,
+        input: DesktopTiktokEvidenceInput,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
+        validate_desktop_tiktok_evidence_input(&input, now)?;
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, project_id, now)?;
+        let mission = service.load_mission(project_id, mission_id)?;
+        if mission.tenant_id.as_str() != input.tenant_id {
+            return Err(DesktopDataError::InvalidTiktokEvidenceAdoption);
+        }
+        let scope = authority_scope_for_mission(&mission, project_id, mission_id)?;
+        let contract_digest = canonical_json_digest(&mission.contract)?;
+        let plan = ObservationPlanBinding {
+            plan_id: "tiktok-video-evidence-adoption".into(),
+            revision: mission.contract.version,
+            version: 1,
+            digest: contract_digest.clone(),
+        };
+        let source = ObservationSourceBinding {
+            source_id: format!("tiktok-video-list-{}", input.source_identity_digest),
+            uri: format!(
+                "tiktok-display-api://video-list/sha256/{}",
+                input.source_identity_digest
+            ),
+            revision: expected_mission_revision,
+            version: "display-api-v2".into(),
+            digest: input.source_identity_digest.clone(),
+            kind: ObservationSourceKind::Provider,
+        };
+        let observation_id = format!("tiktok-video-sequence-{}", input.evidence_root);
+        let pipeline_request = ObservationPipelineRequest {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            expected_mission_revision,
+            contract_version: mission.contract.version,
+            contract_digest,
+            plan: plan.clone(),
+            source: source.clone(),
+            observation_id: observation_id.clone(),
+        };
+        let observation = TypedRuntimeObservation {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            observation_id: observation_id.clone(),
+            plan,
+            source,
+            observed_at: input.observed_at,
+            content: input.model_visible_content,
+            content_digest: input.content_digest,
+            classification: ObservationClassification::ProviderEstimate,
+        };
+        let observation_digest = observation.observation_digest()?;
+        let adoption_digest = canonical_json_digest(&serde_json::json!({
+            "kind": "tiktok_mission_sequence",
+            "tenantId": mission.tenant_id,
+            "projectId": project_id,
+            "missionId": mission_id,
+            "currentMissionRevision": scope.mission_revision(),
+            "expectedMissionRevision": expected_mission_revision,
+            "credentialGeneration": input.credential_generation,
+            "pageSize": input.page_size,
+            "pageCount": input.page_count,
+            "videoCount": input.video_count,
+            "evidenceRoot": input.evidence_root,
+            "observationDigest": observation_digest,
+        }))?;
+        let command = DomainCommandBinding::adopt_provider_observation(
+            observation_id.clone(),
+            adoption_digest.clone(),
+        )?;
+        let facts = live_domain_kernel_facts(&service, project_id, mission_id, now)?;
+        let result = map_domain_command_dispatch_result(dispatch_live_domain_command(
+            &self.cordis,
+            DesktopDomainCommandAuthorization::new(scope.clone(), command),
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = mission_authority_scope(&service, project_id, mission_id)?;
+                if current_scope != scope
+                    || permit.scope() != &scope
+                    || permit.command().kind() != DomainCommandKind::AdoptProviderObservation
+                    || permit.command().observation_id() != Some(observation_id.as_str())
+                    || permit.command().observation_digest() != Some(adoption_digest.as_str())
+                    || permit.command().proposal_digest().is_some()
+                    || permit.command().approval_scope_digest().is_some()
+                {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                service
+                    .accept_runtime_observation(&pipeline_request, observation, now)
+                    .map_err(DesktopDataError::from)
+            },
+        ))?;
+        let ObservationPipelineResult { pack, replayed, .. } = result;
+        let product_evidence = load_product_evidence(now)?;
+        let snapshot = self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )?;
+        Ok(DesktopTiktokEvidenceAdoption {
+            snapshot,
+            evidence_pack: pack,
+            replayed,
         })
     }
 
@@ -8551,6 +8780,115 @@ fn mission_authority_scope(
     authority_scope_for_mission(&mission, project_id, mission_id)
 }
 
+fn desktop_tiktok_evidence_input(
+    sequence: &TiktokMissionAcceptedSequence,
+    now: DateTime<Utc>,
+) -> Result<DesktopTiktokEvidenceInput, DesktopDataError> {
+    sequence.validate_at(now)?;
+    if sequence.provider() != TiktokProviderId::Tiktok {
+        return Err(DesktopDataError::InvalidTiktokEvidenceAdoption);
+    }
+    let scope = sequence.scope();
+    let business_id_digest = sha256_text(scope.business().as_str());
+    let account_id_digest = sha256_text(scope.account().as_str());
+    let source_identity_digest = canonical_json_digest(&serde_json::json!({
+        "provider": "tiktok",
+        "tenantId": scope.tenant().as_str(),
+        "businessId": scope.business().as_str(),
+        "accountId": scope.account().as_str(),
+    }))?;
+    let mut videos = Vec::new();
+    for page in sequence.pages() {
+        for (position, observation) in page.observations().iter().enumerate() {
+            let TiktokReadObservation::Video(video) = observation.observation() else {
+                return Err(DesktopDataError::InvalidTiktokEvidenceAdoption);
+            };
+            videos.push(serde_json::json!({
+                "pageGeneration": page.cursor_generation(),
+                "position": position,
+                "videoId": video.identity().video_id().as_str(),
+                "observedAt": observation.freshness().observed_at(),
+                "createdAt": video.created_at(),
+                "performance": {
+                    "likeCount": video.performance().like_count(),
+                    "commentCount": video.performance().comment_count(),
+                    "shareCount": video.performance().share_count(),
+                    "viewCount": video.performance().view_count(),
+                },
+            }));
+        }
+    }
+    let page_count = u64::try_from(sequence.page_count())
+        .map_err(|_| DesktopDataError::InvalidTiktokEvidenceAdoption)?;
+    let video_count =
+        u64::try_from(videos.len()).map_err(|_| DesktopDataError::InvalidTiktokEvidenceAdoption)?;
+    let observed_at = sequence
+        .pages()
+        .last()
+        .ok_or(DesktopDataError::InvalidTiktokEvidenceAdoption)?
+        .freshness()
+        .observed_at();
+    let model_visible_content = serde_json::to_string(&serde_json::json!({
+        "schemaVersion": 1,
+        "provider": "tiktok",
+        "businessIdDigest": business_id_digest,
+        "accountIdDigest": account_id_digest,
+        "credentialGeneration": sequence.credential_generation(),
+        "pageSize": sequence.page_size(),
+        "pageCount": page_count,
+        "videoCount": video_count,
+        "evidenceRoot": sequence.evidence_root(),
+        "observedAt": observed_at,
+        "videos": videos,
+    }))
+    .map_err(|_| DesktopDataError::InvalidTiktokEvidenceAdoption)?;
+    let input = DesktopTiktokEvidenceInput {
+        tenant_id: scope.tenant().as_str().to_owned(),
+        source_identity_digest,
+        observed_at,
+        credential_generation: sequence.credential_generation(),
+        page_size: sequence.page_size(),
+        page_count,
+        video_count,
+        evidence_root: sequence.evidence_root().to_owned(),
+        content_digest: sha256_text(&model_visible_content),
+        model_visible_content,
+    };
+    validate_desktop_tiktok_evidence_input(&input, now)?;
+    Ok(input)
+}
+
+fn validate_desktop_tiktok_evidence_input(
+    input: &DesktopTiktokEvidenceInput,
+    now: DateTime<Utc>,
+) -> Result<(), DesktopDataError> {
+    if input.tenant_id.trim().is_empty()
+        || !is_canonical_sha256(&input.source_identity_digest)
+        || !is_canonical_sha256(&input.evidence_root)
+        || !is_canonical_sha256(&input.content_digest)
+        || input.content_digest != sha256_text(&input.model_visible_content)
+        || input.model_visible_content.trim().is_empty()
+        || input.credential_generation == 0
+        || !(1..=hartevo_channel_adapters::DEFAULT_VIDEO_PAGE_SIZE).contains(&input.page_size)
+        || input.page_count == 0
+        || input.observed_at > now
+    {
+        return Err(DesktopDataError::InvalidTiktokEvidenceAdoption);
+    }
+    Ok(())
+}
+
+fn canonical_json_digest<T: serde::Serialize>(value: &T) -> Result<String, DesktopDataError> {
+    serde_json::to_value(value)
+        .and_then(|value| serde_json::to_vec(&value))
+        .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
+        .map_err(|_| DesktopDataError::InvalidTiktokEvidenceAdoption)
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
 fn authority_scope_for_mission(
     mission: &Mission,
     project_id: &ProjectId,
@@ -9785,6 +10123,10 @@ pub enum DesktopDataError {
         "Browser public-source Read requires an exact Agent-held Workspace and a valid public HTTPS target"
     )]
     InvalidBrowserPublicSourceRead,
+    #[error(
+        "TikTok evidence adoption requires one exact terminal production sequence and Mission revision"
+    )]
+    InvalidTiktokEvidenceAdoption,
     #[error("Browser public-source Read requires the current Agent-held lease")]
     BrowserWorkspaceReadNotAgentHeld,
     #[error(
@@ -9881,6 +10223,10 @@ pub enum DesktopDataError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Application(#[from] ApplicationError),
+    #[error(transparent)]
+    ObservationPipeline(#[from] ObservationPipelineError),
+    #[error(transparent)]
+    Tiktok(#[from] TiktokError),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
 }
@@ -23283,6 +23629,243 @@ sleep 30"#;
         assert!(!debug.contains("provider"));
         assert!(!debug.contains("idempotency"));
         assert!(!debug.contains("payload"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused journey keeps first commit, exact replay, durable evidence, event count, and released Cordis authority together"
+    )]
+    fn tiktok_sequence_evidence_commits_once_through_cordis_and_replays_exactly() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "Adopt an exact TikTok evidence sequence",
+                now,
+            )
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before adoption");
+        let events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before adoption");
+        drop(service);
+
+        let model_visible_content = serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "tiktok",
+            "businessIdDigest": "b".repeat(64),
+            "accountIdDigest": "a".repeat(64),
+            "credentialGeneration": 4,
+            "pageSize": 20,
+            "pageCount": 2,
+            "videoCount": 2,
+            "evidenceRoot": "e".repeat(64),
+            "observedAt": now,
+            "videos": [
+                {"pageGeneration": 1, "position": 0, "videoId": "7340000000000000001"},
+                {"pageGeneration": 2, "position": 0, "videoId": "7340000000000000002"},
+            ],
+        })
+        .to_string();
+        let input = DesktopTiktokEvidenceInput {
+            tenant_id: before.tenant_id.as_str().to_owned(),
+            source_identity_digest: "c".repeat(64),
+            observed_at: now,
+            credential_generation: 4,
+            page_size: 20,
+            page_count: 2,
+            video_count: 2,
+            evidence_root: "e".repeat(64),
+            content_digest: sha256_text(&model_visible_content),
+            model_visible_content,
+        };
+
+        let adopted = plane
+            .adopt_tiktok_evidence_input_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                before.revision,
+                input.clone(),
+                now,
+            )
+            .expect("Cordis-authorized TikTok evidence adoption");
+        assert!(!adopted.replayed);
+        assert_eq!(
+            adopted.evidence_pack.classification,
+            ObservationClassification::ProviderEstimate
+        );
+        assert_eq!(
+            adopted.evidence_pack.source.kind,
+            ObservationSourceKind::Provider
+        );
+        assert_eq!(
+            adopted.evidence_pack.expected_mission_revision,
+            before.revision
+        );
+        assert_eq!(adopted.evidence_pack.mission_revision, before.revision + 1);
+        assert_eq!(
+            adopted.evidence_pack.model_visible_content,
+            input.model_visible_content
+        );
+        assert!(
+            !adopted
+                .evidence_pack
+                .model_visible_content
+                .contains("Creator")
+        );
+        assert!(
+            !adopted
+                .evidence_pack
+                .model_visible_content
+                .contains("https://")
+        );
+
+        let replay = plane
+            .adopt_tiktok_evidence_input_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                before.revision,
+                input.clone(),
+                now + Duration::seconds(1),
+            )
+            .expect("exact replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.evidence_pack, adopted.evidence_pack);
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("reopened application");
+        let after = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission after adoption");
+        assert_eq!(after.revision, before.revision + 1);
+        assert!(after.evidence.iter().any(|evidence| {
+            evidence.id == adopted.evidence_pack.evidence_id
+                && evidence.status == hartevo_domain_kernel::EvidenceStatus::Candidate
+        }));
+        let events_after = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after replay");
+        assert_eq!(events_after.len(), events_before.len() + 1);
+        assert_eq!(
+            events_after
+                .iter()
+                .filter(|event| event.event_type == "application.runtime_observation_committed")
+                .count(),
+            1
+        );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn tiktok_sequence_evidence_rejects_scope_drift_and_altered_replay() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(4);
+        let started = plane
+            .start_mission_with(&secrets, &project_id, "Reject TikTok evidence drift", now)
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before adoption");
+        let events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before adoption");
+        drop(service);
+        let content = "{\"provider\":\"tiktok\",\"videoCount\":1}".to_owned();
+        let input = DesktopTiktokEvidenceInput {
+            tenant_id: before.tenant_id.as_str().to_owned(),
+            source_identity_digest: "c".repeat(64),
+            observed_at: now,
+            credential_generation: 7,
+            page_size: 20,
+            page_count: 1,
+            video_count: 1,
+            evidence_root: "d".repeat(64),
+            content_digest: sha256_text(&content),
+            model_visible_content: content,
+        };
+
+        let mut wrong_tenant = input.clone();
+        wrong_tenant.tenant_id = "tenant-swapped".into();
+        assert!(matches!(
+            plane.adopt_tiktok_evidence_input_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                before.revision,
+                wrong_tenant,
+                now,
+            ),
+            Err(DesktopDataError::InvalidTiktokEvidenceAdoption)
+        ));
+        let adopted = plane
+            .adopt_tiktok_evidence_input_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                before.revision,
+                input.clone(),
+                now,
+            )
+            .expect("initial adoption");
+        assert!(!adopted.replayed);
+
+        let mut altered = input;
+        altered.model_visible_content = "{\"provider\":\"tiktok\",\"videoCount\":2}".into();
+        altered.content_digest = sha256_text(&altered.model_visible_content);
+        assert!(matches!(
+            plane.adopt_tiktok_evidence_input_with(
+                &secrets,
+                &project_id,
+                &mission_id,
+                before.revision,
+                altered,
+                now + Duration::seconds(1),
+            ),
+            Err(DesktopDataError::ObservationPipeline(
+                ObservationPipelineError::ReplayMismatch
+            ))
+        ));
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("reopened application");
+        assert_eq!(
+            service
+                .load_mission(&project_id, &mission_id)
+                .expect("unchanged Mission")
+                .revision,
+            before.revision + 1
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after refusals")
+                .len(),
+            events_before.len() + 1
+        );
     }
 
     #[test]
