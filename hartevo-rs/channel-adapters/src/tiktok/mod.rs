@@ -30,6 +30,7 @@ pub const VIDEO_QUERY_PATH: &str = "/video/query/";
 pub const REAL_READ_ENABLE_ENV: &str = "HARTEVO_TIKTOK_REAL_READ";
 pub const REAL_READ_SECRET_REFERENCE_ENV: &str = "HARTEVO_TIKTOK_SECRET_REFERENCE";
 pub const DEFAULT_VIDEO_PAGE_SIZE: u8 = 20;
+pub const MAX_VIDEO_SEQUENCE_PAGES: u16 = 100;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1808,6 +1809,8 @@ pub enum TiktokError {
     CursorCheckpointIncompatible,
     #[error("TikTok durable cursor has no more pages")]
     CursorExhausted,
+    #[error("TikTok video sequence did not close within {max_pages} pages")]
+    PageBudgetExhausted { max_pages: u16 },
     #[error("TikTok freshness expired: valid until {valid_until}")]
     FreshnessExpired {
         observed_at: DateTime<Utc>,

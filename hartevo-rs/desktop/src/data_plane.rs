@@ -60,7 +60,11 @@ use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
 use hartevo_channel_adapters::tiktok::ProviderId as TiktokProviderId;
-use hartevo_channel_adapters::{TiktokError, TiktokMissionAcceptedSequence, TiktokReadObservation};
+use hartevo_channel_adapters::{
+    MAX_VIDEO_SEQUENCE_PAGES, OAuthCredential, ReadOnlyTransport, TiktokApiOperation, TiktokError,
+    TiktokFreshnessPolicy, TiktokMissionAcceptedSequence, TiktokReadObservation, TiktokReadScope,
+    execute_real_read_gate,
+};
 use hartevo_context_fabric::{
     ConservativeByteBudgetTokenizer, ContextAssemblyStatus, RuntimeContextEnvelope,
 };
@@ -1489,6 +1493,36 @@ pub struct DesktopAdoptTiktokMissionSequenceRequest {
     pub mission_id: MissionId,
     pub expected_mission_revision: u64,
     pub sequence: TiktokMissionAcceptedSequence,
+}
+
+/// Read one bounded TikTok `video.list` sequence under exact Cordis authority,
+/// then atomically adopt its terminal evidence into the same Mission revision.
+/// Credential bytes are never part of this request; only an opaque reference
+/// carried by `credential` may reach the read-only provider adapter.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopReadAndAdoptTiktokMissionSequenceRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub scope: TiktokReadScope,
+    pub credential: OAuthCredential,
+    pub page_size: u8,
+    pub max_pages: u16,
+}
+
+impl fmt::Debug for DesktopReadAndAdoptTiktokMissionSequenceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopReadAndAdoptTiktokMissionSequenceRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field("scope", &"[REDACTED]")
+            .field("credential", &"[REDACTED]")
+            .field("page_size", &self.page_size)
+            .field("max_pages", &self.max_pages)
+            .finish()
+    }
 }
 
 impl fmt::Debug for DesktopAdoptTiktokMissionSequenceRequest {
@@ -4176,6 +4210,146 @@ impl DesktopDataPlane {
     ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.adopt_tiktok_mission_sequence_with(&secret_store, request, now)
+    }
+
+    /// Execute one live, read-only TikTok sequence behind an exact Cordis
+    /// permit and adopt it only after the sequence closes. Provider failure or
+    /// a concurrent Mission revision change leaves durable Mission state
+    /// untouched.
+    pub fn read_and_adopt_tiktok_mission_sequence_with<T>(
+        &self,
+        secret_store: &impl SecretStore,
+        transport: T,
+        request: DesktopReadAndAdoptTiktokMissionSequenceRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError>
+    where
+        T: ReadOnlyTransport,
+    {
+        self.read_and_adopt_tiktok_evidence_input_with(
+            secret_store,
+            request,
+            now,
+            move |credential, scope, page_size, max_pages| {
+                let mut provider =
+                    execute_real_read_gate(transport, TiktokFreshnessPolicy::default())?;
+                let sequence =
+                    provider.read_video_sequence(credential, scope, now, page_size, max_pages)?;
+                desktop_tiktok_evidence_input(&sequence, now)
+            },
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the private seam keeps request validation, exact Cordis permit checks, provider read, and atomic adoption visible in one focused boundary"
+    )]
+    fn read_and_adopt_tiktok_evidence_input_with<Read>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopReadAndAdoptTiktokMissionSequenceRequest,
+        now: DateTime<Utc>,
+        read: Read,
+    ) -> Result<DesktopTiktokEvidenceAdoption, DesktopDataError>
+    where
+        Read: FnOnce(
+            &OAuthCredential,
+            &TiktokReadScope,
+            u8,
+            u16,
+        ) -> Result<DesktopTiktokEvidenceInput, DesktopDataError>,
+    {
+        let DesktopReadAndAdoptTiktokMissionSequenceRequest {
+            project_id,
+            mission_id,
+            expected_mission_revision,
+            scope: provider_scope,
+            credential,
+            page_size,
+            max_pages,
+        } = request;
+        if expected_mission_revision == 0
+            || !(1..=hartevo_channel_adapters::DEFAULT_VIDEO_PAGE_SIZE).contains(&page_size)
+            || !(1..=MAX_VIDEO_SEQUENCE_PAGES).contains(&max_pages)
+        {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+        credential.require_for(TiktokApiOperation::VideoList, &provider_scope, now)?;
+
+        let (service, _runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        if mission.revision != expected_mission_revision
+            || mission.tenant_id.as_str() != provider_scope.tenant().as_str()
+        {
+            return Err(DesktopDataError::InvalidTiktokProviderRead);
+        }
+        let authority_scope = authority_scope_for_mission(&mission, &project_id, &mission_id)?;
+        let provider_scope_digest = canonical_json_digest(&provider_scope)?;
+        let credential_reference_digest = sha256_text(credential.secret_reference().as_str());
+        let read_digest = canonical_json_digest(&serde_json::json!({
+            "kind": "tiktok_mission_video_sequence_read",
+            "provider": "tiktok",
+            "operation": "video_list",
+            "providerScopeDigest": provider_scope_digest,
+            "credentialReferenceDigest": credential_reference_digest,
+            "credentialGeneration": credential.generation(),
+            "pageSize": page_size,
+            "maxPages": max_pages,
+        }))?;
+        let read_id = format!("tiktok-video-sequence-read-{read_digest}");
+        let command =
+            DomainCommandBinding::read_provider_observation(read_id.clone(), read_digest.clone())?;
+        let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+        let expected_source_identity_digest = canonical_json_digest(&serde_json::json!({
+            "provider": "tiktok",
+            "tenantId": provider_scope.tenant().as_str(),
+            "businessId": provider_scope.business().as_str(),
+            "accountId": provider_scope.account().as_str(),
+        }))?;
+        let input = map_domain_command_dispatch_result(dispatch_live_domain_command(
+            &self.cordis,
+            DesktopDomainCommandAuthorization::new(authority_scope.clone(), command),
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+                if current_scope != authority_scope
+                    || permit.scope() != &authority_scope
+                    || permit.command().kind() != DomainCommandKind::ReadProviderObservation
+                    || permit.command().provider_read_id() != Some(read_id.as_str())
+                    || permit.command().provider_read_digest() != Some(read_digest.as_str())
+                    || permit.command().proposal_digest().is_some()
+                    || permit.command().approval_scope_digest().is_some()
+                    || permit.command().observation_id().is_some()
+                    || permit.command().observation_digest().is_some()
+                {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                let input = read(&credential, &provider_scope, page_size, max_pages)?;
+                validate_desktop_tiktok_evidence_input(&input, now)?;
+                if input.tenant_id != mission.tenant_id.as_str()
+                    || input.source_identity_digest != expected_source_identity_digest
+                    || input.credential_generation != credential.generation()
+                    || input.page_size != page_size
+                    || input.page_count > u64::from(max_pages)
+                {
+                    return Err(DesktopDataError::InvalidTiktokProviderRead);
+                }
+                Ok(input)
+            },
+        ))?;
+        drop(service);
+        self.adopt_tiktok_evidence_input_with(
+            secret_store,
+            &project_id,
+            &mission_id,
+            expected_mission_revision,
+            input,
+            now,
+        )
     }
 
     /// Commit one already-closed TikTok provider sequence through Cordis and
@@ -10127,6 +10301,10 @@ pub enum DesktopDataError {
         "TikTok evidence adoption requires one exact terminal production sequence and Mission revision"
     )]
     InvalidTiktokEvidenceAdoption,
+    #[error(
+        "TikTok provider Read requires exact Mission scope, credential authority, page bounds, and Cordis authorization"
+    )]
+    InvalidTiktokProviderRead,
     #[error("Browser public-source Read requires the current Agent-held lease")]
     BrowserWorkspaceReadNotAgentHeld,
     #[error(
@@ -10309,6 +10487,79 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-11T10:00:00Z")
             .expect("valid fixture time")
             .with_timezone(&Utc)
+    }
+
+    fn tiktok_provider_read_request(
+        project_id: &ProjectId,
+        mission: &Mission,
+        now: DateTime<Utc>,
+    ) -> DesktopReadAndAdoptTiktokMissionSequenceRequest {
+        let scope = TiktokReadScope::new(
+            hartevo_channel_adapters::TenantId::new(mission.tenant_id.as_str()).unwrap(),
+            hartevo_channel_adapters::BusinessId::new("business-01").unwrap(),
+            hartevo_channel_adapters::TiktokAccountId::new("open01").unwrap(),
+        );
+        let credential = OAuthCredential::new(
+            hartevo_channel_adapters::SecretReference::new("keychain://tiktok/open01").unwrap(),
+            scope.clone(),
+            [hartevo_channel_adapters::TiktokOAuthScope::VideoList]
+                .into_iter()
+                .collect(),
+            now + Duration::hours(1),
+            None,
+            4,
+        )
+        .unwrap();
+        DesktopReadAndAdoptTiktokMissionSequenceRequest {
+            project_id: project_id.clone(),
+            mission_id: mission.id.clone(),
+            expected_mission_revision: mission.revision,
+            scope,
+            credential,
+            page_size: 20,
+            max_pages: 2,
+        }
+    }
+
+    fn tiktok_provider_read_evidence_input(
+        request: &DesktopReadAndAdoptTiktokMissionSequenceRequest,
+        now: DateTime<Utc>,
+    ) -> DesktopTiktokEvidenceInput {
+        let content = serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "tiktok",
+            "businessIdDigest": sha256_text(request.scope.business().as_str()),
+            "accountIdDigest": sha256_text(request.scope.account().as_str()),
+            "credentialGeneration": request.credential.generation(),
+            "pageSize": request.page_size,
+            "pageCount": 2,
+            "videoCount": 2,
+            "evidenceRoot": "e".repeat(64),
+            "observedAt": now,
+            "videos": [
+                {"pageGeneration": 1, "position": 0, "videoId": "7340000000000000001"},
+                {"pageGeneration": 2, "position": 0, "videoId": "7340000000000000002"},
+            ],
+        })
+        .to_string();
+        DesktopTiktokEvidenceInput {
+            tenant_id: request.scope.tenant().as_str().to_owned(),
+            source_identity_digest: canonical_json_digest(&serde_json::json!({
+                "provider": "tiktok",
+                "tenantId": request.scope.tenant().as_str(),
+                "businessId": request.scope.business().as_str(),
+                "accountId": request.scope.account().as_str(),
+            }))
+            .unwrap(),
+            observed_at: now,
+            credential_generation: request.credential.generation(),
+            page_size: request.page_size,
+            page_count: 2,
+            video_count: 2,
+            evidence_root: "e".repeat(64),
+            content_digest: sha256_text(&content),
+            model_visible_content: content,
+        }
     }
 
     #[derive(Clone)]
@@ -23768,6 +24019,149 @@ sleep 30"#;
                 .count(),
             1
         );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn tiktok_provider_read_request_debug_redacts_scope_and_credential() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(&secrets, &project_id, "Redact TikTok read authority", now)
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission");
+        let request = tiktok_provider_read_request(&project_id, &mission, now);
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(request.scope.business().as_str()));
+        assert!(!debug.contains(request.scope.account().as_str()));
+        assert!(!debug.contains(request.credential.secret_reference().as_str()));
+    }
+
+    #[test]
+    fn tiktok_provider_read_is_cordis_authorized_then_atomically_adopted() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "Read and adopt TikTok evidence through Cordis",
+                now,
+            )
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before read");
+        drop(service);
+        let request = tiktok_provider_read_request(&project_id, &before, now);
+        let input = tiktok_provider_read_evidence_input(&request, now);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read_calls = Arc::clone(&calls);
+
+        let adopted = plane
+            .read_and_adopt_tiktok_evidence_input_with(
+                &secrets,
+                request.clone(),
+                now,
+                move |credential, scope, page_size, max_pages| {
+                    assert_eq!(credential, &request.credential);
+                    assert_eq!(scope, &request.scope);
+                    assert_eq!((page_size, max_pages), (20, 2));
+                    read_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(input)
+                },
+            )
+            .expect("Cordis-authorized provider read and adoption");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!adopted.replayed);
+        assert_eq!(
+            adopted.evidence_pack.expected_mission_revision,
+            before.revision
+        );
+        assert_eq!(adopted.evidence_pack.mission_revision, before.revision + 1);
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("reopened application");
+        assert_eq!(
+            service
+                .load_mission(&project_id, &mission_id)
+                .expect("Mission after adoption")
+                .revision,
+            before.revision + 1
+        );
+        let cordis = plane.lock_cordis();
+        assert!(cordis.active_domain_command_scope().is_none());
+        assert!(cordis.active_runtime_scope().is_none());
+    }
+
+    #[test]
+    fn tiktok_provider_read_refuses_stale_scope_without_calling_provider_and_settles_errors() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let started = plane
+            .start_mission_with(&secrets, &project_id, "Fence TikTok provider reads", now)
+            .expect("running Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission");
+        drop(service);
+        let request = tiktok_provider_read_request(&project_id, &mission, now);
+        let mut stale = request.clone();
+        stale.expected_mission_revision += 1;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stale_calls = Arc::clone(&calls);
+        assert!(matches!(
+            plane.read_and_adopt_tiktok_evidence_input_with(
+                &secrets,
+                stale,
+                now,
+                move |_, _, _, _| {
+                    stale_calls.fetch_add(1, Ordering::SeqCst);
+                    unreachable!("stale request must fail before provider read")
+                },
+            ),
+            Err(DesktopDataError::InvalidTiktokProviderRead)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            plane.read_and_adopt_tiktok_evidence_input_with(
+                &secrets,
+                request,
+                now,
+                |_, _, _, _| Err(TiktokError::Disconnected.into()),
+            ),
+            Err(DesktopDataError::Tiktok(TiktokError::Disconnected))
+        ));
         let cordis = plane.lock_cordis();
         assert!(cordis.active_domain_command_scope().is_none());
         assert!(cordis.active_runtime_scope().is_none());

@@ -20,16 +20,16 @@ pub use identity::{
 };
 
 pub use tiktok::{
-    BusinessId, DEFAULT_VIDEO_PAGE_SIZE, EvidenceProvenance, MissionTiktokReadConsumer,
-    OAuthCredential, SecretReference, TenantId, TiktokAccountId, TiktokAccountIdentity,
-    TiktokApiOperation, TiktokAuthenticatedReadService, TiktokConnectionState, TiktokCursor,
-    TiktokCursorDisposition, TiktokCursorInvalidationReason, TiktokCursorLifecycle,
-    TiktokDisplayApiProvider, TiktokError, TiktokFreshness, TiktokFreshnessPolicy,
-    TiktokMissionAcceptedRead, TiktokMissionAcceptedSequence, TiktokOAuthScope,
-    TiktokObservationEnvelope, TiktokPageSequence, TiktokProviderResetObservation,
-    TiktokQuotaLedger, TiktokReadObservation, TiktokReadScope, TiktokRealReadGate,
-    TiktokRetryAfterReceipt, TiktokRevisionIdentity, TiktokVideoId, TiktokVideoListCursor,
-    TiktokVideoObservation, TiktokVideoPageEnvelope,
+    BusinessId, DEFAULT_VIDEO_PAGE_SIZE, EvidenceProvenance, MAX_VIDEO_SEQUENCE_PAGES,
+    MissionTiktokReadConsumer, OAuthCredential, SecretReference, TenantId, TiktokAccountId,
+    TiktokAccountIdentity, TiktokApiOperation, TiktokAuthenticatedReadService,
+    TiktokConnectionState, TiktokCursor, TiktokCursorDisposition, TiktokCursorInvalidationReason,
+    TiktokCursorLifecycle, TiktokDisplayApiProvider, TiktokError, TiktokFreshness,
+    TiktokFreshnessPolicy, TiktokMissionAcceptedRead, TiktokMissionAcceptedSequence,
+    TiktokOAuthScope, TiktokObservationEnvelope, TiktokPageSequence,
+    TiktokProviderResetObservation, TiktokQuotaLedger, TiktokReadObservation, TiktokReadScope,
+    TiktokRealReadGate, TiktokRetryAfterReceipt, TiktokRevisionIdentity, TiktokVideoId,
+    TiktokVideoListCursor, TiktokVideoObservation, TiktokVideoPageEnvelope, execute_real_read_gate,
 };
 pub use transport::{
     AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderKind,
