@@ -12064,7 +12064,7 @@ sleep 30"#
     }
 
     #[cfg(target_os = "macos")]
-    fn native_deepseek_browser_read_mission_source(
+    fn native_deepseek_sequential_browser_reads_mission_source(
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
     ) -> DesktopRuntimeSource {
@@ -12076,7 +12076,7 @@ sleep 30"#
                         "delta": {
                             "tool_calls": [{
                                 "index": 0,
-                                "id": "desktop-mission-browser-read-call",
+                                "id": "desktop-mission-browser-read-first-call",
                                 "function": {
                                     "name": hartevo_cordis::RUNTIME_BROWSER_READ_TOOL_NAME,
                                     "arguments": r#"{"url":"https://example.com/research"}"#,
@@ -12091,7 +12091,25 @@ sleep 30"#
                 "desktop-mission-browser-read-2",
                 &serde_json::json!({
                     "choices": [{
-                        "delta": {"content": "Draft grounded in one bounded Browser observation."},
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "desktop-mission-browser-read-second-call",
+                                "function": {
+                                    "name": hartevo_cordis::RUNTIME_BROWSER_READ_TOOL_NAME,
+                                    "arguments": r#"{"url":"https://example.org/comparison"}"#,
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                }),
+            ),
+            native_mission_deepseek_response(
+                "desktop-mission-browser-read-3",
+                &serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": "Draft grounded in two sequential Browser observations."},
                         "finish_reason": "stop",
                     }],
                 }),
@@ -23993,15 +24011,16 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one focused Desktop journey proves request-scoped Cordis tool exposure, exact Browser execution, content-free return, and draft adoption together"
+        reason = "one focused Desktop journey proves sequential exact Browser execution, ordered content-free returns, and draft adoption together"
     )]
-    fn cordis_native_deepseek_reads_one_public_source_before_draft_adoption() {
+    fn cordis_native_deepseek_reads_public_sources_sequentially_before_draft_adoption() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let now = observed_at() + Duration::minutes(6);
         let mut mission_request = catalog_runtime_request(&project_id);
         mission_request.title = Some("Cordis Browser-read Mission".into());
         mission_request.goal =
-            "Read one public source through the active Desktop Browser before drafting".into();
+            "Read two public sources sequentially through the active Desktop Browser before drafting"
+                .into();
         let started = plane
             .start_catalog_mission_execution_with(&secrets, mission_request, now)
             .expect("Catalog Mission");
@@ -24080,7 +24099,7 @@ sleep 30"#;
                 &secrets,
                 &project_id,
                 &mission_id,
-                Some(native_deepseek_browser_read_mission_source(
+                Some(native_deepseek_sequential_browser_reads_mission_source(
                     Arc::clone(&provider_calls),
                     Arc::clone(&provider_requests),
                 )),
@@ -24092,12 +24111,12 @@ sleep 30"#;
             submission.runtime_outcome,
             DesktopMissionRuntimeOutcome::DraftReady { .. }
         ));
-        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(navigation_count.load(Ordering::SeqCst), 1);
-        assert_eq!(observation_count.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(navigation_count.load(Ordering::SeqCst), 2);
+        assert_eq!(observation_count.load(Ordering::SeqCst), 2);
 
         let requests = provider_requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let browser_tool = requests[0]["tools"]
             .as_array()
             .expect("request-scoped tools")
@@ -24112,31 +24131,73 @@ sleep 30"#;
             browser_tool["function"]["parameters"]["additionalProperties"],
             false
         );
-        let tool_output = requests[1]["messages"]
+        let first_tool_output = requests[1]["messages"]
             .as_array()
             .expect("continuation messages")
             .iter()
             .find(|message| {
                 message["role"] == "tool"
-                    && message["tool_call_id"] == "desktop-mission-browser-read-call"
+                    && message["tool_call_id"] == "desktop-mission-browser-read-first-call"
             })
             .and_then(|message| message["content"].as_str())
-            .expect("Browser observation tool result");
-        let observation: BrowserPublicSourceObservation =
-            serde_json::from_str(tool_output).expect("typed Browser observation");
-        assert_eq!(observation.workspace_id, workspace.id);
+            .expect("first Browser observation tool result");
+        let first_observation: BrowserPublicSourceObservation =
+            serde_json::from_str(first_tool_output).expect("first typed Browser observation");
+        assert_eq!(first_observation.workspace_id, workspace.id);
         assert_eq!(
-            observation.expected_mission_revision,
+            first_observation.expected_mission_revision,
             mission_revision_before_read
         );
         assert_eq!(
-            observation.mission_revision,
+            first_observation.mission_revision,
             mission_revision_before_read + 1
         );
-        assert!(observation.script_execution_disabled);
-        assert!(!observation.business_verified);
-        assert!(!tool_output.contains("example.com"));
-        assert!(!tool_output.contains("desktop-mission-secret"));
+        assert!(first_observation.script_execution_disabled);
+        assert!(!first_observation.business_verified);
+
+        let final_messages = requests[2]["messages"]
+            .as_array()
+            .expect("final provider messages");
+        let first_result_index = final_messages
+            .iter()
+            .position(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "desktop-mission-browser-read-first-call"
+            })
+            .expect("first Browser result retained");
+        let second_result_index = final_messages
+            .iter()
+            .position(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "desktop-mission-browser-read-second-call"
+            })
+            .expect("second Browser result retained");
+        assert!(first_result_index < second_result_index);
+        let second_tool_output = final_messages[second_result_index]["content"]
+            .as_str()
+            .expect("second Browser observation tool result");
+        let second_observation: BrowserPublicSourceObservation =
+            serde_json::from_str(second_tool_output).expect("second typed Browser observation");
+        assert_eq!(second_observation.workspace_id, workspace.id);
+        assert_eq!(
+            second_observation.expected_mission_revision,
+            first_observation.mission_revision
+        );
+        assert_eq!(
+            second_observation.mission_revision,
+            mission_revision_before_read + 2
+        );
+        assert_ne!(
+            first_observation.observation_digest,
+            second_observation.observation_digest
+        );
+        assert!(second_observation.script_execution_disabled);
+        assert!(!second_observation.business_verified);
+        for tool_output in [first_tool_output, second_tool_output] {
+            assert!(!tool_output.contains("example.com"));
+            assert!(!tool_output.contains("example.org"));
+            assert!(!tool_output.contains("desktop-mission-secret"));
+        }
         drop(requests);
 
         plane.with_cordis_host(|host| {
@@ -24158,11 +24219,23 @@ sleep 30"#;
             service
                 .load_latest_browser_public_source_observation(&project_id, &mission_id)
                 .expect("durable Browser observation"),
-            Some(observation)
+            Some(second_observation.clone())
         );
         let mission = service
             .load_mission(&project_id, &mission_id)
             .expect("adopted Mission");
+        assert!(
+            mission
+                .evidence
+                .iter()
+                .any(|evidence| evidence.id == first_observation.evidence_id)
+        );
+        assert!(
+            mission
+                .evidence
+                .iter()
+                .any(|evidence| evidence.id == second_observation.evidence_id)
+        );
         assert_eq!(mission.work_products.len(), 1);
         assert!(mission.effects.is_empty());
     }

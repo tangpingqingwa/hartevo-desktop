@@ -368,7 +368,7 @@ fn browser_read_is_exact_mutually_exclusive_drop_safe_and_teardown_revoked() {
 }
 
 #[test]
-fn runtime_browser_read_is_one_shot_exact_and_parent_revoked() {
+fn runtime_browser_reads_are_sequential_exact_and_parent_revoked() {
     let mut host = CordisHost::boot(false).unwrap();
     let runtime = runtime_scope("project-a", "mission-a", 3, 2, 'a');
     host.bind_domain_kernel_scope(
@@ -398,12 +398,43 @@ fn runtime_browser_read_is_one_shot_exact_and_parent_revoked() {
     let child = authority
         .authorize_browser_read(&mission, browser_read("workspace-a"))
         .unwrap();
+    assert_eq!(
+        same_parent
+            .authorize_browser_read(&mission, browser_read("workspace-b"))
+            .unwrap_err(),
+        CordisError::BrowserReadDispatchBusy
+    );
     authority.complete_browser_read(child, 4).unwrap();
     let advanced = domain_scope("project-a", "mission-a", 4);
     assert_eq!(runtime_permit.current_mission_scope().unwrap(), advanced);
     assert_eq!(
         same_parent
-            .authorize_browser_read(&advanced, browser_read("workspace-b"))
+            .authorize_browser_read(&mission, browser_read("workspace-b"))
+            .unwrap_err(),
+        CordisError::AuthorityScopeMismatch
+    );
+    let second = same_parent
+        .authorize_browser_read(&advanced, browser_read("workspace-b"))
+        .unwrap();
+    assert_eq!(
+        authority
+            .authorize_browser_read(&advanced, browser_read("workspace-c"))
+            .unwrap_err(),
+        CordisError::BrowserReadDispatchBusy
+    );
+    same_parent.complete_browser_read(second, 5).unwrap();
+    let twice_advanced = domain_scope("project-a", "mission-a", 5);
+    assert_eq!(
+        runtime_permit.current_mission_scope().unwrap(),
+        twice_advanced
+    );
+    let abandoned = authority
+        .authorize_browser_read(&twice_advanced, browser_read("workspace-c"))
+        .unwrap();
+    drop(abandoned);
+    assert_eq!(
+        same_parent
+            .authorize_browser_read(&twice_advanced, browser_read("workspace-d"))
             .unwrap_err(),
         CordisError::BrowserReadDispatchBusy
     );
@@ -414,7 +445,7 @@ fn runtime_browser_read_is_one_shot_exact_and_parent_revoked() {
         .unwrap();
     assert_eq!(
         authority
-            .authorize_browser_read(&advanced, browser_read("workspace-c"))
+            .authorize_browser_read(&twice_advanced, browser_read("workspace-e"))
             .unwrap_err(),
         CordisError::RuntimePermitMismatch
     );

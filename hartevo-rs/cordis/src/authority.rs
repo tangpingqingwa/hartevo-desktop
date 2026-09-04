@@ -731,9 +731,10 @@ impl fmt::Debug for BrowserReadLease {
 /// One request-scoped Browser-read capability subordinate to a live Runtime.
 ///
 /// Clones are deliberately omitted. Multiple handles derived from the parent
-/// permit still share the same one-shot state, so callers cannot widen the
-/// single-read boundary. Raw URLs, Browser handles, and persistence state stay
-/// in the Desktop callback.
+/// permit share one serial coordinator: only one exact read may be active, and
+/// the next read can be issued only after the prior durable observation advances
+/// the tracked Mission revision. Raw URLs, Browser handles, and persistence
+/// state stay in the Desktop callback.
 pub struct RuntimeBrowserReadAuthority {
     scope: AuthorityScope,
     runtime_lease: Arc<RuntimeDispatchLease>,
@@ -743,7 +744,7 @@ pub struct RuntimeBrowserReadAuthority {
 #[derive(Debug)]
 struct RuntimeBrowserReadState {
     mission_revision: u64,
-    issued: bool,
+    next_serial: u64,
     active: Option<ActiveRuntimeBrowserRead>,
 }
 
@@ -756,7 +757,7 @@ struct ActiveRuntimeBrowserRead {
 }
 
 impl RuntimeBrowserReadAuthority {
-    /// Issue the only Browser read permitted inside this Runtime operation.
+    /// Issue the next exclusive Browser read inside this Runtime operation.
     pub fn authorize_browser_read(
         &self,
         scope: &AuthorityScope,
@@ -775,12 +776,15 @@ impl RuntimeBrowserReadAuthority {
         if *scope != self.scope.mission_scope_at(state.mission_revision) {
             return Err(CordisError::AuthorityScopeMismatch);
         }
-        if state.issued {
+        if state.active.is_some() {
             return Err(CordisError::BrowserReadDispatchBusy);
         }
-        let serial = 1;
+        let serial = state
+            .next_serial
+            .checked_add(1)
+            .ok_or(CordisError::BrowserReadSerialOverflow)?;
         let (permit, lease) = BrowserReadPermit::issue(serial, scope.clone(), binding.clone());
-        state.issued = true;
+        state.next_serial = serial;
         state.active = Some(ActiveRuntimeBrowserRead {
             serial,
             scope: scope.clone(),
@@ -1357,7 +1361,7 @@ impl RuntimeDispatchPermit {
         ));
         let browser_read = Arc::new(Mutex::new(RuntimeBrowserReadState {
             mission_revision: scope.mission_revision(),
-            issued: false,
+            next_serial: 0,
             active: None,
         }));
         (
@@ -1418,7 +1422,8 @@ impl RuntimeDispatchPermit {
     }
 
     /// Derive a Runtime-child Browser capability only after this exact Agent
-    /// publication is live. Every derived handle shares one one-shot state.
+    /// publication is live. Every derived handle shares one exclusive serial
+    /// coordinator and the exact Mission revision advanced by prior reads.
     pub fn browser_read_authority(&self) -> Result<RuntimeBrowserReadAuthority, CordisError> {
         if !self.has_live_publication() {
             return Err(CordisError::RuntimePermitMismatch);
