@@ -142,7 +142,7 @@ pub use logger::{
 };
 pub use registry::{
     LifecycleContextView, LifecycleEventDispatcher, LifecycleHandle, LifecycleProviderHandle,
-    LifecycleRegistry,
+    LifecycleRegistry, SupervisorExitHandle, SupervisorExitSnapshot,
 };
 pub use retry::{LLM_RETRY_KEYS, LlmRetry};
 pub use sandbox::{
