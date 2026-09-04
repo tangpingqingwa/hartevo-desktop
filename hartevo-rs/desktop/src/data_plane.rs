@@ -15171,10 +15171,12 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves both VM-00 local Project checkpoints, zero Runtime construction, SQLCipher durability, and content-free evidence after cold reopen"
+        reason = "one Desktop Journey proves all three VM-00 local Project checkpoints, exact Device context access, zero Runtime construction, SQLCipher durability, and content-free evidence after cold reopen"
     )]
-    fn vm00_local_identity_and_inventory_survive_encrypted_desktop_reopen_without_runtime() {
+    fn vm00_local_identity_inventory_and_encryption_survive_encrypted_desktop_reopen_without_runtime()
+     {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let device_id = plane.device_id.clone();
         let private_goal = "PRIVATE-VM00-DESKTOP::resume only this encrypted local project";
         let submission = plane
             .start_catalog_mission_and_run_with(
@@ -15285,8 +15287,50 @@ sleep 30"#;
             Some("encryption_workspace_ready")
         );
         assert_eq!(
-            projected.current_checkpoint_application_handler_status,
-            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+            (
+                projected.current_checkpoint_application_handler_status,
+                projected
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm00.local-encryption-workspace-ready/v1"),
+            )
+        );
+        assert!(plane.with_cordis_host(|host| host.bound_scope().is_none()));
+
+        let encryption_submission = plane
+            .advance_application_checkpoint_before_runtime(
+                &mut service,
+                &secrets,
+                &runtime_reconciliation,
+                &project_id,
+                &submission.mission_id,
+                observed_at() + Duration::minutes(5),
+            )
+            .expect("Desktop encryption workspace readiness dispatch")
+            .expect("Application-owned encryption workspace readiness submission");
+        assert_eq!(
+            encryption_submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "entitlement_and_wallet".into(),
+                capability_id: "billing.checkout".into(),
+                executor: MissionCheckpointExecutor::EffectBroker,
+                oracle_ids: BTreeSet::from(["effect".into(), "operating_state".into()]),
+                completion_policy: MissionCheckpointCompletionPolicy::VerifiedEffect,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let projected = encryption_submission.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("VM-00 Desktop encryption projection");
+        assert_eq!(projected.completed_checkpoint_count, 3);
+        assert_eq!(
+            projected.current_checkpoint_id.as_deref(),
+            Some("entitlement_and_wallet")
         );
         assert!(plane.with_cordis_host(|host| host.bound_scope().is_none()));
         drop(service);
@@ -15348,6 +15392,34 @@ sleep 30"#;
                 .iter()
                 .any(|source| source.source_kind == "project_inventory")
         );
+        let encryption_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "encryption_workspace_ready")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable encryption workspace readiness completion");
+        let encryption_evidence = encryption_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable encryption workspace readiness evidence");
+        assert_eq!(
+            encryption_evidence.handler_id,
+            "vm00.local-encryption-workspace-ready/v1"
+        );
+        assert!(
+            encryption_evidence
+                .sources
+                .iter()
+                .any(|source| source.source_kind == "project_keyring")
+        );
+        let evidence_json =
+            serde_json::to_string(encryption_evidence).expect("encryption evidence JSON");
+        assert!(!evidence_json.contains(device_id.as_str()));
         let event_json = serde_json::to_string(
             &service
                 .mission_events(&project_id, &submission.mission_id)
@@ -15356,6 +15428,8 @@ sleep 30"#;
         .expect("event JSON");
         assert!(event_json.contains("vm00.local-project-identity/v1"));
         assert!(event_json.contains("vm00.local-project-inventory/v1"));
+        assert!(event_json.contains("vm00.local-encryption-workspace-ready/v1"));
+        assert!(!event_json.contains(device_id.as_str()));
         assert!(!event_json.contains(private_goal));
         drop(directory);
     }

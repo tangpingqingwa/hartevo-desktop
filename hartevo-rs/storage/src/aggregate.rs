@@ -41,6 +41,7 @@ pub struct AtomicMutation {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ApplicationSourceKind {
     Project,
+    ProjectKeyring,
     Mission,
     Connection,
     IdentityLink,
@@ -411,6 +412,9 @@ pub(crate) fn require_application_source_fence(
         ApplicationSourceKind::Project => {
             "SELECT tenant_id, revision FROM projects WHERE id = ?1 AND id = ?2"
         }
+        ApplicationSourceKind::ProjectKeyring => {
+            "SELECT tenant_id, revision FROM project_keyrings WHERE project_id = ?1 AND project_id = ?2"
+        }
         ApplicationSourceKind::Mission => {
             "SELECT tenant_id, revision FROM missions WHERE project_id = ?1 AND id = ?2"
         }
@@ -466,6 +470,7 @@ pub(crate) fn require_application_source_fence(
 pub(crate) const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
     match kind {
         ApplicationSourceKind::Project => "project",
+        ApplicationSourceKind::ProjectKeyring => "project_keyring",
         ApplicationSourceKind::Mission => "mission",
         ApplicationSourceKind::Connection => "connection",
         ApplicationSourceKind::IdentityLink => "identity_link",
@@ -742,6 +747,20 @@ mod tests {
         store
             .create_company(&company, "company.created", &serde_json::json!({}), now())
             .expect("persist company");
+        store
+            .connection
+            .execute(
+                "INSERT INTO project_keyrings
+                   (tenant_id, project_id, mode, active_key_version, remote_execution_opt_in,
+                    rotation_required, revision, created_at, updated_at)
+                 VALUES (?1, ?2, 'team_envelope', 1, 0, 0, 2, ?3, ?3)",
+                params![
+                    project.tenant_id.as_str(),
+                    project.id.as_str(),
+                    now().to_rfc3339(),
+                ],
+            )
+            .expect("persist source-fence keyring revision");
 
         let mut candidate = mission.clone();
         candidate.revision += 1;
@@ -789,6 +808,34 @@ mod tests {
             store
                 .events_for_mission(&project.id, &mission.id)
                 .expect("events after stale project conflict")
+                .len(),
+            event_count
+        );
+        assert!(matches!(
+            store.update_mission_atomic_with_application_source_fences(
+                &candidate,
+                mission.revision,
+                None,
+                &[ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::ProjectKeyring,
+                    project.id.to_string(),
+                    1,
+                )],
+                &[PendingEvent::new(
+                    "test.stale_project_keyring_must_rollback",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            ),
+            Err(StorageError::OptimisticConflict {
+                aggregate,
+                expected_revision: 1,
+            }) if aggregate == "project_keyring_source_fence"
+        ));
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &mission.id)
+                .expect("events after stale ProjectKeyring conflict")
                 .len(),
             event_count
         );
@@ -949,6 +996,11 @@ mod tests {
                         ApplicationSourceKind::Project,
                         revised_project.id.to_string(),
                         revised_project.revision,
+                    ),
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::ProjectKeyring,
+                        revised_project.id.to_string(),
+                        2,
                     ),
                     ApplicationSourceRevisionFence::present(
                         ApplicationSourceKind::Company,
