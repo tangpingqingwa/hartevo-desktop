@@ -329,6 +329,7 @@ mod tests {
                 active_key_version: 1,
                 keyring_revision: 1,
             },
+            browser_profiles: Vec::new(),
             missions: vec![mission.clone()],
         };
         (project, mission)

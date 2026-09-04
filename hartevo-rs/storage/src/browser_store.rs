@@ -111,6 +111,27 @@ impl ProjectStore {
         })
     }
 
+    /// Returns the Project's Browser Profiles by stable id. Every record is
+    /// reloaded through the existing full projection-integrity checks.
+    pub fn list_browser_profiles(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<BrowserProfile>, StorageError> {
+        self.load_project(project_id)?;
+        let profile_ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM browser_profiles WHERE project_id = ?1 ORDER BY id")?;
+            statement
+                .query_map([project_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        profile_ids
+            .into_iter()
+            .map(|id| self.load_browser_profile(project_id, &BrowserProfileId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_browser_workspace_atomic(
         &mut self,
         workspace: &BrowserWorkspace,
@@ -1107,6 +1128,46 @@ mod tests {
         assert!(!audit_payloads.contains("fixture-provider"));
         assert!(!audit_payloads.contains("lease-browser-storage-1"));
         assert!(audit_payloads.contains(&fixture.profile.digest().expect("profile digest")));
+    }
+
+    #[test]
+    fn profile_inventory_is_project_scoped_and_integrity_checked() {
+        let mut fixture = fixture();
+        fixture
+            .store
+            .create_browser_profile_atomic(&fixture.profile)
+            .expect("profile");
+
+        assert_eq!(
+            fixture
+                .store
+                .list_browser_profiles(&fixture.profile.project_id)
+                .expect("profile inventory"),
+            vec![fixture.profile.clone()]
+        );
+
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE browser_profiles SET identity_digest = ?3
+                 WHERE project_id = ?1 AND id = ?2",
+                params![
+                    fixture.profile.project_id.as_str(),
+                    fixture.profile.id.as_str(),
+                    sha('9')
+                ],
+            )
+            .expect("tamper profile projection");
+        assert!(matches!(
+            fixture
+                .store
+                .list_browser_profiles(&fixture.profile.project_id),
+            Err(StorageError::ImmutableRecordMismatch {
+                kind: "browser profile projection",
+                ..
+            })
+        ));
     }
 
     #[test]

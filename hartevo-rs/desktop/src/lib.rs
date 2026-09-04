@@ -6288,6 +6288,7 @@ fn AgentOperationsWorkbench(
                         span { class: format!("operations-status {}", projection.browser.status.tone()), "{projection.browser.status.code()}" }
                     }
                     div { class: "operations-definition-grid",
+                        div { small { "Active profiles" } strong { "{projection.browser.active_profile_count}" } }
                         div { small { "Identity" } strong { "{projection.browser.identity}" } }
                         div { small { "Control owner" } strong { "{projection.browser.control_owner}" } }
                         div { small { "Next action" } strong { "{projection.browser.next_action}" } }

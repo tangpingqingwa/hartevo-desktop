@@ -44,10 +44,11 @@ use chrono::{DateTime, Duration, Utc};
 use hartevo_browser_adapter::{
     BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost,
     BrowserControlState, BrowserError, BrowserFileGrant, BrowserFileType, BrowserIdentity,
-    BrowserLeaseProof, BrowserLocatorResolution, BrowserProfile, BrowserRecipeActivation,
-    BrowserRecipeCandidate, BrowserRecipePreparedPlan, BrowserRecipeRelease,
-    BrowserRecipeResolvedAction, BrowserWorkspace, FileBroker, FileBrokerReconciliation,
-    FileSafetyScanner, FileUploadHandle, TrustedBrowserRecipeKey,
+    BrowserLeaseProof, BrowserLocatorResolution, BrowserProfile, BrowserProfileSource,
+    BrowserProfileStatus, BrowserRecipeActivation, BrowserRecipeCandidate,
+    BrowserRecipePreparedPlan, BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace,
+    FileBroker, FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle,
+    TrustedBrowserRecipeKey,
 };
 use hartevo_catalog::{CapabilityManifest, Catalog, CatalogError, MissionManifest};
 use hartevo_cloud_storage::{
@@ -5018,6 +5019,21 @@ pub struct BrowserWorkspaceProjection {
     pub lease_generation: u64,
 }
 
+/// Content-free Browser Profile facts for Desktop readiness. Credential
+/// references, provider/account identifiers, and revocation evidence stay
+/// inside the encrypted Browser Profile record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserProfileProjection {
+    pub profile_id: BrowserProfileId,
+    pub source: BrowserProfileSource,
+    pub status: BrowserProfileStatus,
+    pub identity_digest: String,
+    pub probe_digest: String,
+    pub identity_observed_at: DateTime<Utc>,
+    pub revision: u64,
+}
+
 /// Exact decision material shown by Desktop for VM-11. The review and both
 /// digests are read back from SQLCipher; callers cannot reconstruct them from
 /// prose or substitute a newer ledger snapshot when submitting the decision.
@@ -5119,6 +5135,8 @@ pub struct DesktopProjectProjection {
     pub revision: u64,
     pub workspace_root_count: usize,
     pub encryption: ProjectEncryptionReadiness,
+    #[serde(default)]
+    pub browser_profiles: Vec<BrowserProfileProjection>,
     pub missions: Vec<MissionProjection>,
 }
 
@@ -19098,6 +19116,20 @@ impl ApplicationService {
                     mission_projection(&self.store, mission, WorkSurface::Orchestrator, false)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let browser_profiles = self
+                .store
+                .list_browser_profiles(&project.id)?
+                .into_iter()
+                .map(|profile| BrowserProfileProjection {
+                    profile_id: profile.id,
+                    source: profile.source,
+                    status: profile.status,
+                    identity_digest: profile.identity.identity_digest,
+                    probe_digest: profile.identity.probe_digest,
+                    identity_observed_at: profile.identity.observed_at,
+                    revision: profile.revision,
+                })
+                .collect();
             projects.push(DesktopProjectProjection {
                 tenant_id: project.tenant_id,
                 project_id: project.id,
@@ -19108,6 +19140,7 @@ impl ApplicationService {
                 revision: project.revision,
                 workspace_root_count: project.workspace_roots.len(),
                 encryption,
+                browser_profiles,
                 missions,
             });
         }
@@ -32950,7 +32983,6 @@ sleep 30"#
                 now(),
             )
             .expect("team encryption");
-
         let inventory = service.desktop_inventory().expect("desktop inventory");
         assert_eq!(inventory.projects.len(), 2);
         assert_eq!(inventory.projects[0].project_id, project_a);
@@ -32960,6 +32992,7 @@ sleep 30"#
         );
         let ready = &inventory.projects[1];
         assert_eq!(ready.project_id, project_b);
+        assert!(ready.browser_profiles.is_empty());
         assert_eq!(ready.missions.len(), 1);
         assert!(ready.missions[0].title.is_empty());
         assert!(ready.missions[0].goal.is_empty());
@@ -32973,7 +33006,6 @@ sleep 30"#
                 keyring_revision: 1,
             }
         ));
-
         let unlocked = service
             .desktop_unlocked_project(&secrets, &project_b, &device_id, now())
             .expect("device-unlocked project");
@@ -32985,6 +33017,57 @@ sleep 30"#
         );
         assert!(unlocked.missions[0].creator_work.is_none());
         assert!(unlocked.missions[0].relationship_conversation.is_none());
+    }
+
+    #[test]
+    fn desktop_browser_profile_inventory_is_content_free() {
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        let workspace = tempfile::tempdir().expect("workspace");
+        let project_id = ProjectId::from("desktop-browser-profile-project");
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("desktop-browser-profile-tenant"),
+                    id: project_id.clone(),
+                    name: "Browser Profile project".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalExisting,
+                },
+                now(),
+            )
+            .expect("project");
+        service
+            .create_managed_browser_profile(
+                CreateManagedBrowserProfile {
+                    id: BrowserProfileId::from("desktop-profile"),
+                    project_id,
+                    credential_reference: "keychain://PRIVATE-DESKTOP-CREDENTIAL/profile".into(),
+                    provider: "private-desktop-provider".into(),
+                    account_id: AccountId::from("private-desktop-account"),
+                    identity_digest: "1".repeat(64),
+                    probe_digest: "2".repeat(64),
+                },
+                now(),
+            )
+            .expect("browser profile");
+
+        let inventory = service.desktop_inventory().expect("desktop inventory");
+        let profiles = &inventory.projects[0].browser_profiles;
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].profile_id,
+            BrowserProfileId::from("desktop-profile")
+        );
+        assert_eq!(profiles[0].source, BrowserProfileSource::Managed);
+        assert_eq!(profiles[0].status, BrowserProfileStatus::Active);
+        assert_eq!(profiles[0].identity_digest, "1".repeat(64));
+        assert_eq!(profiles[0].probe_digest, "2".repeat(64));
+
+        let serialized = serde_json::to_string(&inventory).expect("serialize desktop inventory");
+        assert!(!serialized.contains("PRIVATE-DESKTOP-CREDENTIAL"));
+        assert!(!serialized.contains("private-desktop-provider"));
+        assert!(!serialized.contains("private-desktop-account"));
     }
 
     #[test]
