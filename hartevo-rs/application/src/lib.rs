@@ -3534,6 +3534,9 @@ const VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID: &str =
 const VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID: &str = "vm00.local-mission-handoff/v1";
 const VM01_WORK_QUEUE_HANDLER_ID: &str = "vm01.work-queue/v1";
 const VM01_RANKING_TRAFFIC_REVIEW_HANDLER_ID: &str = "vm01.ranking-traffic-review/v1";
+const VM01_NEXT_CYCLE_HANDLER_ID: &str = "vm01.next-cycle/v1";
+const VM01_NEXT_CYCLE_OUTCOME_SUMMARY: &str =
+    "VM-01 ranking and traffic review accepted for the next scheduled cycle";
 const VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID: &str = "vm04.account-scope-probe/v1";
 const VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID: &str = "vm04.engagement-referral-review/v1";
 const VM04_CHANNEL_REBALANCE_HANDLER_ID: &str = "vm04.channel-rebalance/v1";
@@ -3558,6 +3561,7 @@ enum CompiledApplicationCheckpointHandler {
     LocalMissionHandoff,
     Vm01WorkQueue,
     Vm01RankingTrafficReview,
+    Vm01NextCycle,
     Vm04AccountScopeProbe,
     Vm04EngagementReferralReview,
     Vm04ChannelRebalance,
@@ -3584,6 +3588,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::LocalMissionHandoff => VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID,
             Self::Vm01WorkQueue => VM01_WORK_QUEUE_HANDLER_ID,
             Self::Vm01RankingTrafficReview => VM01_RANKING_TRAFFIC_REVIEW_HANDLER_ID,
+            Self::Vm01NextCycle => VM01_NEXT_CYCLE_HANDLER_ID,
             Self::Vm04AccountScopeProbe => VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID,
             Self::Vm04EngagementReferralReview => VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID,
             Self::Vm04ChannelRebalance => VM04_CHANNEL_REBALANCE_HANDLER_ID,
@@ -3608,6 +3613,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::LocalMissionHandoff => "mission_handoff",
             Self::Vm01WorkQueue => "seo_work_queue",
             Self::Vm01RankingTrafficReview => "url_link_readback",
+            Self::Vm01NextCycle => "ranking_traffic_review",
             Self::Vm04AccountScopeProbe => "account_scope",
             Self::Vm04EngagementReferralReview => "provider_readback",
             Self::Vm04ChannelRebalance => "channel_rebalance",
@@ -3890,6 +3896,7 @@ fn compiled_application_checkpoint_handler(
         VM01_RANKING_TRAFFIC_REVIEW_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview)
         }
+        VM01_NEXT_CYCLE_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::Vm01NextCycle),
         VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe)
         }
@@ -5386,6 +5393,204 @@ fn vm01_ranking_traffic_review_application_evidence(
     Ok((
         evidence,
         source_revision,
+        vec![ApplicationSourceRevisionFence::present(
+            ApplicationSourceKind::Mission,
+            mission.id.to_string(),
+            command.expected_mission_revision,
+        )],
+    ))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the proof keeps the exact ranking predecessor, current contract, deterministic Continue decision, and next-cycle number visible at one atomic scheduling boundary"
+)]
+fn vm01_next_cycle_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<
+    (
+        MissionCheckpointApplicationEvidence,
+        u64,
+        Vec<ApplicationSourceRevisionFence>,
+    ),
+    ApplicationError,
+> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let catalog_digest = Catalog::load()?.snapshot()?.digest;
+    let checkpoint_index = definition
+        .checkpoints
+        .iter()
+        .position(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = &definition.checkpoints[checkpoint_index];
+    let ranking_checkpoint = checkpoint_index
+        .checked_sub(1)
+        .and_then(|index| definition.checkpoints.get(index))
+        .filter(|checkpoint| checkpoint.id == "ranking_traffic_review")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let ranking_route = ranking_checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let ranking_completion = ranking_checkpoint
+        .completion
+        .as_ref()
+        .filter(|_| ranking_checkpoint.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let ranking_evidence = ranking_completion
+        .application_evidence
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let expected_oracles = BTreeSet::from([
+        "decision".into(),
+        "goal".into(),
+        "operating_state".into(),
+        "outcome".into(),
+    ]);
+    let expected_ranking_oracles = BTreeSet::from([
+        "decision".into(),
+        "operating_state".into(),
+        "outcome".into(),
+        "truth".into(),
+    ]);
+    let next_cycle = definition
+        .cycle
+        .checked_add(1)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let expected_cycle = u64::try_from(mission.outcome_history.len())
+        .ok()
+        .and_then(|value| value.checked_add(1));
+    if definition.manifest_id != "VM-01"
+        || definition.manifest_version != 3
+        || definition.catalog_digest != catalog_digest
+        || definition.operating_mode != mission.contract.mode
+        || definition.capability_ids != mission.contract.enabled_capabilities
+        || mission.contract.mode != OperatingMode::ContinuousOperator
+        || mission.contract.parent_mission_id.is_some()
+        || checkpoint_index + 1 != definition.checkpoints.len()
+        || checkpoint.id != "next_cycle"
+        || checkpoint.status != MissionCheckpointStatus::Verifying
+        || route.capability_id != "outcome.review"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids != expected_oracles
+        || ranking_route.capability_id != "attribution.compute"
+        || ranking_route.executor != MissionCheckpointExecutor::Application
+        || ranking_route.completion_policy
+            != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || ranking_route.oracle_ids != expected_ranking_oracles
+        || ranking_completion.oracle_ids != expected_ranking_oracles
+        || !ranking_completion.work_product_ids.is_empty()
+        || !ranking_completion.effect_ids.is_empty()
+        || ranking_evidence.handler_id != VM01_RANKING_TRAFFIC_REVIEW_HANDLER_ID
+        || ranking_evidence.tenant_id != mission.tenant_id
+        || ranking_evidence.project_id != mission.project_id
+        || ranking_evidence.mission_id != mission.id
+        || ranking_evidence.manifest_id != definition.manifest_id
+        || ranking_evidence.manifest_version != definition.manifest_version
+        || ranking_evidence.catalog_digest != definition.catalog_digest
+        || ranking_evidence.cycle != definition.cycle
+        || ranking_evidence.checkpoint_id != ranking_checkpoint.id
+        || ranking_evidence.digest() != ranking_completion.evidence_digest
+        || ranking_evidence.observed_at != ranking_completion.verified_at
+        || ranking_completion.verified_at > now
+        || expected_cycle != Some(definition.cycle)
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    validate_application_evidence_against_registry(ranking_evidence)?;
+    mission.contract.validate(now).map_err(MissionError::from)?;
+
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let mission_contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
+    let ranking_review_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm01-next-cycle-decision/v1",
+        "missionId": mission.id,
+        "cycle": definition.cycle,
+        "nextCycle": next_cycle,
+        "checkpointId": ranking_checkpoint.id,
+        "checkpointRevision": ranking_checkpoint.revision,
+        "handlerId": ranking_evidence.handler_id,
+        "applicationEvidenceDigest": ranking_evidence.digest(),
+        "completionEvidenceDigest": ranking_completion.evidence_digest,
+        "outcomeDecision": OutcomeDecision::Continue,
+        "scheduleAuthority": "durable_mission_schedule",
+        "terminalExecutionAuthority": "denied",
+        "runtimeExecutionAuthority": "denied",
+        "providerExecutionAuthority": "denied",
+        "verifiedAt": ranking_completion.verified_at,
+    }))?;
+    let evidence = MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM01_NEXT_CYCLE_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "mission_contract".into(),
+                source_id: mission.id.to_string(),
+                source_revision: command.expected_mission_revision,
+                projection_digest: mission_contract_digest,
+                oracle_ids: BTreeSet::from(["goal".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "ranking_traffic_review".into(),
+                source_id: format!("{}:{}", mission.id, ranking_checkpoint.id),
+                source_revision: ranking_checkpoint.revision,
+                projection_digest: ranking_review_digest,
+                oracle_ids: BTreeSet::from(["decision".into(), "outcome".into()]),
+            },
+        ]),
+        observed_at: now,
+    };
+    Ok((
+        evidence,
+        ranking_checkpoint.revision,
         vec![ApplicationSourceRevisionFence::present(
             ApplicationSourceKind::Mission,
             mission.id.to_string(),
@@ -6972,6 +7177,9 @@ fn execute_project_application_checkpoint(
                 store, &mission, &route, &command, now,
             )?
         }
+        CompiledApplicationCheckpointHandler::Vm01NextCycle => {
+            vm01_next_cycle_application_evidence(&mission, &route, &command, now)?
+        }
         CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview => {
             vm04_engagement_referral_review_application_evidence(
                 store, &mission, &route, &command, now,
@@ -7024,11 +7232,25 @@ fn execute_project_application_checkpoint(
         verified_at: now,
     };
     let vm04_valid_terminal = handler == CompiledApplicationCheckpointHandler::Vm04ChannelRebalance;
+    let vm01_next_cycle = handler == CompiledApplicationCheckpointHandler::Vm01NextCycle;
     if vm04_valid_terminal {
         mission.complete_vm04_channel_rebalance_terminal(completion)?;
     } else {
         mission.complete_checkpoint(&command.checkpoint_id, completion)?;
     }
+    if vm01_next_cycle {
+        mission.record_outcome(Outcome {
+            summary: VM01_NEXT_CYCLE_OUTCOME_SUMMARY.into(),
+            decision: OutcomeDecision::Continue,
+            metrics: BTreeMap::new(),
+            observed_at: now,
+        })?;
+    }
+    let next_cycle_schedule = if vm01_next_cycle {
+        Some(MissionSchedule::prepare(&mission, now)?)
+    } else {
+        None
+    };
     let completed_checkpoint_revision = mission
         .definition
         .as_ref()
@@ -7040,7 +7262,7 @@ fn execute_project_application_checkpoint(
         })
         .map(|checkpoint| checkpoint.revision)
         .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
-    let next_started = if vm04_valid_terminal {
+    let next_started = if vm04_valid_terminal || vm01_next_cycle {
         None
     } else {
         start_ready_catalog_checkpoint_in_memory(&mut mission, now)?
@@ -7078,6 +7300,42 @@ fn execute_project_application_checkpoint(
             now,
         ));
     }
+    if let Some(schedule) = &next_cycle_schedule {
+        events.extend([
+            PendingEvent::new(
+                "outcome.observed",
+                serde_json::json!({
+                    "summary": mission.outcome.as_ref().map(|item| &item.summary),
+                    "decision": mission.outcome.as_ref().map(|item| &item.decision),
+                    "cycle": mission.outcome_history.len(),
+                    "nextStage": mission.stage,
+                }),
+                now,
+            ),
+            PendingEvent::new(
+                mission_stage_event(&mission.stage),
+                serde_json::json!({
+                    "revision": mission.revision,
+                    "stage": mission.stage,
+                    "terminal": mission.stage.is_terminal(),
+                }),
+                now,
+            ),
+            PendingEvent::new(
+                "mission.schedule_created",
+                serde_json::json!({
+                    "scheduleId": schedule.id,
+                    "missionId": schedule.mission_id,
+                    "cycle": schedule.cycle,
+                    "trigger": schedule.trigger,
+                    "dueAt": schedule.due_at,
+                    "eventTopicCount": schedule.event_topics.len(),
+                    "contractValidUntil": schedule.contract_valid_until,
+                }),
+                now,
+            ),
+        ]);
+    }
     if let Some((checkpoint_id, checkpoint_revision, capability_id, executor, task_id, cycle)) =
         next_started
     {
@@ -7095,12 +7353,21 @@ fn execute_project_application_checkpoint(
             now,
         ));
     }
-    store.update_mission_atomic_with_application_source_fences_only(
-        &mission,
-        expected_mission_revision,
-        &source_fences,
-        &events,
-    )?;
+    if let Some(schedule) = &next_cycle_schedule {
+        store.update_mission_and_create_schedule_atomic(
+            &mission,
+            expected_mission_revision,
+            schedule,
+            &events,
+        )?;
+    } else {
+        store.update_mission_atomic_with_application_source_fences_only(
+            &mission,
+            expected_mission_revision,
+            &source_fences,
+            &events,
+        )?;
+    }
     Ok(ApplicationMissionCheckpointExecution::Completed {
         completed_checkpoint_id: command.checkpoint_id,
         completion_evidence_digest: evidence_digest,
@@ -13032,6 +13299,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::LocalMissionHandoff
                 | CompiledApplicationCheckpointHandler::Vm01WorkQueue
                 | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
+                | CompiledApplicationCheckpointHandler::Vm01NextCycle
                 | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
                 | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
                 | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -13889,6 +14157,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::LocalMissionHandoff
             | CompiledApplicationCheckpointHandler::Vm01WorkQueue
             | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
+            | CompiledApplicationCheckpointHandler::Vm01NextCycle
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
@@ -14027,6 +14296,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::LocalMissionHandoff
             | CompiledApplicationCheckpointHandler::Vm01WorkQueue
             | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
+            | CompiledApplicationCheckpointHandler::Vm01NextCycle
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
@@ -31502,7 +31772,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one VM-01 contract test keeps work-queue evidence, selected brief, verified publication, readback adoption, ranking review, next-route dispatch, and exact replay visible"
+        reason = "one VM-01 contract test keeps work-queue evidence, selected brief, verified publication, readback adoption, ranking review, atomic next-cycle scheduling, exact replay, and cycle-two dispatch visible"
     )]
     fn vm01_work_queue_and_publication_bind_selected_runtime_products() {
         let workspace = tempfile::tempdir().expect("project workspace");
@@ -32052,13 +32322,20 @@ mod tests {
         assert_eq!(
             (
                 next_cycle.application_handler_status,
-                next_cycle.application_handler_id,
+                next_cycle.application_handler_id.as_deref(),
             ),
             (
-                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
-                None
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM01_NEXT_CYCLE_HANDLER_ID),
             )
         );
+        let next_cycle_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: next_cycle.checkpoint_id,
+            expected_mission_revision: next_cycle.mission_revision,
+            expected_checkpoint_revision: next_cycle.checkpoint_revision,
+        };
 
         let ranked_mission = service
             .load_mission(&project_id, &mission_id)
@@ -32072,7 +32349,7 @@ mod tests {
                 .status,
             EffectStatus::Verified
         );
-        let ranking_completion = ranked_mission
+        let ranking_checkpoint = ranked_mission
             .definition
             .as_ref()
             .and_then(|definition| {
@@ -32081,7 +32358,11 @@ mod tests {
                     .iter()
                     .find(|checkpoint| checkpoint.id == "ranking_traffic_review")
             })
-            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable ranking traffic review Checkpoint");
+        let ranking_checkpoint_revision = ranking_checkpoint.revision;
+        let ranking_completion = ranking_checkpoint
+            .completion
+            .as_ref()
             .expect("durable ranking traffic review completion");
         assert!(ranking_completion.work_product_ids.is_empty());
         assert!(ranking_completion.effect_ids.is_empty());
@@ -32132,6 +32413,131 @@ mod tests {
                 .len(),
             ranking_event_count
         );
+
+        let next_cycle_execution = service
+            .execute_application_mission_checkpoint(
+                next_cycle_command.clone(),
+                publication_at + Duration::milliseconds(19),
+            )
+            .expect("atomically schedule the next VM-01 cycle");
+        let ApplicationMissionCheckpointExecution::Completed {
+            replayed: false,
+            outcome_ledger_revision,
+            next_dispatch: None,
+            ..
+        } = next_cycle_execution
+        else {
+            panic!("VM-01 next_cycle must close cycle one into a durable schedule")
+        };
+        assert_eq!(outcome_ledger_revision, ranking_checkpoint_revision);
+
+        let scheduled_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("scheduled VM-01 cycle two");
+        assert_eq!(scheduled_mission.stage, MissionStage::Scheduled);
+        assert_eq!(scheduled_mission.outcome_history.len(), 1);
+        assert_eq!(
+            scheduled_mission
+                .outcome
+                .as_ref()
+                .map(|outcome| (outcome.summary.as_str(), &outcome.decision)),
+            Some((VM01_NEXT_CYCLE_OUTCOME_SUMMARY, &OutcomeDecision::Continue))
+        );
+        assert_eq!(scheduled_mission.effects.len(), 1);
+        assert_eq!(scheduled_mission.work_products.len(), 4);
+        let next_cycle_completion = scheduled_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "next_cycle")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable next-cycle completion");
+        assert!(next_cycle_completion.work_product_ids.is_empty());
+        assert!(next_cycle_completion.effect_ids.is_empty());
+        let next_cycle_evidence = next_cycle_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable next-cycle Application evidence");
+        assert_eq!(next_cycle_evidence.handler_id, VM01_NEXT_CYCLE_HANDLER_ID);
+        assert_eq!(
+            next_cycle_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "mission_checkpoint",
+                "mission_contract",
+                "ranking_traffic_review",
+            ])
+        );
+        let scheduled_projection = service
+            .projection(&project_id, &mission_id, WorkSurface::Orchestrator)
+            .expect("scheduled VM-01 projection");
+        let schedule = scheduled_projection
+            .schedule
+            .expect("durable cycle-two schedule");
+        assert_eq!(schedule.cycle, 2);
+        assert_eq!(schedule.status, MissionScheduleStatus::Pending);
+        assert_eq!(schedule.trigger, CadenceTriggerKind::Interval);
+        let due_at = schedule.due_at.expect("weekly cycle-two due time");
+        let next_cycle_events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free next-cycle events");
+        let next_cycle_event_count = next_cycle_events.len();
+        let next_cycle_event_json =
+            serde_json::to_string(&next_cycle_events).expect("next-cycle event JSON");
+        assert!(next_cycle_event_json.contains(VM01_NEXT_CYCLE_HANDLER_ID));
+        assert!(next_cycle_event_json.contains("mission.schedule_created"));
+        assert!(!next_cycle_event_json.contains(private_scope));
+        assert!(!next_cycle_event_json.contains(private_readback));
+        assert!(!next_cycle_event_json.contains(private_brief));
+        assert!(!next_cycle_event_json.contains(private_approval));
+
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    next_cycle_command,
+                    publication_at + Duration::milliseconds(20),
+                )
+                .expect("exact VM-01 next-cycle replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after next-cycle replay")
+                .len(),
+            next_cycle_event_count
+        );
+
+        let cycle_two = service
+            .run_due_mission_scheduler_once("vm01-local-scheduler", due_at)
+            .expect("run due VM-01 schedule")
+            .expect("start VM-01 cycle two");
+        assert_eq!(cycle_two.stage, MissionStage::Running);
+        assert_eq!(cycle_two.outcome_history.len(), 1);
+        assert_eq!(
+            cycle_two
+                .definition
+                .as_ref()
+                .map(|definition| definition.cycle),
+            Some(2)
+        );
+        let cycle_two_dispatch = service
+            .dispatch_current_mission_checkpoint(&project_id, &mission_id, due_at)
+            .expect("cycle-two scope dispatch");
+        assert_eq!(cycle_two_dispatch.cycle, 2);
+        assert_eq!(cycle_two_dispatch.checkpoint_id, "scope_locked");
+        assert_eq!(
+            cycle_two_dispatch.executor,
+            MissionCheckpointExecutor::Human
+        );
+        assert_eq!(cycle_two_dispatch.capability_id, "seo.plan");
         assert_eq!(executor.calls, 1);
     }
 

@@ -191,7 +191,7 @@ fn validate_header(
     require(
         violations,
         contract.schema_version == "hartevo-mission-route-runtime-authority-contract/v1"
-            && contract.contract_version == "desktop-2026-09-05-ct03-v4"
+            && contract.contract_version == "desktop-2026-09-05-ct03-v5"
             && contract.evidence_level == "E1"
             && contract.default_terminal_execution_authority
                 == DefaultTerminalExecutionAuthority::Denied,
