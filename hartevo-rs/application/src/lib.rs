@@ -3550,6 +3550,7 @@ const VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID: &str =
 const VM11_OUTCOME_REVIEW_HANDLER_ID: &str = "vm11.outcome-review/v1";
 const VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID: &str =
     "vm11.next-contract-or-valid-terminal/v1";
+const VM11_CANDIDATE_LEARNING_HANDLER_ID: &str = "vm11.candidate-learning/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledApplicationCheckpointHandler {
@@ -3573,6 +3574,7 @@ enum CompiledApplicationCheckpointHandler {
     RefundCommissionPayoutRecalc,
     OutcomeReview,
     NextContractOrValidTerminal,
+    Vm11CandidateLearning,
 }
 
 impl CompiledApplicationCheckpointHandler {
@@ -3600,6 +3602,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::RefundCommissionPayoutRecalc => VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID,
             Self::OutcomeReview => VM11_OUTCOME_REVIEW_HANDLER_ID,
             Self::NextContractOrValidTerminal => VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID,
+            Self::Vm11CandidateLearning => VM11_CANDIDATE_LEARNING_HANDLER_ID,
         }
     }
 
@@ -3625,6 +3628,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::RefundCommissionPayoutRecalc => "outcome_settlement",
             Self::OutcomeReview => "outcome_review",
             Self::NextContractOrValidTerminal => "outcome_review_decision",
+            Self::Vm11CandidateLearning => "candidate_learning_proposal",
         }
     }
 }
@@ -3923,6 +3927,9 @@ fn compiled_application_checkpoint_handler(
         VM11_OUTCOME_REVIEW_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::OutcomeReview),
         VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::NextContractOrValidTerminal)
+        }
+        VM11_CANDIDATE_LEARNING_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::Vm11CandidateLearning)
         }
         _ => None,
     }
@@ -6079,6 +6086,346 @@ fn vm04_channel_rebalance_application_evidence(
     ))
 }
 
+#[derive(Clone, Debug)]
+struct Vm11CandidateLearningSource {
+    decision_source_id: String,
+    decision_source_revision: u64,
+    completion_evidence_digest: String,
+    checkpoint_revision: u64,
+    verified_at: DateTime<Utc>,
+}
+
+fn vm11_candidate_learning_source(
+    mission: &Mission,
+    now: DateTime<Utc>,
+) -> Result<Vm11CandidateLearningSource, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let catalog_digest = Catalog::load()?.snapshot()?.digest;
+    let candidate = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "candidate_learning")
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let predecessor = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let completion = predecessor
+        .completion
+        .as_ref()
+        .filter(|_| predecessor.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let evidence = completion
+        .application_evidence
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let decision_source = evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "outcome_review_decision")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let source_kinds = evidence
+        .sources
+        .iter()
+        .map(|source| source.source_kind.as_str())
+        .collect::<BTreeSet<_>>();
+    if definition.manifest_id != "VM-11"
+        || definition.manifest_version != 3
+        || definition.catalog_digest != catalog_digest
+        || definition.operating_mode != mission.contract.mode
+        || definition.capability_ids != mission.contract.enabled_capabilities
+        || candidate.depends_on != BTreeSet::from([predecessor.id.clone()])
+        || !matches!(
+            candidate.status,
+            MissionCheckpointStatus::Running | MissionCheckpointStatus::Verifying
+        )
+        || completion.oracle_ids
+            != BTreeSet::from(["goal".into(), "operating_state".into(), "outcome".into()])
+        || !completion.work_product_ids.is_empty()
+        || !completion.effect_ids.is_empty()
+        || evidence.handler_id != VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID
+        || evidence.checkpoint_id != predecessor.id
+        || evidence.digest() != completion.evidence_digest
+        || evidence.observed_at != completion.verified_at
+        || completion.verified_at > now
+        || source_kinds
+            != BTreeSet::from([
+                "mission_checkpoint",
+                "outcome_review_decision",
+                "parent_mission_contract",
+            ])
+        || decision_source.source_revision != definition.cycle
+        || !decision_source
+            .source_id
+            .ends_with(":continue:continue_current_contract")
+        || decision_source.oracle_ids != BTreeSet::from(["outcome".into()])
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    validate_application_evidence_against_registry(evidence)?;
+    Ok(Vm11CandidateLearningSource {
+        decision_source_id: decision_source.source_id.clone(),
+        decision_source_revision: decision_source.source_revision,
+        completion_evidence_digest: completion.evidence_digest.clone(),
+        checkpoint_revision: predecessor.revision,
+        verified_at: completion.verified_at,
+    })
+}
+
+fn vm11_candidate_learning_proposal_material(
+    mission: &Mission,
+    source: &Vm11CandidateLearningSource,
+) -> Result<(WorkProductId, String), ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let identity_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm11-candidate-learning-identity/v1",
+        "missionId": mission.id,
+        "cycle": definition.cycle,
+        "decisionSourceId": source.decision_source_id,
+        "resolutionCompletionEvidenceDigest": source.completion_evidence_digest,
+        "resolutionCheckpointRevision": source.checkpoint_revision,
+        "resolutionVerifiedAt": source.verified_at,
+    }))?;
+    let body = serde_json::to_string(&serde_json::json!({
+        "schemaVersion": "hartevo-vm11-candidate-learning-proposal/v1",
+        "candidateIdentityDigest": identity_digest,
+        "missionId": mission.id,
+        "cycle": definition.cycle,
+        "decisionSourceId": source.decision_source_id,
+        "resolutionCompletionEvidenceDigest": source.completion_evidence_digest,
+        "resolutionCheckpointRevision": source.checkpoint_revision,
+        "resolutionVerifiedAt": source.verified_at,
+        "candidateStatus": "proposed_only",
+        "evaluationStatus": "not_run",
+        "promotionAuthority": "denied",
+        "releaseAuthority": "denied",
+        "providerExecutionAuthority": "denied",
+        "effectExecutionAuthority": "denied",
+        "runtimeExecutionAuthority": "denied",
+    }))?;
+    Ok((
+        WorkProductId::from_stable(format!("vm11-candidate-learning:{identity_digest}")),
+        body,
+    ))
+}
+
+fn prepare_vm11_candidate_learning_manifest(
+    mission: &mut Mission,
+    now: DateTime<Utc>,
+) -> Result<WorkProductManifest, ApplicationError> {
+    let source = vm11_candidate_learning_source(mission, now)?;
+    let (work_product_id, body) = vm11_candidate_learning_proposal_material(mission, &source)?;
+    let running_tasks = mission
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Running && task.capability == "candidate.propose")
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let [task_id] = running_tasks.as_slice() else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
+    mission.record_work_product(
+        WorkProduct::draft(
+            work_product_id.clone(),
+            "VM-11 candidate learning proposal",
+            body.clone(),
+            BTreeSet::new(),
+        ),
+        now,
+    )?;
+    let work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == work_product_id)
+        .ok_or_else(|| MissionError::UnknownWorkProduct(work_product_id.clone()))?;
+    WorkProductManifest::create(
+        mission.tenant_id.clone(),
+        mission.project_id.clone(),
+        mission.id.clone(),
+        work_product,
+        "candidate_learning_proposal",
+        WorkProductDependencies {
+            task_ids: BTreeSet::from([task_id.clone()]),
+            ..WorkProductDependencies::default()
+        },
+        None,
+        WorkProductPreview::new("application/json", body)?,
+        BTreeSet::from(["/body".into()]),
+        now,
+    )
+    .map_err(ApplicationError::from)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the terminal proof keeps the exact Continue predecessor, candidate-only WorkProduct, route contract, and terminal authority visible in one boundary"
+)]
+fn vm11_candidate_learning_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    manifest: &WorkProductManifest,
+    now: DateTime<Utc>,
+) -> Result<
+    (
+        MissionCheckpointApplicationEvidence,
+        u64,
+        Vec<ApplicationSourceRevisionFence>,
+    ),
+    ApplicationError,
+> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let source = vm11_candidate_learning_source(mission, now)?;
+    let (expected_work_product_id, expected_body) =
+        vm11_candidate_learning_proposal_material(mission, &source)?;
+    let work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == expected_work_product_id)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    manifest.validate_against(work_product)?;
+    let catalog = Catalog::load()?;
+    let terminal_binding = catalog
+        .route_runtime_authority
+        .terminal_transitions
+        .iter()
+        .find(|binding| binding.transition_id == "vm11.candidate_learning.to.valid-terminal/v2")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let RouteTerminalExecutionAuthority::ApplicationHandler(terminal_authority) =
+        &terminal_binding.authority
+    else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
+    let expected_oracles = BTreeSet::from([
+        "decision".into(),
+        "operating_state".into(),
+        "work_product".into(),
+    ]);
+    if checkpoint.id != "candidate_learning"
+        || checkpoint.status != MissionCheckpointStatus::Verifying
+        || route.capability_id != "candidate.propose"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids != expected_oracles
+        || work_product.body != expected_body
+        || work_product.status != WorkProductStatus::ReadyForReview
+        || manifest.work_product_id != expected_work_product_id
+        || manifest.work_product_type != "candidate_learning_proposal"
+        || manifest.version != 1
+        || manifest.work_product_revision != work_product.revision
+        || !manifest.dependencies.fact_ids.is_empty()
+        || !manifest.dependencies.evidence_ids.is_empty()
+        || manifest.dependencies.task_ids.len() != 1
+        || manifest.file_digest.is_some()
+        || manifest.preview.text != work_product.body
+        || manifest.editable_scopes != BTreeSet::from(["/body".into()])
+        || terminal_binding.mission_id != "VM-11"
+        || terminal_binding.mission_version != 3
+        || terminal_binding.source_checkpoint_id != checkpoint.id
+        || terminal_binding.terminal_id != "vm11.valid-terminal/v2"
+        || terminal_authority.kind
+            != ApplicationHandlerRouteTerminalExecutionAuthorityKind::ApplicationHandler
+        || terminal_authority.executor != RouteTerminalAuthorityExecutor::Application
+        || terminal_authority.handler_id != VM11_CANDIDATE_LEARNING_HANDLER_ID
+        || terminal_authority.implementation_crate != "hartevo-application"
+        || terminal_authority.completion_policy
+            != RouteTerminalCompletionPolicy::DeterministicEvidence
+        || terminal_authority.mission_disposition != RouteGraphTerminalDisposition::Completed
+        || !terminal_authority.skipped_checkpoint_ids.is_empty()
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    mission.contract.validate(now).map_err(MissionError::from)?;
+
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let evidence = MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_CANDIDATE_LEARNING_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "next_contract_resolution".into(),
+                source_id: source.decision_source_id,
+                source_revision: source.decision_source_revision,
+                projection_digest: source.completion_evidence_digest,
+                oracle_ids: BTreeSet::from(["decision".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "candidate_learning_proposal".into(),
+                source_id: manifest.work_product_id.to_string(),
+                source_revision: manifest.version,
+                projection_digest: manifest.manifest_digest.clone(),
+                oracle_ids: BTreeSet::from(["work_product".into()]),
+            },
+        ]),
+        observed_at: now,
+    };
+    Ok((
+        evidence,
+        manifest.version,
+        vec![ApplicationSourceRevisionFence::present(
+            ApplicationSourceKind::Mission,
+            mission.id.to_string(),
+            command.expected_mission_revision,
+        )],
+    ))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the proof keeps route, Human predecessor, contract and content-free Oracle bindings visible in one deterministic boundary"
@@ -6901,6 +7248,12 @@ fn execute_project_application_checkpoint(
     if mission.stage == MissionStage::Blocked {
         mission.resume(now)?;
     }
+    let candidate_learning_manifest =
+        if handler == CompiledApplicationCheckpointHandler::Vm11CandidateLearning {
+            Some(prepare_vm11_candidate_learning_manifest(&mut mission, now)?)
+        } else {
+            None
+        };
     mission.begin_checkpoint_verification(&command.checkpoint_id, now)?;
     let route = mission
         .definition
@@ -7188,6 +7541,19 @@ fn execute_project_application_checkpoint(
         CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
             vm04_channel_rebalance_application_evidence(&mission, &route, &command, now)?
         }
+        CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
+            vm11_candidate_learning_application_evidence(
+                &mission,
+                &route,
+                &command,
+                candidate_learning_manifest.as_ref().ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler.handler_id().into(),
+                    },
+                )?,
+                now,
+            )?
+        }
         CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled => {
             let evidence = vm00_local_operating_contract_compiled_application_evidence(
                 &mission, &route, &command, now,
@@ -7209,19 +7575,31 @@ fn execute_project_application_checkpoint(
     };
     validate_application_evidence_against_registry(&application_evidence)?;
     let evidence_digest = application_evidence.digest();
-    let work_product_ids = if handler == CompiledApplicationCheckpointHandler::Vm01WorkQueue {
-        let source = application_evidence
-            .sources
-            .iter()
-            .find(|source| source.source_kind == "seo_work_queue")
-            .ok_or(
-                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
-                    handler_id: handler.handler_id().into(),
-                },
-            )?;
-        BTreeSet::from([WorkProductId::from(source.source_id.as_str())])
-    } else {
-        BTreeSet::new()
+    let work_product_ids = match handler {
+        CompiledApplicationCheckpointHandler::Vm01WorkQueue => {
+            let source = application_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "seo_work_queue")
+                .ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler.handler_id().into(),
+                    },
+                )?;
+            BTreeSet::from([WorkProductId::from(source.source_id.as_str())])
+        }
+        CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
+            BTreeSet::from([candidate_learning_manifest
+                .as_ref()
+                .ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler.handler_id().into(),
+                    },
+                )?
+                .work_product_id
+                .clone()])
+        }
+        _ => BTreeSet::new(),
     };
     let completion = MissionCheckpointCompletion {
         oracle_ids: route.oracle_ids.clone(),
@@ -7232,9 +7610,13 @@ fn execute_project_application_checkpoint(
         verified_at: now,
     };
     let vm04_valid_terminal = handler == CompiledApplicationCheckpointHandler::Vm04ChannelRebalance;
+    let vm11_candidate_learning_terminal =
+        handler == CompiledApplicationCheckpointHandler::Vm11CandidateLearning;
     let vm01_next_cycle = handler == CompiledApplicationCheckpointHandler::Vm01NextCycle;
     if vm04_valid_terminal {
         mission.complete_vm04_channel_rebalance_terminal(completion)?;
+    } else if vm11_candidate_learning_terminal {
+        mission.complete_vm11_candidate_learning_terminal(completion)?;
     } else {
         mission.complete_checkpoint(&command.checkpoint_id, completion)?;
     }
@@ -7262,7 +7644,8 @@ fn execute_project_application_checkpoint(
         })
         .map(|checkpoint| checkpoint.revision)
         .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
-    let next_started = if vm04_valid_terminal || vm01_next_cycle {
+    let next_started = if vm04_valid_terminal || vm11_candidate_learning_terminal || vm01_next_cycle
+    {
         None
     } else {
         start_ready_catalog_checkpoint_in_memory(&mut mission, now)?
@@ -7300,7 +7683,43 @@ fn execute_project_application_checkpoint(
             now,
         ));
     }
-    if let Some(schedule) = &next_cycle_schedule {
+    if vm11_candidate_learning_terminal {
+        let manifest = candidate_learning_manifest.as_ref().ok_or(
+            ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id: handler.handler_id().into(),
+            },
+        )?;
+        events.push(PendingEvent::new(
+            "mission.vm11_candidate_learning_terminal_resolved",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": command.checkpoint_id,
+                "transitionId": "vm11.candidate_learning.to.valid-terminal/v2",
+                "terminalId": "vm11.valid-terminal/v2",
+                "handlerId": handler.handler_id(),
+                "workProductId": manifest.work_product_id,
+                "workProductManifestDigest": manifest.manifest_digest,
+                "missionDisposition": MissionTerminalDisposition::Completed,
+                "candidateStatus": "proposed_only",
+                "evaluationExecuted": false,
+                "promotionAuthorized": false,
+                "releaseAuthorized": false,
+                "providerExecuted": false,
+                "runtimeExecuted": false,
+                "externalEffectExecuted": false,
+                "completionEvidenceDigest": evidence_digest,
+            }),
+            now,
+        ));
+    }
+    if let Some(manifest) = &candidate_learning_manifest {
+        store.create_work_product_manifest_atomic(
+            &mission,
+            expected_mission_revision,
+            manifest,
+            &events,
+        )?;
+    } else if let Some(schedule) = &next_cycle_schedule {
         events.extend([
             PendingEvent::new(
                 "outcome.observed",
@@ -7360,7 +7779,9 @@ fn execute_project_application_checkpoint(
             schedule,
             &events,
         )?;
-    } else {
+    } else if candidate_learning_manifest.is_none() {
+        // The candidate-learning manifest transaction already fences and
+        // advances this Mission with the same expected revision.
         store.update_mission_atomic_with_application_source_fences_only(
             &mission,
             expected_mission_revision,
@@ -13303,6 +13724,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
                 | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
                 | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
+                | CompiledApplicationCheckpointHandler::Vm11CandidateLearning
         ) {
             return execute_project_application_checkpoint(
                 &mut self.store,
@@ -14160,7 +14582,8 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm01NextCycle
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
-            | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
+            | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
+            | CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
                 unreachable!("Project route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest => {
@@ -14299,7 +14722,8 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm01NextCycle
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
-            | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
+            | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
+            | CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
                 unreachable!("Project route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest
@@ -36440,7 +36864,7 @@ mod tests {
         };
         assert_eq!(
             (
-                continued_mission.stage,
+                continued_mission.stage.clone(),
                 &continued_mission.contract,
                 continue_resolution.action,
                 continue_resolution.next_contract_intent,
@@ -36471,9 +36895,25 @@ mod tests {
                 "candidate.propose",
                 MissionCheckpointExecutor::Application,
                 MissionCheckpointDispatchState::Ready,
-                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
             ))
         );
+        let candidate_dispatch = candidate_dispatch.expect("implemented candidate-learning route");
+        let mut generic_bypass = continued_mission.as_ref().clone();
+        assert!(matches!(
+            generic_bypass.complete_checkpoint(
+                "candidate_learning",
+                MissionCheckpointCompletion {
+                    oracle_ids: candidate_dispatch.oracle_ids.clone(),
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: "f".repeat(64),
+                    verified_at: now() + Duration::seconds(72),
+                },
+            ),
+            Err(MissionError::Vm11CandidateLearningTerminalResolutionRequired)
+        ));
         let continue_event_count = service
             .mission_events(&project_id, &continuous_vm11_id)
             .expect("Continue events")
@@ -36490,7 +36930,7 @@ mod tests {
                 next_dispatch: Some(MissionCheckpointDispatch {
                     state: MissionCheckpointDispatchState::Ready,
                     application_handler_status: Some(
-                        ApplicationCheckpointHandlerStatus::NotImplemented
+                        ApplicationCheckpointHandlerStatus::Implemented
                     ),
                     ..
                 }),
@@ -36503,6 +36943,137 @@ mod tests {
                 .expect("unchanged Continue replay events")
                 .len(),
             continue_event_count
+        );
+
+        let candidate_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: continuous_vm11_id.clone(),
+            checkpoint_id: "candidate_learning".into(),
+            expected_mission_revision: candidate_dispatch.mission_revision,
+            expected_checkpoint_revision: candidate_dispatch.checkpoint_revision,
+        };
+        let candidate_completed = service
+            .execute_application_mission_checkpoint(
+                candidate_command.clone(),
+                now() + Duration::seconds(73),
+            )
+            .expect("candidate-only learning terminal");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completed_checkpoint_id,
+            replayed: false,
+            next_dispatch: None,
+            ..
+        } = candidate_completed
+        else {
+            panic!("candidate learning must complete the typed terminal")
+        };
+        assert_eq!(completed_checkpoint_id, "candidate_learning");
+        let candidate_mission = service
+            .load_mission(&project_id, &continuous_vm11_id)
+            .expect("candidate-terminal Mission");
+        assert_eq!(candidate_mission.stage, MissionStage::Completed);
+        assert!(candidate_mission.effects.is_empty());
+        assert_eq!(candidate_mission.work_products.len(), 1);
+        let candidate_product = candidate_mission
+            .work_products
+            .first()
+            .expect("bounded candidate proposal");
+        assert!(
+            candidate_product
+                .body
+                .contains("\"candidateStatus\":\"proposed_only\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"evaluationStatus\":\"not_run\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"promotionAuthority\":\"denied\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"releaseAuthority\":\"denied\"")
+        );
+        let candidate_manifest = service
+            .load_work_product_manifest(&project_id, &candidate_product.id)
+            .expect("durable candidate manifest");
+        assert_eq!(
+            candidate_manifest.work_product_type,
+            "candidate_learning_proposal"
+        );
+        assert_eq!(
+            candidate_manifest.artifact_digest,
+            candidate_product.content_digest
+        );
+        let candidate_completion = candidate_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "candidate_learning")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("typed candidate completion");
+        assert_eq!(
+            candidate_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some(VM11_CANDIDATE_LEARNING_HANDLER_ID)
+        );
+        assert_eq!(
+            candidate_completion
+                .application_evidence
+                .as_ref()
+                .expect("candidate evidence")
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "candidate_learning_proposal",
+                "mission_checkpoint",
+                "next_contract_resolution",
+            ])
+        );
+        let candidate_event_count = service
+            .mission_events(&project_id, &continuous_vm11_id)
+            .expect("candidate terminal events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    candidate_command,
+                    now() + Duration::seconds(74),
+                )
+                .expect("exact candidate replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                completed_checkpoint_id,
+                replayed: true,
+                next_dispatch: None,
+                ..
+            } if completed_checkpoint_id == "candidate_learning"
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &continuous_vm11_id)
+                .expect("unchanged candidate replay events")
+                .len(),
+            candidate_event_count
+        );
+        assert_eq!(
+            service
+                .load_mission(&project_id, &continuous_vm11_id)
+                .expect("unchanged candidate replay Mission")
+                .work_products
+                .len(),
+            1
         );
 
         let scale_vm11_id = MissionId::from("vm11-scale-authorization-mission");

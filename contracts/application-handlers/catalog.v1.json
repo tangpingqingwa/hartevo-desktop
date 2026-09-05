@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v20",
+  "registryVersion": "desktop-2026-09-05-v21",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -328,6 +328,26 @@
         "outcome_review_decision": ["outcome"]
       },
       "oracleIds": ["goal", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.candidate-learning/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "candidate_learning",
+      "capabilityId": "candidate.propose",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": [
+        "mission_checkpoint",
+        "next_contract_resolution",
+        "candidate_learning_proposal"
+      ],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "next_contract_resolution": ["decision"],
+        "candidate_learning_proposal": ["work_product"]
+      },
+      "oracleIds": ["decision", "work_product", "operating_state"],
       "implementationCrate": "hartevo-application"
     }
   ]

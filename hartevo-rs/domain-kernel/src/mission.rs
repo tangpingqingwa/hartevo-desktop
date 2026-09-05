@@ -2003,6 +2003,14 @@ impl Mission {
         {
             return Err(MissionError::Vm11NextContractResolutionRequired);
         }
+        if checkpoint_id == "candidate_learning"
+            && self
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.manifest_id == "VM-11")
+        {
+            return Err(MissionError::Vm11CandidateLearningTerminalResolutionRequired);
+        }
         self.complete_checkpoint_validated(checkpoint_id, completion)
     }
 
@@ -2018,6 +2026,24 @@ impl Mission {
         resolved.complete_checkpoint_validated("channel_rebalance", completion)?;
         if !vm04_valid_terminal_is_typed(&resolved) {
             return Err(MissionError::Vm04ValidTerminalResolutionRequired);
+        }
+        resolved.terminate(MissionTerminalDisposition::Completed, verified_at)?;
+        *self = resolved;
+        Ok(())
+    }
+
+    /// Completes only VM-11's candidate-only learning proposal and its typed
+    /// Completed terminal. The generic checkpoint API cannot use an arbitrary
+    /// WorkProduct or evidence digest to gain terminal or promotion authority.
+    pub fn complete_vm11_candidate_learning_terminal(
+        &mut self,
+        completion: MissionCheckpointCompletion,
+    ) -> Result<(), MissionError> {
+        let verified_at = completion.verified_at;
+        let mut resolved = self.clone();
+        resolved.complete_checkpoint_validated("candidate_learning", completion)?;
+        if !vm11_candidate_learning_valid_terminal_is_typed(&resolved) {
+            return Err(MissionError::Vm11CandidateLearningTerminalResolutionRequired);
         }
         resolved.terminate(MissionTerminalDisposition::Completed, verified_at)?;
         *self = resolved;
@@ -3076,6 +3102,9 @@ fn vm11_valid_terminal_is_typed(mission: &Mission) -> bool {
     let Some(definition) = &mission.definition else {
         return false;
     };
+    if definition.manifest_id != "VM-11" || definition.manifest_version != 3 {
+        return false;
+    }
     let Some(checkpoint) = definition
         .checkpoints
         .iter()
@@ -3097,13 +3126,98 @@ fn vm11_valid_terminal_is_typed(mission: &Mission) -> bool {
     else {
         return false;
     };
-    checkpoint.status == MissionCheckpointStatus::Completed
+    let stop_terminal = checkpoint.status == MissionCheckpointStatus::Completed
         && candidate.status == MissionCheckpointStatus::Skipped
         && evidence.handler_id == OutcomeReviewNextContractResolution::HANDLER_ID
         && evidence.sources.iter().any(|source| {
             source.source_kind == "outcome_review_decision"
                 && source.source_id.ends_with(":stop:valid_terminal")
                 && source.oracle_ids == BTreeSet::from(["outcome".into()])
+        });
+    stop_terminal || vm11_candidate_learning_valid_terminal_is_typed(mission)
+}
+
+fn vm11_candidate_learning_valid_terminal_is_typed(mission: &Mission) -> bool {
+    let Some(definition) = &mission.definition else {
+        return false;
+    };
+    if definition.manifest_id != "VM-11"
+        || definition.manifest_version != 3
+        || !definition
+            .checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+    {
+        return false;
+    }
+    let Some(next_completion) = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+    else {
+        return false;
+    };
+    let Some(next_evidence) = next_completion.application_evidence.as_ref() else {
+        return false;
+    };
+    let Some(next_decision_source) = next_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "outcome_review_decision")
+    else {
+        return false;
+    };
+    let Some(candidate_completion) = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "candidate_learning")
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+    else {
+        return false;
+    };
+    let Some(candidate_evidence) = candidate_completion.application_evidence.as_ref() else {
+        return false;
+    };
+    let source_kinds = candidate_evidence
+        .sources
+        .iter()
+        .map(|source| source.source_kind.as_str())
+        .collect::<BTreeSet<_>>();
+    let proposal_source = candidate_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "candidate_learning_proposal");
+    let resolution_source = candidate_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "next_contract_resolution");
+    next_evidence.handler_id == OutcomeReviewNextContractResolution::HANDLER_ID
+        && next_decision_source
+            .source_id
+            .ends_with(":continue:continue_current_contract")
+        && candidate_evidence.handler_id == "vm11.candidate-learning/v1"
+        && candidate_evidence.checkpoint_id == "candidate_learning"
+        && source_kinds
+            == BTreeSet::from([
+                "candidate_learning_proposal",
+                "mission_checkpoint",
+                "next_contract_resolution",
+            ])
+        && candidate_completion.work_product_ids.len() == 1
+        && proposal_source.is_some_and(|source| {
+            source.source_revision == 1
+                && source.oracle_ids == BTreeSet::from(["work_product".into()])
+                && candidate_completion
+                    .work_product_ids
+                    .iter()
+                    .any(|work_product_id| work_product_id.as_str() == source.source_id)
+        })
+        && resolution_source.is_some_and(|source| {
+            source.source_id == next_decision_source.source_id
+                && source.source_revision == next_decision_source.source_revision
+                && source.projection_digest == next_completion.evidence_digest
+                && source.oracle_ids == BTreeSet::from(["decision".into()])
         })
 }
 
@@ -3429,12 +3543,18 @@ pub enum MissionError {
     AlreadyTerminal,
     #[error("VM-04 Completed requires the typed channel_rebalance terminal resolution")]
     Vm04ValidTerminalResolutionRequired,
-    #[error("VM-11 Completed requires the typed next_contract_or_valid_terminal Stop resolution")]
+    #[error(
+        "VM-11 Completed requires either the typed Stop resolution or the typed candidate-learning Continue closure"
+    )]
     Vm11ValidTerminalResolutionRequired,
     #[error(
         "VM-11 next_contract_or_valid_terminal completion requires its typed route-specific resolution"
     )]
     Vm11NextContractResolutionRequired,
+    #[error(
+        "VM-11 candidate_learning completion requires its typed candidate-only terminal resolution"
+    )]
+    Vm11CandidateLearningTerminalResolutionRequired,
     #[error("mission revision overflow")]
     RevisionOverflow,
 }
