@@ -745,11 +745,11 @@ fn summarize_scope(
 fn expected_scope_summary(stage: ReleaseStage) -> StageApplicationRouteScopeSummary {
     let values = match stage {
         ReleaseStage::EngineeringFoundation | ReleaseStage::InternalAlpha => {
-            (7, 29, 16, 13, 7, 8, 7, 1, 1)
+            (7, 29, 17, 12, 7, 8, 7, 1, 1)
         }
-        ReleaseStage::ControlledBeta => (6, 22, 2, 20, 6, 6, 5, 1, 0),
+        ReleaseStage::ControlledBeta => (6, 22, 3, 19, 6, 6, 5, 1, 0),
         ReleaseStage::GeneralAvailability | ReleaseStage::MatureE5 => {
-            (12, 52, 16, 36, 12, 13, 12, 1, 1)
+            (12, 52, 17, 35, 12, 13, 12, 1, 1)
         }
     };
     StageApplicationRouteScopeSummary {

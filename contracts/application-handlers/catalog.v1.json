@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v16",
+  "registryVersion": "desktop-2026-09-05-v17",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -122,6 +122,28 @@
         "provider_readback": ["truth", "outcome"]
       },
       "oracleIds": ["truth", "decision", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm04.channel-rebalance/v1",
+      "missionId": "VM-04",
+      "missionVersion": 3,
+      "checkpointId": "channel_rebalance",
+      "capabilityId": "outcome.review",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": [
+        "mission_checkpoint",
+        "mission_contract",
+        "engagement_review",
+        "channel_rebalance"
+      ],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "mission_contract": ["goal"],
+        "engagement_review": ["outcome"],
+        "channel_rebalance": ["decision"]
+      },
+      "oracleIds": ["goal", "decision", "operating_state", "outcome"],
       "implementationCrate": "hartevo-application"
     },
     {

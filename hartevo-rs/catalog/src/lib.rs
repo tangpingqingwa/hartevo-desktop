@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 16, 36)
+            (52, 17, 35)
         );
         assert_eq!(
             catalog
@@ -1744,6 +1744,12 @@ mod tests {
                 .application_handler("VM-04", 3, "engagement_and_referral_review")
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm04.engagement-referral-review/v1")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-04", 3, "channel_rebalance")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm04.channel-rebalance/v1")
         );
         assert_eq!(
             catalog
