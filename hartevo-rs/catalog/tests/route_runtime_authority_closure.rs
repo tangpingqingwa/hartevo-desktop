@@ -11,6 +11,7 @@ use hartevo_catalog::{
     validate_route_runtime_authority_closure,
 };
 
+const VM04_CHANNEL_REBALANCE_TRANSITION_ID: &str = "vm04.channel_rebalance.to.valid-terminal/v2";
 const VM11_STOP_TRANSITION_ID: &str =
     "vm11.next_contract_or_valid_terminal.to.valid-terminal.stop/v2";
 
@@ -31,7 +32,7 @@ fn has_violation(violations: &[String], needle: &str) -> bool {
         .any(|violation| violation.contains(needle))
 }
 
-fn application_authority() -> RouteTerminalExecutionAuthority {
+fn vm11_application_authority() -> RouteTerminalExecutionAuthority {
     RouteTerminalExecutionAuthority::ApplicationHandler(
         ApplicationHandlerRouteTerminalExecutionAuthority {
             kind: ApplicationHandlerRouteTerminalExecutionAuthorityKind::ApplicationHandler,
@@ -45,6 +46,20 @@ fn application_authority() -> RouteTerminalExecutionAuthority {
     )
 }
 
+fn vm04_application_authority() -> RouteTerminalExecutionAuthority {
+    RouteTerminalExecutionAuthority::ApplicationHandler(
+        ApplicationHandlerRouteTerminalExecutionAuthority {
+            kind: ApplicationHandlerRouteTerminalExecutionAuthorityKind::ApplicationHandler,
+            executor: RouteTerminalAuthorityExecutor::Application,
+            handler_id: "vm04.channel-rebalance/v1".into(),
+            implementation_crate: "hartevo-application".into(),
+            completion_policy: RouteTerminalCompletionPolicy::DeterministicEvidence,
+            mission_disposition: RouteGraphTerminalDisposition::Completed,
+            skipped_checkpoint_ids: Vec::new(),
+        },
+    )
+}
+
 fn denied_authority() -> RouteTerminalExecutionAuthority {
     RouteTerminalExecutionAuthority::Denied(DeniedRouteTerminalExecutionAuthority {
         kind: DeniedRouteTerminalExecutionAuthorityKind::Denied,
@@ -52,7 +67,7 @@ fn denied_authority() -> RouteTerminalExecutionAuthority {
 }
 
 #[test]
-fn production_contract_grants_only_the_exact_vm11_stop_terminal() {
+fn production_contract_grants_only_the_exact_vm04_and_vm11_terminals() {
     let catalog = Catalog::load().expect("valid production Catalog");
     let contract = &catalog.route_runtime_authority;
 
@@ -60,7 +75,7 @@ fn production_contract_grants_only_the_exact_vm11_stop_terminal() {
         contract.schema_version,
         "hartevo-mission-route-runtime-authority-contract/v1"
     );
-    assert_eq!(contract.contract_version, "desktop-2026-08-13-ct03-v1");
+    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct03-v2");
     assert_eq!(contract.evidence_level, "E1");
     assert_eq!(
         contract.default_terminal_execution_authority,
@@ -97,16 +112,26 @@ fn production_contract_grants_only_the_exact_vm11_stop_terminal() {
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(implemented.len(), 1);
-    assert_eq!(implemented[0].transition_id, VM11_STOP_TRANSITION_ID);
-    assert_eq!(implemented[0].mission_id, "VM-11");
-    assert_eq!(implemented[0].mission_version, 3);
+    assert_eq!(implemented.len(), 2);
     assert_eq!(
-        implemented[0].source_checkpoint_id,
+        implemented[0].transition_id,
+        VM04_CHANNEL_REBALANCE_TRANSITION_ID
+    );
+    assert_eq!(implemented[0].mission_id, "VM-04");
+    assert_eq!(implemented[0].mission_version, 3);
+    assert_eq!(implemented[0].source_checkpoint_id, "channel_rebalance");
+    assert_eq!(implemented[0].terminal_id, "vm04.valid-terminal/v2");
+    assert_eq!(implemented[0].authority, vm04_application_authority());
+
+    assert_eq!(implemented[1].transition_id, VM11_STOP_TRANSITION_ID);
+    assert_eq!(implemented[1].mission_id, "VM-11");
+    assert_eq!(implemented[1].mission_version, 3);
+    assert_eq!(
+        implemented[1].source_checkpoint_id,
         "next_contract_or_valid_terminal"
     );
-    assert_eq!(implemented[0].terminal_id, "vm11.valid-terminal/v2");
-    assert_eq!(implemented[0].authority, application_authority());
+    assert_eq!(implemented[1].terminal_id, "vm11.valid-terminal/v2");
+    assert_eq!(implemented[1].authority, vm11_application_authority());
 
     let candidate_terminal = contract
         .terminal_transitions
@@ -129,7 +154,7 @@ fn production_contract_grants_only_the_exact_vm11_stop_terminal() {
     assert_eq!(snapshot.schema_version, "hartevo-catalog-snapshot/v4");
     assert_eq!(
         snapshot.route_graph_contract_version,
-        "desktop-2026-08-12-ct02-v1"
+        "desktop-2026-09-05-ct02-v2"
     );
 }
 
@@ -152,10 +177,22 @@ fn terminal_authority_coverage_and_implementation_claims_fail_closed() {
     ));
 
     let mut false_claim = catalog.route_runtime_authority.clone();
-    false_claim.terminal_transitions[0].authority = application_authority();
+    false_claim.terminal_transitions[0].authority = vm11_application_authority();
     assert!(has_violation(
         &authority_violations(&false_claim),
         "is not implemented and must remain denied"
+    ));
+
+    let mut removed_claim = catalog.route_runtime_authority.clone();
+    removed_claim
+        .terminal_transitions
+        .iter_mut()
+        .find(|binding| binding.transition_id == VM04_CHANNEL_REBALANCE_TRANSITION_ID)
+        .expect("VM-04 channel-rebalance authority")
+        .authority = denied_authority();
+    assert!(has_violation(
+        &authority_violations(&removed_claim),
+        "VM-04 channel rebalance must bind its exact implemented Application terminal authority"
     ));
 
     let mut removed_claim = catalog.route_runtime_authority.clone();

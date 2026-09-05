@@ -3105,7 +3105,7 @@ mod tests {
             plan.catalog.snapshot_schema_version,
             "hartevo-catalog-snapshot/v4"
         );
-        assert_eq!(route_graph_version, "desktop-2026-08-12-ct02-v1");
+        assert_eq!(route_graph_version, "desktop-2026-09-05-ct02-v2");
         let mut stale = plan;
         stale.catalog = binding_without_route_graph(&stale.catalog);
         stale.plan_digest = stale.expected_plan_digest().expect("stale plan digest");

@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-mission-route-graph-contract/v2",
-  "contractVersion": "desktop-2026-08-12-ct02-v1",
+  "contractVersion": "desktop-2026-09-05-ct02-v2",
   "evidenceLevel": "E1",
   "runtimeAuthority": {
     "branchExecution": false,
@@ -1097,7 +1097,7 @@
         {
           "id": "vm04.valid-terminal/v2",
           "kind": "valid_mission_terminal",
-          "missionDisposition": null
+          "missionDisposition": "completed"
         }
       ]
     },

@@ -277,7 +277,7 @@ fn validate_contract_header(contract: &RouteGraphContract, violations: &mut Vec<
     require(
         violations,
         contract.schema_version == "hartevo-mission-route-graph-contract/v2"
-            && contract.contract_version == "desktop-2026-08-12-ct02-v1"
+            && contract.contract_version == "desktop-2026-09-05-ct02-v2"
             && contract.evidence_level == "E1",
         "Mission route graphs must use the frozen v2 E1 contract",
     );
@@ -452,8 +452,8 @@ fn validate_terminal_shape(
     violations: &mut Vec<String>,
 ) {
     let expected_id = terminal_id(&mission.id);
-    let expected_disposition =
-        (mission.id == "VM-11").then_some(RouteGraphTerminalDisposition::Completed);
+    let expected_disposition = matches!(mission.id.as_str(), "VM-04" | "VM-11")
+        .then_some(RouteGraphTerminalDisposition::Completed);
     require(
         violations,
         graph.terminals.as_slice().first().is_some_and(|terminal| {

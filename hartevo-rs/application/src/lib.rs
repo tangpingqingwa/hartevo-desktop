@@ -51,7 +51,9 @@ use hartevo_browser_adapter::{
     FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle, TrustedBrowserRecipeKey,
 };
 use hartevo_catalog::{
-    CapabilityManifest, Catalog, CatalogError, MissionManifest, RouteTerminalExecutionAuthority,
+    ApplicationHandlerRouteTerminalExecutionAuthorityKind, CapabilityManifest, Catalog,
+    CatalogError, MissionManifest, RouteGraphTerminalDisposition, RouteTerminalAuthorityExecutor,
+    RouteTerminalCompletionPolicy, RouteTerminalExecutionAuthority,
 };
 use hartevo_cloud_storage::{
     CellScope, CloudMutationResult, CloudProjectRegistration, CloudStorageError, DataCell,
@@ -5021,7 +5023,7 @@ fn vm04_engagement_referral_review_application_evidence(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the final proof keeps the exact engagement predecessor, current goal, conservative no-change decision, and denied terminal authority visible at one completion boundary"
+    reason = "the final proof keeps the exact engagement predecessor, current goal, conservative no-change decision, and typed terminal authority visible at one completion boundary"
 )]
 fn vm04_channel_rebalance_application_evidence(
     mission: &Mission,
@@ -5066,12 +5068,17 @@ fn vm04_channel_rebalance_application_evidence(
         .application_evidence
         .as_ref()
         .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
-    let terminal_authority = catalog
+    let terminal_binding = catalog
         .route_runtime_authority
         .terminal_transitions
         .iter()
         .find(|binding| binding.transition_id == "vm04.channel_rebalance.to.valid-terminal/v2")
         .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let RouteTerminalExecutionAuthority::ApplicationHandler(terminal_authority) =
+        &terminal_binding.authority
+    else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
     let expected_oracles = BTreeSet::from([
         "decision".into(),
         "goal".into(),
@@ -5117,14 +5124,19 @@ fn vm04_channel_rebalance_application_evidence(
         || engagement_evidence.digest() != engagement_completion.evidence_digest
         || engagement_evidence.observed_at != engagement_completion.verified_at
         || engagement_completion.verified_at > now
-        || terminal_authority.mission_id != "VM-04"
-        || terminal_authority.mission_version != 3
-        || terminal_authority.source_checkpoint_id != checkpoint.id
-        || terminal_authority.terminal_id != "vm04.valid-terminal/v2"
-        || !matches!(
-            &terminal_authority.authority,
-            RouteTerminalExecutionAuthority::Denied(_)
-        )
+        || terminal_binding.mission_id != "VM-04"
+        || terminal_binding.mission_version != 3
+        || terminal_binding.source_checkpoint_id != checkpoint.id
+        || terminal_binding.terminal_id != "vm04.valid-terminal/v2"
+        || terminal_authority.kind
+            != ApplicationHandlerRouteTerminalExecutionAuthorityKind::ApplicationHandler
+        || terminal_authority.executor != RouteTerminalAuthorityExecutor::Application
+        || terminal_authority.handler_id != VM04_CHANNEL_REBALANCE_HANDLER_ID
+        || terminal_authority.implementation_crate != "hartevo-application"
+        || terminal_authority.completion_policy
+            != RouteTerminalCompletionPolicy::DeterministicEvidence
+        || terminal_authority.mission_disposition != RouteGraphTerminalDisposition::Completed
+        || !terminal_authority.skipped_checkpoint_ids.is_empty()
     {
         return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
     }
@@ -5175,8 +5187,10 @@ fn vm04_channel_rebalance_application_evidence(
         "automaticChannelMutationAuthority": "denied",
         "runtimeExecutionAuthority": "denied",
         "providerExecutionAuthority": "denied",
-        "terminalTransitionId": &terminal_authority.transition_id,
-        "terminalExecutionAuthority": "denied",
+        "terminalTransitionId": &terminal_binding.transition_id,
+        "terminalId": &terminal_binding.terminal_id,
+        "terminalExecutionAuthority": "application_handler",
+        "terminalMissionDisposition": terminal_authority.mission_disposition,
         "observedAt": now,
     }))?;
     let evidence = MissionCheckpointApplicationEvidence {
@@ -6361,17 +6375,20 @@ fn execute_project_application_checkpoint(
     };
     validate_application_evidence_against_registry(&application_evidence)?;
     let evidence_digest = application_evidence.digest();
-    mission.complete_checkpoint(
-        &command.checkpoint_id,
-        MissionCheckpointCompletion {
-            oracle_ids: route.oracle_ids.clone(),
-            work_product_ids: BTreeSet::new(),
-            effect_ids: BTreeSet::new(),
-            application_evidence: Some(application_evidence),
-            evidence_digest: evidence_digest.clone(),
-            verified_at: now,
-        },
-    )?;
+    let completion = MissionCheckpointCompletion {
+        oracle_ids: route.oracle_ids.clone(),
+        work_product_ids: BTreeSet::new(),
+        effect_ids: BTreeSet::new(),
+        application_evidence: Some(application_evidence),
+        evidence_digest: evidence_digest.clone(),
+        verified_at: now,
+    };
+    let vm04_valid_terminal = handler == CompiledApplicationCheckpointHandler::Vm04ChannelRebalance;
+    if vm04_valid_terminal {
+        mission.complete_vm04_channel_rebalance_terminal(completion)?;
+    } else {
+        mission.complete_checkpoint(&command.checkpoint_id, completion)?;
+    }
     let completed_checkpoint_revision = mission
         .definition
         .as_ref()
@@ -6383,7 +6400,11 @@ fn execute_project_application_checkpoint(
         })
         .map(|checkpoint| checkpoint.revision)
         .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
-    let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
+    let next_started = if vm04_valid_terminal {
+        None
+    } else {
+        start_ready_catalog_checkpoint_in_memory(&mut mission, now)?
+    };
     let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
     let mut events = vec![PendingEvent::new(
         "mission.application_checkpoint_completed",
@@ -6401,6 +6422,22 @@ fn execute_project_application_checkpoint(
         }),
         now,
     )];
+    if vm04_valid_terminal {
+        events.push(PendingEvent::new(
+            "mission.vm04_valid_terminal_resolved",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": command.checkpoint_id,
+                "transitionId": "vm04.channel_rebalance.to.valid-terminal/v2",
+                "terminalId": "vm04.valid-terminal/v2",
+                "handlerId": handler.handler_id(),
+                "missionDisposition": MissionTerminalDisposition::Completed,
+                "completionEvidenceDigest": evidence_digest,
+                "externalEffectExecuted": false,
+            }),
+            now,
+        ));
+    }
     if let Some((checkpoint_id, checkpoint_revision, capability_id, executor, task_id, cycle)) =
         next_started
     {
