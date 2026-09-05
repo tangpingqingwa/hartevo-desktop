@@ -3561,10 +3561,25 @@ impl DesktopDataPlane {
         let service = self.open_read_application_from_secret(&database_secret)?;
         self.require_project_context_access(&service, secret_store, project_id, now)?;
         let mission = service.load_mission(project_id, mission_id)?;
+        let runtime_checkpoint = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.current_checkpoint())
+            .and_then(|checkpoint| {
+                checkpoint
+                    .route
+                    .as_ref()
+                    .map(|route| (checkpoint.status, route))
+            });
         if mission.project_id != *project_id
             || mission.id != *mission_id
-            || mission.definition.is_none()
-            || mission.stage.is_terminal()
+            || mission.stage != MissionStage::Running
+            || runtime_checkpoint.is_none_or(|(status, route)| {
+                status != hartevo_domain_kernel::MissionCheckpointStatus::Running
+                    || route.executor != MissionCheckpointExecutor::Runtime
+                    || route.completion_policy
+                        != Some(MissionCheckpointCompletionPolicy::WorkProduct)
+            })
         {
             return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
         }
@@ -18072,6 +18087,12 @@ sleep 30"#;
 
             let cold_after_publication = DesktopDataPlane::at_data_root(reopened.data_root.clone())
                 .expect("cold Desktop after VM-04 publication");
+            assert!(matches!(
+                cold_after_publication
+                    .load_with(&secrets, handoff_now + Duration::seconds(25))
+                    .expect("unlock cold Desktop after VM-04 publication"),
+                DesktopLoadState::Ready(_)
+            ));
             let (published_service, _) = cold_after_publication
                 .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(25))
                 .expect("cold Application after VM-04 publication");
@@ -18099,8 +18120,9 @@ sleep 30"#;
             );
             assert_eq!(
                 publication_completion.effect_ids,
-                BTreeSet::from([publication_effect_id])
+                BTreeSet::from([publication_effect_id.clone()])
             );
+            let verified_publication = (*publication_effect).clone();
             let publication_event_json = serde_json::to_string(
                 &published_service
                     .mission_events(&project_id, &target_plan.target_mission_id)
@@ -18114,6 +18136,11 @@ sleep 30"#;
             assert!(!publication_event_json.contains(social_scope));
             drop(published_service);
 
+            let durable_before_readback_paint = runtime_subscription_durable_snapshot(
+                &cold_after_publication,
+                &secrets,
+                &project_id,
+            );
             let prepared_readback = cold_after_publication
                 .prepare_catalog_mission_runtime_resume_with(
                     &secrets,
@@ -18129,6 +18156,188 @@ sleep 30"#;
             assert_eq!(
                 prepared_readback.snapshot.runtime_reconciliation,
                 no_runtime_turn_startup_reconciliation()
+            );
+            assert_eq!(
+                runtime_subscription_durable_snapshot(
+                    &cold_after_publication,
+                    &secrets,
+                    &project_id,
+                ),
+                durable_before_readback_paint
+            );
+
+            let mut readback_paint = DesktopRuntimeExecutionPaintState::default();
+            let readback_commit = readback_paint
+                .commit_catalog_start(prepared_readback.handle)
+                .expect("commit the exact provider-readback handle for paint");
+            assert_eq!(
+                runtime_subscription_durable_snapshot(
+                    &cold_after_publication,
+                    &secrets,
+                    &project_id,
+                ),
+                durable_before_readback_paint,
+                "pre-paint commit must not dispatch or mutate Runtime"
+            );
+            let readback_launch = readback_paint
+                .acknowledge_rendered_paint(&readback_commit)
+                .expect("acknowledge the exact provider-readback paint");
+            let (_, _, readback_authority) = readback_launch.into_dispatch_parts();
+            assert!(readback_authority.is_exact_post_render_authority());
+            assert_eq!(
+                runtime_subscription_durable_snapshot(
+                    &cold_after_publication,
+                    &secrets,
+                    &project_id,
+                ),
+                durable_before_readback_paint,
+                "paint acknowledgement alone must not execute Runtime"
+            );
+
+            let resumed_readback = cold_after_publication
+                .resume_catalog_mission_runtime_with_cancellation(
+                    &secrets,
+                    readback_authority,
+                    Some(completed_runtime_fixture_source()),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    handoff_now + Duration::seconds(27),
+                )
+                .expect("run provider_readback only after the exact paint gate");
+            let readback_work_product_id = match resumed_readback.runtime_outcome {
+                DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id,
+                outcome => panic!("unexpected provider-readback Runtime outcome: {outcome:?}"),
+            };
+            assert_ne!(readback_work_product_id, third_work_product_id);
+            let durable_after_readback_runtime = runtime_subscription_durable_snapshot(
+                &cold_after_publication,
+                &secrets,
+                &project_id,
+            );
+            assert_eq!(
+                durable_after_readback_runtime.runtime_attempts.row_count,
+                durable_before_readback_paint
+                    .runtime_attempts
+                    .row_count
+                    .saturating_add(1),
+                "the paint-authorized readback route runs exactly one Runtime attempt"
+            );
+
+            let cold_after_readback = DesktopDataPlane::at_data_root(reopened.data_root.clone())
+                .expect("cold Desktop after provider-readback Runtime");
+            let (readback_service, _) = cold_after_readback
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(28))
+                .expect("cold Application after provider-readback Runtime");
+            let readback_target = readback_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 after provider-readback Runtime");
+            assert_eq!(
+                readback_target.definition.as_ref().map_or(0, |definition| {
+                    definition
+                        .checkpoints
+                        .iter()
+                        .filter(|checkpoint| {
+                            checkpoint.status
+                                == hartevo_domain_kernel::MissionCheckpointStatus::Completed
+                        })
+                        .count()
+                }),
+                6,
+                "Runtime completion alone cannot complete provider_readback"
+            );
+            assert_eq!(
+                readback_target.effect(&publication_effect_id),
+                Ok(&verified_publication),
+                "readback Runtime cannot revise the verified publication Effect"
+            );
+            let readback_work_product = readback_target
+                .work_products
+                .iter()
+                .find(|work_product| work_product.id == readback_work_product_id)
+                .cloned()
+                .expect("durable provider-readback Runtime WorkProduct");
+            assert_eq!(
+                readback_work_product.status,
+                hartevo_domain_kernel::WorkProductStatus::ReadyForReview
+            );
+            let readback_manifest = readback_service
+                .load_work_product_manifest(&project_id, &readback_work_product_id)
+                .expect("provider-readback Runtime manifest");
+            let readback_event_json = serde_json::to_string(
+                &readback_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("content-free VM-04 events after readback Runtime"),
+            )
+            .expect("readback event JSON");
+            assert!(!readback_event_json.contains(private_approval));
+            assert!(!readback_event_json.contains("page_desktop_vm04_private"));
+            assert!(!readback_event_json.contains(social_scope));
+            assert!(
+                !readback_event_json
+                    .contains("Reviewable local runtime draft; no external effect occurred.")
+            );
+            drop(readback_service);
+
+            let adopted_readback = cold_after_readback
+                .adopt_work_product_with(
+                    &secrets,
+                    DesktopWorkProductAdoptionRequest {
+                        project_id: project_id.clone(),
+                        mission_id: target_plan.target_mission_id.clone(),
+                        work_product_id: readback_work_product_id,
+                        expected_mission_revision: readback_target.revision,
+                        expected_work_product_revision: readback_work_product.revision,
+                        expected_manifest_version: readback_manifest.version,
+                    },
+                    handoff_now + Duration::seconds(29),
+                )
+                .expect("adopt provider-readback draft and advance to engagement review");
+            let engagement_projection = adopted_readback.inventory.projects[0]
+                .missions
+                .iter()
+                .find(|mission| mission.mission_id == target_plan.target_mission_id)
+                .expect("VM-04 engagement-review projection");
+            assert_eq!(engagement_projection.completed_checkpoint_count, 7);
+            assert_eq!(
+                (
+                    engagement_projection.current_checkpoint_id.as_deref(),
+                    engagement_projection.current_checkpoint_status,
+                    engagement_projection.current_checkpoint_executor,
+                    engagement_projection.current_checkpoint_completion_policy,
+                    engagement_projection.current_checkpoint_application_handler_status,
+                ),
+                (
+                    Some("engagement_and_referral_review"),
+                    Some(hartevo_domain_kernel::MissionCheckpointStatus::Running),
+                    Some(MissionCheckpointExecutor::Application),
+                    Some(MissionCheckpointCompletionPolicy::DeterministicEvidence),
+                    Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
+                )
+            );
+            assert!(matches!(
+                cold_after_readback.prepare_catalog_mission_runtime_resume_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(30),
+                ),
+                Err(DesktopDataError::Application(
+                    ApplicationError::LocalRuntimeMissionNotSchedulable
+                ))
+            ));
+            let engagement_boundary = cold_after_readback
+                .execute_application_mission_checkpoint_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(31),
+                )
+                .expect("report the honest unimplemented engagement-review boundary");
+            assert_eq!(
+                engagement_boundary.runtime_outcome,
+                DesktopMissionRuntimeOutcome::ApplicationCheckpointNotImplemented {
+                    checkpoint_id: "engagement_and_referral_review".into(),
+                    capability_id: "attribution.compute".into(),
+                }
             );
         }
         drop(directory);
