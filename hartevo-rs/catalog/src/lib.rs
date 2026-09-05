@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 14, 38)
+            (52, 15, 37)
         );
         assert_eq!(
             catalog
@@ -1732,6 +1732,12 @@ mod tests {
                 .application_handler("VM-00", 3, "mission_handoff")
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm00.local-mission-handoff/v1")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-04", 3, "account_scope_probe")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm04.account-scope-probe/v1")
         );
         assert_eq!(
             catalog

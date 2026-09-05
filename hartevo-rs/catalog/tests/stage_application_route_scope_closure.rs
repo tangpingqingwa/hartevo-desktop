@@ -111,8 +111,8 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
     );
     assert_eq!(foundation.summary.eligible_mission_count, 7);
     assert_eq!(foundation.summary.application_route_count, 29);
-    assert_eq!(foundation.summary.implemented_handler_count, 14);
-    assert_eq!(foundation.summary.not_implemented_handler_count, 15);
+    assert_eq!(foundation.summary.implemented_handler_count, 15);
+    assert_eq!(foundation.summary.not_implemented_handler_count, 14);
     assert_eq!(foundation.summary.terminal_count, 7);
     assert_eq!(foundation.summary.terminal_transition_count, 8);
     assert_eq!(foundation.summary.application_terminal_transition_count, 7);
@@ -137,8 +137,8 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
     let beta = scope(scopes, ReleaseStage::ControlledBeta);
     assert_eq!(beta.summary.eligible_mission_count, 6);
     assert_eq!(beta.summary.application_route_count, 22);
-    assert_eq!(beta.summary.implemented_handler_count, 0);
-    assert_eq!(beta.summary.not_implemented_handler_count, 22);
+    assert_eq!(beta.summary.implemented_handler_count, 1);
+    assert_eq!(beta.summary.not_implemented_handler_count, 21);
     assert_eq!(beta.summary.terminal_count, 6);
     assert_eq!(beta.summary.terminal_transition_count, 6);
     assert_eq!(beta.summary.application_terminal_transition_count, 5);
@@ -148,8 +148,8 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
 fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
     assert_eq!(ga.summary.eligible_mission_count, 12);
     assert_eq!(ga.summary.application_route_count, 52);
-    assert_eq!(ga.summary.implemented_handler_count, 14);
-    assert_eq!(ga.summary.not_implemented_handler_count, 38);
+    assert_eq!(ga.summary.implemented_handler_count, 15);
+    assert_eq!(ga.summary.not_implemented_handler_count, 37);
     assert_eq!(ga.summary.terminal_count, 12);
     assert_eq!(ga.summary.terminal_transition_count, 13);
     assert_eq!(ga.summary.application_terminal_transition_count, 12);
@@ -171,7 +171,7 @@ fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
             .iter()
             .filter(|route| route.handler.status == StageApplicationHandlerStatus::Implemented)
             .count(),
-        14
+        15
     );
     assert!(routes.iter().all(|route| {
         match (
@@ -185,7 +185,7 @@ fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
                 StageApplicationRouteAuthority::RegisteredApplicationHandler { handler_id, .. },
             ) => {
                 handler.handler_id == *handler_id
-                    && matches!(handler.mission_id.as_str(), "VM-00" | "VM-11")
+                    && matches!(handler.mission_id.as_str(), "VM-00" | "VM-04" | "VM-11")
             }
             (
                 StageApplicationHandlerStatus::NotImplemented,
@@ -215,7 +215,7 @@ fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
                 .and_then(serde_json::Value::as_str)
                 == Some("NOT_IMPLEMENTED"))
             .count(),
-        38
+        37
     );
     assert!(
         wire_routes

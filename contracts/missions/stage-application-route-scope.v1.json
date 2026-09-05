@@ -5,7 +5,7 @@
   "releaseEvidenceSchemaVersion": "2.3.0",
   "missionCatalogVersion": "desktop-2026-08-12-v11",
   "routeGraphContractVersion": "desktop-2026-08-12-ct02-v1",
-  "applicationHandlerRegistryVersion": "desktop-2026-09-05-v14",
+  "applicationHandlerRegistryVersion": "desktop-2026-09-05-v15",
   "routeRuntimeAuthorityContractVersion": "desktop-2026-08-13-ct03-v1",
   "defaultMissingHandlerStatus": "NOT_IMPLEMENTED",
   "genericRuntimeAuthority": "denied",

@@ -15750,7 +15750,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves the VM-00 local Project foundations, atomic frozen-target handoff, exact target redirect/replay, painted Cordis Runtime resume, SQLCipher recovery, and content-free evidence"
+        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, two painted Cordis Runtime turns around the source-fenced account probe, SQLCipher recovery, and content-free evidence"
     )]
     fn vm00_handoff_redirects_frozen_target_into_painted_runtime_resume_after_encrypted_reopen() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -16997,6 +16997,206 @@ sleep 30"#;
             );
             assert_eq!(executor.calls, 1);
             assert_eq!(verifier.calls, 1);
+
+            let first_product = runtime_target
+                .work_products
+                .iter()
+                .find(|work_product| work_product.id == work_product_id)
+                .expect("first VM-04 Runtime WorkProduct");
+            let first_manifest = cold_service
+                .load_work_product_manifest(&project_id, &work_product_id)
+                .expect("first VM-04 Runtime manifest");
+            let first_runtime_revision = runtime_target.revision;
+            let first_product_revision = first_product.revision;
+            drop(cold_service);
+            let adopted = reopened
+                .adopt_work_product_with(
+                    &secrets,
+                    DesktopWorkProductAdoptionRequest {
+                        project_id: project_id.clone(),
+                        mission_id: target_plan.target_mission_id.clone(),
+                        work_product_id: work_product_id.clone(),
+                        expected_mission_revision: first_runtime_revision,
+                        expected_work_product_revision: first_product_revision,
+                        expected_manifest_version: first_manifest.version,
+                    },
+                    handoff_now + Duration::seconds(6),
+                )
+                .expect("adopt first Runtime draft and advance its exact Checkpoint");
+            let adopted_target = adopted.inventory.projects[0]
+                .missions
+                .iter()
+                .find(|mission| mission.mission_id == target_plan.target_mission_id)
+                .expect("adopted VM-04 projection");
+            assert_eq!(adopted_target.completed_checkpoint_count, 1);
+            assert_eq!(
+                (
+                    adopted_target.current_checkpoint_id.as_deref(),
+                    adopted_target.current_checkpoint_executor,
+                    adopted_target
+                        .current_checkpoint_application_handler_id
+                        .as_deref(),
+                ),
+                (
+                    Some("account_scope_probe"),
+                    Some(MissionCheckpointExecutor::Application),
+                    Some("vm04.account-scope-probe/v1"),
+                )
+            );
+
+            let (mut cold_service, _) = reopened
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(7))
+                .expect("Application after first VM-04 WorkProduct adoption");
+
+            let social_connection_id = ConnectionId::from("desktop-vm04-meta-connection");
+            let social_scope = "pages_manage_posts";
+            cold_service
+                .register_connection(
+                    Connection::register(
+                        social_connection_id.clone(),
+                        runtime_target.tenant_id.clone(),
+                        project_id.clone(),
+                        "meta",
+                        AccountId::from("desktop-vm04-social-account"),
+                        "page_desktop_vm04_private",
+                        [social_scope.into()],
+                        handoff_now + Duration::seconds(8),
+                    )
+                    .expect("VM-04 social Connection"),
+                    handoff_now + Duration::seconds(8),
+                )
+                .expect("persist VM-04 social Connection");
+            cold_service
+                .record_connection_probe(
+                    &project_id,
+                    &social_connection_id,
+                    ConnectionProbe {
+                        outcome: ProbeOutcome::Successful,
+                        observed_external_account_id: "page_desktop_vm04_private".into(),
+                        granted_scopes: BTreeSet::from([social_scope.into()]),
+                        probed_at: handoff_now + Duration::seconds(9),
+                        valid_until: handoff_now + Duration::hours(1),
+                        credential_expires_at: handoff_now + Duration::hours(2),
+                        evidence_digest: "8".repeat(64),
+                    },
+                    handoff_now + Duration::seconds(9),
+                )
+                .expect("probe exact VM-04 social Connection");
+            drop(cold_service);
+
+            let routed = reopened
+                .execute_application_mission_checkpoint_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(10),
+                )
+                .expect("complete VM-04 account scope and route the same Mission");
+            assert_eq!(routed.mission_id, target_plan.target_mission_id);
+            assert_eq!(
+                routed.runtime_outcome,
+                DesktopMissionRuntimeOutcome::CheckpointRouted {
+                    checkpoint_id: "pillar_calendar".into(),
+                    capability_id: "content.draft".into(),
+                    executor: MissionCheckpointExecutor::Runtime,
+                    oracle_ids: BTreeSet::from([
+                        "decision".into(),
+                        "operating_state".into(),
+                        "work_product".into(),
+                    ]),
+                    completion_policy: MissionCheckpointCompletionPolicy::WorkProduct,
+                    state: MissionCheckpointDispatchState::Ready,
+                }
+            );
+            let prepared_next = reopened
+                .prepare_catalog_mission_runtime_resume_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(11),
+                )
+                .expect("prepare same-Mission pillar Runtime handle without executing it");
+            assert_eq!(
+                prepared_next.handle.mission_id(),
+                &target_plan.target_mission_id
+            );
+            let resumed_next = reopened
+                .resume_catalog_mission_runtime_with_cancellation(
+                    &secrets,
+                    catalog_runtime_authority(prepared_next.handle),
+                    Some(completed_runtime_fixture_source()),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    handoff_now + Duration::seconds(12),
+                )
+                .expect("run pillar_calendar only after the exact paint gate");
+            let second_work_product_id = match resumed_next.runtime_outcome {
+                DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id,
+                outcome => panic!("unexpected pillar Runtime outcome: {outcome:?}"),
+            };
+            assert_ne!(second_work_product_id, work_product_id);
+
+            let cold_after_pillar = DesktopDataPlane::at_data_root(reopened.data_root.clone())
+                .expect("cold Desktop after pillar Runtime");
+            let (final_service, _) = cold_after_pillar
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(13))
+                .expect("cold Application after pillar Runtime");
+            let final_target = final_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 after pillar Runtime");
+            assert_eq!(
+                final_target.definition.as_ref().map_or(0, |definition| {
+                    definition
+                        .checkpoints
+                        .iter()
+                        .filter(|checkpoint| {
+                            checkpoint.status
+                                == hartevo_domain_kernel::MissionCheckpointStatus::Completed
+                        })
+                        .count()
+                }),
+                2
+            );
+            assert!(final_target.work_products.iter().any(|work_product| {
+                work_product.id == second_work_product_id
+                    && work_product.status
+                        == hartevo_domain_kernel::WorkProductStatus::ReadyForReview
+            }));
+            let account_scope_evidence = final_target
+                .definition
+                .as_ref()
+                .and_then(|definition| {
+                    definition
+                        .checkpoints
+                        .iter()
+                        .find(|checkpoint| checkpoint.id == "account_scope_probe")
+                })
+                .and_then(|checkpoint| checkpoint.completion.as_ref())
+                .and_then(|completion| completion.application_evidence.as_ref())
+                .expect("durable VM-04 account-scope evidence");
+            assert_eq!(
+                account_scope_evidence.handler_id,
+                "vm04.account-scope-probe/v1"
+            );
+            let final_conversation = final_service
+                .mission_conversation(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 Conversation after pillar Runtime");
+            assert_eq!(final_conversation.revision, 4);
+            assert_eq!(
+                final_conversation.messages[2].kind,
+                MissionConversationMessageKind::Steering
+            );
+            let final_event_json = serde_json::to_string(
+                &final_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("content-free VM-04 events after pillar Runtime"),
+            )
+            .expect("final target event JSON");
+            assert!(final_event_json.contains("vm04.account-scope-probe/v1"));
+            assert!(!final_event_json.contains("page_desktop_vm04_private"));
+            assert!(!final_event_json.contains(social_scope));
+            assert!(!final_event_json.contains(
+                "Adopt the reviewed Runtime WorkProduct and continue the contracted Mission."
+            ));
         }
         drop(directory);
     }
