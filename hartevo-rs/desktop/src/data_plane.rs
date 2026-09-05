@@ -29,19 +29,20 @@ use hartevo_application::{
     AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
     AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
     ApplicationService, ApproveProposedEffect, BrowserPublicSourceObservation,
-    CatalogMissionExecutionHandle, CompleteVm00BillingCheckout, ConfirmHumanMissionCheckpoint,
-    ConfirmVm00GoalSelection, ContinueBrowserWorkspace, CordisMissionDraft, CordisMissionTurnPlan,
-    CreateBrowserWorkspace, CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
-    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
-    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
-    ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
-    KeyAdministrationAuthorization, MissionCheckpointDispatch, MissionCheckpointDispatchState,
-    MissionRuntimeProjection, ObservationClassification, ObservationEvidencePack,
-    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
-    ObservationPlanBinding, ObservationSourceBinding, ObservationSourceKind,
-    ObserveContextRuntimeTurn, PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext,
-    PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProposePreviewEffect, ProposeVm00BillingCheckout, ProvisionProjectEncryption,
+    CatalogMissionExecutionHandle, CompleteVm00BillingCheckout, CompleteVm04Publication,
+    ConfirmHumanMissionCheckpoint, ConfirmVm00GoalSelection, ContinueBrowserWorkspace,
+    CordisMissionDraft, CordisMissionTurnPlan, CreateBrowserWorkspace, CreateProject,
+    DecideVm11OutcomeReview, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
+    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
+    ExecuteApplicationMissionCheckpoint, ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn,
+    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatch,
+    MissionCheckpointDispatchState, MissionRuntimeProjection, ObservationClassification,
+    ObservationEvidencePack, ObservationPipelineError, ObservationPipelineRequest,
+    ObservationPipelineResult, ObservationPlanBinding, ObservationSourceBinding,
+    ObservationSourceKind, ObserveContextRuntimeTurn, PauseBrowserWorkspace,
+    PrepareLocalMissionRuntimeContext, PreparedLocalMissionRuntimeContext,
+    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProposePreviewEffect,
+    ProposeVm00BillingCheckout, ProposeVm04Publication, ProvisionProjectEncryption,
     ReadBrowserPublicSource, ReconcileUncertainEffect, RecoverContextWorkerRuntime,
     RecoverPersonalProjectDevice, RelationshipConversationProjection, ResearchPacket,
     ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
@@ -50,8 +51,10 @@ use hartevo_application::{
     RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission, TakeOverBrowserWorkspace,
     TypedRuntimeObservation, VM00_BILLING_CHECKOUT_CAPABILITY, VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
     VM00_BILLING_CHECKOUT_POLICY_VERSION, VM00_BILLING_CHECKOUT_REQUIRED_SCOPE,
+    VM04_PUBLICATION_CAPABILITY, VM04_PUBLICATION_CHECKPOINT_ID, VM04_PUBLICATION_POLICY_VERSION,
     VerifyRecordedReceiptAtRevision, Vm00TargetMissionSelection,
     Vm11NextContractOrValidTerminalResult, vm00_billing_checkout_effect_policy,
+    vm04_publication_effect_policy,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserLeaseProof,
@@ -6896,6 +6899,86 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Proposes one exact VM-04 publication through Cordis. Success stops at
+    /// WaitingApproval; no Provider, Receipt, or Verification is invoked.
+    pub fn propose_vm04_publication_os(
+        &self,
+        command: &ProposeVm04Publication,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.propose_vm04_publication_with(&secret_store, command, now)
+    }
+
+    pub fn propose_vm04_publication_with(
+        &self,
+        secret_store: &impl SecretStore,
+        command: &ProposeVm04Publication,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if command.expected_mission_revision == 0
+            || command.expected_checkpoint_revision == 0
+            || command.expected_connection_revision == 0
+            || command.expected_work_product_revision == 0
+            || command.expected_manifest_version == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || command.required_scopes.is_empty()
+            || command.idempotency_key.trim().is_empty()
+            || command.expires_at <= now
+        {
+            return Err(DesktopDataError::InvalidVm04Publication);
+        }
+        let project_id = command.project_id.clone();
+        let mission_id = command.mission_id.clone();
+        let expected_mission_revision = command.expected_mission_revision;
+        let effect_id = command.effect_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+        if scope.mission_revision() != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: scope.mission_revision(),
+            }
+            .into());
+        }
+        let proposal_digest = vm04_publication_authority_digest(&scope, command, now)?;
+        let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+        let domain_command =
+            DomainCommandBinding::propose_effect(effect_id.as_str(), proposal_digest.clone())?;
+        map_domain_command_dispatch_result(dispatch_live_domain_command(
+            &self.cordis,
+            DesktopDomainCommandAuthorization::new(scope, domain_command),
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+                if &current_scope != permit.scope()
+                    || permit.command().kind() != DomainCommandKind::ProposeEffect
+                    || permit.command().effect_id() != effect_id.as_str()
+                    || permit.command().proposal_digest() != Some(proposal_digest.as_str())
+                    || permit.command().approval_scope_digest().is_some()
+                {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                let proposed = service.propose_vm04_publication(command, now)?;
+                if proposed != effect_id {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                Ok(())
+            },
+        ))?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
+            now,
+        )
+    }
+
     /// Propose one preview Effect through the exact Cordis Domain-command
     /// seam. Success stops at Domain Kernel `Proposed` plus the durable
     /// `approval.requested` event; it grants no execution or provider access.
@@ -7038,6 +7121,13 @@ impl DesktopDataPlane {
             .clone();
         let broker = if proposed_effect.capability == VM00_BILLING_CHECKOUT_CAPABILITY {
             Self::vm00_billing_checkout_broker(&mission, &proposed_effect)?
+        } else if proposed_effect.capability == VM04_PUBLICATION_CAPABILITY
+            && mission
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.manifest_id == "VM-04")
+        {
+            Self::vm04_publication_broker(&mission, &proposed_effect)?
         } else {
             Self::waiting_approval_broker()
         };
@@ -7366,6 +7456,174 @@ impl DesktopDataPlane {
         )?;
         Ok(DesktopApprovedEffectExecution {
             snapshot,
+            disposition: executed.disposition,
+            receipt_id,
+            verification_id,
+            verification_status,
+            verification_independent,
+        })
+    }
+
+    /// Executes one exact approved VM-04 publication, independently verifies
+    /// it, and atomically advances to `provider_readback`. Re-entry after a
+    /// durable Verification or completion never calls the executor again.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "first execution, post-Verification recovery, and completed replay remain explicit at the Desktop authority boundary"
+    )]
+    pub fn execute_vm04_publication_with<Executor, Verifier>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: &DesktopApprovedEffectExecutionRequest,
+        work_product_id: &WorkProductId,
+        executor: &mut Executor,
+        verifier: &mut Verifier,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopApprovedEffectExecution, DesktopDataError>
+    where
+        Executor: EffectExecutor,
+        Verifier: EffectVerifier,
+    {
+        if request.expected_mission_revision == 0
+            || request.effect_id.as_str().trim().is_empty()
+            || work_product_id.as_str().trim().is_empty()
+            || !is_canonical_sha256(&request.expected_scope_digest)
+            || !is_canonical_sha256(&request.expected_broker_authorization_digest)
+        {
+            return Err(DesktopDataError::InvalidVm04Publication);
+        }
+        let project_id = request.project_id.clone();
+        let mission_id = request.mission_id.clone();
+        let effect_id = request.effect_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+
+        if vm04_publication_completion_is_durable(&mission, &effect, work_product_id)? {
+            let (receipt, verification) =
+                verified_vm04_publication_projection(&mission, &effect, request, work_product_id)?;
+            let output = DesktopApprovedEffectExecution {
+                snapshot: self.build_snapshot(
+                    &service,
+                    secret_store,
+                    runtime_reconciliation,
+                    load_product_evidence(now)?,
+                    now,
+                )?,
+                disposition: ExecutionDisposition::AlreadyVerified,
+                receipt_id: receipt.id.clone(),
+                verification_id: verification.id.clone(),
+                verification_status: verification.status.clone(),
+                verification_independent: verification.independent,
+            };
+            return Ok(output);
+        }
+
+        if effect.status == EffectStatus::Verified {
+            Self::vm04_publication_broker(&mission, &effect)?;
+            let (receipt, verification) =
+                verified_vm04_publication_projection(&mission, &effect, request, work_product_id)?;
+            let receipt_id = receipt.id.clone();
+            let verification_id = verification.id.clone();
+            let verification_status = verification.status.clone();
+            let verification_independent = verification.independent;
+            let completed_at = std::cmp::max(now, verification.observed_at);
+            let checkpoint_revision = mission
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.current_checkpoint())
+                .filter(|checkpoint| {
+                    checkpoint.id == VM04_PUBLICATION_CHECKPOINT_ID
+                        && checkpoint.status
+                            == hartevo_domain_kernel::MissionCheckpointStatus::Verifying
+                })
+                .map(|checkpoint| checkpoint.revision)
+                .ok_or(DesktopDataError::InvalidVm04Publication)?;
+            service.complete_vm04_publication(
+                &CompleteVm04Publication {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: effect_id.clone(),
+                    work_product_id: work_product_id.clone(),
+                    expected_mission_revision: mission.revision,
+                    expected_checkpoint_revision: checkpoint_revision,
+                },
+                completed_at,
+            )?;
+            return Ok(DesktopApprovedEffectExecution {
+                snapshot: self.build_snapshot(
+                    &service,
+                    secret_store,
+                    runtime_reconciliation,
+                    load_product_evidence(completed_at)?,
+                    completed_at,
+                )?,
+                disposition: ExecutionDisposition::AlreadyVerified,
+                receipt_id,
+                verification_id,
+                verification_status,
+                verification_independent,
+            });
+        }
+
+        let mut broker = Self::vm04_publication_broker(&mission, &effect)?;
+        drop(service);
+        let executed = self.execute_approved_effect_with(
+            secret_store,
+            (*request).clone(),
+            &mut broker,
+            executor,
+            verifier,
+            now,
+        )?;
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+        let (receipt, verification) =
+            verified_vm04_publication_projection(&mission, &effect, request, work_product_id)?;
+        let receipt_id = receipt.id.clone();
+        let verification_id = verification.id.clone();
+        let verification_status = verification.status.clone();
+        let verification_independent = verification.independent;
+        let completed_at = std::cmp::max(now, verification.observed_at);
+        let checkpoint_revision = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.current_checkpoint())
+            .filter(|checkpoint| {
+                checkpoint.id == VM04_PUBLICATION_CHECKPOINT_ID
+                    && checkpoint.status
+                        == hartevo_domain_kernel::MissionCheckpointStatus::Verifying
+            })
+            .map(|checkpoint| checkpoint.revision)
+            .ok_or(DesktopDataError::InvalidVm04Publication)?;
+        service.complete_vm04_publication(
+            &CompleteVm04Publication {
+                project_id,
+                mission_id,
+                effect_id,
+                work_product_id: work_product_id.clone(),
+                expected_mission_revision: mission.revision,
+                expected_checkpoint_revision: checkpoint_revision,
+            },
+            completed_at,
+        )?;
+        Ok(DesktopApprovedEffectExecution {
+            snapshot: self.build_snapshot(
+                &service,
+                secret_store,
+                runtime_reconciliation,
+                load_product_evidence(completed_at)?,
+                completed_at,
+            )?,
             disposition: executed.disposition,
             receipt_id,
             verification_id,
@@ -10285,6 +10543,17 @@ impl DesktopDataPlane {
         .with_lease_for(Duration::days(36_500)))
     }
 
+    fn vm04_publication_broker(
+        mission: &Mission,
+        effect: &Effect,
+    ) -> Result<EffectBroker, DesktopDataError> {
+        Ok(EffectBroker::new(
+            vm04_publication_effect_policy(mission, effect)?,
+            "desktop-vm04-publication-worker",
+        )
+        .with_lease_for(Duration::days(36_500)))
+    }
+
     fn finish_mission_submission(
         &self,
         service: &ApplicationService,
@@ -11217,6 +11486,37 @@ fn vm00_billing_checkout_authority_digest(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn vm04_publication_authority_digest(
+    scope: &AuthorityScope,
+    command: &ProposeVm04Publication,
+    proposed_at: DateTime<Utc>,
+) -> Result<String, DesktopDataError> {
+    let encoded = command
+        .authority_payload_bytes()
+        .map_err(|_| DesktopDataError::InvalidVm04Publication)?;
+    let mut hasher = Sha256::new();
+    effect_proposal_authority_field(
+        &mut hasher,
+        "domain",
+        b"hartevo.cordis.vm04-publication-authority/v1",
+    );
+    effect_proposal_authority_field(&mut hasher, "tenant", scope.tenant_id().as_bytes());
+    effect_proposal_authority_field(&mut hasher, "project", scope.project_id().as_bytes());
+    effect_proposal_authority_field(&mut hasher, "mission", scope.mission_id().as_bytes());
+    effect_proposal_authority_field(
+        &mut hasher,
+        "mission_revision",
+        &scope.mission_revision().to_be_bytes(),
+    );
+    effect_proposal_authority_field(
+        &mut hasher,
+        "proposed_at",
+        proposed_at.to_rfc3339().as_bytes(),
+    );
+    effect_proposal_authority_field(&mut hasher, "publication", &encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn verified_vm00_billing_checkout_projection<'a>(
     effect: &'a Effect,
     request: &DesktopApprovedEffectExecutionRequest,
@@ -11305,6 +11605,155 @@ fn vm00_billing_checkout_completion_is_durable(
         || completion.verified_at != verification.observed_at
     {
         return Err(DesktopDataError::InvalidVm00BillingCheckout);
+    }
+    Ok(true)
+}
+
+fn verified_vm04_publication_projection<'a>(
+    mission: &'a Mission,
+    effect: &'a Effect,
+    request: &DesktopApprovedEffectExecutionRequest,
+    work_product_id: &WorkProductId,
+) -> Result<(&'a Receipt, &'a Verification), DesktopDataError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let publication_route = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == VM04_PUBLICATION_CHECKPOINT_ID)
+        .and_then(|checkpoint| checkpoint.route.as_ref())
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let selected = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "selective_approval")
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+        .is_some_and(|completion| {
+            completion.work_product_ids == BTreeSet::from([work_product_id.clone()])
+        });
+    let work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| &work_product.id == work_product_id)
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let approval = effect
+        .approval
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let target_prefix = format!(
+        "publication://{}/{}/",
+        effect.provider,
+        effect
+            .connection_id
+            .as_ref()
+            .ok_or(DesktopDataError::InvalidVm04Publication)?
+    );
+    if definition.manifest_id != "VM-04"
+        || definition.manifest_version != 3
+        || publication_route.capability_id != VM04_PUBLICATION_CAPABILITY
+        || publication_route.executor != MissionCheckpointExecutor::EffectBroker
+        || publication_route.completion_policy
+            != Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
+        || publication_route.oracle_ids
+            != BTreeSet::from([
+                "effect".into(),
+                "operating_state".into(),
+                "work_product".into(),
+            ])
+        || !selected
+        || work_product.status != hartevo_domain_kernel::WorkProductStatus::Accepted
+        || effect.tenant_id != mission.tenant_id
+        || effect.project_id != request.project_id
+        || effect.mission_id != request.mission_id
+        || effect.id != request.effect_id
+        || effect.capability != VM04_PUBLICATION_CAPABILITY
+        || effect.effect_class != EffectClass::ExternalWrite
+        || effect.connection_id.is_none()
+        || effect.account_id.is_none()
+        || effect.required_scopes.is_empty()
+        || effect.description != "Publish the selected VM-04 native WorkProduct"
+        || !effect.target_resource.starts_with(&target_prefix)
+        || effect.payload_digest != work_product.content_digest
+        || effect.asset_digests.len() != 1
+        || effect.policy_version != VM04_PUBLICATION_POLICY_VERSION
+        || effect.risk != hartevo_domain_kernel::EffectRisk::High
+        || effect.amount.amount_minor != 0
+        || effect.amount.currency != mission.contract.budget.currency
+        || effect.status != EffectStatus::Verified
+        || approval.decision != ApprovalDecision::Approved
+        || approval.scope_digest != effect.approval_digest()
+        || approval.scope_digest != request.expected_scope_digest
+        || approval.permission_digest != request.expected_broker_authorization_digest
+        || !is_canonical_sha256(&approval.permission_digest)
+        || receipt.provider != effect.provider
+        || receipt.request_digest != effect.approval_digest()
+        || verification.status != VerificationStatus::Confirmed
+        || !verification.independent
+        || verification.receipt_id != receipt.id
+        || verification.observed_at < receipt.accepted_at
+    {
+        return Err(DesktopDataError::InvalidVm04Publication);
+    }
+    Ok((receipt, verification))
+}
+
+fn vm04_publication_completion_is_durable(
+    mission: &Mission,
+    effect: &Effect,
+    work_product_id: &WorkProductId,
+) -> Result<bool, DesktopDataError> {
+    let checkpoint = mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == VM04_PUBLICATION_CHECKPOINT_ID)
+        })
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    if checkpoint.status != hartevo_domain_kernel::MissionCheckpointStatus::Completed {
+        return Ok(false);
+    }
+    let route = checkpoint
+        .route
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let completion = checkpoint
+        .completion
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm04Publication)?;
+    if route.capability_id != VM04_PUBLICATION_CAPABILITY
+        || route.executor != MissionCheckpointExecutor::EffectBroker
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
+        || route.oracle_ids
+            != BTreeSet::from([
+                "effect".into(),
+                "operating_state".into(),
+                "work_product".into(),
+            ])
+        || completion.oracle_ids != route.oracle_ids
+        || completion.work_product_ids != BTreeSet::from([work_product_id.clone()])
+        || completion.effect_ids != BTreeSet::from([effect.id.clone()])
+        || completion.application_evidence.is_some()
+        || !is_canonical_sha256(&completion.evidence_digest)
+        || completion.verified_at != verification.observed_at
+    {
+        return Err(DesktopDataError::InvalidVm04Publication);
     }
     Ok(true)
 }
@@ -12460,6 +12909,10 @@ pub enum DesktopDataError {
         "VM-00 billing checkout requires the exact current route, connected account, bounded payment digest, and Mission/Checkpoint revisions"
     )]
     InvalidVm00BillingCheckout,
+    #[error(
+        "VM-04 publication requires the exact selected WorkProduct, live Connection, and Mission/Checkpoint source revisions"
+    )]
+    InvalidVm04Publication,
     #[error(
         "Browser Workspace Create requires an exact active Project-scoped Browser Profile and revision from SQLCipher"
     )]
@@ -15750,7 +16203,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, three painted Cordis Runtime turns around the source-fenced account probe, exact Human approval, SQLCipher recovery, and content-free evidence"
+        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, three painted Cordis Runtime turns, source-fenced account probe, exact Human selection, typed publication Effect, SQLCipher recovery, and content-free evidence"
     )]
     fn vm00_handoff_redirects_frozen_target_into_painted_runtime_resume_after_encrypted_reopen() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -17049,6 +17502,7 @@ sleep 30"#;
                 .expect("Application after first VM-04 WorkProduct adoption");
 
             let social_connection_id = ConnectionId::from("desktop-vm04-meta-connection");
+            let social_account_id = AccountId::from("desktop-vm04-social-account");
             let social_scope = "pages_manage_posts";
             cold_service
                 .register_connection(
@@ -17057,7 +17511,7 @@ sleep 30"#;
                         runtime_target.tenant_id.clone(),
                         project_id.clone(),
                         "meta",
-                        AccountId::from("desktop-vm04-social-account"),
+                        social_account_id,
                         "page_desktop_vm04_private",
                         [social_scope.into()],
                         handoff_now + Duration::seconds(8),
@@ -17066,7 +17520,7 @@ sleep 30"#;
                     handoff_now + Duration::seconds(8),
                 )
                 .expect("persist VM-04 social Connection");
-            cold_service
+            let connected_social = cold_service
                 .record_connection_probe(
                     &project_id,
                     &social_connection_id,
@@ -17082,6 +17536,7 @@ sleep 30"#;
                     handoff_now + Duration::seconds(9),
                 )
                 .expect("probe exact VM-04 social Connection");
+            let social_connection_revision = connected_social.revision();
             drop(cold_service);
 
             let routed = reopened
@@ -17372,6 +17827,20 @@ sleep 30"#;
             );
             assert!(effect_projection.pending_effects.is_empty());
             assert_eq!(effect_projection.verified_effect_count, 0);
+            let selected_native_projection = effect_projection
+                .work_products
+                .iter()
+                .find(|work_product| work_product.work_product_id == third_work_product_id)
+                .cloned()
+                .expect("selected accepted native WorkProduct projection");
+            assert_eq!(
+                selected_native_projection.adoption_status,
+                hartevo_domain_kernel::WorkProductStatus::Accepted
+            );
+            let publication_mission_revision = effect_projection.revision;
+            let publication_checkpoint_revision = effect_projection
+                .current_checkpoint_revision
+                .expect("schedule-or-publish Checkpoint revision");
 
             let cold_after_approval = DesktopDataPlane::at_data_root(reopened.data_root.clone())
                 .expect("cold Desktop after selective approval");
@@ -17395,7 +17864,7 @@ sleep 30"#;
                 .expect("durable selective-approval completion");
             assert_eq!(
                 selective_completion.work_product_ids,
-                BTreeSet::from([third_work_product_id])
+                BTreeSet::from([third_work_product_id.clone()])
             );
             let approved_conversation = approved_service
                 .mission_conversation(&project_id, &target_plan.target_mission_id)
@@ -17423,8 +17892,244 @@ sleep 30"#;
             assert!(!approved_event_json.contains(
                 "Adopt the reviewed Runtime WorkProduct and continue the contracted Mission."
             ));
-            assert_eq!(executor.calls, 1);
-            assert_eq!(verifier.calls, 1);
+            drop(approved_service);
+
+            let publication_effect_id = EffectId::from("desktop-vm04-publication-effect");
+            let publication_now = handoff_now + Duration::seconds(21);
+            let publication_command = ProposeVm04Publication {
+                project_id: project_id.clone(),
+                mission_id: target_plan.target_mission_id.clone(),
+                effect_id: publication_effect_id.clone(),
+                actor_id: ActorId::from("desktop-vm04-publication-actor"),
+                connection_id: social_connection_id.clone(),
+                work_product_id: third_work_product_id.clone(),
+                required_scopes: BTreeSet::from([social_scope.into()]),
+                scheduled_for: None,
+                idempotency_key: "desktop-vm04-publication-1".into(),
+                expires_at: publication_now + Duration::minutes(30),
+                expected_mission_revision: publication_mission_revision,
+                expected_checkpoint_revision: publication_checkpoint_revision,
+                expected_connection_revision: social_connection_revision,
+                expected_work_product_revision: selected_native_projection.work_product_revision,
+                expected_manifest_version: selected_native_projection.manifest_version,
+            };
+            let stale_work_product = reopened.propose_vm04_publication_with(
+                &secrets,
+                &ProposeVm04Publication {
+                    expected_work_product_revision: publication_command
+                        .expected_work_product_revision
+                        .saturating_sub(1),
+                    ..publication_command.clone()
+                },
+                publication_now,
+            );
+            assert!(matches!(
+                stale_work_product,
+                Err(DesktopDataError::Application(
+                    ApplicationError::Vm04PublicationWorkProductMismatch
+                ))
+            ));
+            let (refusal_service, _) = reopened
+                .open_application_from_secret(&database_secret, publication_now)
+                .expect("Application after stale VM-04 publication refusal");
+            let refused_publication = refusal_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("unchanged VM-04 after stale publication refusal");
+            assert_eq!(refused_publication.revision, publication_mission_revision);
+            assert!(refused_publication.effects.is_empty());
+            drop(refusal_service);
+
+            let proposed = reopened
+                .propose_vm04_publication_with(&secrets, &publication_command, publication_now)
+                .expect("Cordis-authorized VM-04 publication proposal");
+            let proposed_projection = proposed.inventory.projects[0]
+                .missions
+                .iter()
+                .find(|mission| mission.mission_id == target_plan.target_mission_id)
+                .expect("proposed VM-04 publication projection");
+            assert_eq!(proposed_projection.stage, MissionStage::WaitingApproval);
+            assert_eq!(proposed_projection.pending_approval_count, 1);
+            assert_eq!(proposed_projection.pending_effects.len(), 1);
+            assert_eq!(
+                proposed_projection.pending_effects[0].effect_id,
+                publication_effect_id
+            );
+
+            let (publication_service, _) = reopened
+                .open_application_from_secret(&database_secret, publication_now)
+                .expect("Application after VM-04 publication proposal");
+            let proposed_publication = publication_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable proposed VM-04 publication");
+            let proposed_effect = proposed_publication
+                .effect(&publication_effect_id)
+                .expect("proposed VM-04 Effect");
+            assert_eq!(proposed_effect.status, EffectStatus::Proposed);
+            assert_eq!(proposed_effect.capability, VM04_PUBLICATION_CAPABILITY);
+            assert_eq!(
+                proposed_effect.payload_digest,
+                third_work_product.content_digest
+            );
+            assert!(proposed_effect.receipt.is_none());
+            assert!(proposed_effect.verification.is_none());
+            let publication_scope_digest = proposed_effect.approval_digest();
+            let proposed_publication_revision = proposed_publication.revision;
+            drop(publication_service);
+
+            reopened
+                .grant_waiting_approval_with(
+                    &secrets,
+                    DesktopWaitingApprovalGrantRequest {
+                        project_id: project_id.clone(),
+                        mission_id: target_plan.target_mission_id.clone(),
+                        effect_id: publication_effect_id.clone(),
+                        expected_scope_digest: publication_scope_digest.clone(),
+                        expected_mission_revision: proposed_publication_revision,
+                    },
+                    handoff_now + Duration::seconds(22),
+                )
+                .expect("explicit VM-04 publication approval");
+            let (publication_service, _) = reopened
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(22))
+                .expect("Application after VM-04 publication approval");
+            let approved_publication = publication_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("approved VM-04 publication Mission");
+            let approved_effect = approved_publication
+                .effect(&publication_effect_id)
+                .expect("approved VM-04 publication Effect");
+            assert_eq!(approved_effect.status, EffectStatus::Approved);
+            assert!(approved_effect.receipt.is_none());
+            assert!(approved_effect.verification.is_none());
+            let publication_execution_request = DesktopApprovedEffectExecutionRequest {
+                project_id: project_id.clone(),
+                mission_id: target_plan.target_mission_id.clone(),
+                effect_id: publication_effect_id.clone(),
+                expected_scope_digest: publication_scope_digest,
+                expected_broker_authorization_digest: approved_effect
+                    .approval
+                    .as_ref()
+                    .expect("VM-04 publication approval")
+                    .permission_digest
+                    .clone(),
+                expected_mission_revision: approved_publication.revision,
+            };
+            drop(publication_service);
+
+            executor.accepted_at = handoff_now + Duration::seconds(23);
+            verifier.observed_at = handoff_now + Duration::seconds(23) + Duration::milliseconds(1);
+            let published = reopened
+                .execute_vm04_publication_with(
+                    &secrets,
+                    &publication_execution_request,
+                    &third_work_product_id,
+                    &mut executor,
+                    &mut verifier,
+                    handoff_now + Duration::seconds(23),
+                )
+                .expect("execute, independently verify, and complete VM-04 publication");
+            assert_eq!(published.disposition, ExecutionDisposition::Executed);
+            assert_eq!(published.verification_status, VerificationStatus::Confirmed);
+            assert!(published.verification_independent);
+            let readback_projection = published.snapshot.inventory.projects[0]
+                .missions
+                .iter()
+                .find(|mission| mission.mission_id == target_plan.target_mission_id)
+                .expect("VM-04 provider-readback projection");
+            assert_eq!(readback_projection.completed_checkpoint_count, 6);
+            assert_eq!(
+                (
+                    readback_projection.current_checkpoint_id.as_deref(),
+                    readback_projection.current_checkpoint_status,
+                    readback_projection.current_checkpoint_executor,
+                    readback_projection.current_checkpoint_completion_policy,
+                ),
+                (
+                    Some("provider_readback"),
+                    Some(hartevo_domain_kernel::MissionCheckpointStatus::Running),
+                    Some(MissionCheckpointExecutor::Runtime),
+                    Some(MissionCheckpointCompletionPolicy::WorkProduct),
+                )
+            );
+            assert_eq!(readback_projection.verified_effect_count, 1);
+            assert!(readback_projection.pending_effects.is_empty());
+            assert_eq!(executor.calls, 2);
+            assert_eq!(verifier.calls, 2);
+
+            let replayed = reopened
+                .execute_vm04_publication_with(
+                    &secrets,
+                    &publication_execution_request,
+                    &third_work_product_id,
+                    &mut executor,
+                    &mut verifier,
+                    handoff_now + Duration::seconds(24),
+                )
+                .expect("replay durable VM-04 publication completion");
+            assert_eq!(replayed.disposition, ExecutionDisposition::AlreadyVerified);
+            assert_eq!(executor.calls, 2);
+            assert_eq!(verifier.calls, 2);
+
+            let cold_after_publication = DesktopDataPlane::at_data_root(reopened.data_root.clone())
+                .expect("cold Desktop after VM-04 publication");
+            let (published_service, _) = cold_after_publication
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(25))
+                .expect("cold Application after VM-04 publication");
+            let published_target = published_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable published VM-04 Mission");
+            let publication_effect = published_target
+                .effect(&publication_effect_id)
+                .expect("durable verified VM-04 publication");
+            assert_eq!(publication_effect.status, EffectStatus::Verified);
+            let publication_completion = published_target
+                .definition
+                .as_ref()
+                .and_then(|definition| {
+                    definition
+                        .checkpoints
+                        .iter()
+                        .find(|checkpoint| checkpoint.id == VM04_PUBLICATION_CHECKPOINT_ID)
+                })
+                .and_then(|checkpoint| checkpoint.completion.as_ref())
+                .expect("durable VM-04 publication completion");
+            assert_eq!(
+                publication_completion.work_product_ids,
+                BTreeSet::from([third_work_product_id.clone()])
+            );
+            assert_eq!(
+                publication_completion.effect_ids,
+                BTreeSet::from([publication_effect_id])
+            );
+            let publication_event_json = serde_json::to_string(
+                &published_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("content-free VM-04 publication events"),
+            )
+            .expect("publication event JSON");
+            assert!(publication_event_json.contains("vm04.publication_approval_requested"));
+            assert!(publication_event_json.contains("vm04.publication_verified"));
+            assert!(!publication_event_json.contains(private_approval));
+            assert!(!publication_event_json.contains("page_desktop_vm04_private"));
+            assert!(!publication_event_json.contains(social_scope));
+            drop(published_service);
+
+            let prepared_readback = cold_after_publication
+                .prepare_catalog_mission_runtime_resume_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(26),
+                )
+                .expect("prepare exact provider-readback Runtime handle without running it");
+            assert_eq!(
+                prepared_readback.handle.mission_id(),
+                &target_plan.target_mission_id
+            );
+            assert_eq!(
+                prepared_readback.snapshot.runtime_reconciliation,
+                no_runtime_turn_startup_reconciliation()
+            );
         }
         drop(directory);
     }

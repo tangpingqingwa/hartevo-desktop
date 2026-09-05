@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{
     ArrowUp, Bell, Blocks, BotMessageSquare, BriefcaseBusiness, CalendarDays, ChartNoAxesCombined,
@@ -15,6 +15,7 @@ use hartevo_application::{
     ApplicationCheckpointHandlerStatus, ApplicationError, BrowserPublicSourceObservation,
     CreatorWorkProjection, DesktopProjectProjection, MissionCheckpointDispatchState,
     MissionProjection, MissionRuntimeProjection, ProjectEncryptionReadiness,
+    ProposeVm04Publication,
 };
 use hartevo_browser_adapter::{BrowserProfileStatus, BrowserPromptRisk};
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
@@ -24,14 +25,15 @@ use hartevo_channel_adapters::{
 };
 use hartevo_cordis::{LifecycleCancellation, SessionCancelCause};
 use hartevo_domain_kernel::{
-    AcceptanceCheck, CadenceTriggerKind, ConnectionId, ConnectionStatus, ConversationState,
-    CreatorTaskStatus, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
-    MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
-    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
-    ReviewDecision, RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus,
-    StorageMode, TenantId, WorkProductId, WorkProductStatus,
+    AcceptanceCheck, ActorId, CadenceTriggerKind, ConnectionId, ConnectionStatus,
+    ConversationState, CreatorTaskStatus, EffectId, KpiContract, KpiDirection,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode, OutcomeDecision,
+    OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
+    ProjectEncryptionMode, ProjectId, ReviewDecision, RuntimeProcessClaimStatus,
+    RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode, TenantId, WorkProductId,
+    WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
@@ -650,6 +652,7 @@ impl UiFailure {
             | DesktopDataError::InvalidEffectProposal
             | DesktopDataError::InvalidWaitingApprovalGrant
             | DesktopDataError::InvalidApprovedEffectExecution
+            | DesktopDataError::InvalidVm04Publication
             | DesktopDataError::InvalidEffectReconciliation
             | DesktopDataError::InvalidBrowserWorkspaceCreate
             | DesktopDataError::BrowserWorkspaceAlreadyExists
@@ -1851,6 +1854,44 @@ pub fn App() -> Element {
             && mission.current_checkpoint_application_handler_status
                 == Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch)
     });
+    let vm04_publication_route_active = !visual_fixture_mode
+        && mission.as_ref().is_some_and(|mission| {
+            mission.manifest_id.as_deref() == Some("VM-04")
+                && mission.current_checkpoint_id.as_deref() == Some("schedule_or_publish")
+                && mission.current_checkpoint_executor
+                    == Some(MissionCheckpointExecutor::EffectBroker)
+                && mission.current_checkpoint_completion_policy
+                    == Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
+                && mission.current_checkpoint_status == Some(MissionCheckpointStatus::Running)
+                && mission.stage == MissionStage::Running
+                && mission.current_checkpoint_revision.is_some()
+                && mission.pending_effects.is_empty()
+        });
+    let vm04_publication_work_product = mission.as_ref().and_then(|mission| {
+        mission
+            .work_products
+            .iter()
+            .rev()
+            .find(|work_product| work_product.adoption_status == WorkProductStatus::Accepted)
+            .cloned()
+    });
+    let vm04_publication_connections = connections
+        .iter()
+        .filter(|connection| {
+            connection.status == ConnectionStatus::Connected
+                && matches!(
+                    connection.provider.as_str(),
+                    "meta" | "tiktok" | "x" | "linkedin" | "reddit" | "youtube"
+                )
+                && !connection.required_scopes.is_empty()
+                && connection
+                    .required_scopes
+                    .is_subset(&connection.granted_scopes)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let vm04_publication_connection =
+        (vm04_publication_connections.len() == 1).then(|| vm04_publication_connections[0].clone());
     let waiting_approval_grant_active = !visual_fixture_mode
         && mission.as_ref().is_some_and(|mission| {
             mission.stage == MissionStage::WaitingApproval
@@ -1886,6 +1927,8 @@ pub fn App() -> Element {
                 "正在安全恢复本地 Runtime"
             } else if vm11_next_contract_route_active {
                 "正在按冻结 Continue/Stop/Scale/Test 决议推进下一步合同"
+            } else if vm04_publication_route_active {
+                "正在把已采用 WorkProduct 与唯一已连接发布账号冻结为 Effect 提案"
             } else if waiting_approval_grant_active {
                 "正在按冻结 Effect digest 写入 ApprovalGrant"
             } else if application_route_active {
@@ -1984,6 +2027,11 @@ pub fn App() -> Element {
     let can_grant_waiting_approval = project_can_start_mission
         && waiting_approval_grant_active
         && pending_effect_grant.is_some()
+        && !runtime_busy;
+    let can_propose_vm04_publication = project_can_start_mission
+        && vm04_publication_route_active
+        && vm04_publication_work_product.is_some()
+        && vm04_publication_connection.is_some()
         && !runtime_busy;
     let catalog_continuation_handle_ready =
         project
@@ -3908,6 +3956,7 @@ pub fn App() -> Element {
                                     || human_route_active
                                     || application_route_active
                                     || vm11_next_contract_route_active
+                                    || vm04_publication_route_active
                                     || waiting_approval_grant_active
                                     || application_route_not_implemented
                                     || application_route_catalog_mismatch
@@ -4502,6 +4551,103 @@ pub fn App() -> Element {
                                         }
                                     }
                                     div { class: "composer-actions",
+                                        if vm04_publication_route_active {
+                                            button {
+                                                class: "application-checkpoint-button",
+                                                disabled: !can_propose_vm04_publication,
+                                                aria_label: "把已采用 WorkProduct 与唯一已连接社交账号冻结为 VM-04 发布 Effect 提案",
+                                                onclick: move |_| {
+                                                    let connection = vm04_publication_connection.clone();
+                                                    let work_product = vm04_publication_work_product.clone();
+                                                    let selection = {
+                                                        let current = model.read();
+                                                        current.selected_project_id.clone().zip(
+                                                            current.current_mission().and_then(|mission| {
+                                                                Some((
+                                                                    mission.mission_id.clone(),
+                                                                    mission.revision,
+                                                                    mission.current_checkpoint_revision?,
+                                                                ))
+                                                            }),
+                                                        )
+                                                    };
+                                                    let Some((project_id, (mission_id, expected_mission_revision, expected_checkpoint_revision))) = selection else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "BLOCKED_DATA".into(),
+                                                            message: "VM-04 发布路由的 Mission/Checkpoint revision 不完整；未创建 Effect。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let Some(connection) = connection else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "WAITING_USER".into(),
+                                                            message: "请只保留一个已探测且 scopes 完整的社交发布账号作为本次精确目标；未创建 Effect。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let Some(work_product) = work_product else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "BLOCKED_DATA".into(),
+                                                            message: "未找到 Human Checkpoint 已选择并采用的 WorkProduct；未创建 Effect。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let identity = format!(
+                                                        "vm04-publication:{}:{}:{}",
+                                                        mission_id,
+                                                        work_product.work_product_id,
+                                                        work_product.work_product_revision,
+                                                    );
+                                                    let now = Utc::now();
+                                                    let command = ProposeVm04Publication {
+                                                        project_id,
+                                                        mission_id,
+                                                        effect_id: EffectId::from_stable(&identity),
+                                                        actor_id: ActorId::from_stable("desktop-local-vm04-publication-operator"),
+                                                        connection_id: connection.connection_id,
+                                                        work_product_id: work_product.work_product_id,
+                                                        required_scopes: connection.required_scopes,
+                                                        scheduled_for: None,
+                                                        idempotency_key: identity,
+                                                        expires_at: now + Duration::minutes(30),
+                                                        expected_mission_revision,
+                                                        expected_checkpoint_revision,
+                                                        expected_connection_revision: connection.revision,
+                                                        expected_work_product_revision: work_product.work_product_revision,
+                                                        expected_manifest_version: work_product.manifest_version,
+                                                    };
+                                                    mission_submitting.set(true);
+                                                    spawn(async move {
+                                                        let result = tokio::task::spawn_blocking(move || {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
+                                                                plane.propose_vm04_publication_os(&command, now)
+                                                            })
+                                                        })
+                                                        .await;
+                                                        match result {
+                                                            Ok(Ok(snapshot)) => model.write().set_ready(snapshot, false),
+                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Err(_) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "VM04_PUBLICATION_PROPOSAL_COORDINATOR_FAILED".into(),
+                                                                    message: "发布提案协调异常结束；未执行 Provider、未铸造 Receipt，也未声明 Verification。".into(),
+                                                                });
+                                                            }
+                                                        }
+                                                        mission_submitting.set(false);
+                                                    });
+                                                },
+                                                if mission_submitting() {
+                                                    "正在冻结发布提案…"
+                                                } else if vm04_publication_connection.is_none() {
+                                                    "需要唯一已连接发布账号"
+                                                } else if vm04_publication_work_product.is_none() {
+                                                    "缺少已采用发布 WorkProduct"
+                                                } else {
+                                                    "创建发布 Effect 提案"
+                                                }
+                                            }
+                                        }
                                         if waiting_approval_grant_active {
                                             button {
                                                 class: "application-checkpoint-button",
@@ -12995,6 +13141,34 @@ mod tests {
         }
         assert!(!adoption.contains("resume_catalog_mission_runtime"));
         assert!(!adoption.contains("run_existing_mission_runtime"));
+    }
+
+    #[test]
+    fn vm04_publication_window_only_proposes_exact_reviewable_authority() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("aria_label: \"把已采用 WorkProduct 与唯一已连接社交账号冻结为 VM-04 发布 Effect 提案\"")
+            .expect("VM-04 publication proposal boundary");
+        let end = source[start..]
+            .find("if waiting_approval_grant_active {")
+            .expect("VM-04 publication proposal boundary end");
+        let proposal = &source[start..start + end];
+        for contract in [
+            "ProposeVm04Publication",
+            "work_product_id",
+            "expected_mission_revision",
+            "expected_checkpoint_revision",
+            "expected_connection_revision",
+            "expected_work_product_revision",
+            "expected_manifest_version",
+            "propose_vm04_publication_os",
+            "未执行 Provider、未铸造 Receipt，也未声明 Verification",
+        ] {
+            assert!(proposal.contains(contract), "missing {contract}");
+        }
+        assert!(!proposal.contains("execute_vm04_publication"));
+        assert!(!proposal.contains("execute_approved_effect"));
+        assert!(!proposal.contains("resume_catalog_mission_runtime"));
     }
 
     #[test]
