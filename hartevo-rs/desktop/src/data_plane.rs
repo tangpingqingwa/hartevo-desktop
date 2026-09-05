@@ -15691,7 +15691,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves the VM-00 local Project foundations, Cordis-authorized checkout, exact-once Provider execution, SQLCipher recovery, and content-free evidence after cold reopen"
+        reason = "one Desktop Journey proves the VM-00 local Project foundations, Cordis-authorized checkout, atomic frozen-target handoff, exact replay, SQLCipher recovery, and content-free evidence after cold reopen"
     )]
     fn vm00_local_identity_inventory_and_encryption_survive_encrypted_desktop_reopen_without_runtime()
      {
@@ -16305,6 +16305,7 @@ sleep 30"#;
             target_plan.target_mission_id,
             MissionId::from_stable(format!("vm00-target-mission:{}", submission.mission_id))
         );
+        assert!(target_plan.target_contract.parent_mission_id.is_none());
         assert!(!format!("{target_plan:?}").contains(&target_plan.selection.goal));
         assert!(!format!("{goal_selection:?}").contains(&target_plan.selection.goal));
         assert!(matches!(
@@ -16424,9 +16425,73 @@ sleep 30"#;
                 ..
             }
         ));
+        let created_target = service
+            .load_mission(&project_id, &target_plan.target_mission_id)
+            .expect("atomically created frozen target Mission");
+        assert_eq!(created_target.title, target_plan.target_title);
+        assert_eq!(created_target.contract, target_plan.target_contract);
+        let created_target_definition = created_target
+            .definition
+            .as_ref()
+            .expect("frozen target definition");
+        assert_eq!(
+            created_target_definition.manifest_id,
+            target_plan.target_definition.manifest_id
+        );
+        assert_eq!(
+            created_target_definition.catalog_digest,
+            target_plan.target_definition.catalog_digest
+        );
+        assert_eq!(
+            created_target_definition.capability_ids,
+            target_plan.target_definition.capability_ids
+        );
+        assert_eq!(
+            created_target_definition
+                .checkpoints
+                .iter()
+                .map(|checkpoint| (&checkpoint.id, &checkpoint.depends_on, &checkpoint.route))
+                .collect::<Vec<_>>(),
+            target_plan
+                .target_definition
+                .checkpoints
+                .iter()
+                .map(|checkpoint| (&checkpoint.id, &checkpoint.depends_on, &checkpoint.route))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(created_target.revision, 2);
+        assert_eq!(created_target.stage, MissionStage::Running);
+        assert_eq!(created_target.tasks.len(), 1);
+        assert_eq!(created_target.tasks[0].id, target_plan.target_first_task_id);
+        let created_target_checkpoint = created_target
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.current_checkpoint())
+            .expect("running target Checkpoint");
+        assert_eq!(
+            created_target_checkpoint.id,
+            target_plan.target_definition.checkpoints[0].id
+        );
+        assert_eq!(
+            created_target_checkpoint.status,
+            hartevo_domain_kernel::MissionCheckpointStatus::Running
+        );
+        let created_target_conversation = service
+            .mission_conversation(&project_id, &target_plan.target_mission_id)
+            .expect("atomically created private target Conversation");
+        assert_eq!(created_target_conversation.revision, 1);
+        assert_eq!(created_target_conversation.messages.len(), 1);
+        assert_eq!(
+            created_target_conversation.messages[0].body,
+            target_plan.target_contract.goal
+        );
         let handoff_event_count = service
             .mission_events(&project_id, &submission.mission_id)
             .expect("events after Mission handoff")
+            .len();
+        let target_event_count = service
+            .mission_events(&project_id, &target_plan.target_mission_id)
+            .expect("events after target Mission creation")
             .len();
         assert!(matches!(
             service
@@ -16447,6 +16512,19 @@ sleep 30"#;
                 .expect("events after Mission handoff replay")
                 .len(),
             handoff_event_count
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &target_plan.target_mission_id)
+                .expect("target events after Mission handoff replay")
+                .len(),
+            target_event_count
+        );
+        assert_eq!(
+            service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("target Mission after exact replay"),
+            created_target
         );
         assert_eq!(executor.calls, 1);
         assert_eq!(verifier.calls, 1);
@@ -16640,23 +16718,40 @@ sleep 30"#;
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["mission_checkpoint", "mission_handoff"])
         );
+        let target_handoff_source = handoff_evidence
+            .sources
+            .iter()
+            .find(|source| source.source_kind == "mission_handoff")
+            .expect("target Mission handoff source");
+        assert_eq!(
+            target_handoff_source.source_id,
+            target_plan.target_mission_id.to_string()
+        );
+        assert_eq!(target_handoff_source.source_revision, 2);
+        let durable_target = service
+            .load_mission(&project_id, &target_plan.target_mission_id)
+            .expect("durable target Mission after cold reopen");
+        assert_eq!(durable_target, created_target);
+        let durable_target_conversation = service
+            .mission_conversation(&project_id, &target_plan.target_mission_id)
+            .expect("durable private target Conversation after cold reopen");
+        assert_eq!(durable_target_conversation, created_target_conversation);
         let DesktopLoadState::Ready(snapshot) = reopened
             .load_with(&secrets, handoff_now + Duration::seconds(2))
             .expect("Desktop projection after Mission handoff")
         else {
             panic!("reopened Desktop must remain initialized")
         };
-        let projected = snapshot
+        let projected_project = snapshot
             .inventory
             .projects
-            .into_iter()
+            .iter()
             .find(|project| project.project_id == project_id)
-            .and_then(|project| {
-                project
-                    .missions
-                    .into_iter()
-                    .find(|mission| mission.mission_id == submission.mission_id)
-            })
+            .expect("Project projection after Mission handoff");
+        let projected = projected_project
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
             .expect("VM-00 projection after Mission handoff");
         assert_eq!(projected.completed_checkpoint_count, 8);
         assert_eq!(projected.stage, MissionStage::Verifying);
@@ -16667,6 +16762,23 @@ sleep 30"#;
                 .current_checkpoint_application_handler_status
                 .is_none()
         );
+        let projected_target = projected_project
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == target_plan.target_mission_id)
+            .expect("target Mission projection after handoff");
+        assert_eq!(projected_target.manifest_id.as_deref(), Some("VM-04"));
+        assert_eq!(projected_target.stage, MissionStage::Running);
+        assert_eq!(projected_target.completed_checkpoint_count, 0);
+        assert_eq!(
+            projected_target.current_checkpoint_id.as_deref(),
+            target_plan
+                .target_definition
+                .checkpoints
+                .first()
+                .map(|checkpoint| checkpoint.id.as_str())
+        );
+        assert_eq!(projected_target.conversation_revision, Some(1));
         let evidence_json =
             serde_json::to_string(encryption_evidence).expect("encryption evidence JSON");
         assert!(!evidence_json.contains(device_id.as_str()));
@@ -16682,6 +16794,7 @@ sleep 30"#;
         assert!(event_json.contains("vm00.local-connection-readiness/v1"));
         assert!(event_json.contains("vm00.local-operating-contract-compiled/v1"));
         assert!(event_json.contains("vm00.local-mission-handoff/v1"));
+        assert!(event_json.contains(target_plan.target_mission_id.as_str()));
         assert!(event_json.contains("vm00.billing_checkout_approval_requested"));
         assert!(event_json.contains("vm00.billing_checkout_verified"));
         assert!(!event_json.contains("acct_vm00_desktop_private"));
@@ -16694,6 +16807,19 @@ sleep 30"#;
                 .contains("Render authorized private Runtime text while execution remains bounded")
         );
         assert!(!event_json.contains("PRIVATE-SWAPPED-VM00-TARGET"));
+        assert!(!event_json.contains(&target_plan.target_title));
+        let target_event_json = serde_json::to_string(
+            &service
+                .mission_events(&project_id, &target_plan.target_mission_id)
+                .expect("durable content-free target events"),
+        )
+        .expect("target event JSON");
+        assert!(target_event_json.contains("mission.catalog_bound"));
+        assert!(target_event_json.contains("mission.checkpoint_started"));
+        assert!(target_event_json.contains("mission.conversation_started"));
+        assert!(target_event_json.contains(target_plan.target_mission_id.as_str()));
+        assert!(!target_event_json.contains(&target_plan.target_contract.goal));
+        assert!(!target_event_json.contains(&target_plan.target_title));
         drop(directory);
     }
 
