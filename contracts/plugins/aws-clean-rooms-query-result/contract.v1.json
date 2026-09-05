@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-clean-rooms-query-result/contract.v1.json",
+  "title": "Hartevo AWS Clean Rooms protected-query result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-clean-rooms-query-result/v1",
+  "contractVersion": "EXT-AWS-CLEAN-ROOMS-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.clean-rooms.query-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-clean-rooms-query-result/v1|layer=1|service=aws.clean-rooms.query-result.read|provider=aws.clean-rooms.query-result.recording|consumer=mission.aws-clean-rooms-query-result.consumer|api=clean-rooms-get-protected-query-list-protected-queries-2020-05-04-r1",
+  "contractDigest": "9f0c9b2ebda9e446370974997c08f9a5b76cbb4efe3d893394b58a719daaf1fd",
+  "service": {
+    "type": "AwsCleanRoomsQueryResultService",
+    "id": "aws.clean-rooms.query-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "list_protected_queries",
+      "get_protected_query",
+      "compile_protected_query_evidence_proposal",
+      "verify_protected_query_evidence",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsCleanRoomsProvider",
+    "id": "aws.clean-rooms.query-result.recording",
+    "apiRevision": "clean-rooms-get-protected-query-list-protected-queries-2020-05-04-r1",
+    "operations": [
+      "ListProtectedQueries",
+      "GetProtectedQuery"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsCleanRoomsConsumer",
+    "id": "mission.aws-clean-rooms-query-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "collaborationId",
+      "membershipId",
+      "analysisTemplateArn",
+      "protectedQueryId",
+      "privacyBudgetReference",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "memberIdentities": false,
+    "sqlText": false,
+    "privacyBudgetValues": false,
+    "differentialPrivacyValues": false,
+    "resultConfiguration": false,
+    "s3OutputAccess": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationStatus",
+      "evidenceDigest"
+    ],
+    "permissions": [
+      "cleanrooms:GetCollaboration",
+      "cleanrooms:GetMembership",
+      "cleanrooms:GetProtectedQuery",
+      "cleanrooms:ListProtectedQueries",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "cleanrooms:StartProtectedQuery",
+      "cleanrooms:UpdateProtectedQuery",
+      "cleanrooms:ListMembers",
+      "cleanrooms:GetSchema",
+      "cleanrooms:GetSchemaAnalysisRule",
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:PutObject",
+      "iam:PassRole",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "nextToken",
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "collaboration",
+      "membership",
+      "analysisTemplate",
+      "protectedQuery",
+      "privacyBudget",
+      "statusFilter",
+      "pageSize",
+      "pageNumber",
+      "scopeDigest"
+    ],
+    "filterDriftRejected": true,
+    "cursorLoopRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "projection": {
+    "protectedQueryIdentity": [
+      "protectedQueryDigest",
+      "membershipDigest",
+      "collaborationDigest",
+      "analysisTemplateDigest",
+      "privacyBudgetDigest"
+    ],
+    "processing": [
+      "status",
+      "statusDigest",
+      "createdAt",
+      "lastUpdatedAt",
+      "durationDigest",
+      "billedUnitsDigest"
+    ],
+    "redactedMetadataDigests": [
+      "sqlDigest",
+      "memberSetDigest",
+      "outputDigest",
+      "providerErrorDigest"
+    ],
+    "rawMemberIdentities": false,
+    "rawSqlText": false,
+    "rawPrivacyBudget": false,
+    "rawDifferentialPrivacy": false,
+    "rawResultConfiguration": false,
+    "rawS3Output": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "filterDigest",
+      "cursorDigest",
+      "listDigest",
+      "getDigest",
+      "statusDigest",
+      "durationDigest",
+      "billedUnitsDigest",
+      "sqlDigest",
+      "memberSetDigest",
+      "outputDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "SUBMITTED",
+      "STARTED",
+      "CANCELLING",
+      "SUCCESS",
+      "FAILED",
+      "CANCELLED",
+      "TIMED_OUT",
+      "PARTIAL",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "privacyMetadataRedacted": true,
+    "partialIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "providerUnknownIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS account/region/collaboration/membership/analysis-template/protected-query/privacy-budget scope",
+      "bounded ListProtectedQueries and GetProtectedQuery metadata seams",
+      "opaque pagination and status-filter drift fences",
+      "status/duration/billed-unit and sensitive-field digests",
+      "version/contract/provider/permission/consent/scope/evidence digests",
+      "reversible and revocable registration",
+      "Mission-scoped review-only proposal",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS Clean Rooms HTTPS",
+      "StartProtectedQuery",
+      "UpdateProtectedQuery",
+      "CancelProtectedQuery",
+      "raw member identities or member data",
+      "SQL text or SQL execution",
+      "privacy-budget or differential-privacy values",
+      "S3 output access or raw result rows",
+      "statistical privacy claim",
+      "verified Work Product adoption"
+    ]
+  },
+  "forbiddenEffects": [
+    "StartProtectedQuery",
+    "UpdateProtectedQuery",
+    "CancelProtectedQuery",
+    "execute_sql",
+    "read_member_data",
+    "read_s3_output",
+    "export_raw_result",
+    "export_sql",
+    "export_privacy_budget",
+    "adopt_verified_work_product"
+  ],
+  "layer2Gaps": [
+    "native SigV4 credential resolution and live AWS HTTPS",
+    "durable provider receipt",
+    "independent protected-query read-back",
+    "consented query effects",
+    "member-data and S3 result access under kernel authority",
+    "statistical privacy verification",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live ListProtectedQueries/GetProtectedQuery HTTPS, durable provider receipt, independent reconciliation, consented protected-query effects, member-data or S3 result access, statistical privacy verification and verified Mission adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. Protected-query SUCCESS is provider processing metadata, not analytical truth or proof of privacy.",
+  "officialApiBasis": [
+    "https://docs.aws.amazon.com/clean-rooms/latest/apireference/API_GetProtectedQuery.html",
+    "https://docs.aws.amazon.com/clean-rooms/latest/apireference/API_ProtectedQuery.html",
+    "https://docs.aws.amazon.com/clean-rooms/latest/apireference/API_ListProtectedQueries.html",
+    "https://docs.aws.amazon.com/service-authorization/latest/reference/list_cleanrooms.html"
+  ]
+}
