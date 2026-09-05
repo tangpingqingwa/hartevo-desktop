@@ -452,7 +452,7 @@ fn validate_terminal_shape(
     violations: &mut Vec<String>,
 ) {
     let expected_id = terminal_id(&mission.id);
-    let expected_disposition = matches!(mission.id.as_str(), "VM-04" | "VM-11")
+    let expected_disposition = matches!(mission.id.as_str(), "VM-04" | "VM-07" | "VM-11")
         .then_some(RouteGraphTerminalDisposition::Completed);
     require(
         violations,

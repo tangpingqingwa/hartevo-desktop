@@ -235,6 +235,10 @@ fn vm07_redirect_is_bounded_safe_and_cannot_reuse_completion_evidence() {
             && transition.condition == RouteCondition::Vm07ValidTerminal
             && transition.target.kind == RouteGraphTransitionTargetKind::Terminal
     }));
+    assert_eq!(
+        graph.terminals[0].mission_disposition,
+        Some(RouteGraphTerminalDisposition::Completed)
+    );
 }
 
 #[test]

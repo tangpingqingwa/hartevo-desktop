@@ -11,11 +11,13 @@ pub(crate) const ROUTE_RUNTIME_AUTHORITY_CONTRACT_JSON: &str =
     include_str!("../../../contracts/missions/route-runtime-authority.v1.json");
 
 pub const EXPECTED_TERMINAL_TRANSITION_AUTHORITY_COUNT: usize = 13;
-pub const EXPECTED_IMPLEMENTED_TERMINAL_TRANSITION_AUTHORITY_COUNT: usize = 3;
-pub const EXPECTED_DENIED_TERMINAL_TRANSITION_AUTHORITY_COUNT: usize = 10;
+pub const EXPECTED_IMPLEMENTED_TERMINAL_TRANSITION_AUTHORITY_COUNT: usize = 4;
+pub const EXPECTED_DENIED_TERMINAL_TRANSITION_AUTHORITY_COUNT: usize = 9;
 
 const VM04_CHANNEL_REBALANCE_TRANSITION_ID: &str = "vm04.channel_rebalance.to.valid-terminal/v2";
 const VM04_CHANNEL_REBALANCE_HANDLER_ID: &str = "vm04.channel-rebalance/v1";
+const VM07_REPLAN_OR_TERMINAL_TRANSITION_ID: &str = "vm07.replan_or_terminal.to.valid-terminal/v2";
+const VM07_REPLAN_OR_TERMINAL_HANDLER_ID: &str = "vm07.replan-or-terminal/v1";
 const VM11_STOP_TRANSITION_ID: &str =
     "vm11.next_contract_or_valid_terminal.to.valid-terminal.stop/v2";
 const VM11_STOP_HANDLER_ID: &str = "vm11.next-contract-or-valid-terminal/v1";
@@ -193,7 +195,7 @@ fn validate_header(
     require(
         violations,
         contract.schema_version == "hartevo-mission-route-runtime-authority-contract/v1"
-            && contract.contract_version == "desktop-2026-09-05-ct03-v7"
+            && contract.contract_version == "desktop-2026-09-05-ct03-v8"
             && contract.evidence_level == "E1"
             && contract.default_terminal_execution_authority
                 == DefaultTerminalExecutionAuthority::Denied,
@@ -299,6 +301,14 @@ fn validate_terminal_transition_authorities(
                 binding,
                 violations,
             );
+        } else if binding.transition_id == VM07_REPLAN_OR_TERMINAL_TRANSITION_ID {
+            validate_vm07_replan_or_terminal_authority(
+                missions,
+                route_graphs,
+                application_handlers,
+                binding,
+                violations,
+            );
         } else if binding.transition_id == VM11_STOP_TRANSITION_ID {
             validate_vm11_stop_authority(
                 missions,
@@ -338,7 +348,44 @@ fn validate_terminal_transition_authorities(
                 == EXPECTED_IMPLEMENTED_TERMINAL_TRANSITION_AUTHORITY_COUNT
             && denied_terminal_transition_authority_count(contract)
                 == EXPECTED_DENIED_TERMINAL_TRANSITION_AUTHORITY_COUNT,
-        "runtime authority must expose exactly three implemented and ten denied terminal transitions",
+        "runtime authority must expose exactly four implemented and nine denied terminal transitions",
+    );
+}
+
+fn validate_vm07_replan_or_terminal_authority(
+    missions: &MissionCatalog,
+    route_graphs: &RouteGraphContract,
+    application_handlers: &ApplicationHandlerRegistry,
+    binding: &RouteTerminalExecutionBinding,
+    violations: &mut Vec<String>,
+) {
+    let RouteTerminalExecutionAuthority::ApplicationHandler(authority) = &binding.authority else {
+        violations.push(
+            "VM-07 replan-or-terminal must bind its exact implemented Application terminal authority"
+                .into(),
+        );
+        return;
+    };
+    require(
+        violations,
+        authority.kind == ApplicationHandlerRouteTerminalExecutionAuthorityKind::ApplicationHandler
+            && authority.executor == RouteTerminalAuthorityExecutor::Application
+            && authority.handler_id == VM07_REPLAN_OR_TERMINAL_HANDLER_ID
+            && authority.implementation_crate == "hartevo-application"
+            && authority.completion_policy == RouteTerminalCompletionPolicy::DeterministicEvidence
+            && authority.mission_disposition == RouteGraphTerminalDisposition::Completed
+            && authority.skipped_checkpoint_ids.is_empty(),
+        "VM-07 replan-or-terminal authority must bind Completed with no skipped checkpoints",
+    );
+
+    validate_application_handler_terminal_binding(
+        missions,
+        route_graphs,
+        application_handlers,
+        binding,
+        authority,
+        "VM-07 replan or terminal",
+        violations,
     );
 }
 

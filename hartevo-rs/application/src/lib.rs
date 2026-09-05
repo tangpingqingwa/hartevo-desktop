@@ -3541,6 +3541,7 @@ const VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID: &str = "vm04.account-scope-probe/v1";
 const VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID: &str = "vm04.engagement-referral-review/v1";
 const VM04_CHANNEL_REBALANCE_HANDLER_ID: &str = "vm04.channel-rebalance/v1";
 const VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID: &str = "vm07.prioritized-experiments/v1";
+const VM07_REPLAN_OR_TERMINAL_HANDLER_ID: &str = "vm07.replan-or-terminal/v1";
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
@@ -3568,6 +3569,7 @@ enum CompiledApplicationCheckpointHandler {
     Vm04EngagementReferralReview,
     Vm04ChannelRebalance,
     Vm07PrioritizedExperiments,
+    Vm07ReplanOrTerminal,
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
@@ -3597,6 +3599,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm04EngagementReferralReview => VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID,
             Self::Vm04ChannelRebalance => VM04_CHANNEL_REBALANCE_HANDLER_ID,
             Self::Vm07PrioritizedExperiments => VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID,
+            Self::Vm07ReplanOrTerminal => VM07_REPLAN_OR_TERMINAL_HANDLER_ID,
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
@@ -3623,7 +3626,9 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm04AccountScopeProbe => "account_scope",
             Self::Vm04EngagementReferralReview => "provider_readback",
             Self::Vm04ChannelRebalance => "channel_rebalance",
-            Self::Vm07PrioritizedExperiments => "budgeted_experiment_plan",
+            Self::Vm07PrioritizedExperiments | Self::Vm07ReplanOrTerminal => {
+                "budgeted_experiment_plan"
+            }
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
@@ -3916,6 +3921,9 @@ fn compiled_application_checkpoint_handler(
         }
         VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments)
+        }
+        VM07_REPLAN_OR_TERMINAL_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::Vm07ReplanOrTerminal)
         }
         VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
         VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
@@ -6535,6 +6543,391 @@ fn vm07_prioritized_experiments_application_evidence(
     ))
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Vm07BudgetedExperimentPlanItem {
+    rank: usize,
+    id: String,
+    hypothesis: String,
+    success_metric: String,
+    budget_minor: i64,
+    currency: String,
+    max_duration_days: u32,
+    no_external_write: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Vm07BudgetedExperimentPlan {
+    schema_version: String,
+    plan_identity_digest: String,
+    mission_id: MissionId,
+    contract_digest: String,
+    decision_action: Vm07DecisionAction,
+    decision_digest: String,
+    decision_message_id: MissionConversationMessageId,
+    decision_completion_evidence_digest: String,
+    decision_checkpoint_revision: u64,
+    pack_work_product_id: WorkProductId,
+    pack_manifest_digest: String,
+    pack_content_digest: String,
+    pack_revision: u64,
+    plan_status: String,
+    budget_amount_minor: i64,
+    planned_budget_minor: i64,
+    remaining_budget_minor: i64,
+    currency: String,
+    external_write: bool,
+    experiment_execution_authority: String,
+    provider_execution_authority: String,
+    runtime_execution_authority: String,
+    effect_execution_authority: String,
+    replan_authority: String,
+    terminal_authority: String,
+    experiments: Vec<Vm07BudgetedExperimentPlanItem>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the final VM-07 proof keeps the exact completed predecessor, unique bounded plan, denied execution and redirect authority, and route-specific terminal grant visible in one boundary"
+)]
+fn vm07_replan_or_terminal_application_evidence(
+    store: &ProjectStore,
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<
+    (
+        MissionCheckpointApplicationEvidence,
+        u64,
+        Vec<ApplicationSourceRevisionFence>,
+    ),
+    ApplicationError,
+> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let catalog = Catalog::load()?;
+    let catalog_digest = catalog.snapshot()?.digest;
+    let checkpoint_index = definition
+        .checkpoints
+        .iter()
+        .position(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = &definition.checkpoints[checkpoint_index];
+    let prioritized = checkpoint_index
+        .checked_sub(1)
+        .and_then(|index| definition.checkpoints.get(index))
+        .filter(|checkpoint| checkpoint.id == "prioritized_experiments")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let prioritized_route = prioritized
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let prioritized_completion = prioritized
+        .completion
+        .as_ref()
+        .filter(|_| prioritized.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let decision_checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "go_no_go_need_more_evidence")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let decision_completion = decision_checkpoint
+        .completion
+        .as_ref()
+        .filter(|_| decision_checkpoint.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let prioritized_evidence = prioritized_completion
+        .application_evidence
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let mut plan_work_product_ids = prioritized_completion.work_product_ids.iter();
+    let Some(plan_work_product_id) = plan_work_product_ids.next() else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
+    if plan_work_product_ids.next().is_some() {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let plan_work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == *plan_work_product_id)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    plan_work_product.validate()?;
+    let plan_manifest =
+        store.load_work_product_manifest(&mission.project_id, plan_work_product_id)?;
+    plan_manifest.validate_against(plan_work_product)?;
+    let plan: Vm07BudgetedExperimentPlan = serde_json::from_str(&plan_work_product.body)
+        .map_err(|_| ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let decision_source = prioritized_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "vm07_market_decision")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let pack_source = prioritized_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "market_evidence_pack")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let predecessor_plan_source = prioritized_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "budgeted_experiment_plan")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let pack_work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == plan.pack_work_product_id)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let pack_manifest =
+        store.load_work_product_manifest(&mission.project_id, &pack_work_product.id)?;
+    pack_manifest.validate_against(pack_work_product)?;
+    let terminal_binding = catalog
+        .route_runtime_authority
+        .terminal_transitions
+        .iter()
+        .find(|binding| binding.transition_id == "vm07.replan_or_terminal.to.valid-terminal/v2")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let RouteTerminalExecutionAuthority::ApplicationHandler(terminal_authority) =
+        &terminal_binding.authority
+    else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
+    let contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
+    let expected_plan_identity_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm07-prioritized-experiments-identity/v1",
+        "missionId": mission.id,
+        "contractDigest": plan.contract_digest,
+        "packWorkProductId": plan.pack_work_product_id,
+        "packContentDigest": plan.pack_content_digest,
+        "packRevision": plan.pack_revision,
+        "decisionDigest": plan.decision_digest,
+        "decisionCompletionEvidenceDigest": plan.decision_completion_evidence_digest,
+    }))?;
+    let planned_budget_minor = plan
+        .experiments
+        .iter()
+        .try_fold(0_i64, |total, experiment| {
+            total.checked_add(experiment.budget_minor)
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let expected_oracles = BTreeSet::from([
+        "decision".into(),
+        "goal".into(),
+        "operating_state".into(),
+        "outcome".into(),
+    ]);
+    let expected_prioritized_oracles = BTreeSet::from([
+        "decision".into(),
+        "operating_state".into(),
+        "outcome".into(),
+        "work_product".into(),
+    ]);
+    let predecessor_source_kinds = prioritized_evidence
+        .sources
+        .iter()
+        .map(|source| source.source_kind.as_str())
+        .collect::<BTreeSet<_>>();
+    if definition.manifest_id != "VM-07"
+        || definition.manifest_version != 3
+        || definition.catalog_digest != catalog_digest
+        || definition.operating_mode != mission.contract.mode
+        || definition.capability_ids != mission.contract.enabled_capabilities
+        || checkpoint_index + 1 != definition.checkpoints.len()
+        || checkpoint.id != "replan_or_terminal"
+        || checkpoint.status != MissionCheckpointStatus::Verifying
+        || checkpoint.depends_on != BTreeSet::from([prioritized.id.clone()])
+        || !definition
+            .checkpoints
+            .iter()
+            .take(checkpoint_index)
+            .all(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        || route.capability_id != "outcome.review"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids != expected_oracles
+        || prioritized_route.capability_id != "outcome.review"
+        || prioritized_route.executor != MissionCheckpointExecutor::Application
+        || prioritized_route.completion_policy
+            != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || prioritized_route.oracle_ids != expected_prioritized_oracles
+        || prioritized_completion.oracle_ids != expected_prioritized_oracles
+        || !prioritized_completion.effect_ids.is_empty()
+        || prioritized_evidence.handler_id != VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID
+        || prioritized_evidence.digest() != prioritized_completion.evidence_digest
+        || prioritized_evidence.observed_at != prioritized_completion.verified_at
+        || prioritized_completion.verified_at > now
+        || predecessor_source_kinds
+            != BTreeSet::from([
+                "budgeted_experiment_plan",
+                "market_evidence_pack",
+                "mission_checkpoint",
+                "vm07_market_decision",
+            ])
+        || plan_work_product.status != WorkProductStatus::ReadyForReview
+        || plan_manifest.tenant_id != mission.tenant_id
+        || plan_manifest.project_id != mission.project_id
+        || plan_manifest.mission_id != mission.id
+        || plan_manifest.work_product_id != plan_work_product.id
+        || plan_manifest.work_product_type != "budgeted_experiment_plan"
+        || plan_manifest.version != 1
+        || plan_manifest.work_product_revision != plan_work_product.revision
+        || plan_manifest.adoption_status != plan_work_product.status
+        || plan_manifest.file_digest.is_some()
+        || plan_manifest.editable_scopes != BTreeSet::from(["/body".into()])
+        || plan.schema_version != "hartevo-vm07-prioritized-experiments/v1"
+        || plan.plan_identity_digest != expected_plan_identity_digest
+        || plan.mission_id != mission.id
+        || plan.contract_digest != contract_digest
+        || plan.decision_action != Vm07DecisionAction::Continue
+        || plan.decision_digest != decision_source.projection_digest
+        || plan.decision_message_id.as_str() != decision_source.source_id
+        || plan.decision_completion_evidence_digest != decision_completion.evidence_digest
+        || plan.decision_checkpoint_revision != decision_checkpoint.revision
+        || plan.pack_work_product_id.as_str() != pack_source.source_id
+        || plan.pack_content_digest != pack_source.projection_digest
+        || plan.pack_revision != pack_source.source_revision
+        || plan.pack_manifest_digest != pack_manifest.manifest_digest
+        || predecessor_plan_source.source_id != plan_work_product.id.as_str()
+        || predecessor_plan_source.source_revision != plan_manifest.version
+        || predecessor_plan_source.projection_digest != plan_manifest.manifest_digest
+        || plan.plan_status != "planned_only"
+        || plan.budget_amount_minor != mission.contract.budget.amount_minor
+        || plan.planned_budget_minor != planned_budget_minor
+        || plan.remaining_budget_minor
+            != plan
+                .budget_amount_minor
+                .checked_sub(plan.planned_budget_minor)
+                .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?
+        || plan.planned_budget_minor > plan.budget_amount_minor
+        || plan.currency != mission.contract.budget.currency.as_str()
+        || plan.external_write
+        || plan.experiment_execution_authority != "denied"
+        || plan.provider_execution_authority != "denied"
+        || plan.runtime_execution_authority != "denied"
+        || plan.effect_execution_authority != "denied"
+        || plan.replan_authority != "denied"
+        || plan.terminal_authority != "denied"
+        || plan.experiments.is_empty()
+        || plan
+            .experiments
+            .iter()
+            .enumerate()
+            .any(|(index, experiment)| {
+                experiment.rank != index.saturating_add(1)
+                    || experiment.id.trim().is_empty()
+                    || experiment.hypothesis.trim().is_empty()
+                    || experiment.success_metric.trim().is_empty()
+                    || experiment.budget_minor < 0
+                    || experiment.currency != plan.currency
+                    || experiment.max_duration_days == 0
+                    || !experiment.no_external_write
+            })
+        || pack_manifest.work_product_type != "market_evidence_pack"
+        || terminal_binding.mission_id != "VM-07"
+        || terminal_binding.mission_version != 3
+        || terminal_binding.source_checkpoint_id != checkpoint.id
+        || terminal_binding.terminal_id != "vm07.valid-terminal/v2"
+        || terminal_authority.kind
+            != ApplicationHandlerRouteTerminalExecutionAuthorityKind::ApplicationHandler
+        || terminal_authority.executor != RouteTerminalAuthorityExecutor::Application
+        || terminal_authority.handler_id != VM07_REPLAN_OR_TERMINAL_HANDLER_ID
+        || terminal_authority.implementation_crate != "hartevo-application"
+        || terminal_authority.completion_policy
+            != RouteTerminalCompletionPolicy::DeterministicEvidence
+        || terminal_authority.mission_disposition != RouteGraphTerminalDisposition::Completed
+        || !terminal_authority.skipped_checkpoint_ids.is_empty()
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    validate_application_evidence_against_registry(prioritized_evidence)?;
+    mission.contract.validate(now).map_err(MissionError::from)?;
+
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let evidence = MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM07_REPLAN_OR_TERMINAL_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "mission_contract".into(),
+                source_id: mission.id.to_string(),
+                source_revision: command.expected_mission_revision,
+                projection_digest: contract_digest,
+                oracle_ids: BTreeSet::from(["goal".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "prioritized_experiments".into(),
+                source_id: format!("{}:{}", mission.id, prioritized.id),
+                source_revision: prioritized.revision,
+                projection_digest: prioritized_completion.evidence_digest.clone(),
+                oracle_ids: BTreeSet::from(["decision".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "budgeted_experiment_plan".into(),
+                source_id: plan_work_product.id.to_string(),
+                source_revision: plan_work_product.revision,
+                projection_digest: plan_work_product.content_digest.clone(),
+                oracle_ids: BTreeSet::from(["outcome".into()]),
+            },
+        ]),
+        observed_at: now,
+    };
+    Ok((
+        evidence,
+        plan_work_product.revision,
+        vec![ApplicationSourceRevisionFence::present(
+            ApplicationSourceKind::Mission,
+            mission.id.to_string(),
+            command.expected_mission_revision,
+        )],
+    ))
+}
+
 #[derive(Clone, Debug)]
 struct Vm11CandidateLearningSource {
     decision_source_id: String,
@@ -8014,6 +8407,9 @@ fn execute_project_application_checkpoint(
                 now,
             )?
         }
+        CompiledApplicationCheckpointHandler::Vm07ReplanOrTerminal => {
+            vm07_replan_or_terminal_application_evidence(store, &mission, &route, &command, now)?
+        }
         CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
             vm11_candidate_learning_application_evidence(
                 &mission,
@@ -8085,6 +8481,21 @@ fn execute_project_application_checkpoint(
         }
         _ => BTreeSet::new(),
     };
+    let vm07_terminal_plan_source = (handler
+        == CompiledApplicationCheckpointHandler::Vm07ReplanOrTerminal)
+        .then(|| {
+            application_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "budgeted_experiment_plan")
+                .cloned()
+                .ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler.handler_id().into(),
+                    },
+                )
+        })
+        .transpose()?;
     let completion = MissionCheckpointCompletion {
         oracle_ids: route.oracle_ids.clone(),
         work_product_ids,
@@ -8094,11 +8505,14 @@ fn execute_project_application_checkpoint(
         verified_at: now,
     };
     let vm04_valid_terminal = handler == CompiledApplicationCheckpointHandler::Vm04ChannelRebalance;
+    let vm07_valid_terminal = handler == CompiledApplicationCheckpointHandler::Vm07ReplanOrTerminal;
     let vm11_candidate_learning_terminal =
         handler == CompiledApplicationCheckpointHandler::Vm11CandidateLearning;
     let vm01_next_cycle = handler == CompiledApplicationCheckpointHandler::Vm01NextCycle;
     if vm04_valid_terminal {
         mission.complete_vm04_channel_rebalance_terminal(completion)?;
+    } else if vm07_valid_terminal {
+        mission.complete_vm07_replan_or_terminal_terminal(completion)?;
     } else if vm11_candidate_learning_terminal {
         mission.complete_vm11_candidate_learning_terminal(completion)?;
     } else {
@@ -8128,7 +8542,10 @@ fn execute_project_application_checkpoint(
         })
         .map(|checkpoint| checkpoint.revision)
         .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
-    let next_started = if vm04_valid_terminal || vm11_candidate_learning_terminal || vm01_next_cycle
+    let next_started = if vm04_valid_terminal
+        || vm07_valid_terminal
+        || vm11_candidate_learning_terminal
+        || vm01_next_cycle
     {
         None
     } else {
@@ -8163,6 +8580,34 @@ fn execute_project_application_checkpoint(
                 "missionDisposition": MissionTerminalDisposition::Completed,
                 "completionEvidenceDigest": evidence_digest,
                 "externalEffectExecuted": false,
+            }),
+            now,
+        ));
+    }
+    if vm07_valid_terminal {
+        let plan_source = vm07_terminal_plan_source.as_ref().ok_or(
+            ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id: handler.handler_id().into(),
+            },
+        )?;
+        events.push(PendingEvent::new(
+            "mission.vm07_valid_terminal_resolved",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": command.checkpoint_id,
+                "transitionId": "vm07.replan_or_terminal.to.valid-terminal/v2",
+                "terminalId": "vm07.valid-terminal/v2",
+                "handlerId": handler.handler_id(),
+                "workProductId": plan_source.source_id,
+                "workProductRevision": plan_source.source_revision,
+                "missionDisposition": MissionTerminalDisposition::Completed,
+                "planStatus": "planned_only",
+                "experimentExecutionAuthorized": false,
+                "replanAuthorized": false,
+                "providerExecuted": false,
+                "runtimeExecuted": false,
+                "externalEffectExecuted": false,
+                "completionEvidenceDigest": evidence_digest,
             }),
             now,
         ));
@@ -14237,6 +14682,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
                 | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
                 | CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments
+                | CompiledApplicationCheckpointHandler::Vm07ReplanOrTerminal
                 | CompiledApplicationCheckpointHandler::Vm11CandidateLearning
         ) {
             return execute_project_application_checkpoint(
@@ -15097,6 +15543,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
             | CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments
+            | CompiledApplicationCheckpointHandler::Vm07ReplanOrTerminal
             | CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
                 unreachable!("Project route returned before the generic VM-11 pipeline")
             }
@@ -15238,6 +15685,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
             | CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments
+            | CompiledApplicationCheckpointHandler::Vm07ReplanOrTerminal
             | CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
                 unreachable!("Project route returned before the generic VM-11 pipeline")
             }
@@ -32077,9 +32525,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the acceptance test keeps the exact Continue decision, budgeted plan, atomic next route, content-free events, and replay no-op visible"
+        reason = "the acceptance test keeps the exact Continue decision, budgeted plan, typed terminal, content-free events, and replay no-op visible"
     )]
-    fn vm07_continue_materializes_one_budgeted_plan_and_enters_replan() {
+    fn vm07_continue_materializes_one_budgeted_plan_and_reaches_typed_terminal() {
         let workspace = tempfile::tempdir().expect("workspace");
         let project_id = ProjectId::from("vm07-prioritized-project");
         let mission_id = MissionId::from("vm07-prioritized-mission");
@@ -32215,13 +32663,22 @@ mod tests {
                 next_dispatch.checkpoint_id.as_str(),
                 next_dispatch.executor,
                 next_dispatch.application_handler_status,
+                next_dispatch.application_handler_id.as_deref(),
             ),
             (
                 "replan_or_terminal",
                 MissionCheckpointExecutor::Application,
-                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM07_REPLAN_OR_TERMINAL_HANDLER_ID),
             )
         );
+        let terminal_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: next_dispatch.checkpoint_id,
+            expected_mission_revision: next_dispatch.mission_revision,
+            expected_checkpoint_revision: next_dispatch.checkpoint_revision,
+        };
 
         let completed = service
             .load_mission(&project_id, &mission_id)
@@ -32290,7 +32747,6 @@ mod tests {
         let events = service
             .mission_events(&project_id, &mission_id)
             .expect("content-free plan events");
-        let event_count = events.len();
         let event_json = serde_json::to_string(&events).expect("event JSON");
         assert!(event_json.contains(VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID));
         assert!(!event_json.contains(private_rationale));
@@ -32299,21 +32755,97 @@ mod tests {
         assert!(matches!(
             service
                 .execute_application_mission_checkpoint(
-                    command,
+                    terminal_command.clone(),
                     now() + Duration::seconds(23),
+                )
+                .expect("typed VM-07 terminal"),
+            ApplicationMissionCheckpointExecution::Completed {
+                completed_checkpoint_id,
+                replayed: false,
+                next_dispatch: None,
+                ..
+            } if completed_checkpoint_id == "replan_or_terminal"
+        ));
+        let terminal = service
+            .load_mission(&project_id, &mission_id)
+            .expect("terminal VM-07 Mission");
+        assert_eq!(terminal.stage, MissionStage::Completed);
+        assert!(terminal.effects.is_empty());
+        assert_eq!(terminal.work_products.len(), 2);
+        let definition = terminal.definition.as_ref().expect("VM-07 definition");
+        assert_eq!(definition.checkpoints.len(), 8);
+        assert!(
+            definition
+                .checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        );
+        let final_completion = definition
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == "replan_or_terminal")
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("VM-07 final completion");
+        assert!(final_completion.work_product_ids.is_empty());
+        assert!(final_completion.effect_ids.is_empty());
+        let final_evidence = final_completion
+            .application_evidence
+            .as_ref()
+            .expect("VM-07 final evidence");
+        assert_eq!(
+            final_evidence.handler_id,
+            VM07_REPLAN_OR_TERMINAL_HANDLER_ID
+        );
+        assert_eq!(
+            final_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "budgeted_experiment_plan",
+                "mission_checkpoint",
+                "mission_contract",
+                "prioritized_experiments",
+            ])
+        );
+        let terminal_events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free terminal events");
+        let event_count = terminal_events.len();
+        let terminal_event_json =
+            serde_json::to_string(&terminal_events).expect("terminal event JSON");
+        assert!(terminal_event_json.contains("mission.vm07_valid_terminal_resolved"));
+        assert!(!terminal_event_json.contains(private_rationale));
+        assert!(!terminal_event_json.contains(&pack.experiment_plan[0].hypothesis));
+
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    command,
+                    now() + Duration::seconds(24),
                 )
                 .expect("exact prioritized plan replay"),
             ApplicationMissionCheckpointExecution::Completed {
                 completed_checkpoint_id,
                 replayed: true,
-                next_dispatch: Some(MissionCheckpointDispatch {
-                    application_handler_status: Some(
-                        ApplicationCheckpointHandlerStatus::NotImplemented
-                    ),
-                    ..
-                }),
+                next_dispatch: None,
                 ..
             } if completed_checkpoint_id == "prioritized_experiments"
+        ));
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    terminal_command,
+                    now() + Duration::seconds(25),
+                )
+                .expect("exact terminal replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                completed_checkpoint_id,
+                replayed: true,
+                next_dispatch: None,
+                ..
+            } if completed_checkpoint_id == "replan_or_terminal"
         ));
         assert_eq!(
             service
