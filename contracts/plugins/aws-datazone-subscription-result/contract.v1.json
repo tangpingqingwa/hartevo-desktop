@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-datazone-subscription-result/contract.v1.json",
+  "title": "Hartevo Amazon DataZone asset and subscription-request result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-datazone-subscription-result/v1",
+  "contractVersion": "EXT-AWSDATAZONE-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.datazone.subscription-result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-datazone-subscription-result/v1|layer=1|service=aws.datazone.subscription-result.read|provider=aws.datazone.subscription-result.recording|consumer=mission.aws-datazone-subscription-result.consumer|api=datazone-get-asset-get-subscription-request-details-get-subscription-list-subscription-requests-2023-05-26-r1",
+  "contractDigest": "087b6490d4543d61e6fd8acf77479ef28257f9c5556ccc56ed5a1c701d722e26",
+  "service": {
+    "type": "AwsDataZoneSubscriptionResultService",
+    "id": "aws.datazone.subscription-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "GetAsset",
+      "GetSubscriptionRequestDetails",
+      "GetSubscription",
+      "ListSubscriptionRequests",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsDataZoneProvider",
+    "id": "aws.datazone.subscription-result.recording",
+    "apiRevision": "datazone-get-asset-get-subscription-request-details-get-subscription-list-subscription-requests-2023-05-26-r1",
+    "operations": [
+      "GetAsset",
+      "GetSubscriptionRequestDetails",
+      "GetSubscription",
+      "ListSubscriptionRequests"
+    ],
+    "allowedTransports": ["recording", "fixture", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionAwsDataZoneSubscriptionResultConsumer",
+    "id": "mission.aws-datazone-subscription-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "dataZoneDomainId",
+      "dataZoneProjectId",
+      "dataZoneAssetId",
+      "dataZoneAssetRevision",
+      "listingId",
+      "subscriptionRequestId",
+      "subscriptionId",
+      "subscriptionGrantId",
+      "revision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawSchemas": false,
+    "rawMetadataForms": false,
+    "principals": false,
+    "dataAccessPermissions": false,
+    "subscriptionGrantEffects": false,
+    "maxPages": 4,
+    "maxPageSize": 50,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "bindingDigests": [
+      "pluginVersionDigest",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "evidenceDigest",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "datazone:GetAsset",
+      "datazone:GetSubscriptionRequestDetails",
+      "datazone:GetSubscription",
+      "datazone:ListSubscriptionRequests",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "datazone:CreateSubscriptionRequest",
+      "datazone:AcceptSubscriptionRequest",
+      "datazone:RejectSubscriptionRequest",
+      "datazone:CancelSubscriptionRequest",
+      "datazone:RevokeSubscription",
+      "datazone:GetSubscriptionGrant",
+      "datazone:CreateSubscriptionGrant",
+      "data_access.read",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "NextToken",
+    "tokenOpaque": true,
+    "tokenDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "domain",
+      "asset",
+      "statusFilter",
+      "pageSize",
+      "pageNumber",
+      "scopeDigest"
+    ],
+    "loopRejected": true,
+    "filterDriftRejected": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "asset": [
+      "assetDigest",
+      "statusDigest",
+      "revisionDigest",
+      "typeDigest",
+      "listingDigest",
+      "ownerProjectDigest",
+      "createdAt",
+      "updatedAt"
+    ],
+    "subscriptionRequest": [
+      "requestDigest",
+      "assetDigest",
+      "statusDigest",
+      "revisionDigest",
+      "requestReasonDigest",
+      "reviewerRoleDigest",
+      "subscriptionDigest",
+      "createdAt",
+      "updatedAt",
+      "expiresAt"
+    ],
+    "subscription": [
+      "subscriptionDigest",
+      "requestDigest",
+      "grantDigest",
+      "statusDigest",
+      "revisionDigest",
+      "createdAt",
+      "updatedAt"
+    ],
+    "statusRevisionReviewerRoleDigests": true,
+    "rawSchemas": false,
+    "rawMetadataForms": false,
+    "principals": false,
+    "dataAccess": false,
+    "subscriptionGrantEffects": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "filterDigest",
+      "cursorDigest",
+      "listDigest",
+      "assetDigest",
+      "subscriptionRequestDetailsDigest",
+      "subscriptionDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "ready",
+      "pending",
+      "accepted",
+      "rejected",
+      "expired",
+      "partial",
+      "not_found",
+      "access_lost",
+      "throttled",
+      "tampered",
+      "drift",
+      "provider_unknown",
+      "revoked"
+    ],
+    "tamperRejected": true,
+    "driftRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "rawContentIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed account/region/domain/asset/subscription-request/subscription scope",
+      "bounded GetAsset/GetSubscriptionRequestDetails/GetSubscription/ListSubscriptionRequests seams",
+      "status/revision/reviewer-role digest projections",
+      "pagination, filter, revision and reviewer-role drift fences",
+      "version/contract/provider/permission/scope/evidence digests",
+      "reversible and revocable registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live Amazon DataZone HTTPS",
+      "raw schemas or metadata forms",
+      "principal identity or data-access permission truth",
+      "subscription request or grant effects",
+      "verified Work Product adoption"
+    ]
+  },
+  "forbiddenEffects": [
+    "CreateSubscriptionRequest",
+    "AcceptSubscriptionRequest",
+    "RejectSubscriptionRequest",
+    "CancelSubscriptionRequest",
+    "RevokeSubscription",
+    "GetSubscriptionGrant",
+    "CreateSubscriptionGrant",
+    "read_data_access",
+    "export_raw_schema",
+    "export_metadata_forms",
+    "resolve_principal",
+    "adopt_verified_work_product"
+  ],
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live DataZone HTTPS",
+    "durable provider receipt",
+    "independent subscription/grant and data-access readback",
+    "consented subscription request or grant effects",
+    "raw schema/form and principal resolution",
+    "Connected/native/first-party evidence",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live GetAsset/GetSubscriptionRequestDetails/GetSubscription/ListSubscriptionRequests HTTPS, durable provider receipt, independent grant/data-access readback, subscription effects and verified Mission adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. A complete projection is not an approval, grant, authorization or data-read proof."
+}
