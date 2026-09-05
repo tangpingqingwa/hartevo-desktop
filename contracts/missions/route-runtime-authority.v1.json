@@ -1,8 +1,8 @@
 {
   "schemaVersion": "hartevo-mission-route-runtime-authority-contract/v1",
-  "contractVersion": "desktop-2026-08-13-ct03-v1",
+  "contractVersion": "desktop-2026-09-05-ct03-v2",
   "evidenceLevel": "E1",
-  "routeGraphContractVersion": "desktop-2026-08-12-ct02-v1",
+  "routeGraphContractVersion": "desktop-2026-09-05-ct02-v2",
   "applicationHandlerRegistryVersion": "desktop-2026-09-05-v17",
   "defaultTerminalExecutionAuthority": "denied",
   "terminalTransitions": [
@@ -58,7 +58,13 @@
       "condition": "checkpoint.completed",
       "terminalId": "vm04.valid-terminal/v2",
       "authority": {
-        "kind": "denied"
+        "kind": "application_handler",
+        "executor": "application",
+        "handlerId": "vm04.channel-rebalance/v1",
+        "implementationCrate": "hartevo-application",
+        "completionPolicy": "deterministic_evidence",
+        "missionDisposition": "completed",
+        "skippedCheckpointIds": []
       }
     },
     {

@@ -1987,6 +1987,14 @@ impl Mission {
         checkpoint_id: &str,
         completion: MissionCheckpointCompletion,
     ) -> Result<(), MissionError> {
+        if checkpoint_id == "channel_rebalance"
+            && self
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.manifest_id == "VM-04")
+        {
+            return Err(MissionError::Vm04ValidTerminalResolutionRequired);
+        }
         if checkpoint_id == "next_contract_or_valid_terminal"
             && self
                 .definition
@@ -1996,6 +2004,24 @@ impl Mission {
             return Err(MissionError::Vm11NextContractResolutionRequired);
         }
         self.complete_checkpoint_validated(checkpoint_id, completion)
+    }
+
+    /// Completes only the exact final VM-04 Application checkpoint and its
+    /// typed Completed terminal. Generic checkpoint or Mission completion
+    /// cannot bypass the registered channel-rebalance proof.
+    pub fn complete_vm04_channel_rebalance_terminal(
+        &mut self,
+        completion: MissionCheckpointCompletion,
+    ) -> Result<(), MissionError> {
+        let verified_at = completion.verified_at;
+        let mut resolved = self.clone();
+        resolved.complete_checkpoint_validated("channel_rebalance", completion)?;
+        if !vm04_valid_terminal_is_typed(&resolved) {
+            return Err(MissionError::Vm04ValidTerminalResolutionRequired);
+        }
+        resolved.terminate(MissionTerminalDisposition::Completed, verified_at)?;
+        *self = resolved;
+        Ok(())
     }
 
     fn complete_checkpoint_validated(
@@ -2822,6 +2848,15 @@ impl Mission {
             && self
                 .definition
                 .as_ref()
+                .is_some_and(|definition| definition.manifest_id == "VM-04")
+            && !vm04_valid_terminal_is_typed(self)
+        {
+            return Err(MissionError::Vm04ValidTerminalResolutionRequired);
+        }
+        if disposition == MissionTerminalDisposition::Completed
+            && self
+                .definition
+                .as_ref()
                 .is_some_and(|definition| definition.manifest_id == "VM-11")
             && !vm11_valid_terminal_is_typed(self)
         {
@@ -3070,6 +3105,43 @@ fn vm11_valid_terminal_is_typed(mission: &Mission) -> bool {
                 && source.source_id.ends_with(":stop:valid_terminal")
                 && source.oracle_ids == BTreeSet::from(["outcome".into()])
         })
+}
+
+fn vm04_valid_terminal_is_typed(mission: &Mission) -> bool {
+    let Some(definition) = &mission.definition else {
+        return false;
+    };
+    if definition.manifest_id != "VM-04"
+        || definition.manifest_version != 3
+        || !definition
+            .checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+    {
+        return false;
+    }
+    let Some(evidence) = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "channel_rebalance")
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+        .and_then(|completion| completion.application_evidence.as_ref())
+    else {
+        return false;
+    };
+    evidence.handler_id == "vm04.channel-rebalance/v1"
+        && evidence.checkpoint_id == "channel_rebalance"
+        && evidence
+            .sources
+            .iter()
+            .map(|source| source.source_kind.as_str())
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([
+                "channel_rebalance",
+                "engagement_review",
+                "mission_checkpoint",
+                "mission_contract",
+            ])
 }
 
 fn next_stage_after_outcome(
@@ -3355,6 +3427,8 @@ pub enum MissionError {
     BlockNotRecoverable,
     #[error("mission already has a terminal business disposition")]
     AlreadyTerminal,
+    #[error("VM-04 Completed requires the typed channel_rebalance terminal resolution")]
+    Vm04ValidTerminalResolutionRequired,
     #[error("VM-11 Completed requires the typed next_contract_or_valid_terminal Stop resolution")]
     Vm11ValidTerminalResolutionRequired,
     #[error(
@@ -3668,6 +3742,39 @@ mod tests {
         ));
         assert_ne!(mission.stage, MissionStage::Completed);
         assert!(mission.outcome.is_none());
+    }
+
+    #[test]
+    fn vm04_completed_terminal_rejects_generic_mission_and_checkpoint_bypasses() {
+        let mut mission = catalog_mission();
+        let definition = mission.definition.as_mut().expect("Catalog definition");
+        definition.manifest_id = "VM-04".into();
+        definition.manifest_version = 3;
+        let unchanged = mission.clone();
+
+        assert_eq!(
+            mission.terminate(
+                MissionTerminalDisposition::Completed,
+                now() + chrono::Duration::minutes(1),
+            ),
+            Err(MissionError::Vm04ValidTerminalResolutionRequired)
+        );
+        assert_eq!(mission, unchanged);
+        assert_eq!(
+            mission.complete_checkpoint(
+                "channel_rebalance",
+                MissionCheckpointCompletion {
+                    oracle_ids: BTreeSet::from(["decision".into()]),
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: "f".repeat(64),
+                    verified_at: now() + chrono::Duration::minutes(1),
+                },
+            ),
+            Err(MissionError::Vm04ValidTerminalResolutionRequired)
+        );
+        assert_eq!(mission, unchanged);
     }
 
     #[test]

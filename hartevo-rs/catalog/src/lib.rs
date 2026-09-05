@@ -1335,7 +1335,7 @@ impl Catalog {
         require(
             violations,
             snapshot.schema_version == "hartevo-catalog-snapshot/v4"
-                && snapshot.route_graph_contract_version == "desktop-2026-08-12-ct02-v1",
+                && snapshot.route_graph_contract_version == "desktop-2026-09-05-ct02-v2",
             "Catalog Snapshot v4 must exactly bind the Mission route graph companion contract",
         );
         require(

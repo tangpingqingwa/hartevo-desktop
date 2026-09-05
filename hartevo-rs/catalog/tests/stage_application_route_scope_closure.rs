@@ -71,7 +71,7 @@ fn assert_contract_binding(catalog: &Catalog, scopes: &[StageApplicationRouteSco
         contract.schema_version,
         "hartevo-stage-application-route-scope-contract/v1"
     );
-    assert_eq!(contract.contract_version, "desktop-2026-08-13-ct04-v1");
+    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct04-v2");
     assert_eq!(contract.evidence_level, "E1");
     assert_eq!(contract.release_evidence_schema_version, "2.3.0");
     assert_eq!(
@@ -124,7 +124,7 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
         foundation
             .summary
             .implemented_terminal_transition_authority_count,
-        1
+        2
     );
     let writing = foundation
         .selection
@@ -143,6 +143,10 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
     assert_eq!(beta.summary.terminal_transition_count, 6);
     assert_eq!(beta.summary.application_terminal_transition_count, 5);
     assert_eq!(beta.summary.non_application_terminal_transition_count, 1);
+    assert_eq!(
+        beta.summary.implemented_terminal_transition_authority_count,
+        1
+    );
 }
 
 fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
@@ -236,6 +240,28 @@ fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
 }
 
 fn assert_terminal_and_runtime_boundaries(catalog: &Catalog, ga: &StageApplicationRouteScope) {
+    assert_eq!(
+        ga.summary.implemented_terminal_transition_authority_count,
+        2
+    );
+    let vm04 = ga
+        .mission_scopes
+        .iter()
+        .find(|mission| mission.mission_id == "VM-04")
+        .expect("VM-04 scope");
+    assert_eq!(vm04.terminals.len(), 1);
+    assert_eq!(vm04.terminals[0].id, "vm04.valid-terminal/v2");
+    let rebalance = vm04
+        .application_routes
+        .iter()
+        .find(|route| route.route.checkpoint_id == "channel_rebalance")
+        .expect("VM-04 channel-rebalance route");
+    assert_eq!(rebalance.terminal_transition_authorities.len(), 1);
+    assert!(matches!(
+        rebalance.terminal_transition_authorities[0].authority,
+        RouteTerminalExecutionAuthority::ApplicationHandler(_)
+    ));
+
     let vm11 = ga
         .mission_scopes
         .iter()

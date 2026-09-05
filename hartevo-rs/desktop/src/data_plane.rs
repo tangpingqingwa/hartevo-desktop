@@ -16218,7 +16218,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, three painted Cordis Runtime turns, source-fenced account probe, exact Human selection, typed publication Effect, SQLCipher recovery, and the final conservative content-free review decision"
+        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, three painted Cordis Runtime turns, source-fenced account probe, exact Human selection, typed publication Effect, SQLCipher recovery, and the final conservative typed terminal"
     )]
     fn vm00_handoff_redirects_frozen_target_into_painted_runtime_resume_after_encrypted_reopen() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -18417,6 +18417,15 @@ sleep 30"#;
                 Ok(&verified_publication),
                 "engagement review cannot revise the verified publication Effect"
             );
+            let mut premature_terminal = completed_engagement.clone();
+            assert_eq!(
+                premature_terminal.terminate(
+                    hartevo_domain_kernel::MissionTerminalDisposition::Completed,
+                    handoff_now + Duration::seconds(32),
+                ),
+                Err(hartevo_domain_kernel::MissionError::Vm04ValidTerminalResolutionRequired)
+            );
+            assert_eq!(premature_terminal, completed_engagement);
             let engagement_evidence = completed_engagement
                 .definition
                 .as_ref()
@@ -18556,7 +18565,7 @@ sleep 30"#;
             let completed_rebalance = completed_rebalance_service
                 .load_mission(&project_id, &target_plan.target_mission_id)
                 .expect("durable VM-04 channel rebalance");
-            assert_eq!(completed_rebalance.stage, MissionStage::Verifying);
+            assert_eq!(completed_rebalance.stage, MissionStage::Completed);
             assert_eq!(
                 completed_rebalance
                     .definition
@@ -18619,6 +18628,8 @@ sleep 30"#;
             )
             .expect("channel-rebalance event JSON");
             assert!(rebalance_event_json.contains("vm04.channel-rebalance/v1"));
+            assert!(rebalance_event_json.contains("mission.vm04_valid_terminal_resolved"));
+            assert!(rebalance_event_json.contains("vm04.valid-terminal/v2"));
             assert!(!rebalance_event_json.contains(private_approval));
             assert!(!rebalance_event_json.contains("page_desktop_vm04_private"));
             assert!(!rebalance_event_json.contains(social_scope));

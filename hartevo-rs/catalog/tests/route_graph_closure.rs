@@ -38,7 +38,7 @@ fn production_route_graph_and_snapshot_v4_have_the_frozen_shape() {
         contract.schema_version,
         "hartevo-mission-route-graph-contract/v2"
     );
-    assert_eq!(contract.contract_version, "desktop-2026-08-12-ct02-v1");
+    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct02-v2");
     assert_eq!(contract.evidence_level, "E1");
     assert!(!contract.runtime_authority.branch_execution());
     assert!(!contract.runtime_authority.redirect_execution());
@@ -78,7 +78,7 @@ fn production_route_graph_and_snapshot_v4_have_the_frozen_shape() {
     assert_eq!(snapshot.schema_version, "hartevo-catalog-snapshot/v4");
     assert_eq!(
         snapshot.route_graph_contract_version,
-        "desktop-2026-08-12-ct02-v1"
+        "desktop-2026-09-05-ct02-v2"
     );
     assert_eq!(snapshot.summary.route_graph_count, 12);
     assert_eq!(snapshot.summary.route_graph_node_count, 123);
@@ -90,7 +90,38 @@ fn production_route_graph_and_snapshot_v4_have_the_frozen_shape() {
         serialized
             .get("routeGraphContractVersion")
             .and_then(serde_json::Value::as_str),
-        Some("desktop-2026-08-12-ct02-v1")
+        Some("desktop-2026-09-05-ct02-v2")
+    );
+}
+
+#[test]
+fn vm04_channel_rebalance_targets_the_typed_completed_terminal() {
+    let catalog = Catalog::load().expect("valid production Catalog");
+    let graph = catalog
+        .route_graphs
+        .graphs
+        .iter()
+        .find(|graph| graph.mission_id == "VM-04")
+        .expect("VM-04 graph");
+    let transition = graph
+        .transitions
+        .iter()
+        .find(|transition| transition.id == "vm04.channel_rebalance.to.valid-terminal/v2")
+        .expect("VM-04 channel-rebalance terminal transition");
+    assert_eq!(transition.source_checkpoint_id, "channel_rebalance");
+    assert_eq!(transition.condition, RouteCondition::CheckpointCompleted);
+    assert_eq!(
+        transition.target.kind,
+        RouteGraphTransitionTargetKind::Terminal
+    );
+    assert_eq!(
+        transition.target.terminal_id.as_deref(),
+        Some("vm04.valid-terminal/v2")
+    );
+    assert_eq!(graph.terminals.len(), 1);
+    assert_eq!(
+        graph.terminals[0].mission_disposition,
+        Some(RouteGraphTerminalDisposition::Completed)
     );
 }
 
