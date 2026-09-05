@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 18, 34)
+            (52, 19, 33)
         );
         assert_eq!(
             catalog
@@ -1793,6 +1793,17 @@ mod tests {
                 .application_handler("VM-01", 3, "work_queue")
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm01.work-queue/v1")
+        );
+    }
+
+    #[test]
+    fn vm01_ranking_traffic_review_has_an_application_handler() {
+        let catalog = Catalog::load().expect("valid catalog");
+        assert_eq!(
+            catalog
+                .application_handler("VM-01", 3, "ranking_traffic_review")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm01.ranking-traffic-review/v1")
         );
     }
 

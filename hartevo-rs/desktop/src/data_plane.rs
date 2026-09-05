@@ -20270,7 +20270,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one encrypted Desktop Journey keeps work-queue evidence, a paint-gated selected brief, explicit publication approval, Broker verification, cold recovery, and replay visible"
+        reason = "one encrypted Desktop Journey keeps work-queue evidence, a paint-gated selected brief, verified publication, readback adoption, ranking review, cold recovery, and replay visible"
     )]
     fn vm01_work_queue_and_publication_advance_through_cordis_without_duplicate_provider_work() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -20821,11 +20821,11 @@ sleep 30"#;
             .expect("durable VM-01 publication completion");
         assert_eq!(
             publication_completion.work_product_ids,
-            BTreeSet::from([brief_work_product_id])
+            BTreeSet::from([brief_work_product_id.clone()])
         );
         assert_eq!(
             publication_completion.effect_ids,
-            BTreeSet::from([publication_effect_id])
+            BTreeSet::from([publication_effect_id.clone()])
         );
         let publication_events = published_service
             .mission_events(&project_id, &started.mission_id)
@@ -20838,6 +20838,176 @@ sleep 30"#;
         assert!(!publication_event_json.contains(private_approval));
         assert!(!publication_event_json.contains(private_external_account));
         assert!(!publication_event_json.contains("Reviewable local runtime draft"));
+        drop(published_service);
+
+        let readback_work_product_id = run_and_adopt_catalog_runtime_fixture(
+            &plane,
+            &secrets,
+            &project_id,
+            &started.mission_id,
+            started_at + Duration::seconds(26),
+        );
+        let (mut ranking_service, _) = plane
+            .open_application_from_secret(&database_secret, started_at + Duration::seconds(30))
+            .expect("Application at VM-01 ranking review");
+        let ranking_dispatch = ranking_service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &started.mission_id,
+                started_at + Duration::seconds(30),
+            )
+            .expect("VM-01 ranking review dispatch");
+        assert_eq!(
+            (
+                ranking_dispatch.checkpoint_id.as_str(),
+                ranking_dispatch.executor,
+                ranking_dispatch.application_handler_status,
+                ranking_dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "ranking_traffic_review",
+                MissionCheckpointExecutor::Application,
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm01.ranking-traffic-review/v1"),
+            )
+        );
+        let ranking_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: started.mission_id.clone(),
+            checkpoint_id: ranking_dispatch.checkpoint_id,
+            expected_mission_revision: ranking_dispatch.mission_revision,
+            expected_checkpoint_revision: ranking_dispatch.checkpoint_revision,
+        };
+        drop(ranking_service);
+
+        let ranked = plane
+            .execute_application_mission_checkpoint_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                started_at + Duration::seconds(31),
+            )
+            .expect("complete VM-01 ranking review through Desktop");
+        assert_eq!(
+            ranked.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "next_cycle".into(),
+                capability_id: "outcome.review".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "goal".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let next_cycle_projection = ranked.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("VM-01 next-cycle projection");
+        assert_eq!(
+            (
+                next_cycle_projection.current_checkpoint_application_handler_status,
+                next_cycle_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
+                None,
+            )
+        );
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
+
+        let cold_after_ranking = DesktopDataPlane::at_data_root(plane.data_root.clone())
+            .expect("cold Desktop after VM-01 ranking review");
+        let (mut ranked_service, _) = cold_after_ranking
+            .open_application_from_secret(&database_secret, started_at + Duration::seconds(32))
+            .expect("cold Application after VM-01 ranking review");
+        let ranked_mission = ranked_service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("durable ranked VM-01 Mission");
+        assert_eq!(ranked_mission.effects.len(), 1);
+        assert_eq!(ranked_mission.work_products.len(), 4);
+        assert_eq!(
+            ranked_mission
+                .effect(&publication_effect_id)
+                .expect("single durable publication Effect")
+                .status,
+            EffectStatus::Verified
+        );
+        let ranking_completion = ranked_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "ranking_traffic_review")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-01 ranking completion");
+        assert!(ranking_completion.work_product_ids.is_empty());
+        assert!(ranking_completion.effect_ids.is_empty());
+        let ranking_evidence = ranking_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable VM-01 ranking evidence");
+        assert_eq!(
+            ranking_evidence.handler_id,
+            "vm01.ranking-traffic-review/v1"
+        );
+        assert_eq!(
+            ranking_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "mission_checkpoint",
+                "publication_decision",
+                "url_link_readback",
+            ])
+        );
+        assert!(ranking_evidence.sources.iter().any(|source| {
+            source.source_kind == "url_link_readback"
+                && source.source_id == readback_work_product_id.as_str()
+        }));
+        let ranking_events = ranked_service
+            .mission_events(&project_id, &started.mission_id)
+            .expect("content-free VM-01 ranking events");
+        let ranking_event_count = ranking_events.len();
+        let ranking_event_json =
+            serde_json::to_string(&ranking_events).expect("ranking event JSON");
+        assert!(ranking_event_json.contains("vm01.ranking-traffic-review/v1"));
+        assert!(!ranking_event_json.contains(private_scope));
+        assert!(!ranking_event_json.contains(private_approval));
+        assert!(!ranking_event_json.contains(private_external_account));
+        assert!(!ranking_event_json.contains("Reviewable local runtime draft"));
+
+        assert!(matches!(
+            ranked_service
+                .execute_application_mission_checkpoint(
+                    ranking_command,
+                    started_at + Duration::seconds(33),
+                )
+                .expect("exact VM-01 ranking replay after cold reopen"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            ranked_service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("events after cold VM-01 ranking replay")
+                .len(),
+            ranking_event_count
+        );
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
     }
 
     #[test]

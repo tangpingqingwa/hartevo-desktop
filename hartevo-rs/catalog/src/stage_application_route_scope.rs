@@ -237,7 +237,7 @@ fn validate_contract_header(
     require(
         violations,
         contract.schema_version == "hartevo-stage-application-route-scope-contract/v1"
-            && contract.contract_version == "desktop-2026-09-05-ct04-v3"
+            && contract.contract_version == "desktop-2026-09-05-ct04-v4"
             && contract.evidence_level == "E1"
             && contract.release_evidence_schema_version == "2.3.0"
             && contract.default_missing_handler_status
@@ -745,11 +745,11 @@ fn summarize_scope(
 fn expected_scope_summary(stage: ReleaseStage) -> StageApplicationRouteScopeSummary {
     let values = match stage {
         ReleaseStage::EngineeringFoundation | ReleaseStage::InternalAlpha => {
-            (7, 29, 18, 11, 7, 8, 7, 1, 2)
+            (7, 29, 19, 10, 7, 8, 7, 1, 2)
         }
-        ReleaseStage::ControlledBeta => (6, 22, 4, 18, 6, 6, 5, 1, 1),
+        ReleaseStage::ControlledBeta => (6, 22, 5, 17, 6, 6, 5, 1, 1),
         ReleaseStage::GeneralAvailability | ReleaseStage::MatureE5 => {
-            (12, 52, 18, 34, 12, 13, 12, 1, 2)
+            (12, 52, 19, 33, 12, 13, 12, 1, 2)
         }
     };
     StageApplicationRouteScopeSummary {
