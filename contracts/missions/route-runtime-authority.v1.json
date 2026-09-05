@@ -3,7 +3,7 @@
   "contractVersion": "desktop-2026-08-13-ct03-v1",
   "evidenceLevel": "E1",
   "routeGraphContractVersion": "desktop-2026-08-12-ct02-v1",
-  "applicationHandlerRegistryVersion": "desktop-2026-09-05-v13",
+  "applicationHandlerRegistryVersion": "desktop-2026-09-05-v14",
   "defaultTerminalExecutionAuthority": "denied",
   "terminalTransitions": [
     {

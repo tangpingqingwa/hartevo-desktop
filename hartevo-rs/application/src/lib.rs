@@ -3245,6 +3245,7 @@ const VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID: &str =
 const VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID: &str = "vm00.local-connection-readiness/v1";
 const VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID: &str =
     "vm00.local-operating-contract-compiled/v1";
+const VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID: &str = "vm00.local-mission-handoff/v1";
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
@@ -3263,6 +3264,7 @@ enum CompiledApplicationCheckpointHandler {
     LocalEncryptionWorkspaceReady,
     LocalConnectionReadiness,
     LocalOperatingContractCompiled,
+    LocalMissionHandoff,
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
@@ -3283,6 +3285,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::LocalOperatingContractCompiled => {
                 VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID
             }
+            Self::LocalMissionHandoff => VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID,
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
@@ -3301,6 +3304,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::LocalEncryptionWorkspaceReady => "project_keyring",
             Self::LocalConnectionReadiness => "connection_readiness",
             Self::LocalOperatingContractCompiled => "operating_contract",
+            Self::LocalMissionHandoff => "mission_handoff",
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
@@ -3572,6 +3576,9 @@ fn compiled_application_checkpoint_handler(
         }
         VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled)
+        }
+        VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::LocalMissionHandoff)
         }
         VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
         VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
@@ -4523,6 +4530,174 @@ fn vm00_local_operating_contract_compiled_application_evidence(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the final VM-00 proof keeps the exact compiled-contract predecessor, current route, and content-free handoff boundary visible together"
+)]
+fn vm00_local_mission_handoff_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint_index = definition
+        .checkpoints
+        .iter()
+        .position(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = &definition.checkpoints[checkpoint_index];
+    let compiled_checkpoint = checkpoint_index
+        .checked_sub(1)
+        .and_then(|index| definition.checkpoints.get(index))
+        .filter(|checkpoint| checkpoint.id == "operating_contract_compiled")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let compiled_route = compiled_checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let compiled_completion = compiled_checkpoint
+        .completion
+        .as_ref()
+        .filter(|_| compiled_checkpoint.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let compiled_evidence = compiled_completion
+        .application_evidence
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let expected_oracles = BTreeSet::from(["goal".into(), "operating_state".into()]);
+    let compiled_source_kinds = compiled_evidence
+        .sources
+        .iter()
+        .map(|source| source.source_kind.as_str())
+        .collect::<BTreeSet<_>>();
+    let compiled_contract_source = compiled_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "operating_contract");
+    if definition.manifest_id != "VM-00"
+        || definition.manifest_version != 3
+        || definition.operating_mode != mission.contract.mode
+        || definition.capability_ids != mission.contract.enabled_capabilities
+        || mission.contract.parent_mission_id.is_some()
+        || checkpoint_index + 1 != definition.checkpoints.len()
+        || checkpoint.id != "mission_handoff"
+        || route.capability_id != "mission.compile"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids != expected_oracles
+        || compiled_route.capability_id != "mission.compile"
+        || compiled_route.executor != MissionCheckpointExecutor::Application
+        || compiled_route.completion_policy
+            != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || compiled_route.oracle_ids != expected_oracles
+        || compiled_completion.oracle_ids != expected_oracles
+        || !compiled_completion.work_product_ids.is_empty()
+        || !compiled_completion.effect_ids.is_empty()
+        || compiled_evidence.handler_id != VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID
+        || compiled_evidence.catalog_digest != definition.catalog_digest
+        || compiled_evidence.mission_id != mission.id
+        || compiled_evidence.checkpoint_id != compiled_checkpoint.id
+        || compiled_evidence.digest() != compiled_completion.evidence_digest
+        || compiled_source_kinds != BTreeSet::from(["mission_checkpoint", "operating_contract"])
+        || compiled_contract_source.is_none_or(|source| {
+            source.source_id != mission.id.to_string()
+                || source.oracle_ids != BTreeSet::from(["goal".into()])
+                || !is_sha256_text(&source.projection_digest)
+        })
+        || compiled_completion.verified_at < mission.contract.valid_from
+        || compiled_completion.verified_at >= mission.contract.valid_until
+        || compiled_completion.verified_at > now
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    mission.contract.validate(now).map_err(MissionError::from)?;
+
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
+    // The durable handoff is deliberately content-free. It proves that the
+    // current contract is the one compiled by the immediately preceding
+    // checkpoint, but it neither chooses another Mission nor grants terminal
+    // transition, Runtime, or Provider authority.
+    let handoff_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm00-mission-handoff/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "contractVersion": mission.contract.version,
+        "contractDigest": contract_digest,
+        "compiledCheckpointId": compiled_checkpoint.id,
+        "compiledCheckpointRevision": compiled_checkpoint.revision,
+        "compiledCompletionDigest": compiled_completion.evidence_digest,
+        "compiledVerifiedAt": compiled_completion.verified_at,
+        "terminalTransitionId": "vm00.mission_handoff.to.valid-terminal/v2",
+        "terminalExecutionAuthority": "denied",
+        "missionRevision": command.expected_mission_revision,
+        "observedAt": now,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "mission_handoff".into(),
+                source_id: mission.id.to_string(),
+                source_revision: command.expected_mission_revision,
+                projection_digest: handoff_digest,
+                oracle_ids: BTreeSet::from(["goal".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn persist_vm00_source_block(
     store: &mut ProjectStore,
@@ -4592,7 +4767,11 @@ fn execute_vm00_local_project_checkpoint(
     now: DateTime<Utc>,
 ) -> Result<ApplicationMissionCheckpointExecution, ApplicationError> {
     let expected_mission_revision = mission.revision;
-    if handler == CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled {
+    if matches!(
+        handler,
+        CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
+            | CompiledApplicationCheckpointHandler::LocalMissionHandoff
+    ) {
         match mission.contract.validate(now) {
             Ok(()) => {}
             Err(hartevo_domain_kernel::OperatingContractError::InvalidValidity) => {
@@ -4602,8 +4781,8 @@ fn execute_vm00_local_project_checkpoint(
                     expected_mission_revision,
                     &command,
                     dispatch,
-                    VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID,
-                    "operating_contract",
+                    handler.handler_id(),
+                    handler.primary_source_kind(),
                     "operating_contract_not_current",
                     "The durable Operating Contract is outside its approved validity window.",
                     expected_mission_revision,
@@ -4815,6 +4994,19 @@ fn execute_vm00_local_project_checkpoint(
             let evidence = vm00_local_operating_contract_compiled_application_evidence(
                 &mission, &route, &command, now,
             )?;
+            (
+                evidence,
+                expected_mission_revision,
+                vec![ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Mission,
+                    mission.id.to_string(),
+                    expected_mission_revision,
+                )],
+            )
+        }
+        CompiledApplicationCheckpointHandler::LocalMissionHandoff => {
+            let evidence =
+                vm00_local_mission_handoff_application_evidence(&mission, &route, &command, now)?;
             (
                 evidence,
                 expected_mission_revision,
@@ -10805,6 +10997,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady
                 | CompiledApplicationCheckpointHandler::LocalConnectionReadiness
                 | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
+                | CompiledApplicationCheckpointHandler::LocalMissionHandoff
         ) {
             return execute_vm00_local_project_checkpoint(
                 &mut self.store,
@@ -11655,7 +11848,8 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::LocalProjectInventory
             | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady
             | CompiledApplicationCheckpointHandler::LocalConnectionReadiness
-            | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled => {
+            | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
+            | CompiledApplicationCheckpointHandler::LocalMissionHandoff => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest => {
@@ -11787,7 +11981,8 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::LocalProjectInventory
             | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady
             | CompiledApplicationCheckpointHandler::LocalConnectionReadiness
-            | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled => {
+            | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
+            | CompiledApplicationCheckpointHandler::LocalMissionHandoff => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest

@@ -16154,7 +16154,11 @@ sleep 30"#;
         );
         assert_eq!(
             handoff_dispatch.application_handler_status,
-            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented)
+        );
+        assert_eq!(
+            handoff_dispatch.application_handler_id.as_deref(),
+            Some("vm00.local-mission-handoff/v1")
         );
         let compiled_event_count = service
             .mission_events(&project_id, &submission.mission_id)
@@ -16176,6 +16180,49 @@ sleep 30"#;
                 .len(),
             compiled_event_count
         );
+        let handoff_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            checkpoint_id: handoff_dispatch.checkpoint_id,
+            expected_mission_revision: handoff_dispatch.mission_revision,
+            expected_checkpoint_revision: handoff_dispatch.checkpoint_revision,
+        };
+        let handoff_now = contract_now + Duration::seconds(2);
+        let handed_off = service
+            .execute_application_mission_checkpoint(handoff_command.clone(), handoff_now)
+            .expect("seal exact VM-00 Mission handoff");
+        assert!(matches!(
+            handed_off,
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: false,
+                next_dispatch: None,
+                ..
+            }
+        ));
+        let handoff_event_count = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("events after Mission handoff")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    handoff_command,
+                    handoff_now + Duration::seconds(1),
+                )
+                .expect("exact Mission handoff replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                next_dispatch: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("events after Mission handoff replay")
+                .len(),
+            handoff_event_count
+        );
         assert_eq!(executor.calls, 1);
         assert_eq!(verifier.calls, 1);
         drop(service);
@@ -16186,6 +16233,7 @@ sleep 30"#;
         let mission = service
             .load_mission(&project_id, &submission.mission_id)
             .expect("durable VM-00 Mission");
+        assert_eq!(mission.stage, MissionStage::Verifying);
         let checkout_effect = mission
             .effect(&checkout_effect_id)
             .expect("durable verified VM-00 checkout Effect");
@@ -16341,9 +16389,35 @@ sleep 30"#;
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["mission_checkpoint", "operating_contract"])
         );
+        let handoff_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "mission_handoff")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-00 Mission handoff completion");
+        assert!(handoff_completion.effect_ids.is_empty());
+        assert!(handoff_completion.work_product_ids.is_empty());
+        let handoff_evidence = handoff_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable Mission handoff evidence");
+        assert_eq!(handoff_evidence.handler_id, "vm00.local-mission-handoff/v1");
+        assert_eq!(
+            handoff_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mission_checkpoint", "mission_handoff"])
+        );
         let DesktopLoadState::Ready(snapshot) = reopened
-            .load_with(&secrets, contract_now + Duration::seconds(2))
-            .expect("Desktop projection after Operating Contract compilation")
+            .load_with(&secrets, handoff_now + Duration::seconds(2))
+            .expect("Desktop projection after Mission handoff")
         else {
             panic!("reopened Desktop must remain initialized")
         };
@@ -16358,19 +16432,15 @@ sleep 30"#;
                     .into_iter()
                     .find(|mission| mission.mission_id == submission.mission_id)
             })
-            .expect("VM-00 projection after Operating Contract compilation");
-        assert_eq!(projected.completed_checkpoint_count, 7);
-        assert_eq!(
-            projected.current_checkpoint_id.as_deref(),
-            Some("mission_handoff")
-        );
-        assert_eq!(
-            projected.current_checkpoint_executor,
-            Some(MissionCheckpointExecutor::Application)
-        );
-        assert_eq!(
-            projected.current_checkpoint_application_handler_status,
-            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+            .expect("VM-00 projection after Mission handoff");
+        assert_eq!(projected.completed_checkpoint_count, 8);
+        assert_eq!(projected.stage, MissionStage::Verifying);
+        assert!(projected.current_checkpoint_id.is_none());
+        assert!(projected.current_checkpoint_executor.is_none());
+        assert!(
+            projected
+                .current_checkpoint_application_handler_status
+                .is_none()
         );
         let evidence_json =
             serde_json::to_string(encryption_evidence).expect("encryption evidence JSON");
@@ -16386,6 +16456,7 @@ sleep 30"#;
         assert!(event_json.contains("vm00.local-encryption-workspace-ready/v1"));
         assert!(event_json.contains("vm00.local-connection-readiness/v1"));
         assert!(event_json.contains("vm00.local-operating-contract-compiled/v1"));
+        assert!(event_json.contains("vm00.local-mission-handoff/v1"));
         assert!(event_json.contains("vm00.billing_checkout_approval_requested"));
         assert!(event_json.contains("vm00.billing_checkout_verified"));
         assert!(!event_json.contains("acct_vm00_desktop_private"));
