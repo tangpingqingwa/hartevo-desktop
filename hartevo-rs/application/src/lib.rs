@@ -522,6 +522,10 @@ pub enum ApplicationMissionCheckpointExecution {
         outcome_ledger_revision: u64,
         replayed: bool,
         next_dispatch: Option<MissionCheckpointDispatch>,
+        /// Exact current dispatch for a newly created handoff target. This is
+        /// separate from `next_dispatch`, which always belongs to the source
+        /// Mission being completed.
+        target_dispatch: Option<Box<MissionCheckpointDispatch>>,
     },
     Blocked {
         checkpoint_id: String,
@@ -3952,6 +3956,7 @@ fn start_ready_catalog_checkpoint_in_memory(
 }
 
 fn completed_application_checkpoint_replay(
+    store: &ProjectStore,
     mission: &Mission,
     command: &ExecuteApplicationMissionCheckpoint,
     handler_id: &str,
@@ -3980,18 +3985,33 @@ fn completed_application_checkpoint_replay(
     {
         return Err(ApplicationError::ApplicationCheckpointReplayMismatch);
     }
-    let outcome_ledger_revision = evidence
+    let outcome_source = evidence
         .sources
         .iter()
         .find(|source| source.source_kind == outcome_source_kind)
-        .map(|source| source.source_revision)
         .ok_or(ApplicationError::ApplicationCheckpointReplayMismatch)?;
+    let outcome_ledger_revision = outcome_source.source_revision;
+    let target_dispatch = if handler_id == VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID {
+        let target_mission_id = MissionId::from(outcome_source.source_id.as_str());
+        let target_mission = store.load_mission(&mission.project_id, &target_mission_id)?;
+        if target_mission.tenant_id != mission.tenant_id
+            || target_mission.project_id != mission.project_id
+            || target_mission.id == mission.id
+            || target_mission.revision != outcome_source.source_revision
+        {
+            return Err(ApplicationError::ApplicationCheckpointReplayMismatch);
+        }
+        current_checkpoint_dispatch_projection(&target_mission)?.map(Box::new)
+    } else {
+        None
+    };
     Ok(Some(ApplicationMissionCheckpointExecution::Completed {
         completed_checkpoint_id: command.checkpoint_id.clone(),
         completion_evidence_digest: completion.evidence_digest.clone(),
         outcome_ledger_revision,
         replayed: true,
         next_dispatch: current_checkpoint_dispatch_projection(mission)?,
+        target_dispatch,
     }))
 }
 
@@ -5289,12 +5309,15 @@ fn execute_vm00_local_mission_handoff(
         &source_events,
         &target_events,
     )?;
+    let target_dispatch = current_checkpoint_dispatch_projection(&prepared.target_mission)?
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
     Ok(ApplicationMissionCheckpointExecution::Completed {
         completed_checkpoint_id: command.checkpoint_id,
         completion_evidence_digest: evidence_digest,
         outcome_ledger_revision: prepared.target_mission.revision,
         replayed: false,
         next_dispatch: None,
+        target_dispatch: Some(Box::new(target_dispatch)),
     })
 }
 
@@ -5627,6 +5650,7 @@ fn execute_vm00_local_project_checkpoint(
         outcome_ledger_revision: source_revision,
         replayed: false,
         next_dispatch,
+        target_dispatch: None,
     })
 }
 
@@ -11484,6 +11508,7 @@ impl ApplicationService {
                 return Err(ApplicationError::Vm11NextContractRouteSpecificCommandRequired);
             }
             if let Some(replay) = completed_application_checkpoint_replay(
+                &self.store,
                 &mission,
                 &command,
                 replay_handler.handler_id(),
@@ -12736,6 +12761,7 @@ impl ApplicationService {
             outcome_ledger_revision: outcome_ledger.revision,
             replayed: false,
             next_dispatch,
+            target_dispatch: None,
         })
     }
 

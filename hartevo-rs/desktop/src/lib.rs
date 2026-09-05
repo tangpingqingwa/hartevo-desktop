@@ -13,8 +13,8 @@ use dioxus_icons::lucide::{
 };
 use hartevo_application::{
     ApplicationCheckpointHandlerStatus, ApplicationError, BrowserPublicSourceObservation,
-    CreatorWorkProjection, DesktopProjectProjection, MissionProjection, MissionRuntimeProjection,
-    ProjectEncryptionReadiness,
+    CreatorWorkProjection, DesktopProjectProjection, MissionCheckpointDispatchState,
+    MissionProjection, MissionRuntimeProjection, ProjectEncryptionReadiness,
 };
 use hartevo_browser_adapter::{BrowserProfileStatus, BrowserPromptRisk};
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
@@ -4595,17 +4595,71 @@ pub fn App() -> Element {
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::persistent().and_then(|plane| {
-                                                                plane.execute_application_mission_checkpoint_os(
+                                                                let submission = plane.execute_application_mission_checkpoint_os(
                                                                     &project_id,
                                                                     &mission_id,
                                                                     Utc::now(),
-                                                                )
+                                                                )?;
+                                                                let redirected_runtime = submission.mission_id != mission_id
+                                                                    && matches!(
+                                                                        submission.runtime_outcome,
+                                                                        DesktopMissionRuntimeOutcome::CheckpointRouted {
+                                                                            executor: MissionCheckpointExecutor::Runtime,
+                                                                            state: MissionCheckpointDispatchState::Ready,
+                                                                            ..
+                                                                        }
+                                                                    );
+                                                                let prepared = redirected_runtime
+                                                                    .then(|| {
+                                                                        plane.prepare_catalog_mission_runtime_resume_os(
+                                                                            &project_id,
+                                                                            &submission.mission_id,
+                                                                            Utc::now(),
+                                                                        )
+                                                                    })
+                                                                    .transpose()?;
+                                                                Ok((submission, prepared))
                                                             })
                                                         })
                                                         .await;
                                                         match result {
-                                                            Ok(Ok(submission)) => {
-                                                                model.write().set_ready(submission.snapshot, false);
+                                                            Ok(Ok((submission, Some(prepared)))) => {
+                                                                let target_mission_id = submission.mission_id.clone();
+                                                                let mut model = model.write();
+                                                                model.set_ready(prepared.snapshot, false);
+                                                                model.select_mission(target_mission_id);
+                                                                drop(model);
+                                                                runtime_cancellation.set(None);
+                                                                runtime_stop_requested.set(false);
+                                                                runtime_progress.set(Vec::new());
+                                                                match runtime_execution_paint
+                                                                    .write()
+                                                                    .commit_catalog_start(prepared.handle)
+                                                                {
+                                                                    Ok(commit) => {
+                                                                        let scope = &commit.selection().scope;
+                                                                        runtime_text_scope.set(Some((
+                                                                            scope.project_id().clone(),
+                                                                            scope.mission_id().clone(),
+                                                                        )));
+                                                                        runtime_text_stream.set(None);
+                                                                        runtime_text_error.set(None);
+                                                                        runtime_follow_latest.set(true);
+                                                                        runtime_has_unseen.set(false);
+                                                                        // The post-render effect owns the exact
+                                                                        // handle and all Runtime authority.
+                                                                        return;
+                                                                    }
+                                                                    Err(error) => runtime_text_error.set(Some(
+                                                                        UiFailure::from_runtime_subscription_error(error),
+                                                                    )),
+                                                                }
+                                                            }
+                                                            Ok(Ok((submission, None))) => {
+                                                                let target_mission_id = submission.mission_id.clone();
+                                                                let mut model = model.write();
+                                                                model.set_ready(submission.snapshot, false);
+                                                                model.select_mission(target_mission_id);
                                                             }
                                                             Ok(Err(error)) => model.write().set_notice(&error),
                                                             Err(_) => {
