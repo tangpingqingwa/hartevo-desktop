@@ -18310,7 +18310,7 @@ sleep 30"#;
                     Some(hartevo_domain_kernel::MissionCheckpointStatus::Running),
                     Some(MissionCheckpointExecutor::Application),
                     Some(MissionCheckpointCompletionPolicy::DeterministicEvidence),
-                    Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
+                    Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
                 )
             );
             assert!(matches!(
@@ -18324,19 +18324,193 @@ sleep 30"#;
                     ApplicationError::LocalRuntimeMissionNotSchedulable
                 ))
             ));
-            let engagement_boundary = cold_after_readback
+            let (mut engagement_service, _) = cold_after_readback
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(30))
+                .expect("Application before VM-04 engagement review");
+            let engagement_dispatch = engagement_service
+                .dispatch_current_mission_checkpoint(
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(30),
+                )
+                .expect("exact VM-04 engagement-review dispatch");
+            assert_eq!(
+                (
+                    engagement_dispatch.checkpoint_id.as_str(),
+                    engagement_dispatch.capability_id.as_str(),
+                    engagement_dispatch.application_handler_status,
+                    engagement_dispatch.application_handler_id.as_deref(),
+                ),
+                (
+                    "engagement_and_referral_review",
+                    "attribution.compute",
+                    Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                    Some("vm04.engagement-referral-review/v1"),
+                )
+            );
+            drop(engagement_service);
+
+            let engagement_completed = cold_after_readback
                 .execute_application_mission_checkpoint_with(
                     &secrets,
                     &project_id,
                     &target_plan.target_mission_id,
                     handoff_now + Duration::seconds(31),
                 )
-                .expect("report the honest unimplemented engagement-review boundary");
+                .expect("complete the exact VM-04 engagement review");
             assert_eq!(
-                engagement_boundary.runtime_outcome,
+                engagement_completed.runtime_outcome,
+                DesktopMissionRuntimeOutcome::CheckpointRouted {
+                    checkpoint_id: "channel_rebalance".into(),
+                    capability_id: "outcome.review".into(),
+                    executor: MissionCheckpointExecutor::Application,
+                    oracle_ids: BTreeSet::from([
+                        "decision".into(),
+                        "goal".into(),
+                        "operating_state".into(),
+                        "outcome".into(),
+                    ]),
+                    completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                    state: MissionCheckpointDispatchState::Ready,
+                }
+            );
+            let runtime_after_engagement =
+                runtime_subscription_durable_snapshot(&cold_after_readback, &secrets, &project_id);
+            assert_eq!(
+                runtime_after_engagement.runtime_attempts,
+                durable_after_readback_runtime.runtime_attempts,
+                "Application engagement review cannot start another Runtime attempt"
+            );
+            assert_eq!(
+                runtime_after_engagement.private_messages,
+                durable_after_readback_runtime.private_messages
+            );
+            assert_eq!(
+                runtime_after_engagement.private_text_deltas,
+                durable_after_readback_runtime.private_text_deltas
+            );
+
+            let (mut completed_engagement_service, _) = cold_after_readback
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(32))
+                .expect("Application after VM-04 engagement review");
+            let completed_engagement = completed_engagement_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 engagement review");
+            assert_eq!(
+                completed_engagement
+                    .definition
+                    .as_ref()
+                    .map_or(0, |definition| {
+                        definition
+                            .checkpoints
+                            .iter()
+                            .filter(|checkpoint| {
+                                checkpoint.status
+                                    == hartevo_domain_kernel::MissionCheckpointStatus::Completed
+                            })
+                            .count()
+                    }),
+                8
+            );
+            assert_eq!(
+                completed_engagement.effect(&publication_effect_id),
+                Ok(&verified_publication),
+                "engagement review cannot revise the verified publication Effect"
+            );
+            let engagement_evidence = completed_engagement
+                .definition
+                .as_ref()
+                .and_then(|definition| {
+                    definition
+                        .checkpoints
+                        .iter()
+                        .find(|checkpoint| checkpoint.id == "engagement_and_referral_review")
+                })
+                .and_then(|checkpoint| checkpoint.completion.as_ref())
+                .and_then(|completion| completion.application_evidence.as_ref())
+                .expect("durable content-free VM-04 engagement evidence");
+            assert_eq!(
+                engagement_evidence.handler_id,
+                "vm04.engagement-referral-review/v1"
+            );
+            assert_eq!(
+                engagement_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    "mission_checkpoint",
+                    "provider_readback",
+                    "publication_decision",
+                ])
+            );
+            let engagement_event_json = serde_json::to_string(
+                &completed_engagement_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("content-free VM-04 events after engagement review"),
+            )
+            .expect("engagement event JSON");
+            assert!(engagement_event_json.contains("vm04.engagement-referral-review/v1"));
+            assert!(!engagement_event_json.contains(private_approval));
+            assert!(!engagement_event_json.contains("page_desktop_vm04_private"));
+            assert!(!engagement_event_json.contains(social_scope));
+            assert!(
+                !engagement_event_json
+                    .contains("Reviewable local runtime draft; no external effect occurred.")
+            );
+            let engagement_event_count = completed_engagement_service
+                .mission_events(&project_id, &target_plan.target_mission_id)
+                .expect("VM-04 engagement events")
+                .len();
+            assert!(matches!(
+                completed_engagement_service
+                    .execute_application_mission_checkpoint(
+                        ExecuteApplicationMissionCheckpoint {
+                            project_id: project_id.clone(),
+                            mission_id: target_plan.target_mission_id.clone(),
+                            checkpoint_id: engagement_dispatch.checkpoint_id,
+                            expected_mission_revision: engagement_dispatch.mission_revision,
+                            expected_checkpoint_revision: engagement_dispatch.checkpoint_revision,
+                        },
+                        handoff_now + Duration::seconds(32),
+                    )
+                    .expect("exact VM-04 engagement-review replay"),
+                ApplicationMissionCheckpointExecution::Completed {
+                    replayed: true,
+                    next_dispatch: Some(MissionCheckpointDispatch {
+                        checkpoint_id,
+                        executor: MissionCheckpointExecutor::Application,
+                        application_handler_status: Some(
+                            hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented
+                        ),
+                        ..
+                    }),
+                    ..
+                } if checkpoint_id == "channel_rebalance"
+            ));
+            assert_eq!(
+                completed_engagement_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("unchanged engagement replay events")
+                    .len(),
+                engagement_event_count
+            );
+            drop(completed_engagement_service);
+
+            let rebalance_boundary = cold_after_readback
+                .execute_application_mission_checkpoint_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(33),
+                )
+                .expect("report the honest unimplemented channel-rebalance boundary");
+            assert_eq!(
+                rebalance_boundary.runtime_outcome,
                 DesktopMissionRuntimeOutcome::ApplicationCheckpointNotImplemented {
-                    checkpoint_id: "engagement_and_referral_review".into(),
-                    capability_id: "attribution.compute".into(),
+                    checkpoint_id: "channel_rebalance".into(),
+                    capability_id: "outcome.review".into(),
                 }
             );
         }
