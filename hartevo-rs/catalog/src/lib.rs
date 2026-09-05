@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 12, 40)
+            (52, 13, 39)
         );
         assert_eq!(
             catalog
@@ -1720,6 +1720,12 @@ mod tests {
                 .application_handler("VM-00", 3, "connection_probe")
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm00.local-connection-readiness/v1")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-00", 3, "operating_contract_compiled")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm00.local-operating-contract-compiled/v1")
         );
         assert_eq!(
             catalog
