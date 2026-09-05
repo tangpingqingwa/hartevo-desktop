@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v15",
+  "registryVersion": "desktop-2026-09-05-v16",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -106,6 +106,22 @@
         "account_scope": ["truth"]
       },
       "oracleIds": ["truth", "operating_state"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm04.engagement-referral-review/v1",
+      "missionId": "VM-04",
+      "missionVersion": 3,
+      "checkpointId": "engagement_and_referral_review",
+      "capabilityId": "attribution.compute",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "publication_decision", "provider_readback"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "publication_decision": ["decision"],
+        "provider_readback": ["truth", "outcome"]
+      },
+      "oracleIds": ["truth", "decision", "operating_state", "outcome"],
       "implementationCrate": "hartevo-application"
     },
     {
