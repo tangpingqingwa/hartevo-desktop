@@ -274,6 +274,89 @@ impl ProjectStore {
         )
     }
 
+    /// Atomically accepts a Runtime WorkProduct, advances its Catalog route,
+    /// and appends the user adoption that authorizes the next Runtime
+    /// generation. The private message body remains only in SQLCipher.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the transaction explicitly fences Mission, manifest, and Conversation revisions"
+    )]
+    pub fn revise_runtime_work_product_with_conversation_atomic(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        manifest: &WorkProductManifest,
+        expected_manifest_version: u64,
+        conversation: &MissionConversation,
+        expected_conversation_revision: u64,
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        if mission.revision <= expected_mission_revision || events.is_empty() {
+            return Err(if events.is_empty() {
+                StorageError::EmptyAtomicEventSet
+            } else {
+                StorageError::UnexpectedNewerRevision {
+                    expected_revision: expected_mission_revision,
+                    actual: mission.revision,
+                }
+            });
+        }
+        let work_product = validate_manifest_scope(mission, manifest)?;
+        manifest.validate_against(work_product)?;
+        conversation.validate_for(mission, conversation.updated_at)?;
+        let previous_conversation =
+            self.load_mission_conversation(&mission.project_id, &mission.id)?;
+        let message = conversation.messages.last().ok_or_else(|| {
+            StorageError::DomainDecode("missing WorkProduct adoption message".into())
+        })?;
+        if previous_conversation.revision != expected_conversation_revision
+            || !conversation.follows(&previous_conversation)?
+            || message.kind != MissionConversationMessageKind::Steering
+            || message.work_product_id.is_some()
+        {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: format!("runtime_work_product_adoption:{}", manifest.work_product_id),
+                expected_revision: expected_conversation_revision,
+            });
+        }
+
+        let transaction = self.connection.transaction()?;
+        validate_manifest_dependencies(&transaction, mission, manifest)?;
+        let existing = load_work_product_manifest(
+            &transaction,
+            &mission.project_id,
+            &manifest.work_product_id,
+        )?;
+        persist_manifest_revision(
+            &transaction,
+            existing.as_ref(),
+            manifest,
+            Some(expected_manifest_version),
+        )?;
+        update_mission_normalized_cas(&transaction, mission, expected_mission_revision)?;
+        update_mission_conversation_append(
+            &transaction,
+            conversation,
+            expected_conversation_revision,
+            message,
+        )?;
+        let (event_sequences, outbox_sequences) = append_events(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+            Some(mission.id.as_str()),
+            "runtime_work_product_adoption",
+            manifest.work_product_id.as_str(),
+            events,
+        )?;
+        transaction.commit()?;
+        Ok(AtomicMutation {
+            event_sequences,
+            outbox_sequences,
+            state_revision: mission.revision,
+        })
+    }
+
     pub fn load_work_product_manifest(
         &self,
         project_id: &ProjectId,

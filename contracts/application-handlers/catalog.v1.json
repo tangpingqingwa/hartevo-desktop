@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v14",
+  "registryVersion": "desktop-2026-09-05-v15",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -91,6 +91,21 @@
         "mission_handoff": ["goal"]
       },
       "oracleIds": ["goal", "operating_state"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm04.account-scope-probe/v1",
+      "missionId": "VM-04",
+      "missionVersion": 3,
+      "checkpointId": "account_scope_probe",
+      "capabilityId": "connection.probe",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "account_scope"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "account_scope": ["truth"]
+      },
+      "oracleIds": ["truth", "operating_state"],
       "implementationCrate": "hartevo-application"
     },
     {

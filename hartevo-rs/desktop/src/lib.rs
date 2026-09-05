@@ -4600,16 +4600,15 @@ pub fn App() -> Element {
                                                                     &mission_id,
                                                                     Utc::now(),
                                                                 )?;
-                                                                let redirected_runtime = submission.mission_id != mission_id
-                                                                    && matches!(
-                                                                        submission.runtime_outcome,
-                                                                        DesktopMissionRuntimeOutcome::CheckpointRouted {
-                                                                            executor: MissionCheckpointExecutor::Runtime,
-                                                                            state: MissionCheckpointDispatchState::Ready,
-                                                                            ..
-                                                                        }
-                                                                    );
-                                                                let prepared = redirected_runtime
+                                                                let routed_runtime = matches!(
+                                                                    submission.runtime_outcome,
+                                                                    DesktopMissionRuntimeOutcome::CheckpointRouted {
+                                                                        executor: MissionCheckpointExecutor::Runtime,
+                                                                        state: MissionCheckpointDispatchState::Ready,
+                                                                        ..
+                                                                    }
+                                                                );
+                                                                let prepared = routed_runtime
                                                                     .then(|| {
                                                                         plane.prepare_catalog_mission_runtime_resume_os(
                                                                             &project_id,
