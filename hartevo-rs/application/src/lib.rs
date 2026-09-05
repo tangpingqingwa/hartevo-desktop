@@ -1193,6 +1193,75 @@ pub struct Vm00BillingCheckoutCompletion {
     pub replayed: bool,
 }
 
+pub const VM01_PUBLICATION_CAPABILITY: &str = "publication.publish";
+pub const VM01_PUBLICATION_CHECKPOINT_ID: &str = "publication_or_submission";
+pub const VM01_PUBLICATION_POLICY_VERSION: &str = "vm01-publication-policy/v1";
+
+/// Exact, replay-stable proposal for the VM-01 brief selected by the preceding
+/// Human checkpoint. Application derives provider/account authority from the
+/// fenced Connection and never receives the private brief body.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ProposeVm01Publication {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub actor_id: ActorId,
+    pub connection_id: ConnectionId,
+    pub work_product_id: WorkProductId,
+    pub required_scopes: BTreeSet<String>,
+    pub scheduled_for: Option<DateTime<Utc>>,
+    pub idempotency_key: String,
+    pub expires_at: DateTime<Utc>,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_connection_revision: u64,
+    pub expected_work_product_revision: u64,
+    pub expected_manifest_version: u64,
+}
+
+impl fmt::Debug for ProposeVm01Publication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProposeVm01Publication")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("effect_id", &self.effect_id)
+            .field("work_product_id", &self.work_product_id)
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field(
+                "expected_checkpoint_revision",
+                &self.expected_checkpoint_revision,
+            )
+            .field("publication", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProposeVm01Publication {
+    pub fn authority_payload_bytes(&self) -> Result<Vec<u8>, ApplicationError> {
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
+/// Exact post-Verification CAS for the VM-01 publication route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompleteVm01Publication {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub work_product_id: WorkProductId,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vm01PublicationCompletion {
+    pub mission: Mission,
+    pub completion_evidence_digest: String,
+    pub next_dispatch: Option<MissionCheckpointDispatch>,
+    pub replayed: bool,
+}
+
 pub const VM04_PUBLICATION_CAPABILITY: &str = "publication.publish";
 pub const VM04_PUBLICATION_CHECKPOINT_ID: &str = "schedule_or_publish";
 pub const VM04_PUBLICATION_POLICY_VERSION: &str = "vm04-publication-policy/v1";
@@ -17949,6 +18018,281 @@ impl ApplicationService {
         })
     }
 
+    /// Proposes one VM-01 publication from the exact brief selected by the
+    /// preceding Human checkpoint and one live, revision-fenced site
+    /// Connection. This creates approval state only and never calls a Provider.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "route, selected brief, manifest, Connection, replay, and source-fenced persistence stay visible in one proposal authority boundary"
+    )]
+    pub fn propose_vm01_publication(
+        &mut self,
+        command: &ProposeVm01Publication,
+        now: DateTime<Utc>,
+    ) -> Result<EffectId, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let (checkpoint_revision, checkpoint_status, _) =
+            vm01_publication_route_contract(&mission)?;
+        if command.expected_mission_revision == 0
+            || command.expected_checkpoint_revision == 0
+            || command.expected_connection_revision == 0
+            || command.expected_work_product_revision == 0
+            || command.expected_manifest_version == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || command.actor_id.as_str().trim().is_empty()
+            || command.required_scopes.is_empty()
+            || command
+                .required_scopes
+                .iter()
+                .any(|scope| scope.trim().is_empty() || scope.trim() != scope)
+            || command.idempotency_key.trim().is_empty()
+            || command.idempotency_key.trim() != command.idempotency_key
+            || command.expires_at <= now
+            || command.expires_at > mission.contract.valid_until
+            || command.expires_at > now + Duration::hours(1)
+            || command.scheduled_for.is_some_and(|scheduled_for| {
+                scheduled_for < now || scheduled_for >= command.expires_at
+            })
+        {
+            return Err(ApplicationError::Vm01PublicationCommandMismatch);
+        }
+        let work_product = vm01_selected_publication_work_product(&mission, command)?;
+        let manifest = self
+            .store
+            .load_work_product_manifest(&command.project_id, &command.work_product_id)?;
+        if manifest.tenant_id != mission.tenant_id
+            || manifest.project_id != mission.project_id
+            || manifest.mission_id != mission.id
+            || manifest.work_product_id != work_product.id
+            || manifest.version != command.expected_manifest_version
+            || manifest.work_product_revision != work_product.revision
+            || manifest.adoption_status != WorkProductStatus::Accepted
+            || manifest.artifact_digest != work_product.content_digest
+        {
+            return Err(ApplicationError::Vm01PublicationWorkProductMismatch);
+        }
+        let connection = self
+            .store
+            .load_connection(&command.project_id, &command.connection_id)
+            .map_err(|_| ApplicationError::Vm01PublicationConnectionUnavailable)?;
+        if connection.tenant_id() != &mission.tenant_id
+            || connection.project_id() != &mission.project_id
+            || connection.id() != &command.connection_id
+            || connection.revision() != command.expected_connection_revision
+            || !connection.permits_scopes(&command.required_scopes, now)
+            || !vm01_publication_provider_is_contracted(connection.provider())?
+        {
+            return Err(ApplicationError::Vm01PublicationConnectionUnavailable);
+        }
+        let spec =
+            vm01_publication_effect_spec(&mission, &connection, &work_product, &manifest, command)?;
+        if let Some(existing) = mission
+            .effects
+            .iter()
+            .find(|effect| effect.id == command.effect_id)
+        {
+            if vm01_publication_effect_matches_spec(&mission, existing, &spec) {
+                return Ok(existing.id.clone());
+            }
+            return Err(ApplicationError::Vm01PublicationEffectMismatch);
+        }
+        if mission.revision != command.expected_mission_revision
+            || checkpoint_revision != command.expected_checkpoint_revision
+            || checkpoint_status != MissionCheckpointStatus::Running
+            || !mission.tasks.iter().any(|task| {
+                task.status == TaskStatus::Running && task.capability == VM01_PUBLICATION_CAPABILITY
+            })
+        {
+            return Err(ApplicationError::Vm01PublicationCommandMismatch);
+        }
+        let expected_mission_revision = mission.revision;
+        let effect_id = mission.propose_effect(spec, now)?;
+        let effect = mission.effect(&effect_id)?;
+        vm01_publication_effect_policy(&mission, effect)?;
+        let approval_digest = effect.approval_digest();
+        self.store
+            .update_mission_atomic_with_application_source_fences_only(
+                &mission,
+                expected_mission_revision,
+                &[ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Connection,
+                    connection.id().to_string(),
+                    connection.revision(),
+                )],
+                &[PendingEvent::new(
+                    "vm01.publication_approval_requested",
+                    serde_json::json!({
+                        "missionId": mission.id,
+                        "checkpointId": VM01_PUBLICATION_CHECKPOINT_ID,
+                        "checkpointRevision": command.expected_checkpoint_revision,
+                        "capabilityId": VM01_PUBLICATION_CAPABILITY,
+                        "effectId": effect_id,
+                        "workProductId": work_product.id,
+                        "workProductRevision": work_product.revision,
+                        "manifestVersion": manifest.version,
+                        "approvalDigest": approval_digest,
+                        "provider": connection.provider(),
+                        "connectionRevision": connection.revision(),
+                        "providerExecuted": false,
+                    }),
+                    now,
+                )],
+            )?;
+        Ok(effect_id)
+    }
+
+    /// Completes `publication_or_submission` only from its exact independently
+    /// verified publication Effect. A replay returns the durable completion.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "verified VM-01 publication completion, replay, and the readback route form one auditable Mission CAS boundary"
+    )]
+    pub fn complete_vm01_publication(
+        &mut self,
+        command: &CompleteVm01Publication,
+        now: DateTime<Utc>,
+    ) -> Result<Vm01PublicationCompletion, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let effect = mission
+            .effect(&command.effect_id)
+            .map_err(|_| ApplicationError::Vm01PublicationEffectMismatch)?
+            .clone();
+        let work_product = mission
+            .work_products
+            .iter()
+            .find(|work_product| work_product.id == command.work_product_id)
+            .cloned()
+            .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+        let completion_evidence_digest =
+            vm01_publication_completion_digest(&mission, &effect, &work_product, command)?;
+        let persisted_completion = mission.definition.as_ref().and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == VM01_PUBLICATION_CHECKPOINT_ID)
+                .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+                .and_then(|checkpoint| checkpoint.completion.as_ref())
+        });
+        if let Some(completion) = persisted_completion {
+            if completion.oracle_ids
+                == BTreeSet::from([
+                    "effect".into(),
+                    "operating_state".into(),
+                    "work_product".into(),
+                ])
+                && completion.work_product_ids == BTreeSet::from([command.work_product_id.clone()])
+                && completion.effect_ids == BTreeSet::from([command.effect_id.clone()])
+                && completion.application_evidence.is_none()
+                && completion.evidence_digest == completion_evidence_digest
+                && completion.verified_at
+                    == effect
+                        .verification
+                        .as_ref()
+                        .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?
+                        .observed_at
+            {
+                return Ok(Vm01PublicationCompletion {
+                    next_dispatch: current_checkpoint_dispatch_projection(&mission)?,
+                    mission,
+                    completion_evidence_digest,
+                    replayed: true,
+                });
+            }
+            return Err(ApplicationError::Vm01PublicationReplayMismatch);
+        }
+        let (checkpoint_revision, checkpoint_status, route) =
+            vm01_publication_route_contract(&mission)?;
+        if command.expected_mission_revision == 0
+            || command.expected_checkpoint_revision == 0
+            || mission.revision != command.expected_mission_revision
+            || checkpoint_revision != command.expected_checkpoint_revision
+            || checkpoint_status != MissionCheckpointStatus::Verifying
+            || now
+                < effect
+                    .verification
+                    .as_ref()
+                    .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?
+                    .observed_at
+        {
+            return Err(ApplicationError::Vm01PublicationCompletionMismatch);
+        }
+        let expected_mission_revision = mission.revision;
+        let verified_at = effect
+            .verification
+            .as_ref()
+            .expect("verified VM-01 publication validated")
+            .observed_at;
+        mission.complete_checkpoint(
+            VM01_PUBLICATION_CHECKPOINT_ID,
+            MissionCheckpointCompletion {
+                oracle_ids: route.oracle_ids,
+                work_product_ids: BTreeSet::from([command.work_product_id.clone()]),
+                effect_ids: BTreeSet::from([command.effect_id.clone()]),
+                application_evidence: None,
+                evidence_digest: completion_evidence_digest.clone(),
+                verified_at,
+            },
+        )?;
+        let completed_checkpoint_revision = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == VM01_PUBLICATION_CHECKPOINT_ID)
+            })
+            .map(|checkpoint| checkpoint.revision)
+            .ok_or(ApplicationError::Vm01PublicationCompletionMismatch)?;
+        let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
+        let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
+        let mut events = vec![PendingEvent::new(
+            "vm01.publication_verified",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": VM01_PUBLICATION_CHECKPOINT_ID,
+                "checkpointRevision": completed_checkpoint_revision,
+                "capabilityId": VM01_PUBLICATION_CAPABILITY,
+                "effectId": effect.id,
+                "workProductId": work_product.id,
+                "receiptId": effect.receipt.as_ref().map(|receipt| &receipt.id),
+                "verificationId": effect.verification.as_ref().map(|verification| &verification.id),
+                "independent": true,
+                "completionEvidenceDigest": completion_evidence_digest,
+            }),
+            now,
+        )];
+        if let Some((checkpoint_id, checkpoint_revision, capability_id, executor, task_id, cycle)) =
+            next_started
+        {
+            events.push(PendingEvent::new(
+                "mission.checkpoint_started",
+                serde_json::json!({
+                    "missionId": mission.id,
+                    "checkpointId": checkpoint_id,
+                    "checkpointRevision": checkpoint_revision,
+                    "capabilityId": capability_id,
+                    "executor": executor,
+                    "cycle": cycle,
+                    "taskId": task_id,
+                }),
+                now,
+            ));
+        }
+        self.store
+            .update_mission_atomic(&mission, expected_mission_revision, &events)?;
+        Ok(Vm01PublicationCompletion {
+            mission,
+            completion_evidence_digest,
+            next_dispatch,
+            replayed: false,
+        })
+    }
+
     /// Propose one preview Effect only at the exact caller-observed Mission
     /// revision. Desktop uses this entry point after Cordis admits the typed
     /// proposal; it still creates Domain state only and never invokes a
@@ -27707,6 +28051,429 @@ fn validate_vm04_publication_verified_effect(
     Ok(())
 }
 
+fn vm01_publication_route_contract(
+    mission: &Mission,
+) -> Result<(u64, MissionCheckpointStatus, MissionCheckpointRoute), ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationRouteUnavailable)?;
+    let catalog = Catalog::load()?;
+    let catalog_digest = catalog.snapshot()?.digest;
+    let checkpoint = definition
+        .current_checkpoint()
+        .ok_or(ApplicationError::Vm01PublicationRouteUnavailable)?;
+    let route = checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationRouteUnavailable)?;
+    if definition.manifest_id != "VM-01"
+        || definition.manifest_version != 3
+        || definition.catalog_digest != catalog_digest
+        || checkpoint.id != VM01_PUBLICATION_CHECKPOINT_ID
+        || route.capability_id != VM01_PUBLICATION_CAPABILITY
+        || route.executor != MissionCheckpointExecutor::EffectBroker
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
+        || route.oracle_ids
+            != BTreeSet::from([
+                "effect".into(),
+                "operating_state".into(),
+                "work_product".into(),
+            ])
+    {
+        return Err(ApplicationError::Vm01PublicationRouteUnavailable);
+    }
+    Ok((checkpoint.revision, checkpoint.status, route.clone()))
+}
+
+fn vm01_publication_provider_is_contracted(provider: &str) -> Result<bool, ApplicationError> {
+    let catalog = Catalog::load()?;
+    let Some(mission) = catalog.mission("VM-01") else {
+        return Ok(false);
+    };
+    Ok(mission.provider_ids.iter().any(|id| id == provider)
+        && catalog.providers.providers.iter().any(|candidate| {
+            candidate.id == provider
+                && candidate
+                    .capability_ids
+                    .iter()
+                    .any(|capability| capability == VM01_PUBLICATION_CAPABILITY)
+                && candidate.requires_external_approval
+                && matches!(
+                    candidate.status.as_str(),
+                    "target_contract" | "contract_only"
+                )
+        }))
+}
+
+fn vm01_selected_publication_work_product(
+    mission: &Mission,
+    command: &ProposeVm01Publication,
+) -> Result<WorkProduct, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    let brief_checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "brief_or_patch_ready")
+        .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    let brief_route = brief_checkpoint
+        .route
+        .as_ref()
+        .filter(|route| {
+            route.capability_id == "content.draft"
+                && route.executor == MissionCheckpointExecutor::Runtime
+                && route.completion_policy == Some(MissionCheckpointCompletionPolicy::WorkProduct)
+                && route.oracle_ids
+                    == BTreeSet::from([
+                        "decision".into(),
+                        "operating_state".into(),
+                        "work_product".into(),
+                    ])
+        })
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    let brief_completion = brief_checkpoint
+        .completion
+        .as_ref()
+        .filter(|completion| {
+            completion.oracle_ids == brief_route.oracle_ids
+                && completion.work_product_ids == BTreeSet::from([command.work_product_id.clone()])
+                && completion.effect_ids.is_empty()
+                && completion.application_evidence.is_none()
+                && is_sha256_text(&completion.evidence_digest)
+        })
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    let selective_checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "selective_approval")
+        .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    let selective_route = selective_checkpoint
+        .route
+        .as_ref()
+        .filter(|route| {
+            route.capability_id == "source.write"
+                && route.executor == MissionCheckpointExecutor::Human
+                && route.completion_policy
+                    == Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+                && route.oracle_ids
+                    == BTreeSet::from([
+                        "decision".into(),
+                        "operating_state".into(),
+                        "work_product".into(),
+                    ])
+        })
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    let selective_completion = selective_checkpoint
+        .completion
+        .as_ref()
+        .filter(|completion| {
+            completion.oracle_ids == selective_route.oracle_ids
+                && completion.work_product_ids == BTreeSet::from([command.work_product_id.clone()])
+                && completion.effect_ids.is_empty()
+                && completion.application_evidence.is_none()
+                && is_sha256_text(&completion.evidence_digest)
+                && completion.verified_at >= brief_completion.verified_at
+        })
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    let work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == command.work_product_id)
+        .filter(|work_product| {
+            work_product.status == WorkProductStatus::Accepted
+                && work_product.revision == command.expected_work_product_revision
+                && selective_completion
+                    .work_product_ids
+                    .contains(&work_product.id)
+        })
+        .cloned()
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    Ok(work_product)
+}
+
+fn vm01_publication_effect_spec(
+    mission: &Mission,
+    connection: &Connection,
+    work_product: &WorkProduct,
+    manifest: &WorkProductManifest,
+    command: &ProposeVm01Publication,
+) -> Result<EffectSpec, ApplicationError> {
+    let selective_digest = mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == "selective_approval")
+        })
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+        .map(|completion| completion.evidence_digest.clone())
+        .filter(|digest| is_sha256_text(digest))
+        .ok_or(ApplicationError::Vm01PublicationWorkProductMismatch)?;
+    Ok(EffectSpec {
+        id: command.effect_id.clone(),
+        actor_id: command.actor_id.clone(),
+        capability: VM01_PUBLICATION_CAPABILITY.into(),
+        provider: connection.provider().into(),
+        connection_id: Some(connection.id().clone()),
+        account_id: Some(connection.account_id().clone()),
+        required_scopes: command.required_scopes.clone(),
+        effect_class: EffectClass::ExternalWrite,
+        description: VM01_PUBLICATION_DESCRIPTION.into(),
+        target_resource: format!(
+            "publication://{}/{}/{}",
+            connection.provider(),
+            connection.id(),
+            command.effect_id
+        ),
+        audience_digest: Some(selective_digest),
+        payload_digest: work_product.content_digest.clone(),
+        asset_digests: BTreeSet::from([manifest.manifest_digest.clone()]),
+        scheduled_for: command.scheduled_for,
+        timezone: mission.contract.timezone.clone(),
+        consent: ConsentState::NotRequired,
+        consent_record_id: None,
+        consent_requirement: None,
+        conversation_guard: None,
+        creator_contact_guard: None,
+        policy_version: VM01_PUBLICATION_POLICY_VERSION.into(),
+        risk: EffectRisk::High,
+        idempotency_key: command.idempotency_key.clone(),
+        amount: Money::zero(mission.contract.budget.currency.clone()),
+        expires_at: command.expires_at,
+    })
+}
+
+fn vm01_publication_effect_matches_spec(
+    mission: &Mission,
+    effect: &Effect,
+    spec: &EffectSpec,
+) -> bool {
+    effect.tenant_id == mission.tenant_id
+        && effect.project_id == mission.project_id
+        && effect.mission_id == mission.id
+        && effect.id == spec.id
+        && effect.actor_id == spec.actor_id
+        && effect.capability == spec.capability
+        && effect.provider == spec.provider
+        && effect.connection_id == spec.connection_id
+        && effect.account_id == spec.account_id
+        && effect.required_scopes == spec.required_scopes
+        && effect.effect_class == spec.effect_class
+        && effect.description == spec.description
+        && effect.target_resource == spec.target_resource
+        && effect.audience_digest == spec.audience_digest
+        && effect.payload_digest == spec.payload_digest
+        && effect.asset_digests == spec.asset_digests
+        && effect.scheduled_for == spec.scheduled_for
+        && effect.timezone == spec.timezone
+        && effect.consent == spec.consent
+        && effect.consent_record_id == spec.consent_record_id
+        && effect.consent_requirement == spec.consent_requirement
+        && effect.conversation_guard == spec.conversation_guard
+        && effect.creator_contact_guard == spec.creator_contact_guard
+        && effect.policy_version == spec.policy_version
+        && effect.risk == spec.risk
+        && effect.idempotency_key == spec.idempotency_key
+        && effect.amount == spec.amount
+        && effect.expires_at == spec.expires_at
+}
+
+fn validate_vm01_publication_effect_shape(
+    mission: &Mission,
+    effect: &Effect,
+) -> Result<(), ApplicationError> {
+    let target_prefix = format!(
+        "publication://{}/{}/",
+        effect.provider,
+        effect
+            .connection_id
+            .as_ref()
+            .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?
+    );
+    if !mission.contract.approval_policy.exact_scope_required
+        || !mission
+            .contract
+            .approval_policy
+            .required_effect_classes
+            .contains(&EffectClass::ExternalWrite)
+        || effect.tenant_id != mission.tenant_id
+        || effect.project_id != mission.project_id
+        || effect.mission_id != mission.id
+        || effect.capability != VM01_PUBLICATION_CAPABILITY
+        || !vm01_publication_provider_is_contracted(&effect.provider)?
+        || effect.connection_id.is_none()
+        || effect.account_id.is_none()
+        || effect.required_scopes.is_empty()
+        || effect.effect_class != EffectClass::ExternalWrite
+        || effect.description != VM01_PUBLICATION_DESCRIPTION
+        || !effect.target_resource.starts_with(&target_prefix)
+        || effect
+            .audience_digest
+            .as_ref()
+            .is_none_or(|digest| !is_sha256_text(digest))
+        || !is_sha256_text(&effect.payload_digest)
+        || effect.asset_digests.len() != 1
+        || effect
+            .asset_digests
+            .iter()
+            .any(|digest| !is_sha256_text(digest))
+        || effect.timezone != mission.contract.timezone
+        || effect.consent != ConsentState::NotRequired
+        || effect.consent_record_id.is_some()
+        || effect.consent_requirement.is_some()
+        || effect.conversation_guard.is_some()
+        || effect.creator_contact_guard.is_some()
+        || effect.policy_version != VM01_PUBLICATION_POLICY_VERSION
+        || effect.risk != EffectRisk::High
+        || effect.idempotency_key.trim().is_empty()
+        || effect.amount.amount_minor != 0
+        || effect.amount.currency != mission.contract.budget.currency
+        || effect.expires_at > mission.contract.valid_until
+        || effect
+            .scheduled_for
+            .is_some_and(|scheduled_for| scheduled_for >= effect.expires_at)
+    {
+        return Err(ApplicationError::Vm01PublicationEffectMismatch);
+    }
+    Ok(())
+}
+
+/// Deterministic policy shared by explicit approval and first execution of an
+/// exact VM-01 publication. Provider credentials remain outside Application.
+pub fn vm01_publication_effect_policy(
+    mission: &Mission,
+    effect: &Effect,
+) -> Result<EffectPolicy, ApplicationError> {
+    let (_, status, _) = vm01_publication_route_contract(mission)?;
+    if !matches!(
+        status,
+        MissionCheckpointStatus::WaitingApproval
+            | MissionCheckpointStatus::Running
+            | MissionCheckpointStatus::Verifying
+    ) {
+        return Err(ApplicationError::Vm01PublicationRouteUnavailable);
+    }
+    validate_vm01_publication_effect_shape(mission, effect)?;
+    Ok(EffectPolicy {
+        version: VM01_PUBLICATION_POLICY_VERSION.into(),
+        allowed_capabilities: BTreeSet::from([VM01_PUBLICATION_CAPABILITY.into()]),
+        allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
+        max_amounts_minor: BTreeMap::from([(mission.contract.budget.currency.clone(), 0)]),
+        rate_limits: vec![EffectRateLimit {
+            rule_id: "desktop-vm01-publication-hourly".into(),
+            provider: effect.provider.clone(),
+            capability: VM01_PUBLICATION_CAPABILITY.into(),
+            max_executions: 1,
+            window_seconds: 3_600,
+        }],
+    })
+}
+
+fn vm01_publication_completion_digest(
+    mission: &Mission,
+    effect: &Effect,
+    work_product: &WorkProduct,
+    command: &CompleteVm01Publication,
+) -> Result<String, ApplicationError> {
+    validate_vm01_publication_verified_effect(mission, effect, work_product)?;
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?;
+    canonical_sha256(&serde_json::json!({
+        "schemaVersion": "vm01-publication-completion/v1",
+        "missionId": mission.id,
+        "checkpointId": VM01_PUBLICATION_CHECKPOINT_ID,
+        "capabilityId": VM01_PUBLICATION_CAPABILITY,
+        "effectId": effect.id,
+        "effectApprovalDigest": effect.approval_digest(),
+        "workProductId": work_product.id,
+        "workProductRevision": work_product.revision,
+        "workProductContentDigest": work_product.content_digest,
+        "provider": effect.provider,
+        "connectionId": effect.connection_id,
+        "accountId": effect.account_id,
+        "receiptId": receipt.id,
+        "receiptRequestDigest": receipt.request_digest,
+        "receiptResponseDigest": receipt.response_digest,
+        "verificationId": verification.id,
+        "verificationEvidenceDigest": verification.evidence_digest,
+        "verifiedAt": verification.observed_at,
+        "verificationMissionRevision": command.expected_mission_revision,
+        "verificationCheckpointRevision": command.expected_checkpoint_revision,
+    }))
+}
+
+fn validate_vm01_publication_verified_effect(
+    mission: &Mission,
+    effect: &Effect,
+    work_product: &WorkProduct,
+) -> Result<(), ApplicationError> {
+    validate_vm01_publication_effect_shape(mission, effect)?;
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?;
+    let brief_selected = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "brief_or_patch_ready")
+        .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+        .is_some_and(|completion| {
+            completion.work_product_ids == BTreeSet::from([work_product.id.clone()])
+        });
+    let human_selected = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "selective_approval")
+        .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+        .is_some_and(|completion| {
+            completion.work_product_ids == BTreeSet::from([work_product.id.clone()])
+        });
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(ApplicationError::Vm01PublicationEffectMismatch)?;
+    if !brief_selected
+        || !human_selected
+        || work_product.status != WorkProductStatus::Accepted
+        || effect.payload_digest != work_product.content_digest
+        || effect.status != EffectStatus::Verified
+        || effect.approval.as_ref().is_none_or(|approval| {
+            approval.decision != ApprovalDecision::Approved
+                || approval.scope_digest != effect.approval_digest()
+        })
+        || receipt.provider != effect.provider
+        || receipt.request_digest != effect.approval_digest()
+        || verification.status != VerificationStatus::Confirmed
+        || !verification.independent
+        || verification.receipt_id != receipt.id
+        || verification.observed_at < receipt.accepted_at
+    {
+        return Err(ApplicationError::Vm01PublicationEffectMismatch);
+    }
+    Ok(())
+}
+
+const VM01_PUBLICATION_DESCRIPTION: &str = "Publish the selected VM-01 brief WorkProduct";
+
 #[allow(clippy::too_many_arguments)]
 fn creator_recruitment_effect_spec(
     hiring: &CreatorHiring,
@@ -29085,6 +29852,24 @@ pub enum ApplicationError {
     #[error("VM-00 billing checkout replay does not match the durable verified completion")]
     Vm00BillingCheckoutReplayMismatch,
     #[error(
+        "VM-01 publication requires an exact selected brief, live Connection, and Mission/Checkpoint source revisions"
+    )]
+    Vm01PublicationCommandMismatch,
+    #[error("VM-01 publication is not the current contracted Effect Broker route")]
+    Vm01PublicationRouteUnavailable,
+    #[error("VM-01 publication requires the exact selected and accepted brief revision")]
+    Vm01PublicationWorkProductMismatch,
+    #[error("VM-01 publication requires the exact connected site account and scopes")]
+    Vm01PublicationConnectionUnavailable,
+    #[error("VM-01 publication Effect no longer matches its frozen route authority")]
+    Vm01PublicationEffectMismatch,
+    #[error(
+        "VM-01 publication completion no longer matches the verified Mission/Checkpoint revision"
+    )]
+    Vm01PublicationCompletionMismatch,
+    #[error("VM-01 publication replay does not match the durable verified completion")]
+    Vm01PublicationReplayMismatch,
+    #[error(
         "VM-04 publication requires an exact selected WorkProduct, live Connection, and Mission/Checkpoint source revisions"
     )]
     Vm04PublicationCommandMismatch,
@@ -30453,17 +31238,20 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one VM-01 contract test keeps locked Human scope, two accepted Runtime artifacts, content-free evidence, next-route dispatch, and exact replay visible"
+        reason = "one VM-01 contract test keeps work-queue evidence, selected brief, explicit publication approval, Broker verification, next-route dispatch, and exact replay visible"
     )]
-    fn vm01_work_queue_binds_locked_scope_and_two_accepted_runtime_products() {
+    fn vm01_work_queue_and_publication_bind_selected_runtime_products() {
         let workspace = tempfile::tempdir().expect("project workspace");
         let project_id = ProjectId::from("vm01-work-queue-project");
         let mission_id = MissionId::from("vm01-work-queue-mission");
         let private_scope = "PRIVATE-VM01-SCOPE::only the frozen site and market";
         let private_baseline = "PRIVATE-VM01-BASELINE::raw analytics and search observations";
         let private_opportunity = "PRIVATE-VM01-OPPORTUNITY::ranked keyword and page queue";
+        let private_brief = "PRIVATE-VM01-BRIEF::publish this exact accepted patch";
+        let private_approval = "PRIVATE-VM01-APPROVAL::approve only the selected patch";
         let baseline_work_product_id = WorkProductId::from("vm01-baseline-work-product");
         let opportunity_work_product_id = WorkProductId::from("vm01-opportunity-work-product");
+        let brief_work_product_id = WorkProductId::from("vm01-brief-work-product");
         let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
         service
             .create_project(
@@ -30614,7 +31402,7 @@ mod tests {
             .expect("durable work_queue completion");
         assert_eq!(
             completion.work_product_ids,
-            BTreeSet::from([opportunity_work_product_id])
+            BTreeSet::from([opportunity_work_product_id.clone()])
         );
         assert!(completion.effect_ids.is_empty());
         let evidence = completion
@@ -30653,6 +31441,291 @@ mod tests {
                 .len(),
             event_count
         );
+
+        let publication_at = now() + Duration::minutes(2);
+        let brief = record_and_accept_runtime_fixture(
+            &mut service,
+            &project_id,
+            &mission_id,
+            "brief_or_patch_ready",
+            brief_work_product_id.clone(),
+            private_brief,
+            publication_at,
+        );
+        assert_eq!(brief.work_product.status, WorkProductStatus::Accepted);
+        let selective_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("VM-01 at selective approval");
+        let selective_checkpoint = selective_mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("selective approval Checkpoint");
+        assert_eq!(selective_checkpoint.id, "selective_approval");
+        let selective_conversation_revision = service
+            .mission_conversation(&project_id, &mission_id)
+            .expect("selective approval Conversation")
+            .revision;
+        service
+            .confirm_human_mission_checkpoint(
+                ConfirmHumanMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    checkpoint_id: "selective_approval".into(),
+                    message_id: MissionConversationMessageId::from("vm01-selective-message"),
+                    body: private_approval.into(),
+                    idempotency_key: "vm01-selective-confirmation".into(),
+                    work_product_ids: BTreeSet::from([brief_work_product_id.clone()]),
+                    expected_mission_revision: selective_mission.revision,
+                    expected_checkpoint_revision: selective_checkpoint.revision,
+                    expected_conversation_revision: selective_conversation_revision,
+                },
+                publication_at + Duration::milliseconds(2),
+            )
+            .expect("approve exact VM-01 brief");
+
+        let connection_id = ConnectionId::from("vm01-publication-connection");
+        let account_id = AccountId::from("vm01-publication-account");
+        let publication_scope = "contents.write";
+        let private_external_account = "PRIVATE-VM01-ACCOUNT::site-owner";
+        service
+            .register_connection(
+                Connection::register(
+                    connection_id.clone(),
+                    TenantId::from("vm01-work-queue-tenant"),
+                    project_id.clone(),
+                    "github",
+                    account_id,
+                    private_external_account,
+                    [publication_scope.into()],
+                    publication_at + Duration::milliseconds(3),
+                )
+                .expect("VM-01 GitHub Connection"),
+                publication_at + Duration::milliseconds(3),
+            )
+            .expect("persist VM-01 GitHub Connection");
+        let connected = service
+            .record_connection_probe(
+                &project_id,
+                &connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: private_external_account.into(),
+                    granted_scopes: BTreeSet::from([publication_scope.into()]),
+                    probed_at: publication_at + Duration::milliseconds(4),
+                    valid_until: publication_at + Duration::days(30),
+                    credential_expires_at: publication_at + Duration::days(30),
+                    evidence_digest: "6".repeat(64),
+                },
+                publication_at + Duration::milliseconds(4),
+            )
+            .expect("probe live VM-01 publication Connection");
+        let publication_ready = service
+            .load_mission(&project_id, &mission_id)
+            .expect("VM-01 publication ready");
+        let publication_checkpoint = publication_ready
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("publication Checkpoint");
+        assert_eq!(publication_checkpoint.id, VM01_PUBLICATION_CHECKPOINT_ID);
+        let publication_effect_id = EffectId::from("vm01-publication-effect");
+        let proposal = ProposeVm01Publication {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: publication_effect_id.clone(),
+            actor_id: ActorId::from("vm01-publication-actor"),
+            connection_id,
+            work_product_id: brief_work_product_id.clone(),
+            required_scopes: BTreeSet::from([publication_scope.into()]),
+            scheduled_for: None,
+            idempotency_key: "vm01-publication-1".into(),
+            expires_at: publication_at + Duration::minutes(30),
+            expected_mission_revision: publication_ready.revision,
+            expected_checkpoint_revision: publication_checkpoint.revision,
+            expected_connection_revision: connected.revision(),
+            expected_work_product_revision: brief.work_product.revision,
+            expected_manifest_version: brief.manifest.version,
+        };
+        let events_before_proposal = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before VM-01 publication proposal")
+            .len();
+        assert!(matches!(
+            service.propose_vm01_publication(
+                &ProposeVm01Publication {
+                    work_product_id: opportunity_work_product_id,
+                    expected_work_product_revision: opportunity.work_product.revision,
+                    expected_manifest_version: opportunity.manifest.version,
+                    ..proposal.clone()
+                },
+                publication_at + Duration::milliseconds(5),
+            ),
+            Err(ApplicationError::Vm01PublicationWorkProductMismatch)
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after rejected VM-01 publication")
+                .len(),
+            events_before_proposal
+        );
+        assert_eq!(
+            service
+                .propose_vm01_publication(&proposal, publication_at + Duration::milliseconds(6),)
+                .expect("propose exact VM-01 publication"),
+            publication_effect_id
+        );
+        let proposal_event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after VM-01 publication proposal")
+            .len();
+        assert_eq!(
+            service
+                .propose_vm01_publication(&proposal, publication_at + Duration::milliseconds(7),)
+                .expect("replay exact VM-01 publication proposal"),
+            publication_effect_id
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after proposal replay")
+                .len(),
+            proposal_event_count
+        );
+
+        let proposed = service
+            .load_mission(&project_id, &mission_id)
+            .expect("proposed VM-01 publication");
+        let proposed_effect = proposed
+            .effect(&publication_effect_id)
+            .expect("VM-01 publication Effect");
+        assert_eq!(proposed_effect.status, EffectStatus::Proposed);
+        assert!(proposed_effect.receipt.is_none());
+        assert!(proposed_effect.verification.is_none());
+        let expected_scope_digest = proposed_effect.approval_digest();
+        let mut broker = EffectBroker::new(
+            vm01_publication_effect_policy(&proposed, proposed_effect)
+                .expect("deterministic VM-01 publication policy"),
+            "vm01-application-publication-worker",
+        )
+        .with_lease_for(Duration::days(36_500));
+        service
+            .approve_proposed_effect(
+                &broker,
+                ApproveProposedEffect {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: publication_effect_id.clone(),
+                    expected_scope_digest: expected_scope_digest.clone(),
+                    expected_mission_revision: proposed.revision,
+                },
+                ActorId::from("vm01-publication-approver"),
+                publication_at + Duration::milliseconds(8),
+            )
+            .expect("explicit VM-01 publication approval");
+        let approved = service
+            .load_mission(&project_id, &mission_id)
+            .expect("approved VM-01 publication");
+        let approval = approved
+            .effect(&publication_effect_id)
+            .expect("approved VM-01 publication Effect")
+            .approval
+            .clone()
+            .expect("durable VM-01 publication approval");
+        let mut executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: publication_at + Duration::milliseconds(10),
+        };
+        let mut verifier = RelationshipVerifier {
+            observed_at: publication_at + Duration::milliseconds(11),
+        };
+        service
+            .execute_approved_effect_at_revision(
+                &mut broker,
+                &ExecuteApprovedEffect {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: publication_effect_id.clone(),
+                    expected_scope_digest,
+                    expected_broker_authorization_digest: approval.permission_digest,
+                    expected_mission_revision: approved.revision,
+                },
+                &mut executor,
+                &mut verifier,
+                publication_at + Duration::milliseconds(9),
+            )
+            .expect("execute and independently verify VM-01 publication");
+        assert_eq!(executor.calls, 1);
+
+        let verified_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("verified VM-01 publication");
+        assert_eq!(
+            verified_mission
+                .effect(&publication_effect_id)
+                .expect("verified VM-01 publication Effect")
+                .status,
+            EffectStatus::Verified
+        );
+        let verifying_checkpoint = verified_mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("verifying VM-01 publication Checkpoint");
+        assert_eq!(
+            verifying_checkpoint.status,
+            MissionCheckpointStatus::Verifying
+        );
+        let completion_command = CompleteVm01Publication {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: publication_effect_id,
+            work_product_id: brief_work_product_id,
+            expected_mission_revision: verified_mission.revision,
+            expected_checkpoint_revision: verifying_checkpoint.revision,
+        };
+        let publication_completion = service
+            .complete_vm01_publication(
+                &completion_command,
+                publication_at + Duration::milliseconds(12),
+            )
+            .expect("complete verified VM-01 publication");
+        assert!(!publication_completion.replayed);
+        let readback = publication_completion
+            .next_dispatch
+            .expect("VM-01 publication readback route");
+        assert_eq!(readback.checkpoint_id, "url_link_readback");
+        assert_eq!(readback.executor, MissionCheckpointExecutor::Runtime);
+        assert_eq!(readback.capability_id, "publication.verify");
+        let publication_events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free VM-01 publication events");
+        let publication_event_count = publication_events.len();
+        let publication_event_json =
+            serde_json::to_string(&publication_events).expect("publication event JSON");
+        assert!(publication_event_json.contains("vm01.publication_approval_requested"));
+        assert!(publication_event_json.contains("vm01.publication_verified"));
+        assert!(!publication_event_json.contains(private_brief));
+        assert!(!publication_event_json.contains(private_approval));
+        assert!(!publication_event_json.contains(private_external_account));
+        assert!(
+            service
+                .complete_vm01_publication(
+                    &completion_command,
+                    publication_at + Duration::milliseconds(13),
+                )
+                .expect("replay exact VM-01 publication completion")
+                .replayed
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after VM-01 publication replay")
+                .len(),
+            publication_event_count
+        );
+        assert_eq!(executor.calls, 1);
     }
 
     #[test]
