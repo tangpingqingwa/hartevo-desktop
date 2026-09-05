@@ -16218,7 +16218,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, three painted Cordis Runtime turns, source-fenced account probe, exact Human selection, typed publication Effect, SQLCipher recovery, and content-free evidence"
+        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, three painted Cordis Runtime turns, source-fenced account probe, exact Human selection, typed publication Effect, SQLCipher recovery, and the final conservative content-free review decision"
     )]
     fn vm00_handoff_redirects_frozen_target_into_painted_runtime_resume_after_encrypted_reopen() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -18482,7 +18482,7 @@ sleep 30"#;
                         checkpoint_id,
                         executor: MissionCheckpointExecutor::Application,
                         application_handler_status: Some(
-                            hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented
+                            hartevo_application::ApplicationCheckpointHandlerStatus::Implemented
                         ),
                         ..
                     }),
@@ -18496,22 +18496,172 @@ sleep 30"#;
                     .len(),
                 engagement_event_count
             );
+            let rebalance_dispatch = completed_engagement_service
+                .dispatch_current_mission_checkpoint(
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(32),
+                )
+                .expect("exact VM-04 channel-rebalance dispatch");
+            assert_eq!(
+                (
+                    rebalance_dispatch.checkpoint_id.as_str(),
+                    rebalance_dispatch.capability_id.as_str(),
+                    rebalance_dispatch.application_handler_status,
+                    rebalance_dispatch.application_handler_id.as_deref(),
+                ),
+                (
+                    "channel_rebalance",
+                    "outcome.review",
+                    Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                    Some("vm04.channel-rebalance/v1"),
+                )
+            );
             drop(completed_engagement_service);
 
-            let rebalance_boundary = cold_after_readback
+            let rebalance_completed = cold_after_readback
                 .execute_application_mission_checkpoint_with(
                     &secrets,
                     &project_id,
                     &target_plan.target_mission_id,
                     handoff_now + Duration::seconds(33),
                 )
-                .expect("report the honest unimplemented channel-rebalance boundary");
+                .expect("complete the conservative VM-04 channel-rebalance decision");
+            assert!(matches!(
+                rebalance_completed.runtime_outcome,
+                DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                    ref checkpoint_id,
+                    ref evidence_digest,
+                } if checkpoint_id == "channel_rebalance" && evidence_digest.len() == 64
+            ));
+            let runtime_after_rebalance =
+                runtime_subscription_durable_snapshot(&cold_after_readback, &secrets, &project_id);
             assert_eq!(
-                rebalance_boundary.runtime_outcome,
-                DesktopMissionRuntimeOutcome::ApplicationCheckpointNotImplemented {
-                    checkpoint_id: "channel_rebalance".into(),
-                    capability_id: "outcome.review".into(),
+                runtime_after_rebalance.runtime_attempts,
+                durable_after_readback_runtime.runtime_attempts,
+                "channel rebalance cannot construct another Runtime attempt"
+            );
+            assert_eq!(
+                runtime_after_rebalance.private_messages,
+                durable_after_readback_runtime.private_messages
+            );
+            assert_eq!(
+                runtime_after_rebalance.private_text_deltas,
+                durable_after_readback_runtime.private_text_deltas
+            );
+
+            let (mut completed_rebalance_service, _) = cold_after_readback
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(34))
+                .expect("Application after VM-04 channel rebalance");
+            let completed_rebalance = completed_rebalance_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 channel rebalance");
+            assert_eq!(completed_rebalance.stage, MissionStage::Verifying);
+            assert_eq!(
+                completed_rebalance
+                    .definition
+                    .as_ref()
+                    .map_or(0, |definition| {
+                        definition
+                            .checkpoints
+                            .iter()
+                            .filter(|checkpoint| {
+                                checkpoint.status
+                                    == hartevo_domain_kernel::MissionCheckpointStatus::Completed
+                            })
+                            .count()
+                    }),
+                9
+            );
+            assert_eq!(
+                completed_rebalance.effect(&publication_effect_id),
+                Ok(&verified_publication),
+                "channel rebalance cannot revise the verified publication Effect"
+            );
+            let rebalance_evidence = completed_rebalance
+                .definition
+                .as_ref()
+                .and_then(|definition| {
+                    definition
+                        .checkpoints
+                        .iter()
+                        .find(|checkpoint| checkpoint.id == "channel_rebalance")
+                })
+                .and_then(|checkpoint| checkpoint.completion.as_ref())
+                .and_then(|completion| completion.application_evidence.as_ref())
+                .expect("durable content-free VM-04 channel-rebalance evidence");
+            assert_eq!(rebalance_evidence.handler_id, "vm04.channel-rebalance/v1");
+            assert_eq!(
+                rebalance_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    "channel_rebalance",
+                    "engagement_review",
+                    "mission_checkpoint",
+                    "mission_contract",
+                ])
+            );
+            assert!(matches!(
+                completed_rebalance_service.dispatch_current_mission_checkpoint(
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(34),
+                ),
+                Err(ApplicationError::MissionCheckpointDispatchUnavailable)
+            ));
+            let rebalance_event_json = serde_json::to_string(
+                &completed_rebalance_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("content-free VM-04 events after channel rebalance"),
+            )
+            .expect("channel-rebalance event JSON");
+            assert!(rebalance_event_json.contains("vm04.channel-rebalance/v1"));
+            assert!(!rebalance_event_json.contains(private_approval));
+            assert!(!rebalance_event_json.contains("page_desktop_vm04_private"));
+            assert!(!rebalance_event_json.contains(social_scope));
+            assert!(
+                !rebalance_event_json
+                    .contains("Reviewable local runtime draft; no external effect occurred.")
+            );
+            let rebalance_event_count = completed_rebalance_service
+                .mission_events(&project_id, &target_plan.target_mission_id)
+                .expect("VM-04 channel-rebalance events")
+                .len();
+            assert!(matches!(
+                completed_rebalance_service
+                    .execute_application_mission_checkpoint(
+                        ExecuteApplicationMissionCheckpoint {
+                            project_id: project_id.clone(),
+                            mission_id: target_plan.target_mission_id.clone(),
+                            checkpoint_id: rebalance_dispatch.checkpoint_id,
+                            expected_mission_revision: rebalance_dispatch.mission_revision,
+                            expected_checkpoint_revision: rebalance_dispatch.checkpoint_revision,
+                        },
+                        handoff_now + Duration::seconds(34),
+                    )
+                    .expect("exact VM-04 channel-rebalance replay"),
+                ApplicationMissionCheckpointExecution::Completed {
+                    replayed: true,
+                    next_dispatch: None,
+                    ..
                 }
+            ));
+            assert_eq!(
+                completed_rebalance_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("unchanged channel-rebalance replay events")
+                    .len(),
+                rebalance_event_count
+            );
+            assert_eq!(
+                completed_rebalance_service
+                    .load_mission(&project_id, &target_plan.target_mission_id)
+                    .expect("unchanged VM-04 Mission after channel-rebalance replay")
+                    .effect(&publication_effect_id),
+                Ok(&verified_publication)
             );
         }
         drop(directory);
