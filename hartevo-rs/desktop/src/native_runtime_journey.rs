@@ -1360,6 +1360,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidCatalogMissionContract
         | DesktopDataError::InvalidMissionContinuation
         | DesktopDataError::InvalidHumanCheckpointConfirmation
+        | DesktopDataError::InvalidVm00GoalSelection
         | DesktopDataError::InvalidVm11OutcomeDecision
         | DesktopDataError::InvalidVm11NextContractResolution
         | DesktopDataError::InvalidEffectProposal

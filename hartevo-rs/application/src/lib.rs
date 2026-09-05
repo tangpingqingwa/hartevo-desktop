@@ -238,6 +238,146 @@ pub struct ConfirmHumanMissionCheckpoint {
     pub expected_conversation_revision: u64,
 }
 
+/// Private, typed selection of the operating Mission that VM-00 will hand
+/// control to. IDs and compiled authority are deliberately absent: the
+/// Application derives and freezes both from the current Catalog.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Vm00TargetMissionSelection {
+    pub manifest_id: String,
+    pub mode: OperatingMode,
+    pub title: Option<String>,
+    pub goal: String,
+    pub market: String,
+    pub language: String,
+    pub audience: String,
+    pub timezone: String,
+    pub kpis: BTreeMap<String, KpiContract>,
+    pub budget: Money,
+}
+
+impl fmt::Debug for Vm00TargetMissionSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Vm00TargetMissionSelection")
+            .field("manifest_id", &self.manifest_id)
+            .field("mode", &self.mode)
+            .field("title", &"[REDACTED]")
+            .field("goal", &"[REDACTED]")
+            .field("market", &"[REDACTED]")
+            .field("language", &"[REDACTED]")
+            .field("audience", &"[REDACTED]")
+            .field("timezone", &"[REDACTED]")
+            .field("kpis", &format_args!("[REDACTED; {}]", self.kpis.len()))
+            .field("budget", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct ConfirmVm00GoalSelection {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub selection: Vm00TargetMissionSelection,
+    pub message_id: MissionConversationMessageId,
+    pub idempotency_key: String,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_conversation_revision: u64,
+}
+
+impl fmt::Debug for ConfirmVm00GoalSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfirmVm00GoalSelection")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("selection", &self.selection)
+            .field("message_id", &self.message_id)
+            .field("idempotency_key", &"[REDACTED]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field(
+                "expected_checkpoint_revision",
+                &self.expected_checkpoint_revision,
+            )
+            .field(
+                "expected_conversation_revision",
+                &self.expected_conversation_revision,
+            )
+            .finish()
+    }
+}
+
+/// Frozen target blueprint held only inside the encrypted Mission
+/// Conversation. A later Catalog release cannot silently change the selected
+/// target's contract or Checkpoint DAG before handoff.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Vm00TargetMissionPlan {
+    pub schema_version: String,
+    pub source_mission_id: MissionId,
+    pub source_mission_revision: u64,
+    pub source_checkpoint_revision: u64,
+    pub source_conversation_revision: u64,
+    pub target_mission_id: MissionId,
+    pub target_first_task_id: TaskId,
+    pub selection: Vm00TargetMissionSelection,
+    pub target_title: String,
+    pub target_contract: MissionContract,
+    pub target_definition: MissionDefinition,
+}
+
+impl Vm00TargetMissionPlan {
+    pub const SCHEMA_VERSION: &'static str = "hartevo-vm00-target-mission-plan/v1";
+}
+
+impl fmt::Debug for Vm00TargetMissionPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Vm00TargetMissionPlan")
+            .field("schema_version", &self.schema_version)
+            .field("source_mission_id", &self.source_mission_id)
+            .field("source_mission_revision", &self.source_mission_revision)
+            .field(
+                "source_checkpoint_revision",
+                &self.source_checkpoint_revision,
+            )
+            .field(
+                "source_conversation_revision",
+                &self.source_conversation_revision,
+            )
+            .field("target_mission_id", &self.target_mission_id)
+            .field("target_first_task_id", &self.target_first_task_id)
+            .field("selection", &self.selection)
+            .field("target_title", &"[REDACTED]")
+            .field("target_contract", &"[REDACTED]")
+            .field("target_definition", &"[FROZEN]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct Vm00GoalSelectionConfirmation {
+    pub confirmation: HumanMissionCheckpointConfirmation,
+    pub plan: Vm00TargetMissionPlan,
+    pub replayed: bool,
+}
+
+impl fmt::Debug for Vm00GoalSelectionConfirmation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Vm00GoalSelectionConfirmation")
+            .field("confirmation", &"[REDACTED]")
+            .field(
+                "completed_checkpoint_id",
+                &self.confirmation.completed_checkpoint_id,
+            )
+            .field("plan", &self.plan)
+            .field("replayed", &self.replayed)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HumanMissionCheckpointConfirmation {
     pub mission: Mission,
@@ -6263,6 +6403,60 @@ fn is_vm11_structured_outcome_decision_checkpoint(mission: &Mission, checkpoint_
         })
 }
 
+fn is_vm00_structured_goal_selection_checkpoint(mission: &Mission, checkpoint_id: &str) -> bool {
+    checkpoint_id == "goal_selected"
+        && mission.definition.as_ref().is_some_and(|definition| {
+            definition.manifest_id == "VM-00"
+                && definition.manifest_version == 3
+                && definition.checkpoints.iter().any(|checkpoint| {
+                    checkpoint.id == checkpoint_id
+                        && checkpoint.route.as_ref().is_some_and(|route| {
+                            route.executor == MissionCheckpointExecutor::Human
+                                && route.completion_policy
+                                    == Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+                                && route.capability_id == "mission.compile"
+                                && route.oracle_ids
+                                    == BTreeSet::from([
+                                        "goal".to_owned(),
+                                        "operating_state".to_owned(),
+                                    ])
+                        })
+                })
+        })
+}
+
+fn is_vm00_operating_target(manifest_id: &str) -> bool {
+    matches!(
+        manifest_id,
+        "VM-01"
+            | "VM-02"
+            | "VM-03"
+            | "VM-04"
+            | "VM-05"
+            | "VM-06"
+            | "VM-07"
+            | "VM-08"
+            | "VM-09"
+            | "VM-10"
+    )
+}
+
+fn normalize_vm00_target_selection(
+    mut selection: Vm00TargetMissionSelection,
+) -> Vm00TargetMissionSelection {
+    selection.manifest_id = selection.manifest_id.trim().to_owned();
+    selection.title = selection
+        .title
+        .map(|title| title.trim().to_owned())
+        .filter(|title| !title.is_empty());
+    selection.goal = selection.goal.trim().to_owned();
+    selection.market = selection.market.trim().to_owned();
+    selection.language = selection.language.trim().to_owned();
+    selection.audience = selection.audience.trim().to_owned();
+    selection.timezone = selection.timezone.trim().to_owned();
+    selection
+}
+
 #[allow(clippy::too_many_arguments)]
 fn persist_application_checkpoint_block(
     store: &mut ProjectStore,
@@ -10750,7 +10944,7 @@ impl ApplicationService {
             .as_ref()
             .map(|parent_id| self.store.load_mission(&command.project_id, parent_id))
             .transpose()?;
-        let contract = compile_catalog_contract(
+        let blueprint = compile_catalog_mission_blueprint(
             &catalog,
             &snapshot.digest,
             manifest,
@@ -10758,62 +10952,21 @@ impl ApplicationService {
             parent_mission.as_ref(),
             now,
         )?;
-        let checkpoint_routes = manifest
-            .checkpoint_routes
-            .iter()
-            .map(|route| {
-                Ok((
-                    route.checkpoint_id.clone(),
-                    MissionCheckpointRoute::contracted(
-                        route.capability_id.clone(),
-                        MissionCheckpointExecutor::try_from(route.executor.as_str())?,
-                        route.oracle_ids.iter().cloned(),
-                        MissionCheckpointCompletionPolicy::try_from(
-                            route.completion_policy.as_str(),
-                        )?,
-                    )?,
-                ))
-            })
-            .collect::<Result<Vec<_>, MissionError>>()?;
-        let definition = MissionDefinition::from_routed_linear_manifest(
-            manifest.id.clone(),
-            manifest.version,
-            snapshot.digest.clone(),
-            command.mode.clone(),
-            manifest.capability_ids.iter().cloned(),
-            manifest.required_artifacts.iter().cloned(),
-            manifest.oracle_ids.iter().cloned(),
-            checkpoint_routes,
-        )?;
-        let title = command
-            .title
-            .unwrap_or_else(|| format!("{} · {}", manifest.id, concise_title(command.goal.trim())));
-        let first_checkpoint_id = manifest
-            .checkpoint_ids
-            .first()
-            .cloned()
-            .ok_or(ApplicationError::InvalidCatalogMissionInput)?;
-        let (first_capability, first_executor) = definition
-            .checkpoints
-            .first()
-            .and_then(|checkpoint| checkpoint.route.as_ref())
-            .map(|route| (route.capability_id.clone(), route.executor))
-            .ok_or(ApplicationError::InvalidCatalogMissionInput)?;
         let mut mission = Mission::compile_catalog(
             project.tenant_id,
             command.id,
             command.project_id,
-            title,
-            contract,
-            definition,
+            blueprint.title,
+            blueprint.contract,
+            blueprint.definition,
             now,
         )?;
         mission.start_research(
             [Task {
                 id: command.first_task_id,
-                title: format!("Checkpoint: {first_checkpoint_id}"),
+                title: format!("Checkpoint: {}", blueprint.first_checkpoint_id),
                 status: TaskStatus::Running,
-                capability: first_capability.clone(),
+                capability: blueprint.first_capability.clone(),
             }],
             now,
         )?;
@@ -10854,11 +11007,11 @@ impl ApplicationService {
                 PendingEvent::new(
                     "mission.checkpoint_started",
                     serde_json::json!({
-                        "checkpointId": first_checkpoint_id,
+                        "checkpointId": blueprint.first_checkpoint_id,
                         "cycle": 1,
                         "checkpointRevision": 2,
-                        "capabilityId": first_capability,
-                        "executor": first_executor,
+                        "capabilityId": blueprint.first_capability,
+                        "executor": blueprint.first_executor,
                     }),
                     now,
                 ),
@@ -12927,14 +13080,207 @@ impl ApplicationService {
         })
     }
 
+    /// Confirms VM-00's target only from a typed Catalog selection. The
+    /// resulting blueprint is private Conversation content; public
+    /// Event/Outbox evidence sees only its digest.
     #[allow(
         clippy::too_many_lines,
-        reason = "the Human Checkpoint boundary binds replay, dual revisions, exact WorkProducts, confirmation evidence, completion, and next-route handoff in one transaction"
+        reason = "the typed VM-00 boundary keeps replay validation, source CAS, Catalog compilation, private plan persistence, and atomic Checkpoint handoff visible together"
     )]
+    pub fn confirm_vm00_goal_selection(
+        &mut self,
+        command: ConfirmVm00GoalSelection,
+        now: DateTime<Utc>,
+    ) -> Result<Vm00GoalSelectionConfirmation, ApplicationError> {
+        let mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let conversation = self
+            .store
+            .load_mission_conversation(&command.project_id, &command.mission_id)?;
+        let idempotency_key = command.idempotency_key.trim().to_owned();
+        if idempotency_key.is_empty()
+            || command.message_id.as_str().trim().is_empty()
+            || !is_vm00_structured_goal_selection_checkpoint(&mission, "goal_selected")
+        {
+            return Err(ApplicationError::StructuredVm00GoalSelectionCommandMismatch);
+        }
+        let selection = normalize_vm00_target_selection(command.selection);
+
+        if let Some(existing) = conversation
+            .messages
+            .iter()
+            .find(|message| message.idempotency_key == idempotency_key)
+        {
+            let plan = serde_json::from_str::<Vm00TargetMissionPlan>(&existing.body)
+                .map_err(|_| ApplicationError::StructuredVm00GoalSelectionReplayMismatch)?;
+            if existing.id != command.message_id
+                || plan.schema_version != Vm00TargetMissionPlan::SCHEMA_VERSION
+                || plan.source_mission_id != command.mission_id
+                || plan.source_mission_revision != command.expected_mission_revision
+                || plan.source_checkpoint_revision != command.expected_checkpoint_revision
+                || plan.source_conversation_revision != command.expected_conversation_revision
+                || plan.target_mission_id
+                    != MissionId::from_stable(format!("vm00-target-mission:{}", command.mission_id))
+                || plan.target_first_task_id
+                    != TaskId::from_stable(format!("vm00-target-first-task:{}", command.mission_id))
+                || plan.selection != selection
+                || plan.target_definition.manifest_id != plan.selection.manifest_id
+                || plan.target_definition.operating_mode != plan.selection.mode
+                || plan.target_definition.catalog_digest
+                    != mission
+                        .definition
+                        .as_ref()
+                        .map(|definition| definition.catalog_digest.as_str())
+                        .unwrap_or_default()
+                || plan.target_definition.capability_ids
+                    != plan.target_contract.enabled_capabilities
+                || plan.target_title.trim().is_empty()
+                || plan.target_contract.mode != plan.selection.mode
+                || plan.target_contract.goal != plan.selection.goal
+                || plan.target_contract.market != plan.selection.market
+                || plan.target_contract.language != plan.selection.language
+                || plan.target_contract.audience != plan.selection.audience
+                || plan.target_contract.timezone != plan.selection.timezone
+                || plan.target_contract.kpis != plan.selection.kpis
+                || plan.target_contract.budget != plan.selection.budget
+                || plan.target_contract.parent_mission_id.is_some()
+            {
+                return Err(ApplicationError::StructuredVm00GoalSelectionReplayMismatch);
+            }
+            let confirmation = self.confirm_human_mission_checkpoint_inner(
+                ConfirmHumanMissionCheckpoint {
+                    project_id: command.project_id,
+                    mission_id: command.mission_id,
+                    checkpoint_id: "goal_selected".into(),
+                    message_id: command.message_id,
+                    body: existing.body.clone(),
+                    idempotency_key,
+                    work_product_ids: BTreeSet::new(),
+                    expected_mission_revision: command.expected_mission_revision,
+                    expected_checkpoint_revision: command.expected_checkpoint_revision,
+                    expected_conversation_revision: command.expected_conversation_revision,
+                },
+                now,
+                true,
+            )?;
+            return Ok(Vm00GoalSelectionConfirmation {
+                confirmation,
+                plan,
+                replayed: true,
+            });
+        }
+
+        if mission.revision != command.expected_mission_revision
+            || conversation.revision != command.expected_conversation_revision
+            || !mission.definition.as_ref().is_some_and(|definition| {
+                definition.current_checkpoint().is_some_and(|checkpoint| {
+                    checkpoint.id == "goal_selected"
+                        && checkpoint.status == MissionCheckpointStatus::Running
+                        && checkpoint.revision == command.expected_checkpoint_revision
+                })
+            })
+        {
+            return Err(ApplicationError::StructuredVm00GoalSelectionUnavailable);
+        }
+        if !is_vm00_operating_target(&selection.manifest_id) {
+            return Err(ApplicationError::StructuredVm00GoalSelectionCommandMismatch);
+        }
+
+        let catalog = Catalog::load()?;
+        let snapshot = catalog.snapshot()?;
+        if mission
+            .definition
+            .as_ref()
+            .is_none_or(|definition| definition.catalog_digest != snapshot.digest)
+        {
+            return Err(ApplicationError::StructuredVm00GoalSelectionUnavailable);
+        }
+        let manifest = catalog
+            .mission(&selection.manifest_id)
+            .ok_or(ApplicationError::StructuredVm00GoalSelectionCommandMismatch)?;
+        let target_mission_id =
+            MissionId::from_stable(format!("vm00-target-mission:{}", command.mission_id));
+        let target_first_task_id =
+            TaskId::from_stable(format!("vm00-target-first-task:{}", command.mission_id));
+        let target_command = StartCatalogMission {
+            id: target_mission_id.clone(),
+            first_task_id: target_first_task_id.clone(),
+            project_id: command.project_id.clone(),
+            manifest_id: selection.manifest_id.clone(),
+            mode: selection.mode.clone(),
+            parent_mission_id: None,
+            title: selection.title.clone(),
+            goal: selection.goal.clone(),
+            market: selection.market.clone(),
+            language: selection.language.clone(),
+            audience: selection.audience.clone(),
+            timezone: selection.timezone.clone(),
+            kpis: selection.kpis.clone(),
+            budget: selection.budget.clone(),
+        };
+        let blueprint = compile_catalog_mission_blueprint(
+            &catalog,
+            &snapshot.digest,
+            manifest,
+            &target_command,
+            None,
+            now,
+        )?;
+        let plan = Vm00TargetMissionPlan {
+            schema_version: Vm00TargetMissionPlan::SCHEMA_VERSION.into(),
+            source_mission_id: command.mission_id.clone(),
+            source_mission_revision: command.expected_mission_revision,
+            source_checkpoint_revision: command.expected_checkpoint_revision,
+            source_conversation_revision: command.expected_conversation_revision,
+            target_mission_id,
+            target_first_task_id,
+            selection,
+            target_title: blueprint.title,
+            target_contract: blueprint.contract,
+            target_definition: blueprint.definition,
+        };
+        let body = serde_json::to_string(&plan)?;
+        let confirmation = self.confirm_human_mission_checkpoint_inner(
+            ConfirmHumanMissionCheckpoint {
+                project_id: command.project_id,
+                mission_id: command.mission_id,
+                checkpoint_id: "goal_selected".into(),
+                message_id: command.message_id,
+                body,
+                idempotency_key,
+                work_product_ids: BTreeSet::new(),
+                expected_mission_revision: command.expected_mission_revision,
+                expected_checkpoint_revision: command.expected_checkpoint_revision,
+                expected_conversation_revision: command.expected_conversation_revision,
+            },
+            now,
+            true,
+        )?;
+        Ok(Vm00GoalSelectionConfirmation {
+            confirmation,
+            plan,
+            replayed: false,
+        })
+    }
+
     pub fn confirm_human_mission_checkpoint(
         &mut self,
         command: ConfirmHumanMissionCheckpoint,
         now: DateTime<Utc>,
+    ) -> Result<HumanMissionCheckpointConfirmation, ApplicationError> {
+        self.confirm_human_mission_checkpoint_inner(command, now, false)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the Human Checkpoint boundary binds replay, dual revisions, exact WorkProducts, confirmation evidence, completion, and next-route handoff in one transaction"
+    )]
+    fn confirm_human_mission_checkpoint_inner(
+        &mut self,
+        command: ConfirmHumanMissionCheckpoint,
+        now: DateTime<Utc>,
+        allow_vm00_structured_selection: bool,
     ) -> Result<HumanMissionCheckpointConfirmation, ApplicationError> {
         let mut mission = self
             .store
@@ -12944,6 +13290,11 @@ impl ApplicationService {
             .load_mission_conversation(&command.project_id, &command.mission_id)?;
         if is_vm11_structured_outcome_decision_checkpoint(&mission, &command.checkpoint_id) {
             return Err(ApplicationError::StructuredOutcomeDecisionRequired);
+        }
+        if !allow_vm00_structured_selection
+            && is_vm00_structured_goal_selection_checkpoint(&mission, &command.checkpoint_id)
+        {
+            return Err(ApplicationError::StructuredVm00GoalSelectionRequired);
         }
         let normalized_body = command.body.trim();
 
@@ -25526,6 +25877,81 @@ pub fn compile_contract(prompt: &str, now: DateTime<Utc>) -> MissionContract {
     contract
 }
 
+struct CatalogMissionBlueprint {
+    title: String,
+    contract: MissionContract,
+    definition: MissionDefinition,
+    first_checkpoint_id: String,
+    first_capability: String,
+    first_executor: MissionCheckpointExecutor,
+}
+
+fn compile_catalog_mission_blueprint(
+    catalog: &Catalog,
+    catalog_digest: &str,
+    manifest: &MissionManifest,
+    command: &StartCatalogMission,
+    parent_mission: Option<&Mission>,
+    now: DateTime<Utc>,
+) -> Result<CatalogMissionBlueprint, ApplicationError> {
+    let contract = compile_catalog_contract(
+        catalog,
+        catalog_digest,
+        manifest,
+        command,
+        parent_mission,
+        now,
+    )?;
+    let checkpoint_routes = manifest
+        .checkpoint_routes
+        .iter()
+        .map(|route| {
+            Ok((
+                route.checkpoint_id.clone(),
+                MissionCheckpointRoute::contracted(
+                    route.capability_id.clone(),
+                    MissionCheckpointExecutor::try_from(route.executor.as_str())?,
+                    route.oracle_ids.iter().cloned(),
+                    MissionCheckpointCompletionPolicy::try_from(route.completion_policy.as_str())?,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>, MissionError>>()?;
+    let definition = MissionDefinition::from_routed_linear_manifest(
+        manifest.id.clone(),
+        manifest.version,
+        catalog_digest.to_owned(),
+        command.mode.clone(),
+        manifest.capability_ids.iter().cloned(),
+        manifest.required_artifacts.iter().cloned(),
+        manifest.oracle_ids.iter().cloned(),
+        checkpoint_routes,
+    )?;
+    let title = command
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("{} · {}", manifest.id, concise_title(command.goal.trim())));
+    let first_checkpoint_id = manifest
+        .checkpoint_ids
+        .first()
+        .cloned()
+        .ok_or(ApplicationError::InvalidCatalogMissionInput)?;
+    let (first_capability, first_executor) = definition
+        .checkpoints
+        .first()
+        .and_then(|checkpoint| checkpoint.route.as_ref())
+        .map(|route| (route.capability_id.clone(), route.executor))
+        .ok_or(ApplicationError::InvalidCatalogMissionInput)?;
+    Ok(CatalogMissionBlueprint {
+        title,
+        contract,
+        definition,
+        first_checkpoint_id,
+        first_capability,
+        first_executor,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the compiler materializes every Operating Contract authority, consent, approval, cadence, budget, market, and completion dimension"
@@ -26224,6 +26650,14 @@ pub enum ApplicationError {
     HumanCheckpointConfirmationReplayMismatch,
     #[error("Human Checkpoint confirmation does not bind the exact required WorkProducts")]
     HumanCheckpointWorkProductMismatch,
+    #[error("VM-00 goal_selected requires a structured Catalog Mission selection")]
+    StructuredVm00GoalSelectionRequired,
+    #[error("the current Mission is not at its structured VM-00 goal selection route")]
+    StructuredVm00GoalSelectionUnavailable,
+    #[error("the structured VM-00 target Mission selection is incomplete or malformed")]
+    StructuredVm00GoalSelectionCommandMismatch,
+    #[error("the structured VM-00 target Mission replay does not match persisted evidence")]
+    StructuredVm00GoalSelectionReplayMismatch,
     #[error(transparent)]
     MarketEvidence(#[from] MarketEvidenceError),
     #[error("VM-07 Market Evidence Pack is not available as a typed WorkProduct")]
