@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-iot-sitewise-measurement-result/contract.v1.json",
+  "title": "Hartevo AWS IoT SiteWise measurement result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-iot-sitewise-measurement-result/v1",
+  "contractVersion": "EXT-AWSIOTSITEWISE-01-L1/v1",
+  "pluginId": "aws.iot-sitewise.measurement-result",
+  "objectiveType": "industrial_measurement_state",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-iot-sitewise-measurement-result/v1|layer=1|service=aws.iot-sitewise.measurement-result.read|provider=aws.iot-sitewise.measurement-result.recording|consumer=mission.aws-iot-sitewise-measurement.consumer",
+  "contractDigest": "14abc3693d98aaa7dc1f2ce1251a8247a8b1b48b39f985746a052a768f731687",
+  "service": {
+    "type": "AwsIoTSiteWiseMeasurementService",
+    "id": "aws.iot-sitewise.measurement-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "ListAssets",
+      "DescribeAsset",
+      "DescribeAssetProperty",
+      "GetAssetPropertyValueHistory",
+      "compile_measurement_evidence_proposal",
+      "verify_measurement_evidence",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "AwsIoTSiteWiseProvider",
+    "id": "aws.iot-sitewise.measurement-result.recording",
+    "apiRevision": "sitewise-list-assets-describe-asset-describe-property-get-history-1",
+    "operations": [
+      "ListAssets",
+      "DescribeAsset",
+      "DescribeAssetProperty",
+      "GetAssetPropertyValueHistory"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsIoTSiteWiseConsumer",
+    "id": "mission.aws-iot-sitewise-measurement.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing scope-bound SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "assetModelId",
+      "assetId",
+      "propertyId",
+      "propertyAlias",
+      "timeWindowStart",
+      "timeWindowEnd",
+      "quality",
+      "maxPoints",
+      "maxPages",
+      "maxResponseBytes",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawTelemetry": false,
+    "rawValues": false,
+    "rawTimestamps": false,
+    "maxWindowSeconds": 2678400,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 4194304
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginId",
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "status"
+    ],
+    "permissions": [
+      "iotsitewise:ListAssets",
+      "iotsitewise:DescribeAsset",
+      "iotsitewise:DescribeAssetProperty",
+      "iotsitewise:GetAssetPropertyValueHistory",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "iotsitewise:BatchPutAssetPropertyValue",
+      "iotsitewise:CreateAsset",
+      "iotsitewise:UpdateAsset",
+      "iotsitewise:DeleteAsset",
+      "iotsitewise:CreateAssetModel",
+      "iotsitewise:UpdateAssetModel",
+      "iotsitewise:DeleteAssetModel",
+      "iotsitewise:AssociateTimeSeriesToAssetProperty",
+      "iotsitewise:DisassociateTimeSeriesFromAssetProperty",
+      "iot:Connect",
+      "iot:Publish",
+      "iot:Subscribe",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "assetModelId",
+      "assetId",
+      "propertyId",
+      "propertyAlias",
+      "timeWindow",
+      "quality",
+      "maxPoints",
+      "pageNumber",
+      "filterDigest"
+    ],
+    "filterDriftRejected": true,
+    "assetDriftRejected": true,
+    "propertyDriftRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "measurement": {
+    "pointProjection": [
+      "timestamp",
+      "quality",
+      "valueKind",
+      "valueDigest",
+      "pointDigest"
+    ],
+    "aggregateProjection": [
+      "count",
+      "qualityCounts",
+      "timestampDigest",
+      "valueDigest",
+      "minValueDigest",
+      "maxValueDigest",
+      "aggregateDigest"
+    ],
+    "ascendingOrderRequired": true,
+    "timeWindowRequired": true,
+    "qualityFilterRequired": true,
+    "rawTelemetryRetained": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "listAssetsDigest",
+      "describeAssetDigest",
+      "describePropertyDigest",
+      "historyDigest",
+      "cursorDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "PRESENT",
+      "EMPTY",
+      "PARTIAL",
+      "STALE",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "tamperRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "staleIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "malformedIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS account/region/asset-model/asset/property/property-alias scope",
+      "bounded ListAssets, DescribeAsset, DescribeAssetProperty and GetAssetPropertyValueHistory seams",
+      "time-window, quality, ascending-order, point-count, page-count and response-byte fences",
+      "redacted point, timestamp, value, quality, aggregate, min/max and evidence digests",
+      "version/contract/provider/permission/consent/scope/evidence registration",
+      "reversible and revocable registration transitions",
+      "deterministic Mission proposal and idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS IoT SiteWise HTTPS",
+      "measurement ingestion or writes",
+      "asset, asset-model or property mutation",
+      "gateway or device control",
+      "raw telemetry or raw credentials",
+      "physical or process causality",
+      "provider receipt",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "host-owned SigV4 credential resolution",
+    "live AWS IoT SiteWise HTTPS",
+    "durable provider receipt",
+    "independent native read-back",
+    "consented ingestion or asset effects",
+    "Connected/native/first-party evidence",
+    "physical/process causality",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live ListAssets/DescribeAsset/DescribeAssetProperty/GetAssetPropertyValueHistory HTTPS, durable provider receipt, independent native read-back, consented effects and verified Mission adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. A measurement projection is provider-state evidence only and is not proof of physical or process causality."
+}
