@@ -20270,7 +20270,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one encrypted Desktop Journey keeps work-queue evidence, a paint-gated selected brief, verified publication, readback adoption, ranking review, cold recovery, and replay visible"
+        reason = "one encrypted Desktop Journey keeps work-queue evidence, a paint-gated selected brief, verified publication, readback adoption, ranking review, atomic next-cycle scheduling, cold recovery, replay, and cycle-two dispatch visible"
     )]
     fn vm01_work_queue_and_publication_advance_through_cordis_without_duplicate_provider_work() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -20917,8 +20917,8 @@ sleep 30"#;
                     .as_deref(),
             ),
             (
-                Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
-                None,
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm01.next-cycle/v1"),
             )
         );
         assert_eq!(executor.calls, 1);
@@ -21006,6 +21006,119 @@ sleep 30"#;
                 .len(),
             ranking_event_count
         );
+        drop(ranked_service);
+
+        let scheduled = cold_after_ranking
+            .execute_application_mission_checkpoint_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                started_at + Duration::seconds(34),
+            )
+            .expect("complete VM-01 next cycle through Desktop");
+        assert!(matches!(
+            &scheduled.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                checkpoint_id,
+                ..
+            } if checkpoint_id == "next_cycle"
+        ));
+        let scheduled_projection = scheduled.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("scheduled VM-01 Desktop projection");
+        assert_eq!(scheduled_projection.stage, MissionStage::Scheduled);
+        let scheduled_cycle = scheduled_projection
+            .schedule
+            .as_ref()
+            .expect("cycle-two Schedule in Desktop projection");
+        assert_eq!(scheduled_cycle.cycle, 2);
+        assert_eq!(scheduled_cycle.status, MissionScheduleStatus::Pending);
+        let due_at = scheduled_cycle.due_at.expect("weekly cycle-two due time");
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
+
+        let cold_after_schedule = DesktopDataPlane::at_data_root(plane.data_root.clone())
+            .expect("cold Desktop after VM-01 scheduling");
+        let (mut cycle_two_service, _) = cold_after_schedule
+            .open_application_from_secret(&database_secret, started_at + Duration::seconds(35))
+            .expect("cold Application with VM-01 Schedule");
+        let scheduled_mission = cycle_two_service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("durable scheduled VM-01 Mission");
+        assert_eq!(scheduled_mission.stage, MissionStage::Scheduled);
+        assert_eq!(scheduled_mission.outcome_history.len(), 1);
+        assert_eq!(
+            scheduled_mission
+                .outcome
+                .as_ref()
+                .map(|outcome| &outcome.decision),
+            Some(&OutcomeDecision::Continue)
+        );
+        let next_cycle_completion = scheduled_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "next_cycle")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-01 next-cycle completion");
+        let next_cycle_evidence = next_cycle_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable VM-01 next-cycle evidence");
+        assert_eq!(next_cycle_evidence.handler_id, "vm01.next-cycle/v1");
+        assert_eq!(
+            next_cycle_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "mission_checkpoint",
+                "mission_contract",
+                "ranking_traffic_review",
+            ])
+        );
+        let scheduled_events = cycle_two_service
+            .mission_events(&project_id, &started.mission_id)
+            .expect("content-free VM-01 scheduling events");
+        let scheduled_event_json =
+            serde_json::to_string(&scheduled_events).expect("scheduling event JSON");
+        assert!(scheduled_event_json.contains("vm01.next-cycle/v1"));
+        assert!(scheduled_event_json.contains("mission.schedule_created"));
+        assert!(!scheduled_event_json.contains(private_scope));
+        assert!(!scheduled_event_json.contains(private_approval));
+        assert!(!scheduled_event_json.contains(private_external_account));
+        assert!(!scheduled_event_json.contains("Reviewable local runtime draft"));
+
+        let cycle_two = cycle_two_service
+            .run_due_mission_scheduler_once("desktop-vm01-scheduler", due_at)
+            .expect("run cold-recovered VM-01 Schedule")
+            .expect("start VM-01 cycle two");
+        assert_eq!(cycle_two.stage, MissionStage::Running);
+        assert_eq!(cycle_two.outcome_history.len(), 1);
+        assert_eq!(
+            cycle_two
+                .definition
+                .as_ref()
+                .map(|definition| definition.cycle),
+            Some(2)
+        );
+        let cycle_two_dispatch = cycle_two_service
+            .dispatch_current_mission_checkpoint(&project_id, &started.mission_id, due_at)
+            .expect("cycle-two VM-01 Desktop dispatch");
+        assert_eq!(cycle_two_dispatch.cycle, 2);
+        assert_eq!(cycle_two_dispatch.checkpoint_id, "scope_locked");
+        assert_eq!(
+            cycle_two_dispatch.executor,
+            MissionCheckpointExecutor::Human
+        );
+        assert_eq!(cycle_two_dispatch.capability_id, "seo.plan");
         assert_eq!(executor.calls, 1);
         assert_eq!(verifier.calls, 1);
     }
