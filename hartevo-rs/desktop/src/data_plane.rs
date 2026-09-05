@@ -21624,9 +21624,9 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the encrypted Desktop Journey keeps the typed VM-07 Pack, Continue decision, bounded Application plan, cold recovery, zero Runtime construction, and exact replay visible"
+        reason = "the encrypted Desktop Journey keeps the typed VM-07 Pack, Continue decision, bounded Application plan, typed terminal, cold recovery, zero Runtime construction, and exact replay visible"
     )]
-    fn vm07_prioritized_experiments_cold_recovers_without_runtime_or_external_write() {
+    fn vm07_planned_decision_cold_recovers_to_typed_terminal_without_external_write() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let started = plane
             .start_catalog_mission_and_run_with(
@@ -21874,8 +21874,23 @@ sleep 30"#;
         );
         assert_eq!(
             projected.current_checkpoint_application_handler_status,
-            Some(ApplicationCheckpointHandlerStatus::NotImplemented)
+            Some(ApplicationCheckpointHandlerStatus::Implemented)
         );
+        assert_eq!(
+            projected
+                .current_checkpoint_application_handler_id
+                .as_deref(),
+            Some("vm07.replan-or-terminal/v1")
+        );
+        let terminal_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: started.mission_id.clone(),
+            checkpoint_id: "replan_or_terminal".into(),
+            expected_mission_revision: projected.revision,
+            expected_checkpoint_revision: projected
+                .current_checkpoint_revision
+                .expect("replan-or-terminal revision"),
+        };
         assert!(planned.snapshot.runtime_activity.iter().all(|activity| {
             activity.mission_id != started.mission_id
                 || (activity.process_claim_status.is_none()
@@ -21883,12 +21898,13 @@ sleep 30"#;
                     && activity.turn_status.is_none())
         }));
 
-        let (mut cold_service, _) = cold
+        let (cold_service, _) = cold
             .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(12))
             .expect("cold Application after prioritized plan");
         let planned_mission = cold_service
             .load_mission(&project_id, &started.mission_id)
             .expect("durable planned Mission");
+        let planned_work_product_count = planned_mission.work_products.len();
         assert!(planned_mission.effects.is_empty());
         assert!(
             cold_service
@@ -21920,6 +21936,7 @@ sleep 30"#;
         assert_eq!(body["replanAuthority"], "denied");
         assert_eq!(body["terminalAuthority"], "denied");
         assert_eq!(plan_manifest.artifact_digest, plan.content_digest);
+        let plan_id = plan.id.clone();
         let prioritized = planned_mission
             .definition
             .as_ref()
@@ -21961,12 +21978,120 @@ sleep 30"#;
                 .any(|window| window == pack.experiment_plan[0].hypothesis.as_bytes())
         );
 
-        let event_count = cold_service
-            .mission_events(&project_id, &started.mission_id)
-            .expect("events before replay")
-            .len();
+        drop(budgeted_products);
+        drop(planned_mission);
+        drop(cold_service);
+
+        let terminal_submission = cold
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("VM-07 terminal Application route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(13),
+            )
+            .expect("cold-complete typed VM-07 terminal");
         assert!(matches!(
-            cold_service
+            terminal_submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                checkpoint_id,
+                ..
+            } if checkpoint_id == "replan_or_terminal"
+        ));
+        let terminal_projection = terminal_submission.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("terminal VM-07 projection");
+        assert_eq!(terminal_projection.stage, MissionStage::Completed);
+        assert_eq!(terminal_projection.completed_checkpoint_count, 8);
+        assert_eq!(terminal_projection.current_checkpoint_id, None);
+        assert!(
+            terminal_submission
+                .snapshot
+                .runtime_activity
+                .iter()
+                .all(|activity| {
+                    activity.mission_id != started.mission_id
+                        || (activity.process_claim_status.is_none()
+                            && activity.recovery_status.is_none()
+                            && activity.turn_status.is_none())
+                })
+        );
+
+        let (mut terminal_service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(14))
+            .expect("cold reopen typed VM-07 terminal");
+        let terminal_mission = terminal_service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("durable typed VM-07 terminal");
+        assert_eq!(terminal_mission.stage, MissionStage::Completed);
+        assert!(terminal_mission.effects.is_empty());
+        assert_eq!(
+            terminal_mission.work_products.len(),
+            planned_work_product_count
+        );
+        assert!(
+            terminal_service
+                .latest_runtime_turn_for_mission(&project_id, &started.mission_id)
+                .expect("terminal Runtime ledger query")
+                .is_none()
+        );
+        let terminal_definition = terminal_mission
+            .definition
+            .as_ref()
+            .expect("terminal VM-07 definition");
+        assert!(
+            terminal_definition
+                .checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        );
+        let terminal_completion = terminal_definition
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == "replan_or_terminal")
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-07 terminal completion");
+        assert!(terminal_completion.work_product_ids.is_empty());
+        assert!(terminal_completion.effect_ids.is_empty());
+        let terminal_evidence = terminal_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable VM-07 terminal evidence");
+        assert_eq!(terminal_evidence.handler_id, "vm07.replan-or-terminal/v1");
+        assert_eq!(
+            terminal_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "budgeted_experiment_plan",
+                "mission_checkpoint",
+                "mission_contract",
+                "prioritized_experiments",
+            ])
+        );
+        let terminal_events = terminal_service
+            .mission_events(&project_id, &started.mission_id)
+            .expect("content-free VM-07 terminal events");
+        let event_count = terminal_events.len();
+        let terminal_event_json =
+            serde_json::to_string(&terminal_events).expect("VM-07 terminal event JSON");
+        assert!(terminal_event_json.contains("mission.vm07_valid_terminal_resolved"));
+        assert!(!terminal_event_json.contains(private_decision));
+        assert!(!terminal_event_json.contains(&pack.experiment_plan[0].hypothesis));
+
+        assert!(matches!(
+            terminal_service
                 .execute_application_mission_checkpoint(
                     ExecuteApplicationMissionCheckpoint {
                         project_id: project_id.clone(),
@@ -21975,34 +22100,42 @@ sleep 30"#;
                         expected_mission_revision: plan_dispatch.mission_revision,
                         expected_checkpoint_revision: plan_dispatch.checkpoint_revision,
                     },
-                    observed_at() + Duration::minutes(13),
+                    observed_at() + Duration::minutes(15),
                 )
                 .expect("exact cold plan replay"),
             ApplicationMissionCheckpointExecution::Completed {
                 replayed: true,
-                next_dispatch: Some(MissionCheckpointDispatch {
-                    application_handler_status: Some(
-                        ApplicationCheckpointHandlerStatus::NotImplemented
-                    ),
-                    ..
-                }),
+                next_dispatch: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            terminal_service
+                .execute_application_mission_checkpoint(
+                    terminal_command,
+                    observed_at() + Duration::minutes(16),
+                )
+                .expect("exact cold terminal replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                next_dispatch: None,
                 ..
             }
         ));
         assert_eq!(
-            cold_service
+            terminal_service
                 .mission_events(&project_id, &started.mission_id)
                 .expect("unchanged replay events")
                 .len(),
             event_count
         );
         assert_eq!(
-            cold_service
+            terminal_service
                 .load_mission(&project_id, &started.mission_id)
                 .expect("unchanged replay Mission")
                 .work_products
                 .iter()
-                .filter(|product| product.id == plan.id)
+                .filter(|product| product.id == plan_id)
                 .count(),
             1
         );

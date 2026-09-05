@@ -1987,6 +1987,14 @@ impl Mission {
         checkpoint_id: &str,
         completion: MissionCheckpointCompletion,
     ) -> Result<(), MissionError> {
+        if checkpoint_id == "replan_or_terminal"
+            && self
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.manifest_id == "VM-07")
+        {
+            return Err(MissionError::Vm07ReplanOrTerminalResolutionRequired);
+        }
         if checkpoint_id == "channel_rebalance"
             && self
                 .definition
@@ -2026,6 +2034,24 @@ impl Mission {
         resolved.complete_checkpoint_validated("channel_rebalance", completion)?;
         if !vm04_valid_terminal_is_typed(&resolved) {
             return Err(MissionError::Vm04ValidTerminalResolutionRequired);
+        }
+        resolved.terminate(MissionTerminalDisposition::Completed, verified_at)?;
+        *self = resolved;
+        Ok(())
+    }
+
+    /// Completes only the exact final VM-07 Application checkpoint and its
+    /// typed Completed terminal. The bounded plan remains unexecuted and the
+    /// separate redirect/replan branch keeps deny-by-default authority.
+    pub fn complete_vm07_replan_or_terminal_terminal(
+        &mut self,
+        completion: MissionCheckpointCompletion,
+    ) -> Result<(), MissionError> {
+        let verified_at = completion.verified_at;
+        let mut resolved = self.clone();
+        resolved.complete_checkpoint_validated("replan_or_terminal", completion)?;
+        if !vm07_replan_or_terminal_valid_terminal_is_typed(&resolved) {
+            return Err(MissionError::Vm07ReplanOrTerminalResolutionRequired);
         }
         resolved.terminate(MissionTerminalDisposition::Completed, verified_at)?;
         *self = resolved;
@@ -3137,6 +3163,119 @@ fn vm11_valid_terminal_is_typed(mission: &Mission) -> bool {
     stop_terminal || vm11_candidate_learning_valid_terminal_is_typed(mission)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the typed terminal predicate keeps every predecessor, plan, Oracle, and no-effect binding fail closed in one pure check"
+)]
+fn vm07_replan_or_terminal_valid_terminal_is_typed(mission: &Mission) -> bool {
+    let Some(definition) = &mission.definition else {
+        return false;
+    };
+    if definition.manifest_id != "VM-07"
+        || definition.manifest_version != 3
+        || !definition
+            .checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+    {
+        return false;
+    }
+    let Some(prioritized) = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "prioritized_experiments")
+    else {
+        return false;
+    };
+    let Some(prioritized_completion) = prioritized.completion.as_ref() else {
+        return false;
+    };
+    let Some(prioritized_evidence) = prioritized_completion.application_evidence.as_ref() else {
+        return false;
+    };
+    let mut plan_work_product_ids = prioritized_completion.work_product_ids.iter();
+    let Some(plan_work_product_id) = plan_work_product_ids.next() else {
+        return false;
+    };
+    if plan_work_product_ids.next().is_some() {
+        return false;
+    }
+    let Some(plan) = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == *plan_work_product_id)
+    else {
+        return false;
+    };
+    let Some(final_completion) = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "replan_or_terminal")
+        .and_then(|checkpoint| checkpoint.completion.as_ref())
+    else {
+        return false;
+    };
+    let Some(final_evidence) = final_completion.application_evidence.as_ref() else {
+        return false;
+    };
+    let source_kinds = final_evidence
+        .sources
+        .iter()
+        .map(|source| source.source_kind.as_str())
+        .collect::<BTreeSet<_>>();
+    let prioritized_source = final_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "prioritized_experiments");
+    let plan_source = final_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "budgeted_experiment_plan");
+    let contract_source = final_evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "mission_contract");
+
+    prioritized_evidence.handler_id == "vm07.prioritized-experiments/v1"
+        && prioritized_evidence.digest() == prioritized_completion.evidence_digest
+        && prioritized_completion.effect_ids.is_empty()
+        && final_completion.work_product_ids.is_empty()
+        && final_completion.effect_ids.is_empty()
+        && final_completion.oracle_ids
+            == BTreeSet::from([
+                "decision".into(),
+                "goal".into(),
+                "operating_state".into(),
+                "outcome".into(),
+            ])
+        && final_evidence.digest() == final_completion.evidence_digest
+        && final_evidence.handler_id == "vm07.replan-or-terminal/v1"
+        && final_evidence.checkpoint_id == "replan_or_terminal"
+        && source_kinds
+            == BTreeSet::from([
+                "budgeted_experiment_plan",
+                "mission_checkpoint",
+                "mission_contract",
+                "prioritized_experiments",
+            ])
+        && prioritized_source.is_some_and(|source| {
+            source.source_id == format!("{}:prioritized_experiments", mission.id)
+                && source.source_revision == prioritized.revision
+                && source.projection_digest == prioritized_completion.evidence_digest
+                && source.oracle_ids == BTreeSet::from(["decision".into()])
+        })
+        && plan_source.is_some_and(|source| {
+            source.source_id == plan.id.as_str()
+                && source.source_revision == plan.revision
+                && source.projection_digest == plan.content_digest
+                && source.oracle_ids == BTreeSet::from(["outcome".into()])
+        })
+        && contract_source.is_some_and(|source| {
+            source.source_id == mission.id.as_str()
+                && source.oracle_ids == BTreeSet::from(["goal".into()])
+        })
+}
+
 fn vm11_candidate_learning_valid_terminal_is_typed(mission: &Mission) -> bool {
     let Some(definition) = &mission.definition else {
         return false;
@@ -3544,6 +3683,10 @@ pub enum MissionError {
     #[error("VM-04 Completed requires the typed channel_rebalance terminal resolution")]
     Vm04ValidTerminalResolutionRequired,
     #[error(
+        "VM-07 replan_or_terminal completion requires its typed decision-ready terminal resolution"
+    )]
+    Vm07ReplanOrTerminalResolutionRequired,
+    #[error(
         "VM-11 Completed requires either the typed Stop resolution or the typed candidate-learning Continue closure"
     )]
     Vm11ValidTerminalResolutionRequired,
@@ -3893,6 +4036,36 @@ mod tests {
                 },
             ),
             Err(MissionError::Vm04ValidTerminalResolutionRequired)
+        );
+        assert_eq!(mission, unchanged);
+    }
+
+    #[test]
+    fn vm07_replan_or_terminal_rejects_generic_checkpoint_bypass() {
+        let mut mission = catalog_mission();
+        let definition = mission.definition.as_mut().expect("Catalog definition");
+        definition.manifest_id = "VM-07".into();
+        definition.manifest_version = 3;
+        let unchanged = mission.clone();
+
+        assert_eq!(
+            mission.complete_checkpoint(
+                "replan_or_terminal",
+                MissionCheckpointCompletion {
+                    oracle_ids: BTreeSet::from([
+                        "decision".into(),
+                        "goal".into(),
+                        "operating_state".into(),
+                        "outcome".into(),
+                    ]),
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: "f".repeat(64),
+                    verified_at: now() + chrono::Duration::minutes(1),
+                },
+            ),
+            Err(MissionError::Vm07ReplanOrTerminalResolutionRequired)
         );
         assert_eq!(mission, unchanged);
     }

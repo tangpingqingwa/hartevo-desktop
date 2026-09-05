@@ -2019,7 +2019,7 @@
         {
           "id": "vm07.valid-terminal/v2",
           "kind": "valid_mission_terminal",
-          "missionDisposition": null
+          "missionDisposition": "completed"
         }
       ]
     },
