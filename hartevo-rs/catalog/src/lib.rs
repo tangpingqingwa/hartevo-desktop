@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 20, 32)
+            (52, 21, 31)
         );
         assert_eq!(
             catalog
@@ -1763,18 +1763,21 @@ mod tests {
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm11.normalize-dedupe-order/v1")
         );
-        assert_eq!(
-            catalog
-                .application_handler("VM-11", 3, "identity_chain")
-                .map(|handler| handler.handler_id.as_str()),
-            Some("vm11.identity-chain/v1")
-        );
-        assert_eq!(
-            catalog
-                .application_handler("VM-11", 3, "next_contract_or_valid_terminal")
-                .map(|handler| handler.handler_id.as_str()),
-            Some("vm11.next-contract-or-valid-terminal/v1")
-        );
+        for (checkpoint_id, expected_handler_id) in [
+            ("identity_chain", "vm11.identity-chain/v1"),
+            (
+                "next_contract_or_valid_terminal",
+                "vm11.next-contract-or-valid-terminal/v1",
+            ),
+            ("candidate_learning", "vm11.candidate-learning/v1"),
+        ] {
+            assert_eq!(
+                catalog
+                    .application_handler("VM-11", 3, checkpoint_id)
+                    .map(|handler| handler.handler_id.as_str()),
+                Some(expected_handler_id)
+            );
+        }
         assert!(catalog.mission("VM-06").is_some_and(|mission| {
             mission
                 .checkpoint_ids

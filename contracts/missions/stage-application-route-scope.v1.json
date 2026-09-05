@@ -1,12 +1,12 @@
 {
   "schemaVersion": "hartevo-stage-application-route-scope-contract/v1",
-  "contractVersion": "desktop-2026-09-05-ct04-v5",
+  "contractVersion": "desktop-2026-09-05-ct04-v6",
   "evidenceLevel": "E1",
   "releaseEvidenceSchemaVersion": "2.3.0",
   "missionCatalogVersion": "desktop-2026-08-12-v11",
   "routeGraphContractVersion": "desktop-2026-09-05-ct02-v2",
-  "applicationHandlerRegistryVersion": "desktop-2026-09-05-v20",
-  "routeRuntimeAuthorityContractVersion": "desktop-2026-09-05-ct03-v5",
+  "applicationHandlerRegistryVersion": "desktop-2026-09-05-v21",
+  "routeRuntimeAuthorityContractVersion": "desktop-2026-09-05-ct03-v6",
   "defaultMissingHandlerStatus": "NOT_IMPLEMENTED",
   "genericRuntimeAuthority": "denied",
   "stages": [

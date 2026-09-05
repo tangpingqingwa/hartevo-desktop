@@ -15109,11 +15109,11 @@ mod tests {
                 secrets,
                 DesktopCatalogMissionRequest {
                     project_id: project_id.clone(),
-                    manifest_id: "VM-07".into(),
-                    mode: OperatingMode::OneOffDecision,
+                    manifest_id: "VM-01".into(),
+                    mode: OperatingMode::ContinuousOperator,
                     parent_mission_id: None,
-                    title: Some("Outcome source mission".into()),
-                    goal: "Decide a bounded market experiment and measure its verified lead".into(),
+                    title: Some("Continuous outcome source mission".into()),
+                    goal: "Continue only the exact bounded contract after verified outcomes".into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
@@ -19202,7 +19202,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the Desktop data-plane Journey proves eight deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, typed next-contract resolution, and zero Runtime construction"
+        reason = "the Desktop data-plane Journey proves nine deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, candidate-only learning, cold recovery, and zero Runtime construction"
     )]
     fn vm11_application_handlers_recover_and_advance_without_constructing_runtime() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -19218,7 +19218,7 @@ sleep 30"#;
                 DesktopCatalogMissionRequest {
                     project_id: project_id.clone(),
                     manifest_id: "VM-11".into(),
-                    mode: OperatingMode::OneOffDecision,
+                    mode: OperatingMode::ContinuousOperator,
                     parent_mission_id: Some(parent_mission_id.clone()),
                     title: Some("Verified outcome review".into()),
                     goal: "Use only verified outcome events for the next decision".into(),
@@ -19826,9 +19826,9 @@ sleep 30"#;
             review_decision_projection
                 .action_gates
                 .iter()
-                .find(|gate| gate.action == OutcomeDecision::Scale)
+                .find(|gate| gate.action == OutcomeDecision::Continue)
                 .map(|gate| gate.status),
-            Some(hartevo_domain_kernel::OutcomeReviewDecisionGateStatus::BlockedLoopPolicy)
+            Some(hartevo_domain_kernel::OutcomeReviewDecisionGateStatus::Available)
         );
 
         let generic_message_id = MissionConversationMessageId::new();
@@ -19865,9 +19865,9 @@ sleep 30"#;
         let decision_request = DesktopVm11OutcomeDecisionRequest {
             project_id: project_id.clone(),
             mission_id: started.mission_id.clone(),
-            action: OutcomeDecision::Stop,
+            action: OutcomeDecision::Continue,
             message_id: decision_message_id.clone(),
-            rationale: "Stop: the one-off parent contract forbids an implicit loop; retain the frozen outcome evidence".into(),
+            rationale: "PRIVATE-VM11-CONTINUE::reuse the exact bounded contract without extending authority".into(),
             idempotency_key: format!(
                 "desktop-vm11-outcome-decision:{}",
                 decision_message_id.as_str()
@@ -19892,7 +19892,7 @@ sleep 30"#;
                 decision_request.clone(),
                 observed_at() + Duration::minutes(13),
             )
-            .expect("structured Stop decision");
+            .expect("structured Continue decision");
         let decided_projection = decided.inventory.projects[0]
             .missions
             .iter()
@@ -19916,7 +19916,7 @@ sleep 30"#;
             .as_ref()
             .and_then(|projection| projection.decision.as_ref())
             .expect("structured decision projection");
-        assert_eq!(persisted_decision.action, OutcomeDecision::Stop);
+        assert_eq!(persisted_decision.action, OutcomeDecision::Continue);
         assert_eq!(persisted_decision.message_id, decision_message_id);
         assert!(
             persisted_decision
@@ -20109,7 +20109,7 @@ sleep 30"#;
             .and_then(|mission| mission.vm11_outcome_review)
             .and_then(|projection| projection.decision)
             .expect("durable structured outcome decision");
-        assert_eq!(decision.action, OutcomeDecision::Stop);
+        assert_eq!(decision.action, OutcomeDecision::Continue);
         let event_json = serde_json::to_string(
             &service
                 .mission_events(&project_id, &started.mission_id)
@@ -20117,7 +20117,7 @@ sleep 30"#;
         )
         .expect("VM-11 event JSON");
         assert!(event_json.contains("mission.outcome_review_decided"));
-        assert!(!event_json.contains("one-off parent contract"));
+        assert!(!event_json.contains("PRIVATE-VM11-CONTINUE"));
 
         assert!(matches!(
             plane.resume_mission_runtime_with(
@@ -20166,42 +20166,59 @@ sleep 30"#;
                 next_contract_request.clone(),
                 observed_at() + Duration::minutes(17),
             )
-            .expect("Desktop Stop typed terminal");
-        assert!(matches!(
+            .expect("Desktop Continue resolution");
+        assert_eq!(
             resolved.runtime_outcome,
-            DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
-                checkpoint_id,
-                ..
-            } if checkpoint_id == "next_contract_or_valid_terminal"
-        ));
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "candidate_learning".into(),
+                capability_id: "candidate.propose".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "operating_state".into(),
+                    "work_product".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
         let resolved_projection = resolved.snapshot.inventory.projects[0]
             .missions
             .iter()
             .find(|mission| mission.mission_id == started.mission_id)
             .expect("resolved VM-11 projection");
-        assert_eq!(resolved_projection.stage, MissionStage::Completed);
+        assert_eq!(resolved_projection.stage, MissionStage::Running);
         assert_eq!(resolved_projection.completed_checkpoint_count, 9);
-        assert_eq!(resolved_projection.current_checkpoint_id, None);
+        assert_eq!(
+            resolved_projection.current_checkpoint_id.as_deref(),
+            Some("candidate_learning")
+        );
+        assert_eq!(
+            resolved_projection
+                .current_checkpoint_application_handler_id
+                .as_deref(),
+            Some("vm11.candidate-learning/v1")
+        );
         assert!(resolved.snapshot.runtime_activity.iter().all(|activity| {
             activity.mission_id != started.mission_id
                 || (activity.process_claim_status.is_none()
                     && activity.recovery_status.is_none()
                     && activity.turn_status.is_none())
         }));
-        let replayed_terminal = plane
+        let replayed_resolution = plane
             .resolve_vm11_next_contract_or_valid_terminal_with(
                 &secrets,
                 next_contract_request.clone(),
                 observed_at() + Duration::minutes(18),
             )
-            .expect("exact Desktop terminal replay");
-        let replayed_terminal_projection = replayed_terminal.snapshot.inventory.projects[0]
+            .expect("exact Desktop Continue replay");
+        let replayed_resolution_projection = replayed_resolution.snapshot.inventory.projects[0]
             .missions
             .iter()
             .find(|mission| mission.mission_id == started.mission_id)
-            .expect("replayed terminal projection");
+            .expect("replayed Continue projection");
         assert_eq!(
-            replayed_terminal_projection.revision,
+            replayed_resolution_projection.revision,
             resolved_projection.revision
         );
         let mut drifted = next_contract_request;
@@ -20216,9 +20233,53 @@ sleep 30"#;
                 ApplicationError::Vm11NextContractCommandMismatch
             ))
         ));
-        let (service, _) = plane
-            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(20))
-            .expect("reopen typed terminal");
+        let candidate_completed = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("candidate learning must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(20),
+            )
+            .expect("complete candidate-only learning without Runtime");
+        assert!(matches!(
+            candidate_completed.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                checkpoint_id,
+                ..
+            } if checkpoint_id == "candidate_learning"
+        ));
+        let candidate_projection = candidate_completed.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("candidate-terminal VM-11 projection");
+        assert_eq!(candidate_projection.stage, MissionStage::Completed);
+        assert_eq!(candidate_projection.completed_checkpoint_count, 10);
+        assert_eq!(candidate_projection.current_checkpoint_id, None);
+        assert!(
+            candidate_completed
+                .snapshot
+                .runtime_activity
+                .iter()
+                .all(|activity| {
+                    activity.mission_id != started.mission_id
+                        || (activity.process_claim_status.is_none()
+                            && activity.recovery_status.is_none()
+                            && activity.turn_status.is_none())
+                })
+        );
+
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(21))
+            .expect("cold reopen typed candidate terminal");
         let terminal_mission = service
             .load_mission(&project_id, &started.mission_id)
             .expect("durable typed terminal");
@@ -20234,7 +20295,7 @@ sleep 30"#;
                     .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
             })
             .and_then(|checkpoint| checkpoint.completion.as_ref())
-            .expect("durable eighth-handler completion");
+            .expect("durable next-contract completion");
         assert_eq!(
             terminal_completion
                 .application_evidence
@@ -20251,19 +20312,112 @@ sleep 30"#;
                     .iter()
                     .find(|checkpoint| checkpoint.id == "candidate_learning")
             })
-            .expect("durable skipped candidate_learning");
+            .expect("durable candidate_learning");
         assert_eq!(
             candidate_learning.status,
-            hartevo_domain_kernel::MissionCheckpointStatus::Skipped
+            hartevo_domain_kernel::MissionCheckpointStatus::Completed
+        );
+        assert_eq!(
+            candidate_learning
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.application_evidence.as_ref())
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.candidate-learning/v1")
+        );
+        assert_eq!(terminal_mission.work_products.len(), 1);
+        let candidate_product = terminal_mission
+            .work_products
+            .first()
+            .expect("durable candidate-only WorkProduct");
+        assert_eq!(
+            candidate_product.status,
+            hartevo_domain_kernel::WorkProductStatus::ReadyForReview
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"candidateStatus\":\"proposed_only\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"evaluationStatus\":\"not_run\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"promotionAuthority\":\"denied\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"releaseAuthority\":\"denied\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"providerExecutionAuthority\":\"denied\"")
+        );
+        assert!(
+            candidate_product
+                .body
+                .contains("\"runtimeExecutionAuthority\":\"denied\"")
+        );
+        let candidate_manifest = service
+            .load_work_product_manifest(&project_id, &candidate_product.id)
+            .expect("durable candidate-only manifest");
+        assert_eq!(
+            candidate_manifest.work_product_type,
+            "candidate_learning_proposal"
+        );
+        assert_eq!(
+            candidate_manifest.artifact_digest,
+            candidate_product.content_digest
         );
         let terminal_event_json = serde_json::to_string(
             &service
                 .mission_events(&project_id, &started.mission_id)
-                .expect("content-free eighth-handler events"),
+                .expect("content-free candidate-terminal events"),
         )
-        .expect("eighth-handler event JSON");
+        .expect("candidate-terminal event JSON");
         assert!(terminal_event_json.contains("mission.next_contract_or_valid_terminal_resolved"));
-        assert!(!terminal_event_json.contains("one-off parent contract"));
+        assert!(terminal_event_json.contains("mission.vm11_candidate_learning_terminal_resolved"));
+        assert!(!terminal_event_json.contains("PRIVATE-VM11-CONTINUE"));
+        assert!(!terminal_event_json.contains("candidate_learning_proposal/v1"));
+
+        let candidate_event_count = service
+            .mission_events(&project_id, &started.mission_id)
+            .expect("candidate events before exact replay")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    ExecuteApplicationMissionCheckpoint {
+                        project_id: project_id.clone(),
+                        mission_id: started.mission_id.clone(),
+                        checkpoint_id: "candidate_learning".into(),
+                        expected_mission_revision: resolved_projection.revision,
+                        expected_checkpoint_revision: resolved_projection
+                            .current_checkpoint_revision
+                            .expect("candidate Checkpoint revision"),
+                    },
+                    observed_at() + Duration::minutes(22),
+                )
+                .expect("exact candidate-learning replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                next_dispatch: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("unchanged candidate replay events")
+                .len(),
+            candidate_event_count
+        );
     }
 
     #[cfg(unix)]

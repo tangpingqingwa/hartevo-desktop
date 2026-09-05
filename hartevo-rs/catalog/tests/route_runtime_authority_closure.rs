@@ -14,6 +14,7 @@ use hartevo_catalog::{
 const VM04_CHANNEL_REBALANCE_TRANSITION_ID: &str = "vm04.channel_rebalance.to.valid-terminal/v2";
 const VM11_STOP_TRANSITION_ID: &str =
     "vm11.next_contract_or_valid_terminal.to.valid-terminal.stop/v2";
+const VM11_CANDIDATE_LEARNING_TRANSITION_ID: &str = "vm11.candidate_learning.to.valid-terminal/v2";
 
 fn authority_violations(contract: &RouteRuntimeAuthorityContract) -> Vec<String> {
     let catalog = Catalog::load().expect("valid production Catalog");
@@ -60,6 +61,20 @@ fn vm04_application_authority() -> RouteTerminalExecutionAuthority {
     )
 }
 
+fn vm11_candidate_learning_authority() -> RouteTerminalExecutionAuthority {
+    RouteTerminalExecutionAuthority::ApplicationHandler(
+        ApplicationHandlerRouteTerminalExecutionAuthority {
+            kind: ApplicationHandlerRouteTerminalExecutionAuthorityKind::ApplicationHandler,
+            executor: RouteTerminalAuthorityExecutor::Application,
+            handler_id: "vm11.candidate-learning/v1".into(),
+            implementation_crate: "hartevo-application".into(),
+            completion_policy: RouteTerminalCompletionPolicy::DeterministicEvidence,
+            mission_disposition: RouteGraphTerminalDisposition::Completed,
+            skipped_checkpoint_ids: Vec::new(),
+        },
+    )
+}
+
 fn denied_authority() -> RouteTerminalExecutionAuthority {
     RouteTerminalExecutionAuthority::Denied(DeniedRouteTerminalExecutionAuthority {
         kind: DeniedRouteTerminalExecutionAuthorityKind::Denied,
@@ -75,7 +90,7 @@ fn production_contract_grants_only_the_exact_vm04_and_vm11_terminals() {
         contract.schema_version,
         "hartevo-mission-route-runtime-authority-contract/v1"
     );
-    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct03-v5");
+    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct03-v6");
     assert_eq!(contract.evidence_level, "E1");
     assert_eq!(
         contract.default_terminal_execution_authority,
@@ -112,7 +127,7 @@ fn production_contract_grants_only_the_exact_vm04_and_vm11_terminals() {
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(implemented.len(), 2);
+    assert_eq!(implemented.len(), 3);
     assert_eq!(
         implemented[0].transition_id,
         VM04_CHANNEL_REBALANCE_TRANSITION_ID
@@ -123,22 +138,28 @@ fn production_contract_grants_only_the_exact_vm04_and_vm11_terminals() {
     assert_eq!(implemented[0].terminal_id, "vm04.valid-terminal/v2");
     assert_eq!(implemented[0].authority, vm04_application_authority());
 
-    assert_eq!(implemented[1].transition_id, VM11_STOP_TRANSITION_ID);
+    assert_eq!(
+        implemented[1].transition_id,
+        VM11_CANDIDATE_LEARNING_TRANSITION_ID
+    );
     assert_eq!(implemented[1].mission_id, "VM-11");
     assert_eq!(implemented[1].mission_version, 3);
+    assert_eq!(implemented[1].source_checkpoint_id, "candidate_learning");
+    assert_eq!(implemented[1].terminal_id, "vm11.valid-terminal/v2");
     assert_eq!(
-        implemented[1].source_checkpoint_id,
+        implemented[1].authority,
+        vm11_candidate_learning_authority()
+    );
+
+    assert_eq!(implemented[2].transition_id, VM11_STOP_TRANSITION_ID);
+    assert_eq!(implemented[2].mission_id, "VM-11");
+    assert_eq!(implemented[2].mission_version, 3);
+    assert_eq!(
+        implemented[2].source_checkpoint_id,
         "next_contract_or_valid_terminal"
     );
-    assert_eq!(implemented[1].terminal_id, "vm11.valid-terminal/v2");
-    assert_eq!(implemented[1].authority, vm11_application_authority());
-
-    let candidate_terminal = contract
-        .terminal_transitions
-        .iter()
-        .find(|binding| binding.transition_id == "vm11.candidate_learning.to.valid-terminal/v2")
-        .expect("VM-11 candidate terminal binding");
-    assert_eq!(candidate_terminal.authority, denied_authority());
+    assert_eq!(implemented[2].terminal_id, "vm11.valid-terminal/v2");
+    assert_eq!(implemented[2].authority, vm11_application_authority());
 
     assert!(!catalog.route_graphs.runtime_authority.branch_execution());
     assert!(!catalog.route_graphs.runtime_authority.redirect_execution());

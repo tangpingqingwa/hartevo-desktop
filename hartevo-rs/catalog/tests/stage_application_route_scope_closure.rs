@@ -71,7 +71,7 @@ fn assert_contract_binding(catalog: &Catalog, scopes: &[StageApplicationRouteSco
         contract.schema_version,
         "hartevo-stage-application-route-scope-contract/v1"
     );
-    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct04-v5");
+    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct04-v6");
     assert_eq!(contract.evidence_level, "E1");
     assert_eq!(contract.release_evidence_schema_version, "2.3.0");
     assert_eq!(
@@ -111,8 +111,8 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
     );
     assert_eq!(foundation.summary.eligible_mission_count, 7);
     assert_eq!(foundation.summary.application_route_count, 29);
-    assert_eq!(foundation.summary.implemented_handler_count, 20);
-    assert_eq!(foundation.summary.not_implemented_handler_count, 9);
+    assert_eq!(foundation.summary.implemented_handler_count, 21);
+    assert_eq!(foundation.summary.not_implemented_handler_count, 8);
     assert_eq!(foundation.summary.terminal_count, 7);
     assert_eq!(foundation.summary.terminal_transition_count, 8);
     assert_eq!(foundation.summary.application_terminal_transition_count, 7);
@@ -124,7 +124,7 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
         foundation
             .summary
             .implemented_terminal_transition_authority_count,
-        2
+        3
     );
     let writing = foundation
         .selection
@@ -152,8 +152,8 @@ fn assert_foundation_and_beta_scope(scopes: &[StageApplicationRouteScope]) {
 fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
     assert_eq!(ga.summary.eligible_mission_count, 12);
     assert_eq!(ga.summary.application_route_count, 52);
-    assert_eq!(ga.summary.implemented_handler_count, 20);
-    assert_eq!(ga.summary.not_implemented_handler_count, 32);
+    assert_eq!(ga.summary.implemented_handler_count, 21);
+    assert_eq!(ga.summary.not_implemented_handler_count, 31);
     assert_eq!(ga.summary.terminal_count, 12);
     assert_eq!(ga.summary.terminal_transition_count, 13);
     assert_eq!(ga.summary.application_terminal_transition_count, 12);
@@ -175,7 +175,7 @@ fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
             .iter()
             .filter(|route| route.handler.status == StageApplicationHandlerStatus::Implemented)
             .count(),
-        20
+        21
     );
     assert!(routes.iter().all(|route| {
         match (
@@ -222,7 +222,7 @@ fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
                 .and_then(serde_json::Value::as_str)
                 == Some("NOT_IMPLEMENTED"))
             .count(),
-        32
+        31
     );
     assert!(
         wire_routes
@@ -245,7 +245,7 @@ fn assert_ga_handler_scope(ga: &StageApplicationRouteScope) {
 fn assert_terminal_and_runtime_boundaries(catalog: &Catalog, ga: &StageApplicationRouteScope) {
     assert_eq!(
         ga.summary.implemented_terminal_transition_authority_count,
-        2
+        3
     );
     let vm04 = ga
         .mission_scopes
@@ -289,15 +289,15 @@ fn assert_terminal_and_runtime_boundaries(catalog: &Catalog, ga: &StageApplicati
         .expect("VM-11 candidate route");
     assert_eq!(
         candidate.handler.status,
-        StageApplicationHandlerStatus::NotImplemented
+        StageApplicationHandlerStatus::Implemented
     );
     assert!(matches!(
         candidate.authority,
-        StageApplicationRouteAuthority::DeniedNotImplemented
+        StageApplicationRouteAuthority::RegisteredApplicationHandler { .. }
     ));
     assert!(matches!(
         candidate.terminal_transition_authorities[0].authority,
-        RouteTerminalExecutionAuthority::Denied(_)
+        RouteTerminalExecutionAuthority::ApplicationHandler(_)
     ));
 
     let vm03 = ga
