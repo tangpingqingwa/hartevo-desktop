@@ -3540,6 +3540,7 @@ const VM01_NEXT_CYCLE_OUTCOME_SUMMARY: &str =
 const VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID: &str = "vm04.account-scope-probe/v1";
 const VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID: &str = "vm04.engagement-referral-review/v1";
 const VM04_CHANNEL_REBALANCE_HANDLER_ID: &str = "vm04.channel-rebalance/v1";
+const VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID: &str = "vm07.prioritized-experiments/v1";
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
@@ -3566,6 +3567,7 @@ enum CompiledApplicationCheckpointHandler {
     Vm04AccountScopeProbe,
     Vm04EngagementReferralReview,
     Vm04ChannelRebalance,
+    Vm07PrioritizedExperiments,
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
@@ -3594,6 +3596,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm04AccountScopeProbe => VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID,
             Self::Vm04EngagementReferralReview => VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID,
             Self::Vm04ChannelRebalance => VM04_CHANNEL_REBALANCE_HANDLER_ID,
+            Self::Vm07PrioritizedExperiments => VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID,
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
@@ -3620,6 +3623,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm04AccountScopeProbe => "account_scope",
             Self::Vm04EngagementReferralReview => "provider_readback",
             Self::Vm04ChannelRebalance => "channel_rebalance",
+            Self::Vm07PrioritizedExperiments => "budgeted_experiment_plan",
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
@@ -3909,6 +3913,9 @@ fn compiled_application_checkpoint_handler(
         }
         VM04_CHANNEL_REBALANCE_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm04ChannelRebalance)
+        }
+        VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments)
         }
         VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
         VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
@@ -6087,6 +6094,448 @@ fn vm04_channel_rebalance_application_evidence(
 }
 
 #[derive(Clone, Debug)]
+struct Vm07PrioritizedExperimentsSource {
+    decision_binding: Vm07DecisionBinding,
+    decision_message: MissionConversationMessage,
+    decision_completion_evidence_digest: String,
+    decision_checkpoint_revision: u64,
+    pack_work_product: WorkProduct,
+    pack_manifest: WorkProductManifest,
+    pack: MarketEvidencePack,
+    total_budget_minor: i64,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the VM-07 plan source revalidates the exact private Continue decision, completed Human predecessor, immutable Pack manifest, and contract budget in one fail-closed boundary"
+)]
+fn vm07_prioritized_experiments_source(
+    store: &ProjectStore,
+    mission: &Mission,
+    now: DateTime<Utc>,
+) -> Result<Vm07PrioritizedExperimentsSource, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let catalog_digest = Catalog::load()?.snapshot()?.digest;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "prioritized_experiments")
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let predecessor = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "go_no_go_need_more_evidence")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let predecessor_route = predecessor
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let completion = predecessor
+        .completion
+        .as_ref()
+        .filter(|_| predecessor.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let conversation = store.load_mission_conversation(&mission.project_id, &mission.id)?;
+    conversation.validate_for(mission, now)?;
+    let mut decisions = conversation
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == MissionConversationRole::User
+                && message.kind == MissionConversationMessageKind::CheckpointConfirmation
+                && message.checkpoint_id.as_deref() == Some("go_no_go_need_more_evidence")
+        })
+        .map(|message| {
+            vm07_decision_binding_from_body(&message.body).map(|binding| (message.clone(), binding))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, binding)| binding.action == Vm07DecisionAction::Continue)
+        .collect::<Vec<_>>();
+    let [(decision_message, decision_binding)] = decisions.as_mut_slice() else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
+
+    let mut packs = mission
+        .work_products
+        .iter()
+        .filter_map(|work_product| {
+            serde_json::from_str::<MarketEvidencePack>(&work_product.body)
+                .ok()
+                .map(|pack| (work_product.clone(), pack))
+        })
+        .filter(|(_, pack)| {
+            pack.content_digest == decision_binding.pack_content_digest
+                && pack.pack_revision == decision_binding.pack_revision
+        })
+        .collect::<Vec<_>>();
+    let [(pack_work_product, pack)] = packs.as_mut_slice() else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
+    pack.validate()?;
+    validate_vm07_pack_identity(mission, pack)?;
+    let pack_manifest =
+        store.load_work_product_manifest(&mission.project_id, &pack_work_product.id)?;
+    pack_manifest.validate_against(pack_work_product)?;
+    let contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
+    let expected_evidence_digest = sha256(
+        serde_json::to_string(&serde_json::json!({
+            "packContentDigest": pack.content_digest,
+            "packRevision": pack.pack_revision,
+            "action": decision_binding.action,
+            "missionRevision": decision_binding.mission_revision,
+            "checkpointRevision": decision_binding.checkpoint_revision,
+            "conversationRevision": decision_binding.conversation_revision,
+            "messageContentDigest": decision_message.content_digest,
+        }))?
+        .as_bytes(),
+    );
+    let total_budget_minor = pack
+        .experiment_plan
+        .iter()
+        .try_fold(0_i64, |total, experiment| {
+            total.checked_add(experiment.budget_minor)
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    mission.contract.validate(now).map_err(MissionError::from)?;
+
+    if definition.manifest_id != "VM-07"
+        || definition.manifest_version != 3
+        || definition.catalog_digest != catalog_digest
+        || definition.operating_mode != mission.contract.mode
+        || definition.capability_ids != mission.contract.enabled_capabilities
+        || checkpoint.depends_on != BTreeSet::from([predecessor.id.clone()])
+        || !matches!(
+            checkpoint.status,
+            MissionCheckpointStatus::Running | MissionCheckpointStatus::Verifying
+        )
+        || predecessor_route.executor != MissionCheckpointExecutor::Human
+        || predecessor_route.completion_policy
+            != Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+        || completion.oracle_ids != predecessor_route.oracle_ids
+        || !completion.work_product_ids.is_empty()
+        || !completion.effect_ids.is_empty()
+        || completion.application_evidence.is_some()
+        || completion.evidence_digest != expected_evidence_digest
+        || completion.verified_at != decision_message.recorded_at
+        || completion.verified_at > now
+        || decision_binding.tenant_id != mission.tenant_id
+        || decision_binding.project_id != mission.project_id
+        || decision_binding.mission_id != mission.id
+        || decision_binding.checkpoint_id != predecessor.id
+        || decision_binding.contract_digest != contract_digest
+        || decision_binding.experiment_plan_digest.is_some()
+        || decision_binding.mission_revision != decision_message.mission_revision
+        || decision_binding.conversation_revision.checked_add(1) != Some(decision_message.sequence)
+        || decision_binding.checkpoint_revision.checked_add(2) != Some(predecessor.revision)
+        || decision_message.sequence > conversation.revision
+        || pack_manifest.work_product_type != "market_evidence_pack"
+        || pack_manifest.version != pack.pack_revision
+        || pack_manifest.work_product_revision != pack.pack_revision
+        || pack_manifest.artifact_digest != pack_work_product.content_digest
+        || pack.experiment_plan.iter().any(|experiment| {
+            experiment.currency != mission.contract.budget.currency.as_str()
+                || !experiment.no_external_write
+        })
+        || total_budget_minor > mission.contract.budget.amount_minor
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+
+    Ok(Vm07PrioritizedExperimentsSource {
+        decision_binding: decision_binding.clone(),
+        decision_message: decision_message.clone(),
+        decision_completion_evidence_digest: completion.evidence_digest.clone(),
+        decision_checkpoint_revision: predecessor.revision,
+        pack_work_product: pack_work_product.clone(),
+        pack_manifest,
+        pack: pack.clone(),
+        total_budget_minor,
+    })
+}
+
+fn vm07_prioritized_experiments_material(
+    mission: &Mission,
+    source: &Vm07PrioritizedExperimentsSource,
+) -> Result<(WorkProductId, String, String), ApplicationError> {
+    let remaining_budget_minor = mission
+        .contract
+        .budget
+        .amount_minor
+        .checked_sub(source.total_budget_minor)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let identity_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm07-prioritized-experiments-identity/v1",
+        "missionId": mission.id,
+        "contractDigest": source.decision_binding.contract_digest,
+        "packWorkProductId": source.pack_work_product.id,
+        "packContentDigest": source.pack.content_digest,
+        "packRevision": source.pack.pack_revision,
+        "decisionDigest": source.decision_binding.decision_digest,
+        "decisionCompletionEvidenceDigest": source.decision_completion_evidence_digest,
+    }))?;
+    let experiments = source
+        .pack
+        .experiment_plan
+        .iter()
+        .enumerate()
+        .map(|(index, experiment)| {
+            serde_json::json!({
+                "rank": index.saturating_add(1),
+                "id": experiment.id,
+                "hypothesis": experiment.hypothesis,
+                "successMetric": experiment.success_metric,
+                "budgetMinor": experiment.budget_minor,
+                "currency": experiment.currency,
+                "maxDurationDays": experiment.max_duration_days,
+                "noExternalWrite": experiment.no_external_write,
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::to_string(&serde_json::json!({
+        "schemaVersion": "hartevo-vm07-prioritized-experiments/v1",
+        "planIdentityDigest": identity_digest,
+        "missionId": mission.id,
+        "contractDigest": source.decision_binding.contract_digest,
+        "decisionAction": source.decision_binding.action,
+        "decisionDigest": source.decision_binding.decision_digest,
+        "decisionMessageId": source.decision_message.id,
+        "decisionCompletionEvidenceDigest": source.decision_completion_evidence_digest,
+        "decisionCheckpointRevision": source.decision_checkpoint_revision,
+        "packWorkProductId": source.pack_work_product.id,
+        "packManifestDigest": source.pack_manifest.manifest_digest,
+        "packContentDigest": source.pack.content_digest,
+        "packRevision": source.pack.pack_revision,
+        "planStatus": "planned_only",
+        "budgetAmountMinor": mission.contract.budget.amount_minor,
+        "plannedBudgetMinor": source.total_budget_minor,
+        "remainingBudgetMinor": remaining_budget_minor,
+        "currency": mission.contract.budget.currency,
+        "externalWrite": false,
+        "experimentExecutionAuthority": "denied",
+        "providerExecutionAuthority": "denied",
+        "runtimeExecutionAuthority": "denied",
+        "effectExecutionAuthority": "denied",
+        "replanAuthority": "denied",
+        "terminalAuthority": "denied",
+        "experiments": experiments,
+    }))?;
+    let preview = serde_json::to_string(&serde_json::json!({
+        "schemaVersion": "hartevo-vm07-prioritized-experiments-preview/v1",
+        "planIdentityDigest": identity_digest,
+        "experimentCount": source.pack.experiment_plan.len(),
+        "plannedBudgetMinor": source.total_budget_minor,
+        "currency": mission.contract.budget.currency,
+        "planStatus": "planned_only",
+        "externalWrite": false,
+    }))?;
+    Ok((
+        WorkProductId::from_stable(format!("vm07-prioritized-experiments:{identity_digest}")),
+        body,
+        preview,
+    ))
+}
+
+fn prepare_vm07_prioritized_experiments_manifest(
+    store: &ProjectStore,
+    mission: &mut Mission,
+    now: DateTime<Utc>,
+) -> Result<WorkProductManifest, ApplicationError> {
+    let source = vm07_prioritized_experiments_source(store, mission, now)?;
+    let (work_product_id, body, preview) = vm07_prioritized_experiments_material(mission, &source)?;
+    let running_tasks = mission
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Running && task.capability == "outcome.review")
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let [task_id] = running_tasks.as_slice() else {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    };
+    mission.record_work_product(
+        WorkProduct::draft(
+            work_product_id.clone(),
+            "VM-07 prioritized experiments",
+            body,
+            source.pack_work_product.evidence_ids.iter().cloned(),
+        ),
+        now,
+    )?;
+    let work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == work_product_id)
+        .ok_or_else(|| MissionError::UnknownWorkProduct(work_product_id.clone()))?;
+    WorkProductManifest::create(
+        mission.tenant_id.clone(),
+        mission.project_id.clone(),
+        mission.id.clone(),
+        work_product,
+        "budgeted_experiment_plan",
+        WorkProductDependencies {
+            evidence_ids: source.pack_work_product.evidence_ids,
+            task_ids: BTreeSet::from([task_id.clone()]),
+            ..WorkProductDependencies::default()
+        },
+        None,
+        WorkProductPreview::new("application/json", preview)?,
+        BTreeSet::from(["/body".into()]),
+        now,
+    )
+    .map_err(ApplicationError::from)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the VM-07 proof keeps the exact Continue source, bounded plan WorkProduct, and denied execution authority visible in one deterministic boundary"
+)]
+fn vm07_prioritized_experiments_application_evidence(
+    store: &ProjectStore,
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    manifest: &WorkProductManifest,
+    now: DateTime<Utc>,
+) -> Result<
+    (
+        MissionCheckpointApplicationEvidence,
+        u64,
+        Vec<ApplicationSourceRevisionFence>,
+    ),
+    ApplicationError,
+> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let source = vm07_prioritized_experiments_source(store, mission, now)?;
+    let (expected_work_product_id, expected_body, expected_preview) =
+        vm07_prioritized_experiments_material(mission, &source)?;
+    let work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| work_product.id == expected_work_product_id)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    manifest.validate_against(work_product)?;
+    let expected_oracles = BTreeSet::from([
+        "decision".into(),
+        "operating_state".into(),
+        "outcome".into(),
+        "work_product".into(),
+    ]);
+    if checkpoint.id != "prioritized_experiments"
+        || checkpoint.status != MissionCheckpointStatus::Verifying
+        || route.capability_id != "outcome.review"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids != expected_oracles
+        || work_product.body != expected_body
+        || work_product.status != WorkProductStatus::ReadyForReview
+        || manifest.work_product_id != expected_work_product_id
+        || manifest.work_product_type != "budgeted_experiment_plan"
+        || manifest.version != 1
+        || manifest.work_product_revision != work_product.revision
+        || !manifest.dependencies.fact_ids.is_empty()
+        || manifest.dependencies.evidence_ids != source.pack_work_product.evidence_ids
+        || manifest.dependencies.task_ids.len() != 1
+        || manifest.file_digest.is_some()
+        || manifest.preview.media_type != "application/json"
+        || manifest.preview.text != expected_preview
+        || manifest.editable_scopes != BTreeSet::from(["/body".into()])
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let evidence = MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "vm07_market_decision".into(),
+                source_id: source.decision_message.id.to_string(),
+                source_revision: source.decision_message.sequence,
+                projection_digest: source.decision_binding.decision_digest,
+                oracle_ids: BTreeSet::from(["decision".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "market_evidence_pack".into(),
+                source_id: source.pack_work_product.id.to_string(),
+                source_revision: source.pack.pack_revision,
+                projection_digest: source.pack.content_digest,
+                oracle_ids: BTreeSet::from(["outcome".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "budgeted_experiment_plan".into(),
+                source_id: manifest.work_product_id.to_string(),
+                source_revision: manifest.version,
+                projection_digest: manifest.manifest_digest.clone(),
+                oracle_ids: BTreeSet::from(["work_product".into()]),
+            },
+        ]),
+        observed_at: now,
+    };
+    Ok((
+        evidence,
+        source.pack.pack_revision,
+        vec![ApplicationSourceRevisionFence::present(
+            ApplicationSourceKind::Mission,
+            mission.id.to_string(),
+            command.expected_mission_revision,
+        )],
+    ))
+}
+
+#[derive(Clone, Debug)]
 struct Vm11CandidateLearningSource {
     decision_source_id: String,
     decision_source_revision: u64,
@@ -7248,6 +7697,16 @@ fn execute_project_application_checkpoint(
     if mission.stage == MissionStage::Blocked {
         mission.resume(now)?;
     }
+    let vm07_prioritized_experiments_manifest =
+        if handler == CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments {
+            Some(prepare_vm07_prioritized_experiments_manifest(
+                store,
+                &mut mission,
+                now,
+            )?)
+        } else {
+            None
+        };
     let candidate_learning_manifest =
         if handler == CompiledApplicationCheckpointHandler::Vm11CandidateLearning {
             Some(prepare_vm11_candidate_learning_manifest(&mut mission, now)?)
@@ -7541,6 +8000,20 @@ fn execute_project_application_checkpoint(
         CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
             vm04_channel_rebalance_application_evidence(&mission, &route, &command, now)?
         }
+        CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments => {
+            vm07_prioritized_experiments_application_evidence(
+                store,
+                &mission,
+                &route,
+                &command,
+                vm07_prioritized_experiments_manifest.as_ref().ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler.handler_id().into(),
+                    },
+                )?,
+                now,
+            )?
+        }
         CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
             vm11_candidate_learning_application_evidence(
                 &mission,
@@ -7590,6 +8063,17 @@ fn execute_project_application_checkpoint(
         }
         CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
             BTreeSet::from([candidate_learning_manifest
+                .as_ref()
+                .ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler.handler_id().into(),
+                    },
+                )?
+                .work_product_id
+                .clone()])
+        }
+        CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments => {
+            BTreeSet::from([vm07_prioritized_experiments_manifest
                 .as_ref()
                 .ok_or(
                     ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
@@ -7712,14 +8196,30 @@ fn execute_project_application_checkpoint(
             now,
         ));
     }
-    if let Some(manifest) = &candidate_learning_manifest {
-        store.create_work_product_manifest_atomic(
-            &mission,
-            expected_mission_revision,
-            manifest,
-            &events,
-        )?;
-    } else if let Some(schedule) = &next_cycle_schedule {
+    if let Some(manifest) = &vm07_prioritized_experiments_manifest {
+        events.push(PendingEvent::new(
+            "mission.vm07_prioritized_experiments_planned",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": command.checkpoint_id,
+                "handlerId": handler.handler_id(),
+                "workProductId": manifest.work_product_id,
+                "workProductManifestDigest": manifest.manifest_digest,
+                "planStatus": "planned_only",
+                "externalWrite": false,
+                "experimentExecutionAuthorized": false,
+                "providerExecuted": false,
+                "runtimeExecuted": false,
+                "externalEffectExecuted": false,
+                "completionEvidenceDigest": evidence_digest,
+            }),
+            now,
+        ));
+    }
+    if vm07_prioritized_experiments_manifest.is_none()
+        && candidate_learning_manifest.is_none()
+        && let Some(schedule) = &next_cycle_schedule
+    {
         events.extend([
             PendingEvent::new(
                 "outcome.observed",
@@ -7779,9 +8279,21 @@ fn execute_project_application_checkpoint(
             schedule,
             &events,
         )?;
-    } else if candidate_learning_manifest.is_none() {
-        // The candidate-learning manifest transaction already fences and
-        // advances this Mission with the same expected revision.
+    } else if let Some(manifest) = vm07_prioritized_experiments_manifest
+        .as_ref()
+        .or(candidate_learning_manifest.as_ref())
+    {
+        store.create_work_product_manifest_atomic(
+            &mission,
+            expected_mission_revision,
+            manifest,
+            &events,
+        )?;
+    } else if vm07_prioritized_experiments_manifest.is_none()
+        && candidate_learning_manifest.is_none()
+    {
+        // Generated-manifest transactions already fence and advance this
+        // Mission with the same expected revision.
         store.update_mission_atomic_with_application_source_fences_only(
             &mission,
             expected_mission_revision,
@@ -13724,6 +14236,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
                 | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
                 | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
+                | CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments
                 | CompiledApplicationCheckpointHandler::Vm11CandidateLearning
         ) {
             return execute_project_application_checkpoint(
@@ -14583,6 +15096,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
+            | CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments
             | CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
                 unreachable!("Project route returned before the generic VM-11 pipeline")
             }
@@ -14723,6 +15237,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
+            | CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments
             | CompiledApplicationCheckpointHandler::Vm11CandidateLearning => {
                 unreachable!("Project route returned before the generic VM-11 pipeline")
             }
@@ -31556,6 +32071,264 @@ mod tests {
                 .expect("events after swap")
                 .len(),
             events_after
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance test keeps the exact Continue decision, budgeted plan, atomic next route, content-free events, and replay no-op visible"
+    )]
+    fn vm07_continue_materializes_one_budgeted_plan_and_enters_replan() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let project_id = ProjectId::from("vm07-prioritized-project");
+        let mission_id = MissionId::from("vm07-prioritized-mission");
+        let pack_work_product_id = WorkProductId::from("vm07-prioritized-pack");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("vm07-prioritized-tenant"),
+                    id: project_id.clone(),
+                    name: "VM-07 prioritized experiments".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm07-prioritized-first-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-07".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: Some("Germany experiment plan".into()),
+                    goal: "Plan only the bounded evidence needed for a Germany decision".into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "founder".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::new(1_000, CurrencyCode::parse("EUR").expect("EUR")),
+                },
+                now(),
+            )
+            .expect("VM-07 mission");
+        let initial = service
+            .load_mission(&project_id, &mission_id)
+            .expect("initial mission");
+        let pack = vm07_market_pack_for(&initial, now() + Duration::milliseconds(1));
+        service
+            .record_vm07_market_evidence_pack(
+                RecordVm07MarketEvidencePack {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    work_product_id: pack_work_product_id.clone(),
+                    pack: pack.clone(),
+                },
+                now() + Duration::milliseconds(2),
+            )
+            .expect("market evidence pack");
+        let staged = stage_vm07_decision_checkpoint(
+            &mut service,
+            &project_id,
+            &mission_id,
+            &pack_work_product_id,
+        );
+        let conversation = service
+            .mission_conversation(&project_id, &mission_id)
+            .expect("decision conversation");
+        let decision_checkpoint = staged
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("decision checkpoint");
+        let private_rationale =
+            "PRIVATE-VM07-DECISION::continue only with the frozen read-only plan";
+        let decided = service
+            .decide_vm07_market(
+                DecideVm07MarketDecision {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    pack_work_product_id: pack_work_product_id.clone(),
+                    action: Vm07DecisionAction::Continue,
+                    message_id: MissionConversationMessageId::from("vm07-continue-message"),
+                    rationale: private_rationale.into(),
+                    idempotency_key: "vm07-decision:continue:1".into(),
+                    expected_pack_content_digest: pack.content_digest.clone(),
+                    expected_pack_revision: pack.pack_revision,
+                    expected_mission_revision: staged.revision,
+                    expected_checkpoint_revision: decision_checkpoint.revision,
+                    expected_conversation_revision: conversation.revision,
+                },
+                now() + Duration::seconds(21),
+            )
+            .expect("Continue decision");
+        let dispatch = decided
+            .next_dispatch
+            .expect("prioritized experiments dispatch");
+        assert_eq!(
+            (
+                dispatch.checkpoint_id.as_str(),
+                dispatch.capability_id.as_str(),
+                dispatch.executor,
+                dispatch.application_handler_status,
+                dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "prioritized_experiments",
+                "outcome.review",
+                MissionCheckpointExecutor::Application,
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID),
+            )
+        );
+        let command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: dispatch.checkpoint_id,
+            expected_mission_revision: dispatch.mission_revision,
+            expected_checkpoint_revision: dispatch.checkpoint_revision,
+        };
+        let execution = service
+            .execute_application_mission_checkpoint(command.clone(), now() + Duration::seconds(22))
+            .expect("bounded prioritized plan");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completed_checkpoint_id,
+            outcome_ledger_revision,
+            replayed: false,
+            next_dispatch: Some(next_dispatch),
+            ..
+        } = execution
+        else {
+            panic!("prioritized experiments must enter replan_or_terminal")
+        };
+        assert_eq!(completed_checkpoint_id, "prioritized_experiments");
+        assert_eq!(outcome_ledger_revision, pack.pack_revision);
+        assert_eq!(
+            (
+                next_dispatch.checkpoint_id.as_str(),
+                next_dispatch.executor,
+                next_dispatch.application_handler_status,
+            ),
+            (
+                "replan_or_terminal",
+                MissionCheckpointExecutor::Application,
+                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
+            )
+        );
+
+        let completed = service
+            .load_mission(&project_id, &mission_id)
+            .expect("planned Mission");
+        assert_eq!(completed.stage, MissionStage::Running);
+        assert!(completed.effects.is_empty());
+        assert_eq!(completed.work_products.len(), 2);
+        let plan = completed
+            .work_products
+            .iter()
+            .find(|product| product.id != pack_work_product_id)
+            .expect("one generated plan");
+        let plan_body: serde_json::Value =
+            serde_json::from_str(&plan.body).expect("typed plan body");
+        assert_eq!(plan_body["planStatus"], "planned_only");
+        assert_eq!(plan_body["budgetAmountMinor"], 1_000);
+        assert_eq!(plan_body["plannedBudgetMinor"], 500);
+        assert_eq!(plan_body["remainingBudgetMinor"], 500);
+        assert_eq!(plan_body["currency"], "EUR");
+        assert_eq!(plan_body["externalWrite"], false);
+        assert_eq!(plan_body["experimentExecutionAuthority"], "denied");
+        assert_eq!(plan_body["replanAuthority"], "denied");
+        assert_eq!(plan_body["terminalAuthority"], "denied");
+        assert_eq!(plan_body["experiments"][0]["rank"], 1);
+        assert_eq!(plan_body["experiments"][0]["noExternalWrite"], true);
+        let manifest = service
+            .load_work_product_manifest(&project_id, &plan.id)
+            .expect("durable budgeted plan manifest");
+        assert_eq!(manifest.work_product_type, "budgeted_experiment_plan");
+        assert_eq!(manifest.artifact_digest, plan.content_digest);
+        assert_eq!(manifest.dependencies.evidence_ids, plan.evidence_ids);
+        let completion = completed
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "prioritized_experiments")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("prioritized completion");
+        assert_eq!(
+            completion.work_product_ids,
+            BTreeSet::from([plan.id.clone()])
+        );
+        assert!(completion.effect_ids.is_empty());
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .expect("prioritized Application evidence");
+        assert_eq!(evidence.handler_id, VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID);
+        assert_eq!(
+            evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "budgeted_experiment_plan",
+                "market_evidence_pack",
+                "mission_checkpoint",
+                "vm07_market_decision",
+            ])
+        );
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free plan events");
+        let event_count = events.len();
+        let event_json = serde_json::to_string(&events).expect("event JSON");
+        assert!(event_json.contains(VM07_PRIORITIZED_EXPERIMENTS_HANDLER_ID));
+        assert!(!event_json.contains(private_rationale));
+        assert!(!event_json.contains(&pack.experiment_plan[0].hypothesis));
+
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    command,
+                    now() + Duration::seconds(23),
+                )
+                .expect("exact prioritized plan replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                completed_checkpoint_id,
+                replayed: true,
+                next_dispatch: Some(MissionCheckpointDispatch {
+                    application_handler_status: Some(
+                        ApplicationCheckpointHandlerStatus::NotImplemented
+                    ),
+                    ..
+                }),
+                ..
+            } if completed_checkpoint_id == "prioritized_experiments"
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged replay events")
+                .len(),
+            event_count
+        );
+        assert_eq!(
+            service
+                .load_mission(&project_id, &mission_id)
+                .expect("unchanged replay Mission")
+                .work_products
+                .len(),
+            2
         );
     }
 

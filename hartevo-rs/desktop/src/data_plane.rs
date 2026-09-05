@@ -13594,10 +13594,12 @@ mod tests {
     };
     use hartevo_application::llm_deepseek::{DeepSeekTransport, DeepSeekWireResponse};
     use hartevo_application::{
-        AcceptCreatorTask, CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject,
-        EvidenceInput, ProposePreviewEffect, ProvisionProjectEncryption, PublishCreatorTask,
-        ResearchPacket, RuntimeTextSubscriptionError, StartCreatorWorkMission, StartMission,
-        StartRelationshipMission, SubmitCreatorDeliverable, Vm00TargetMissionPlan,
+        AcceptCreatorTask, ApplicationCheckpointHandlerStatus, CreateBrowserWorkspace,
+        CreateManagedBrowserProfile, CreateProject, DecideVm07MarketDecision, EvidenceInput,
+        ProposePreviewEffect, ProvisionProjectEncryption, PublishCreatorTask,
+        RecordVm07MarketEvidencePack, ResearchPacket, RuntimeTextSubscriptionError,
+        StartCreatorWorkMission, StartMission, StartRelationshipMission, SubmitCreatorDeliverable,
+        Vm00TargetMissionPlan,
     };
     use hartevo_browser_adapter::FakeBrowserHost;
     use hartevo_domain_kernel::{
@@ -13609,12 +13611,16 @@ mod tests {
         CreatorHiringId, CreatorId, CreatorMilestoneId, CreatorMilestoneSpec, CreatorTaskId,
         CreatorTaskSpec, DeliverableAssessment, DeliverableId, EffectId, EffectStatus, EvidenceId,
         ExternalIdentity, FundingReservation, IdentityLink, IdentityLinkId, IdentitySubject,
-        KeyRecipient, KpiDirection, LegalBasis, MessagingGateway, MissionCheckpointExecutor,
+        KeyRecipient, KpiDirection, LegalBasis, MarketCounterevidence,
+        MarketDecisionRecommendation, MarketEvidenceClaim, MarketEvidenceClassification,
+        MarketEvidencePack, MarketExperimentPlanItem, MarketUncertainty,
+        MarketUncertaintyMateriality, MessagingGateway, MissionCheckpointCompletion,
+        MissionCheckpointExecutor, MissionCheckpointStatus, MissionDefinition,
         MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision, OutcomeEvent,
         OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
         PartnerId, Person, PersonId, ProbeOutcome, ProjectEncryptionMode, Receipt, ReceiptId,
         RightsAttestation, StorageMode, TaskId, TaskStatus, TenantId, UsageRights, Verification,
-        VerificationId, VerificationStatus, WorkProductId, WorkerLeaseStatus,
+        VerificationId, VerificationStatus, Vm07DecisionAction, WorkProductId, WorkerLeaseStatus,
     };
     use hartevo_effect_broker::{
         DurableEffectLedger, EffectBroker, EffectExecutor, EffectPermissionResolver,
@@ -13639,6 +13645,163 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-11T10:00:00Z")
             .expect("valid fixture time")
             .with_timezone(&Utc)
+    }
+
+    fn desktop_vm07_market_pack(
+        mission: &Mission,
+        observed_at: DateTime<Utc>,
+    ) -> MarketEvidencePack {
+        MarketEvidencePack {
+            schema_version: MarketEvidencePack::SCHEMA_VERSION,
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            contract_digest: canonical_json_digest(
+                &serde_json::to_value(&mission.contract).expect("contract JSON"),
+            )
+            .expect("contract digest"),
+            mission_revision: mission.revision,
+            pack_revision: 1,
+            market: mission.contract.market.clone(),
+            language: mission.contract.language.clone(),
+            claims: vec![MarketEvidenceClaim {
+                id: "desktop-demand-estimate".into(),
+                statement: "German category demand requires one bounded validation".into(),
+                source_id: "desktop-fixture:market-demand:de".into(),
+                source_uri: "fixture://vm07/de/market-demand".into(),
+                observed_at,
+                content_digest: sha256_text("desktop-vm07-demand"),
+                classification: MarketEvidenceClassification::ProviderEstimate,
+                confidence: 70,
+                uncertainty_id: "desktop-demand-uncertainty".into(),
+            }],
+            truth_uncertainty_map: vec![MarketUncertainty {
+                id: "desktop-demand-uncertainty".into(),
+                statement: "Observed demand may not convert".into(),
+                materiality: MarketUncertaintyMateriality::High,
+                claim_ids: BTreeSet::from(["desktop-demand-estimate".into()]),
+                resolution: "Review one read-only interest signal".into(),
+            }],
+            counterevidence: vec![MarketCounterevidence {
+                id: "desktop-distribution-risk".into(),
+                statement: "Incumbent distribution may suppress conversion".into(),
+                source_id: "desktop-fixture:incumbents:de".into(),
+                source_uri: "fixture://vm07/de/incumbents".into(),
+                observed_at,
+                content_digest: sha256_text("desktop-vm07-distribution-risk"),
+                claim_ids: BTreeSet::from(["desktop-demand-estimate".into()]),
+            }],
+            recommendation: MarketDecisionRecommendation::NeedMoreEvidence,
+            recommendation_rationale:
+                "A bounded read-only signal can reduce the remaining uncertainty".into(),
+            supporting_claim_ids: BTreeSet::from(["desktop-demand-estimate".into()]),
+            counterevidence_ids: BTreeSet::from(["desktop-distribution-risk".into()]),
+            experiment_plan: vec![MarketExperimentPlanItem {
+                id: "desktop-interest-signal".into(),
+                hypothesis: "PRIVATE-VM07-EXPERIMENT::qualified prospects show interest".into(),
+                success_metric: "Five qualified read-only signals".into(),
+                budget_minor: 500,
+                currency: "EUR".into(),
+                max_duration_days: 14,
+                no_external_write: true,
+            }],
+            content_digest: String::new(),
+        }
+        .seal()
+        .expect("valid desktop VM-07 Pack")
+    }
+
+    fn complete_desktop_vm07_runtime_fixture(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        checkpoint_id: &str,
+        sequence: u64,
+        at: DateTime<Utc>,
+    ) -> MissionCheckpointDispatch {
+        let mission = service
+            .load_mission(project_id, mission_id)
+            .expect("VM-07 Runtime Mission");
+        let checkpoint = mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("VM-07 Runtime Checkpoint");
+        let route = checkpoint.route.as_ref().expect("VM-07 Runtime route");
+        assert_eq!(checkpoint.id, checkpoint_id);
+        assert_eq!(checkpoint.status, MissionCheckpointStatus::Running);
+        assert_eq!(route.executor, MissionCheckpointExecutor::Runtime);
+        let task_id = mission
+            .tasks
+            .iter()
+            .find(|task| {
+                task.status == TaskStatus::Running && task.capability == route.capability_id
+            })
+            .map(|task| task.id.clone())
+            .expect("route-bound Runtime Task");
+        let work_product_id = WorkProductId::from_stable(format!(
+            "desktop-vm07-runtime:{mission_id}:{checkpoint_id}:{sequence}"
+        ));
+        service
+            .record_research(
+                project_id,
+                mission_id,
+                ResearchPacket {
+                    work_product_id: work_product_id.clone(),
+                    title: format!("VM-07 fixture {checkpoint_id}"),
+                    body: format!("PRIVATE-VM07-RUNTIME::{checkpoint_id}:{sequence}"),
+                    work_product_type: "runtime_draft".into(),
+                    fact_ids: BTreeSet::new(),
+                    task_ids: BTreeSet::from([task_id]),
+                    file_digest: None,
+                    preview_media_type: "text/plain".into(),
+                    preview: format!("Reviewable VM-07 fixture {sequence}"),
+                    editable_scopes: BTreeSet::from(["/body".into()]),
+                    evidence: vec![EvidenceInput {
+                        id: EvidenceId::from_stable(format!(
+                            "desktop-vm07-evidence:{mission_id}:{checkpoint_id}:{sequence}"
+                        )),
+                        title: format!("VM-07 evidence {sequence}"),
+                        source_uri: format!("fixture://vm07/{checkpoint_id}/{sequence}"),
+                        confidence: 1.0,
+                        content: format!("PRIVATE-VM07-EVIDENCE::{checkpoint_id}:{sequence}"),
+                    }],
+                },
+                at,
+            )
+            .expect("persist VM-07 Runtime artifact");
+        service
+            .begin_mission_checkpoint_verification(
+                project_id,
+                mission_id,
+                checkpoint_id,
+                at + Duration::milliseconds(1),
+            )
+            .expect("begin VM-07 Runtime verification");
+        service
+            .complete_mission_checkpoint(
+                project_id,
+                mission_id,
+                checkpoint_id,
+                MissionCheckpointCompletion {
+                    oracle_ids: route.oracle_ids.clone(),
+                    work_product_ids: BTreeSet::from([work_product_id]),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: sha256_text(&format!(
+                        "desktop-vm07-completion:{checkpoint_id}:{sequence}"
+                    )),
+                    verified_at: at + Duration::milliseconds(2),
+                },
+            )
+            .expect("complete VM-07 Runtime fixture");
+        service
+            .dispatch_current_mission_checkpoint(
+                project_id,
+                mission_id,
+                at + Duration::milliseconds(3),
+            )
+            .expect("start next VM-07 Checkpoint")
     }
 
     fn tiktok_provider_read_request(
@@ -21456,6 +21619,393 @@ sleep 30"#;
         assert!(event_json.contains("mission.human_checkpoint_confirmed"));
         assert!(event_json.contains("mission.checkpoint_started"));
         assert!(!event_json.contains(confirmation_body));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the encrypted Desktop Journey keeps the typed VM-07 Pack, Continue decision, bounded Application plan, cold recovery, zero Runtime construction, and exact replay visible"
+    )]
+    fn vm07_prioritized_experiments_cold_recovers_without_runtime_or_external_write() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let started = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-07".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: Some("Germany bounded experiment plan".into()),
+                    goal: "Plan one bounded read-only experiment from reviewed market evidence"
+                        .into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "owner".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 1_000,
+                    currency: "EUR".into(),
+                },
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("initial VM-07 Human route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("start VM-07 at Human scope");
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("open encrypted Application");
+        let initial = service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("initial VM-07 Mission");
+        let initial_checkpoint = initial
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("initial Human Checkpoint");
+        let initial_conversation = service
+            .mission_conversation(&project_id, &started.mission_id)
+            .expect("initial Conversation");
+        service
+            .confirm_human_mission_checkpoint(
+                ConfirmHumanMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: started.mission_id.clone(),
+                    checkpoint_id: initial_checkpoint.id.clone(),
+                    message_id: MissionConversationMessageId::from("desktop-vm07-scope-message"),
+                    body: "PRIVATE-VM07-SCOPE::Germany, EUR 10, no external write".into(),
+                    idempotency_key: "desktop-vm07-scope:1".into(),
+                    work_product_ids: BTreeSet::new(),
+                    expected_mission_revision: initial.revision,
+                    expected_checkpoint_revision: initial_checkpoint.revision,
+                    expected_conversation_revision: initial_conversation.revision,
+                },
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("confirm exact VM-07 scope");
+
+        let mut next = complete_desktop_vm07_runtime_fixture(
+            &mut service,
+            &project_id,
+            &started.mission_id,
+            "evidence_plan",
+            1,
+            observed_at() + Duration::minutes(5),
+        );
+        assert_eq!(next.checkpoint_id, "scoped_collection");
+        next = complete_desktop_vm07_runtime_fixture(
+            &mut service,
+            &project_id,
+            &started.mission_id,
+            "scoped_collection",
+            2,
+            observed_at() + Duration::minutes(6),
+        );
+        assert_eq!(
+            next.checkpoint_id,
+            "confirmed_estimated_inferred_unknown_conflict"
+        );
+        next = complete_desktop_vm07_runtime_fixture(
+            &mut service,
+            &project_id,
+            &started.mission_id,
+            "confirmed_estimated_inferred_unknown_conflict",
+            3,
+            observed_at() + Duration::minutes(7),
+        );
+        assert_eq!(next.checkpoint_id, "scenarios_risks_counterevidence");
+
+        let scenarios = service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("VM-07 scenarios Mission");
+        let scenarios_checkpoint = scenarios
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("VM-07 scenarios Checkpoint");
+        let scenarios_route = scenarios_checkpoint
+            .route
+            .as_ref()
+            .expect("VM-07 scenarios route");
+        let pack_work_product_id = WorkProductId::from("desktop-vm07-market-pack");
+        let pack_at = observed_at() + Duration::minutes(8);
+        let pack = desktop_vm07_market_pack(&scenarios, pack_at);
+        service
+            .record_vm07_market_evidence_pack(
+                RecordVm07MarketEvidencePack {
+                    project_id: project_id.clone(),
+                    mission_id: started.mission_id.clone(),
+                    work_product_id: pack_work_product_id.clone(),
+                    pack: pack.clone(),
+                },
+                pack_at,
+            )
+            .expect("persist typed Market Evidence Pack");
+        service
+            .begin_mission_checkpoint_verification(
+                &project_id,
+                &started.mission_id,
+                &scenarios_checkpoint.id,
+                pack_at + Duration::milliseconds(1),
+            )
+            .expect("verify scenarios Pack");
+        service
+            .complete_mission_checkpoint(
+                &project_id,
+                &started.mission_id,
+                &scenarios_checkpoint.id,
+                MissionCheckpointCompletion {
+                    oracle_ids: scenarios_route.oracle_ids.clone(),
+                    work_product_ids: BTreeSet::from([pack_work_product_id.clone()]),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: sha256_text("desktop-vm07-scenarios-completion"),
+                    verified_at: pack_at + Duration::milliseconds(2),
+                },
+            )
+            .expect("complete VM-07 scenarios route");
+        let decision_dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &started.mission_id,
+                pack_at + Duration::milliseconds(3),
+            )
+            .expect("start typed VM-07 decision");
+        assert_eq!(
+            decision_dispatch.checkpoint_id,
+            "go_no_go_need_more_evidence"
+        );
+        assert_eq!(decision_dispatch.executor, MissionCheckpointExecutor::Human);
+        let decision_mission = service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("decision Mission");
+        let decision_conversation = service
+            .mission_conversation(&project_id, &started.mission_id)
+            .expect("decision Conversation");
+        let private_decision = "PRIVATE-VM07-CONTINUE::freeze only this reviewed plan";
+        let decided = service
+            .decide_vm07_market(
+                DecideVm07MarketDecision {
+                    project_id: project_id.clone(),
+                    mission_id: started.mission_id.clone(),
+                    pack_work_product_id: pack_work_product_id.clone(),
+                    action: Vm07DecisionAction::Continue,
+                    message_id: MissionConversationMessageId::from("desktop-vm07-continue-message"),
+                    rationale: private_decision.into(),
+                    idempotency_key: "desktop-vm07-continue:1".into(),
+                    expected_pack_content_digest: pack.content_digest.clone(),
+                    expected_pack_revision: pack.pack_revision,
+                    expected_mission_revision: decision_mission.revision,
+                    expected_checkpoint_revision: decision_dispatch.checkpoint_revision,
+                    expected_conversation_revision: decision_conversation.revision,
+                },
+                observed_at() + Duration::minutes(9),
+            )
+            .expect("persist exact Continue decision");
+        let plan_dispatch = decided
+            .next_dispatch
+            .clone()
+            .expect("prioritized experiments dispatch");
+        assert_eq!(plan_dispatch.checkpoint_id, "prioritized_experiments");
+        assert_eq!(
+            plan_dispatch.application_handler_id.as_deref(),
+            Some("vm07.prioritized-experiments/v1")
+        );
+        drop(service);
+
+        let cold = DesktopDataPlane::at_data_root(plane.data_root())
+            .expect("cold Desktop before prioritized plan");
+        let DesktopLoadState::Ready(_) = cold
+            .load_with(&secrets, observed_at() + Duration::minutes(10))
+            .expect("unlock cold Desktop")
+        else {
+            panic!("cold Desktop remains ready")
+        };
+        let planned = cold
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("VM-07 prioritized Application route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(11),
+            )
+            .expect("cold-complete bounded VM-07 plan");
+        assert_eq!(
+            planned.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "replan_or_terminal".into(),
+                capability_id: "outcome.review".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "goal".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let projected = planned.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("planned VM-07 projection");
+        assert_eq!(projected.completed_checkpoint_count, 7);
+        assert_eq!(
+            projected.current_checkpoint_id.as_deref(),
+            Some("replan_or_terminal")
+        );
+        assert_eq!(
+            projected.current_checkpoint_application_handler_status,
+            Some(ApplicationCheckpointHandlerStatus::NotImplemented)
+        );
+        assert!(planned.snapshot.runtime_activity.iter().all(|activity| {
+            activity.mission_id != started.mission_id
+                || (activity.process_claim_status.is_none()
+                    && activity.recovery_status.is_none()
+                    && activity.turn_status.is_none())
+        }));
+
+        let (mut cold_service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(12))
+            .expect("cold Application after prioritized plan");
+        let planned_mission = cold_service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("durable planned Mission");
+        assert!(planned_mission.effects.is_empty());
+        assert!(
+            cold_service
+                .latest_runtime_turn_for_mission(&project_id, &started.mission_id)
+                .expect("Runtime ledger query")
+                .is_none()
+        );
+        let mut budgeted_products = planned_mission
+            .work_products
+            .iter()
+            .filter_map(|product| {
+                cold_service
+                    .load_work_product_manifest(&project_id, &product.id)
+                    .ok()
+                    .filter(|manifest| manifest.work_product_type == "budgeted_experiment_plan")
+                    .map(|manifest| (product, manifest))
+            })
+            .collect::<Vec<_>>();
+        let [(plan, plan_manifest)] = budgeted_products.as_mut_slice() else {
+            panic!("exactly one durable budgeted plan is required")
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&plan.body).expect("typed budgeted plan body");
+        assert_eq!(body["planStatus"], "planned_only");
+        assert_eq!(body["plannedBudgetMinor"], 500);
+        assert_eq!(body["remainingBudgetMinor"], 500);
+        assert_eq!(body["externalWrite"], false);
+        assert_eq!(body["experimentExecutionAuthority"], "denied");
+        assert_eq!(body["replanAuthority"], "denied");
+        assert_eq!(body["terminalAuthority"], "denied");
+        assert_eq!(plan_manifest.artifact_digest, plan.content_digest);
+        let prioritized = planned_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "prioritized_experiments")
+            })
+            .expect("durable prioritized Checkpoint");
+        assert_eq!(prioritized.status, MissionCheckpointStatus::Completed);
+        assert_eq!(
+            prioritized
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.application_evidence.as_ref())
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm07.prioritized-experiments/v1")
+        );
+        let event_json = serde_json::to_string(
+            &cold_service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("content-free VM-07 plan events"),
+        )
+        .expect("VM-07 event JSON");
+        assert!(event_json.contains("mission.vm07_prioritized_experiments_planned"));
+        assert!(!event_json.contains(private_decision));
+        assert!(!event_json.contains(&pack.experiment_plan[0].hypothesis));
+        let database = fs::read(plane.data_root().join(DATABASE_FILE_NAME))
+            .expect("encrypted Desktop database bytes");
+        assert!(
+            !database
+                .windows(private_decision.len())
+                .any(|window| { window == private_decision.as_bytes() })
+        );
+        assert!(
+            !database
+                .windows(pack.experiment_plan[0].hypothesis.len())
+                .any(|window| window == pack.experiment_plan[0].hypothesis.as_bytes())
+        );
+
+        let event_count = cold_service
+            .mission_events(&project_id, &started.mission_id)
+            .expect("events before replay")
+            .len();
+        assert!(matches!(
+            cold_service
+                .execute_application_mission_checkpoint(
+                    ExecuteApplicationMissionCheckpoint {
+                        project_id: project_id.clone(),
+                        mission_id: started.mission_id.clone(),
+                        checkpoint_id: plan_dispatch.checkpoint_id,
+                        expected_mission_revision: plan_dispatch.mission_revision,
+                        expected_checkpoint_revision: plan_dispatch.checkpoint_revision,
+                    },
+                    observed_at() + Duration::minutes(13),
+                )
+                .expect("exact cold plan replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                next_dispatch: Some(MissionCheckpointDispatch {
+                    application_handler_status: Some(
+                        ApplicationCheckpointHandlerStatus::NotImplemented
+                    ),
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(
+            cold_service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("unchanged replay events")
+                .len(),
+            event_count
+        );
+        assert_eq!(
+            cold_service
+                .load_mission(&project_id, &started.mission_id)
+                .expect("unchanged replay Mission")
+                .work_products
+                .iter()
+                .filter(|product| product.id == plan.id)
+                .count(),
+            1
+        );
     }
 
     #[test]

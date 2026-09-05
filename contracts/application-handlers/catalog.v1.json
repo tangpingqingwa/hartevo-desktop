@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v21",
+  "registryVersion": "desktop-2026-09-05-v22",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -191,6 +191,28 @@
         "channel_rebalance": ["decision"]
       },
       "oracleIds": ["goal", "decision", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm07.prioritized-experiments/v1",
+      "missionId": "VM-07",
+      "missionVersion": 3,
+      "checkpointId": "prioritized_experiments",
+      "capabilityId": "outcome.review",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": [
+        "mission_checkpoint",
+        "vm07_market_decision",
+        "market_evidence_pack",
+        "budgeted_experiment_plan"
+      ],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "vm07_market_decision": ["decision"],
+        "market_evidence_pack": ["outcome"],
+        "budgeted_experiment_plan": ["work_product"]
+      },
+      "oracleIds": ["decision", "work_product", "operating_state", "outcome"],
       "implementationCrate": "hartevo-application"
     },
     {

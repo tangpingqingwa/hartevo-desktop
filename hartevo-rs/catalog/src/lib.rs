@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 21, 31)
+            (52, 22, 30)
         );
         assert_eq!(
             catalog
@@ -1786,6 +1786,17 @@ mod tests {
                     .required_artifacts
                     .contains(&"creator_deliverable".into())
         }));
+    }
+
+    #[test]
+    fn vm07_prioritized_experiments_has_an_application_handler() {
+        let catalog = Catalog::load().expect("valid catalog");
+        assert_eq!(
+            catalog
+                .application_handler("VM-07", 3, "prioritized_experiments")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm07.prioritized-experiments/v1")
+        );
     }
 
     #[test]
