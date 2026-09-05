@@ -15236,6 +15236,66 @@ sleep 30"#
         }
     }
 
+    #[cfg(unix)]
+    fn run_and_adopt_catalog_runtime_fixture(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> WorkProductId {
+        let prepared = plane
+            .prepare_catalog_mission_runtime_resume_with(secrets, project_id, mission_id, now)
+            .expect("prepare exact painted Catalog Runtime handle");
+        let resumed = plane
+            .resume_catalog_mission_runtime_with_cancellation(
+                secrets,
+                catalog_runtime_authority(prepared.handle),
+                Some(completed_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                now + Duration::seconds(1),
+            )
+            .expect("complete one painted Catalog Runtime turn");
+        let work_product_id = match resumed.runtime_outcome {
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id,
+            outcome => panic!("unexpected Runtime outcome: {outcome:?}"),
+        };
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(2))
+            .expect("Application after painted Runtime turn");
+        let mission = service
+            .load_mission(project_id, mission_id)
+            .expect("Mission with Runtime draft");
+        let work_product = mission
+            .work_products
+            .iter()
+            .find(|work_product| work_product.id == work_product_id)
+            .cloned()
+            .expect("Runtime WorkProduct");
+        let manifest = service
+            .load_work_product_manifest(project_id, &work_product_id)
+            .expect("Runtime WorkProduct manifest");
+        drop(service);
+        plane
+            .adopt_work_product_with(
+                secrets,
+                DesktopWorkProductAdoptionRequest {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    work_product_id: work_product_id.clone(),
+                    expected_mission_revision: mission.revision,
+                    expected_work_product_revision: work_product.revision,
+                    expected_manifest_version: manifest.version,
+                },
+                now + Duration::seconds(3),
+            )
+            .expect("adopt painted Runtime WorkProduct");
+        work_product_id
+    }
+
     #[derive(Clone)]
     struct MissionDeepSeekTransport {
         outcome: MissionDeepSeekOutcome,
@@ -19743,6 +19803,256 @@ sleep 30"#;
         .expect("eighth-handler event JSON");
         assert!(terminal_event_json.contains("mission.next_contract_or_valid_terminal_resolved"));
         assert!(!terminal_event_json.contains("one-off parent contract"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one encrypted Desktop Journey keeps Human scope, two paint-gated Runtime artifacts, explicit adoption, Application completion, cold recovery, and replay visible"
+    )]
+    fn vm01_work_queue_advances_two_adopted_runtime_products_without_provider_work() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let private_scope = "PRIVATE-VM01-DESKTOP::the selected site and market only";
+        let started_at = observed_at() + Duration::minutes(2);
+        let started = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-01".into(),
+                    mode: OperatingMode::ContinuousOperator,
+                    parent_mission_id: None,
+                    title: Some("SEO continuous operator".into()),
+                    goal: "Build a bounded evidence-backed SEO queue".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("VM-01 Human scope must not construct a Runtime command")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                started_at,
+            )
+            .expect("VM-01 starts at Human scope");
+        assert_eq!(
+            started.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "scope_locked".into(),
+                capability_id: "seo.plan".into(),
+                executor: MissionCheckpointExecutor::Human,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "goal".into(),
+                    "operating_state".into(),
+                    "truth".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::HumanConfirmation,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let started_projection = started.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("started VM-01 projection");
+        let confirmed = plane
+            .confirm_human_mission_checkpoint_with(
+                &secrets,
+                DesktopHumanCheckpointConfirmationRequest {
+                    project_id: project_id.clone(),
+                    mission_id: started.mission_id.clone(),
+                    checkpoint_id: "scope_locked".into(),
+                    message_id: MissionConversationMessageId::from("desktop-vm01-scope-message"),
+                    body: private_scope.into(),
+                    idempotency_key: "desktop-vm01-scope-confirmation".into(),
+                    work_product_ids: BTreeSet::new(),
+                    expected_mission_revision: started_projection.revision,
+                    expected_checkpoint_revision: started_projection
+                        .current_checkpoint_revision
+                        .expect("scope revision"),
+                    expected_conversation_revision: started_projection
+                        .conversation_revision
+                        .expect("Conversation revision"),
+                },
+                started_at + Duration::seconds(1),
+            )
+            .expect("confirm exact VM-01 scope");
+        let baseline_projection = confirmed.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("baseline VM-01 projection");
+        assert_eq!(
+            (
+                baseline_projection.current_checkpoint_id.as_deref(),
+                baseline_projection.current_checkpoint_executor,
+                baseline_projection.current_checkpoint_completion_policy,
+            ),
+            (
+                Some("analytics_and_search_baseline"),
+                Some(MissionCheckpointExecutor::Runtime),
+                Some(MissionCheckpointCompletionPolicy::WorkProduct),
+            )
+        );
+
+        let baseline_work_product_id = run_and_adopt_catalog_runtime_fixture(
+            &plane,
+            &secrets,
+            &project_id,
+            &started.mission_id,
+            started_at + Duration::seconds(2),
+        );
+        let opportunity_work_product_id = run_and_adopt_catalog_runtime_fixture(
+            &plane,
+            &secrets,
+            &project_id,
+            &started.mission_id,
+            started_at + Duration::seconds(6),
+        );
+        assert_ne!(baseline_work_product_id, opportunity_work_product_id);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, started_at + Duration::seconds(10))
+            .expect("Application at VM-01 work queue");
+        let dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &started.mission_id,
+                started_at + Duration::seconds(10),
+            )
+            .expect("work_queue dispatch");
+        assert_eq!(
+            (
+                dispatch.checkpoint_id.as_str(),
+                dispatch.application_handler_status,
+                dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "work_queue",
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm01.work-queue/v1"),
+            )
+        );
+        let replay_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: started.mission_id.clone(),
+            checkpoint_id: dispatch.checkpoint_id,
+            expected_mission_revision: dispatch.mission_revision,
+            expected_checkpoint_revision: dispatch.checkpoint_revision,
+        };
+        let events_before_handler = service
+            .mission_events(&project_id, &started.mission_id)
+            .expect("VM-01 events before handler")
+            .len();
+        let mission_before_handler = service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("VM-01 before handler");
+        assert!(mission_before_handler.effects.is_empty());
+        assert_eq!(mission_before_handler.work_products.len(), 2);
+        drop(service);
+
+        let completed = plane
+            .execute_application_mission_checkpoint_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                started_at + Duration::seconds(11),
+            )
+            .expect("complete VM-01 work queue through Desktop");
+        assert_eq!(
+            completed.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "brief_or_patch_ready".into(),
+                capability_id: "content.draft".into(),
+                executor: MissionCheckpointExecutor::Runtime,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "operating_state".into(),
+                    "work_product".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::WorkProduct,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+
+        let cold = DesktopDataPlane::at_data_root(plane.data_root.clone())
+            .expect("cold Desktop after VM-01 work queue");
+        let (mut service, _) = cold
+            .open_application_from_secret(&database_secret, started_at + Duration::seconds(12))
+            .expect("cold Application after VM-01 work queue");
+        let mission = service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("durable VM-01 work queue");
+        assert!(mission.effects.is_empty());
+        assert_eq!(mission.work_products.len(), 2);
+        let completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "work_queue")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable work_queue completion");
+        assert_eq!(
+            completion.work_product_ids,
+            BTreeSet::from([opportunity_work_product_id])
+        );
+        assert!(completion.effect_ids.is_empty());
+        let application_evidence = completion
+            .application_evidence
+            .as_ref()
+            .expect("durable VM-01 Application evidence");
+        assert_eq!(application_evidence.handler_id, "vm01.work-queue/v1");
+        assert_eq!(
+            application_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mission_checkpoint", "seo_work_queue"])
+        );
+        let events = service
+            .mission_events(&project_id, &started.mission_id)
+            .expect("durable content-free VM-01 events");
+        assert_eq!(events.len(), events_before_handler + 2);
+        let event_count = events.len();
+        let event_json = serde_json::to_string(&events).expect("VM-01 event JSON");
+        assert!(event_json.contains("vm01.work-queue/v1"));
+        assert!(!event_json.contains(private_scope));
+        assert!(!event_json.contains("Reviewable local runtime draft"));
+
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    replay_command,
+                    started_at + Duration::seconds(13),
+                )
+                .expect("exact VM-01 work queue replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("events after exact replay")
+                .len(),
+            event_count
+        );
     }
 
     #[test]

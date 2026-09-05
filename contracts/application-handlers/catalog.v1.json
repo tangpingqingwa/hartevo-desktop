@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v17",
+  "registryVersion": "desktop-2026-09-05-v18",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -91,6 +91,21 @@
         "mission_handoff": ["goal"]
       },
       "oracleIds": ["goal", "operating_state"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm01.work-queue/v1",
+      "missionId": "VM-01",
+      "missionVersion": 3,
+      "checkpointId": "work_queue",
+      "capabilityId": "outreach.send",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "seo_work_queue"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "seo_work_queue": ["decision", "work_product"]
+      },
+      "oracleIds": ["decision", "work_product", "operating_state"],
       "implementationCrate": "hartevo-application"
     },
     {

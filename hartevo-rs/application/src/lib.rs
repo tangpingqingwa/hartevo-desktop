@@ -3463,6 +3463,7 @@ const VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID: &str = "vm00.local-connection-
 const VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID: &str =
     "vm00.local-operating-contract-compiled/v1";
 const VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID: &str = "vm00.local-mission-handoff/v1";
+const VM01_WORK_QUEUE_HANDLER_ID: &str = "vm01.work-queue/v1";
 const VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID: &str = "vm04.account-scope-probe/v1";
 const VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID: &str = "vm04.engagement-referral-review/v1";
 const VM04_CHANNEL_REBALANCE_HANDLER_ID: &str = "vm04.channel-rebalance/v1";
@@ -3485,6 +3486,7 @@ enum CompiledApplicationCheckpointHandler {
     LocalConnectionReadiness,
     LocalOperatingContractCompiled,
     LocalMissionHandoff,
+    Vm01WorkQueue,
     Vm04AccountScopeProbe,
     Vm04EngagementReferralReview,
     Vm04ChannelRebalance,
@@ -3509,6 +3511,7 @@ impl CompiledApplicationCheckpointHandler {
                 VM00_LOCAL_OPERATING_CONTRACT_COMPILED_HANDLER_ID
             }
             Self::LocalMissionHandoff => VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID,
+            Self::Vm01WorkQueue => VM01_WORK_QUEUE_HANDLER_ID,
             Self::Vm04AccountScopeProbe => VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID,
             Self::Vm04EngagementReferralReview => VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID,
             Self::Vm04ChannelRebalance => VM04_CHANNEL_REBALANCE_HANDLER_ID,
@@ -3531,6 +3534,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::LocalConnectionReadiness => "connection_readiness",
             Self::LocalOperatingContractCompiled => "operating_contract",
             Self::LocalMissionHandoff => "mission_handoff",
+            Self::Vm01WorkQueue => "seo_work_queue",
             Self::Vm04AccountScopeProbe => "account_scope",
             Self::Vm04EngagementReferralReview => "provider_readback",
             Self::Vm04ChannelRebalance => "channel_rebalance",
@@ -3809,6 +3813,7 @@ fn compiled_application_checkpoint_handler(
         VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::LocalMissionHandoff)
         }
+        VM01_WORK_QUEUE_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::Vm01WorkQueue),
         VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe)
         }
@@ -4774,6 +4779,294 @@ fn vm04_account_scope_probe_application_evidence(
         ]),
         observed_at: now,
     })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the proof keeps the Human scope, two accepted Runtime artifacts, exact route, and content-free queue projection visible at one completion boundary"
+)]
+fn vm01_work_queue_application_evidence(
+    store: &ProjectStore,
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<
+    (
+        MissionCheckpointApplicationEvidence,
+        u64,
+        Vec<ApplicationSourceRevisionFence>,
+    ),
+    ApplicationError,
+> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let catalog_digest = Catalog::load()?.snapshot()?.digest;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if definition.manifest_id != "VM-01"
+        || definition.manifest_version != 3
+        || definition.catalog_digest != catalog_digest
+        || checkpoint.id != "work_queue"
+        || checkpoint.status != MissionCheckpointStatus::Verifying
+        || route.capability_id != "outreach.send"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids
+            != BTreeSet::from([
+                "decision".into(),
+                "operating_state".into(),
+                "work_product".into(),
+            ])
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+
+    let scope_checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|candidate| candidate.id == "scope_locked")
+        .filter(|candidate| candidate.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let scope_route = scope_checkpoint
+        .route
+        .as_ref()
+        .filter(|scope_route| {
+            scope_route.capability_id == "seo.plan"
+                && scope_route.executor == MissionCheckpointExecutor::Human
+                && scope_route.completion_policy
+                    == Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+                && scope_route.oracle_ids
+                    == BTreeSet::from([
+                        "decision".into(),
+                        "goal".into(),
+                        "operating_state".into(),
+                        "truth".into(),
+                    ])
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let scope_completion = scope_checkpoint
+        .completion
+        .as_ref()
+        .filter(|completion| {
+            completion.oracle_ids == scope_route.oracle_ids
+                && completion.work_product_ids.is_empty()
+                && completion.effect_ids.is_empty()
+                && completion.application_evidence.is_none()
+                && is_sha256_text(&completion.evidence_digest)
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+
+    let baseline_checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|candidate| candidate.id == "analytics_and_search_baseline")
+        .filter(|candidate| candidate.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let baseline_route = baseline_checkpoint
+        .route
+        .as_ref()
+        .filter(|baseline_route| {
+            baseline_route.capability_id == "analytics.read"
+                && baseline_route.executor == MissionCheckpointExecutor::Runtime
+                && baseline_route.completion_policy
+                    == Some(MissionCheckpointCompletionPolicy::WorkProduct)
+                && baseline_route.oracle_ids
+                    == BTreeSet::from([
+                        "operating_state".into(),
+                        "truth".into(),
+                        "work_product".into(),
+                    ])
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let baseline_completion = baseline_checkpoint
+        .completion
+        .as_ref()
+        .filter(|completion| {
+            completion.oracle_ids == baseline_route.oracle_ids
+                && completion.work_product_ids.len() == 1
+                && completion.effect_ids.is_empty()
+                && completion.application_evidence.is_none()
+                && is_sha256_text(&completion.evidence_digest)
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+
+    let opportunity_checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|candidate| candidate.id == "opportunity_prioritized")
+        .filter(|candidate| candidate.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let opportunity_route = opportunity_checkpoint
+        .route
+        .as_ref()
+        .filter(|opportunity_route| {
+            opportunity_route.capability_id == "search.measure"
+                && opportunity_route.executor == MissionCheckpointExecutor::Runtime
+                && opportunity_route.completion_policy
+                    == Some(MissionCheckpointCompletionPolicy::WorkProduct)
+                && opportunity_route.oracle_ids
+                    == BTreeSet::from([
+                        "decision".into(),
+                        "operating_state".into(),
+                        "truth".into(),
+                        "work_product".into(),
+                    ])
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let opportunity_completion = opportunity_checkpoint
+        .completion
+        .as_ref()
+        .filter(|completion| {
+            completion.oracle_ids == opportunity_route.oracle_ids
+                && completion.work_product_ids.len() == 1
+                && completion.effect_ids.is_empty()
+                && completion.application_evidence.is_none()
+                && is_sha256_text(&completion.evidence_digest)
+        })
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+
+    let baseline_work_product_id = baseline_completion
+        .work_product_ids
+        .iter()
+        .next()
+        .expect("one baseline WorkProduct checked");
+    let opportunity_work_product_id = opportunity_completion
+        .work_product_ids
+        .iter()
+        .next()
+        .expect("one opportunity WorkProduct checked");
+    if baseline_work_product_id == opportunity_work_product_id {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let baseline_work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| &work_product.id == baseline_work_product_id)
+        .filter(|work_product| work_product.status == WorkProductStatus::Accepted)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let opportunity_work_product = mission
+        .work_products
+        .iter()
+        .find(|work_product| &work_product.id == opportunity_work_product_id)
+        .filter(|work_product| work_product.status == WorkProductStatus::Accepted)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let baseline_manifest =
+        store.load_work_product_manifest(&mission.project_id, baseline_work_product_id)?;
+    let opportunity_manifest =
+        store.load_work_product_manifest(&mission.project_id, opportunity_work_product_id)?;
+    baseline_manifest.validate_against(baseline_work_product)?;
+    opportunity_manifest.validate_against(opportunity_work_product)?;
+    if [&baseline_manifest, &opportunity_manifest]
+        .into_iter()
+        .any(|manifest| {
+            manifest.tenant_id != mission.tenant_id
+                || manifest.project_id != mission.project_id
+                || manifest.mission_id != mission.id
+                || manifest.work_product_type != "runtime_draft"
+                || manifest.adoption_status != WorkProductStatus::Accepted
+        })
+        || baseline_manifest.updated_at != baseline_completion.verified_at
+        || opportunity_manifest.updated_at != opportunity_completion.verified_at
+        || scope_completion.verified_at > baseline_completion.verified_at
+        || baseline_completion.verified_at > opportunity_completion.verified_at
+        || opportunity_completion.verified_at > now
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let work_queue_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm01-seo-work-queue/v1",
+        "missionId": mission.id,
+        "scopeCheckpointRevision": scope_checkpoint.revision,
+        "scopeCompletionEvidenceDigest": scope_completion.evidence_digest,
+        "baselineCheckpointRevision": baseline_checkpoint.revision,
+        "baselineCompletionEvidenceDigest": baseline_completion.evidence_digest,
+        "baselineWorkProductId": baseline_work_product.id,
+        "baselineWorkProductRevision": baseline_work_product.revision,
+        "baselineWorkProductContentDigest": baseline_work_product.content_digest,
+        "baselineManifestVersion": baseline_manifest.version,
+        "baselineManifestDigest": baseline_manifest.manifest_digest,
+        "opportunityCheckpointRevision": opportunity_checkpoint.revision,
+        "opportunityCompletionEvidenceDigest": opportunity_completion.evidence_digest,
+        "opportunityWorkProductId": opportunity_work_product.id,
+        "opportunityWorkProductRevision": opportunity_work_product.revision,
+        "opportunityWorkProductContentDigest": opportunity_work_product.content_digest,
+        "opportunityManifestVersion": opportunity_manifest.version,
+        "opportunityManifestDigest": opportunity_manifest.manifest_digest,
+        "queuePolicy": "preserve_prioritized_opportunity_set",
+        "externalEffectExecuted": false,
+    }))?;
+    let evidence = MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM01_WORK_QUEUE_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "seo_work_queue".into(),
+                source_id: opportunity_work_product.id.to_string(),
+                source_revision: opportunity_manifest.version,
+                projection_digest: work_queue_digest,
+                oracle_ids: BTreeSet::from(["decision".into(), "work_product".into()]),
+            },
+        ]),
+        observed_at: now,
+    };
+    Ok((
+        evidence,
+        opportunity_manifest.version,
+        vec![ApplicationSourceRevisionFence::present(
+            ApplicationSourceKind::Mission,
+            mission.id.to_string(),
+            command.expected_mission_revision,
+        )],
+    ))
 }
 
 #[allow(
@@ -6346,6 +6639,9 @@ fn execute_project_application_checkpoint(
                 .collect();
             (evidence, revision, source_fences)
         }
+        CompiledApplicationCheckpointHandler::Vm01WorkQueue => {
+            vm01_work_queue_application_evidence(store, &mission, &route, &command, now)?
+        }
         CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview => {
             vm04_engagement_referral_review_application_evidence(
                 store, &mission, &route, &command, now,
@@ -6375,9 +6671,23 @@ fn execute_project_application_checkpoint(
     };
     validate_application_evidence_against_registry(&application_evidence)?;
     let evidence_digest = application_evidence.digest();
+    let work_product_ids = if handler == CompiledApplicationCheckpointHandler::Vm01WorkQueue {
+        let source = application_evidence
+            .sources
+            .iter()
+            .find(|source| source.source_kind == "seo_work_queue")
+            .ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler.handler_id().into(),
+                },
+            )?;
+        BTreeSet::from([WorkProductId::from(source.source_id.as_str())])
+    } else {
+        BTreeSet::new()
+    };
     let completion = MissionCheckpointCompletion {
         oracle_ids: route.oracle_ids.clone(),
-        work_product_ids: BTreeSet::new(),
+        work_product_ids,
         effect_ids: BTreeSet::new(),
         application_evidence: Some(application_evidence),
         evidence_digest: evidence_digest.clone(),
@@ -12390,6 +12700,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::LocalConnectionReadiness
                 | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
                 | CompiledApplicationCheckpointHandler::LocalMissionHandoff
+                | CompiledApplicationCheckpointHandler::Vm01WorkQueue
                 | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
                 | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
                 | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -13245,6 +13556,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::LocalConnectionReadiness
             | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
             | CompiledApplicationCheckpointHandler::LocalMissionHandoff
+            | CompiledApplicationCheckpointHandler::Vm01WorkQueue
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
@@ -13381,6 +13693,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::LocalConnectionReadiness
             | CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
             | CompiledApplicationCheckpointHandler::LocalMissionHandoff
+            | CompiledApplicationCheckpointHandler::Vm01WorkQueue
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance => {
@@ -30066,6 +30379,280 @@ mod tests {
         assert!(catalog.application_handlers.handlers.iter().all(|handler| {
             compiled_application_checkpoint_handler(&handler.handler_id).is_some()
         }));
+    }
+
+    fn record_and_accept_runtime_fixture(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        checkpoint_id: &str,
+        work_product_id: WorkProductId,
+        private_body: &str,
+        recorded_at: DateTime<Utc>,
+    ) -> WorkProductMutation {
+        let mission = service
+            .load_mission(project_id, mission_id)
+            .expect("running Runtime Mission");
+        let checkpoint = mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("running Runtime Checkpoint");
+        assert_eq!(checkpoint.id, checkpoint_id);
+        assert_eq!(checkpoint.status, MissionCheckpointStatus::Running);
+        let route = checkpoint.route.as_ref().expect("Runtime route");
+        assert_eq!(route.executor, MissionCheckpointExecutor::Runtime);
+        let task_id = mission
+            .tasks
+            .iter()
+            .find(|task| {
+                task.status == TaskStatus::Running && task.capability == route.capability_id
+            })
+            .map(|task| task.id.clone())
+            .expect("running Runtime Task");
+        service
+            .record_research(
+                project_id,
+                mission_id,
+                ResearchPacket {
+                    work_product_id: work_product_id.clone(),
+                    title: format!("Runtime artifact for {checkpoint_id}"),
+                    body: private_body.into(),
+                    work_product_type: "runtime_draft".into(),
+                    fact_ids: BTreeSet::new(),
+                    task_ids: BTreeSet::from([task_id]),
+                    file_digest: None,
+                    preview_media_type: "text/plain".into(),
+                    preview: format!("Reviewable {checkpoint_id} artifact"),
+                    editable_scopes: BTreeSet::from(["/body".into()]),
+                    evidence: Vec::new(),
+                },
+                recorded_at,
+            )
+            .expect("record Runtime WorkProduct");
+        let prepared = service
+            .load_mission(project_id, mission_id)
+            .expect("Mission with Runtime WorkProduct");
+        let manifest = service
+            .load_work_product_manifest(project_id, &work_product_id)
+            .expect("Runtime WorkProduct manifest");
+        service
+            .accept_work_product(
+                &AcceptWorkProduct {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    work_product_id,
+                    expected_mission_revision: prepared.revision,
+                    expected_manifest_version: manifest.version,
+                },
+                recorded_at + Duration::milliseconds(1),
+            )
+            .expect("accept Runtime WorkProduct")
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one VM-01 contract test keeps locked Human scope, two accepted Runtime artifacts, content-free evidence, next-route dispatch, and exact replay visible"
+    )]
+    fn vm01_work_queue_binds_locked_scope_and_two_accepted_runtime_products() {
+        let workspace = tempfile::tempdir().expect("project workspace");
+        let project_id = ProjectId::from("vm01-work-queue-project");
+        let mission_id = MissionId::from("vm01-work-queue-mission");
+        let private_scope = "PRIVATE-VM01-SCOPE::only the frozen site and market";
+        let private_baseline = "PRIVATE-VM01-BASELINE::raw analytics and search observations";
+        let private_opportunity = "PRIVATE-VM01-OPPORTUNITY::ranked keyword and page queue";
+        let baseline_work_product_id = WorkProductId::from("vm01-baseline-work-product");
+        let opportunity_work_product_id = WorkProductId::from("vm01-opportunity-work-product");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("vm01-work-queue-tenant"),
+                    id: project_id.clone(),
+                    name: "VM-01 project".into(),
+                    description: "VM-01 work queue boundary".into(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("Project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm01-scope-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-01".into(),
+                    mode: OperatingMode::ContinuousOperator,
+                    parent_mission_id: None,
+                    title: Some("SEO continuous operator".into()),
+                    goal: "Build a bounded evidence-backed SEO queue".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now() + Duration::milliseconds(1),
+            )
+            .expect("VM-01 Mission");
+
+        let scope_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("scope Mission");
+        let scope_checkpoint = scope_mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("scope Checkpoint");
+        let conversation_revision = service
+            .mission_conversation(&project_id, &mission_id)
+            .expect("scope Conversation")
+            .revision;
+        service
+            .confirm_human_mission_checkpoint(
+                ConfirmHumanMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    checkpoint_id: "scope_locked".into(),
+                    message_id: MissionConversationMessageId::from("vm01-scope-message"),
+                    body: private_scope.into(),
+                    idempotency_key: "vm01-scope-confirmation".into(),
+                    work_product_ids: BTreeSet::new(),
+                    expected_mission_revision: scope_mission.revision,
+                    expected_checkpoint_revision: scope_checkpoint.revision,
+                    expected_conversation_revision: conversation_revision,
+                },
+                now() + Duration::milliseconds(2),
+            )
+            .expect("lock exact Human SEO scope");
+        let baseline = record_and_accept_runtime_fixture(
+            &mut service,
+            &project_id,
+            &mission_id,
+            "analytics_and_search_baseline",
+            baseline_work_product_id.clone(),
+            private_baseline,
+            now() + Duration::milliseconds(3),
+        );
+        let opportunity = record_and_accept_runtime_fixture(
+            &mut service,
+            &project_id,
+            &mission_id,
+            "opportunity_prioritized",
+            opportunity_work_product_id.clone(),
+            private_opportunity,
+            now() + Duration::milliseconds(5),
+        );
+        assert_eq!(baseline.work_product.status, WorkProductStatus::Accepted);
+        assert_eq!(opportunity.work_product.status, WorkProductStatus::Accepted);
+
+        let dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::milliseconds(7),
+            )
+            .expect("VM-01 work_queue dispatch");
+        assert_eq!(dispatch.checkpoint_id, "work_queue");
+        assert_eq!(dispatch.executor, MissionCheckpointExecutor::Application);
+        assert_eq!(
+            (
+                dispatch.application_handler_status,
+                dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM01_WORK_QUEUE_HANDLER_ID),
+            )
+        );
+        let command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: dispatch.checkpoint_id,
+            expected_mission_revision: dispatch.mission_revision,
+            expected_checkpoint_revision: dispatch.checkpoint_revision,
+        };
+        let execution = service
+            .execute_application_mission_checkpoint(
+                command.clone(),
+                now() + Duration::milliseconds(8),
+            )
+            .expect("complete exact VM-01 work queue");
+        let ApplicationMissionCheckpointExecution::Completed {
+            replayed: false,
+            outcome_ledger_revision,
+            next_dispatch: Some(next_dispatch),
+            ..
+        } = execution
+        else {
+            panic!("VM-01 work queue must complete and enter the next Runtime route")
+        };
+        assert_eq!(outcome_ledger_revision, opportunity.manifest.version);
+        assert_eq!(next_dispatch.checkpoint_id, "brief_or_patch_ready");
+        assert_eq!(next_dispatch.executor, MissionCheckpointExecutor::Runtime);
+        assert_eq!(next_dispatch.capability_id, "content.draft");
+
+        let completed = service
+            .load_mission(&project_id, &mission_id)
+            .expect("completed VM-01 work queue");
+        assert!(completed.effects.is_empty());
+        assert_eq!(completed.work_products.len(), 2);
+        let completion = completed
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "work_queue")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable work_queue completion");
+        assert_eq!(
+            completion.work_product_ids,
+            BTreeSet::from([opportunity_work_product_id])
+        );
+        assert!(completion.effect_ids.is_empty());
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .expect("VM-01 Application evidence");
+        assert_eq!(evidence.handler_id, VM01_WORK_QUEUE_HANDLER_ID);
+        assert_eq!(
+            evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mission_checkpoint", "seo_work_queue"])
+        );
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("content-free VM-01 events");
+        let event_count = events.len();
+        let event_json = serde_json::to_string(&events).expect("event JSON");
+        assert!(event_json.contains(VM01_WORK_QUEUE_HANDLER_ID));
+        assert!(!event_json.contains(private_scope));
+        assert!(!event_json.contains(private_baseline));
+        assert!(!event_json.contains(private_opportunity));
+
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(command, now() + Duration::milliseconds(9),)
+                .expect("exact VM-01 work queue replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after VM-01 replay")
+                .len(),
+            event_count
+        );
     }
 
     #[test]
