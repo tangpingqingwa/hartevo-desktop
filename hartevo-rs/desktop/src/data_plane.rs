@@ -35,20 +35,20 @@ use hartevo_application::{
     DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
-    KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
-    ObservationClassification, ObservationEvidencePack, ObservationPipelineError,
-    ObservationPipelineRequest, ObservationPipelineResult, ObservationPlanBinding,
-    ObservationSourceBinding, ObservationSourceKind, ObserveContextRuntimeTurn,
-    PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext, PreparedLocalMissionRuntimeContext,
-    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProposePreviewEffect,
-    ProposeVm00BillingCheckout, ProvisionProjectEncryption, ReadBrowserPublicSource,
-    ReconcileUncertainEffect, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
-    RespondContextRuntimeLocalApproval, ResumeBrowserWorkspace, RetryContextWorkerRuntime,
-    ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor,
-    RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition, StartCatalogMission,
-    StartMission, TakeOverBrowserWorkspace, TypedRuntimeObservation,
-    VM00_BILLING_CHECKOUT_CAPABILITY, VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
+    KeyAdministrationAuthorization, MissionCheckpointDispatch, MissionCheckpointDispatchState,
+    MissionRuntimeProjection, ObservationClassification, ObservationEvidencePack,
+    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
+    ObservationPlanBinding, ObservationSourceBinding, ObservationSourceKind,
+    ObserveContextRuntimeTurn, PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext,
+    PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
+    ProposePreviewEffect, ProposeVm00BillingCheckout, ProvisionProjectEncryption,
+    ReadBrowserPublicSource, ReconcileUncertainEffect, RecoverContextWorkerRuntime,
+    RecoverPersonalProjectDevice, RelationshipConversationProjection, ResearchPacket,
+    ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
+    ResumeBrowserWorkspace, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
+    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionError,
+    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission, TakeOverBrowserWorkspace,
+    TypedRuntimeObservation, VM00_BILLING_CHECKOUT_CAPABILITY, VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
     VM00_BILLING_CHECKOUT_POLICY_VERSION, VM00_BILLING_CHECKOUT_REQUIRED_SCOPE,
     VerifyRecordedReceiptAtRevision, Vm00TargetMissionSelection,
     Vm11NextContractOrValidTerminalResult, vm00_billing_checkout_effect_policy,
@@ -3955,8 +3955,18 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.execute_application_mission_checkpoint_with(&secret_store, project_id, mission_id, now)
+    }
+
+    fn execute_application_mission_checkpoint_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let (mut service, runtime_reconciliation, _context_session) =
-            self.open_ready_runtime_project(&secret_store, project_id, now)?;
+            self.open_ready_runtime_project(secret_store, project_id, now)?;
         let mission = service.load_mission(project_id, mission_id)?;
         if mission.project_id != *project_id
             || mission.id != *mission_id
@@ -3967,7 +3977,7 @@ impl DesktopDataPlane {
         }
         if let Some(submission) = self.advance_application_checkpoint_before_runtime(
             &mut service,
-            &secret_store,
+            secret_store,
             &runtime_reconciliation,
             project_id,
             mission_id,
@@ -3978,7 +3988,7 @@ impl DesktopDataPlane {
         let dispatch = service.dispatch_current_mission_checkpoint(project_id, mission_id, now)?;
         self.finish_mission_submission(
             &service,
-            &secret_store,
+            secret_store,
             runtime_reconciliation,
             mission_id.clone(),
             DesktopMissionRuntimeOutcome::CheckpointRouted {
@@ -9030,6 +9040,22 @@ impl DesktopDataPlane {
                 now,
             )? {
                 ApplicationMissionCheckpointExecution::Completed {
+                    target_dispatch: Some(target_dispatch),
+                    next_dispatch,
+                    ..
+                } => {
+                    return self
+                        .finish_handoff_target_submission(
+                            service,
+                            secret_store,
+                            runtime_reconciliation,
+                            (project_id, mission_id, next_dispatch.is_some()),
+                            *target_dispatch,
+                            now,
+                        )
+                        .map(Some);
+                }
+                ApplicationMissionCheckpointExecution::Completed {
                     next_dispatch: Some(next_dispatch),
                     ..
                 } => dispatch = next_dispatch,
@@ -9084,17 +9110,50 @@ impl DesktopDataPlane {
             secret_store,
             runtime_reconciliation.clone(),
             mission_id.clone(),
-            DesktopMissionRuntimeOutcome::CheckpointRouted {
-                checkpoint_id: dispatch.checkpoint_id,
-                capability_id: dispatch.capability_id,
-                executor: dispatch.executor,
-                oracle_ids: dispatch.oracle_ids,
-                completion_policy: dispatch.completion_policy,
-                state: dispatch.state,
-            },
+            Self::checkpoint_routed_outcome(dispatch),
             now,
         )
         .map(Some)
+    }
+
+    fn finish_handoff_target_submission(
+        &self,
+        service: &ApplicationService,
+        secret_store: &impl SecretStore,
+        runtime_reconciliation: &RuntimeTurnStartupReconciliation,
+        source_scope: (&ProjectId, &MissionId, bool),
+        target_dispatch: MissionCheckpointDispatch,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let (project_id, mission_id, source_dispatch_pending) = source_scope;
+        if source_dispatch_pending
+            || target_dispatch.project_id != *project_id
+            || target_dispatch.mission_id == *mission_id
+        {
+            return Err(ApplicationError::ApplicationCheckpointCommandMismatch.into());
+        }
+        let target_mission_id = target_dispatch.mission_id.clone();
+        self.finish_mission_submission(
+            service,
+            secret_store,
+            runtime_reconciliation.clone(),
+            target_mission_id,
+            Self::checkpoint_routed_outcome(target_dispatch),
+            now,
+        )
+    }
+
+    fn checkpoint_routed_outcome(
+        dispatch: MissionCheckpointDispatch,
+    ) -> DesktopMissionRuntimeOutcome {
+        DesktopMissionRuntimeOutcome::CheckpointRouted {
+            checkpoint_id: dispatch.checkpoint_id,
+            capability_id: dispatch.capability_id,
+            executor: dispatch.executor,
+            oracle_ids: dispatch.oracle_ids,
+            completion_policy: dispatch.completion_policy,
+            state: dispatch.state,
+        }
     }
 
     #[allow(
@@ -15691,10 +15750,9 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves the VM-00 local Project foundations, Cordis-authorized checkout, atomic frozen-target handoff, exact replay, SQLCipher recovery, and content-free evidence after cold reopen"
+        reason = "one Desktop Journey proves the VM-00 local Project foundations, atomic frozen-target handoff, exact target redirect/replay, painted Cordis Runtime resume, SQLCipher recovery, and content-free evidence"
     )]
-    fn vm00_local_identity_inventory_and_encryption_survive_encrypted_desktop_reopen_without_runtime()
-     {
+    fn vm00_handoff_redirects_frozen_target_into_painted_runtime_resume_after_encrypted_reopen() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
         let device_id = plane.device_id.clone();
         let private_goal = "PRIVATE-VM00-DESKTOP::resume only this encrypted local project";
@@ -16414,17 +16472,50 @@ sleep 30"#;
             expected_checkpoint_revision: handoff_dispatch.checkpoint_revision,
         };
         let handoff_now = contract_now + Duration::seconds(2);
-        let handed_off = service
-            .execute_application_mission_checkpoint(handoff_command.clone(), handoff_now)
-            .expect("seal exact VM-00 Mission handoff");
-        assert!(matches!(
-            handed_off,
-            ApplicationMissionCheckpointExecution::Completed {
-                replayed: false,
-                next_dispatch: None,
-                ..
+        drop(service);
+        let redirected = reopened
+            .execute_application_mission_checkpoint_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                handoff_now,
+            )
+            .expect("atomically hand off and redirect Desktop to target Mission");
+        assert_eq!(redirected.mission_id, target_plan.target_mission_id);
+        assert_eq!(
+            redirected.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: target_plan.target_definition.checkpoints[0].id.clone(),
+                capability_id: target_plan.target_definition.checkpoints[0]
+                    .route
+                    .as_ref()
+                    .expect("target first route")
+                    .capability_id
+                    .clone(),
+                executor: MissionCheckpointExecutor::Runtime,
+                oracle_ids: target_plan.target_definition.checkpoints[0]
+                    .route
+                    .as_ref()
+                    .expect("target first route")
+                    .oracle_ids
+                    .clone(),
+                completion_policy: MissionCheckpointCompletionPolicy::WorkProduct,
+                state: MissionCheckpointDispatchState::Ready,
             }
-        ));
+        );
+        assert!(
+            redirected.snapshot.inventory.projects[0]
+                .missions
+                .iter()
+                .any(
+                    |mission| mission.mission_id == target_plan.target_mission_id
+                        && mission.current_checkpoint_executor
+                            == Some(MissionCheckpointExecutor::Runtime)
+                )
+        );
+        let (mut service, _) = reopened
+            .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(1))
+            .expect("Application after Desktop target redirect");
         let created_target = service
             .load_mission(&project_id, &target_plan.target_mission_id)
             .expect("atomically created frozen target Mission");
@@ -16493,19 +16584,26 @@ sleep 30"#;
             .mission_events(&project_id, &target_plan.target_mission_id)
             .expect("events after target Mission creation")
             .len();
-        assert!(matches!(
-            service
-                .execute_application_mission_checkpoint(
-                    handoff_command,
-                    handoff_now + Duration::seconds(1),
-                )
-                .expect("exact Mission handoff replay"),
-            ApplicationMissionCheckpointExecution::Completed {
-                replayed: true,
-                next_dispatch: None,
-                ..
-            }
-        ));
+        let replayed_handoff = service
+            .execute_application_mission_checkpoint(
+                handoff_command,
+                handoff_now + Duration::seconds(1),
+            )
+            .expect("exact Mission handoff replay");
+        let ApplicationMissionCheckpointExecution::Completed {
+            replayed: true,
+            next_dispatch: None,
+            target_dispatch: Some(replayed_target_dispatch),
+            ..
+        } = replayed_handoff
+        else {
+            panic!("exact Mission handoff replay must return the durable target dispatch")
+        };
+        assert_eq!(
+            replayed_target_dispatch.mission_id,
+            target_plan.target_mission_id
+        );
+        assert_eq!(replayed_target_dispatch.mission_revision, 2);
         assert_eq!(
             service
                 .mission_events(&project_id, &submission.mission_id)
@@ -16820,6 +16918,86 @@ sleep 30"#;
         assert!(target_event_json.contains(target_plan.target_mission_id.as_str()));
         assert!(!target_event_json.contains(&target_plan.target_contract.goal));
         assert!(!target_event_json.contains(&target_plan.target_title));
+        drop(service);
+
+        #[cfg(unix)]
+        {
+            let prepared = reopened
+                .prepare_catalog_mission_runtime_resume_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(3),
+                )
+                .expect("prepare exact redirected target handle without Runtime");
+            assert_eq!(prepared.handle.mission_id(), &target_plan.target_mission_id);
+            assert_eq!(
+                prepared.snapshot.runtime_reconciliation,
+                no_runtime_turn_startup_reconciliation()
+            );
+            let resumed = reopened
+                .resume_catalog_mission_runtime_with_cancellation(
+                    &secrets,
+                    catalog_runtime_authority(prepared.handle),
+                    Some(completed_runtime_fixture_source()),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    handoff_now + Duration::seconds(4),
+                )
+                .expect("run first redirected target Checkpoint after exact paint");
+            assert_eq!(resumed.mission_id, target_plan.target_mission_id);
+            let work_product_id = match resumed.runtime_outcome {
+                DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id,
+                outcome => panic!("unexpected redirected target Runtime outcome: {outcome:?}"),
+            };
+            let cold_after_runtime = DesktopDataPlane::at_data_root(reopened.data_root.clone())
+                .expect("cold Desktop after redirected target Runtime");
+            let (cold_service, _) = cold_after_runtime
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(5))
+                .expect("cold Application after redirected target Runtime");
+            assert_eq!(
+                cold_service
+                    .mission_events(&project_id, &submission.mission_id)
+                    .expect("source events after target Runtime")
+                    .len(),
+                handoff_event_count
+            );
+            let runtime_target = cold_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("cold target Mission after first Runtime turn");
+            assert!(runtime_target.work_products.iter().any(|work_product| {
+                work_product.id == work_product_id
+                    && work_product.status
+                        == hartevo_domain_kernel::WorkProductStatus::ReadyForReview
+            }));
+            let runtime_conversation = cold_service
+                .mission_conversation(&project_id, &target_plan.target_mission_id)
+                .expect("cold target Conversation after first Runtime turn");
+            assert_eq!(runtime_conversation.revision, 2);
+            assert_eq!(runtime_conversation.messages.len(), 2);
+            assert_eq!(
+                runtime_conversation.messages[1].body,
+                "Reviewable local runtime draft; no external effect occurred."
+            );
+            let runtime_target_event_json = serde_json::to_string(
+                &cold_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("content-free target events after Runtime"),
+            )
+            .expect("target Runtime event JSON");
+            assert!(
+                !runtime_target_event_json
+                    .contains("Reviewable local runtime draft; no external effect occurred.")
+            );
+            assert!(
+                cold_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("target events after first Runtime")
+                    .len()
+                    > target_event_count
+            );
+            assert_eq!(executor.calls, 1);
+            assert_eq!(verifier.calls, 1);
+        }
         drop(directory);
     }
 
