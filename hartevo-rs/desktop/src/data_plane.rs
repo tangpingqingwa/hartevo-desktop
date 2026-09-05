@@ -15776,8 +15776,8 @@ sleep 30"#;
                     observed_external_account_id: "acct_vm00_desktop_private".into(),
                     granted_scopes: BTreeSet::from([VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()]),
                     probed_at: checkout_now,
-                    valid_until: checkout_now + Duration::days(30),
-                    credential_expires_at: checkout_now + Duration::days(30),
+                    valid_until: checkout_now + Duration::days(1),
+                    credential_expires_at: checkout_now + Duration::days(1),
                     evidence_digest: "6".repeat(64),
                 },
                 checkout_now,
@@ -15909,7 +15909,7 @@ sleep 30"#;
         let data_root = plane.data_root.clone();
         drop(plane);
         let reopened = DesktopDataPlane::at_data_root(data_root).expect("cold reopened plane");
-        let expired_at = checkout_now + Duration::days(31);
+        let expired_at = checkout_now + Duration::days(2);
         let (mut service, _runtime_reconciliation) = reopened
             .open_application_from_secret(&database_secret, expired_at)
             .expect("mutable encrypted Application after reopen");
@@ -16041,9 +16041,148 @@ sleep 30"#;
         assert_eq!(verifier.calls, 1);
         drop(service);
 
+        let DesktopLoadState::Ready(goal_snapshot) = reopened
+            .load_with(&secrets, refreshed_at + Duration::seconds(3))
+            .expect("Desktop projection at VM-00 goal selection")
+        else {
+            panic!("reopened Desktop must remain initialized")
+        };
+        let goal_projection = goal_snapshot
+            .inventory
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .and_then(|project| {
+                project
+                    .missions
+                    .iter()
+                    .find(|mission| mission.mission_id == submission.mission_id)
+            })
+            .expect("VM-00 goal-selection projection");
+        assert_eq!(goal_projection.completed_checkpoint_count, 5);
+        assert_eq!(
+            goal_projection.current_checkpoint_id.as_deref(),
+            Some("goal_selected")
+        );
+        assert_eq!(
+            goal_projection.current_checkpoint_executor,
+            Some(MissionCheckpointExecutor::Human)
+        );
+
+        let private_goal_confirmation =
+            "PRIVATE-VM00-GOAL-CONFIRMATION::compile only this selected local goal";
+        let goal_message_id = MissionConversationMessageId::new();
+        let contract_snapshot = reopened
+            .confirm_human_mission_checkpoint_with(
+                &secrets,
+                DesktopHumanCheckpointConfirmationRequest {
+                    project_id: project_id.clone(),
+                    mission_id: submission.mission_id.clone(),
+                    checkpoint_id: "goal_selected".into(),
+                    message_id: goal_message_id.clone(),
+                    body: private_goal_confirmation.into(),
+                    idempotency_key: format!(
+                        "desktop-vm00-goal-confirmation:{}",
+                        goal_message_id.as_str()
+                    ),
+                    work_product_ids: BTreeSet::new(),
+                    expected_mission_revision: goal_projection.revision,
+                    expected_checkpoint_revision: goal_projection
+                        .current_checkpoint_revision
+                        .expect("goal Checkpoint revision"),
+                    expected_conversation_revision: goal_projection
+                        .conversation_revision
+                        .expect("goal Conversation revision"),
+                },
+                refreshed_at + Duration::seconds(4),
+            )
+            .expect("confirm exact VM-00 goal selection");
+        let contract_projection = contract_snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("VM-00 Operating Contract projection");
+        assert_eq!(contract_projection.completed_checkpoint_count, 6);
+        assert_eq!(
+            contract_projection.current_checkpoint_id.as_deref(),
+            Some("operating_contract_compiled")
+        );
+        assert_eq!(
+            (
+                contract_projection.current_checkpoint_executor,
+                contract_projection.current_checkpoint_application_handler_status,
+                contract_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(MissionCheckpointExecutor::Application),
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm00.local-operating-contract-compiled/v1"),
+            )
+        );
+
+        let contract_now = refreshed_at + Duration::seconds(5);
+        let (mut service, _) = reopened
+            .open_application_from_secret(&database_secret, contract_now)
+            .expect("mutable Application for VM-00 Operating Contract");
+        let contract_dispatch = service
+            .dispatch_current_mission_checkpoint(&project_id, &submission.mission_id, contract_now)
+            .expect("VM-00 Operating Contract dispatch");
+        let contract_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            checkpoint_id: contract_dispatch.checkpoint_id,
+            expected_mission_revision: contract_dispatch.mission_revision,
+            expected_checkpoint_revision: contract_dispatch.checkpoint_revision,
+        };
+        let compiled = service
+            .execute_application_mission_checkpoint(contract_command.clone(), contract_now)
+            .expect("compile exact VM-00 Operating Contract");
+        let ApplicationMissionCheckpointExecution::Completed {
+            replayed: false,
+            next_dispatch: Some(handoff_dispatch),
+            ..
+        } = compiled
+        else {
+            panic!("VM-00 Operating Contract must advance to Mission handoff")
+        };
+        assert_eq!(handoff_dispatch.checkpoint_id, "mission_handoff");
+        assert_eq!(
+            handoff_dispatch.executor,
+            MissionCheckpointExecutor::Application
+        );
+        assert_eq!(
+            handoff_dispatch.application_handler_status,
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+        );
+        let compiled_event_count = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("events after Operating Contract compilation")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    contract_command,
+                    contract_now + Duration::seconds(1),
+                )
+                .expect("exact Operating Contract replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("events after Operating Contract replay")
+                .len(),
+            compiled_event_count
+        );
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
+        drop(service);
+
         let service = reopened
             .open_read_application_from_secret(&database_secret)
-            .expect("encrypted Application after Connection readiness");
+            .expect("encrypted Application after Operating Contract compilation");
         let mission = service
             .load_mission(&project_id, &submission.mission_id)
             .expect("durable VM-00 Mission");
@@ -16173,9 +16312,38 @@ sleep 30"#;
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["connection_readiness", "mission_checkpoint"])
         );
+        let contract_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "operating_contract_compiled")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-00 Operating Contract completion");
+        assert!(contract_completion.effect_ids.is_empty());
+        assert!(contract_completion.work_product_ids.is_empty());
+        let contract_evidence = contract_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable Operating Contract evidence");
+        assert_eq!(
+            contract_evidence.handler_id,
+            "vm00.local-operating-contract-compiled/v1"
+        );
+        assert_eq!(
+            contract_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mission_checkpoint", "operating_contract"])
+        );
         let DesktopLoadState::Ready(snapshot) = reopened
-            .load_with(&secrets, refreshed_at + Duration::seconds(3))
-            .expect("Desktop projection after Connection readiness")
+            .load_with(&secrets, contract_now + Duration::seconds(2))
+            .expect("Desktop projection after Operating Contract compilation")
         else {
             panic!("reopened Desktop must remain initialized")
         };
@@ -16190,15 +16358,19 @@ sleep 30"#;
                     .into_iter()
                     .find(|mission| mission.mission_id == submission.mission_id)
             })
-            .expect("VM-00 projection after Connection readiness");
-        assert_eq!(projected.completed_checkpoint_count, 5);
+            .expect("VM-00 projection after Operating Contract compilation");
+        assert_eq!(projected.completed_checkpoint_count, 7);
         assert_eq!(
             projected.current_checkpoint_id.as_deref(),
-            Some("goal_selected")
+            Some("mission_handoff")
         );
         assert_eq!(
             projected.current_checkpoint_executor,
-            Some(MissionCheckpointExecutor::Human)
+            Some(MissionCheckpointExecutor::Application)
+        );
+        assert_eq!(
+            projected.current_checkpoint_application_handler_status,
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
         );
         let evidence_json =
             serde_json::to_string(encryption_evidence).expect("encryption evidence JSON");
@@ -16213,6 +16385,7 @@ sleep 30"#;
         assert!(event_json.contains("vm00.local-project-inventory/v1"));
         assert!(event_json.contains("vm00.local-encryption-workspace-ready/v1"));
         assert!(event_json.contains("vm00.local-connection-readiness/v1"));
+        assert!(event_json.contains("vm00.local-operating-contract-compiled/v1"));
         assert!(event_json.contains("vm00.billing_checkout_approval_requested"));
         assert!(event_json.contains("vm00.billing_checkout_verified"));
         assert!(!event_json.contains("acct_vm00_desktop_private"));
@@ -16220,6 +16393,7 @@ sleep 30"#;
         assert!(!event_json.contains("preview-desktop-vm00-checkout-effect"));
         assert!(!event_json.contains(device_id.as_str()));
         assert!(!event_json.contains(private_goal));
+        assert!(!event_json.contains(private_goal_confirmation));
         drop(directory);
     }
 
