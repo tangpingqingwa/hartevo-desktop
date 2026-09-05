@@ -4670,14 +4670,183 @@ fn vm00_local_operating_contract_compiled_application_evidence(
     })
 }
 
+struct PreparedVm00TargetHandoff {
+    source_conversation: MissionConversation,
+    plan: Vm00TargetMissionPlan,
+    plan_digest: String,
+    target_mission: Mission,
+    target_conversation: MissionConversation,
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "the final VM-00 proof keeps the exact compiled-contract predecessor, current route, and content-free handoff boundary visible together"
+    reason = "the handoff preparation revalidates the complete private Human proof before constructing the frozen target without consulting the live Catalog"
+)]
+fn prepare_vm00_target_handoff(
+    store: &ProjectStore,
+    source_mission: &Mission,
+    now: DateTime<Utc>,
+) -> Result<PreparedVm00TargetHandoff, ApplicationError> {
+    let source_conversation =
+        store.load_mission_conversation(&source_mission.project_id, &source_mission.id)?;
+    let definition = source_mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let goal_checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "goal_selected")
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let goal_route = goal_checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let goal_completion = goal_checkpoint
+        .completion
+        .as_ref()
+        .filter(|_| goal_checkpoint.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let mut plan_messages = source_conversation.messages.iter().filter(|message| {
+        message.role == MissionConversationRole::User
+            && message.kind == MissionConversationMessageKind::CheckpointConfirmation
+            && message.checkpoint_id.as_deref() == Some("goal_selected")
+    });
+    let plan_message = plan_messages
+        .next()
+        .cloned()
+        .ok_or(ApplicationError::StructuredVm00GoalSelectionReplayMismatch)?;
+    if plan_messages.next().is_some() {
+        return Err(ApplicationError::StructuredVm00GoalSelectionReplayMismatch);
+    }
+    let plan = serde_json::from_str::<Vm00TargetMissionPlan>(&plan_message.body)
+        .map_err(|_| ApplicationError::StructuredVm00GoalSelectionReplayMismatch)?;
+    let normalized_selection = normalize_vm00_target_selection(plan.selection.clone());
+    let expected_target_mission_id =
+        MissionId::from_stable(format!("vm00-target-mission:{}", source_mission.id));
+    let expected_target_first_task_id =
+        TaskId::from_stable(format!("vm00-target-first-task:{}", source_mission.id));
+    let expected_plan_message_sequence = plan
+        .source_conversation_revision
+        .checked_add(1)
+        .ok_or(ApplicationError::StructuredVm00GoalSelectionReplayMismatch)?;
+    let expected_goal_evidence_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-human-checkpoint-confirmation/v1",
+        "tenantId": source_mission.tenant_id,
+        "projectId": source_mission.project_id,
+        "missionId": source_mission.id,
+        "missionRevision": plan.source_mission_revision,
+        "catalogDigest": definition.catalog_digest,
+        "manifestVersion": definition.manifest_version,
+        "cycle": definition.cycle,
+        "checkpointId": goal_checkpoint.id,
+        "checkpointRevision": plan.source_checkpoint_revision,
+        "capabilityId": goal_route.capability_id,
+        "executor": goal_route.executor,
+        "completionPolicy": goal_route.completion_policy,
+        "oracleIds": goal_route.oracle_ids,
+        "conversationId": source_conversation.id,
+        "conversationRevision": plan_message.sequence,
+        "messageId": plan_message.id,
+        "messageSequence": plan_message.sequence,
+        "messageContentDigest": plan_message.content_digest,
+        "idempotencyKey": plan_message.idempotency_key,
+        "workProducts": Vec::<serde_json::Value>::new(),
+    }))?;
+    if definition.manifest_id != "VM-00"
+        || definition.manifest_version != 3
+        || plan.schema_version != Vm00TargetMissionPlan::SCHEMA_VERSION
+        || plan.source_mission_id != source_mission.id
+        || plan.source_mission_revision != plan_message.mission_revision
+        || plan.source_mission_revision >= source_mission.revision
+        || plan.source_checkpoint_revision >= goal_checkpoint.revision
+        || plan_message.sequence != expected_plan_message_sequence
+        || plan_message.sequence > source_conversation.revision
+        || plan.target_mission_id != expected_target_mission_id
+        || plan.target_first_task_id != expected_target_first_task_id
+        || plan.selection != normalized_selection
+        || !is_vm00_operating_target(&plan.selection.manifest_id)
+        || plan.target_definition.manifest_id != plan.selection.manifest_id
+        || plan.target_definition.operating_mode != plan.selection.mode
+        || plan.target_definition.catalog_digest != definition.catalog_digest
+        || plan.target_definition.capability_ids != plan.target_contract.enabled_capabilities
+        || plan.target_title.trim().is_empty()
+        || plan.target_contract.mode != plan.selection.mode
+        || plan.target_contract.goal != plan.selection.goal
+        || plan.target_contract.market != plan.selection.market
+        || plan.target_contract.language != plan.selection.language
+        || plan.target_contract.audience != plan.selection.audience
+        || plan.target_contract.timezone != plan.selection.timezone
+        || plan.target_contract.kpis != plan.selection.kpis
+        || plan.target_contract.budget != plan.selection.budget
+        || plan.target_contract.parent_mission_id.is_some()
+        || goal_completion.oracle_ids != goal_route.oracle_ids
+        || !goal_completion.work_product_ids.is_empty()
+        || !goal_completion.effect_ids.is_empty()
+        || goal_completion.application_evidence.is_some()
+        || goal_completion.evidence_digest != expected_goal_evidence_digest
+        || goal_completion.verified_at != plan_message.recorded_at
+    {
+        return Err(ApplicationError::StructuredVm00GoalSelectionReplayMismatch);
+    }
+
+    let first_checkpoint = plan
+        .target_definition
+        .checkpoints
+        .first()
+        .ok_or(ApplicationError::StructuredVm00GoalSelectionReplayMismatch)?;
+    let first_route = first_checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::StructuredVm00GoalSelectionReplayMismatch)?;
+    let mut target_mission = Mission::compile_catalog(
+        source_mission.tenant_id.clone(),
+        plan.target_mission_id.clone(),
+        source_mission.project_id.clone(),
+        plan.target_title.clone(),
+        plan.target_contract.clone(),
+        plan.target_definition.clone(),
+        now,
+    )?;
+    target_mission.start_research(
+        [Task {
+            id: plan.target_first_task_id.clone(),
+            title: format!("Checkpoint: {}", first_checkpoint.id),
+            status: TaskStatus::Running,
+            capability: first_route.capability_id.clone(),
+        }],
+        now,
+    )?;
+    let target_conversation = MissionConversation::start(
+        MissionConversationId::from_stable(format!("mission-conversation:{}", target_mission.id)),
+        MissionConversationMessageId::from_stable(format!(
+            "mission-message:goal:{}",
+            target_mission.id
+        )),
+        &target_mission,
+        target_mission.contract.goal.clone(),
+        format!("mission-start:{}", target_mission.id),
+        now,
+    )?;
+    let plan_digest = canonical_sha256(&serde_json::to_value(&plan)?)?;
+    Ok(PreparedVm00TargetHandoff {
+        source_conversation,
+        plan,
+        plan_digest,
+        target_mission,
+        target_conversation,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the final VM-00 proof keeps the compiled predecessor, frozen private plan, created target, and content-free handoff boundary visible together"
 )]
 fn vm00_local_mission_handoff_application_evidence(
     mission: &Mission,
     route: &MissionCheckpointRoute,
     command: &ExecuteApplicationMissionCheckpoint,
+    prepared: &PreparedVm00TargetHandoff,
     now: DateTime<Utc>,
 ) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
     let definition = mission
@@ -4751,6 +4920,45 @@ fn vm00_local_mission_handoff_application_evidence(
         || compiled_completion.verified_at < mission.contract.valid_from
         || compiled_completion.verified_at >= mission.contract.valid_until
         || compiled_completion.verified_at > now
+        || prepared.plan.source_mission_id != mission.id
+        || prepared.target_mission.id != prepared.plan.target_mission_id
+        || prepared.target_mission.tenant_id != mission.tenant_id
+        || prepared.target_mission.project_id != mission.project_id
+        || prepared.target_mission.title != prepared.plan.target_title
+        || prepared.target_mission.contract != prepared.plan.target_contract
+        || prepared
+            .target_mission
+            .definition
+            .as_ref()
+            .is_none_or(|target_definition| {
+                target_definition.manifest_id != prepared.plan.target_definition.manifest_id
+                    || target_definition.manifest_version
+                        != prepared.plan.target_definition.manifest_version
+                    || target_definition.catalog_digest
+                        != prepared.plan.target_definition.catalog_digest
+                    || target_definition.operating_mode
+                        != prepared.plan.target_definition.operating_mode
+                    || target_definition.capability_ids
+                        != prepared.plan.target_definition.capability_ids
+                    || target_definition.required_artifact_types
+                        != prepared.plan.target_definition.required_artifact_types
+                    || target_definition.oracle_ids != prepared.plan.target_definition.oracle_ids
+                    || target_definition.cycle != prepared.plan.target_definition.cycle
+                    || target_definition.checkpoints.len()
+                        != prepared.plan.target_definition.checkpoints.len()
+                    || target_definition
+                        .checkpoints
+                        .iter()
+                        .zip(prepared.plan.target_definition.checkpoints.iter())
+                        .any(|(target_checkpoint, planned_checkpoint)| {
+                            target_checkpoint.id != planned_checkpoint.id
+                                || target_checkpoint.depends_on != planned_checkpoint.depends_on
+                                || target_checkpoint.route != planned_checkpoint.route
+                        })
+            })
+        || prepared.target_mission.revision != 2
+        || prepared.target_mission.stage != MissionStage::Running
+        || prepared.target_conversation.mission_id != prepared.target_mission.id
     {
         return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
     }
@@ -4775,15 +4983,23 @@ fn vm00_local_mission_handoff_application_evidence(
         "completionPolicy": route.completion_policy,
     }))?;
     let contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
-    // The durable handoff is deliberately content-free. It proves that the
-    // current contract is the one compiled by the immediately preceding
-    // checkpoint, but it neither chooses another Mission nor grants terminal
-    // transition, Runtime, or Provider authority.
+    let target_contract_digest =
+        canonical_sha256(&serde_json::to_value(&prepared.target_mission.contract)?)?;
+    let target_definition_digest = canonical_sha256(&serde_json::to_value(
+        prepared
+            .target_mission
+            .definition
+            .as_ref()
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+    )?)?;
+    // The public proof exposes only stable identifiers and canonical digests.
+    // Private target content remains in the two encrypted Conversations, and
+    // target creation still grants neither Runtime nor Provider authority.
     let handoff_digest = canonical_sha256(&serde_json::json!({
-        "schemaVersion": "hartevo-vm00-mission-handoff/v1",
+        "schemaVersion": "hartevo-vm00-mission-handoff/v2",
         "tenantId": mission.tenant_id,
         "projectId": mission.project_id,
-        "missionId": mission.id,
+        "sourceMissionId": mission.id,
         "manifestId": definition.manifest_id,
         "manifestVersion": definition.manifest_version,
         "catalogDigest": definition.catalog_digest,
@@ -4793,8 +5009,17 @@ fn vm00_local_mission_handoff_application_evidence(
         "compiledCheckpointRevision": compiled_checkpoint.revision,
         "compiledCompletionDigest": compiled_completion.evidence_digest,
         "compiledVerifiedAt": compiled_completion.verified_at,
+        "sourceConversationRevision": prepared.source_conversation.revision,
+        "targetPlanDigest": prepared.plan_digest,
+        "targetMissionId": prepared.target_mission.id,
+        "targetMissionRevision": prepared.target_mission.revision,
+        "targetConversationId": prepared.target_conversation.id,
+        "targetContractDigest": target_contract_digest,
+        "targetDefinitionDigest": target_definition_digest,
         "terminalTransitionId": "vm00.mission_handoff.to.valid-terminal/v2",
         "terminalExecutionAuthority": "denied",
+        "runtimeExecutionAuthority": "denied",
+        "providerExecutionAuthority": "denied",
         "missionRevision": command.expected_mission_revision,
         "observedAt": now,
     }))?;
@@ -4828,8 +5053,8 @@ fn vm00_local_mission_handoff_application_evidence(
             },
             MissionCheckpointOracleSource {
                 source_kind: "mission_handoff".into(),
-                source_id: mission.id.to_string(),
-                source_revision: command.expected_mission_revision,
+                source_id: prepared.target_mission.id.to_string(),
+                source_revision: prepared.target_mission.revision,
                 projection_digest: handoff_digest,
                 oracle_ids: BTreeSet::from(["goal".into()]),
             },
@@ -4896,6 +5121,185 @@ fn persist_vm00_source_block(
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the VM-00 handoff keeps private-plan validation, target construction, source completion, both content-free event sets, and one atomic store call visible together"
+)]
+fn execute_vm00_local_mission_handoff(
+    store: &mut ProjectStore,
+    mut source_mission: Mission,
+    command: ExecuteApplicationMissionCheckpoint,
+    dispatch: &MissionCheckpointDispatch,
+    now: DateTime<Utc>,
+) -> Result<ApplicationMissionCheckpointExecution, ApplicationError> {
+    let expected_source_mission_revision = source_mission.revision;
+    let prepared = prepare_vm00_target_handoff(store, &source_mission, now)?;
+    let expected_source_conversation_revision = prepared.source_conversation.revision;
+    if source_mission.stage == MissionStage::Blocked {
+        source_mission.resume(now)?;
+    }
+    source_mission.begin_checkpoint_verification(&command.checkpoint_id, now)?;
+    let route = source_mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        })
+        .and_then(|checkpoint| checkpoint.route.clone())
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let application_evidence = vm00_local_mission_handoff_application_evidence(
+        &source_mission,
+        &route,
+        &command,
+        &prepared,
+        now,
+    )?;
+    validate_application_evidence_against_registry(&application_evidence)?;
+    let evidence_digest = application_evidence.digest();
+    source_mission.complete_checkpoint(
+        &command.checkpoint_id,
+        MissionCheckpointCompletion {
+            oracle_ids: route.oracle_ids.clone(),
+            work_product_ids: BTreeSet::new(),
+            effect_ids: BTreeSet::new(),
+            application_evidence: Some(application_evidence),
+            evidence_digest: evidence_digest.clone(),
+            verified_at: now,
+        },
+    )?;
+    let completed_checkpoint_revision = source_mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        })
+        .map(|checkpoint| checkpoint.revision)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if start_ready_catalog_checkpoint_in_memory(&mut source_mission, now)?.is_some()
+        || current_checkpoint_dispatch_projection(&source_mission)?.is_some()
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+
+    let target_definition = prepared
+        .target_mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let target_checkpoint = target_definition
+        .current_checkpoint()
+        .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Running)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let target_route = target_checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let target_initial_message = prepared
+        .target_conversation
+        .messages
+        .first()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let target_contract_digest =
+        canonical_sha256(&serde_json::to_value(&prepared.target_mission.contract)?)?;
+    let source_events = vec![
+        PendingEvent::new(
+            "mission.application_checkpoint_completed",
+            serde_json::json!({
+                "missionId": source_mission.id,
+                "checkpointId": command.checkpoint_id,
+                "checkpointRevision": completed_checkpoint_revision,
+                "capabilityId": dispatch.capability_id,
+                "handlerId": VM00_LOCAL_MISSION_HANDOFF_HANDLER_ID,
+                "oracleIds": dispatch.oracle_ids,
+                "sourceKind": "mission_handoff",
+                "sourceRevision": prepared.target_mission.revision,
+                "sourceFenceCount": 2,
+                "evidenceDigest": evidence_digest,
+            }),
+            now,
+        ),
+        PendingEvent::new(
+            "mission.vm00_target_handed_off",
+            serde_json::json!({
+                "sourceMissionId": source_mission.id,
+                "targetMissionId": prepared.target_mission.id,
+                "targetMissionRevision": prepared.target_mission.revision,
+                "targetManifestId": target_definition.manifest_id,
+                "targetManifestVersion": target_definition.manifest_version,
+                "targetPlanDigest": prepared.plan_digest,
+                "targetContractDigest": target_contract_digest,
+                "sourceConversationRevision": prepared.source_conversation.revision,
+                "runtimeStarted": false,
+                "providerCalled": false,
+            }),
+            now,
+        ),
+    ];
+    let target_events = vec![
+        PendingEvent::new(
+            "mission.catalog_bound",
+            serde_json::json!({
+                "manifestId": target_definition.manifest_id,
+                "manifestVersion": target_definition.manifest_version,
+                "catalogDigest": target_definition.catalog_digest,
+                "contractDigest": target_contract_digest,
+                "mode": prepared.target_mission.contract.mode,
+                "sourceMissionId": source_mission.id,
+                "sourcePlanDigest": prepared.plan_digest,
+            }),
+            now,
+        ),
+        PendingEvent::new(
+            "mission.checkpoint_started",
+            serde_json::json!({
+                "checkpointId": target_checkpoint.id,
+                "cycle": target_definition.cycle,
+                "checkpointRevision": target_checkpoint.revision,
+                "capabilityId": target_route.capability_id,
+                "executor": target_route.executor,
+                "taskId": prepared.plan.target_first_task_id,
+            }),
+            now,
+        ),
+        PendingEvent::new(
+            "mission.conversation_started",
+            serde_json::json!({
+                "conversationId": prepared.target_conversation.id,
+                "messageId": target_initial_message.id,
+                "sequence": target_initial_message.sequence,
+                "contentDigest": target_initial_message.content_digest,
+                "missionRevision": target_initial_message.mission_revision,
+                "checkpointId": target_initial_message.checkpoint_id,
+                "sourceMissionId": source_mission.id,
+            }),
+            now,
+        ),
+    ];
+    store.complete_vm00_handoff_with_target_atomic(
+        &source_mission,
+        expected_source_mission_revision,
+        &prepared.source_conversation,
+        expected_source_conversation_revision,
+        &prepared.target_mission,
+        &prepared.target_conversation,
+        &source_events,
+        &target_events,
+    )?;
+    Ok(ApplicationMissionCheckpointExecution::Completed {
+        completed_checkpoint_id: command.checkpoint_id,
+        completion_evidence_digest: evidence_digest,
+        outcome_ledger_revision: prepared.target_mission.revision,
+        replayed: false,
+        next_dispatch: None,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "the shared VM-00 Project transaction keeps evidence, completion, next-route start, source fence, and events in one atomic boundary"
 )]
 fn execute_vm00_local_project_checkpoint(
@@ -4936,6 +5340,9 @@ fn execute_vm00_local_project_checkpoint(
             }
             Err(error) => return Err(MissionError::from(error).into()),
         }
+    }
+    if handler == CompiledApplicationCheckpointHandler::LocalMissionHandoff {
+        return execute_vm00_local_mission_handoff(store, mission, command, dispatch, now);
     }
     if mission.stage == MissionStage::Blocked {
         mission.resume(now)?;
@@ -5145,17 +5552,7 @@ fn execute_vm00_local_project_checkpoint(
             )
         }
         CompiledApplicationCheckpointHandler::LocalMissionHandoff => {
-            let evidence =
-                vm00_local_mission_handoff_application_evidence(&mission, &route, &command, now)?;
-            (
-                evidence,
-                expected_mission_revision,
-                vec![ApplicationSourceRevisionFence::present(
-                    ApplicationSourceKind::Mission,
-                    mission.id.to_string(),
-                    expected_mission_revision,
-                )],
-            )
+            unreachable!("VM-00 Mission handoff returns through its target-creation transaction")
         }
         _ => return Err(ApplicationError::ApplicationCheckpointCommandMismatch),
     };

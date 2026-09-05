@@ -56,6 +56,141 @@ impl ProjectStore {
         })
     }
 
+    /// Completes VM-00's source handoff and creates the frozen target Catalog
+    /// Mission as one transaction. The source Conversation is read-fenced but
+    /// not changed: it already owns the private target plan being consumed.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the atomic boundary keeps both aggregates, both event sets, the exact source fences, and one SQL transaction visible together"
+    )]
+    pub fn complete_vm00_handoff_with_target_atomic(
+        &mut self,
+        source_mission: &Mission,
+        expected_source_mission_revision: u64,
+        source_conversation: &MissionConversation,
+        expected_source_conversation_revision: u64,
+        target_mission: &Mission,
+        target_conversation: &MissionConversation,
+        source_events: &[PendingEvent],
+        target_events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        if source_mission.revision <= expected_source_mission_revision {
+            return Err(StorageError::UnexpectedNewerRevision {
+                expected_revision: expected_source_mission_revision,
+                actual: source_mission.revision,
+            });
+        }
+        if source_events.is_empty()
+            || target_events.is_empty()
+            || source_conversation.revision != expected_source_conversation_revision
+            || target_mission.revision != 2
+            || target_mission.definition.is_none()
+            || target_conversation.revision != 1
+            || target_conversation.messages.len() != 1
+        {
+            return Err(StorageError::EmptyAtomicEventSet);
+        }
+        if source_mission.tenant_id != target_mission.tenant_id
+            || source_mission.project_id != target_mission.project_id
+            || source_mission.id == target_mission.id
+            || source_conversation.tenant_id != source_mission.tenant_id
+            || source_conversation.project_id != source_mission.project_id
+            || source_conversation.mission_id != source_mission.id
+        {
+            return Err(StorageError::TenantScopeMismatch);
+        }
+        source_conversation.validate_for(source_mission, source_mission.updated_at)?;
+        target_conversation.validate_for(target_mission, target_mission.updated_at)?;
+
+        let transaction = self.connection.transaction()?;
+        ensure_project_scope(
+            &transaction,
+            source_mission.tenant_id.as_str(),
+            source_mission.project_id.as_str(),
+        )?;
+        let stored_source_conversation = transaction
+            .query_row(
+                "SELECT tenant_id, revision FROM mission_conversations
+                 WHERE project_id = ?1 AND mission_id = ?2 AND id = ?3",
+                params![
+                    source_mission.project_id.as_str(),
+                    source_mission.id.as_str(),
+                    source_conversation.id.as_str(),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if stored_source_conversation
+            .as_ref()
+            .is_some_and(|(tenant_id, _)| tenant_id != source_mission.tenant_id.as_str())
+        {
+            return Err(StorageError::TenantScopeMismatch);
+        }
+        let expected_source_conversation_revision_sql =
+            to_sql_u64(expected_source_conversation_revision)?;
+        if stored_source_conversation
+            .as_ref()
+            .map(|(_, revision)| *revision)
+            != Some(expected_source_conversation_revision_sql)
+        {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: format!("mission_conversation:{}", source_conversation.id),
+                expected_revision: expected_source_conversation_revision,
+            });
+        }
+        let target_revision = transaction
+            .query_row(
+                "SELECT revision FROM missions WHERE project_id = ?1 AND id = ?2",
+                params![
+                    target_mission.project_id.as_str(),
+                    target_mission.id.as_str()
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if target_revision.is_some() {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: format!("mission_target:{}", target_mission.id),
+                expected_revision: 0,
+            });
+        }
+
+        update_mission_normalized_cas(
+            &transaction,
+            source_mission,
+            expected_source_mission_revision,
+        )?;
+        insert_mission_normalized(&transaction, target_mission)?;
+        insert_mission_conversation(&transaction, target_conversation)?;
+        let (mut event_sequences, mut outbox_sequences) = append_events(
+            &transaction,
+            source_mission.tenant_id.as_str(),
+            source_mission.project_id.as_str(),
+            Some(source_mission.id.as_str()),
+            "mission",
+            source_mission.id.as_str(),
+            source_events,
+        )?;
+        let (target_event_sequences, target_outbox_sequences) = append_events(
+            &transaction,
+            target_mission.tenant_id.as_str(),
+            target_mission.project_id.as_str(),
+            Some(target_mission.id.as_str()),
+            "mission_conversation",
+            target_conversation.id.as_str(),
+            target_events,
+        )?;
+        event_sequences.extend(target_event_sequences);
+        outbox_sequences.extend(target_outbox_sequences);
+        transaction.commit()?;
+        Ok(AtomicMutation {
+            event_sequences,
+            outbox_sequences,
+            state_revision: source_mission.revision,
+        })
+    }
+
     pub fn load_mission_conversation(
         &self,
         project_id: &ProjectId,
@@ -701,6 +836,61 @@ mod tests {
         (project, mission, conversation)
     }
 
+    fn target_fixture(project: &Project) -> (Mission, MissionConversation) {
+        let mut contract = OperatingContract::bootstrap(
+            "private frozen target goal",
+            ["research.discover".into()],
+            now() + Duration::minutes(2),
+        );
+        contract.mode = OperatingMode::OneOffDecision;
+        contract.market = "US".into();
+        contract.language = "en-US".into();
+        contract.audience = "owner".into();
+        contract.budget = Money::new(0, CurrencyCode::parse("USD").expect("USD"));
+        let definition = MissionDefinition::from_linear_manifest(
+            "VM-04",
+            1,
+            "d".repeat(64),
+            OperatingMode::OneOffDecision,
+            ["research.discover".into()],
+            ["target_output".into()],
+            ["goal".into(), "work_product".into()],
+            ["target_scope".into()],
+        )
+        .expect("target definition");
+        let mut mission = Mission::compile_catalog(
+            project.tenant_id.clone(),
+            MissionId::from("mission-target-handoff"),
+            project.id.clone(),
+            "Frozen target",
+            contract,
+            definition,
+            now() + Duration::minutes(2),
+        )
+        .expect("target Mission");
+        mission
+            .start_research(
+                [Task {
+                    id: TaskId::from("task-target-handoff"),
+                    title: "Target scope".into(),
+                    status: TaskStatus::Running,
+                    capability: "research.discover".into(),
+                }],
+                now() + Duration::minutes(2),
+            )
+            .expect("start target");
+        let conversation = MissionConversation::start(
+            MissionConversationId::from("conversation-target-handoff"),
+            MissionConversationMessageId::from("message-target-goal"),
+            &mission,
+            mission.contract.goal.clone(),
+            "start:mission-target-handoff",
+            now() + Duration::minutes(2),
+        )
+        .expect("target Conversation");
+        (mission, conversation)
+    }
+
     #[test]
     fn conversation_and_catalog_mission_commit_atomically_and_tamper_fails_closed() {
         let mut store = ProjectStore::in_memory().expect("store");
@@ -936,6 +1126,186 @@ mod tests {
         )
         .expect("events JSON");
         assert!(!events_json.contains("The exact market constraints are correct."));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the VM-00 handoff test proves rollback, exact source fencing, target creation, content-free events, and collision safety across both aggregates"
+    )]
+    fn vm00_handoff_rolls_back_then_creates_target_once_as_one_transaction() {
+        let mut store = ProjectStore::in_memory().expect("store");
+        let (project, mut source_mission, source_conversation) = fixture();
+        let (target_mission, target_conversation) = target_fixture(&project);
+        store.save_project(&project).expect("project");
+        store
+            .create_catalog_mission_with_conversation_atomic(
+                &source_mission,
+                &source_conversation,
+                &[PendingEvent::new(
+                    "mission.catalog_bound",
+                    serde_json::json!({"missionId": source_mission.id}),
+                    now(),
+                )],
+            )
+            .expect("source create");
+
+        let source_before = source_mission.clone();
+        let source_events_before = store
+            .events_for_mission(&project.id, &source_mission.id)
+            .expect("source events before");
+        let expected_source_mission_revision = source_mission.revision;
+        let expected_source_conversation_revision = source_conversation.revision;
+        let checkpoint = source_mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("source checkpoint")
+            .clone();
+        let completed_at = now() + Duration::minutes(3);
+        source_mission
+            .begin_checkpoint_verification(&checkpoint.id, completed_at)
+            .expect("begin source verification");
+        source_mission
+            .complete_checkpoint(
+                &checkpoint.id,
+                MissionCheckpointCompletion {
+                    oracle_ids: BTreeSet::from(["goal".into()]),
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: "e".repeat(64),
+                    verified_at: completed_at,
+                },
+            )
+            .expect("complete source checkpoint");
+        let source_events = [PendingEvent::new(
+            "mission.vm00_target_handed_off",
+            serde_json::json!({
+                "sourceMissionId": source_mission.id,
+                "targetMissionId": target_mission.id,
+            }),
+            completed_at,
+        )];
+        let target_events = [PendingEvent::new(
+            "mission.conversation_started",
+            serde_json::json!({
+                "conversationId": target_conversation.id,
+                "messageId": target_conversation.messages[0].id,
+                "contentDigest": target_conversation.messages[0].content_digest,
+            }),
+            completed_at,
+        )];
+
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_vm00_target_message
+                 BEFORE INSERT ON mission_conversation_messages
+                 WHEN NEW.mission_id = 'mission-target-handoff'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected target Conversation failure');
+                 END;",
+            )
+            .expect("failure trigger");
+        assert!(matches!(
+            store.complete_vm00_handoff_with_target_atomic(
+                &source_mission,
+                expected_source_mission_revision,
+                &source_conversation,
+                expected_source_conversation_revision,
+                &target_mission,
+                &target_conversation,
+                &source_events,
+                &target_events,
+            ),
+            Err(StorageError::Sql(_))
+        ));
+        assert_eq!(
+            store
+                .load_mission(&project.id, &source_mission.id)
+                .expect("rolled-back source"),
+            source_before
+        );
+        assert!(store.load_mission(&project.id, &target_mission.id).is_err());
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &source_mission.id)
+                .expect("rolled-back source events"),
+            source_events_before
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_vm00_target_message;")
+            .expect("drop trigger");
+        store
+            .complete_vm00_handoff_with_target_atomic(
+                &source_mission,
+                expected_source_mission_revision,
+                &source_conversation,
+                expected_source_conversation_revision,
+                &target_mission,
+                &target_conversation,
+                &source_events,
+                &target_events,
+            )
+            .expect("atomic handoff");
+        assert_eq!(
+            store
+                .load_mission(&project.id, &source_mission.id)
+                .expect("committed source"),
+            source_mission
+        );
+        assert_eq!(
+            store
+                .load_mission(&project.id, &target_mission.id)
+                .expect("committed target"),
+            target_mission
+        );
+        assert_eq!(
+            store
+                .load_mission_conversation(&project.id, &target_mission.id)
+                .expect("committed target Conversation"),
+            target_conversation
+        );
+        let committed_source_events = store
+            .events_for_mission(&project.id, &source_mission.id)
+            .expect("committed source events");
+        let committed_target_events = store
+            .events_for_mission(&project.id, &target_mission.id)
+            .expect("committed target events");
+        let target_events_json =
+            serde_json::to_string(&committed_target_events).expect("target events JSON");
+        assert!(!target_events_json.contains("private frozen target goal"));
+
+        assert!(matches!(
+            store.complete_vm00_handoff_with_target_atomic(
+                &source_mission,
+                expected_source_mission_revision,
+                &source_conversation,
+                expected_source_conversation_revision,
+                &target_mission,
+                &target_conversation,
+                &source_events,
+                &target_events,
+            ),
+            Err(StorageError::OptimisticConflict {
+                aggregate,
+                expected_revision: 0,
+            }) if aggregate == format!("mission_target:{}", target_mission.id)
+        ));
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &source_mission.id)
+                .expect("source events after collision"),
+            committed_source_events
+        );
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &target_mission.id)
+                .expect("target events after collision"),
+            committed_target_events
+        );
     }
 
     #[test]
