@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-09-05-v11",
+  "registryVersion": "desktop-2026-09-05-v12",
   "handlers": [
     {
       "handlerId": "vm00.local-project-identity/v1",
@@ -44,6 +44,21 @@
       "sourceOracleBindings": {
         "mission_checkpoint": ["operating_state"],
         "project_keyring": ["truth"]
+      },
+      "oracleIds": ["truth", "operating_state"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm00.local-connection-readiness/v1",
+      "missionId": "VM-00",
+      "missionVersion": 3,
+      "checkpointId": "connection_probe",
+      "capabilityId": "connection.probe",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "connection_readiness"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "connection_readiness": ["truth"]
       },
       "oracleIds": ["truth", "operating_state"],
       "implementationCrate": "hartevo-application"

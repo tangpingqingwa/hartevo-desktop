@@ -15794,8 +15794,8 @@ sleep 30"#;
                     effect_id: checkout_effect_id.clone(),
                     actor_id: ActorId::from("desktop-vm00-checkout-actor"),
                     provider: "stripe".into(),
-                    connection_id: checkout_connection_id,
-                    account_id: checkout_account_id,
+                    connection_id: checkout_connection_id.clone(),
+                    account_id: checkout_account_id.clone(),
                     checkout_digest: "a".repeat(64),
                     amount: Money::new(2_000, CurrencyCode::parse("USD").expect("USD")),
                     idempotency_key: "desktop-vm00-checkout-1".into(),
@@ -15909,9 +15909,141 @@ sleep 30"#;
         let data_root = plane.data_root.clone();
         drop(plane);
         let reopened = DesktopDataPlane::at_data_root(data_root).expect("cold reopened plane");
+        let expired_at = checkout_now + Duration::days(31);
+        let (mut service, _runtime_reconciliation) = reopened
+            .open_application_from_secret(&database_secret, expired_at)
+            .expect("mutable encrypted Application after reopen");
+        let expired_dispatch = service
+            .dispatch_current_mission_checkpoint(&project_id, &submission.mission_id, expired_at)
+            .expect("expired VM-00 Connection dispatch");
+        assert_eq!(expired_dispatch.checkpoint_id, "connection_probe");
+        assert_eq!(
+            (
+                expired_dispatch.application_handler_status,
+                expired_dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm00.local-connection-readiness/v1"),
+            )
+        );
+        let expired_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            checkpoint_id: expired_dispatch.checkpoint_id,
+            expected_mission_revision: expired_dispatch.mission_revision,
+            expected_checkpoint_revision: expired_dispatch.checkpoint_revision,
+        };
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(expired_command.clone(), expired_at)
+                .expect("expired checkout Connection blocks recoverably"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                code,
+                replayed: false,
+                ..
+            } if code == "checkout_connection_not_live"
+        ));
+        let blocked_event_count = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("events after expired Connection block")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    expired_command,
+                    expired_at + Duration::seconds(1),
+                )
+                .expect("exact expired Connection block replay"),
+            ApplicationMissionCheckpointExecution::Blocked { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("events after blocked replay")
+                .len(),
+            blocked_event_count
+        );
+
+        let refreshed_at = expired_at + Duration::minutes(1);
+        service
+            .record_connection_probe(
+                &project_id,
+                &checkout_connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "acct_vm00_desktop_private".into(),
+                    granted_scopes: BTreeSet::from([VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()]),
+                    probed_at: refreshed_at,
+                    valid_until: refreshed_at + Duration::days(30),
+                    credential_expires_at: refreshed_at + Duration::days(30),
+                    evidence_digest: "7".repeat(64),
+                },
+                refreshed_at,
+            )
+            .expect("refresh exact checkout Connection probe");
+        let recovered_dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &submission.mission_id,
+                refreshed_at + Duration::seconds(1),
+            )
+            .expect("recovered VM-00 Connection dispatch");
+        let recovered_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            checkpoint_id: recovered_dispatch.checkpoint_id,
+            expected_mission_revision: recovered_dispatch.mission_revision,
+            expected_checkpoint_revision: recovered_dispatch.checkpoint_revision,
+        };
+        let recovered = service
+            .execute_application_mission_checkpoint(
+                recovered_command.clone(),
+                refreshed_at + Duration::seconds(1),
+            )
+            .expect("complete refreshed VM-00 Connection readiness");
+        let ApplicationMissionCheckpointExecution::Completed {
+            replayed: false,
+            next_dispatch: Some(goal_dispatch),
+            ..
+        } = recovered
+        else {
+            panic!("VM-00 Connection readiness must advance to goal selection")
+        };
+        assert_eq!(goal_dispatch.checkpoint_id, "goal_selected");
+        assert_eq!(goal_dispatch.executor, MissionCheckpointExecutor::Human);
+        assert_eq!(
+            goal_dispatch.completion_policy,
+            MissionCheckpointCompletionPolicy::HumanConfirmation
+        );
+        assert_eq!(goal_dispatch.state, MissionCheckpointDispatchState::Ready);
+        let completed_event_count = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("events after Connection readiness")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    recovered_command,
+                    refreshed_at + Duration::seconds(2),
+                )
+                .expect("exact Connection readiness replay"),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("events after Connection readiness replay")
+                .len(),
+            completed_event_count
+        );
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
+        drop(service);
+
         let service = reopened
             .open_read_application_from_secret(&database_secret)
-            .expect("encrypted Application after reopen");
+            .expect("encrypted Application after Connection readiness");
         let mission = service
             .load_mission(&project_id, &submission.mission_id)
             .expect("durable VM-00 Mission");
@@ -16013,6 +16145,61 @@ sleep 30"#;
             checkout_completion.oracle_ids,
             BTreeSet::from(["effect".into(), "operating_state".into(),])
         );
+        let connection_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "connection_probe")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-00 Connection readiness completion");
+        assert!(connection_completion.effect_ids.is_empty());
+        let connection_evidence = connection_completion
+            .application_evidence
+            .as_ref()
+            .expect("durable Connection readiness evidence");
+        assert_eq!(
+            connection_evidence.handler_id,
+            "vm00.local-connection-readiness/v1"
+        );
+        assert_eq!(
+            connection_evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["connection_readiness", "mission_checkpoint"])
+        );
+        let DesktopLoadState::Ready(snapshot) = reopened
+            .load_with(&secrets, refreshed_at + Duration::seconds(3))
+            .expect("Desktop projection after Connection readiness")
+        else {
+            panic!("reopened Desktop must remain initialized")
+        };
+        let projected = snapshot
+            .inventory
+            .projects
+            .into_iter()
+            .find(|project| project.project_id == project_id)
+            .and_then(|project| {
+                project
+                    .missions
+                    .into_iter()
+                    .find(|mission| mission.mission_id == submission.mission_id)
+            })
+            .expect("VM-00 projection after Connection readiness");
+        assert_eq!(projected.completed_checkpoint_count, 5);
+        assert_eq!(
+            projected.current_checkpoint_id.as_deref(),
+            Some("goal_selected")
+        );
+        assert_eq!(
+            projected.current_checkpoint_executor,
+            Some(MissionCheckpointExecutor::Human)
+        );
         let evidence_json =
             serde_json::to_string(encryption_evidence).expect("encryption evidence JSON");
         assert!(!evidence_json.contains(device_id.as_str()));
@@ -16025,9 +16212,11 @@ sleep 30"#;
         assert!(event_json.contains("vm00.local-project-identity/v1"));
         assert!(event_json.contains("vm00.local-project-inventory/v1"));
         assert!(event_json.contains("vm00.local-encryption-workspace-ready/v1"));
+        assert!(event_json.contains("vm00.local-connection-readiness/v1"));
         assert!(event_json.contains("vm00.billing_checkout_approval_requested"));
         assert!(event_json.contains("vm00.billing_checkout_verified"));
         assert!(!event_json.contains("acct_vm00_desktop_private"));
+        assert!(!event_json.contains(&"7".repeat(64)));
         assert!(!event_json.contains("preview-desktop-vm00-checkout-effect"));
         assert!(!event_json.contains(device_id.as_str()));
         assert!(!event_json.contains(private_goal));
