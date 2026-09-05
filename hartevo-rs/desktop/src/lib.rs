@@ -641,6 +641,10 @@ impl UiFailure {
                 "WAITING_USER",
                 "Human Checkpoint 确认必须绑定当前 Mission/Checkpoint revision、持久 Conversation、非空确认和稳定幂等键；未写入部分状态。",
             ),
+            DesktopDataError::InvalidVm00GoalSelection => Self::coded(
+                "WAITING_USER",
+                "VM-00 目标必须是同一项目内明确的 VM-01～VM-10 合同；未创建目标 Mission，也未运行 Runtime。",
+            ),
             DesktopDataError::InvalidVm11OutcomeDecision
             | DesktopDataError::InvalidVm11NextContractResolution
             | DesktopDataError::InvalidEffectProposal
@@ -752,6 +756,13 @@ impl UiFailure {
                 "此前认领的本机 Runtime 进程无法被精确检查或终止。Hartevo 不会按 PID 猜测清理，也不会启动第二个 Runtime；请保留现场并进入支持恢复流程。",
             ),
             DesktopDataError::Application(
+                ApplicationError::StructuredVm00GoalSelectionRequired
+                | ApplicationError::StructuredVm00GoalSelectionCommandMismatch,
+            ) => Self::coded(
+                "WAITING_USER",
+                "VM-00 目标选择不接受自由文本；请提交明确的 Catalog Mission 合同。",
+            ),
+            DesktopDataError::Application(
                 ApplicationError::StructuredOutcomeDecisionRequired
                 | ApplicationError::StructuredOutcomeDecisionCommandMismatch
                 | ApplicationError::Vm11NextContractRouteSpecificCommandRequired,
@@ -760,7 +771,9 @@ impl UiFailure {
                 "该 VM-11 Checkpoint 不接受自由文本或通用 Application 完成入口；请使用窗口中的 Continue/Stop/Scale/Test 动作。",
             ),
             DesktopDataError::Application(
-                ApplicationError::StructuredOutcomeDecisionUnavailable
+                ApplicationError::StructuredVm00GoalSelectionUnavailable
+                | ApplicationError::StructuredVm00GoalSelectionReplayMismatch
+                | ApplicationError::StructuredOutcomeDecisionUnavailable
                 | ApplicationError::StructuredOutcomeDecisionReviewMismatch
                 | ApplicationError::StructuredOutcomeDecisionReplayMismatch
                 | ApplicationError::Vm11NextContractCommandMismatch
