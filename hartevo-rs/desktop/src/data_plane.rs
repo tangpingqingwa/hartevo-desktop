@@ -15750,7 +15750,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, two painted Cordis Runtime turns around the source-fenced account probe, SQLCipher recovery, and content-free evidence"
+        reason = "one Desktop Journey proves the VM-00 foundations, frozen VM-04 handoff, three painted Cordis Runtime turns around the source-fenced account probe, exact Human approval, SQLCipher recovery, and content-free evidence"
     )]
     fn vm00_handoff_redirects_frozen_target_into_painted_runtime_resume_after_encrypted_reopen() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -17137,14 +17137,14 @@ sleep 30"#;
 
             let cold_after_pillar = DesktopDataPlane::at_data_root(reopened.data_root.clone())
                 .expect("cold Desktop after pillar Runtime");
-            let (final_service, _) = cold_after_pillar
+            let (pillar_service, _) = cold_after_pillar
                 .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(13))
                 .expect("cold Application after pillar Runtime");
-            let final_target = final_service
+            let pillar_target = pillar_service
                 .load_mission(&project_id, &target_plan.target_mission_id)
                 .expect("durable VM-04 after pillar Runtime");
             assert_eq!(
-                final_target.definition.as_ref().map_or(0, |definition| {
+                pillar_target.definition.as_ref().map_or(0, |definition| {
                     definition
                         .checkpoints
                         .iter()
@@ -17156,12 +17156,20 @@ sleep 30"#;
                 }),
                 2
             );
-            assert!(final_target.work_products.iter().any(|work_product| {
-                work_product.id == second_work_product_id
-                    && work_product.status
-                        == hartevo_domain_kernel::WorkProductStatus::ReadyForReview
-            }));
-            let account_scope_evidence = final_target
+            let second_work_product = pillar_target
+                .work_products
+                .iter()
+                .find(|work_product| work_product.id == second_work_product_id)
+                .cloned()
+                .expect("durable pillar Runtime WorkProduct");
+            assert_eq!(
+                second_work_product.status,
+                hartevo_domain_kernel::WorkProductStatus::ReadyForReview
+            );
+            let second_manifest = pillar_service
+                .load_work_product_manifest(&project_id, &second_work_product_id)
+                .expect("pillar Runtime manifest");
+            let account_scope_evidence = pillar_target
                 .definition
                 .as_ref()
                 .and_then(|definition| {
@@ -17177,26 +17185,246 @@ sleep 30"#;
                 account_scope_evidence.handler_id,
                 "vm04.account-scope-probe/v1"
             );
-            let final_conversation = final_service
+            let pillar_conversation = pillar_service
                 .mission_conversation(&project_id, &target_plan.target_mission_id)
                 .expect("durable VM-04 Conversation after pillar Runtime");
-            assert_eq!(final_conversation.revision, 4);
+            assert_eq!(pillar_conversation.revision, 4);
             assert_eq!(
-                final_conversation.messages[2].kind,
+                pillar_conversation.messages[2].kind,
                 MissionConversationMessageKind::Steering
             );
-            let final_event_json = serde_json::to_string(
-                &final_service
+            let pillar_event_json = serde_json::to_string(
+                &pillar_service
                     .mission_events(&project_id, &target_plan.target_mission_id)
                     .expect("content-free VM-04 events after pillar Runtime"),
             )
-            .expect("final target event JSON");
-            assert!(final_event_json.contains("vm04.account-scope-probe/v1"));
-            assert!(!final_event_json.contains("page_desktop_vm04_private"));
-            assert!(!final_event_json.contains(social_scope));
-            assert!(!final_event_json.contains(
+            .expect("pillar target event JSON");
+            assert!(pillar_event_json.contains("vm04.account-scope-probe/v1"));
+            assert!(!pillar_event_json.contains("page_desktop_vm04_private"));
+            assert!(!pillar_event_json.contains(social_scope));
+            assert!(!pillar_event_json.contains(
                 "Adopt the reviewed Runtime WorkProduct and continue the contracted Mission."
             ));
+            drop(pillar_service);
+
+            let adopted_pillar = reopened
+                .adopt_work_product_with(
+                    &secrets,
+                    DesktopWorkProductAdoptionRequest {
+                        project_id: project_id.clone(),
+                        mission_id: target_plan.target_mission_id.clone(),
+                        work_product_id: second_work_product_id.clone(),
+                        expected_mission_revision: pillar_target.revision,
+                        expected_work_product_revision: second_work_product.revision,
+                        expected_manifest_version: second_manifest.version,
+                    },
+                    handoff_now + Duration::seconds(14),
+                )
+                .expect("adopt pillar draft and advance to native variants");
+            let native_projection = adopted_pillar.inventory.projects[0]
+                .missions
+                .iter()
+                .find(|mission| mission.mission_id == target_plan.target_mission_id)
+                .expect("native-variants VM-04 projection");
+            assert_eq!(native_projection.completed_checkpoint_count, 3);
+            assert_eq!(
+                (
+                    native_projection.current_checkpoint_id.as_deref(),
+                    native_projection.current_checkpoint_status,
+                    native_projection.current_checkpoint_executor,
+                    native_projection.current_checkpoint_completion_policy,
+                ),
+                (
+                    Some("native_variants_and_assets"),
+                    Some(hartevo_domain_kernel::MissionCheckpointStatus::Running),
+                    Some(MissionCheckpointExecutor::Runtime),
+                    Some(MissionCheckpointCompletionPolicy::WorkProduct),
+                )
+            );
+            let prepared_native = reopened
+                .prepare_catalog_mission_runtime_resume_with(
+                    &secrets,
+                    &project_id,
+                    &target_plan.target_mission_id,
+                    handoff_now + Duration::seconds(15),
+                )
+                .expect("prepare exact native-variants Runtime handle");
+            let resumed_native = reopened
+                .resume_catalog_mission_runtime_with_cancellation(
+                    &secrets,
+                    catalog_runtime_authority(prepared_native.handle),
+                    Some(completed_runtime_fixture_source()),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    handoff_now + Duration::seconds(16),
+                )
+                .expect("run native variants only after the exact paint gate");
+            let third_work_product_id = match resumed_native.runtime_outcome {
+                DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id,
+                outcome => panic!("unexpected native-variants Runtime outcome: {outcome:?}"),
+            };
+            assert_ne!(third_work_product_id, work_product_id);
+            assert_ne!(third_work_product_id, second_work_product_id);
+
+            let cold_after_native = DesktopDataPlane::at_data_root(reopened.data_root.clone())
+                .expect("cold Desktop after native-variants Runtime");
+            let (native_service, _) = cold_after_native
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(17))
+                .expect("cold Application after native-variants Runtime");
+            let native_target = native_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 after native-variants Runtime");
+            let third_work_product = native_target
+                .work_products
+                .iter()
+                .find(|work_product| work_product.id == third_work_product_id)
+                .cloned()
+                .expect("durable native-variants Runtime WorkProduct");
+            assert_eq!(
+                third_work_product.status,
+                hartevo_domain_kernel::WorkProductStatus::ReadyForReview
+            );
+            let third_manifest = native_service
+                .load_work_product_manifest(&project_id, &third_work_product_id)
+                .expect("native-variants Runtime manifest");
+            drop(native_service);
+
+            let adopted_native = reopened
+                .adopt_work_product_with(
+                    &secrets,
+                    DesktopWorkProductAdoptionRequest {
+                        project_id: project_id.clone(),
+                        mission_id: target_plan.target_mission_id.clone(),
+                        work_product_id: third_work_product_id.clone(),
+                        expected_mission_revision: native_target.revision,
+                        expected_work_product_revision: third_work_product.revision,
+                        expected_manifest_version: third_manifest.version,
+                    },
+                    handoff_now + Duration::seconds(18),
+                )
+                .expect("adopt native variants and enter selective approval");
+            let approval_projection = adopted_native.inventory.projects[0]
+                .missions
+                .iter()
+                .find(|mission| mission.mission_id == target_plan.target_mission_id)
+                .expect("selective-approval VM-04 projection");
+            assert_eq!(approval_projection.completed_checkpoint_count, 4);
+            assert_eq!(
+                (
+                    approval_projection.current_checkpoint_id.as_deref(),
+                    approval_projection.current_checkpoint_status,
+                    approval_projection.current_checkpoint_executor,
+                    approval_projection.current_checkpoint_completion_policy,
+                ),
+                (
+                    Some("selective_approval"),
+                    Some(hartevo_domain_kernel::MissionCheckpointStatus::Running),
+                    Some(MissionCheckpointExecutor::Human),
+                    Some(MissionCheckpointCompletionPolicy::HumanConfirmation),
+                )
+            );
+
+            let private_approval =
+                "PRIVATE-VM04-APPROVAL::publish only the selected native variants";
+            let approval_message_id = MissionConversationMessageId::from_stable(
+                "desktop-vm04-selective-approval-message",
+            );
+            let approved = reopened
+                .confirm_human_mission_checkpoint_with(
+                    &secrets,
+                    DesktopHumanCheckpointConfirmationRequest {
+                        project_id: project_id.clone(),
+                        mission_id: target_plan.target_mission_id.clone(),
+                        checkpoint_id: "selective_approval".into(),
+                        message_id: approval_message_id.clone(),
+                        body: private_approval.into(),
+                        idempotency_key: "desktop-vm04-selective-approval".into(),
+                        work_product_ids: BTreeSet::from([third_work_product_id.clone()]),
+                        expected_mission_revision: approval_projection.revision,
+                        expected_checkpoint_revision: approval_projection
+                            .current_checkpoint_revision
+                            .expect("selective-approval Checkpoint revision"),
+                        expected_conversation_revision: approval_projection
+                            .conversation_revision
+                            .expect("selective-approval Conversation revision"),
+                    },
+                    handoff_now + Duration::seconds(19),
+                )
+                .expect("confirm exact selected WorkProduct without publishing");
+            let effect_projection = approved.inventory.projects[0]
+                .missions
+                .iter()
+                .find(|mission| mission.mission_id == target_plan.target_mission_id)
+                .expect("schedule-or-publish VM-04 projection");
+            assert_eq!(effect_projection.completed_checkpoint_count, 5);
+            assert_eq!(
+                (
+                    effect_projection.current_checkpoint_id.as_deref(),
+                    effect_projection.current_checkpoint_status,
+                    effect_projection.current_checkpoint_executor,
+                    effect_projection.current_checkpoint_completion_policy,
+                ),
+                (
+                    Some("schedule_or_publish"),
+                    Some(hartevo_domain_kernel::MissionCheckpointStatus::Running),
+                    Some(MissionCheckpointExecutor::EffectBroker),
+                    Some(MissionCheckpointCompletionPolicy::VerifiedEffect),
+                )
+            );
+            assert!(effect_projection.pending_effects.is_empty());
+            assert_eq!(effect_projection.verified_effect_count, 0);
+
+            let cold_after_approval = DesktopDataPlane::at_data_root(reopened.data_root.clone())
+                .expect("cold Desktop after selective approval");
+            let (approved_service, _) = cold_after_approval
+                .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(20))
+                .expect("cold Application at schedule-or-publish boundary");
+            let approved_target = approved_service
+                .load_mission(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 at Effect Broker boundary");
+            assert!(approved_target.effects.is_empty());
+            let selective_completion = approved_target
+                .definition
+                .as_ref()
+                .and_then(|definition| {
+                    definition
+                        .checkpoints
+                        .iter()
+                        .find(|checkpoint| checkpoint.id == "selective_approval")
+                })
+                .and_then(|checkpoint| checkpoint.completion.as_ref())
+                .expect("durable selective-approval completion");
+            assert_eq!(
+                selective_completion.work_product_ids,
+                BTreeSet::from([third_work_product_id])
+            );
+            let approved_conversation = approved_service
+                .mission_conversation(&project_id, &target_plan.target_mission_id)
+                .expect("durable VM-04 Conversation after selective approval");
+            assert_eq!(approved_conversation.revision, 8);
+            assert_eq!(
+                approved_conversation
+                    .messages
+                    .last()
+                    .map(|message| (&message.id, message.kind)),
+                Some((
+                    &approval_message_id,
+                    MissionConversationMessageKind::CheckpointConfirmation,
+                ))
+            );
+            let approved_event_json = serde_json::to_string(
+                &approved_service
+                    .mission_events(&project_id, &target_plan.target_mission_id)
+                    .expect("content-free VM-04 events after selective approval"),
+            )
+            .expect("approved target event JSON");
+            assert!(!approved_event_json.contains(private_approval));
+            assert!(!approved_event_json.contains("page_desktop_vm04_private"));
+            assert!(!approved_event_json.contains(social_scope));
+            assert!(!approved_event_json.contains(
+                "Adopt the reviewed Runtime WorkProduct and continue the contracted Mission."
+            ));
+            assert_eq!(executor.calls, 1);
+            assert_eq!(verifier.calls, 1);
         }
         drop(directory);
     }

@@ -3076,22 +3076,90 @@ pub fn App() -> Element {
                 result_action_pending.set(true);
                 model.write().notice = None;
                 spawn(async move {
+                    let project_id = binding.project_id;
+                    let mission_id = binding.mission_id;
                     let request = DesktopWorkProductAdoptionRequest {
-                        project_id: binding.project_id,
-                        mission_id: binding.mission_id,
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
                         work_product_id: binding.result_id,
                         expected_mission_revision: binding.mission_revision,
                         expected_work_product_revision: binding.result_revision,
                         expected_manifest_version: binding.manifest_version,
                     };
                     let result = tokio::task::spawn_blocking(move || {
-                        DesktopDataPlane::persistent()
-                            .and_then(|plane| plane.adopt_work_product_os(request, Utc::now()))
+                        DesktopDataPlane::persistent().and_then(|plane| {
+                            let now = Utc::now();
+                            let snapshot = plane.adopt_work_product_os(request, now)?;
+                            let routed_runtime = snapshot
+                                .inventory
+                                .projects
+                                .iter()
+                                .find(|project| project.project_id == project_id)
+                                .and_then(|project| {
+                                    project
+                                        .missions
+                                        .iter()
+                                        .find(|mission| mission.mission_id == mission_id)
+                                })
+                                .is_some_and(|mission| {
+                                    mission.manifest_id.is_some()
+                                        && mission.current_checkpoint_status
+                                            == Some(MissionCheckpointStatus::Running)
+                                        && mission.current_checkpoint_executor
+                                            == Some(MissionCheckpointExecutor::Runtime)
+                                        && mission.current_checkpoint_completion_policy
+                                            == Some(MissionCheckpointCompletionPolicy::WorkProduct)
+                                });
+                            let prepared = if routed_runtime {
+                                plane
+                                    .prepare_catalog_mission_runtime_resume_os(
+                                        &project_id,
+                                        &mission_id,
+                                        now,
+                                    )
+                                    .map(Some)
+                            } else {
+                                Ok(None)
+                            };
+                            Ok((snapshot, prepared))
+                        })
                     })
                     .await;
                     match result {
-                        Ok(Ok(snapshot)) => {
+                        Ok(Ok((_snapshot, Ok(Some(prepared))))) => {
+                            model.write().set_ready(prepared.snapshot, false);
+                            runtime_cancellation.set(None);
+                            runtime_stop_requested.set(false);
+                            runtime_progress.set(Vec::new());
+                            match runtime_execution_paint
+                                .write()
+                                .commit_catalog_start(prepared.handle)
+                            {
+                                Ok(commit) => {
+                                    let scope = &commit.selection().scope;
+                                    runtime_text_scope.set(Some((
+                                        scope.project_id().clone(),
+                                        scope.mission_id().clone(),
+                                    )));
+                                    runtime_text_stream.set(None);
+                                    runtime_text_error.set(None);
+                                    runtime_follow_latest.set(true);
+                                    runtime_has_unseen.set(false);
+                                    // The existing post-render effect owns
+                                    // the exact handle and Runtime authority.
+                                }
+                                Err(error) => runtime_text_error
+                                    .set(Some(UiFailure::from_runtime_subscription_error(error))),
+                            }
+                            result_action_pending.set(false);
+                        }
+                        Ok(Ok((snapshot, Ok(None)))) => {
                             model.write().set_ready(snapshot, false);
+                            result_action_pending.set(false);
+                        }
+                        Ok(Ok((snapshot, Err(error)))) => {
+                            model.write().set_ready(snapshot, false);
+                            model.write().set_notice(&error);
                             result_action_pending.set(false);
                         }
                         Ok(Err(error)) => {
@@ -12902,6 +12970,31 @@ mod tests {
             );
         }
         assert!(css.contains("@media (prefers-reduced-motion: reduce)"));
+    }
+
+    #[test]
+    fn result_adoption_prepares_the_next_catalog_runtime_for_the_existing_paint_gate() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("let on_result_action =")
+            .expect("result adoption boundary");
+        let end = source[start..]
+            .find("let runtime_chip =")
+            .expect("result adoption boundary end");
+        let adoption = &source[start..start + end];
+        for contract in [
+            "adopt_work_product_os",
+            "current_checkpoint_status",
+            "MissionCheckpointExecutor::Runtime",
+            "MissionCheckpointCompletionPolicy::WorkProduct",
+            "prepare_catalog_mission_runtime_resume_os",
+            "commit_catalog_start(prepared.handle)",
+            "The existing post-render effect owns",
+        ] {
+            assert!(adoption.contains(contract), "missing {contract}");
+        }
+        assert!(!adoption.contains("resume_catalog_mission_runtime"));
+        assert!(!adoption.contains("run_existing_mission_runtime"));
     }
 
     #[test]
