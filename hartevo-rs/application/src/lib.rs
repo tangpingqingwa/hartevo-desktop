@@ -3242,6 +3242,7 @@ const VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID: &str = "vm00.local-project-identit
 const VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID: &str = "vm00.local-project-inventory/v1";
 const VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID: &str =
     "vm00.local-encryption-workspace-ready/v1";
+const VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID: &str = "vm00.local-connection-readiness/v1";
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
@@ -3258,6 +3259,7 @@ enum CompiledApplicationCheckpointHandler {
     LocalProjectIdentity,
     LocalProjectInventory,
     LocalEncryptionWorkspaceReady,
+    LocalConnectionReadiness,
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
@@ -3274,6 +3276,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::LocalProjectIdentity => VM00_LOCAL_PROJECT_IDENTITY_HANDLER_ID,
             Self::LocalProjectInventory => VM00_LOCAL_PROJECT_INVENTORY_HANDLER_ID,
             Self::LocalEncryptionWorkspaceReady => VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID,
+            Self::LocalConnectionReadiness => VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID,
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
@@ -3290,6 +3293,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::LocalProjectIdentity => "project_scope",
             Self::LocalProjectInventory => "project_inventory",
             Self::LocalEncryptionWorkspaceReady => "project_keyring",
+            Self::LocalConnectionReadiness => "connection_readiness",
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
@@ -3555,6 +3559,9 @@ fn compiled_application_checkpoint_handler(
         }
         VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady)
+        }
+        VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::LocalConnectionReadiness)
         }
         VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
         VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
@@ -4204,13 +4211,175 @@ fn vm00_local_encryption_workspace_ready_application_evidence(
     })
 }
 
+fn vm00_verified_checkout_for_connection_readiness(
+    mission: &Mission,
+) -> Result<Effect, ApplicationError> {
+    let checkpoint = mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == VM00_BILLING_CHECKOUT_CHECKPOINT_ID)
+        })
+        .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let completion = checkpoint
+        .completion
+        .as_ref()
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let effect_id = completion
+        .effect_ids
+        .iter()
+        .next()
+        .filter(|_| completion.effect_ids.len() == 1)
+        .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let effect = mission
+        .effect(effect_id)
+        .map_err(|_| ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    validate_vm00_billing_checkout_verified_effect(mission, effect)?;
+    if completion.oracle_ids != BTreeSet::from(["effect".into(), "operating_state".into()])
+        || !completion.work_product_ids.is_empty()
+        || completion.application_evidence.is_some()
+        || !is_sha256_text(&completion.evidence_digest)
+        || completion.verified_at
+            != effect
+                .verification
+                .as_ref()
+                .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?
+                .observed_at
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    Ok(effect.clone())
+}
+
+fn vm00_connection_matches_verified_checkout(
+    mission: &Mission,
+    effect: &Effect,
+    connection: &Connection,
+    now: DateTime<Utc>,
+) -> bool {
+    effect.connection_id.as_ref() == Some(connection.id())
+        && effect.account_id.as_ref() == Some(connection.account_id())
+        && effect.provider == connection.provider()
+        && connection.tenant_id() == &mission.tenant_id
+        && connection.project_id() == &mission.project_id
+        && connection.permits_scopes(&effect.required_scopes, now)
+}
+
+fn vm00_local_connection_readiness_application_evidence(
+    mission: &Mission,
+    effect: &Effect,
+    connection: &Connection,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let verified_at = effect
+        .verification
+        .as_ref()
+        .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?
+        .observed_at;
+    if definition.manifest_id != "VM-00"
+        || definition.manifest_version != 3
+        || checkpoint.id != "connection_probe"
+        || route.capability_id != "connection.probe"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids != BTreeSet::from(["operating_state".into(), "truth".into()])
+        || now < verified_at
+        || !vm00_connection_matches_verified_checkout(mission, effect, connection, now)
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let connection_readiness_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm00-checkout-connection-readiness/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "checkoutEffectId": effect.id,
+        "checkoutApprovalDigest": effect.approval_digest(),
+        "connection": connection.snapshot(),
+        "observedAt": now,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "connection_readiness".into(),
+                source_id: connection.id().to_string(),
+                source_revision: connection.revision(),
+                projection_digest: connection_readiness_digest,
+                oracle_ids: BTreeSet::from(["truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn persist_vm00_project_keyring_block(
+fn persist_vm00_source_block(
     store: &mut ProjectStore,
     mission: &mut Mission,
     expected_mission_revision: u64,
     command: &ExecuteApplicationMissionCheckpoint,
     dispatch: &MissionCheckpointDispatch,
+    handler_id: &str,
+    source_kind: &str,
     code: &str,
     detail: &str,
     source_revision: u64,
@@ -4237,13 +4406,13 @@ fn persist_vm00_project_keyring_block(
                 "missionId": mission.id,
                 "checkpointId": command.checkpoint_id,
                 "capabilityId": dispatch.capability_id,
-                "handlerId": VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID,
+                "handlerId": handler_id,
                 "dispatchMissionRevision": command.expected_mission_revision,
                 "dispatchCheckpointRevision": command.expected_checkpoint_revision,
                 "code": code,
                 "recoverable": true,
                 "outcomeLedgerRevision": source_revision,
-                "sourceKind": "project_keyring",
+                "sourceKind": source_kind,
                 "sourceRevision": source_revision,
                 "sourceFenceCount": 1,
             }),
@@ -4326,12 +4495,14 @@ fn execute_vm00_local_project_checkpoint(
                     kind: "project keyring",
                     ..
                 }) => {
-                    return persist_vm00_project_keyring_block(
+                    return persist_vm00_source_block(
                         store,
                         &mut mission,
                         expected_mission_revision,
                         &command,
                         dispatch,
+                        VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID,
+                        "project_keyring",
                         "project_encryption_not_provisioned",
                         "Project encryption must be explicitly provisioned before this Mission can continue.",
                         0,
@@ -4359,12 +4530,14 @@ fn execute_vm00_local_project_checkpoint(
                         "Project encryption has no currently available mode-required recipient set.",
                     )
                 };
-                return persist_vm00_project_keyring_block(
+                return persist_vm00_source_block(
                     store,
                     &mut mission,
                     expected_mission_revision,
                     &command,
                     dispatch,
+                    VM00_LOCAL_ENCRYPTION_WORKSPACE_READY_HANDLER_ID,
+                    "project_keyring",
                     code,
                     detail,
                     keyring.revision,
@@ -4386,6 +4559,76 @@ fn execute_vm00_local_project_checkpoint(
                 vec![ApplicationSourceRevisionFence::present(
                     ApplicationSourceKind::ProjectKeyring,
                     keyring.project_id.to_string(),
+                    revision,
+                )],
+            )
+        }
+        CompiledApplicationCheckpointHandler::LocalConnectionReadiness => {
+            let effect = vm00_verified_checkout_for_connection_readiness(&mission)?;
+            let connection_id = effect
+                .connection_id
+                .clone()
+                .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+            let connection = match store.load_connection(&command.project_id, &connection_id) {
+                Ok(connection) => connection,
+                Err(StorageError::ScopedRecordNotFound {
+                    kind: "connection", ..
+                }) => {
+                    return persist_vm00_source_block(
+                        store,
+                        &mut mission,
+                        expected_mission_revision,
+                        &command,
+                        dispatch,
+                        VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID,
+                        "connection_readiness",
+                        "checkout_connection_unavailable",
+                        "The exact Connection used by the verified checkout is unavailable.",
+                        0,
+                        ApplicationSourceRevisionFence::absent(
+                            ApplicationSourceKind::Connection,
+                            connection_id.to_string(),
+                        ),
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if !vm00_connection_matches_verified_checkout(&mission, &effect, &connection, now) {
+                return persist_vm00_source_block(
+                    store,
+                    &mut mission,
+                    expected_mission_revision,
+                    &command,
+                    dispatch,
+                    VM00_LOCAL_CONNECTION_READINESS_HANDLER_ID,
+                    "connection_readiness",
+                    "checkout_connection_not_live",
+                    "The exact Connection used by the verified checkout requires a fresh successful probe.",
+                    connection.revision(),
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Connection,
+                        connection.id().to_string(),
+                        connection.revision(),
+                    ),
+                    now,
+                );
+            }
+            let evidence = vm00_local_connection_readiness_application_evidence(
+                &mission,
+                &effect,
+                &connection,
+                &route,
+                &command,
+                now,
+            )?;
+            let revision = connection.revision();
+            (
+                evidence,
+                revision,
+                vec![ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Connection,
+                    connection.id().to_string(),
                     revision,
                 )],
             )
@@ -10368,6 +10611,7 @@ impl ApplicationService {
             CompiledApplicationCheckpointHandler::LocalProjectIdentity
                 | CompiledApplicationCheckpointHandler::LocalProjectInventory
                 | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady
+                | CompiledApplicationCheckpointHandler::LocalConnectionReadiness
         ) {
             return execute_vm00_local_project_checkpoint(
                 &mut self.store,
@@ -11216,7 +11460,8 @@ impl ApplicationService {
         let application_evidence = match compiled_handler {
             CompiledApplicationCheckpointHandler::LocalProjectIdentity
             | CompiledApplicationCheckpointHandler::LocalProjectInventory
-            | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady => {
+            | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady
+            | CompiledApplicationCheckpointHandler::LocalConnectionReadiness => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest => {
@@ -11346,7 +11591,8 @@ impl ApplicationService {
         let source_metrics = match compiled_handler {
             CompiledApplicationCheckpointHandler::LocalProjectIdentity
             | CompiledApplicationCheckpointHandler::LocalProjectInventory
-            | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady => {
+            | CompiledApplicationCheckpointHandler::LocalEncryptionWorkspaceReady
+            | CompiledApplicationCheckpointHandler::LocalConnectionReadiness => {
                 unreachable!("VM-00 route returned before the generic VM-11 pipeline")
             }
             CompiledApplicationCheckpointHandler::EventIngest
@@ -24298,7 +24544,7 @@ fn vm00_billing_checkout_completion_digest(
     effect: &Effect,
     command: &CompleteVm00BillingCheckout,
 ) -> Result<String, ApplicationError> {
-    validate_vm00_billing_checkout_effect_shape(mission, effect)?;
+    validate_vm00_billing_checkout_verified_effect(mission, effect)?;
     let receipt = effect
         .receipt
         .as_ref()
@@ -24307,16 +24553,6 @@ fn vm00_billing_checkout_completion_digest(
         .verification
         .as_ref()
         .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?;
-    if effect.status != EffectStatus::Verified
-        || receipt.provider != effect.provider
-        || receipt.request_digest != effect.approval_digest()
-        || verification.status != VerificationStatus::Confirmed
-        || !verification.independent
-        || verification.receipt_id != receipt.id
-        || verification.observed_at < receipt.accepted_at
-    {
-        return Err(ApplicationError::Vm00BillingCheckoutEffectMismatch);
-    }
     canonical_sha256(&serde_json::json!({
         "schemaVersion": "vm00-billing-checkout-completion/v1",
         "missionId": mission.id,
@@ -24338,6 +24574,32 @@ fn vm00_billing_checkout_completion_digest(
         "verificationMissionRevision": command.expected_mission_revision,
         "verificationCheckpointRevision": command.expected_checkpoint_revision,
     }))
+}
+
+fn validate_vm00_billing_checkout_verified_effect(
+    mission: &Mission,
+    effect: &Effect,
+) -> Result<(), ApplicationError> {
+    validate_vm00_billing_checkout_effect_shape(mission, effect)?;
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?;
+    if effect.status != EffectStatus::Verified
+        || receipt.provider != effect.provider
+        || receipt.request_digest != effect.approval_digest()
+        || verification.status != VerificationStatus::Confirmed
+        || !verification.independent
+        || verification.receipt_id != receipt.id
+        || verification.observed_at < receipt.accepted_at
+    {
+        return Err(ApplicationError::Vm00BillingCheckoutEffectMismatch);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
