@@ -29,25 +29,29 @@ use hartevo_application::{
     AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
     AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
     ApplicationService, ApproveProposedEffect, BrowserPublicSourceObservation,
-    CatalogMissionExecutionHandle, ConfirmHumanMissionCheckpoint, ContinueBrowserWorkspace,
-    CordisMissionDraft, CordisMissionTurnPlan, CreateBrowserWorkspace, CreateProject,
-    DecideVm11OutcomeReview, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
-    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
-    ExecuteApplicationMissionCheckpoint, ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn,
-    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
-    MissionRuntimeProjection, ObservationClassification, ObservationEvidencePack,
-    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
-    ObservationPlanBinding, ObservationSourceBinding, ObservationSourceKind,
-    ObserveContextRuntimeTurn, PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext,
-    PreparedLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProposePreviewEffect, ProvisionProjectEncryption, ReadBrowserPublicSource,
+    CatalogMissionExecutionHandle, CompleteVm00BillingCheckout, ConfirmHumanMissionCheckpoint,
+    ContinueBrowserWorkspace, CordisMissionDraft, CordisMissionTurnPlan, CreateBrowserWorkspace,
+    CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
+    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
+    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
+    ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
+    KeyAdministrationAuthorization, MissionCheckpointDispatchState, MissionRuntimeProjection,
+    ObservationClassification, ObservationEvidencePack, ObservationPipelineError,
+    ObservationPipelineRequest, ObservationPipelineResult, ObservationPlanBinding,
+    ObservationSourceBinding, ObservationSourceKind, ObserveContextRuntimeTurn,
+    PauseBrowserWorkspace, PrepareLocalMissionRuntimeContext, PreparedLocalMissionRuntimeContext,
+    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProposePreviewEffect,
+    ProposeVm00BillingCheckout, ProvisionProjectEncryption, ReadBrowserPublicSource,
     ReconcileUncertainEffect, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
     RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
     RespondContextRuntimeLocalApproval, ResumeBrowserWorkspace, RetryContextWorkerRuntime,
     ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor,
     RuntimeTextSubscriptionError, RuntimeTurnDispatchDisposition, StartCatalogMission,
     StartMission, TakeOverBrowserWorkspace, TypedRuntimeObservation,
+    VM00_BILLING_CHECKOUT_CAPABILITY, VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
+    VM00_BILLING_CHECKOUT_POLICY_VERSION, VM00_BILLING_CHECKOUT_REQUIRED_SCOPE,
     VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
+    vm00_billing_checkout_effect_policy,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserLeaseProof,
@@ -97,7 +101,7 @@ use hartevo_domain_kernel::{
     PersonId, ProbeOutcome, ProjectEncryptionMode, ProjectId, ProjectKeyring, Receipt, ReceiptId,
     ReviewDecision, ReviewId, RuntimeRecoveryAttempt, RuntimeRecoveryStatus, RuntimeResumeStrategy,
     RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnPrivateMessage, RuntimeTurnStatus,
-    StorageMode, TaskId, TenantId, VerificationId, VerificationStatus, WorkProductId,
+    StorageMode, TaskId, TenantId, Verification, VerificationId, VerificationStatus, WorkProductId,
     WorkerHandleStatus,
 };
 use hartevo_effect_broker::{
@@ -6689,6 +6693,85 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Propose the exact current VM-00 checkout through the Cordis
+    /// Domain-command seam. Success stops at WaitingApproval and never calls
+    /// the Provider.
+    pub fn propose_vm00_billing_checkout_os(
+        &self,
+        command: &ProposeVm00BillingCheckout,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.propose_vm00_billing_checkout_with(&secret_store, command, now)
+    }
+
+    pub fn propose_vm00_billing_checkout_with(
+        &self,
+        secret_store: &impl SecretStore,
+        command: &ProposeVm00BillingCheckout,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if command.expected_mission_revision == 0
+            || command.expected_checkpoint_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || !is_canonical_sha256(&command.checkout_digest)
+            || command.amount.amount_minor <= 0
+            || command.idempotency_key.trim().is_empty()
+            || command.expires_at <= now
+        {
+            return Err(DesktopDataError::InvalidVm00BillingCheckout);
+        }
+        let project_id = command.project_id.clone();
+        let mission_id = command.mission_id.clone();
+        let expected_mission_revision = command.expected_mission_revision;
+        let effect_id = command.effect_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+        if scope.mission_revision() != expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: expected_mission_revision,
+                actual: scope.mission_revision(),
+            }
+            .into());
+        }
+        let proposal_digest = vm00_billing_checkout_authority_digest(&scope, command, now)?;
+        let facts = live_domain_kernel_facts(&service, &project_id, &mission_id, now)?;
+        let domain_command =
+            DomainCommandBinding::propose_effect(effect_id.as_str(), proposal_digest.clone())?;
+        map_domain_command_dispatch_result(dispatch_live_domain_command(
+            &self.cordis,
+            DesktopDomainCommandAuthorization::new(scope, domain_command),
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+            |permit| {
+                let current_scope = mission_authority_scope(&service, &project_id, &mission_id)?;
+                if &current_scope != permit.scope()
+                    || permit.command().kind() != DomainCommandKind::ProposeEffect
+                    || permit.command().effect_id() != effect_id.as_str()
+                    || permit.command().proposal_digest() != Some(proposal_digest.as_str())
+                    || permit.command().approval_scope_digest().is_some()
+                {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                let proposed = service.propose_vm00_billing_checkout(command, now)?;
+                if proposed != effect_id {
+                    return Err(CordisError::DomainCommandPermitMismatch.into());
+                }
+                Ok(())
+            },
+        ))?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
+            now,
+        )
+    }
+
     /// Propose one preview Effect through the exact Cordis Domain-command
     /// seam. Success stops at Domain Kernel `Proposed` plus the durable
     /// `approval.requested` event; it grants no execution or provider access.
@@ -6824,7 +6907,16 @@ impl DesktopDataPlane {
             effect_id.as_str(),
             expected_scope_digest.clone(),
         )?;
-        let broker = Self::waiting_approval_broker();
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        let proposed_effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+        let broker = if proposed_effect.capability == VM00_BILLING_CHECKOUT_CAPABILITY {
+            Self::vm00_billing_checkout_broker(&mission, &proposed_effect)?
+        } else {
+            Self::waiting_approval_broker()
+        };
         let actor = ActorId::from_stable(format!("desktop-local-operator:{}", self.device_id));
         map_domain_command_dispatch_result(dispatch_live_domain_command(
             &self.cordis,
@@ -6983,6 +7075,178 @@ impl DesktopDataPlane {
             verification_id: result.verification.id,
             verification_status: result.verification.status,
             verification_independent: result.verification.independent,
+        })
+    }
+
+    /// Executes the exact current VM-00 checkout once, then atomically advances
+    /// its independently verified Effect checkpoint. If the Provider result
+    /// was already made durable before a crash, re-entry completes or replays
+    /// the checkpoint without calling the executor again.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the three durable states keep first execution, post-Verification recovery, and completed replay visibly separate at the Desktop boundary"
+    )]
+    pub fn execute_vm00_billing_checkout_with<Executor, Verifier>(
+        &self,
+        secret_store: &impl SecretStore,
+        request: &DesktopApprovedEffectExecutionRequest,
+        executor: &mut Executor,
+        verifier: &mut Verifier,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopApprovedEffectExecution, DesktopDataError>
+    where
+        Executor: EffectExecutor,
+        Verifier: EffectVerifier,
+    {
+        if request.expected_mission_revision == 0
+            || request.effect_id.as_str().trim().is_empty()
+            || !is_canonical_sha256(&request.expected_scope_digest)
+            || !is_canonical_sha256(&request.expected_broker_authorization_digest)
+        {
+            return Err(DesktopDataError::InvalidVm00BillingCheckout);
+        }
+
+        let project_id = request.project_id.clone();
+        let mission_id = request.mission_id.clone();
+        let effect_id = request.effect_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+
+        if vm00_billing_checkout_completion_is_durable(&mission, &effect)? {
+            let (receipt, verification) =
+                verified_vm00_billing_checkout_projection(&effect, request)?;
+            let receipt_id = receipt.id.clone();
+            let verification_id = verification.id.clone();
+            let verification_status = verification.status.clone();
+            let verification_independent = verification.independent;
+            let snapshot = self.build_snapshot(
+                &service,
+                secret_store,
+                runtime_reconciliation,
+                load_product_evidence(now)?,
+                now,
+            )?;
+            return Ok(DesktopApprovedEffectExecution {
+                snapshot,
+                disposition: ExecutionDisposition::AlreadyVerified,
+                receipt_id,
+                verification_id,
+                verification_status,
+                verification_independent,
+            });
+        }
+
+        if effect.status == EffectStatus::Verified {
+            Self::vm00_billing_checkout_broker(&mission, &effect)?;
+            let (receipt, verification) =
+                verified_vm00_billing_checkout_projection(&effect, request)?;
+            let receipt_id = receipt.id.clone();
+            let verification_id = verification.id.clone();
+            let verification_status = verification.status.clone();
+            let verification_independent = verification.independent;
+            let completed_at = std::cmp::max(now, verification.observed_at);
+            let checkpoint_revision = mission
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.current_checkpoint())
+                .filter(|checkpoint| {
+                    checkpoint.id == VM00_BILLING_CHECKOUT_CHECKPOINT_ID
+                        && checkpoint.status
+                            == hartevo_domain_kernel::MissionCheckpointStatus::Verifying
+                })
+                .map(|checkpoint| checkpoint.revision)
+                .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+            service.complete_vm00_billing_checkout(
+                &CompleteVm00BillingCheckout {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: effect_id.clone(),
+                    expected_mission_revision: mission.revision,
+                    expected_checkpoint_revision: checkpoint_revision,
+                },
+                completed_at,
+            )?;
+            let snapshot = self.build_snapshot(
+                &service,
+                secret_store,
+                runtime_reconciliation,
+                load_product_evidence(completed_at)?,
+                completed_at,
+            )?;
+            return Ok(DesktopApprovedEffectExecution {
+                snapshot,
+                disposition: ExecutionDisposition::AlreadyVerified,
+                receipt_id,
+                verification_id,
+                verification_status,
+                verification_independent,
+            });
+        }
+
+        let mut broker = Self::vm00_billing_checkout_broker(&mission, &effect)?;
+        drop(service);
+        let executed = self.execute_approved_effect_with(
+            secret_store,
+            (*request).clone(),
+            &mut broker,
+            executor,
+            verifier,
+            now,
+        )?;
+
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let mission = service.load_mission(&project_id, &mission_id)?;
+        let effect = mission
+            .effect(&effect_id)
+            .map_err(ApplicationError::from)?
+            .clone();
+        let (receipt, verification) = verified_vm00_billing_checkout_projection(&effect, request)?;
+        let receipt_id = receipt.id.clone();
+        let verification_id = verification.id.clone();
+        let verification_status = verification.status.clone();
+        let verification_independent = verification.independent;
+        let completed_at = std::cmp::max(now, verification.observed_at);
+        let checkpoint_revision = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.current_checkpoint())
+            .filter(|checkpoint| {
+                checkpoint.id == VM00_BILLING_CHECKOUT_CHECKPOINT_ID
+                    && checkpoint.status
+                        == hartevo_domain_kernel::MissionCheckpointStatus::Verifying
+            })
+            .map(|checkpoint| checkpoint.revision)
+            .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+        service.complete_vm00_billing_checkout(
+            &CompleteVm00BillingCheckout {
+                project_id,
+                mission_id,
+                effect_id,
+                expected_mission_revision: mission.revision,
+                expected_checkpoint_revision: checkpoint_revision,
+            },
+            completed_at,
+        )?;
+        let snapshot = self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(completed_at)?,
+            completed_at,
+        )?;
+        Ok(DesktopApprovedEffectExecution {
+            snapshot,
+            disposition: executed.disposition,
+            receipt_id,
+            verification_id,
+            verification_status,
+            verification_independent,
         })
     }
 
@@ -9837,6 +10101,17 @@ impl DesktopDataPlane {
         .with_lease_for(Duration::days(36_500))
     }
 
+    fn vm00_billing_checkout_broker(
+        mission: &Mission,
+        effect: &Effect,
+    ) -> Result<EffectBroker, DesktopDataError> {
+        Ok(EffectBroker::new(
+            vm00_billing_checkout_effect_policy(mission, effect)?,
+            "desktop-vm00-billing-checkout-worker",
+        )
+        .with_lease_for(Duration::days(36_500)))
+    }
+
     fn finish_mission_submission(
         &self,
         service: &ApplicationService,
@@ -10736,6 +11011,129 @@ fn effect_proposal_authority_digest(
     );
     effect_proposal_authority_field(&mut hasher, "proposal", &encoded);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn vm00_billing_checkout_authority_digest(
+    scope: &AuthorityScope,
+    command: &ProposeVm00BillingCheckout,
+    proposed_at: DateTime<Utc>,
+) -> Result<String, DesktopDataError> {
+    let encoded = command
+        .authority_payload_bytes()
+        .map_err(|_| DesktopDataError::InvalidVm00BillingCheckout)?;
+    let mut hasher = Sha256::new();
+    effect_proposal_authority_field(
+        &mut hasher,
+        "domain",
+        b"hartevo.cordis.vm00-billing-checkout-authority/v1",
+    );
+    effect_proposal_authority_field(&mut hasher, "tenant", scope.tenant_id().as_bytes());
+    effect_proposal_authority_field(&mut hasher, "project", scope.project_id().as_bytes());
+    effect_proposal_authority_field(&mut hasher, "mission", scope.mission_id().as_bytes());
+    effect_proposal_authority_field(
+        &mut hasher,
+        "mission_revision",
+        &scope.mission_revision().to_be_bytes(),
+    );
+    effect_proposal_authority_field(
+        &mut hasher,
+        "proposed_at",
+        proposed_at.to_rfc3339().as_bytes(),
+    );
+    effect_proposal_authority_field(&mut hasher, "checkout", &encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verified_vm00_billing_checkout_projection<'a>(
+    effect: &'a Effect,
+    request: &DesktopApprovedEffectExecutionRequest,
+) -> Result<(&'a Receipt, &'a Verification), DesktopDataError> {
+    let approval = effect
+        .approval
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+    if effect.tenant_id.as_str().trim().is_empty()
+        || effect.project_id != request.project_id
+        || effect.mission_id != request.mission_id
+        || effect.id != request.effect_id
+        || effect.capability != VM00_BILLING_CHECKOUT_CAPABILITY
+        || effect.effect_class != EffectClass::Payment
+        || effect.connection_id.is_none()
+        || effect.account_id.is_none()
+        || effect.required_scopes
+            != BTreeSet::from([VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.to_owned()])
+        || effect.policy_version != VM00_BILLING_CHECKOUT_POLICY_VERSION
+        || !is_canonical_sha256(&effect.payload_digest)
+        || effect.amount.amount_minor <= 0
+        || effect.status != EffectStatus::Verified
+        || approval.decision != ApprovalDecision::Approved
+        || approval.scope_digest != effect.approval_digest()
+        || approval.scope_digest != request.expected_scope_digest
+        || approval.permission_digest != request.expected_broker_authorization_digest
+        || !is_canonical_sha256(&approval.permission_digest)
+        || receipt.provider != effect.provider
+        || receipt.request_digest != effect.approval_digest()
+        || verification.status != VerificationStatus::Confirmed
+        || !verification.independent
+        || verification.receipt_id != receipt.id
+        || verification.observed_at < receipt.accepted_at
+    {
+        return Err(DesktopDataError::InvalidVm00BillingCheckout);
+    }
+    Ok((receipt, verification))
+}
+
+fn vm00_billing_checkout_completion_is_durable(
+    mission: &Mission,
+    effect: &Effect,
+) -> Result<bool, DesktopDataError> {
+    let checkpoint = mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == VM00_BILLING_CHECKOUT_CHECKPOINT_ID)
+        })
+        .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+    if checkpoint.status != hartevo_domain_kernel::MissionCheckpointStatus::Completed {
+        return Ok(false);
+    }
+    let route = checkpoint
+        .route
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+    let completion = checkpoint
+        .completion
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(DesktopDataError::InvalidVm00BillingCheckout)?;
+    if route.capability_id != VM00_BILLING_CHECKOUT_CAPABILITY
+        || route.executor != MissionCheckpointExecutor::EffectBroker
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
+        || route.oracle_ids != BTreeSet::from(["effect".into(), "operating_state".into()])
+        || completion.oracle_ids != route.oracle_ids
+        || !completion.work_product_ids.is_empty()
+        || completion.effect_ids != BTreeSet::from([effect.id.clone()])
+        || completion.application_evidence.is_some()
+        || !is_canonical_sha256(&completion.evidence_digest)
+        || completion.verified_at != verification.observed_at
+    {
+        return Err(DesktopDataError::InvalidVm00BillingCheckout);
+    }
+    Ok(true)
 }
 
 fn runtime_authority_scope(
@@ -11881,6 +12279,10 @@ pub enum DesktopDataError {
         "Effect proposal requires a typed payload, canonical digest, stable idempotency key, positive expiry, and exact Mission CAS revision"
     )]
     InvalidEffectProposal,
+    #[error(
+        "VM-00 billing checkout requires the exact current route, connected account, bounded payment digest, and Mission/Checkpoint revisions"
+    )]
+    InvalidVm00BillingCheckout,
     #[error(
         "Browser Workspace Create requires an exact active Project-scoped Browser Profile and revision from SQLCipher"
     )]
@@ -15171,7 +15573,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one Desktop Journey proves all three VM-00 local Project checkpoints, exact Device context access, zero Runtime construction, SQLCipher durability, and content-free evidence after cold reopen"
+        reason = "one Desktop Journey proves the VM-00 local Project foundations, Cordis-authorized checkout, exact-once Provider execution, SQLCipher recovery, and content-free evidence after cold reopen"
     )]
     fn vm00_local_identity_inventory_and_encryption_survive_encrypted_desktop_reopen_without_runtime()
      {
@@ -15193,7 +15595,7 @@ sleep 30"#;
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
                     kpis: catalog_count_kpis(),
-                    budget_minor: 0,
+                    budget_minor: 5_000,
                     currency: "USD".into(),
                 },
                 Some(DesktopRuntimeSource::Fixture {
@@ -15333,7 +15735,176 @@ sleep 30"#;
             Some("entitlement_and_wallet")
         );
         assert!(plane.with_cordis_host(|host| host.bound_scope().is_none()));
+
+        let checkout_connection_id = ConnectionId::from("desktop-vm00-stripe-connection");
+        let checkout_account_id = AccountId::from("desktop-vm00-owner-account");
+        let checkout_effect_id = EffectId::from("desktop-vm00-checkout-effect");
+        let checkout_now = observed_at() + Duration::minutes(6);
+        let ready_mission = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("VM-00 checkout-ready Mission");
+        let tenant_id = ready_mission.tenant_id.clone();
+        let checkout_checkpoint_revision = ready_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.current_checkpoint())
+            .map(|checkpoint| checkpoint.revision)
+            .expect("VM-00 checkout Checkpoint revision");
+        let checkout_mission_revision = ready_mission.revision;
+        service
+            .register_connection(
+                Connection::register(
+                    checkout_connection_id.clone(),
+                    tenant_id,
+                    project_id.clone(),
+                    "stripe",
+                    checkout_account_id.clone(),
+                    "acct_vm00_desktop_private",
+                    [VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()],
+                    checkout_now,
+                )
+                .expect("Stripe checkout connection"),
+                checkout_now,
+            )
+            .expect("persist Stripe checkout connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &checkout_connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "acct_vm00_desktop_private".into(),
+                    granted_scopes: BTreeSet::from([VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()]),
+                    probed_at: checkout_now,
+                    valid_until: checkout_now + Duration::days(30),
+                    credential_expires_at: checkout_now + Duration::days(30),
+                    evidence_digest: "6".repeat(64),
+                },
+                checkout_now,
+            )
+            .expect("probe Stripe checkout connection");
         drop(service);
+
+        plane
+            .propose_vm00_billing_checkout_with(
+                &secrets,
+                &ProposeVm00BillingCheckout {
+                    project_id: project_id.clone(),
+                    mission_id: submission.mission_id.clone(),
+                    effect_id: checkout_effect_id.clone(),
+                    actor_id: ActorId::from("desktop-vm00-checkout-actor"),
+                    provider: "stripe".into(),
+                    connection_id: checkout_connection_id,
+                    account_id: checkout_account_id,
+                    checkout_digest: "a".repeat(64),
+                    amount: Money::new(2_000, CurrencyCode::parse("USD").expect("USD")),
+                    idempotency_key: "desktop-vm00-checkout-1".into(),
+                    expires_at: checkout_now + Duration::minutes(30),
+                    expected_mission_revision: checkout_mission_revision,
+                    expected_checkpoint_revision: checkout_checkpoint_revision,
+                },
+                checkout_now + Duration::minutes(1),
+            )
+            .expect("Cordis-authorized VM-00 checkout proposal");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, checkout_now + Duration::minutes(1))
+            .expect("Application after VM-00 checkout proposal");
+        let proposed_mission = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("proposed VM-00 checkout Mission");
+        let proposed_effect = proposed_mission
+            .effect(&checkout_effect_id)
+            .expect("proposed VM-00 checkout Effect");
+        assert_eq!(proposed_effect.effect_class, EffectClass::Payment);
+        assert_eq!(proposed_effect.status, EffectStatus::Proposed);
+        assert!(proposed_effect.receipt.is_none());
+        assert!(proposed_effect.verification.is_none());
+        let expected_scope_digest = proposed_effect.approval_digest();
+        let proposed_mission_revision = proposed_mission.revision;
+        drop(service);
+
+        plane
+            .grant_waiting_approval_with(
+                &secrets,
+                DesktopWaitingApprovalGrantRequest {
+                    project_id: project_id.clone(),
+                    mission_id: submission.mission_id.clone(),
+                    effect_id: checkout_effect_id.clone(),
+                    expected_scope_digest: expected_scope_digest.clone(),
+                    expected_mission_revision: proposed_mission_revision,
+                },
+                checkout_now + Duration::minutes(2),
+            )
+            .expect("explicit VM-00 checkout approval");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, checkout_now + Duration::minutes(2))
+            .expect("Application after VM-00 checkout approval");
+        let approved_mission = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("approved VM-00 checkout Mission");
+        let approved_effect = approved_mission
+            .effect(&checkout_effect_id)
+            .expect("approved VM-00 checkout Effect");
+        let approval = approved_effect
+            .approval
+            .as_ref()
+            .expect("durable explicit checkout approval");
+        let execution_request = DesktopApprovedEffectExecutionRequest {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            effect_id: checkout_effect_id.clone(),
+            expected_scope_digest,
+            expected_broker_authorization_digest: approval.permission_digest.clone(),
+            expected_mission_revision: approved_mission.revision,
+        };
+        drop(service);
+
+        let mut executor = DesktopPreviewExecutor {
+            calls: 0,
+            accepted_at: checkout_now + Duration::minutes(3),
+            uncertain: false,
+        };
+        let mut verifier = DesktopPreviewVerifier {
+            calls: 0,
+            observed_at: checkout_now + Duration::minutes(3) + Duration::seconds(1),
+        };
+        let executed = plane
+            .execute_vm00_billing_checkout_with(
+                &secrets,
+                &execution_request,
+                &mut executor,
+                &mut verifier,
+                checkout_now + Duration::minutes(3),
+            )
+            .expect("execute and verify VM-00 checkout");
+        assert_eq!(executed.disposition, ExecutionDisposition::Executed);
+        assert_eq!(executed.verification_status, VerificationStatus::Confirmed);
+        assert!(executed.verification_independent);
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
+        let projected = executed.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("completed VM-00 checkout projection");
+        assert_eq!(projected.completed_checkpoint_count, 4);
+        assert_eq!(
+            projected.current_checkpoint_id.as_deref(),
+            Some("connection_probe")
+        );
+
+        let replayed = plane
+            .execute_vm00_billing_checkout_with(
+                &secrets,
+                &execution_request,
+                &mut executor,
+                &mut verifier,
+                checkout_now + Duration::minutes(4),
+            )
+            .expect("replay durable VM-00 checkout completion");
+        assert_eq!(replayed.disposition, ExecutionDisposition::AlreadyVerified);
+        assert_eq!(executor.calls, 1);
+        assert_eq!(verifier.calls, 1);
 
         let data_root = plane.data_root.clone();
         drop(plane);
@@ -15344,7 +15915,12 @@ sleep 30"#;
         let mission = service
             .load_mission(&project_id, &submission.mission_id)
             .expect("durable VM-00 Mission");
-        assert!(mission.effects.is_empty());
+        let checkout_effect = mission
+            .effect(&checkout_effect_id)
+            .expect("durable verified VM-00 checkout Effect");
+        assert_eq!(checkout_effect.status, EffectStatus::Verified);
+        assert!(checkout_effect.receipt.is_some());
+        assert!(checkout_effect.verification.is_some());
         let completion = mission
             .definition
             .as_ref()
@@ -15417,6 +15993,26 @@ sleep 30"#;
                 .iter()
                 .any(|source| source.source_kind == "project_keyring")
         );
+        let checkout_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == VM00_BILLING_CHECKOUT_CHECKPOINT_ID)
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-00 checkout completion");
+        assert_eq!(
+            checkout_completion.effect_ids,
+            BTreeSet::from([checkout_effect_id.clone()])
+        );
+        assert!(checkout_completion.application_evidence.is_none());
+        assert_eq!(
+            checkout_completion.oracle_ids,
+            BTreeSet::from(["effect".into(), "operating_state".into(),])
+        );
         let evidence_json =
             serde_json::to_string(encryption_evidence).expect("encryption evidence JSON");
         assert!(!evidence_json.contains(device_id.as_str()));
@@ -15429,6 +16025,10 @@ sleep 30"#;
         assert!(event_json.contains("vm00.local-project-identity/v1"));
         assert!(event_json.contains("vm00.local-project-inventory/v1"));
         assert!(event_json.contains("vm00.local-encryption-workspace-ready/v1"));
+        assert!(event_json.contains("vm00.billing_checkout_approval_requested"));
+        assert!(event_json.contains("vm00.billing_checkout_verified"));
+        assert!(!event_json.contains("acct_vm00_desktop_private"));
+        assert!(!event_json.contains("preview-desktop-vm00-checkout-effect"));
         assert!(!event_json.contains(device_id.as_str()));
         assert!(!event_json.contains(private_goal));
         drop(directory);

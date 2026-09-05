@@ -131,9 +131,9 @@ use hartevo_domain_kernel::{
 };
 use hartevo_effect_broker::{
     BrokerError, BrokerResult, EffectBroker, EffectCompletionAuthority, EffectCompletionPoint,
-    EffectExecutor, EffectReceiptReconciler, EffectReconciler, EffectVerifier,
-    IndependentVerificationResult, ReceiptReconciliationResult, ReceiptVerificationClaimBinding,
-    ReceiptVerificationSource, canonical_verifier_id,
+    EffectExecutor, EffectPolicy, EffectRateLimit, EffectReceiptReconciler, EffectReconciler,
+    EffectVerifier, IndependentVerificationResult, ReceiptReconciliationResult,
+    ReceiptVerificationClaimBinding, ReceiptVerificationSource, canonical_verifier_id,
 };
 use hartevo_runtime_adapter::{
     AdapterError, LeaseFence, MappedTurnEventKind, ObservedRuntimeProcessIdentity,
@@ -992,6 +992,57 @@ impl ProposePreviewEffect {
     pub fn authority_payload_bytes(&self) -> Result<Vec<u8>, ApplicationError> {
         Ok(serde_json::to_vec(self)?)
     }
+}
+
+pub const VM00_BILLING_CHECKOUT_CAPABILITY: &str = "billing.checkout";
+pub const VM00_BILLING_CHECKOUT_CHECKPOINT_ID: &str = "entitlement_and_wallet";
+pub const VM00_BILLING_CHECKOUT_POLICY_VERSION: &str = "vm00-billing-checkout-policy/v1";
+pub const VM00_BILLING_CHECKOUT_REQUIRED_SCOPE: &str = "billing.checkout";
+
+/// Exact, replay-stable request for the VM-00 checkout proposal. The checkout
+/// body stays with the provider adapter; Application persists only its
+/// canonical digest and the bounded Effect authority fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProposeVm00BillingCheckout {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub actor_id: ActorId,
+    pub provider: String,
+    pub connection_id: ConnectionId,
+    pub account_id: AccountId,
+    pub checkout_digest: String,
+    pub amount: Money,
+    pub idempotency_key: String,
+    pub expires_at: DateTime<Utc>,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+}
+
+impl ProposeVm00BillingCheckout {
+    pub fn authority_payload_bytes(&self) -> Result<Vec<u8>, ApplicationError> {
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
+/// Exact post-Verification CAS for completing the VM-00 checkout route.
+/// Replaying this command can only reuse the already-verified Effect; it never
+/// grants provider execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompleteVm00BillingCheckout {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vm00BillingCheckoutCompletion {
+    pub mission: Mission,
+    pub completion_evidence_digest: String,
+    pub next_dispatch: Option<MissionCheckpointDispatch>,
+    pub replayed: bool,
 }
 
 /// Window-bound ApprovalGrant for one Proposed Effect. The frozen digest and
@@ -14659,6 +14710,249 @@ impl ApplicationService {
         self.persist_preview_effect(mission, command, now)
     }
 
+    /// Proposes the exact current VM-00 checkout as a Payment Effect. This is
+    /// a durable approval request only: no Provider, Receipt, Verification or
+    /// entitlement is created here.
+    pub fn propose_vm00_billing_checkout(
+        &mut self,
+        command: &ProposeVm00BillingCheckout,
+        now: DateTime<Utc>,
+    ) -> Result<EffectId, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let (checkpoint_revision, checkpoint_status, _) =
+            vm00_billing_checkout_route_contract(&mission)?;
+        if command.expected_mission_revision == 0
+            || command.expected_checkpoint_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || command.actor_id.as_str().trim().is_empty()
+            || command.provider.trim().is_empty()
+            || command.provider.trim() != command.provider
+            || command.connection_id.as_str().trim().is_empty()
+            || command.account_id.as_str().trim().is_empty()
+            || !is_sha256_text(&command.checkout_digest)
+            || command.amount.amount_minor <= 0
+            || command.amount.currency != mission.contract.budget.currency
+            || command.amount.amount_minor > mission.contract.budget.amount_minor
+            || command.idempotency_key.trim().is_empty()
+            || command.idempotency_key.trim() != command.idempotency_key
+            || command.expires_at <= now
+            || command.expires_at > mission.contract.valid_until
+            || command.expires_at > now + Duration::hours(1)
+            || !vm00_billing_checkout_provider_is_contracted(&command.provider)?
+        {
+            return Err(ApplicationError::Vm00BillingCheckoutCommandMismatch);
+        }
+        let spec = vm00_billing_checkout_effect_spec(&mission, command);
+        if let Some(existing) = mission
+            .effects
+            .iter()
+            .find(|effect| effect.id == command.effect_id)
+        {
+            if vm00_billing_checkout_effect_matches_spec(&mission, existing, &spec) {
+                return Ok(existing.id.clone());
+            }
+            return Err(ApplicationError::Vm00BillingCheckoutEffectMismatch);
+        }
+        if mission.revision != command.expected_mission_revision
+            || checkpoint_revision != command.expected_checkpoint_revision
+            || checkpoint_status != MissionCheckpointStatus::Running
+            || !mission.tasks.iter().any(|task| {
+                task.status == TaskStatus::Running
+                    && task.capability == VM00_BILLING_CHECKOUT_CAPABILITY
+            })
+        {
+            return Err(ApplicationError::Vm00BillingCheckoutCommandMismatch);
+        }
+        let connection = self
+            .store
+            .load_connection(&command.project_id, &command.connection_id)
+            .map_err(|_| ApplicationError::Vm00BillingCheckoutConnectionUnavailable)?;
+        if connection.tenant_id() != &mission.tenant_id
+            || connection.project_id() != &mission.project_id
+            || connection.id() != &command.connection_id
+            || connection.provider() != command.provider
+            || connection.account_id() != &command.account_id
+            || !connection.permits_scopes(&spec.required_scopes, now)
+        {
+            return Err(ApplicationError::Vm00BillingCheckoutConnectionUnavailable);
+        }
+        let connection_revision = connection.revision();
+        let expected_mission_revision = mission.revision;
+        let effect_id = mission.propose_effect(spec, now)?;
+        let effect = mission.effect(&effect_id)?;
+        vm00_billing_checkout_effect_policy(&mission, effect)?;
+        let approval_digest = effect.approval_digest();
+        self.store
+            .update_mission_atomic_with_application_source_fences_only(
+                &mission,
+                expected_mission_revision,
+                &[ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Connection,
+                    connection.id().to_string(),
+                    connection_revision,
+                )],
+                &[PendingEvent::new(
+                    "vm00.billing_checkout_approval_requested",
+                    serde_json::json!({
+                        "missionId": mission.id,
+                        "checkpointId": VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
+                        "checkpointRevision": command.expected_checkpoint_revision,
+                        "capabilityId": VM00_BILLING_CHECKOUT_CAPABILITY,
+                        "effectId": effect_id,
+                        "approvalDigest": approval_digest,
+                        "provider": command.provider,
+                        "connectionRevision": connection_revision,
+                        "amountMinor": command.amount.amount_minor,
+                        "currency": command.amount.currency,
+                        "providerExecuted": false,
+                    }),
+                    now,
+                )],
+            )?;
+        Ok(effect_id)
+    }
+
+    /// Completes VM-00 only from the exact independently verified checkout
+    /// Effect. A replay reuses durable completion and never enters the Broker.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact replay check, verified-effect completion, next-route start, and events form one auditable Mission CAS boundary"
+    )]
+    pub fn complete_vm00_billing_checkout(
+        &mut self,
+        command: &CompleteVm00BillingCheckout,
+        now: DateTime<Utc>,
+    ) -> Result<Vm00BillingCheckoutCompletion, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let effect = mission
+            .effect(&command.effect_id)
+            .map_err(|_| ApplicationError::Vm00BillingCheckoutEffectMismatch)?
+            .clone();
+        let completion_evidence_digest =
+            vm00_billing_checkout_completion_digest(&mission, &effect, command)?;
+        let persisted_completion = mission.definition.as_ref().and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == VM00_BILLING_CHECKOUT_CHECKPOINT_ID)
+                .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
+                .and_then(|checkpoint| checkpoint.completion.as_ref())
+        });
+        if let Some(completion) = persisted_completion {
+            if completion.oracle_ids == BTreeSet::from(["effect".into(), "operating_state".into()])
+                && completion.work_product_ids.is_empty()
+                && completion.effect_ids == BTreeSet::from([command.effect_id.clone()])
+                && completion.application_evidence.is_none()
+                && completion.evidence_digest == completion_evidence_digest
+                && completion.verified_at
+                    == effect
+                        .verification
+                        .as_ref()
+                        .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?
+                        .observed_at
+            {
+                let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
+                return Ok(Vm00BillingCheckoutCompletion {
+                    mission,
+                    completion_evidence_digest,
+                    next_dispatch,
+                    replayed: true,
+                });
+            }
+            return Err(ApplicationError::Vm00BillingCheckoutReplayMismatch);
+        }
+        let (checkpoint_revision, checkpoint_status, route) =
+            vm00_billing_checkout_route_contract(&mission)?;
+        if command.expected_mission_revision == 0
+            || command.expected_checkpoint_revision == 0
+            || mission.revision != command.expected_mission_revision
+            || checkpoint_revision != command.expected_checkpoint_revision
+            || checkpoint_status != MissionCheckpointStatus::Verifying
+            || now
+                < effect
+                    .verification
+                    .as_ref()
+                    .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?
+                    .observed_at
+        {
+            return Err(ApplicationError::Vm00BillingCheckoutCompletionMismatch);
+        }
+        let expected_mission_revision = mission.revision;
+        let verified_at = effect
+            .verification
+            .as_ref()
+            .expect("verified checkout validated")
+            .observed_at;
+        mission.complete_checkpoint(
+            VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
+            MissionCheckpointCompletion {
+                oracle_ids: route.oracle_ids,
+                work_product_ids: BTreeSet::new(),
+                effect_ids: BTreeSet::from([command.effect_id.clone()]),
+                application_evidence: None,
+                evidence_digest: completion_evidence_digest.clone(),
+                verified_at,
+            },
+        )?;
+        let completed_checkpoint_revision = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == VM00_BILLING_CHECKOUT_CHECKPOINT_ID)
+            })
+            .map(|checkpoint| checkpoint.revision)
+            .ok_or(ApplicationError::Vm00BillingCheckoutCompletionMismatch)?;
+        let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
+        let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
+        let mut events = vec![PendingEvent::new(
+            "vm00.billing_checkout_verified",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
+                "checkpointRevision": completed_checkpoint_revision,
+                "capabilityId": VM00_BILLING_CHECKOUT_CAPABILITY,
+                "effectId": effect.id,
+                "receiptId": effect.receipt.as_ref().map(|receipt| &receipt.id),
+                "verificationId": effect.verification.as_ref().map(|verification| &verification.id),
+                "independent": true,
+                "completionEvidenceDigest": completion_evidence_digest,
+            }),
+            now,
+        )];
+        if let Some((checkpoint_id, checkpoint_revision, capability_id, executor, task_id, cycle)) =
+            next_started
+        {
+            events.push(PendingEvent::new(
+                "mission.checkpoint_started",
+                serde_json::json!({
+                    "missionId": mission.id,
+                    "checkpointId": checkpoint_id,
+                    "checkpointRevision": checkpoint_revision,
+                    "capabilityId": capability_id,
+                    "executor": executor,
+                    "cycle": cycle,
+                    "taskId": task_id,
+                }),
+                now,
+            ));
+        }
+        self.store
+            .update_mission_atomic(&mission, expected_mission_revision, &events)?;
+        Ok(Vm00BillingCheckoutCompletion {
+            mission,
+            completion_evidence_digest,
+            next_dispatch,
+            replayed: false,
+        })
+    }
+
     /// Propose one preview Effect only at the exact caller-observed Mission
     /// revision. Desktop uses this entry point after Cordis admits the typed
     /// proposal; it still creates Domain state only and never invokes a
@@ -23796,6 +24090,256 @@ fn order_mission(
         .ok_or_else(|| OutcomeLedgerError::EventProjectionMismatch.into())
 }
 
+const VM00_BILLING_CHECKOUT_DESCRIPTION: &str = "Confirm the VM-00 entitlement checkout";
+
+fn vm00_billing_checkout_route_contract(
+    mission: &Mission,
+) -> Result<(u64, MissionCheckpointStatus, MissionCheckpointRoute), ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::Vm00BillingCheckoutRouteUnavailable)?;
+    let catalog = Catalog::load()?;
+    let catalog_digest = catalog.snapshot()?.digest;
+    let checkpoint = definition
+        .current_checkpoint()
+        .ok_or(ApplicationError::Vm00BillingCheckoutRouteUnavailable)?;
+    let route = checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::Vm00BillingCheckoutRouteUnavailable)?;
+    if definition.manifest_id != "VM-00"
+        || definition.manifest_version != 3
+        || definition.catalog_digest != catalog_digest
+        || checkpoint.id != VM00_BILLING_CHECKOUT_CHECKPOINT_ID
+        || route.capability_id != VM00_BILLING_CHECKOUT_CAPABILITY
+        || route.executor != MissionCheckpointExecutor::EffectBroker
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
+        || route.oracle_ids != BTreeSet::from(["effect".into(), "operating_state".into()])
+    {
+        return Err(ApplicationError::Vm00BillingCheckoutRouteUnavailable);
+    }
+    Ok((checkpoint.revision, checkpoint.status, route.clone()))
+}
+
+fn vm00_billing_checkout_provider_is_contracted(provider: &str) -> Result<bool, ApplicationError> {
+    let catalog = Catalog::load()?;
+    let Some(mission) = catalog.mission("VM-00") else {
+        return Ok(false);
+    };
+    Ok(mission.provider_ids.iter().any(|id| id == provider)
+        && catalog.providers.providers.iter().any(|candidate| {
+            candidate.id == provider
+                && candidate
+                    .capability_ids
+                    .iter()
+                    .any(|capability| capability == VM00_BILLING_CHECKOUT_CAPABILITY)
+                && candidate.requires_external_approval
+                && matches!(
+                    candidate.status.as_str(),
+                    "target_contract" | "contract_only"
+                )
+        }))
+}
+
+fn vm00_billing_checkout_effect_spec(
+    mission: &Mission,
+    command: &ProposeVm00BillingCheckout,
+) -> EffectSpec {
+    EffectSpec {
+        id: command.effect_id.clone(),
+        actor_id: command.actor_id.clone(),
+        capability: VM00_BILLING_CHECKOUT_CAPABILITY.into(),
+        provider: command.provider.clone(),
+        connection_id: Some(command.connection_id.clone()),
+        account_id: Some(command.account_id.clone()),
+        required_scopes: BTreeSet::from([VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()]),
+        effect_class: EffectClass::Payment,
+        description: VM00_BILLING_CHECKOUT_DESCRIPTION.into(),
+        target_resource: format!(
+            "billing-checkout://{}/{}",
+            command.project_id, command.effect_id
+        ),
+        audience_digest: None,
+        payload_digest: command.checkout_digest.clone(),
+        asset_digests: BTreeSet::new(),
+        scheduled_for: None,
+        timezone: mission.contract.timezone.clone(),
+        consent: ConsentState::NotRequired,
+        consent_record_id: None,
+        consent_requirement: None,
+        conversation_guard: None,
+        creator_contact_guard: None,
+        policy_version: VM00_BILLING_CHECKOUT_POLICY_VERSION.into(),
+        risk: EffectRisk::Critical,
+        idempotency_key: command.idempotency_key.clone(),
+        amount: command.amount.clone(),
+        expires_at: command.expires_at,
+    }
+}
+
+fn vm00_billing_checkout_effect_matches_spec(
+    mission: &Mission,
+    effect: &Effect,
+    spec: &EffectSpec,
+) -> bool {
+    effect.tenant_id == mission.tenant_id
+        && effect.project_id == mission.project_id
+        && effect.mission_id == mission.id
+        && effect.id == spec.id
+        && effect.actor_id == spec.actor_id
+        && effect.capability == spec.capability
+        && effect.provider == spec.provider
+        && effect.connection_id == spec.connection_id
+        && effect.account_id == spec.account_id
+        && effect.required_scopes == spec.required_scopes
+        && effect.effect_class == spec.effect_class
+        && effect.description == spec.description
+        && effect.target_resource == spec.target_resource
+        && effect.audience_digest == spec.audience_digest
+        && effect.payload_digest == spec.payload_digest
+        && effect.asset_digests == spec.asset_digests
+        && effect.scheduled_for == spec.scheduled_for
+        && effect.timezone == spec.timezone
+        && effect.consent == spec.consent
+        && effect.consent_record_id == spec.consent_record_id
+        && effect.consent_requirement == spec.consent_requirement
+        && effect.conversation_guard == spec.conversation_guard
+        && effect.creator_contact_guard == spec.creator_contact_guard
+        && effect.policy_version == spec.policy_version
+        && effect.risk == spec.risk
+        && effect.idempotency_key == spec.idempotency_key
+        && effect.amount == spec.amount
+        && effect.expires_at == spec.expires_at
+}
+
+fn validate_vm00_billing_checkout_effect_shape(
+    mission: &Mission,
+    effect: &Effect,
+) -> Result<(), ApplicationError> {
+    let expected_target = format!("billing-checkout://{}/{}", mission.project_id, effect.id);
+    if !mission.contract.approval_policy.exact_scope_required
+        || !mission
+            .contract
+            .approval_policy
+            .required_effect_classes
+            .contains(&EffectClass::Payment)
+        || effect.tenant_id != mission.tenant_id
+        || effect.project_id != mission.project_id
+        || effect.mission_id != mission.id
+        || effect.capability != VM00_BILLING_CHECKOUT_CAPABILITY
+        || !vm00_billing_checkout_provider_is_contracted(&effect.provider)?
+        || effect.connection_id.is_none()
+        || effect.account_id.is_none()
+        || effect.required_scopes != BTreeSet::from([VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()])
+        || effect.effect_class != EffectClass::Payment
+        || effect.description != VM00_BILLING_CHECKOUT_DESCRIPTION
+        || effect.target_resource != expected_target
+        || effect.audience_digest.is_some()
+        || !is_sha256_text(&effect.payload_digest)
+        || !effect.asset_digests.is_empty()
+        || effect.scheduled_for.is_some()
+        || effect.timezone != mission.contract.timezone
+        || effect.consent != ConsentState::NotRequired
+        || effect.consent_record_id.is_some()
+        || effect.consent_requirement.is_some()
+        || effect.conversation_guard.is_some()
+        || effect.creator_contact_guard.is_some()
+        || effect.policy_version != VM00_BILLING_CHECKOUT_POLICY_VERSION
+        || effect.risk != EffectRisk::Critical
+        || effect.idempotency_key.trim().is_empty()
+        || effect.amount.amount_minor <= 0
+        || effect.amount.currency != mission.contract.budget.currency
+        || effect.amount.amount_minor > mission.contract.budget.amount_minor
+        || effect.expires_at > mission.contract.valid_until
+    {
+        return Err(ApplicationError::Vm00BillingCheckoutEffectMismatch);
+    }
+    Ok(())
+}
+
+/// Deterministic policy used for both explicit approval and first execution
+/// of the exact current VM-00 checkout Effect. The Provider adapter and its
+/// credentials remain outside Application and Cordis.
+pub fn vm00_billing_checkout_effect_policy(
+    mission: &Mission,
+    effect: &Effect,
+) -> Result<EffectPolicy, ApplicationError> {
+    let (_, status, _) = vm00_billing_checkout_route_contract(mission)?;
+    if !matches!(
+        status,
+        MissionCheckpointStatus::WaitingApproval
+            | MissionCheckpointStatus::Running
+            | MissionCheckpointStatus::Verifying
+    ) {
+        return Err(ApplicationError::Vm00BillingCheckoutRouteUnavailable);
+    }
+    validate_vm00_billing_checkout_effect_shape(mission, effect)?;
+    Ok(EffectPolicy {
+        version: VM00_BILLING_CHECKOUT_POLICY_VERSION.into(),
+        allowed_capabilities: BTreeSet::from([VM00_BILLING_CHECKOUT_CAPABILITY.into()]),
+        allowed_classes: BTreeSet::from([EffectClass::Payment]),
+        max_amounts_minor: BTreeMap::from([(
+            mission.contract.budget.currency.clone(),
+            mission.contract.budget.amount_minor,
+        )]),
+        rate_limits: vec![EffectRateLimit {
+            rule_id: "desktop-vm00-billing-checkout-hourly".into(),
+            provider: effect.provider.clone(),
+            capability: VM00_BILLING_CHECKOUT_CAPABILITY.into(),
+            max_executions: 1,
+            window_seconds: 3_600,
+        }],
+    })
+}
+
+fn vm00_billing_checkout_completion_digest(
+    mission: &Mission,
+    effect: &Effect,
+    command: &CompleteVm00BillingCheckout,
+) -> Result<String, ApplicationError> {
+    validate_vm00_billing_checkout_effect_shape(mission, effect)?;
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(ApplicationError::Vm00BillingCheckoutEffectMismatch)?;
+    if effect.status != EffectStatus::Verified
+        || receipt.provider != effect.provider
+        || receipt.request_digest != effect.approval_digest()
+        || verification.status != VerificationStatus::Confirmed
+        || !verification.independent
+        || verification.receipt_id != receipt.id
+        || verification.observed_at < receipt.accepted_at
+    {
+        return Err(ApplicationError::Vm00BillingCheckoutEffectMismatch);
+    }
+    canonical_sha256(&serde_json::json!({
+        "schemaVersion": "vm00-billing-checkout-completion/v1",
+        "missionId": mission.id,
+        "checkpointId": VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
+        "capabilityId": VM00_BILLING_CHECKOUT_CAPABILITY,
+        "effectId": effect.id,
+        "effectApprovalDigest": effect.approval_digest(),
+        "provider": effect.provider,
+        "connectionId": effect.connection_id,
+        "accountId": effect.account_id,
+        "amountMinor": effect.amount.amount_minor,
+        "currency": effect.amount.currency,
+        "receiptId": receipt.id,
+        "receiptRequestDigest": receipt.request_digest,
+        "receiptResponseDigest": receipt.response_digest,
+        "verificationId": verification.id,
+        "verificationEvidenceDigest": verification.evidence_digest,
+        "verifiedAt": verification.observed_at,
+        "verificationMissionRevision": command.expected_mission_revision,
+        "verificationCheckpointRevision": command.expected_checkpoint_revision,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn creator_recruitment_effect_spec(
     hiring: &CreatorHiring,
@@ -25072,6 +25616,24 @@ pub enum ApplicationError {
     ProposedEffectApprovalUnavailable,
     #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
     ProposedEffectApprovalDigestMismatch,
+    #[error(
+        "VM-00 billing checkout requires an exact current route, bounded payment, stable digest, and Mission/Checkpoint revisions"
+    )]
+    Vm00BillingCheckoutCommandMismatch,
+    #[error("VM-00 billing checkout is not the current contracted Effect Broker route")]
+    Vm00BillingCheckoutRouteUnavailable,
+    #[error(
+        "VM-00 billing checkout requires the exact connected provider account and checkout scope"
+    )]
+    Vm00BillingCheckoutConnectionUnavailable,
+    #[error("VM-00 billing checkout Effect no longer matches its frozen route authority")]
+    Vm00BillingCheckoutEffectMismatch,
+    #[error(
+        "VM-00 billing checkout completion no longer matches the verified Mission/Checkpoint revision"
+    )]
+    Vm00BillingCheckoutCompletionMismatch,
+    #[error("VM-00 billing checkout replay does not match the durable verified completion")]
+    Vm00BillingCheckoutReplayMismatch,
     #[error(
         "Effect execution requires an exact approved Effect digest, Broker authorization digest, and Mission CAS revision"
     )]
@@ -26354,7 +26916,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one VM-00 contract test proves three local Project checkpoints, Project/Keyring fencing, recoverable provisioning, content-free evidence, atomic handoffs, exact replay, and stale-command refusal"
+        reason = "one VM-00 contract test proves the local Project foundations plus budget-fenced, connected-account checkout proposal, content-free evidence, exact replay, and stale-command refusal"
     )]
     fn vm00_local_identity_inventory_and_encryption_are_fenced_replayable_and_advance_without_outcome()
      {
@@ -26397,7 +26959,7 @@ mod tests {
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
                     kpis: catalog_count_kpis(),
-                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                    budget: Money::new(5_000, CurrencyCode::parse("USD").expect("USD")),
                 },
                 now() + Duration::milliseconds(1),
             )
@@ -26838,6 +27400,240 @@ mod tests {
                 .len(),
             event_count
         );
+
+        let checkout_now = now() + Duration::milliseconds(15);
+        let connection_id = ConnectionId::from("vm00-checkout-connection");
+        let account_id = AccountId::from("vm00-checkout-account");
+        service
+            .register_connection(
+                Connection::register(
+                    connection_id.clone(),
+                    TenantId::from("vm00-local-identity-tenant"),
+                    project_id.clone(),
+                    "stripe",
+                    account_id.clone(),
+                    "acct_vm00_application_private",
+                    [VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()],
+                    checkout_now,
+                )
+                .expect("VM-00 Stripe connection"),
+                checkout_now,
+            )
+            .expect("persist VM-00 Stripe connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "acct_vm00_application_private".into(),
+                    granted_scopes: BTreeSet::from([VM00_BILLING_CHECKOUT_REQUIRED_SCOPE.into()]),
+                    probed_at: checkout_now,
+                    valid_until: checkout_now + Duration::days(30),
+                    credential_expires_at: checkout_now + Duration::days(30),
+                    evidence_digest: "6".repeat(64),
+                },
+                checkout_now,
+            )
+            .expect("probe VM-00 Stripe connection");
+        let checkout_ready = service
+            .load_mission(&project_id, &mission_id)
+            .expect("checkout-ready VM-00 Mission");
+        let checkpoint_revision = checkout_ready
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .map(|checkpoint| checkpoint.revision)
+            .expect("checkout Checkpoint revision");
+        let checkout_effect_id = EffectId::from("vm00-checkout-effect");
+        let checkout_command = ProposeVm00BillingCheckout {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: checkout_effect_id.clone(),
+            actor_id: ActorId::from("vm00-checkout-actor"),
+            provider: "stripe".into(),
+            connection_id,
+            account_id,
+            checkout_digest: "a".repeat(64),
+            amount: Money::new(2_000, CurrencyCode::parse("USD").expect("USD")),
+            idempotency_key: "vm00-checkout-1".into(),
+            expires_at: checkout_now + Duration::minutes(30),
+            expected_mission_revision: checkout_ready.revision,
+            expected_checkpoint_revision: checkpoint_revision,
+        };
+        let checkout_event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before checkout proposal")
+            .len();
+        assert!(matches!(
+            service.propose_vm00_billing_checkout(
+                &ProposeVm00BillingCheckout {
+                    amount: Money::new(5_001, CurrencyCode::parse("USD").expect("USD"),),
+                    ..checkout_command.clone()
+                },
+                checkout_now,
+            ),
+            Err(ApplicationError::Vm00BillingCheckoutCommandMismatch)
+        ));
+        assert!(
+            service
+                .load_mission(&project_id, &mission_id)
+                .expect("VM-00 Mission after rejected checkout")
+                .effects
+                .is_empty()
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after rejected checkout")
+                .len(),
+            checkout_event_count
+        );
+
+        assert_eq!(
+            service
+                .propose_vm00_billing_checkout(&checkout_command, checkout_now)
+                .expect("bounded VM-00 checkout proposal"),
+            checkout_effect_id
+        );
+        let proposed = service
+            .load_mission(&project_id, &mission_id)
+            .expect("VM-00 Mission after checkout proposal");
+        let effect = proposed
+            .effect(&checkout_effect_id)
+            .expect("VM-00 Payment Effect");
+        assert_eq!(effect.effect_class, EffectClass::Payment);
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        assert_eq!(effect.amount.amount_minor, 2_000);
+        assert!(effect.receipt.is_none());
+        assert!(effect.verification.is_none());
+        let proposal_event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after checkout proposal")
+            .len();
+        assert_eq!(
+            service
+                .propose_vm00_billing_checkout(
+                    &checkout_command,
+                    checkout_now + Duration::milliseconds(1),
+                )
+                .expect("exact checkout replay"),
+            checkout_effect_id
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after exact checkout replay")
+                .len(),
+            proposal_event_count
+        );
+        assert!(matches!(
+            service.propose_vm00_billing_checkout(
+                &ProposeVm00BillingCheckout {
+                    checkout_digest: "b".repeat(64),
+                    ..checkout_command
+                },
+                checkout_now + Duration::milliseconds(2),
+            ),
+            Err(ApplicationError::Vm00BillingCheckoutEffectMismatch)
+        ));
+        let checkout_event_json = serde_json::to_string(
+            &service
+                .mission_events(&project_id, &mission_id)
+                .expect("content-free checkout events"),
+        )
+        .expect("checkout event JSON");
+        assert!(checkout_event_json.contains("vm00.billing_checkout_approval_requested"));
+        assert!(!checkout_event_json.contains("acct_vm00_application_private"));
+        assert!(!checkout_event_json.contains(&"a".repeat(64)));
+
+        let proposed = service
+            .load_mission(&project_id, &mission_id)
+            .expect("proposed checkout before approval");
+        let proposed_effect = proposed
+            .effect(&checkout_effect_id)
+            .expect("proposed checkout Effect before approval");
+        let expected_scope_digest = proposed_effect.approval_digest();
+        let mut checkout_broker = EffectBroker::new(
+            vm00_billing_checkout_effect_policy(&proposed, proposed_effect)
+                .expect("deterministic VM-00 checkout policy"),
+            "vm00-application-checkout-worker",
+        )
+        .with_lease_for(Duration::days(36_500));
+        service
+            .approve_proposed_effect(
+                &checkout_broker,
+                ApproveProposedEffect {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: checkout_effect_id.clone(),
+                    expected_scope_digest: expected_scope_digest.clone(),
+                    expected_mission_revision: proposed.revision,
+                },
+                ActorId::from("vm00-checkout-approver"),
+                checkout_now + Duration::milliseconds(3),
+            )
+            .expect("explicit VM-00 checkout approval");
+        let approved = service
+            .load_mission(&project_id, &mission_id)
+            .expect("approved VM-00 checkout Mission");
+        let approval = approved
+            .effect(&checkout_effect_id)
+            .expect("approved VM-00 checkout Effect")
+            .approval
+            .clone()
+            .expect("durable VM-00 checkout approval");
+        let mut uncertain_executor = UncertainRelationshipExecutor::default();
+        let mut verifier = RelationshipVerifier {
+            observed_at: checkout_now + Duration::milliseconds(5),
+        };
+        assert!(
+            service
+                .execute_approved_effect_at_revision(
+                    &mut checkout_broker,
+                    &ExecuteApprovedEffect {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        effect_id: checkout_effect_id.clone(),
+                        expected_scope_digest: expected_scope_digest.clone(),
+                        expected_broker_authorization_digest: approval.permission_digest.clone(),
+                        expected_mission_revision: approved.revision,
+                    },
+                    &mut uncertain_executor,
+                    &mut verifier,
+                    checkout_now + Duration::milliseconds(4),
+                )
+                .is_err()
+        );
+        assert_eq!(uncertain_executor.calls, 1);
+        let uncertain = service
+            .load_mission(&project_id, &mission_id)
+            .expect("uncertain VM-00 checkout Mission");
+        assert_eq!(
+            uncertain
+                .effect(&checkout_effect_id)
+                .expect("uncertain VM-00 checkout Effect")
+                .status,
+            EffectStatus::VerificationRequired
+        );
+        assert!(matches!(
+            service.execute_approved_effect_at_revision(
+                &mut checkout_broker,
+                &ExecuteApprovedEffect {
+                    project_id,
+                    mission_id,
+                    effect_id: checkout_effect_id,
+                    expected_scope_digest,
+                    expected_broker_authorization_digest: approval.permission_digest,
+                    expected_mission_revision: uncertain.revision,
+                },
+                &mut uncertain_executor,
+                &mut verifier,
+                checkout_now + Duration::milliseconds(6),
+            ),
+            Err(ApplicationError::EffectExecutionAuthorityMismatch)
+        ));
+        assert_eq!(uncertain_executor.calls, 1);
     }
 
     #[test]
