@@ -30,8 +30,8 @@ use hartevo_application::{
     AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
     ApplicationService, ApproveProposedEffect, BrowserPublicSourceObservation,
     CatalogMissionExecutionHandle, CompleteVm00BillingCheckout, ConfirmHumanMissionCheckpoint,
-    ContinueBrowserWorkspace, CordisMissionDraft, CordisMissionTurnPlan, CreateBrowserWorkspace,
-    CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
+    ConfirmVm00GoalSelection, ContinueBrowserWorkspace, CordisMissionDraft, CordisMissionTurnPlan,
+    CreateBrowserWorkspace, CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
     DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     ExecuteApprovedEffect, FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn,
@@ -50,8 +50,8 @@ use hartevo_application::{
     StartMission, TakeOverBrowserWorkspace, TypedRuntimeObservation,
     VM00_BILLING_CHECKOUT_CAPABILITY, VM00_BILLING_CHECKOUT_CHECKPOINT_ID,
     VM00_BILLING_CHECKOUT_POLICY_VERSION, VM00_BILLING_CHECKOUT_REQUIRED_SCOPE,
-    VerifyRecordedReceiptAtRevision, Vm11NextContractOrValidTerminalResult,
-    vm00_billing_checkout_effect_policy,
+    VerifyRecordedReceiptAtRevision, Vm00TargetMissionSelection,
+    Vm11NextContractOrValidTerminalResult, vm00_billing_checkout_effect_policy,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserLeaseProof,
@@ -649,6 +649,46 @@ pub struct DesktopHumanCheckpointConfirmationRequest {
     pub expected_mission_revision: u64,
     pub expected_checkpoint_revision: u64,
     pub expected_conversation_revision: u64,
+}
+
+/// Exact Desktop input for VM-00's private target-Mission selection. The
+/// nested Catalog request supplies contract facts only; Application derives
+/// stable IDs and freezes the compiled target authority.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopVm00GoalSelectionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub target: DesktopCatalogMissionRequest,
+    pub message_id: MissionConversationMessageId,
+    pub idempotency_key: String,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_conversation_revision: u64,
+}
+
+impl fmt::Debug for DesktopVm00GoalSelectionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopVm00GoalSelectionRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("target", &"[REDACTED]")
+            .field("target_manifest_id", &self.target.manifest_id)
+            .field("target_mode", &self.target.mode)
+            .field("private_target_contract", &"[REDACTED]")
+            .field("message_id", &self.message_id)
+            .field("idempotency_key", &"[REDACTED]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field(
+                "expected_checkpoint_revision",
+                &self.expected_checkpoint_revision,
+            )
+            .field(
+                "expected_conversation_revision",
+                &self.expected_conversation_revision,
+            )
+            .finish()
+    }
 }
 
 /// Exact Desktop-to-Application fence for adopting one projected WorkProduct.
@@ -4170,6 +4210,80 @@ impl DesktopDataPlane {
             secret_store,
             runtime_reconciliation,
             product_evidence,
+            now,
+        )
+    }
+
+    /// Persists VM-00's exact target-Mission selection without creating the
+    /// target or dispatching Runtime/Provider work. Application compiles the
+    /// selected Catalog contract and stores the frozen blueprint privately in
+    /// the same SQLCipher transaction as the Human Checkpoint transition.
+    pub fn confirm_vm00_goal_selection_os(
+        &self,
+        request: DesktopVm00GoalSelectionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.confirm_vm00_goal_selection_with(&secret_store, request, now)
+    }
+
+    pub fn confirm_vm00_goal_selection_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopVm00GoalSelectionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.idempotency_key.trim().is_empty()
+            || request.target.project_id != request.project_id
+            || request.target.parent_mission_id.is_some()
+        {
+            return Err(DesktopDataError::InvalidVm00GoalSelection);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let StartCatalogMission {
+            manifest_id,
+            mode,
+            title,
+            goal,
+            market,
+            language,
+            audience,
+            timezone,
+            kpis,
+            budget,
+            ..
+        } = Self::catalog_mission_start_command(&service, request.target)?;
+        service.confirm_vm00_goal_selection(
+            ConfirmVm00GoalSelection {
+                project_id,
+                mission_id: request.mission_id,
+                selection: Vm00TargetMissionSelection {
+                    manifest_id,
+                    mode,
+                    title,
+                    goal,
+                    market,
+                    language,
+                    audience,
+                    timezone,
+                    kpis,
+                    budget,
+                },
+                message_id: request.message_id,
+                idempotency_key: request.idempotency_key,
+                expected_mission_revision: request.expected_mission_revision,
+                expected_checkpoint_revision: request.expected_checkpoint_revision,
+                expected_conversation_revision: request.expected_conversation_revision,
+            },
+            now,
+        )?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
             now,
         )
     }
@@ -12256,6 +12370,10 @@ pub enum DesktopDataError {
     )]
     InvalidHumanCheckpointConfirmation,
     #[error(
+        "VM-00 goal selection requires one same-Project, parent-free Catalog Mission contract and exact revisions"
+    )]
+    InvalidVm00GoalSelection,
+    #[error(
         "VM-11 outcome decision requires a typed action, private rationale, actor, and exact frozen review digests"
     )]
     InvalidVm11OutcomeDecision,
@@ -12491,7 +12609,7 @@ mod tests {
         AcceptCreatorTask, CreateBrowserWorkspace, CreateManagedBrowserProfile, CreateProject,
         EvidenceInput, ProposePreviewEffect, ProvisionProjectEncryption, PublishCreatorTask,
         ResearchPacket, RuntimeTextSubscriptionError, StartCreatorWorkMission, StartMission,
-        StartRelationshipMission, SubmitCreatorDeliverable,
+        StartRelationshipMission, SubmitCreatorDeliverable, Vm00TargetMissionPlan,
     };
     use hartevo_browser_adapter::FakeBrowserHost;
     use hartevo_domain_kernel::{
@@ -16069,21 +16187,19 @@ sleep 30"#;
             Some(MissionCheckpointExecutor::Human)
         );
 
-        let private_goal_confirmation =
-            "PRIVATE-VM00-GOAL-CONFIRMATION::compile only this selected local goal";
-        let goal_message_id = MissionConversationMessageId::new();
-        let contract_snapshot = reopened
-            .confirm_human_mission_checkpoint_with(
+        let generic_goal_message_id = MissionConversationMessageId::new();
+        assert!(matches!(
+            reopened.confirm_human_mission_checkpoint_with(
                 &secrets,
                 DesktopHumanCheckpointConfirmationRequest {
                     project_id: project_id.clone(),
                     mission_id: submission.mission_id.clone(),
                     checkpoint_id: "goal_selected".into(),
-                    message_id: goal_message_id.clone(),
-                    body: private_goal_confirmation.into(),
+                    message_id: generic_goal_message_id.clone(),
+                    body: "PRIVATE-VM00-GOAL-CONFIRMATION::must not be parsed".into(),
                     idempotency_key: format!(
-                        "desktop-vm00-goal-confirmation:{}",
-                        goal_message_id.as_str()
+                        "desktop-vm00-generic-goal:{}",
+                        generic_goal_message_id.as_str()
                     ),
                     work_product_ids: BTreeSet::new(),
                     expected_mission_revision: goal_projection.revision,
@@ -16095,8 +16211,34 @@ sleep 30"#;
                         .expect("goal Conversation revision"),
                 },
                 refreshed_at + Duration::seconds(4),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::StructuredVm00GoalSelectionRequired
+            ))
+        ));
+
+        let goal_message_id = MissionConversationMessageId::new();
+        let goal_selection = DesktopVm00GoalSelectionRequest {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            target: catalog_runtime_request(&project_id),
+            message_id: goal_message_id.clone(),
+            idempotency_key: format!("desktop-vm00-goal-selection:{}", goal_message_id.as_str()),
+            expected_mission_revision: goal_projection.revision,
+            expected_checkpoint_revision: goal_projection
+                .current_checkpoint_revision
+                .expect("goal Checkpoint revision"),
+            expected_conversation_revision: goal_projection
+                .conversation_revision
+                .expect("goal Conversation revision"),
+        };
+        let contract_snapshot = reopened
+            .confirm_vm00_goal_selection_with(
+                &secrets,
+                goal_selection.clone(),
+                refreshed_at + Duration::seconds(5),
             )
-            .expect("confirm exact VM-00 goal selection");
+            .expect("confirm typed VM-00 target Mission selection");
         let contract_projection = contract_snapshot.inventory.projects[0]
             .missions
             .iter()
@@ -16122,7 +16264,90 @@ sleep 30"#;
             )
         );
 
-        let contract_now = refreshed_at + Duration::seconds(5);
+        let (service, _) = reopened
+            .open_application_from_secret(&database_secret, refreshed_at + Duration::seconds(6))
+            .expect("Application after VM-00 target selection");
+        let selection_event_count = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("events after typed VM-00 target selection")
+            .len();
+        let conversation = service
+            .mission_conversation(&project_id, &submission.mission_id)
+            .expect("private VM-00 Conversation after target selection");
+        let private_plan_message = conversation
+            .messages
+            .iter()
+            .find(|message| message.id == goal_message_id)
+            .expect("private VM-00 target Mission plan");
+        let target_plan = serde_json::from_str::<Vm00TargetMissionPlan>(&private_plan_message.body)
+            .expect("typed private VM-00 target Mission plan");
+        assert_eq!(
+            target_plan.schema_version,
+            Vm00TargetMissionPlan::SCHEMA_VERSION
+        );
+        assert_eq!(target_plan.source_mission_id, submission.mission_id);
+        assert_eq!(target_plan.selection.manifest_id, "VM-04");
+        assert_eq!(
+            target_plan.selection.goal,
+            "Render authorized private Runtime text while execution remains bounded"
+        );
+        assert_eq!(target_plan.target_definition.manifest_id, "VM-04");
+        assert_eq!(
+            target_plan.target_definition.catalog_digest,
+            Catalog::load()
+                .expect("Catalog")
+                .snapshot()
+                .expect("Catalog snapshot")
+                .digest
+        );
+        assert_eq!(target_plan.target_contract.goal, target_plan.selection.goal);
+        assert_eq!(
+            target_plan.target_mission_id,
+            MissionId::from_stable(format!("vm00-target-mission:{}", submission.mission_id))
+        );
+        assert!(!format!("{target_plan:?}").contains(&target_plan.selection.goal));
+        assert!(!format!("{goal_selection:?}").contains(&target_plan.selection.goal));
+        assert!(matches!(
+            service.load_mission(&project_id, &target_plan.target_mission_id),
+            Err(ApplicationError::Storage(
+                StorageError::MissionNotFound { .. }
+            ))
+        ));
+        drop(service);
+
+        reopened
+            .confirm_vm00_goal_selection_with(
+                &secrets,
+                goal_selection.clone(),
+                refreshed_at + Duration::seconds(7),
+            )
+            .expect("exact typed VM-00 target selection replay");
+        let (service, _) = reopened
+            .open_application_from_secret(&database_secret, refreshed_at + Duration::seconds(8))
+            .expect("Application after target-selection replay");
+        assert_eq!(
+            service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("events after target-selection replay")
+                .len(),
+            selection_event_count
+        );
+        drop(service);
+
+        let mut swapped_goal_selection = goal_selection;
+        swapped_goal_selection.target.goal = "PRIVATE-SWAPPED-VM00-TARGET".into();
+        assert!(matches!(
+            reopened.confirm_vm00_goal_selection_with(
+                &secrets,
+                swapped_goal_selection,
+                refreshed_at + Duration::seconds(9),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::StructuredVm00GoalSelectionReplayMismatch
+            ))
+        ));
+
+        let contract_now = refreshed_at + Duration::seconds(10);
         let (mut service, _) = reopened
             .open_application_from_secret(&database_secret, contract_now)
             .expect("mutable Application for VM-00 Operating Contract");
@@ -16464,7 +16689,11 @@ sleep 30"#;
         assert!(!event_json.contains("preview-desktop-vm00-checkout-effect"));
         assert!(!event_json.contains(device_id.as_str()));
         assert!(!event_json.contains(private_goal));
-        assert!(!event_json.contains(private_goal_confirmation));
+        assert!(
+            !event_json
+                .contains("Render authorized private Runtime text while execution remains bounded")
+        );
+        assert!(!event_json.contains("PRIVATE-SWAPPED-VM00-TARGET"));
         drop(directory);
     }
 
