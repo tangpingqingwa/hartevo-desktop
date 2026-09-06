@@ -1195,6 +1195,7 @@ mod tests {
             evidence_count: 0,
             work_product_count: 0,
             work_products: Vec::new(),
+            vm03_domain_quote: None,
             pending_approval_count: 0,
             pending_effects: Vec::new(),
             verified_effect_count: 0,

@@ -17147,19 +17147,20 @@ sleep 30"#;
             .load_work_product_manifest(&project_id, &work_product_id)
             .expect("quote manifest");
         drop(cold_service);
-        cold.adopt_work_product_with(
-            &secrets,
-            DesktopWorkProductAdoptionRequest {
-                project_id: project_id.clone(),
-                mission_id: submission.mission_id.clone(),
-                work_product_id: work_product_id.clone(),
-                expected_mission_revision: mission.revision,
-                expected_work_product_revision: draft.revision,
-                expected_manifest_version: manifest.version,
-            },
-            observed_at() + Duration::minutes(6),
-        )
-        .expect("adopt exact domain quote");
+        let adopted = cold
+            .adopt_work_product_with(
+                &secrets,
+                DesktopWorkProductAdoptionRequest {
+                    project_id: project_id.clone(),
+                    mission_id: submission.mission_id.clone(),
+                    work_product_id: work_product_id.clone(),
+                    expected_mission_revision: mission.revision,
+                    expected_work_product_revision: draft.revision,
+                    expected_manifest_version: manifest.version,
+                },
+                observed_at() + Duration::minutes(6),
+            )
+            .expect("adopt exact domain quote");
         let (service, _) = cold
             .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(6))
             .expect("purchase-ready Application");
@@ -17169,31 +17170,77 @@ sleep 30"#;
         let manifest = service
             .load_work_product_manifest(&project_id, &work_product_id)
             .expect("adopted quote manifest");
-        let proposal = hartevo_application::ProposeVm03DomainPurchase {
-            project_id: project_id.clone(),
-            mission_id: submission.mission_id.clone(),
-            effect_id: EffectId::from("desktop-vm03-purchase"),
-            actor_id: ActorId::from("desktop-vm03-owner"),
-            work_product_id: work_product_id.clone(),
-            idempotency_key: "desktop-vm03-purchase-once".into(),
-            expected_mission_revision: ready.revision,
-            expected_checkpoint_revision: ready
-                .definition
-                .as_ref()
-                .and_then(|definition| definition.current_checkpoint())
-                .expect("purchase route")
-                .revision,
-            expected_connection_revision: connected.revision(),
-            expected_work_product_revision: manifest.work_product_revision,
-            expected_manifest_version: manifest.version,
-        };
+        let projected = adopted.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("exact adopted Mission");
+        let quote = projected
+            .vm03_domain_quote
+            .as_ref()
+            .expect("unlocked quote terms");
+        assert!(quote.can_propose);
+        assert_eq!(quote.provider, "cloudflare-registrar");
+        assert_eq!(quote.amount.amount_minor, 1_000);
+        assert_eq!(quote.registration_years, 1);
+        let now = observed_at() + Duration::minutes(7);
+        let proposal = crate::vm03_domain_purchase_proposal(&project_id, projected, now)
+            .expect("native window uses exact authoritative quote references");
+        assert_eq!(proposal.expected_mission_revision, ready.revision);
+        assert_eq!(proposal.expected_connection_revision, connected.revision());
+        assert_eq!(
+            proposal.expected_work_product_revision,
+            manifest.work_product_revision
+        );
+        assert_eq!(proposal.expected_manifest_version, manifest.version);
+        assert_eq!(proposal.work_product_id, work_product_id);
+        assert_eq!(
+            Some(&proposal),
+            crate::vm03_domain_purchase_proposal(&project_id, projected, now).as_ref()
+        );
+        assert!(
+            crate::vm03_domain_purchase_proposal(&ProjectId::from("other-project"), projected, now)
+                .is_none()
+        );
+        assert!(
+            crate::vm03_domain_purchase_proposal(&project_id, projected, quote.valid_until)
+                .is_none()
+        );
+        let mut blocked = projected.clone();
+        blocked
+            .vm03_domain_quote
+            .as_mut()
+            .expect("quote")
+            .can_propose = false;
+        assert!(crate::vm03_domain_purchase_proposal(&project_id, &blocked, now).is_none());
+        let metadata = service
+            .projection(
+                &project_id,
+                &submission.mission_id,
+                hartevo_application::WorkSurface::Orchestrator,
+            )
+            .expect("locked metadata excludes quote terms");
+        assert!(metadata.vm03_domain_quote.is_none());
         drop(service);
-        cold.propose_vm03_domain_purchase_with(
-            &secrets,
-            &proposal,
-            observed_at() + Duration::minutes(7),
-        )
-        .expect("Cordis purchase proposal");
+        let waiting = cold
+            .propose_vm03_domain_purchase_with(
+                &secrets,
+                &proposal,
+                observed_at() + Duration::minutes(7),
+            )
+            .expect("Cordis purchase proposal");
+        let waiting = waiting.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("exact waiting Mission");
+        assert!(
+            waiting
+                .vm03_domain_quote
+                .as_ref()
+                .is_some_and(|quote| !quote.can_propose)
+        );
+        assert!(crate::vm03_domain_purchase_proposal(&project_id, waiting, now).is_none());
         let (service, _) = cold
             .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(7))
             .expect("proposed Application");

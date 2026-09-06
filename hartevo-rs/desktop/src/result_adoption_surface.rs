@@ -308,6 +308,7 @@ mod tests {
             evidence_count: 4,
             work_product_count: 1,
             work_products: vec![product],
+            vm03_domain_quote: None,
             pending_approval_count: 0,
             pending_effects: Vec::new(),
             verified_effect_count: 0,

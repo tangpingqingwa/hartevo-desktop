@@ -682,6 +682,7 @@ fn mission_projection(project_id: &ProjectId, source: VisualMission) -> MissionP
         evidence_count: 0,
         work_product_count: work_products.len(),
         work_products,
+        vm03_domain_quote: None,
         pending_approval_count: source.pending_approvals,
         pending_effects: Vec::new(),
         verified_effect_count: 0,
