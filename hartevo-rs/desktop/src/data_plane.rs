@@ -25,6 +25,8 @@ use hartevo_application::llm_deepseek::{
     DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, DeepSeekTransport,
     UreqDeepSeekTransport,
 };
+mod vm03_domain_purchase;
+
 use hartevo_application::{
     AcceptWorkProduct, AdoptCordisSessionDraft, AdoptRuntimeTurnDraft,
     AppendMissionConversationMessage, ApplicationError, ApplicationMissionCheckpointExecution,
@@ -7218,6 +7220,9 @@ impl DesktopDataPlane {
             .clone();
         let broker = if proposed_effect.capability == VM00_BILLING_CHECKOUT_CAPABILITY {
             Self::vm00_billing_checkout_broker(&mission, &proposed_effect)?
+        } else if proposed_effect.capability == hartevo_application::VM03_DOMAIN_PURCHASE_CAPABILITY
+        {
+            Self::vm03_domain_purchase_broker(&mission, &proposed_effect)?
         } else if proposed_effect.capability == VM01_PUBLICATION_CAPABILITY
             && mission
                 .definition
@@ -16903,9 +16908,9 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one encrypted Desktop Journey proves the VM-03 Application truth gate completes before Cordis mints the exact domain-search Runtime turn, then survives cold replay without Provider or Effect work"
+        reason = "one encrypted Desktop Journey covers the VM-03 truth gate, adopted quote, explicit payment approval, independent verification and cold expired-quote replay without repeating the executor"
     )]
-    fn vm03_minimum_truth_enters_cordis_domain_search_from_encrypted_desktop() {
+    fn vm03_quote_purchase_and_cold_recovery_use_the_desktop_cordis_chain() {
         let (directory, plane, secrets, project_id) = ready_personal_fixture();
         let database_secret = secrets
             .get(plane.database_key_reference())
@@ -16929,21 +16934,24 @@ sleep 30"#;
                     "cloudflare-registrar",
                     AccountId::from("desktop-vm03-domain-account"),
                     "desktop-vm03-private-owner",
-                    ["domain.search".into()],
+                    ["domain.search".into(), "domain.purchase".into()],
                     observed_at() + Duration::minutes(2),
                 )
                 .expect("VM-03 domain-search Connection"),
                 observed_at() + Duration::minutes(2),
             )
             .expect("persist VM-03 domain-search Connection");
-        service
+        let connected = service
             .record_connection_probe(
                 &project_id,
                 &connection_id,
                 ConnectionProbe {
                     outcome: ProbeOutcome::Successful,
                     observed_external_account_id: "desktop-vm03-private-owner".into(),
-                    granted_scopes: BTreeSet::from(["domain.search".into()]),
+                    granted_scopes: BTreeSet::from([
+                        "domain.search".into(),
+                        "domain.purchase".into(),
+                    ]),
                     probed_at: observed_at() + Duration::minutes(2),
                     valid_until: observed_at() + Duration::hours(1),
                     credential_expires_at: observed_at() + Duration::hours(2),
@@ -16955,6 +16963,47 @@ sleep 30"#;
         drop(service);
 
         let private_goal = "PRIVATE-VM03-DESKTOP::search only the bounded owner domain";
+        let quote = serde_json::json!({
+            "schemaVersion": "hartevo-domain-quote/v1",
+            "domainName": "private-desktop.example",
+            "provider": "cloudflare-registrar",
+            "connectionId": connected.id(),
+            "accountId": connected.account_id(),
+            "connectionRevision": connected.revision(),
+            "quoteId": "PRIVATE-DESKTOP-QUOTE",
+            "registrationYears": 1,
+            "amount": { "amountMinor": 1_000, "currency": "USD" },
+            "quotedAt": observed_at() + Duration::minutes(3),
+            "validUntil": observed_at() + Duration::minutes(40),
+            "available": true, "autoRenew": false,
+        })
+        .to_string();
+        let quote_source = DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(move |root, runtime_home| {
+                let mut command = completed_runtime_fixture_command(root, runtime_home);
+                let chunks = quote.split_at(quote.len() / 2);
+                let mut deltas = [chunks.0, chunks.1].into_iter();
+                for argument in &mut command.args {
+                    let Ok(mut event) = serde_json::from_str::<serde_json::Value>(argument) else {
+                        continue;
+                    };
+                    match event["method"].as_str() {
+                        Some("item/agentMessage/delta") => {
+                            event["params"]["delta"] =
+                                deltas.next().expect("two quote chunks").into();
+                        }
+                        Some("item/completed") => {
+                            event["params"]["item"]["text"] = quote.clone().into();
+                        }
+                        _ => continue,
+                    }
+                    *argument = event.to_string();
+                }
+                command
+            }),
+        };
         let submission = plane
             .start_catalog_mission_and_run_with(
                 &secrets,
@@ -16970,10 +17019,10 @@ sleep 30"#;
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
                     kpis: catalog_count_kpis(),
-                    budget_minor: 0,
+                    budget_minor: 5_000,
                     currency: "USD".into(),
                 },
-                Some(completed_runtime_fixture_source()),
+                Some(quote_source),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
                 observed_at() + Duration::minutes(3),
             )
@@ -17088,6 +17137,178 @@ sleep 30"#;
                 .len(),
             event_count
         );
+
+        let draft = mission
+            .work_products
+            .iter()
+            .find(|product| product.id == work_product_id)
+            .expect("quote draft");
+        let manifest = cold_service
+            .load_work_product_manifest(&project_id, &work_product_id)
+            .expect("quote manifest");
+        drop(cold_service);
+        cold.adopt_work_product_with(
+            &secrets,
+            DesktopWorkProductAdoptionRequest {
+                project_id: project_id.clone(),
+                mission_id: submission.mission_id.clone(),
+                work_product_id: work_product_id.clone(),
+                expected_mission_revision: mission.revision,
+                expected_work_product_revision: draft.revision,
+                expected_manifest_version: manifest.version,
+            },
+            observed_at() + Duration::minutes(6),
+        )
+        .expect("adopt exact domain quote");
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(6))
+            .expect("purchase-ready Application");
+        let ready = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("purchase-ready Mission");
+        let manifest = service
+            .load_work_product_manifest(&project_id, &work_product_id)
+            .expect("adopted quote manifest");
+        let proposal = hartevo_application::ProposeVm03DomainPurchase {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            effect_id: EffectId::from("desktop-vm03-purchase"),
+            actor_id: ActorId::from("desktop-vm03-owner"),
+            work_product_id: work_product_id.clone(),
+            idempotency_key: "desktop-vm03-purchase-once".into(),
+            expected_mission_revision: ready.revision,
+            expected_checkpoint_revision: ready
+                .definition
+                .as_ref()
+                .and_then(|definition| definition.current_checkpoint())
+                .expect("purchase route")
+                .revision,
+            expected_connection_revision: connected.revision(),
+            expected_work_product_revision: manifest.work_product_revision,
+            expected_manifest_version: manifest.version,
+        };
+        drop(service);
+        cold.propose_vm03_domain_purchase_with(
+            &secrets,
+            &proposal,
+            observed_at() + Duration::minutes(7),
+        )
+        .expect("Cordis purchase proposal");
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(7))
+            .expect("proposed Application");
+        let proposed = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("proposed Mission");
+        let effect = proposed
+            .effect(&proposal.effect_id)
+            .expect("proposed purchase");
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        assert!(effect.receipt.is_none() && effect.verification.is_none());
+        let scope_digest = effect.approval_digest();
+        drop(service);
+        cold.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: submission.mission_id.clone(),
+                effect_id: proposal.effect_id.clone(),
+                expected_scope_digest: scope_digest.clone(),
+                expected_mission_revision: proposed.revision,
+            },
+            observed_at() + Duration::minutes(8),
+        )
+        .expect("explicit Desktop purchase approval");
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(8))
+            .expect("approved Application");
+        let approved = service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("approved Mission");
+        let effect = approved
+            .effect(&proposal.effect_id)
+            .expect("approved purchase");
+        let request = DesktopApprovedEffectExecutionRequest {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            effect_id: proposal.effect_id.clone(),
+            expected_scope_digest: scope_digest,
+            expected_broker_authorization_digest: effect
+                .approval
+                .as_ref()
+                .expect("approval")
+                .permission_digest
+                .clone(),
+            expected_mission_revision: approved.revision,
+        };
+        drop(service);
+        let mut executor = DesktopPreviewExecutor {
+            calls: 0,
+            accepted_at: observed_at() + Duration::minutes(9),
+            uncertain: false,
+        };
+        let mut verifier = DesktopPreviewVerifier {
+            calls: 0,
+            observed_at: observed_at() + Duration::minutes(9) + Duration::milliseconds(1),
+        };
+        let purchased = cold
+            .execute_vm03_domain_purchase_with(
+                &secrets,
+                &request,
+                &mut executor,
+                &mut verifier,
+                observed_at() + Duration::minutes(9),
+            )
+            .expect("Cordis payment, verification and next route");
+        assert_eq!(purchased.disposition, ExecutionDisposition::Executed);
+        assert!(purchased.verification_independent);
+        let projection = purchased.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("post-purchase projection");
+        assert_eq!(
+            projection.current_checkpoint_id.as_deref(),
+            Some("site_spec_and_claims")
+        );
+        assert_eq!(projection.verified_effect_count, 1);
+        let reopened = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("reopen after purchase");
+        let (service, _) = reopened
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(45))
+            .expect("cold completed Application");
+        let event_count = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("completed events")
+            .len();
+        drop(service);
+        let recovered = reopened
+            .execute_vm03_domain_purchase_with(
+                &secrets,
+                &request,
+                &mut executor,
+                &mut verifier,
+                observed_at() + Duration::minutes(45),
+            )
+            .expect("expired quote must recover without repurchasing");
+        assert_eq!(recovered.disposition, ExecutionDisposition::AlreadyVerified);
+        assert_eq!((executor.calls, verifier.calls), (1, 1));
+        let (service, _) = reopened
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(45))
+            .expect("replayed Application");
+        let events = service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("replayed events");
+        assert_eq!(events.len(), event_count);
+        let public = serde_json::to_string(&events).expect("public event JSON");
+        for private in [
+            private_goal,
+            "private-desktop.example",
+            "PRIVATE-DESKTOP-QUOTE",
+            "desktop-vm03-private-owner",
+        ] {
+            assert!(!public.contains(private));
+        }
     }
 
     #[test]

@@ -6,7 +6,14 @@ pub mod llm_deepseek;
 mod observation_evidence_pack;
 mod plugin_invocation_timeline;
 mod runtime_text_subscription;
+mod vm03_domain_purchase;
 mod work_product_outcome;
+
+pub use vm03_domain_purchase::{
+    CompleteVm03DomainPurchase, ProposeVm03DomainPurchase, VM03_DOMAIN_PURCHASE_CAPABILITY,
+    VM03_DOMAIN_PURCHASE_CHECKPOINT_ID, Vm03DomainPurchaseCompletion,
+    vm03_domain_purchase_effect_policy, vm03_domain_purchase_verified_receipt,
+};
 
 pub use observation_evidence_pack::{
     ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
@@ -20329,7 +20336,7 @@ impl ApplicationService {
             .iter()
             .find(|effect| effect.id == command.effect_id)
         {
-            if vm01_publication_effect_matches_spec(&mission, existing, &spec) {
+            if mission_effect_matches_spec(&mission, existing, &spec) {
                 return Ok(existing.id.clone());
             }
             return Err(ApplicationError::Vm01PublicationEffectMismatch);
@@ -21799,7 +21806,7 @@ impl ApplicationService {
             "desktop-local-runtime/v1"
         };
         let tokenizer_profile = tokenizer.profile()?;
-        let summary = Zeroizing::new(serde_json::to_string(&serde_json::json!({
+        let mut summary_value = serde_json::json!({
             "schema": "hartevo.local-mission-checkpoint/v1",
             "missionId": mission.id,
             "title": mission.title,
@@ -21817,7 +21824,18 @@ impl ApplicationService {
             "activeUserMessageSequence": latest_user_message.map(|message| message.sequence),
             "runtimePurpose": if compaction { "cordis_compaction" } else { "agent" },
             "effectAuthority": "none; local Runtime must return a typed draft only",
-        }))?);
+        });
+        if !compaction
+            && mission.definition.as_ref().is_some_and(|definition| {
+                definition.manifest_id == "VM-03"
+                    && definition
+                        .current_checkpoint()
+                        .is_some_and(|checkpoint| checkpoint.id == "domain_search_and_quote")
+            })
+        {
+            summary_value["artifactContract"] = vm03_domain_purchase::QUOTE_OUTPUT_CONTRACT.into();
+        }
+        let summary = Zeroizing::new(serde_json::to_string(&summary_value)?);
         let source = Zeroizing::new(serde_json::to_string(&(&mission, &conversation))?);
         let summary_token_count = tokenizer.count_tokens(summary.as_str())?;
         let source_token_count = tokenizer.count_tokens(source.as_str())?;
@@ -30486,11 +30504,7 @@ fn vm01_publication_effect_spec(
     })
 }
 
-fn vm01_publication_effect_matches_spec(
-    mission: &Mission,
-    effect: &Effect,
-    spec: &EffectSpec,
-) -> bool {
+fn mission_effect_matches_spec(mission: &Mission, effect: &Effect, spec: &EffectSpec) -> bool {
     effect.tenant_id == mission.tenant_id
         && effect.project_id == mission.project_id
         && effect.mission_id == mission.id
@@ -32105,6 +32119,10 @@ pub enum ApplicationError {
     Vm01PublicationCompletionMismatch,
     #[error("VM-01 publication replay does not match the durable verified completion")]
     Vm01PublicationReplayMismatch,
+    #[error(
+        "VM-03 domain purchase requires the exact current route, accepted bounded quote, live registrar Connection, and frozen payment authority"
+    )]
+    Vm03DomainPurchaseMismatch,
     #[error(
         "VM-04 publication requires an exact selected WorkProduct, live Connection, and Mission/Checkpoint source revisions"
     )]
@@ -39125,7 +39143,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the Journey keeps project and provider truth gates, recoverable source blocks, dual source fences, content-free evidence, next Runtime routing, and replay in one ordered proof"
     )]
-    fn vm03_minimum_truth_uses_one_live_domain_connection_and_starts_domain_search() {
+    fn vm03_minimum_truth_and_purchase_bind_one_accepted_quote() {
         let workspace = tempfile::tempdir().expect("project workspace");
         let project_id = ProjectId::from("vm03-minimum-truth-project");
         let mission_id = MissionId::from("vm03-minimum-truth-mission");
@@ -39160,7 +39178,7 @@ mod tests {
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
                     kpis: catalog_count_kpis(),
-                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                    budget: Money::new(5_000, CurrencyCode::parse("USD").expect("USD")),
                 },
                 now(),
             )
@@ -39281,7 +39299,7 @@ mod tests {
                     "cloudflare-registrar",
                     AccountId::from("vm03-domain-account"),
                     "cloudflare-private-owner",
-                    ["domain.search".into()],
+                    ["domain.search".into(), "domain.purchase".into()],
                     now() + Duration::seconds(6),
                 )
                 .expect("domain-search Connection"),
@@ -39318,7 +39336,10 @@ mod tests {
                 ConnectionProbe {
                     outcome: ProbeOutcome::Successful,
                     observed_external_account_id: "cloudflare-private-owner".into(),
-                    granted_scopes: BTreeSet::from(["domain.search".into()]),
+                    granted_scopes: BTreeSet::from([
+                        "domain.search".into(),
+                        "domain.purchase".into(),
+                    ]),
                     probed_at: now() + Duration::seconds(8),
                     valid_until: now() + Duration::hours(1),
                     credential_expires_at: now() + Duration::hours(2),
@@ -39442,6 +39463,245 @@ mod tests {
         assert!(event_json.contains(VM03_MINIMUM_TRUTH_READY_HANDLER_ID));
         assert!(!event_json.contains(private_description));
         assert!(!event_json.contains("cloudflare-private-owner"));
+
+        let connected = service
+            .store
+            .load_connection(&project_id, &domain_connection_id)
+            .expect("live registrar");
+        let quote_body = serde_json::to_string(&serde_json::json!({
+            "schemaVersion": "hartevo-domain-quote/v1",
+            "domainName": "private-owner.example",
+            "provider": "cloudflare-registrar",
+            "connectionId": domain_connection_id,
+            "accountId": connected.account_id(),
+            "connectionRevision": connected.revision(),
+            "quoteId": "PRIVATE-VM03-QUOTE-1",
+            "registrationYears": 1,
+            "amount": Money::new(1_000, CurrencyCode::parse("USD").expect("USD")),
+            "quotedAt": now() + Duration::seconds(10),
+            "validUntil": now() + Duration::minutes(30),
+            "available": true,
+            "autoRenew": false,
+        }))
+        .expect("typed quote");
+        let accepted = record_and_accept_runtime_fixture(
+            &mut service,
+            &project_id,
+            &mission_id,
+            "domain_search_and_quote",
+            WorkProductId::from("vm03-domain-quote"),
+            &quote_body,
+            now() + Duration::seconds(11),
+        );
+        let purchase = service
+            .load_mission(&project_id, &mission_id)
+            .expect("purchase-ready Mission");
+        let checkpoint = purchase
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("purchase checkpoint");
+        assert_eq!(checkpoint.id, VM03_DOMAIN_PURCHASE_CHECKPOINT_ID);
+        let proposal = ProposeVm03DomainPurchase {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: EffectId::from("vm03-domain-purchase"),
+            actor_id: ActorId::from("vm03-purchase-proposer"),
+            work_product_id: accepted.work_product.id.clone(),
+            idempotency_key: "vm03-purchase-once".into(),
+            expected_mission_revision: purchase.revision,
+            expected_checkpoint_revision: checkpoint.revision,
+            expected_connection_revision: connected.revision(),
+            expected_work_product_revision: accepted.work_product.revision,
+            expected_manifest_version: accepted.manifest.version,
+        };
+        let count_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before purchase")
+            .len();
+        for invalid in [
+            ProposeVm03DomainPurchase {
+                expected_connection_revision: connected.revision() + 1,
+                ..proposal.clone()
+            },
+            ProposeVm03DomainPurchase {
+                expected_manifest_version: accepted.manifest.version + 1,
+                ..proposal.clone()
+            },
+            ProposeVm03DomainPurchase {
+                work_product_id: WorkProductId::from("another-quote"),
+                ..proposal.clone()
+            },
+        ] {
+            assert!(
+                service
+                    .propose_vm03_domain_purchase(&invalid, now() + Duration::seconds(12))
+                    .is_err()
+            );
+        }
+        assert!(
+            service
+                .propose_vm03_domain_purchase(&proposal, now() + Duration::minutes(30))
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("no rejected proposal events")
+                .len(),
+            count_before
+        );
+        service
+            .propose_vm03_domain_purchase(&proposal, now() + Duration::seconds(12))
+            .expect("bounded proposal");
+        let proposed_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("proposal events")
+            .len();
+        service
+            .propose_vm03_domain_purchase(&proposal, now() + Duration::seconds(13))
+            .expect("exact proposal replay");
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("replay events")
+                .len(),
+            proposed_count
+        );
+        let proposed = service
+            .load_mission(&project_id, &mission_id)
+            .expect("proposed purchase");
+        let effect = proposed
+            .effect(&proposal.effect_id)
+            .expect("payment proposal");
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        assert_eq!(effect.effect_class, EffectClass::Payment);
+        assert_eq!(effect.amount.amount_minor, 1_000);
+        assert_eq!(effect.payload_digest, accepted.work_product.content_digest);
+        assert!(effect.receipt.is_none() && effect.verification.is_none());
+        let mut tampered = effect.clone();
+        tampered.amount.amount_minor += 1;
+        assert!(vm03_domain_purchase_effect_policy(&proposed, &tampered).is_err());
+        let mut broker = EffectBroker::new(
+            vm03_domain_purchase_effect_policy(&proposed, effect).expect("purchase policy"),
+            "vm03-purchase-worker",
+        )
+        .with_lease_for(Duration::days(36_500));
+        let scope_digest = effect.approval_digest();
+        let mut executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: now() + Duration::seconds(16),
+        };
+        let mut verifier = RelationshipVerifier {
+            observed_at: now() + Duration::seconds(17),
+        };
+        assert!(
+            service
+                .execute_approved_effect_at_revision(
+                    &mut broker,
+                    &ExecuteApprovedEffect {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        effect_id: proposal.effect_id.clone(),
+                        expected_scope_digest: scope_digest.clone(),
+                        expected_broker_authorization_digest: "0".repeat(64),
+                        expected_mission_revision: proposed.revision,
+                    },
+                    &mut executor,
+                    &mut verifier,
+                    now() + Duration::seconds(14)
+                )
+                .is_err()
+        );
+        assert_eq!(executor.calls, 0);
+        let before_approval = service
+            .load_mission(&project_id, &mission_id)
+            .expect("before explicit approval");
+        service
+            .approve_proposed_effect(
+                &broker,
+                ApproveProposedEffect {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: proposal.effect_id.clone(),
+                    expected_scope_digest: scope_digest.clone(),
+                    expected_mission_revision: before_approval.revision,
+                },
+                ActorId::from("vm03-purchase-approver"),
+                now() + Duration::seconds(15),
+            )
+            .expect("explicit purchase approval");
+        let approved = service
+            .load_mission(&project_id, &mission_id)
+            .expect("approved purchase");
+        let approval = approved
+            .effect(&proposal.effect_id)
+            .expect("approved effect")
+            .approval
+            .as_ref()
+            .expect("approval");
+        service
+            .execute_approved_effect_at_revision(
+                &mut broker,
+                &ExecuteApprovedEffect {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    effect_id: proposal.effect_id.clone(),
+                    expected_scope_digest: scope_digest,
+                    expected_broker_authorization_digest: approval.permission_digest.clone(),
+                    expected_mission_revision: approved.revision,
+                },
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(16),
+            )
+            .expect("execute once and independently verify");
+        assert_eq!(executor.calls, 1);
+        let settled_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("verified purchase");
+        let completion_command = CompleteVm03DomainPurchase {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: proposal.effect_id,
+            expected_mission_revision: settled_mission.revision,
+            expected_checkpoint_revision: settled_mission
+                .definition
+                .as_ref()
+                .and_then(MissionDefinition::current_checkpoint)
+                .expect("verifying")
+                .revision,
+        };
+        let completed = service
+            .complete_vm03_domain_purchase(&completion_command, now() + Duration::seconds(18))
+            .expect("advance after verification");
+        assert!(!completed.replayed);
+        let next = completed.next_dispatch.expect("site specification Runtime");
+        assert_eq!(next.checkpoint_id, "site_spec_and_claims");
+        assert_eq!(next.executor, MissionCheckpointExecutor::Runtime);
+        let event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("completed events")
+            .len();
+        assert!(
+            service
+                .complete_vm03_domain_purchase(&completion_command, now() + Duration::minutes(40))
+                .expect("expired quote may recover completed payment")
+                .replayed
+        );
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("replayed events");
+        assert_eq!(events.len(), event_count);
+        let public = serde_json::to_string(&events).expect("public events");
+        for private in [
+            "private-owner.example",
+            "PRIVATE-VM03-QUOTE-1",
+            "cloudflare-private-owner",
+        ] {
+            assert!(!public.contains(private));
+        }
+        assert_eq!(executor.calls, 1);
     }
 
     #[test]
