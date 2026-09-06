@@ -16899,6 +16899,197 @@ sleep 30"#;
         assert!(event_json.contains("mission.checkpoint_started"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one encrypted Desktop Journey proves the VM-03 Application truth gate completes before Cordis mints the exact domain-search Runtime turn, then survives cold replay without Provider or Effect work"
+    )]
+    fn vm03_minimum_truth_enters_cordis_domain_search_from_encrypted_desktop() {
+        let (directory, plane, secrets, project_id) = ready_personal_fixture();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(2))
+            .expect("encrypted Application");
+        let project = service
+            .list_projects()
+            .expect("Projects")
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .expect("ready personal Project");
+        let connection_id = ConnectionId::from("desktop-vm03-cloudflare-domain");
+        service
+            .register_connection(
+                Connection::register(
+                    connection_id.clone(),
+                    project.tenant_id,
+                    project_id.clone(),
+                    "cloudflare-registrar",
+                    AccountId::from("desktop-vm03-domain-account"),
+                    "desktop-vm03-private-owner",
+                    ["domain.search".into()],
+                    observed_at() + Duration::minutes(2),
+                )
+                .expect("VM-03 domain-search Connection"),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("persist VM-03 domain-search Connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "desktop-vm03-private-owner".into(),
+                    granted_scopes: BTreeSet::from(["domain.search".into()]),
+                    probed_at: observed_at() + Duration::minutes(2),
+                    valid_until: observed_at() + Duration::hours(1),
+                    credential_expires_at: observed_at() + Duration::hours(2),
+                    evidence_digest: "3".repeat(64),
+                },
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("probe exact VM-03 domain-search Connection");
+        drop(service);
+
+        let private_goal = "PRIVATE-VM03-DESKTOP::search only the bounded owner domain";
+        let submission = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-03".into(),
+                    mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
+                    title: Some("Bounded site build".into()),
+                    goal: private_goal.into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(completed_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("VM-03 Application gate and Cordis Runtime turn");
+        let work_product_id = match submission.runtime_outcome {
+            DesktopMissionRuntimeOutcome::DraftReady { work_product_id } => work_product_id,
+            outcome => panic!("expected VM-03 domain-search Runtime draft, got {outcome:?}"),
+        };
+        let projected = submission.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("VM-03 Desktop projection");
+        assert_eq!(projected.manifest_id.as_deref(), Some("VM-03"));
+        assert_eq!(projected.completed_checkpoint_count, 1);
+        assert_eq!(
+            (
+                projected.current_checkpoint_id.as_deref(),
+                projected.current_checkpoint_executor,
+            ),
+            (
+                Some("domain_search_and_quote"),
+                Some(MissionCheckpointExecutor::Runtime),
+            )
+        );
+
+        let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("cold Desktop plane");
+        assert!(matches!(
+            cold.load_with(&secrets, observed_at() + Duration::minutes(4))
+                .expect("cold encrypted Desktop load"),
+            DesktopLoadState::Ready(_)
+        ));
+        let (mut cold_service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(4))
+            .expect("cold encrypted Application");
+        let mission = cold_service
+            .load_mission(&project_id, &submission.mission_id)
+            .expect("durable VM-03 Mission");
+        assert!(mission.effects.is_empty());
+        assert_eq!(mission.work_products.len(), 1);
+        assert_eq!(mission.work_products[0].id, work_product_id);
+        let completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "minimum_truth_ready")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-03 minimum-truth completion");
+        assert!(completion.work_product_ids.is_empty());
+        assert!(completion.effect_ids.is_empty());
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .expect("durable VM-03 minimum-truth evidence");
+        assert_eq!(evidence.handler_id, "vm03.minimum-truth-ready/v1");
+        assert_eq!(
+            evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "minimum_site_truth",
+                "mission_checkpoint",
+                "mission_contract",
+            ])
+        );
+        let event_count = cold_service
+            .mission_events(&project_id, &submission.mission_id)
+            .expect("durable VM-03 events")
+            .len();
+        let event_json = serde_json::to_string(
+            &cold_service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("content-free VM-03 events"),
+        )
+        .expect("VM-03 event JSON");
+        assert!(event_json.contains("vm03.minimum-truth-ready/v1"));
+        assert!(!event_json.contains(private_goal));
+        assert!(!event_json.contains("desktop-vm03-private-owner"));
+        assert!(matches!(
+            cold_service
+                .execute_application_mission_checkpoint(
+                    ExecuteApplicationMissionCheckpoint {
+                        project_id: project_id.clone(),
+                        mission_id: submission.mission_id.clone(),
+                        checkpoint_id: "minimum_truth_ready".into(),
+                        expected_mission_revision: evidence.dispatch_mission_revision,
+                        expected_checkpoint_revision: evidence.dispatch_checkpoint_revision,
+                    },
+                    observed_at() + Duration::minutes(5),
+                )
+                .expect("cold exact VM-03 Application replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                next_dispatch: Some(MissionCheckpointDispatch {
+                    executor: MissionCheckpointExecutor::Runtime,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(
+            cold_service
+                .mission_events(&project_id, &submission.mission_id)
+                .expect("unchanged cold VM-03 replay events")
+                .len(),
+            event_count
+        );
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,
