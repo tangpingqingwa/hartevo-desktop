@@ -105,7 +105,7 @@ fn production_contract_grants_only_the_exact_vm04_vm07_and_vm11_terminals() {
         contract.schema_version,
         "hartevo-mission-route-runtime-authority-contract/v1"
     );
-    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct03-v8");
+    assert_eq!(contract.contract_version, "desktop-2026-09-05-ct03-v9");
     assert_eq!(contract.evidence_level, "E1");
     assert_eq!(
         contract.default_terminal_execution_authority,

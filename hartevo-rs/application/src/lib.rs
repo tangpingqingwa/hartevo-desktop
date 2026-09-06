@@ -3537,6 +3537,7 @@ const VM01_RANKING_TRAFFIC_REVIEW_HANDLER_ID: &str = "vm01.ranking-traffic-revie
 const VM01_NEXT_CYCLE_HANDLER_ID: &str = "vm01.next-cycle/v1";
 const VM01_NEXT_CYCLE_OUTCOME_SUMMARY: &str =
     "VM-01 ranking and traffic review accepted for the next scheduled cycle";
+const VM03_MINIMUM_TRUTH_READY_HANDLER_ID: &str = "vm03.minimum-truth-ready/v1";
 const VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID: &str = "vm04.account-scope-probe/v1";
 const VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID: &str = "vm04.engagement-referral-review/v1";
 const VM04_CHANNEL_REBALANCE_HANDLER_ID: &str = "vm04.channel-rebalance/v1";
@@ -3565,6 +3566,7 @@ enum CompiledApplicationCheckpointHandler {
     Vm01WorkQueue,
     Vm01RankingTrafficReview,
     Vm01NextCycle,
+    Vm03MinimumTruthReady,
     Vm04AccountScopeProbe,
     Vm04EngagementReferralReview,
     Vm04ChannelRebalance,
@@ -3595,6 +3597,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm01WorkQueue => VM01_WORK_QUEUE_HANDLER_ID,
             Self::Vm01RankingTrafficReview => VM01_RANKING_TRAFFIC_REVIEW_HANDLER_ID,
             Self::Vm01NextCycle => VM01_NEXT_CYCLE_HANDLER_ID,
+            Self::Vm03MinimumTruthReady => VM03_MINIMUM_TRUTH_READY_HANDLER_ID,
             Self::Vm04AccountScopeProbe => VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID,
             Self::Vm04EngagementReferralReview => VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID,
             Self::Vm04ChannelRebalance => VM04_CHANNEL_REBALANCE_HANDLER_ID,
@@ -3623,6 +3626,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm01WorkQueue => "seo_work_queue",
             Self::Vm01RankingTrafficReview => "url_link_readback",
             Self::Vm01NextCycle => "ranking_traffic_review",
+            Self::Vm03MinimumTruthReady => "minimum_site_truth",
             Self::Vm04AccountScopeProbe => "account_scope",
             Self::Vm04EngagementReferralReview => "provider_readback",
             Self::Vm04ChannelRebalance => "channel_rebalance",
@@ -3910,6 +3914,9 @@ fn compiled_application_checkpoint_handler(
             Some(CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview)
         }
         VM01_NEXT_CYCLE_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::Vm01NextCycle),
+        VM03_MINIMUM_TRUTH_READY_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady)
+        }
         VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe)
         }
@@ -4745,6 +4752,205 @@ fn vm00_local_connection_readiness_application_evidence(
                 source_id: connection.id().to_string(),
                 source_revision: connection.revision(),
                 projection_digest: connection_readiness_digest,
+                oracle_ids: BTreeSet::from(["truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+fn vm03_minimum_truth_provider_ids(
+    mission: &Mission,
+) -> Result<BTreeSet<String>, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let catalog = Catalog::load()?;
+    let catalog_digest = catalog.snapshot()?.digest;
+    let manifest = catalog
+        .mission("VM-03")
+        .filter(|manifest| manifest.version == 3)
+        .ok_or(
+            ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id: VM03_MINIMUM_TRUTH_READY_HANDLER_ID.into(),
+            },
+        )?;
+    if definition.manifest_id != manifest.id
+        || definition.manifest_version != manifest.version
+        || definition.catalog_digest != catalog_digest
+    {
+        return Err(ApplicationError::ApplicationCheckpointCatalogRevisionMismatch);
+    }
+    let provider_ids = catalog
+        .providers
+        .providers
+        .iter()
+        .filter(|provider| {
+            manifest.provider_ids.contains(&provider.id)
+                && provider
+                    .capability_ids
+                    .iter()
+                    .any(|capability| capability == "connection.probe")
+                && provider
+                    .capability_ids
+                    .iter()
+                    .any(|capability| capability == "domain.search")
+        })
+        .map(|provider| provider.id.clone())
+        .collect::<BTreeSet<_>>();
+    if provider_ids.is_empty() {
+        return Err(
+            ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id: VM03_MINIMUM_TRUTH_READY_HANDLER_ID.into(),
+            },
+        );
+    }
+    Ok(provider_ids)
+}
+
+fn vm03_project_has_minimum_truth(project: &Project) -> bool {
+    if project.revision == 0
+        || project.name.trim().is_empty()
+        || project.description.trim().is_empty()
+        || matches!(&project.storage_mode, StorageMode::Cloud)
+        || project.workspace_roots.is_empty()
+        || project
+            .workspace_roots
+            .iter()
+            .any(|root| !root.is_absolute())
+    {
+        return false;
+    }
+    let mut workspace_roots = project.workspace_roots.iter().collect::<Vec<_>>();
+    workspace_roots.sort();
+    !workspace_roots.windows(2).any(|roots| roots[0] == roots[1])
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the evidence freezes the exact Contract, Checkpoint, local Project profile, provider capability set, and selected live Connection without persisting their private content"
+)]
+fn vm03_minimum_truth_ready_application_evidence(
+    mission: &Mission,
+    project: &Project,
+    connection: &Connection,
+    allowed_provider_ids: &BTreeSet<String>,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if project.tenant_id != mission.tenant_id
+        || project.id != mission.project_id
+        || connection.tenant_id() != &mission.tenant_id
+        || connection.project_id() != &mission.project_id
+    {
+        return Err(StorageError::TenantScopeMismatch.into());
+    }
+    mission.contract.validate(now).map_err(MissionError::from)?;
+    if definition.manifest_id != "VM-03"
+        || definition.manifest_version != 3
+        || checkpoint.id != "minimum_truth_ready"
+        || checkpoint.status != MissionCheckpointStatus::Verifying
+        || route.capability_id != "connection.probe"
+        || route.executor != MissionCheckpointExecutor::Application
+        || route.completion_policy != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+        || route.oracle_ids
+            != BTreeSet::from(["goal".into(), "operating_state".into(), "truth".into()])
+        || !vm03_project_has_minimum_truth(project)
+        || !allowed_provider_ids.contains(connection.provider())
+        || !connection.is_connected(now)
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let mut workspace_roots = project.workspace_roots.iter().collect::<Vec<_>>();
+    workspace_roots.sort();
+    let contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    // Project prose, local paths, provider account data, scopes and probe
+    // details remain transient inputs. Only this canonical digest crosses into
+    // durable Application evidence or public Mission events.
+    let minimum_site_truth_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-vm03-minimum-site-truth/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "projectRevision": project.revision,
+        "projectName": project.name,
+        "projectDescription": project.description,
+        "storageMode": project.storage_mode,
+        "dataCell": project.data_cell,
+        "workspaceRoots": workspace_roots,
+        "allowedDomainSearchProviderIds": allowed_provider_ids,
+        "connection": connection.snapshot(),
+        "observedAt": now,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM03_MINIMUM_TRUTH_READY_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_contract".into(),
+                source_id: mission.id.to_string(),
+                source_revision: command.expected_mission_revision,
+                projection_digest: contract_digest,
+                oracle_ids: BTreeSet::from(["goal".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "minimum_site_truth".into(),
+                source_id: project.id.to_string(),
+                source_revision: project.revision,
+                projection_digest: minimum_site_truth_digest,
                 oracle_ids: BTreeSet::from(["truth".into()]),
             },
         ]),
@@ -8058,6 +8264,7 @@ fn execute_project_application_checkpoint(
         handler,
         CompiledApplicationCheckpointHandler::LocalOperatingContractCompiled
             | CompiledApplicationCheckpointHandler::LocalMissionHandoff
+            | CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady
     ) {
         match mission.contract.validate(now) {
             Ok(()) => {}
@@ -8069,7 +8276,11 @@ fn execute_project_application_checkpoint(
                     &command,
                     dispatch,
                     handler.handler_id(),
-                    handler.primary_source_kind(),
+                    if handler == CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady {
+                        "mission_contract"
+                    } else {
+                        handler.primary_source_kind()
+                    },
                     "operating_contract_not_current",
                     "The durable Operating Contract is outside its approved validity window.",
                     expected_mission_revision,
@@ -8294,6 +8505,107 @@ fn execute_project_application_checkpoint(
                     connection.id().to_string(),
                     revision,
                 )],
+            )
+        }
+        CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady => {
+            let allowed_provider_ids = vm03_minimum_truth_provider_ids(&mission)?;
+            let project = store.load_project(&command.project_id)?;
+            if !vm03_project_has_minimum_truth(&project) {
+                return persist_vm00_source_block(
+                    store,
+                    &mut mission,
+                    expected_mission_revision,
+                    &command,
+                    dispatch,
+                    VM03_MINIMUM_TRUTH_READY_HANDLER_ID,
+                    "minimum_site_truth",
+                    "minimum_site_truth_unavailable",
+                    "Complete the local Project name, description, and absolute workspace scope before this Mission can continue.",
+                    project.revision,
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Project,
+                        project.id.to_string(),
+                        project.revision,
+                    ),
+                    now,
+                );
+            }
+            let mut connections = store
+                .connections_for_project(&command.project_id)?
+                .into_iter()
+                .filter(|connection| allowed_provider_ids.contains(connection.provider()))
+                .collect::<Vec<_>>();
+            connections.sort_by(|left, right| left.id().cmp(right.id()));
+            if connections.is_empty() {
+                return persist_vm00_source_block(
+                    store,
+                    &mut mission,
+                    expected_mission_revision,
+                    &command,
+                    dispatch,
+                    VM03_MINIMUM_TRUTH_READY_HANDLER_ID,
+                    "minimum_site_truth",
+                    "domain_search_connection_unavailable",
+                    "Connect and successfully probe one current VM-03 domain-search provider before this Mission can continue.",
+                    project.revision,
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Project,
+                        project.id.to_string(),
+                        project.revision,
+                    ),
+                    now,
+                );
+            }
+            let Some(connection) = connections
+                .iter()
+                .find(|connection| connection.is_connected(now))
+            else {
+                let connection = connections
+                    .first()
+                    .ok_or(ApplicationError::ApplicationCheckpointCommandMismatch)?;
+                return persist_vm00_source_block(
+                    store,
+                    &mut mission,
+                    expected_mission_revision,
+                    &command,
+                    dispatch,
+                    VM03_MINIMUM_TRUTH_READY_HANDLER_ID,
+                    "minimum_site_truth",
+                    "domain_search_connection_not_live",
+                    "A configured VM-03 domain-search Connection needs a fresh successful probe.",
+                    connection.revision(),
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Connection,
+                        connection.id().to_string(),
+                        connection.revision(),
+                    ),
+                    now,
+                );
+            };
+            let evidence = vm03_minimum_truth_ready_application_evidence(
+                &mission,
+                &project,
+                connection,
+                &allowed_provider_ids,
+                &route,
+                &command,
+                now,
+            )?;
+            (
+                evidence,
+                project.revision,
+                vec![
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Project,
+                        project.id.to_string(),
+                        project.revision,
+                    ),
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Connection,
+                        connection.id().to_string(),
+                        connection.revision(),
+                    ),
+                ],
             )
         }
         CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe => {
@@ -14678,6 +14990,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::Vm01WorkQueue
                 | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
                 | CompiledApplicationCheckpointHandler::Vm01NextCycle
+                | CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady
                 | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
                 | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
                 | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -15539,6 +15852,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm01WorkQueue
             | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
             | CompiledApplicationCheckpointHandler::Vm01NextCycle
+            | CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -15681,6 +15995,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm01WorkQueue
             | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
             | CompiledApplicationCheckpointHandler::Vm01NextCycle
+            | CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -38803,6 +39118,330 @@ mod tests {
                 .len(),
             event_count
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the Journey keeps project and provider truth gates, recoverable source blocks, dual source fences, content-free evidence, next Runtime routing, and replay in one ordered proof"
+    )]
+    fn vm03_minimum_truth_uses_one_live_domain_connection_and_starts_domain_search() {
+        let workspace = tempfile::tempdir().expect("project workspace");
+        let project_id = ProjectId::from("vm03-minimum-truth-project");
+        let mission_id = MissionId::from("vm03-minimum-truth-mission");
+        let tenant_id = TenantId::from("vm03-minimum-truth-tenant");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        let project = service
+            .create_project(
+                CreateProject {
+                    tenant_id: tenant_id.clone(),
+                    id: project_id.clone(),
+                    name: "VM-03 private project name".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm03-minimum-truth-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-03".into(),
+                    mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
+                    title: Some("Minimum site truth".into()),
+                    goal: "Create only the bounded site selected by the owner".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now(),
+            )
+            .expect("VM-03 Mission");
+
+        let initial = service
+            .dispatch_current_mission_checkpoint(&project_id, &mission_id, now())
+            .expect("VM-03 entry dispatch");
+        assert_eq!(
+            (
+                initial.checkpoint_id.as_str(),
+                initial.capability_id.as_str(),
+                initial.executor,
+                initial.application_handler_status,
+                initial.application_handler_id.as_deref(),
+            ),
+            (
+                "minimum_truth_ready",
+                "connection.probe",
+                MissionCheckpointExecutor::Application,
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM03_MINIMUM_TRUTH_READY_HANDLER_ID),
+            )
+        );
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    ExecuteApplicationMissionCheckpoint {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        checkpoint_id: initial.checkpoint_id,
+                        expected_mission_revision: initial.mission_revision,
+                        expected_checkpoint_revision: initial.checkpoint_revision,
+                    },
+                    now() + Duration::seconds(1),
+                )
+                .expect("incomplete Project blocks"),
+            ApplicationMissionCheckpointExecution::Blocked { code, replayed: false, .. }
+                if code == "minimum_site_truth_unavailable"
+        ));
+
+        let private_description = "PRIVATE-VM03-DESCRIPTION::owner-selected local site";
+        service
+            .update_project_metadata(
+                UpdateProjectMetadata {
+                    project_id: project_id.clone(),
+                    expected_revision: project.revision,
+                    name: project.name,
+                    description: private_description.into(),
+                },
+                now() + Duration::seconds(2),
+            )
+            .expect("complete local Project truth");
+        let irrelevant_id = ConnectionId::from("vm03-irrelevant-github");
+        service
+            .register_connection(
+                Connection::register(
+                    irrelevant_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "github",
+                    AccountId::from("vm03-irrelevant-account"),
+                    "github-private-owner",
+                    ["repo".into()],
+                    now() + Duration::seconds(3),
+                )
+                .expect("irrelevant Connection"),
+                now() + Duration::seconds(3),
+            )
+            .expect("persist irrelevant Connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &irrelevant_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "github-private-owner".into(),
+                    granted_scopes: BTreeSet::from(["repo".into()]),
+                    probed_at: now() + Duration::seconds(4),
+                    valid_until: now() + Duration::hours(1),
+                    credential_expires_at: now() + Duration::hours(2),
+                    evidence_digest: "3".repeat(64),
+                },
+                now() + Duration::seconds(4),
+            )
+            .expect("probe irrelevant Connection");
+        let missing = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::seconds(5),
+            )
+            .expect("VM-03 dispatch after Project update");
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    ExecuteApplicationMissionCheckpoint {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        checkpoint_id: missing.checkpoint_id,
+                        expected_mission_revision: missing.mission_revision,
+                        expected_checkpoint_revision: missing.checkpoint_revision,
+                    },
+                    now() + Duration::seconds(5),
+                )
+                .expect("non-domain Connection cannot satisfy VM-03"),
+            ApplicationMissionCheckpointExecution::Blocked { code, replayed: false, .. }
+                if code == "domain_search_connection_unavailable"
+        ));
+
+        let domain_connection_id = ConnectionId::from("vm03-cloudflare-domain");
+        service
+            .register_connection(
+                Connection::register(
+                    domain_connection_id.clone(),
+                    tenant_id,
+                    project_id.clone(),
+                    "cloudflare-registrar",
+                    AccountId::from("vm03-domain-account"),
+                    "cloudflare-private-owner",
+                    ["domain.search".into()],
+                    now() + Duration::seconds(6),
+                )
+                .expect("domain-search Connection"),
+                now() + Duration::seconds(6),
+            )
+            .expect("persist domain-search Connection");
+        let pending = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::seconds(7),
+            )
+            .expect("VM-03 pending Connection dispatch");
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    ExecuteApplicationMissionCheckpoint {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        checkpoint_id: pending.checkpoint_id,
+                        expected_mission_revision: pending.mission_revision,
+                        expected_checkpoint_revision: pending.checkpoint_revision,
+                    },
+                    now() + Duration::seconds(7),
+                )
+                .expect("pending domain Connection blocks"),
+            ApplicationMissionCheckpointExecution::Blocked { code, replayed: false, .. }
+                if code == "domain_search_connection_not_live"
+        ));
+        service
+            .record_connection_probe(
+                &project_id,
+                &domain_connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "cloudflare-private-owner".into(),
+                    granted_scopes: BTreeSet::from(["domain.search".into()]),
+                    probed_at: now() + Duration::seconds(8),
+                    valid_until: now() + Duration::hours(1),
+                    credential_expires_at: now() + Duration::hours(2),
+                    evidence_digest: "8".repeat(64),
+                },
+                now() + Duration::seconds(8),
+            )
+            .expect("probe exact domain Connection");
+        let live = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::seconds(9),
+            )
+            .expect("VM-03 live Connection dispatch");
+        let live_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: live.checkpoint_id,
+            expected_mission_revision: live.mission_revision,
+            expected_checkpoint_revision: live.checkpoint_revision,
+        };
+        let completed = service
+            .execute_application_mission_checkpoint(
+                live_command.clone(),
+                now() + Duration::seconds(9),
+            )
+            .expect("complete exact VM-03 minimum truth");
+        let ApplicationMissionCheckpointExecution::Completed {
+            replayed: false,
+            next_dispatch: Some(next),
+            target_dispatch: None,
+            ..
+        } = completed
+        else {
+            panic!("VM-03 minimum truth must start domain search")
+        };
+        assert_eq!(
+            (
+                next.checkpoint_id.as_str(),
+                next.capability_id.as_str(),
+                next.executor,
+                next.state,
+            ),
+            (
+                "domain_search_and_quote",
+                "domain.search",
+                MissionCheckpointExecutor::Runtime,
+                MissionCheckpointDispatchState::Ready,
+            )
+        );
+        let event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("VM-03 events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    live_command,
+                    now() + Duration::seconds(10),
+                )
+                .expect("exact VM-03 replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                next_dispatch: Some(MissionCheckpointDispatch {
+                    executor: MissionCheckpointExecutor::Runtime,
+                    state: MissionCheckpointDispatchState::Ready,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged VM-03 replay events")
+                .len(),
+            event_count
+        );
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("durable VM-03 minimum truth");
+        assert!(mission.work_products.is_empty());
+        assert!(mission.effects.is_empty());
+        let completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "minimum_truth_ready")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable VM-03 minimum truth completion");
+        assert!(completion.work_product_ids.is_empty());
+        assert!(completion.effect_ids.is_empty());
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .expect("durable VM-03 minimum truth evidence");
+        assert_eq!(evidence.handler_id, VM03_MINIMUM_TRUTH_READY_HANDLER_ID);
+        assert_eq!(
+            evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "minimum_site_truth",
+                "mission_checkpoint",
+                "mission_contract",
+            ])
+        );
+        let event_json = serde_json::to_string(
+            &service
+                .mission_events(&project_id, &mission_id)
+                .expect("content-free VM-03 events"),
+        )
+        .expect("VM-03 event JSON");
+        assert!(event_json.contains(VM03_MINIMUM_TRUTH_READY_HANDLER_ID));
+        assert!(!event_json.contains(private_description));
+        assert!(!event_json.contains("cloudflare-private-owner"));
     }
 
     #[test]

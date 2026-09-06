@@ -1695,7 +1695,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 23, 29)
+            (52, 24, 28)
         );
         assert_eq!(
             catalog
@@ -1840,6 +1840,17 @@ mod tests {
                 .application_handler("VM-01", 3, "next_cycle")
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm01.next-cycle/v1")
+        );
+    }
+
+    #[test]
+    fn vm03_minimum_truth_has_an_application_handler() {
+        let catalog = Catalog::load().expect("valid catalog");
+        assert_eq!(
+            catalog
+                .application_handler("VM-03", 3, "minimum_truth_ready")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm03.minimum-truth-ready/v1")
         );
     }
 
