@@ -11,7 +11,7 @@ mod work_product_outcome;
 
 pub use vm03_domain_purchase::{
     CompleteVm03DomainPurchase, ProposeVm03DomainPurchase, VM03_DOMAIN_PURCHASE_CAPABILITY,
-    VM03_DOMAIN_PURCHASE_CHECKPOINT_ID, Vm03DomainPurchaseCompletion,
+    VM03_DOMAIN_PURCHASE_CHECKPOINT_ID, Vm03DomainPurchaseCompletion, Vm03DomainQuoteProjection,
     vm03_domain_purchase_effect_policy, vm03_domain_purchase_verified_receipt,
 };
 
@@ -10397,6 +10397,9 @@ pub struct MissionProjection {
     pub evidence_count: usize,
     pub work_product_count: usize,
     pub work_products: Vec<WorkProductProjection>,
+    /// Validated private quote terms; metadata-only projections leave this empty.
+    #[serde(default)]
+    pub vm03_domain_quote: Option<Vm03DomainQuoteProjection>,
     pub pending_approval_count: usize,
     #[serde(default)]
     pub pending_effects: Vec<PendingEffectApprovalProjection>,
@@ -26155,7 +26158,11 @@ impl ApplicationService {
             .list_missions(project_id)?
             .into_iter()
             .map(|mission| {
-                mission_projection(&self.store, mission, WorkSurface::Orchestrator, true)
+                let quote = vm03_domain_purchase::quote_projection(&self.store, &mission, now)?;
+                let mut projection =
+                    mission_projection(&self.store, mission, WorkSurface::Orchestrator, true)?;
+                projection.vm03_domain_quote = quote;
+                Ok::<_, ApplicationError>(projection)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DesktopUnlockedProjectProjection {
@@ -26960,6 +26967,7 @@ fn mission_projection(
         evidence_count: mission.evidence.len(),
         work_product_count: mission.work_products.len(),
         work_products,
+        vm03_domain_quote: None,
         pending_approval_count: mission
             .effects
             .iter()
@@ -39502,6 +39510,42 @@ mod tests {
             .and_then(MissionDefinition::current_checkpoint)
             .expect("purchase checkpoint");
         assert_eq!(checkpoint.id, VM03_DOMAIN_PURCHASE_CHECKPOINT_ID);
+        let quote = vm03_domain_purchase::quote_projection(
+            &service.store,
+            &purchase,
+            now() + Duration::seconds(12),
+        )
+        .expect("private quote projection")
+        .expect("selected quote");
+        assert_eq!(quote.domain_name, "private-owner.example");
+        assert_eq!(quote.amount.amount_minor, 1_000);
+        assert!(quote.can_propose);
+        assert!(
+            !vm03_domain_purchase::quote_projection(&service.store, &purchase, quote.valid_until,)
+                .expect("expired terms remain readable")
+                .expect("expired quote")
+                .can_propose
+        );
+        let redacted = service
+            .projection(&project_id, &mission_id, WorkSurface::Orchestrator)
+            .expect("metadata projection");
+        assert!(redacted.vm03_domain_quote.is_none());
+        assert!(
+            !serde_json::to_string(&redacted)
+                .expect("metadata JSON")
+                .contains("private-owner.example")
+        );
+        let mut unrelated = purchase.clone();
+        unrelated.definition = None;
+        assert!(
+            vm03_domain_purchase::quote_projection(
+                &service.store,
+                &unrelated,
+                now() + Duration::seconds(12),
+            )
+            .expect("not a purchase route")
+            .is_none()
+        );
         let proposal = ProposeVm03DomainPurchase {
             project_id: project_id.clone(),
             mission_id: mission_id.clone(),

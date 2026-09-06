@@ -15,7 +15,7 @@ use hartevo_application::{
     ApplicationCheckpointHandlerStatus, ApplicationError, BrowserPublicSourceObservation,
     CreatorWorkProjection, DesktopProjectProjection, MissionCheckpointDispatchState,
     MissionProjection, MissionRuntimeProjection, ProjectEncryptionReadiness,
-    ProposeVm04Publication,
+    ProposeVm03DomainPurchase, ProposeVm04Publication,
 };
 use hartevo_browser_adapter::{BrowserProfileStatus, BrowserPromptRisk};
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
@@ -1854,6 +1854,14 @@ pub fn App() -> Element {
             && mission.current_checkpoint_application_handler_status
                 == Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch)
     });
+    let vm03_domain_purchase_route_active = !visual_fixture_mode
+        && mission.as_ref().is_some_and(|mission| {
+            mission.manifest_id.as_deref() == Some("VM-03")
+                && mission.current_checkpoint_id.as_deref() == Some("domain_purchase_approval")
+        });
+    let vm03_domain_quote = mission
+        .as_ref()
+        .and_then(|mission| mission.vm03_domain_quote.clone());
     let vm04_publication_route_active = !visual_fixture_mode
         && mission.as_ref().is_some_and(|mission| {
             mission.manifest_id.as_deref() == Some("VM-04")
@@ -1929,6 +1937,8 @@ pub fn App() -> Element {
                 "正在按冻结 Continue/Stop/Scale/Test 决议推进下一步合同"
             } else if vm04_publication_route_active {
                 "正在把已采用 WorkProduct 与唯一已连接发布账号冻结为 Effect 提案"
+            } else if vm03_domain_purchase_route_active {
+                "正在把已采用域名报价冻结为购买审批提案"
             } else if waiting_approval_grant_active {
                 "正在按冻结 Effect digest 写入 ApprovalGrant"
             } else if application_route_active {
@@ -2027,12 +2037,25 @@ pub fn App() -> Element {
     let can_grant_waiting_approval = project_can_start_mission
         && waiting_approval_grant_active
         && pending_effect_grant.is_some()
+        && (!vm03_domain_purchase_route_active
+            || vm03_domain_quote
+                .as_ref()
+                .is_some_and(|quote| Utc::now() < quote.valid_until))
         && !runtime_busy;
     let can_propose_vm04_publication = project_can_start_mission
         && vm04_publication_route_active
         && vm04_publication_work_product.is_some()
         && vm04_publication_connection.is_some()
         && !runtime_busy;
+    let can_propose_vm03_domain_purchase = project_can_start_mission
+        && vm03_domain_purchase_route_active
+        && !runtime_busy
+        && project
+            .as_ref()
+            .zip(mission.as_ref())
+            .is_some_and(|(project, mission)| {
+                vm03_domain_purchase_proposal(&project.project_id, mission, Utc::now()).is_some()
+            });
     let catalog_continuation_handle_ready =
         project
             .as_ref()
@@ -3957,6 +3980,7 @@ pub fn App() -> Element {
                                     || application_route_active
                                     || vm11_next_contract_route_active
                                     || vm04_publication_route_active
+                                    || vm03_domain_purchase_route_active
                                     || waiting_approval_grant_active
                                     || application_route_not_implemented
                                     || application_route_catalog_mismatch
@@ -4521,6 +4545,22 @@ pub fn App() -> Element {
                                             UiIcon { name: UiIconName::Bot, size: 15 }
                                         }
                                     }
+                                    if vm03_domain_purchase_route_active {
+                                        section { class: "human-checkpoint-confirmation", aria_label: "域名购买报价", aria_live: "polite",
+                                            strong { "域名购买 · 核对报价后再审批" }
+                                            if let Some(quote) = vm03_domain_quote.as_ref() {
+                                                p { "{quote.domain_name} · {quote.provider} · 注册 {quote.registration_years} 年" }
+                                                p { "金额（最小货币单位）：{quote.amount.amount_minor} {quote.amount.currency}" }
+                                                p { "报价有效期至：{quote.valid_until} · 自动续费：关闭" }
+                                                if !can_propose_vm03_domain_purchase && !waiting_approval_grant_active {
+                                                    p { "当前不能再次提交：报价可能已过期、账号状态已变化或提案已存在；刷新状态后再核对。" }
+                                                }
+                                            } else {
+                                                p { "缺少当前已采用的有效域名报价。请先完成报价核对；不会猜测域名、价格或购买账号。" }
+                                            }
+                                            small { "本入口只提交审批；批准也不会从此窗口直接扣款。真实注册商执行尚未接入。" }
+                                        }
+                                    }
                                     div { class: "runtime-pickers",
                                         div { class: "runtime-profile-anchor",
                                             button {
@@ -4551,6 +4591,50 @@ pub fn App() -> Element {
                                         }
                                     }
                                     div { class: "composer-actions",
+                                        if vm03_domain_purchase_route_active
+                                            && mission.as_ref().is_some_and(|mission| mission.stage == MissionStage::Running)
+                                        {
+                                            button {
+                                                class: "application-checkpoint-button",
+                                                disabled: !can_propose_vm03_domain_purchase,
+                                                aria_label: "按已采用域名报价提交购买审批，不直接付款",
+                                                onclick: move |_| {
+                                                    let now = Utc::now();
+                                                    let command = {
+                                                        let model = model.read();
+                                                        model.selected_project_id.as_ref().zip(model.current_mission())
+                                                            .and_then(|(project_id, mission)| vm03_domain_purchase_proposal(project_id, mission, now))
+                                                    };
+                                                    let Some(command) = command else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "BLOCKED_DATA".into(),
+                                                            message: "域名报价已失效或当前状态不允许提交；请刷新报价。未创建提案、未付款。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    mission_submitting.set(true);
+                                                    spawn(async move {
+                                                        let result = tokio::task::spawn_blocking(move || {
+                                                            DesktopDataPlane::persistent().and_then(|plane| {
+                                                                plane.propose_vm03_domain_purchase_os(&command, now)
+                                                            })
+                                                        }).await;
+                                                        match result {
+                                                            Ok(Ok(snapshot)) => model.write().set_ready(snapshot, false),
+                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Err(_) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "VM03_DOMAIN_PROPOSAL_COORDINATOR_FAILED".into(),
+                                                                    message: "购买提案协调异常结束；请刷新状态核对。未执行注册商扣款。".into(),
+                                                                });
+                                                            }
+                                                        }
+                                                        mission_submitting.set(false);
+                                                    });
+                                                },
+                                                if mission_submitting() { "正在提交购买审批…" } else { "提交购买审批" }
+                                            }
+                                        }
                                         if vm04_publication_route_active {
                                             button {
                                                 class: "application-checkpoint-button",
@@ -12028,6 +12112,55 @@ fn money_label(money: &Money) -> String {
     format!("{} {} minor", money.amount_minor, money.currency)
 }
 
+fn vm03_domain_purchase_proposal(
+    project_id: &ProjectId,
+    mission: &MissionProjection,
+    now: DateTime<Utc>,
+) -> Option<ProposeVm03DomainPurchase> {
+    let quote = mission.vm03_domain_quote.as_ref()?;
+    let checkpoint_revision = mission
+        .current_checkpoint_revision
+        .filter(|revision| *revision > 0)?;
+    if &mission.project_id != project_id
+        || mission.manifest_id.as_deref() != Some("VM-03")
+        || mission.manifest_version != Some(3)
+        || mission.current_checkpoint_id.as_deref() != Some("domain_purchase_approval")
+        || mission.current_checkpoint_capability_id.as_deref() != Some("domain.purchase")
+        || mission.current_checkpoint_executor != Some(MissionCheckpointExecutor::EffectBroker)
+        || mission.current_checkpoint_completion_policy
+            != Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
+        || mission.current_checkpoint_status != Some(MissionCheckpointStatus::Running)
+        || mission.stage != MissionStage::Running
+        || mission.revision == 0
+        || !mission.pending_effects.is_empty()
+        || !quote.can_propose
+        || now < quote.quoted_at
+        || now >= quote.valid_until
+    {
+        return None;
+    }
+    let identity = format!(
+        "vm03-domain-purchase:{}:{}:{}:{}",
+        mission.mission_id,
+        quote.work_product_id,
+        quote.work_product_revision,
+        quote.manifest_version,
+    );
+    Some(ProposeVm03DomainPurchase {
+        project_id: project_id.clone(),
+        mission_id: mission.mission_id.clone(),
+        effect_id: EffectId::from_stable(&identity),
+        actor_id: ActorId::from_stable("desktop-local-vm03-domain-operator"),
+        work_product_id: quote.work_product_id.clone(),
+        idempotency_key: identity,
+        expected_mission_revision: mission.revision,
+        expected_checkpoint_revision: checkpoint_revision,
+        expected_connection_revision: quote.connection_revision,
+        expected_work_product_revision: quote.work_product_revision,
+        expected_manifest_version: quote.manifest_version,
+    })
+}
+
 fn runtime_availability_label(status: DesktopRuntimeAvailabilityStatus) -> &'static str {
     match status {
         DesktopRuntimeAvailabilityStatus::NotConfigured => "NOT_CONFIGURED",
@@ -13169,6 +13302,36 @@ mod tests {
         assert!(!proposal.contains("execute_vm04_publication"));
         assert!(!proposal.contains("execute_approved_effect"));
         assert!(!proposal.contains("resume_catalog_mission_runtime"));
+    }
+
+    #[test]
+    fn vm03_purchase_window_shows_terms_and_only_submits_approval() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("aria_label: \"域名购买报价\"")
+            .expect("quote card");
+        let end = source[start..]
+            .find("if vm04_publication_route_active {")
+            .expect("next control");
+        let controls = &source[start..start + end];
+        for contract in [
+            "quote.domain_name",
+            "quote.provider",
+            "quote.registration_years",
+            "quote.amount.amount_minor",
+            "quote.amount.currency",
+            "quote.valid_until",
+            "自动续费：关闭",
+            "真实注册商执行尚未接入",
+            "vm03_domain_purchase_proposal",
+            "propose_vm03_domain_purchase_os",
+            "disabled: !can_propose_vm03_domain_purchase",
+            "提交购买审批",
+        ] {
+            assert!(controls.contains(contract), "missing {contract}");
+        }
+        assert!(!controls.contains("execute_vm03_domain_purchase"));
+        assert!(!controls.contains("execute_approved_effect"));
     }
 
     #[test]

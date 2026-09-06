@@ -9,11 +9,13 @@ use hartevo_domain_kernel::{
     AccountId, ActorId, ApprovalDecision, ConnectionId, ConsentState, Effect, EffectClass,
     EffectId, EffectRisk, EffectSpec, EffectStatus, Mission, MissionCheckpoint,
     MissionCheckpointCompletion, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionCheckpointStatus, MissionId, Money, ProjectId, Receipt, TaskStatus, Verification,
-    VerificationStatus, WorkProduct, WorkProductId, WorkProductStatus,
+    MissionCheckpointStatus, MissionId, MissionStage, Money, ProjectId, Receipt, TaskStatus,
+    Verification, VerificationStatus, WorkProduct, WorkProductId, WorkProductStatus,
 };
 use hartevo_effect_broker::{EffectPolicy, EffectRateLimit};
-use hartevo_storage::{ApplicationSourceKind, ApplicationSourceRevisionFence, PendingEvent};
+use hartevo_storage::{
+    ApplicationSourceKind, ApplicationSourceRevisionFence, PendingEvent, ProjectStore, StorageError,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -94,6 +96,92 @@ struct DomainQuote {
     valid_until: DateTime<Utc>,
     available: bool,
     auto_renew: bool,
+}
+
+/// Private quote terms, available only in an unlocked Project projection.
+/// Readiness is advisory: the command rechecks every source and time fence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Vm03DomainQuoteProjection {
+    pub domain_name: String,
+    pub provider: String,
+    pub registration_years: u8,
+    pub amount: Money,
+    pub quoted_at: DateTime<Utc>,
+    pub valid_until: DateTime<Utc>,
+    pub work_product_id: WorkProductId,
+    pub work_product_revision: u64,
+    pub manifest_version: u64,
+    pub connection_revision: u64,
+    pub can_propose: bool,
+}
+
+pub(super) fn quote_projection(
+    store: &ProjectStore,
+    mission: &Mission,
+    now: DateTime<Utc>,
+) -> Result<Option<Vm03DomainQuoteProjection>, ApplicationError> {
+    let checkpoint = match current_purchase_checkpoint(mission) {
+        Ok(checkpoint) => checkpoint,
+        Err(ApplicationError::Vm03DomainPurchaseMismatch) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (product, quote) = match selected_quote(mission) {
+        Ok(selected) => selected,
+        Err(ApplicationError::Vm03DomainPurchaseMismatch) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let manifest = store.load_work_product_manifest(&mission.project_id, &product.id)?;
+    manifest.validate_against(product)?;
+    if manifest.tenant_id != mission.tenant_id
+        || manifest.project_id != mission.project_id
+        || manifest.mission_id != mission.id
+        || manifest.work_product_type != "runtime_draft"
+        || manifest.adoption_status != WorkProductStatus::Accepted
+    {
+        return Ok(None);
+    }
+    let connection = match store.load_connection(&mission.project_id, &quote.connection_id) {
+        Ok(connection) => Some(connection),
+        Err(StorageError::ScopedRecordNotFound { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let can_propose = mission.stage == MissionStage::Running
+        && checkpoint.status == MissionCheckpointStatus::Running
+        && mission.contract.validate(now).is_ok()
+        && quote.quoted_at <= now
+        && now < quote.valid_until
+        && mission.tasks.iter().any(|task| {
+            task.status == TaskStatus::Running && task.capability == VM03_DOMAIN_PURCHASE_CAPABILITY
+        })
+        && !mission
+            .effects
+            .iter()
+            .any(|effect| effect.capability == VM03_DOMAIN_PURCHASE_CAPABILITY)
+        && connection.is_some_and(|connection| {
+            connection.tenant_id() == &mission.tenant_id
+                && connection.project_id() == &mission.project_id
+                && connection.provider() == quote.provider
+                && connection.account_id() == &quote.account_id
+                && connection.revision() == quote.connection_revision
+                && connection.permits_scopes(
+                    &BTreeSet::from([VM03_DOMAIN_PURCHASE_CAPABILITY.into()]),
+                    now,
+                )
+        });
+    Ok(Some(Vm03DomainQuoteProjection {
+        domain_name: quote.domain_name,
+        provider: quote.provider,
+        registration_years: quote.registration_years,
+        amount: quote.amount,
+        quoted_at: quote.quoted_at,
+        valid_until: quote.valid_until,
+        work_product_id: product.id.clone(),
+        work_product_revision: product.revision,
+        manifest_version: manifest.version,
+        connection_revision: quote.connection_revision,
+        can_propose,
+    }))
 }
 
 fn mismatch() -> ApplicationError {
