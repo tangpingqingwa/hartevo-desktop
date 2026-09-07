@@ -316,7 +316,7 @@ pub(super) fn prepare(
             "text/plain",
             "Static HTML preview built from the adopted Project metadata. Review required; no scripts, live form, publication or deployment.",
         )?,
-        BTreeSet::new(),
+        BTreeSet::from(["/body".into()]),
         now,
     )?;
     Ok(PreparedSiteBuild {
