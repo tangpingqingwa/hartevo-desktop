@@ -849,7 +849,7 @@ impl DesktopUiModel {
                     selected_mission_id: None,
                     notice: None,
                 };
-                model.restore_valid_selection(false);
+                model.restore_valid_selection(true);
                 model
             }
             Err(error) => Self {
@@ -908,19 +908,11 @@ impl DesktopUiModel {
             self.selected_mission_id = None;
             return;
         };
-        let existing_is_valid = !select_latest_mission
-            && self.selected_mission_id.as_ref().is_some_and(|id| {
-                project
-                    .missions
-                    .iter()
-                    .any(|mission| &mission.mission_id == id)
-            });
-        if !existing_is_valid {
-            self.selected_mission_id = project
-                .missions
-                .last()
-                .map(|mission| mission.mission_id.clone());
-        }
+        self.selected_mission_id = restored_mission_selection(
+            project,
+            self.selected_mission_id.as_ref(),
+            select_latest_mission,
+        );
     }
 
     fn select_project(&mut self, project_id: &ProjectId) {
@@ -1253,6 +1245,22 @@ fn scoped_runtime_render_projection<'a>(
     }
 }
 
+fn restored_mission_selection(
+    project: &DesktopProjectProjection,
+    selected: Option<&MissionId>,
+    select_latest: bool,
+) -> Option<MissionId> {
+    // None is an intentional dispatcher/new-task selection, not a stale task.
+    // Only cold startup or an explicit request should select the latest task.
+    if !select_latest
+        && selected.is_none_or(|id| project.missions.iter().any(|m| &m.mission_id == id))
+    {
+        selected.cloned()
+    } else {
+        project.missions.last().map(|m| m.mission_id.clone())
+    }
+}
+
 #[component]
 pub fn App() -> Element {
     let mut initial_model = use_signal(|| None::<DesktopUiModel>);
@@ -1262,6 +1270,7 @@ pub fn App() -> Element {
     rsx! {
         document::Title { "Hartevo Desktop" }
         document::Stylesheet { href: MAIN_CSS }
+        document::Stylesheet { href: PROTOTYPE_CSS }
         document::Stylesheet { href: PRODUCT_CSS }
         if let Some(model) = initial_model() {
             DesktopWorkspace { initial_model: model }
@@ -3433,10 +3442,6 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     let mission_count = project.as_ref().map_or(0, |project| project.missions.len());
 
     rsx! {
-        document::Title { "Hartevo Desktop" }
-        document::Stylesheet { href: MAIN_CSS }
-        document::Stylesheet { href: PROTOTYPE_CSS }
-        document::Stylesheet { href: PRODUCT_CSS }
         div {
             class: "desktop-shell",
             tabindex: "-1",
@@ -12531,6 +12536,28 @@ mod tests {
     use sha2::Digest as _;
 
     use super::*;
+
+    #[test]
+    fn workspace_refresh_preserves_new_task_selection_and_validates_existing_task_ids() {
+        let (project, mission) =
+            result_adoption_surface::tests::project_and_mission(WorkProductStatus::Accepted);
+        // A refresh started in a task must respect a later switch to New Task.
+        assert_eq!(restored_mission_selection(&project, None, false), None);
+        assert_eq!(
+            restored_mission_selection(&project, Some(&mission.mission_id), false),
+            Some(mission.mission_id.clone()),
+        );
+        let missing = MissionId::from("deleted-task");
+        assert_eq!(
+            restored_mission_selection(&project, Some(&missing), false),
+            Some(mission.mission_id.clone()),
+        );
+        // Cold startup still deliberately restores the latest task.
+        assert_eq!(
+            restored_mission_selection(&project, None, true),
+            Some(mission.mission_id),
+        );
+    }
 
     #[test]
     fn restoring_history_preserves_results_while_live_text_respects_attention_and_scroll() {
