@@ -25,6 +25,7 @@ use hartevo_application::llm_deepseek::{
     DEEPSEEK_PROVIDER_ID, DeepSeekAdapter, DeepSeekConnection, DeepSeekTransport,
     UreqDeepSeekTransport,
 };
+use hartevo_application::llm_openai::{ChatCompletionsProvider, OpenAiCompatibleAdapter};
 mod vm03_domain_purchase;
 
 use hartevo_application::{
@@ -2708,6 +2709,15 @@ pub(crate) enum DesktopRuntimeSource {
         adapter: DeepSeekAdapter,
     },
     #[cfg(any(test, feature = "native-journey"))]
+    #[allow(
+        dead_code,
+        reason = "opt-in live model journeys use this real-transport observation seam"
+    )]
+    NativeCompatible {
+        model: String,
+        adapter: OpenAiCompatibleAdapter,
+    },
+    #[cfg(any(test, feature = "native-journey"))]
     Fixture {
         provider: String,
         model: String,
@@ -2715,8 +2725,30 @@ pub(crate) enum DesktopRuntimeSource {
     },
 }
 
+#[derive(Clone, Debug)]
+enum DesktopNativeLlmAdapter {
+    DeepSeek(DeepSeekAdapter),
+    Compatible(OpenAiCompatibleAdapter),
+}
+
+impl LlmAdapter for DesktopNativeLlmAdapter {
+    fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+        match self {
+            Self::DeepSeek(adapter) => adapter.prepare_model(provider, model),
+            Self::Compatible(adapter) => adapter.prepare_model(provider, model),
+        }
+    }
+
+    fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
+        match self {
+            Self::DeepSeek(adapter) => adapter.stream(request),
+            Self::Compatible(adapter) => adapter.stream(request),
+        }
+    }
+}
+
 enum DesktopMissionProvider {
-    NativeDeepSeek(DeepSeekAdapter),
+    Native(DesktopNativeLlmAdapter),
     ApplicationRuntime(RuntimeCommand),
 }
 
@@ -2727,13 +2759,15 @@ struct LocalRuntimeResumePlan {
 }
 
 impl DesktopRuntimeSource {
-    fn is_native_deepseek(&self) -> bool {
+    fn is_cordis_native(&self) -> bool {
         match self {
             Self::Pinned(configuration) => {
-                configuration.artifact.is_none() && configuration.provider == DEEPSEEK_PROVIDER_ID
+                configuration.artifact.is_none()
+                    && (configuration.provider == DEEPSEEK_PROVIDER_ID
+                        || ChatCompletionsProvider::from_id(&configuration.provider).is_some())
             }
             #[cfg(any(test, feature = "native-journey"))]
-            Self::NativeDeepSeek { .. } => true,
+            Self::NativeDeepSeek { .. } | Self::NativeCompatible { .. } => true,
             #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { .. } => false,
         }
@@ -2745,6 +2779,8 @@ impl DesktopRuntimeSource {
             #[cfg(any(test, feature = "native-journey"))]
             Self::NativeDeepSeek { .. } => DEEPSEEK_PROVIDER_ID,
             #[cfg(any(test, feature = "native-journey"))]
+            Self::NativeCompatible { adapter, .. } => adapter.provider().id(),
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { provider, .. } => provider,
         }
     }
@@ -2753,7 +2789,7 @@ impl DesktopRuntimeSource {
         match self {
             Self::Pinned(configuration) => &configuration.model,
             #[cfg(any(test, feature = "native-journey"))]
-            Self::NativeDeepSeek { model, .. } => model,
+            Self::NativeDeepSeek { model, .. } | Self::NativeCompatible { model, .. } => model,
             #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { model, .. } => model,
         }
@@ -2766,13 +2802,7 @@ impl DesktopRuntimeSource {
     ) -> Result<DesktopMissionProvider, DesktopDataError> {
         match self {
             Self::Pinned(configuration) if configuration.artifact.is_none() => {
-                if configuration.provider != DEEPSEEK_PROVIDER_ID {
-                    return Err(DesktopDataError::CordisSessionPersistence(
-                        "Desktop native provider configuration is unsupported".into(),
-                    ));
-                }
-                production_native_deepseek_adapter(&configuration)
-                    .map(DesktopMissionProvider::NativeDeepSeek)
+                production_native_adapter(&configuration).map(DesktopMissionProvider::Native)
             }
             Self::Pinned(configuration) => {
                 let runtime_home = ensure_project_runtime_home(project_root, mission_scope_digest)?;
@@ -2786,9 +2816,13 @@ impl DesktopRuntimeSource {
                     })
             }
             #[cfg(any(test, feature = "native-journey"))]
-            Self::NativeDeepSeek { adapter, .. } => {
-                Ok(DesktopMissionProvider::NativeDeepSeek(adapter))
-            }
+            Self::NativeDeepSeek { adapter, .. } => Ok(DesktopMissionProvider::Native(
+                DesktopNativeLlmAdapter::DeepSeek(adapter),
+            )),
+            #[cfg(any(test, feature = "native-journey"))]
+            Self::NativeCompatible { adapter, .. } => Ok(DesktopMissionProvider::Native(
+                DesktopNativeLlmAdapter::Compatible(adapter),
+            )),
             #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture {
                 command_builder, ..
@@ -2819,9 +2853,11 @@ impl DesktopRuntimeSource {
                 .runtime_command(project_root, runtime_home)
                 .map_err(|error| DesktopDataError::Application(ApplicationError::Runtime(error))),
             #[cfg(any(test, feature = "native-journey"))]
-            Self::NativeDeepSeek { .. } => Err(DesktopDataError::CordisSessionPersistence(
-                "Cordis-native provider does not expose an Application Runtime command".into(),
-            )),
+            Self::NativeDeepSeek { .. } | Self::NativeCompatible { .. } => {
+                Err(DesktopDataError::CordisSessionPersistence(
+                    "Cordis-native provider does not expose an Application Runtime command".into(),
+                ))
+            }
             #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture {
                 command_builder, ..
@@ -2830,19 +2866,37 @@ impl DesktopRuntimeSource {
     }
 }
 
-fn production_native_deepseek_adapter(
+fn production_native_adapter(
     configuration: &DesktopRuntimeConfiguration,
-) -> Result<DeepSeekAdapter, DesktopDataError> {
+) -> Result<DesktopNativeLlmAdapter, DesktopDataError> {
+    if let Some(provider) = ChatCompletionsProvider::from_id(&configuration.provider) {
+        let connection = configuration.compatible_connection.clone().ok_or_else(|| {
+            DesktopDataError::CordisSessionPersistence(
+                "Native compatible connection is missing".into(),
+            )
+        })?;
+        return Ok(DesktopNativeLlmAdapter::Compatible(
+            OpenAiCompatibleAdapter::production(provider, connection),
+        ));
+    }
+    if configuration.provider != DEEPSEEK_PROVIDER_ID {
+        return Err(DesktopDataError::CordisSessionPersistence(
+            "Unsupported native provider".into(),
+        ));
+    }
     if configuration.native_profile_reference.is_none() {
         let connection = DeepSeekConnection::official(DEEPSEEK_CREDENTIAL_ENV)
             .map_err(|error| DesktopDataError::CordisSessionPersistence(error.to_string()))?;
-        return Ok(DeepSeekAdapter::production(connection));
+        return Ok(DesktopNativeLlmAdapter::DeepSeek(
+            DeepSeekAdapter::production(connection),
+        ));
     }
     native_deepseek_profile_adapter(
         configuration,
         Arc::new(OsSecretStore::new(OS_SECRET_SERVICE)?),
         UreqDeepSeekTransport,
     )
+    .map(DesktopNativeLlmAdapter::DeepSeek)
 }
 
 fn native_deepseek_profile_adapter<S, T>(
@@ -4106,17 +4160,22 @@ impl DesktopDataPlane {
     {
         if runtime
             .as_ref()
-            .is_some_and(DesktopRuntimeSource::is_native_deepseek)
+            .is_some_and(DesktopRuntimeSource::is_cordis_native)
         {
             let adapter = match runtime {
                 Some(DesktopRuntimeSource::Pinned(configuration))
-                    if configuration.artifact.is_none()
-                        && configuration.provider == DEEPSEEK_PROVIDER_ID =>
+                    if configuration.artifact.is_none() =>
                 {
-                    production_native_deepseek_adapter(&configuration)?
+                    production_native_adapter(&configuration)?
                 }
                 #[cfg(any(test, feature = "native-journey"))]
-                Some(DesktopRuntimeSource::NativeDeepSeek { adapter, .. }) => adapter,
+                Some(DesktopRuntimeSource::NativeDeepSeek { adapter, .. }) => {
+                    DesktopNativeLlmAdapter::DeepSeek(adapter)
+                }
+                #[cfg(any(test, feature = "native-journey"))]
+                Some(DesktopRuntimeSource::NativeCompatible { adapter, .. }) => {
+                    DesktopNativeLlmAdapter::Compatible(adapter)
+                }
                 _ => {
                     return Err(DesktopDataError::CordisSessionPersistence(
                         "Desktop native compaction provider is unavailable".into(),
@@ -9925,8 +9984,8 @@ impl DesktopDataPlane {
                 }
             }
         };
-        let native_deepseek = runtime.is_native_deepseek();
-        let native_turn_plan = if native_deepseek && !is_followup {
+        let native_provider = runtime.is_cordis_native();
+        let native_turn_plan = if native_provider && !is_followup {
             let checkpoint = {
                 let cordis = self.cordis.checkout().map_err(|error| {
                     DesktopDataError::CordisSessionPersistence(error.to_string())
@@ -9988,7 +10047,7 @@ impl DesktopDataPlane {
             CordisMissionTurnPlan::Dispatch { attempt, .. } => Some(*attempt),
             CordisMissionTurnPlan::Adopt(_) => None,
         });
-        let prepared = if native_deepseek && is_followup {
+        let prepared = if native_provider && is_followup {
             None
         } else if is_followup {
             Some(service.prepare_local_mission_runtime_followup_context(
@@ -10044,7 +10103,7 @@ impl DesktopDataPlane {
             stop: None,
         };
         let cordis_approval = cancellation.map(DesktopRuntimeCancellation::cordis_approval_bridge);
-        if let DesktopMissionProvider::NativeDeepSeek(adapter) = &mission_provider {
+        if let DesktopMissionProvider::Native(adapter) = &mission_provider {
             let cordis_cancellation = cancellation
                 .filter(|control| !control.is_requested())
                 .map_or_else(
@@ -13590,6 +13649,7 @@ impl From<DesktopCordisApprovalDecisionError> for DesktopDataError {
 
 #[cfg(test)]
 mod tests {
+    mod live_models;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
         Arc, Mutex,

@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hartevo_application::llm_deepseek::{
-    DEEPSEEK_PROVIDER_ID, DeepSeekAdapterError, DeepSeekCredentialResolver,
+    DEEPSEEK_PROVIDER_ID, DeepSeekAdapterError, DeepSeekConnection, DeepSeekCredentialResolver,
 };
+use hartevo_application::llm_openai::ChatCompletionsProvider;
 use hartevo_runtime_adapter::{
     AdapterError, OPENINTERPRETER_RELEASE, VerifiedRuntimeArtifact, host_openinterpreter_target,
     pinned_runtime_artifact, verify_pinned_runtime_artifact,
@@ -15,6 +16,11 @@ use zeroize::Zeroizing;
 pub const RUNTIME_PROGRAM_ENV: &str = "HARTEVO_OPENINTERPRETER_BIN";
 pub const RUNTIME_PROVIDER_ENV: &str = "HARTEVO_RUNTIME_PROVIDER";
 pub const RUNTIME_MODEL_ENV: &str = "HARTEVO_RUNTIME_MODEL";
+/// Explicit opt-in for a native compatible route. Secrets are read by name.
+pub const RUNTIME_API_BASE_ENV: &str = "HARTEVO_RUNTIME_API_BASE";
+pub const RUNTIME_API_KEY_ENV_ENV: &str = "HARTEVO_RUNTIME_API_KEY_ENV";
+pub const RUNTIME_CONTEXT_TOKENS_ENV: &str = "HARTEVO_RUNTIME_CONTEXT_TOKENS";
+pub const RUNTIME_MAX_TOKENS_ENV: &str = "HARTEVO_RUNTIME_MAX_TOKENS";
 pub(crate) const DEEPSEEK_CREDENTIAL_ENV: &str = "DEEPSEEK_API_KEY";
 const CORDIS_NATIVE_TARGET: &str = "cordis-native";
 const DEEPSEEK_NATIVE_RELEASE: &str = "deepseek-harness-cd5ef814/cordis-v1";
@@ -82,6 +88,7 @@ pub(crate) struct DesktopRuntimeConfiguration {
     pub provider: String,
     pub model: String,
     pub native_profile_reference: Option<SecretReference>,
+    pub compatible_connection: Option<DeepSeekConnection>,
 }
 
 impl std::fmt::Debug for DesktopRuntimeConfiguration {
@@ -240,6 +247,7 @@ pub(crate) fn clear_native_deepseek_profile(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DesktopRuntimeBackend {
     CordisNative,
+    CordisCompatible(ChatCompletionsProvider),
     OpenInterpreter,
 }
 
@@ -257,13 +265,19 @@ enum EnvironmentCredentialState {
 fn runtime_backend(provider: Option<&str>) -> DesktopRuntimeBackend {
     match provider {
         None | Some(DEEPSEEK_PROVIDER_ID) => DesktopRuntimeBackend::CordisNative,
-        Some(_) => DesktopRuntimeBackend::OpenInterpreter,
+        Some(id) => ChatCompletionsProvider::from_id(id).map_or(
+            DesktopRuntimeBackend::OpenInterpreter,
+            DesktopRuntimeBackend::CordisCompatible,
+        ),
     }
 }
 
 pub(crate) fn discover_runtime() -> DesktopRuntimeDiscovery {
     match runtime_backend(normalized_env(RUNTIME_PROVIDER_ENV).as_deref()) {
         DesktopRuntimeBackend::CordisNative => discover_environment_native_deepseek(),
+        DesktopRuntimeBackend::CordisCompatible(provider) => {
+            discover_environment_compatible(provider)
+        }
         DesktopRuntimeBackend::OpenInterpreter => discover_openinterpreter(),
     }
 }
@@ -274,6 +288,9 @@ pub(crate) fn discover_runtime_with_native_profile(
 ) -> DesktopRuntimeDiscovery {
     match runtime_backend(normalized_env(RUNTIME_PROVIDER_ENV).as_deref()) {
         DesktopRuntimeBackend::OpenInterpreter => discover_openinterpreter(),
+        DesktopRuntimeBackend::CordisCompatible(provider) => {
+            discover_environment_compatible(provider)
+        }
         DesktopRuntimeBackend::CordisNative => match load_native_deepseek_profile(store, reference)
         {
             Ok(profile) => discover_native_deepseek(
@@ -398,6 +415,7 @@ fn discover_openinterpreter() -> DesktopRuntimeDiscovery {
             provider,
             model,
             native_profile_reference: None,
+            compatible_connection: None,
         }),
     }
 }
@@ -407,6 +425,65 @@ fn runtime_ready_status(artifact: &VerifiedRuntimeArtifact) -> DesktopRuntimeAva
         DesktopRuntimeAvailabilityStatus::ReadyDistribution
     } else {
         DesktopRuntimeAvailabilityStatus::ReadyDevelopment
+    }
+}
+
+fn discover_environment_compatible(provider: ChatCompletionsProvider) -> DesktopRuntimeDiscovery {
+    let model = normalized_env(RUNTIME_MODEL_ENV).filter(|value| valid_native_model(value));
+    let base = normalized_env(RUNTIME_API_BASE_ENV);
+    let key_env = normalized_env(RUNTIME_API_KEY_ENV_ENV);
+    let parse_limit = |name: &str, default: u64| match normalized_env(name) {
+        Some(value) => value.parse::<u64>().ok().filter(|value| *value > 0),
+        None => Some(default),
+    };
+    let connection = base.zip(key_env).and_then(|(base, key_env)| {
+        DeepSeekConnection::new(
+            base,
+            key_env,
+            parse_limit(RUNTIME_CONTEXT_TOKENS_ENV, 32_768)?,
+            parse_limit(RUNTIME_MAX_TOKENS_ENV, 4_096)?,
+            std::time::Duration::from_mins(3),
+        )
+        .ok()
+    });
+    let credential_ready = connection.as_ref().is_some_and(|connection| {
+        env::var(connection.api_key_env())
+            .ok()
+            .map(Zeroizing::new)
+            .is_some_and(|value| valid_native_credential(&value))
+    });
+    let ready = model.is_some() && connection.is_some() && credential_ready;
+    let projection = DesktopRuntimeProjection {
+        status: if ready {
+            DesktopRuntimeAvailabilityStatus::ReadyDevelopment
+        } else {
+            DesktopRuntimeAvailabilityStatus::ConfigurationRequired
+        },
+        target: Some(CORDIS_NATIVE_TARGET.into()),
+        release: "cordis-chat-completions-v1".into(),
+        program_sha256: None,
+        provider: Some(provider.id().into()),
+        model: model.clone(),
+        native_credential_source: credential_ready
+            .then_some(DesktopNativeCredentialSource::Environment),
+        distribution_signature_evidence: None,
+        exact_tokenizer_evidence: false,
+    };
+    let configuration = if ready {
+        Some(DesktopRuntimeConfiguration {
+            projection: projection.clone(),
+            artifact: None,
+            provider: provider.id().into(),
+            model: model.expect("ready model"),
+            native_profile_reference: None,
+            compatible_connection: connection,
+        })
+    } else {
+        None
+    };
+    DesktopRuntimeDiscovery {
+        projection,
+        configuration,
     }
 }
 
@@ -458,6 +535,7 @@ fn discover_native_deepseek(
             provider: DEEPSEEK_PROVIDER_ID.into(),
             model,
             native_profile_reference,
+            compatible_connection: None,
         }
     });
     DesktopRuntimeDiscovery {
@@ -646,6 +724,15 @@ mod tests {
             runtime_backend(Some(DEEPSEEK_PROVIDER_ID)),
             DesktopRuntimeBackend::CordisNative
         );
+        for provider in [
+            ChatCompletionsProvider::OpenAi,
+            ChatCompletionsProvider::Grok,
+        ] {
+            assert_eq!(
+                runtime_backend(Some(provider.id())),
+                DesktopRuntimeBackend::CordisCompatible(provider)
+            );
+        }
         assert_eq!(
             runtime_backend(Some("openai")),
             DesktopRuntimeBackend::OpenInterpreter

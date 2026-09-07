@@ -134,7 +134,7 @@ fn request(session: &str) -> LlmGenerateRequest {
     .with_session_id(SessionId::new(session).unwrap())
 }
 
-fn collect(adapter: &DeepSeekAdapter, request: LlmGenerateRequest) -> Vec<SessionStreamChunk> {
+fn collect(adapter: &impl LlmAdapter, request: LlmGenerateRequest) -> Vec<SessionStreamChunk> {
     let stream = adapter.stream(request).expect("stream");
     futures_executor::block_on(stream.collect::<Vec<_>>())
         .into_iter()
@@ -142,11 +142,122 @@ fn collect(adapter: &DeepSeekAdapter, request: LlmGenerateRequest) -> Vec<Sessio
         .expect("chunks")
 }
 
-fn stream_error(adapter: &DeepSeekAdapter, request: LlmGenerateRequest) -> SessionLlmFailure {
+fn stream_error(adapter: &impl LlmAdapter, request: LlmGenerateRequest) -> SessionLlmFailure {
     match adapter.stream(request) {
         Ok(_) => panic!("request unexpectedly produced a stream"),
         Err(error) => error,
     }
+}
+
+fn compatible_request(provider: ChatCompletionsProvider) -> LlmGenerateRequest {
+    let original = request("compatible-session");
+    let mut config = original.config().clone();
+    config.provider = provider.id().into();
+    config.model = "configured-model".into();
+    config.reasoning_effort = None;
+    LlmGenerateRequest::new(config, original.messages().to_vec())
+        .with_system(original.system().map(str::to_owned))
+        .with_tools(original.tools().unwrap().to_vec())
+}
+
+#[test]
+fn compatible_routes_keep_identity_tool_history_and_provider_token_fields() {
+    use crate::llm_openai::OpenAiCompatibleAdapter;
+
+    for provider in [
+        ChatCompletionsProvider::OpenAi,
+        ChatCompletionsProvider::Grok,
+    ] {
+        let transport = RecordingTransport::new(vec![Ok(response(&[
+            r#"{"choices":[{"delta":{"content":"draft"},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]))]);
+        let adapter = OpenAiCompatibleAdapter::new(
+            provider,
+            DeepSeekConnection::new(
+                "https://gateway.example/v1",
+                "TEST_API_KEY",
+                32_768,
+                2_048,
+                Duration::from_secs(10),
+            )
+            .unwrap(),
+            |_: &str| Ok(Zeroizing::new("synthetic-credential".into())),
+            transport.clone(),
+        );
+        let model = adapter
+            .prepare_model(provider.id(), "configured-model")
+            .unwrap();
+        assert_eq!(model.provider(), provider.id());
+        assert!(model.reasoning().is_none());
+        assert_eq!(model.default_max_tokens(), Some(2_048));
+        assert!(
+            adapter
+                .prepare_model(DEEPSEEK_PROVIDER_ID, "configured-model")
+                .is_err()
+        );
+        let chunks = collect(&adapter, compatible_request(provider));
+        assert!(matches!(
+            chunks.last(),
+            Some(SessionStreamChunk::Finish {
+                reason: SessionFinishReason::Stop,
+                ..
+            })
+        ));
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let body = &calls[0].request;
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        let (expected, absent) = if provider == ChatCompletionsProvider::OpenAi {
+            ("max_completion_tokens", "max_tokens")
+        } else {
+            ("max_tokens", "max_completion_tokens")
+        };
+        assert_eq!(body[expected], 4_096);
+        assert!(body.get(absent).is_none());
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(body["messages"][3]["role"], "tool");
+        assert_eq!(body["messages"][3]["tool_call_id"], "call-1");
+        assert_eq!(body["tools"][0]["function"]["name"], "inspect");
+        assert!(!body.to_string().contains("synthetic-credential"));
+    }
+}
+
+#[test]
+fn compatible_route_mismatch_and_cancellation_never_resolve_a_credential() {
+    use crate::llm_openai::OpenAiCompatibleAdapter;
+
+    let adapter = OpenAiCompatibleAdapter::new(
+        ChatCompletionsProvider::OpenAi,
+        DeepSeekConnection::official("TEST_API_KEY").unwrap(),
+        |_: &str| -> Result<Zeroizing<String>, DeepSeekAdapterError> {
+            panic!("must not read credential")
+        },
+        RecordingTransport::new(vec![]),
+    );
+    assert_eq!(
+        stream_error(&adapter, compatible_request(ChatCompletionsProvider::Grok)).code,
+        "INVALID_MODEL"
+    );
+    let cancellation = LifecycleCancellation::default();
+    cancellation.cancel();
+    assert_eq!(
+        stream_error(
+            &adapter,
+            compatible_request(ChatCompletionsProvider::OpenAi).with_cancellation(cancellation)
+        )
+        .code,
+        "ABORTED"
+    );
+    let mut config = compatible_request(ChatCompletionsProvider::OpenAi)
+        .config()
+        .clone();
+    config.reasoning_effort = Some("high".into());
+    assert_eq!(
+        stream_error(&adapter, LlmGenerateRequest::new(config, vec![])).code,
+        "UNSUPPORTED_REASONING_EFFORT"
+    );
 }
 
 #[test]

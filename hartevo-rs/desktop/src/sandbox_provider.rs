@@ -2811,7 +2811,11 @@ mod tests {
             vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
-                OsString::from("trap ': > \"$1\"' TERM; : > \"$2\"; while :; do sleep 30; done"),
+                // A foreground external command can defer the shell's TERM trap
+                // across fork/wait, racing the short grace period in this test.
+                // Builtins keep the resistant process ready to handle TERM;
+                // the separate group-reaping test covers child processes.
+                OsString::from("trap ': > \"$1\"' TERM; : > \"$2\"; while :; do :; done"),
                 OsString::from("n98-grace-probe"),
                 term_seen.clone().into_os_string(),
                 ready.clone().into_os_string(),

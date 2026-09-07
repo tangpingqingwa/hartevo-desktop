@@ -2,6 +2,7 @@
 
 pub mod connectors;
 pub mod llm_deepseek;
+pub mod llm_openai;
 
 pub mod mission_loop;
 mod observation_evidence_pack;
