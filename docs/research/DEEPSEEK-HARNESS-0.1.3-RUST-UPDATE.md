@@ -39,6 +39,8 @@ POSIX 每次写入前核对当前路径与已锁定 inode。路径消失或被�
 
 同一桌面刷新同一数据库时复用原持锁连接，重新校验当前 durable prefix，不争抢自身锁或提前释放所有权。生成已有合法 Finish 后若 transport 仍等待 EOF，随后取消会复用已有结束记录并保存正文，不追加第二个 Finish。
 
+Application Runtime 桥接仍由外部停止请求中断实际执行；其已落盘的有界正文流交付到最后一个 Finish 时，再将取消投影到 Cordis，确保正文恰好提交一次并可跨加密重开恢复。Native DeepSeek 的实时流继续立即响应取消。冷重启回归会先关闭原桌面实例，避免把仍有活跃 writer 的第二个实例误当作重启。
+
 ## 兼容与回退
 
 数据库 schema 仍为 52，本地 Rust Session 格式仍为 0。没有重写已提交事件，没有丢弃原始 token 边界、时间戳、usage 或 replay metadata，没有更改 Domain/Effect 的权限与事实归属。
@@ -51,7 +53,7 @@ POSIX 每次写入前核对当前路径与已锁定 inode。路径消失或被�
 
 - `cargo test -p hartevo-storage --locked --lib cordis_session_store`：不可变 checkpoint、版本拒绝、跨连接/跨进程竞争、崩溃释放、占用时恢复回滚、inode 替换与符号链接拒绝。带 ignore 的 child fixture 由真实崩溃测试显式启动，不是跳过崩溃验证。
 - `cargo test -p hartevo-cordis --locked --test agent_loop`：取消、原始流、provider failure/retry、工具排序和回合边界。
-- `cargo test -p hartevo-desktop --locked --lib cordis_host::tests`：桌面绑定、恢复、模型前认领、取消正文跨 SQLCipher 重开。
+- `cargo test -p hartevo-desktop --all-targets --all-features --locked`：桌面绑定、恢复、模型前认领、Native 与 Application Runtime 取消正文跨 SQLCipher 重开，以及完整桌面流程回归。
 - `cargo fmt --all --check` 与相关 Rust crate 的 `cargo clippy --all-targets --locked -- -D warnings`。
 
 上述命令是可复现验证入口；实际执行结果以本轮 PR 的当前提交和 CI 为准，不构成生产模型、Windows 实机或 Release 验收声明。
