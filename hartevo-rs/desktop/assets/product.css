@@ -144,3 +144,21 @@
 .task-creation-bar small{font-size:12px;line-height:1.6;color:#657268}
 .mission-table-row .task-state{margin:0}
 @media(max-width:1050px){.task-creation-bar{align-items:flex-start;flex-direction:column}.task-creation-bar>button{align-self:flex-end}}
+.product-dispatcher{max-width:1040px;margin:0 auto 24px;background:transparent;border:0;box-shadow:none}
+.product-dispatcher .dispatcher-hero{padding:8px 0 24px;border:0}
+.product-dispatcher .dispatcher-hero h1{font-size:24px;font-weight:650;letter-spacing:-.025em}
+.product-dispatcher .dispatcher-hero p{font-size:14px;line-height:1.7;max-width:660px;margin-top:8px}
+.product-dispatcher .dispatcher-stats{grid-template-columns:repeat(3,1fr);margin:0 0 28px;border:0;border-top:1px solid #e0e6e0;border-bottom:1px solid #e0e6e0;border-radius:0;background:transparent}
+.product-dispatcher .dispatcher-stats>div{padding:18px 12px}
+.product-dispatcher .dispatcher-stats strong{font-size:23px;font-weight:620}
+.product-dispatcher .dispatcher-stats small{font-size:12px;margin-top:6px}
+.product-dispatcher .dispatcher-priority{padding:0;border:0;background:transparent}
+.product-dispatcher .dispatcher-priority>header{margin-bottom:12px}
+.product-dispatcher .dispatcher-priority h2{font-size:15px}
+.product-dispatcher .dispatcher-priority header>span{font-size:12px}
+.product-dispatcher .dispatcher-mission-row{display:flex;gap:18px;align-items:center;padding:18px 12px;min-height:78px;border:0;border-bottom:1px solid #e1e6e1;border-radius:0}
+.product-dispatcher .dispatcher-mission-row>span{flex:1;min-width:0}
+.product-dispatcher .dispatcher-mission-row strong{font-size:14px;line-height:1.6}
+.product-dispatcher .dispatcher-mission-row small{font-size:12px;margin-top:5px}
+.product-dispatcher .dispatcher-mission-row b{font-size:13px}
+.mission-chat-nav{max-width:1040px;margin:0 auto 12px;display:flex;justify-content:flex-end}

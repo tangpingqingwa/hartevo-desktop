@@ -254,6 +254,18 @@ impl DesktopDataPlane {
             .media_generations(project, mission)?)
     }
 
+    pub(crate) fn media_job_os(
+        &self,
+        project: &ProjectId,
+        mission: &MissionId,
+        id: &str,
+    ) -> Result<MediaGeneration, DesktopDataError> {
+        let secrets = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        Ok(self
+            .media_service(&secrets, project, Utc::now())?
+            .media_generation(project, mission, id)?)
+    }
+
     pub fn media_adopt_os(
         &self,
         id: &str,

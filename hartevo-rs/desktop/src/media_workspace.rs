@@ -76,13 +76,38 @@ fn execute(action: Action) -> Result<(Option<MediaGeneration>, DesktopSnapshot),
 fn load_workspace(
     project: &ProjectId,
     mission: &MissionId,
+    requested: Option<&hartevo_domain_kernel::WorkProductId>,
 ) -> Result<(Vec<MediaGeneration>, DesktopSnapshot), String> {
     let plane = DesktopDataPlane::persistent().map_err(failure)?;
     let DesktopLoadState::Ready(snapshot) = plane.load_os(chrono::Utc::now()).map_err(failure)?
     else {
         return Err("项目需要重新解锁。".into());
     };
-    let jobs = plane.media_jobs_os(project, mission).map_err(failure)?;
+    let mut jobs = plane.media_jobs_os(project, mission).map_err(failure)?;
+    if let Some(product_id) = requested {
+        let generation = snapshot
+            .inventory
+            .projects
+            .iter()
+            .find(|p| &p.project_id == project)
+            .and_then(|p| p.missions.iter().find(|m| &m.mission_id == mission))
+            .and_then(|m| {
+                m.work_products
+                    .iter()
+                    .find(|p| &p.work_product_id == product_id)
+            })
+            .and_then(crate::product_experience::media_identity)
+            .ok_or("所选素材已变化，请返回任务重新打开。")?;
+        if !jobs.iter().any(|job| job.request.id == generation.0) {
+            // The recent history is bounded to 50 rows. An explicit result must
+            // still open its own generation, never a different recent result.
+            jobs.push(
+                plane
+                    .media_job_os(project, mission, &generation.0)
+                    .map_err(failure)?,
+            );
+        }
+    }
     Ok((jobs, *snapshot))
 }
 
@@ -226,15 +251,14 @@ fn preferred_job<'a>(
     mission: &MissionProjection,
     requested: Option<&hartevo_domain_kernel::WorkProductId>,
 ) -> Option<&'a MediaGeneration> {
-    requested
-        .and_then(|id| {
-            rows.iter()
-                .find(|job| &job.work_product_id == id && current_product(mission, job).is_some())
-        })
-        .or_else(|| {
-            rows.iter().find(|job| {
-                current_product(mission, job).is_some() && job.state == MediaGenerationState::Ready
-            })
+    if let Some(id) = requested {
+        return rows
+            .iter()
+            .find(|job| &job.work_product_id == id && current_product(mission, job).is_some());
+    }
+    rows.iter()
+        .find(|job| {
+            current_product(mission, job).is_some() && job.state == MediaGenerationState::Ready
         })
         .or_else(|| rows.first())
 }
@@ -255,14 +279,22 @@ pub(crate) fn MediaWorkspace(
     let mut refresh = use_signal(|| 0u64);
     let mut viewed = use_signal(|| None::<String>);
     let mut show_generator = use_signal(|| false);
-    let scope = use_hook(|| (mission.project_id.clone(), mission.mission_id.clone()));
+    let scope = use_hook(|| {
+        (
+            mission.project_id.clone(),
+            mission.mission_id.clone(),
+            initial_work_product_id.clone(),
+        )
+    });
     let jobs = use_resource(move || {
         let _ = refresh();
-        let (project, mission) = scope.clone();
+        let (project, mission, requested) = scope.clone();
         async move {
-            tokio::task::spawn_blocking(move || load_workspace(&project, &mission))
-                .await
-                .unwrap_or_else(|_| Err("暂时无法读取素材任务。".into()))
+            tokio::task::spawn_blocking(move || {
+                load_workspace(&project, &mission, requested.as_ref())
+            })
+            .await
+            .unwrap_or_else(|_| Err("暂时无法读取素材任务。".into()))
         }
     });
     let rows = jobs
@@ -275,8 +307,19 @@ pub(crate) fn MediaWorkspace(
     use_effect(move || {
         if let Some(Ok((rows, snapshot))) = jobs.read().as_ref() {
             if selected.peek().is_none() {
+                let current = snapshot
+                    .inventory
+                    .projects
+                    .iter()
+                    .find(|p| p.project_id == initial_selection.0.project_id)
+                    .and_then(|p| {
+                        p.missions
+                            .iter()
+                            .find(|m| m.mission_id == initial_selection.0.mission_id)
+                    });
                 selected_writer.set(
-                    preferred_job(rows, &initial_selection.0, initial_selection.1.as_ref())
+                    current
+                        .and_then(|m| preferred_job(rows, m, initial_selection.1.as_ref()))
                         .map(|job| job.request.id.clone()),
                 );
                 if rows.is_empty() {
@@ -300,6 +343,7 @@ pub(crate) fn MediaWorkspace(
     let can_generate = configured
         && mission.stage == MissionStage::Running
         && !busy()
+        && prompt().len() <= 4096
         && !prompt().trim().is_empty();
     let generate_mission = mission.clone();
     let selected_job = rows
@@ -400,13 +444,14 @@ pub(crate) fn MediaWorkspace(
                     label {r#for:"media-generation-prompt","描述画面与要求"}
                     textarea {id:"media-generation-prompt",value:"{prompt}",maxlength:4096,disabled:busy(),placeholder:"主体、场景、色调和构图，例如：绿色水瓶置于浅色石面，柔和自然光。",oninput:move |e|prompt.set(e.value())}
                     if !configured {p {class:"media-status error","此模型尚未连接，请先配置生成模型凭据。"}}
+                    if prompt().len() > 4096 {p {class:"media-status error",role:"status","描述过长，请精简后再生成。"}}
                     p {class:"media-status","生成会调用所选模型并产生费用。已有成果会保留。"}
                     div {class:"media-actions",
                         button {class:"task-primary-action",disabled:!can_generate,aria_label:"生成任务素材",onclick:move |_|{
                             let request = DesktopMediaRequest {id:format!("creative-{}",chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()),
                                 project_id:generate_mission.project_id.clone(),mission_id:generate_mission.mission_id.clone(),expected_mission_revision:generate_mission.revision,
                                 prompt:prompt(),kind,provider,revises_job_id:revises()};
-                            viewed.set(None);show_generator.set(false);start_action(Action::Generate(request),busy,notice,refresh,selected,on_changed);
+                            show_generator.set(false);start_action(Action::Generate(request),busy,notice,refresh,selected,on_changed);
                         },if busy() {"正在生成…"} else {"生成素材"}}
                         button {class:"task-secondary-action",disabled:busy(),onclick:move |_|{revises.set(None);show_generator.set(false);},"取消"}
                     }
@@ -527,6 +572,8 @@ mod tests {
         );
         assert!(current_product(&mission, &rows[1]).is_none());
         assert!(preferred_job(&[], &mission, Some(&product_id)).is_none());
+        assert!(preferred_job(&rows[..2], &mission, Some(&product_id)).is_none());
+        assert!(preferred_job(&rows, &mission, Some(&WorkProductId::from("not-loaded"))).is_none());
     }
 
     #[test]

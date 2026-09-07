@@ -17,13 +17,43 @@ pub(crate) enum TaskFilter {
     History,
 }
 
+pub(crate) type TaskScope = (
+    hartevo_domain_kernel::ProjectId,
+    hartevo_domain_kernel::MissionId,
+);
+
+pub(crate) fn scope_matches(mission: &MissionProjection, scope: Option<&TaskScope>) -> bool {
+    scope.is_some_and(|(project, id)| project == &mission.project_id && id == &mission.mission_id)
+}
+
+pub(crate) fn legacy_media_entry_available(
+    mission: Option<&MissionProjection>,
+    executing: bool,
+    recovering: bool,
+) -> bool {
+    !executing
+        && !recovering
+        && mission.is_some_and(|m| {
+            m.stage == MissionStage::Running
+                && m.manifest_id.is_none()
+                && m.conversation_revision.is_none()
+                && m.current_checkpoint_id.is_none()
+                && m.pending_approval_count == 0
+        })
+}
+
 impl TaskFilter {
-    pub(crate) fn matches(self, mission: &MissionProjection) -> bool {
+    pub(crate) fn matches_with_attention(
+        self,
+        mission: &MissionProjection,
+        attention: Option<&TaskScope>,
+    ) -> bool {
         match self {
             Self::All => true,
             Self::Active => !mission.stage.is_terminal(),
             Self::Waiting => {
-                mission.pending_approval_count > 0
+                scope_matches(mission, attention)
+                    || mission.pending_approval_count > 0
                     || matches!(
                         mission.stage,
                         MissionStage::WaitingUser | MissionStage::WaitingApproval
@@ -43,6 +73,7 @@ pub(crate) fn TaskList(
     project: Option<DesktopProjectProjection>,
     selected_mission_id: Option<hartevo_domain_kernel::MissionId>,
     executing_mission_id: Option<hartevo_domain_kernel::MissionId>,
+    live_attention: Option<TaskScope>,
     filter: TaskFilter,
     on_filter: EventHandler<TaskFilter>,
     on_select: EventHandler<hartevo_domain_kernel::MissionId>,
@@ -55,7 +86,7 @@ pub(crate) fn TaskList(
     let rows: Vec<_> = project
         .missions
         .iter()
-        .filter(|m| filter.matches(m))
+        .filter(|m| filter.matches_with_attention(m, live_attention.as_ref()))
         .filter(|m| {
             search.is_empty()
                 || format!("{} {}", m.title, m.goal)
@@ -87,7 +118,7 @@ pub(crate) fn TaskList(
                         {
                             let id = mission.mission_id.clone();
                             let selected = selected_mission_id.as_ref() == Some(&id);
-                            let status = task_status(&mission,executing_mission_id.as_ref() == Some(&id));
+                            let status = if scope_matches(&mission,live_attention.as_ref()) {"等待确认"} else {task_status(&mission,executing_mission_id.as_ref() == Some(&id))};
                             let result_count = mission.work_products.iter().filter(|p|p.adoption_status != WorkProductStatus::Superseded).count();
                             rsx! {
                                 button {class:if selected {"mission-table-row active"} else {"mission-table-row"},onclick:move |_|on_select.call(id.clone()),
@@ -293,21 +324,55 @@ mod tests {
         use hartevo_domain_kernel::WorkProductStatus;
         let (_, mut mission) =
             crate::result_adoption_surface::tests::project_and_mission(WorkProductStatus::Accepted);
-        assert!(TaskFilter::All.matches(&mission));
-        assert!(TaskFilter::Active.matches(&mission));
-        assert!(!TaskFilter::Waiting.matches(&mission));
-        assert!(!TaskFilter::History.matches(&mission));
+        assert!(TaskFilter::All.matches_with_attention(&mission, None));
+        assert!(TaskFilter::Active.matches_with_attention(&mission, None));
+        assert!(!TaskFilter::Waiting.matches_with_attention(&mission, None));
+        assert!(!TaskFilter::History.matches_with_attention(&mission, None));
         mission.work_products[0].adoption_status = WorkProductStatus::ReadyForReview;
-        assert!(TaskFilter::Waiting.matches(&mission));
+        assert!(TaskFilter::Waiting.matches_with_attention(&mission, None));
         mission.work_products[0].adoption_status = WorkProductStatus::Accepted;
         mission.pending_approval_count = 1;
-        assert!(TaskFilter::Waiting.matches(&mission));
+        assert!(TaskFilter::Waiting.matches_with_attention(&mission, None));
         mission.pending_approval_count = 0;
         mission.stage = MissionStage::WaitingUser;
-        assert!(TaskFilter::Waiting.matches(&mission));
+        assert!(TaskFilter::Waiting.matches_with_attention(&mission, None));
         mission.stage = MissionStage::Failed;
-        assert!(!TaskFilter::Active.matches(&mission));
-        assert!(TaskFilter::History.matches(&mission));
+        assert!(!TaskFilter::Active.matches_with_attention(&mission, None));
+        assert!(TaskFilter::History.matches_with_attention(&mission, None));
+    }
+
+    #[test]
+    fn live_approval_uses_the_command_scope_even_without_a_proposed_effect() {
+        use super::{TaskFilter, scope_matches};
+        let (_, mission) =
+            crate::result_adoption_surface::tests::project_and_mission(WorkProductStatus::Accepted);
+        let scope = (mission.project_id.clone(), mission.mission_id.clone());
+        assert_eq!(mission.pending_approval_count, 0);
+        assert!(TaskFilter::Waiting.matches_with_attention(&mission, Some(&scope)));
+        let other = (
+            mission.project_id.clone(),
+            hartevo_domain_kernel::MissionId::from("other-task"),
+        );
+        assert!(!scope_matches(&mission, Some(&other)));
+        assert!(!TaskFilter::Waiting.matches_with_attention(&mission, Some(&other)));
+    }
+
+    #[test]
+    fn legacy_creative_entry_keeps_approval_checkpoint_and_recovery_actions_accessible() {
+        use super::legacy_media_entry_available;
+        let (_, mut mission) =
+            crate::result_adoption_surface::tests::project_and_mission(WorkProductStatus::Accepted);
+        mission.manifest_id = None;
+        assert!(legacy_media_entry_available(Some(&mission), false, false));
+        mission.stage = MissionStage::WaitingApproval;
+        mission.pending_approval_count = 1;
+        assert!(!legacy_media_entry_available(Some(&mission), false, false));
+        mission.stage = MissionStage::Running;
+        mission.pending_approval_count = 0;
+        assert!(!legacy_media_entry_available(Some(&mission), false, true));
+        assert!(!legacy_media_entry_available(Some(&mission), true, false));
+        mission.current_checkpoint_id = Some("checkpoint".into());
+        assert!(!legacy_media_entry_available(Some(&mission), false, false));
     }
 
     #[test]

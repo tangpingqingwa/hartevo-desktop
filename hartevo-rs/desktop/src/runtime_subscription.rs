@@ -1379,6 +1379,14 @@ pub(crate) struct DesktopRuntimeCommandSlot {
     active: Option<DesktopRuntimeCommandHandle>,
 }
 
+/// Presentation facts from the command owner, independent of visible selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DesktopRuntimeLiveActivity {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub waiting_for_approval: bool,
+}
+
 impl DesktopRuntimeCommandSlot {
     const fn has_active_command(&self) -> bool {
         self.active.is_some()
@@ -2338,6 +2346,16 @@ impl DesktopRuntimeExecutionPaintState {
         let scope = selected
             .and_then(|(project_id, mission_id)| self.selected_scope_for(project_id, mission_id));
         self.command_slot.cancellation_for(scope)
+    }
+
+    pub(crate) fn live_activity(&self) -> Option<DesktopRuntimeLiveActivity> {
+        let handle = self.command_slot.active.as_ref()?;
+        Some(DesktopRuntimeLiveActivity {
+            project_id: handle.identity.scope.project_id().clone(),
+            mission_id: handle.identity.scope.mission_id().clone(),
+            waiting_for_approval: handle.cancellation.held_local_approval().is_some()
+                || handle.cancellation.held_cordis_approval().is_some(),
+        })
     }
 
     pub(crate) fn progress_since(
@@ -3616,6 +3634,24 @@ mod tests {
         let viewport = reducer.viewport(&scope_a).expect("A viewport");
         assert!(viewport.follow_latest());
         assert!(!viewport.has_unseen());
+    }
+
+    #[test]
+    fn live_activity_stays_with_the_command_owner_when_visible_selection_changes() {
+        let owner = scope("project", "mission-a", 'a');
+        let visible = scope("project", "mission-b", 'b');
+        let (handle, _) =
+            DesktopRuntimeCommandHandle::pair(owner.clone(), digest('c')).expect("pair");
+        let identity = handle.identity();
+        let mut state = DesktopRuntimeExecutionPaintState::default();
+        state.command_slot.install(handle).expect("install");
+        state.visible_scope = Some(visible);
+        let activity = state.live_activity().expect("active owner");
+        assert_eq!(&activity.project_id, owner.project_id());
+        assert_eq!(&activity.mission_id, owner.mission_id());
+        assert!(!activity.waiting_for_approval);
+        state.command_slot.finish_exact(&identity);
+        assert!(state.live_activity().is_none());
     }
 
     #[test]
