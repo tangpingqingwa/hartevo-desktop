@@ -25,6 +25,7 @@ hartevo-effect-broker = { path = "../effect-broker" }
 hartevo-runtime-adapter = { path = "../runtime-adapter" }
 hartevo-storage = { path = "../storage" }
 hex.workspace = true
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 rust_decimal.workspace = true
 sha2.workspace = true
 serde.workspace = true

@@ -45,6 +45,7 @@ pub mod data_plane;
 mod media_workspace;
 #[cfg(feature = "native-journey")]
 pub mod native_runtime_journey;
+mod product_experience;
 mod result_adoption_surface;
 mod runtime_plane;
 mod runtime_subscription;
@@ -93,6 +94,7 @@ use runtime_subscription::{
 
 static MAIN_CSS: Asset = asset!("/assets/main.css");
 static PROTOTYPE_CSS: Asset = asset!("/assets/prototype.css");
+static PRODUCT_CSS: Asset = asset!("/assets/product.css");
 const DESKTOP_TIKTOK_READ_MAX_PAGES: u16 = MAX_VIDEO_SEQUENCE_PAGES;
 #[allow(
     dead_code,
@@ -1288,6 +1290,7 @@ pub fn App() -> Element {
         initial_visual_runtime_progress(visual_runtime_state, legacy_visual_streaming_fixture);
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
+    let mut mission_list_filter = use_signal(product_experience::TaskFilter::default);
     let mut model = use_signal(DesktopUiModel::load);
     let mut draft = use_signal(String::new);
     let mut catalog_manifest_id = use_signal(String::new);
@@ -1612,7 +1615,6 @@ pub fn App() -> Element {
     let mission_title = mission
         .as_ref()
         .map_or_else(|| "项目总调度".to_owned(), |item| item.title.clone());
-    let status = status_label(&view);
     let surface_heading = surface_heading(current_surface, &mission_title);
     let surface_context = surface_context_label(current_surface);
     let workpad_visible =
@@ -1674,6 +1676,7 @@ pub fn App() -> Element {
             projection.fallback_scope_matches,
         )
     };
+    let status = status_label(&view, runtime_busy && runtime_fallback_scope_matches);
     let runtime_waiting_for_turn = selected_runtime_execution_paint
         .as_ref()
         .is_some_and(DesktopRuntimeExecutionPaintView::awaiting_turn)
@@ -1708,9 +1711,9 @@ pub fn App() -> Element {
         .as_ref()
         .map_or("本地数据层未就绪", project_storage_label);
     let composer_target = if mission.is_some() {
-        "当前 Mission 持久会话"
+        "任务沟通"
     } else {
-        "项目总调度 · 新建 Catalog Mission"
+        "描述新任务"
     };
     let catalog_routes = evidence
         .as_ref()
@@ -3250,10 +3253,10 @@ pub fn App() -> Element {
             }
         }
     };
-    let runtime_chip = runtime_projection.as_ref().map_or_else(
-        || "Runtime · 数据层未就绪".to_owned(),
-        |runtime| format!("Runtime · {}", runtime_availability_label(runtime.status)),
-    );
+    let runtime_chip = runtime_projection
+        .as_ref()
+        .and_then(|runtime| runtime.model.clone())
+        .unwrap_or_else(|| "设置模型".to_owned());
     let provider_chip = runtime_projection.as_ref().map_or_else(
         || "Provider · 未配置".to_owned(),
         |runtime| {
@@ -3299,14 +3302,8 @@ pub fn App() -> Element {
                 "结果区只是结构预览；你可以返回审批或写下下一步判断",
                 "写下下一步",
             ),
-            _ if mission.is_some() => (
-                "继续说，随时调整当前 Mission 的范围、优先级或停止条件",
-                "调整方向",
-            ),
-            _ => (
-                "你可以随时创建、暂停或重排多个任务，不需要先选择功能模块",
-                "描述任务",
-            ),
+            _ if mission.is_some() => ("补充要求或调整方向", "调整方向"),
+            _ => ("今天想推进什么？", "描述任务"),
         };
     let composer_guidance_visible = !composer_guidance_dismissed()
         && !composer_expanded()
@@ -3342,12 +3339,7 @@ pub fn App() -> Element {
         project
             .missions
             .iter()
-            .filter(|mission| {
-                matches!(
-                    mission.stage,
-                    MissionStage::WaitingUser | MissionStage::WaitingApproval
-                )
-            })
+            .filter(|mission| product_experience::TaskFilter::Waiting.matches(mission))
             .count()
     });
     let mission_count = project.as_ref().map_or(0, |project| project.missions.len());
@@ -3356,6 +3348,7 @@ pub fn App() -> Element {
         document::Title { "Hartevo Desktop" }
         document::Stylesheet { href: MAIN_CSS }
         document::Stylesheet { href: PROTOTYPE_CSS }
+        document::Stylesheet { href: PRODUCT_CSS }
         div {
             class: "desktop-shell",
             tabindex: "-1",
@@ -3592,10 +3585,10 @@ pub fn App() -> Element {
                 }
                 nav { class: "primary-nav prototype-primary-nav", aria_label: "项目工作面",
                     div { class: "nav-label", "工作" }
-                    NavButton { label: "总调度", meta: "运行中", icon: UiIconName::Sparkles, active: current_surface == Surface::Orchestrator && view.selected_mission_id.is_none(), onclick: move |_| { model.write().select_dispatcher(); surface.set(Surface::Orchestrator); } }
-                    NavButton { label: "当前状态", meta: "Project", icon: UiIconName::Home, active: current_surface == Surface::Current, onclick: move |_| surface.set(Surface::Current) }
-                    NavButton { label: "全部任务", meta: "{mission_count}", icon: UiIconName::List, active: current_surface == Surface::Missions, onclick: move |_| surface.set(Surface::Missions) }
-                    NavButton { label: "待确认", meta: "{waiting_count}", icon: UiIconName::Shield, active: false, onclick: move |_| surface.set(Surface::Missions) }
+                    NavButton { label: "总调度", meta: "", icon: UiIconName::Sparkles, active: current_surface == Surface::Orchestrator && view.selected_mission_id.is_none(), onclick: move |_| { model.write().select_dispatcher(); surface.set(Surface::Orchestrator); } }
+                    NavButton { label: "项目概览", meta: "", icon: UiIconName::Home, active: current_surface == Surface::Current, onclick: move |_| surface.set(Surface::Current) }
+                    NavButton { label: "全部任务", meta: "{mission_count}", icon: UiIconName::List, active: current_surface == Surface::Missions && mission_list_filter() != product_experience::TaskFilter::Waiting, onclick: move |_| { mission_list_filter.set(product_experience::TaskFilter::All); surface.set(Surface::Missions); } }
+                    NavButton { label: "待确认", meta: "{waiting_count}", icon: UiIconName::Shield, active: current_surface == Surface::Missions && mission_list_filter() == product_experience::TaskFilter::Waiting, onclick: move |_| { mission_list_filter.set(product_experience::TaskFilter::Waiting); surface.set(Surface::Missions); } }
 
                     if !running_missions.is_empty() {
                         div { class: "nav-label mission-group-label", span { "任务 · 进行中" } em { "{running_missions.len()}" } }
@@ -3606,6 +3599,7 @@ pub fn App() -> Element {
                                     && view.selected_mission_id.as_ref() == Some(&mission_id);
                                 rsx! {
                                     MissionNavRow {
+                                        executing: runtime_busy && runtime_text_scope.read().as_ref().is_some_and(|(p,m)|p == &item.project_id && m == &item.mission_id),
                                         mission: item,
                                         active: selected,
                                         menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
@@ -3638,6 +3632,7 @@ pub fn App() -> Element {
                                     && view.selected_mission_id.as_ref() == Some(&mission_id);
                                 rsx! {
                                     MissionNavRow {
+                                        executing: runtime_busy && runtime_text_scope.read().as_ref().is_some_and(|(p,m)|p == &item.project_id && m == &item.mission_id),
                                         mission: item,
                                         active: selected,
                                         menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
@@ -3662,12 +3657,12 @@ pub fn App() -> Element {
                     }
 
                     div { class: "nav-label", "成果与工作面" }
-                    NavButton { label: "成果与循环", meta: "Outcome", icon: UiIconName::Chart, active: current_surface == Surface::Outcomes, onclick: move |_| surface.set(Surface::Outcomes) }
-                    NavButton { label: "渠道运营", meta: "Channel", icon: UiIconName::Mail, active: current_surface == Surface::ChannelOperations, onclick: move |_| surface.set(Surface::ChannelOperations) }
-                    NavButton { label: "关系与 CRM", meta: "CRM", icon: UiIconName::Contact, active: current_surface == Surface::Relationships, onclick: move |_| surface.set(Surface::Relationships) }
-                    NavButton { label: "达人与联盟", meta: "Partner", icon: UiIconName::Handshake, active: current_surface == Surface::Partners, onclick: move |_| surface.set(Surface::Partners) }
-                    NavButton { label: "连接中心", meta: "Probe", icon: UiIconName::Plug, active: current_surface == Surface::Connections, onclick: move |_| surface.set(Surface::Connections) }
-                    NavButton { label: "能力与证据", meta: "E0–E5", icon: UiIconName::Blocks, active: current_surface == Surface::CapabilityEvidence, onclick: move |_| surface.set(Surface::CapabilityEvidence) }
+                    NavButton { label: "成果与效果", meta: "", icon: UiIconName::Chart, active: current_surface == Surface::Outcomes, onclick: move |_| surface.set(Surface::Outcomes) }
+                    NavButton { label: "渠道运营", meta: "", icon: UiIconName::Mail, active: current_surface == Surface::ChannelOperations, onclick: move |_| surface.set(Surface::ChannelOperations) }
+                    NavButton { label: "关系与 CRM", meta: "", icon: UiIconName::Contact, active: current_surface == Surface::Relationships, onclick: move |_| surface.set(Surface::Relationships) }
+                    NavButton { label: "达人与联盟", meta: "", icon: UiIconName::Handshake, active: current_surface == Surface::Partners, onclick: move |_| surface.set(Surface::Partners) }
+                    NavButton { label: "连接中心", meta: "", icon: UiIconName::Plug, active: current_surface == Surface::Connections, onclick: move |_| surface.set(Surface::Connections) }
+                    NavButton { label: "能力与证据", meta: "", icon: UiIconName::Blocks, active: current_surface == Surface::CapabilityEvidence, onclick: move |_| surface.set(Surface::CapabilityEvidence) }
                 }
 
                 footer { class: "workspace-switcher",
@@ -3783,7 +3778,7 @@ pub fn App() -> Element {
                         span { strong { "{project_name}" } small { b { "{project_storage_status}" } } }
                         UiIcon { name: UiIconName::ChevronDown, size: 14 }
                     }
-                    div { class: "local-path", "路径只用于本机数据层，不进入日志或 Release Evidence" }
+                    div { class: "local-path", "项目内容保存在本机" }
                 }
             }
 
@@ -3794,7 +3789,7 @@ pub fn App() -> Element {
                         strong { "{surface_context}" }
                     }
                     span { class: "conversation-hint",
-                        if current_surface == Surface::Orchestrator { "可以随时改变方向；不会扩大 Capability" } else { "变化回写同一 Project / Mission Truth" }
+                        if current_surface == Surface::Orchestrator { "进展、成果与后续沟通都保留在这里" } else { "变化回写同一 Project / Mission Truth" }
                     }
                     if let Some(fixture_id) = &visual_fixture_id {
                         span { class: "visual-fixture-indicator", "VISUAL_FIXTURE · {fixture_id}" }
@@ -3824,7 +3819,7 @@ pub fn App() -> Element {
                                 runtime_text_error: rendered_runtime_text_error.clone(),
                                 runtime_fixture_state: visual_runtime_state,
                                 runtime_transport_caught_up: rendered_runtime_transport_caught_up,
-                                runtime_busy,
+                                runtime_busy: runtime_busy && runtime_fallback_scope_matches,
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
                                 runtime_has_unseen: rendered_runtime_has_unseen,
@@ -3851,6 +3846,10 @@ pub fn App() -> Element {
                                 on_error: move |error| model.write().set_notice(&error),
                                 on_select_mission: move |mission_id| model.write().select_mission(mission_id),
                                 on_open_workpad: move |()| workpad_open.set(true),
+                                on_open_settings: move |()| {
+                                    surface_before_settings.set(current_surface);
+                                    surface.set(Surface::Settings);
+                                },
                                 on_quick_entry: move |()| {
                                     composer_expanded.set(true);
                                     restore_ui_focus("mission-composer-input");
@@ -3918,7 +3917,7 @@ pub fn App() -> Element {
                         } else if current_surface == Surface::Current {
                             CurrentSurface { project: project.clone(), context_access: context_access.clone() }
                         } else if current_surface == Surface::Missions {
-                            MissionsSurface { project: project.clone(), selected_mission_id: view.selected_mission_id.clone(), on_select: move |mission_id| {
+                            product_experience::TaskList { executing_mission_id: runtime_text_scope.read().as_ref().filter(|(id,_)| runtime_busy && project.as_ref().is_some_and(|p| &p.project_id == id)).map(|(_,id)|id.clone()), project: project.clone(), selected_mission_id: view.selected_mission_id.clone(), filter: mission_list_filter(), on_filter: move |filter| mission_list_filter.set(filter), on_select: move |mission_id| {
                                 model.write().select_mission(mission_id);
                                 surface.set(Surface::Orchestrator);
                             } }
@@ -3971,7 +3970,12 @@ pub fn App() -> Element {
                             EmptyState { code: "INTEGRITY_ERROR", title: "机器合同不可用", detail: "Catalog 未通过加载与验证，能力声明已停止显示。" }
                         }
 
-                        if current_surface == Surface::Orchestrator {
+                        if current_surface == Surface::Orchestrator && !visual_fixture_mode && !runtime_busy && mission.as_ref().is_some_and(|m| m.conversation_revision.is_none()) {
+                            div { class: "task-creation-bar",
+                                div { strong { "继续准备创意素材" } small { "这条旧任务尚不支持对话。你可以在工作台修改描述、生成新版本和导出成果。" } }
+                                button { class: "task-primary-action", onclick: move |_| workpad_open.set(true), "打开创意工作台" }
+                            }
+                        } else if current_surface == Surface::Orchestrator {
                             section {
                                 class: if composer_expanded()
                                     || fixture_attachment_visible()
@@ -4062,7 +4066,7 @@ pub fn App() -> Element {
                                                 aria_expanded: catalog_contract_expanded(),
                                                 aria_controls: "operating-contract-fields",
                                                 onclick: move |_| catalog_contract_expanded.set(!catalog_contract_expanded()),
-                                                span { "Operating Contract" }
+                                                span { "任务范围" }
                                                 UiIcon { name: UiIconName::ChevronDown, size: 12 }
                                             }
                                         }
@@ -4319,11 +4323,6 @@ pub fn App() -> Element {
                                         span { "{route.mission_id} · {route.default_cadence}" }
                                         span { "当前 Release Evidence {mission_evidence_status_label(route.status)} / {evidence_level_label(route.evidence_level)}" }
                                     }
-                                } else if mission.is_some() {
-                                    div { class: "catalog-route-note",
-                                        span { "Mission Conversation revision {mission.as_ref().and_then(|mission| mission.conversation_revision).unwrap_or_default()}" }
-                                        span { "消息会写入同一 Mission Stream；不会另建 Mission，也不会修改 Operating Contract 权限。" }
-                                    }
                                 }
                                 if application_route_not_implemented || application_route_catalog_mismatch {
                                     div { class: "catalog-route-note application-handler-boundary", role: "status",
@@ -4469,11 +4468,11 @@ pub fn App() -> Element {
                                     id: "mission-composer-input",
                                     value: "{draft}",
                                     disabled: !can_write_composer,
-                                    aria_label: "Operating Contract 目标、约束与停止条件",
+                                    aria_label: "任务要求与补充说明",
                                     placeholder: if mission.is_some() {
-                                        if vm11_outcome_decision_active { "写下选择该动作的理由、风险与停止条件；正文只进入加密 Mission Conversation…" } else if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "继续当前 Mission，或输入 /compact 压缩当前 Cordis Session…" } else if can_edit_human_command { "可输入 /compact 压缩当前 Cordis Session；普通续写仍需持久 Conversation" } else { "当前 Mission 状态不接受续写" }
+                                        if vm11_outcome_decision_active { "写下选择该动作的理由、风险与停止条件；正文只进入加密 Mission Conversation…" } else if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "补充要求，或告诉我哪里需要修改…" } else if can_edit_human_command { "描述你想调整的内容…" } else { "当前 Mission 状态不接受续写" }
                                     } else if project_can_start_mission {
-                                        "写明目标、硬约束、非目标与停止条件…"
+                                        "告诉我你想达成什么，例如：为新产品准备一周社媒内容…"
                                     } else {
                                         "项目加密与 Context 就绪后才能创建 Mission"
                                     },
@@ -4577,19 +4576,21 @@ pub fn App() -> Element {
                                                 UiIcon { name: UiIconName::ChevronDown, size: 11 }
                                             }
                                             if runtime_profile_open() {
-                                                section { class: "runtime-profile-menu", role: "dialog", aria_label: "Runtime 与权限边界",
-                                                    header { strong { "Runtime Profile" } small { "模型 × Mission 最小能力" } }
+                                                section { class: "runtime-profile-menu", role: "dialog", aria_label: "模型与连接",
+                                                    header { strong { "当前模型" } }
                                                     div { span { "执行环境" } b { "{runtime_chip}" } }
                                                     div { span { "Provider route" } b { "{provider_chip}" } }
                                                     div { span { "外部 Effect" } b { "必须独立审批" } }
-                                                    footer { "切换模型不能扩大 Capability、Consent 或账号范围。" }
+                                                    button { class: "task-primary-action", onclick: move |_| {
+                                                        runtime_profile_open.set(false);
+                                                        surface_before_settings.set(current_surface);
+                                                        surface.set(Surface::Settings);
+                                                    }, "打开模型设置" }
+                                                    footer { "连接与调用权限分开管理。" }
                                                 }
                                             }
                                         }
-                                        span { class: "honesty-chip", "{provider_chip}" }
-                                        if runtime_projection.as_ref().is_some_and(|runtime| !runtime.exact_tokenizer_evidence) {
-                                            span { class: "honesty-chip", "Tokenizer · DEV_FALLBACK" }
-                                        }
+
                                     }
                                     div { class: "composer-actions",
                                         if vm03_domain_purchase_route_active
@@ -5614,9 +5615,9 @@ pub fn App() -> Element {
                                                 if mission_submitting() {
                                                     "正在固化合同与首个 Checkpoint…"
                                                 } else if !catalog_contract_ready {
-                                                    "确认完整合同后创建"
+                                                    "请补全任务范围"
                                                 } else {
-                                                    "创建 Catalog Mission"
+                                                    "创建任务"
                                                 }
                                             }
                                         }
@@ -5782,12 +5783,13 @@ fn NavButton(
 fn MissionNavRow(
     mission: MissionProjection,
     active: bool,
+    #[props(default = false)] executing: bool,
     menu_open: bool,
     onclick: EventHandler<MouseEvent>,
     on_menu: EventHandler<MissionId>,
 ) -> Element {
     let dot = dispatcher_stage_dot(&mission.stage);
-    let stage = mission_stage_label(&mission.stage);
+    let stage = product_experience::task_status(&mission, executing);
     let cadence = if mission.stage == MissionStage::Scheduled {
         "持续运行".to_owned()
     } else if mission.current_checkpoint_id.is_some() {
@@ -5815,7 +5817,7 @@ fn MissionNavRow(
                     strong { "{mission.title}" }
                     small { "{cadence}" }
                 }
-                em { "{mission.revision}" }
+                if mission.work_product_count > 0 { em { "{mission.work_product_count}" } }
             }
             button {
                 id: "{trigger_id}",
@@ -7662,6 +7664,7 @@ fn OrchestratorSurface(
     on_error: EventHandler<DesktopDataError>,
     on_select_mission: EventHandler<MissionId>,
     on_open_workpad: EventHandler<()>,
+    on_open_settings: EventHandler<()>,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
     on_approve_local_runtime: EventHandler<()>,
@@ -7750,6 +7753,9 @@ fn OrchestratorSurface(
             let Some(mission) = mission else {
                 return rsx! {
                     div { class: "surface-scroll",
+                        ProjectDispatcherSurface { project, on_select_mission }
+                        details { class: "persisted-state-details",
+                            summary { "运行详情" }
                         AgentOperationsWorkbench {
                             projection: operations.clone(),
                             result_action_pending,
@@ -7773,7 +7779,8 @@ fn OrchestratorSurface(
                             on_reject_cordis,
                             on_result_action,
                         }
-                        ProjectDispatcherSurface { project, on_select_mission }
+                        }
+
                     }
                 };
             };
@@ -7878,52 +7885,62 @@ fn OrchestratorSurface(
                 runtime_text_stream.is_some() && replayed_message_sequence.is_none();
             let runtime_fixture_copy = runtime_fixture_state
                 .map(|state| (state.label(), visual_runtime_state_copy(state)));
+            let follow_existing_conversation = !mission.conversation_messages.is_empty();
             rsx! {
                 div {
                     id: "persisted-mission-thread",
                     class: "surface-scroll persisted-mission-thread",
-                    aria_label: "持久 Mission Conversation",
-                    onmounted: move |_| scroll_mission_thread_to_latest(),
+                    aria_label: "任务会话",
+                    onmounted: move |_| { if follow_existing_conversation { scroll_mission_thread_to_latest(); } },
                     onscroll: move |event| {
                         let remaining = f64::from(
                             event.data.scroll_height() - event.data.client_height(),
                         ) - event.data.scroll_top();
                         on_runtime_scroll.call(remaining <= 96.0);
                     },
-                    AgentOperationsWorkbench {
-                        projection: operations,
-                        result_action_pending,
-                        browser_workspace_create_pending,
-                        browser_workspace_mount_pending,
-                        browser_public_source_read_pending,
-                        browser_public_source_observation,
-                        interrupt_available,
-                        interrupt_requested,
-                        on_quick_entry,
-                        on_interrupt,
-                        on_create_browser_workspace,
-                        on_mount_browser_workspace,
-                        on_read_browser_public_source,
-                        on_take_over_browser_workspace,
-                        on_continue_browser_workspace,
-                        on_pause_browser_workspace,
-                        on_resume_browser_workspace,
-                        on_approve_local_runtime,
-                        on_allow_cordis_once,
-                        on_reject_cordis,
-                        on_result_action,
+                    product_experience::MissionOverview {
+                        project: project.clone(), mission: mission.clone(),
+                        executing: runtime_busy,
+                        awaiting_confirmation: operations.approvals.cordis_allow_once_status == OperationsStatus::Ready || operations.approvals.local_runtime_approve_status == OperationsStatus::Ready,
+                        model_ready: operations.runtime.status == OperationsStatus::Ready,
+                        on_open_workpad, on_open_settings, on_result_action,
+                    }
+                    if operations.approvals.cordis_allow_once_status == OperationsStatus::Ready {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "需要你确认工具操作" } p { "{operations.approvals.cordis_tool_detail}" } }
+                            div { class: "task-attention-actions",
+                                button { class: "task-primary-action", onclick: move |_| on_allow_cordis_once.call(()), "仅允许这一次" }
+                                button { class: "task-secondary-action", onclick: move |_| on_reject_cordis.call(()), "拒绝" }
+                            }
+                        }
+                    }
+                    if operations.approvals.local_runtime_approve_status == OperationsStatus::Ready {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "需要确认本地文件写入" } p { "{operations.approvals.local_runtime_detail}" } }
+                            button { class: "task-primary-action", onclick: move |_| on_approve_local_runtime.call(()), "允许本次写入" }
+                        }
+                    }
+                    if mission.pending_approval_count > 0 {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "有 {mission.pending_approval_count} 项操作等待确认" } p { "请查看任务下方的确认内容。确认前，这些操作不会执行。" } }
+                            button { class: "task-secondary-action", onclick: move |_| on_quick_entry.call(()), "查看确认内容" }
+                        }
+                    }
+                    if operations.browser.status == OperationsStatus::WaitingUser {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "浏览器需要你的操作" } p { "{operations.browser.next_action}" } }
+                            if operations.browser.continue_status == OperationsStatus::Ready {
+                                button { class: "task-primary-action", onclick: move |_| on_continue_browser_workspace.call(()), "交还任务继续" }
+                            }
+                            if operations.browser.resume_status == OperationsStatus::Ready {
+                                button { class: "task-secondary-action", onclick: move |_| on_resume_browser_workspace.call(()), "恢复浏览器" }
+                            }
+                        }
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
-                    }
-                    if let Some(result) = selected_result {
-                        SelectedResultSurface {
-                            result,
-                            action_pending: result_action_pending,
-                            on_action: on_result_action,
-                        }
                     }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
@@ -7958,21 +7975,51 @@ fn OrchestratorSurface(
                             }
                         }
                     }
+                    details { class: "persisted-state-details",
+                        summary {
+                            UiIcon { name: UiIconName::Workflow, size: 14 }
+                            span {
+                                strong { "运行详情" }
+                                small { "处理记录、权限与技术信息" }
+                            }
+                            em { "按需展开" }
+                            UiIcon { name: UiIconName::ChevronDown, size: 12 }
+                        }
+                    AgentOperationsWorkbench {
+                        projection: operations,
+                        result_action_pending,
+                        browser_workspace_create_pending,
+                        browser_workspace_mount_pending,
+                        browser_public_source_read_pending,
+                        browser_public_source_observation,
+                        interrupt_available,
+                        interrupt_requested,
+                        on_quick_entry,
+                        on_interrupt,
+                        on_create_browser_workspace,
+                        on_mount_browser_workspace,
+                        on_read_browser_public_source,
+                        on_take_over_browser_workspace,
+                        on_continue_browser_workspace,
+                        on_pause_browser_workspace,
+                        on_resume_browser_workspace,
+                        on_approve_local_runtime,
+                        on_allow_cordis_once,
+                        on_reject_cordis,
+                        on_result_action,
+                    }
+                    if let Some(result) = selected_result {
+                        SelectedResultSurface {
+                            result,
+                            action_pending: result_action_pending,
+                            on_action: on_result_action,
+                        }
+                    }
                     PersistedMissionProcessDensity {
                         mission: mission.clone(),
                         visual_fixture: runtime_stream_is_fixture,
                         on_open_workpad,
                     }
-                    details { class: "persisted-state-details",
-                        summary {
-                            UiIcon { name: UiIconName::Workflow, size: 14 }
-                            span {
-                                strong { "任务边界与持久状态" }
-                                small { "{mission_stage_label(&mission.stage)} · revision {mission.revision} · {mission.completed_checkpoint_count}/{mission.checkpoint_count} Checkpoints" }
-                            }
-                            em { "按需展开" }
-                            UiIcon { name: UiIconName::ChevronDown, size: 12 }
-                        }
                         article { class: "assistant-turn persisted-state-turn",
                             header { class: "assistant-byline",
                                 img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
@@ -8069,18 +8116,7 @@ fn PersistedConversationMessages(
     replayed_message_sequence: Option<u64>,
 ) -> Element {
     if mission.conversation_messages.is_empty() {
-        return rsx! {
-            article { class: "assistant-turn persisted-assistant-turn conversation-empty",
-                header { class: "assistant-byline",
-                    img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
-                    strong { "Hartevo" }
-                    time { "Mission 已持久化" }
-                }
-                div { class: "assistant-copy",
-                    p { "当前 Mission 还没有可展示的 Conversation 正文。你可以从下方输入目标或纠正；未开始的 Runtime 不会被绘制成答案。" }
-                }
-            }
-        };
+        return rsx! {};
     }
     rsx! {
         for message in mission.conversation_messages.clone() {
@@ -9261,59 +9297,6 @@ fn CurrentSurface(
 }
 
 #[component]
-fn MissionsSurface(
-    project: Option<DesktopProjectProjection>,
-    selected_mission_id: Option<MissionId>,
-    on_select: EventHandler<MissionId>,
-) -> Element {
-    let Some(project) = project else {
-        return rsx! { EmptyState { code: "EMPTY", title: "没有 Mission 项目范围", detail: "选择项目后，Missions 只显示该项目的持久 Application projection。" } };
-    };
-    rsx! {
-        div { class: "surface-scroll business-surface missions-surface",
-            header { class: "surface-head",
-                div { class: "surface-head-copy",
-                    span { class: "surface-eyebrow", "MISSIONS · APPLICATION PROJECTION" }
-                    h1 { "全部任务" }
-                    p { "一次选择会继续原来的 Mission Conversation，不创建第二套页面状态。" }
-                }
-                span { class: "sync-chip", "{project.name} · {project.missions.len()} Missions" }
-            }
-            nav { class: "surface-tabs", aria_label: "Mission 视图",
-                button { class: "active", "全部" }
-                button { disabled: true, "进行中" }
-                button { disabled: true, "自动任务" }
-                button { disabled: true, "历史" }
-            }
-            section { class: "surface-section mission-table-section",
-                if project.missions.is_empty() {
-                    div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } h2 { "尚无持久 Mission" } p { "返回总调度，选择 VM-00～VM-11 并完成 Operating Contract。" } }
-                } else {
-                    div { class: "mission-table", role: "list",
-                        for mission in project.missions {
-                            {
-                                let mission_id = mission.mission_id.clone();
-                                let selected = selected_mission_id.as_ref() == Some(&mission_id);
-                                rsx! {
-                                    button { class: if selected { "mission-table-row active" } else { "mission-table-row" }, onclick: move |_| on_select.call(mission_id.clone()),
-                                        span { class: "mission-table-status", i { class: if mission.stage.is_terminal() { "" } else { "live" } } }
-                                        span { class: "mission-table-copy", strong { "{mission.title}" } small { "{mission.goal}" } }
-                                        span { strong { "{mission_stage_label(&mission.stage)}" } small { "状态" } }
-                                        span { strong { "{mission.completed_checkpoint_count}/{mission.checkpoint_count}" } small { "Checkpoint" } }
-                                        span { strong { "{mission.pending_approval_count}" } small { "待审批" } }
-                                        span { class: "mission-table-action", "继续 →" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
 fn ChannelSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
@@ -9808,11 +9791,7 @@ fn SettingsSurface(
     on_clear_native_provider: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
-    let initial_panel = if active_visual_surface_variant().as_deref() == Some("settings-models") {
-        "models"
-    } else {
-        "general"
-    };
+    let initial_panel = "models";
     let mut active_panel = use_signal(move || initial_panel);
     let mut settings_query = use_signal(String::new);
     let initial_native_model = runtime
@@ -9876,7 +9855,7 @@ fn SettingsSurface(
                         }
                     }
                 }
-                div { class: "settings-version", "Hartevo Desktop" small { "UI baseline · prototype v12" } }
+                div { class: "settings-version", "Hartevo Desktop" small { "本地桌面应用" } }
             }
             main { class: "settings-content",
                 if active_panel() == "general" {
@@ -9890,28 +9869,28 @@ fn SettingsSurface(
                 } else if active_panel() == "models" {
                     section { class: "settings-panel", aria_busy: action_busy,
                         header {
-                            h1 { "模型与 Runtime" }
-                            p { "为 Cordis 原生路径配置 DeepSeek。模型选择不会改变 Mission Capability、预算或审批边界。" }
+                            h1 { "模型连接" }
+                            p { "连接对话模型后，可以开始和继续任务。图片、视频使用各自的生成模型连接。" }
                         }
                         section { class: "settings-section",
                             h2 { "当前状态" }
                             div { class: "settings-group",
-                                SettingsRow { title: "Runtime", detail: "来自 DesktopRuntimeProjection。", value: runtime_status }
-                                SettingsRow { title: "Provider", detail: "没有真实配置时不显示可用。", value: provider }
-                                SettingsRow { title: "Model", detail: "只展示当前生效投影。", value: model }
+                                SettingsRow { title: "Runtime", detail: "当前应用检测到的连接状态。", value: runtime_status }
+                                SettingsRow { title: "Provider", detail: "当前使用的模型服务。", value: provider }
+                                SettingsRow { title: "Model", detail: "新消息使用的模型。", value: model }
                                 SettingsRow { title: "凭据来源", detail: "仅展示来源类型，不回读凭据或 Secret Store 引用。", value: credential_source }
                             }
                         }
                         section { class: "settings-section",
-                            h2 { "Cordis 原生配置" }
+                            h2 { "DeepSeek 连接" }
                             div { class: "settings-group",
-                                SettingsControlRow { title: "DeepSeek model", detail: "保存后用于新的 Cordis Session；不会改写既有 Mission 合同。",
+                                SettingsControlRow { title: "模型名称", detail: "例如 deepseek-chat。保存后用于新会话。",
                                     input {
                                         value: "{native_model}",
                                         disabled: !actions_enabled || action_busy,
                                         autocomplete: "off",
                                         spellcheck: "false",
-                                        aria_label: "DeepSeek model",
+                                        aria_label: "模型名称",
                                         oninput: move |event| native_model.set(event.value()),
                                     }
                                 }
@@ -9949,7 +9928,7 @@ fn SettingsSurface(
                                                 let credential = native_credential.write().take();
                                                 on_configure_native_provider.call((native_model(), credential));
                                             },
-                                            if action_busy { "正在更新…" } else { "保存并刷新 Runtime" }
+                                            if action_busy { "正在更新…" } else { "保存连接" }
                                         }
                                     }
                                 }
@@ -10797,7 +10776,7 @@ fn Workpad(
     rsx! {
         aside { class: "workpad", aria_label: "任务工作台",
             header {
-                span { strong { "工作产物" } small { "Application projection" } }
+                span { strong { "成果工作台" } }
                 button { class: "icon-button", aria_label: "收起工作台", onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::Panel, size: 14 } }
             }
             div { class: "workpad-body",
@@ -10809,15 +10788,16 @@ fn Workpad(
                     div { class: "document-kicker", "MISSION · REVISION {mission.revision}" }
                     h2 { "{mission.title}" }
                     {rsx! { media_workspace::MediaWorkspace {
-                            key: "media-{mission.project_id}-{mission.mission_id}",
+                            key: "media-{mission.project_id}-{mission.mission_id}-{selected_work_product_id:?}",
+                            initial_work_product_id: selected_work_product_id.clone(),
                             mission: mission.clone(),
                             on_changed,
                     } }}
                     if mission.work_product_count == 0 {
-                        p { class: "document-lead", "EMPTY：当前 Mission 没有持久 WorkProductManifest。页面不会填充示例报告。" }
+                        p { class: "document-lead", "还没有成果。生成素材后，可以在这里预览、修改和采用。" }
                     } else {
-                        p { class: "document-lead", "以下 Preview 来自 SQLCipher 中通过 Application 完整校验的 WorkProductManifest；不是页面生成的示例内容。" }
-                        for product in mission.work_products {
+
+                        for product in mission.work_products.into_iter().filter(|p| !matches!(p.work_product_type.as_str(), "generated_image" | "generated_video")) {
                             {
                                 let selected = selected_work_product_id
                                     .as_ref()
@@ -10897,9 +10877,9 @@ fn surface_heading(surface: Surface, mission_title: &str) -> String {
 
 const fn surface_context_label(surface: Surface) -> &'static str {
     match surface {
-        Surface::Orchestrator => "Mission Conversation",
+        Surface::Orchestrator => "任务会话",
         Surface::Current => "Project Current",
-        Surface::Missions => "Mission Inventory",
+        Surface::Missions => "全部任务",
         Surface::ChannelOperations => "Growth Operations",
         Surface::Relationships => "Relationships",
         Surface::Partners => "Partner Operations",
@@ -11884,7 +11864,7 @@ fn settings_panel_label(panel: &str) -> &'static str {
     }
 }
 
-fn status_label(model: &DesktopUiModel) -> String {
+fn status_label(model: &DesktopUiModel, executing: bool) -> String {
     if let Some(notice) = &model.notice {
         return format!("{} · 已停止", notice.code);
     }
@@ -11906,7 +11886,7 @@ fn status_label(model: &DesktopUiModel) -> String {
     if let Some(activity) = model.current_runtime_activity() {
         match activity.process_claim_status {
             Some(RuntimeProcessClaimStatus::Blocked) => {
-                return "Runtime process BLOCKED · 禁止重复启动".into();
+                return "上次执行需要检查".into();
             }
             Some(
                 status @ (RuntimeProcessClaimStatus::Prepared | RuntimeProcessClaimStatus::Spawned),
@@ -11920,16 +11900,32 @@ fn status_label(model: &DesktopUiModel) -> String {
             | None => {}
         }
         if activity.requires_reconciliation {
-            return "Runtime UNCERTAIN · 禁止自动重放".into();
+            return "正在等待上次执行结果确认".into();
         }
         if let Some(status) = activity.turn_status {
-            return format!(
-                "Runtime {} · Mission 未自完成",
-                runtime_turn_status_label(status)
-            );
+            let label = match status {
+                RuntimeTurnStatus::WaitingLocalApproval | RuntimeTurnStatus::ApprovalResponding => {
+                    Some("等待操作确认")
+                }
+                RuntimeTurnStatus::InterruptRequested => Some("正在停止"),
+                RuntimeTurnStatus::Interrupted => Some("已暂停"),
+                RuntimeTurnStatus::Failed => Some("本次处理失败"),
+                RuntimeTurnStatus::Uncertain => Some("执行结果待确认"),
+                RuntimeTurnStatus::Prepared
+                | RuntimeTurnStatus::Dispatching
+                | RuntimeTurnStatus::Running => Some(if executing {
+                    "正在处理"
+                } else {
+                    "上次处理待恢复"
+                }),
+                RuntimeTurnStatus::Completed => None,
+            };
+            if let Some(label) = label {
+                return label.into();
+            }
         }
         if activity.recovery_status == Some(RuntimeRecoveryStatus::Failed) {
-            return "Runtime recovery FAILED · 等待安全重建".into();
+            return "恢复未完成，需要处理".into();
         }
     }
     match &model.backend {
@@ -11943,7 +11939,7 @@ fn status_label(model: &DesktopUiModel) -> String {
                     "没有宣发项目".into()
                 }
             },
-            |mission| mission_stage_label(&mission.stage).into(),
+            |mission| product_experience::task_status(mission, executing).into(),
         ),
     }
 }

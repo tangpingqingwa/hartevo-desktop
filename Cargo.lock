@@ -2373,6 +2373,7 @@ dependencies = [
  "hartevo-runtime-adapter",
  "hartevo-storage",
  "hex",
+ "rfd",
  "rust_decimal",
  "serde",
  "serde_json",
