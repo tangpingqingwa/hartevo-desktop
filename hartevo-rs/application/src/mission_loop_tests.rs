@@ -265,6 +265,60 @@ fn mission_loop_application_wait_does_not_invoke_runtime_or_spend() {
 }
 
 #[test]
+fn mission_loop_application_rechecks_task_after_durable_dispatch_before_callback() {
+    use hartevo_domain_kernel::TaskStatus;
+    use hartevo_storage::DatabaseKey;
+    use std::cell::RefCell;
+
+    for status in [TaskStatus::Completed, TaskStatus::Cancelled] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("task-close-race.sqlite3");
+        let key = DatabaseKey::new([72; 32]).unwrap();
+        let mut service = setup_with(ProjectStore::open(&path, &key).unwrap());
+        let writer = RefCell::new(ProjectStore::open(&path, &key).unwrap());
+        let request = request();
+        let task_closed = Cell::new(false);
+        let calls = Cell::new(0);
+        let result = service.run_mission_loop_slice(
+            &request,
+            || {
+                let mut writer = writer.borrow_mut();
+                let snapshot = writer
+                    .mission_loop_snapshot(&request.project_id, &request.mission_id, now())
+                    .unwrap()
+                    .unwrap();
+                if snapshot.state.todos()["research-slice"].execution_started
+                    && !task_closed.replace(true)
+                {
+                    let mut mission = snapshot.mission;
+                    mission.tasks[0].status = status.clone();
+                    mission.revision += 1;
+                    writer.save_mission(&mission).unwrap();
+                }
+                now()
+            },
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(LoopTurnResult::NoProgress {
+                    reason_digest: hash("must not run"),
+                })
+            },
+        );
+        assert!(task_closed.get());
+        assert_eq!(calls.get(), 0);
+        assert!(matches!(
+            result,
+            Err(MissionLoopApplicationError::Domain(LoopError::ClaimLost))
+        ));
+        let snapshot = service
+            .require_loop_snapshot(&request.project_id, &request.mission_id, now())
+            .unwrap();
+        assert_eq!(snapshot.state.spent_slots(), 0);
+        assert!(snapshot.state.todos()["research-slice"].execution_started);
+    }
+}
+
+#[test]
 fn mission_loop_application_runtime_failure_is_durable_and_does_not_retry_automatically() {
     let mut service = setup();
     let request = request();

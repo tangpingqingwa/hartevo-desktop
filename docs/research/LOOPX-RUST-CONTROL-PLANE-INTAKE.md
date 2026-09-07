@@ -27,16 +27,16 @@ Hartevo 已有 Mission/Operating Contract、Checkpoint DAG、Context Workspace/W
 | peer 身份与能力 | `LoopPeer` 注册 + 每轮 `LoopHost` 声明 + Mission 合同同时满足；注册不授予 Effect 权限。 |
 | 认领、租约、写冲突 | SQLCipher `BEGIN IMMEDIATE` 内重新决策和 CAS；actor 必须匹配 owner，租约上限 15 分钟，相对写路径按路径段检查重叠。 |
 | 软建议与硬限制 | `decision_for_todo` 可选择优先建议之外的合法 Todo；建议顺序不成为权限。 |
-| 人工协作 | `LoopUserGate` 必须有具体 question，范围为 Mission、Agent、Todo 或层级 Decision；局部 gate 不阻塞独立切片。通知按当前问题摘要独立确认，不同 peer 的确认不会相互覆盖，解决或重新打开问题只影响相关通知。配置的 operator 才能关闭 gate、调配 quota、暂停和批准恢复。 |
+| 人工协作 | `LoopUserGate` 必须有具体 question，范围为 Mission、Agent、Todo 或层级 Decision；局部 gate 不阻塞独立切片。通知发给同一 Mission operator，按当前问题集合摘要去重：相同集合共享确认，不同集合互不覆盖，解决或重新打开问题只影响相关通知。配置的 operator 才能关闭 gate、调配 quota、暂停和批准恢复。 |
 | 暂停、改向 | Pause、降低配额、Steer 撤销当前代际；未确定结果保留为 Uncertain。持久用户 Conversation 摘要与 Operating Contract 共同形成 claim authority fence。 |
-| 配额与防空转 | 认领预留 slot，验证写回后消费。NoProgress 不扣配额，连续无进展触发 Repair；没有可执行修复时等待状态变化。 |
+| 配额与防空转 | 认领预留 slot，验证写回后消费。NoProgress 不扣配额，连续无进展触发 Repair；每个 Repair/Replan 切片自身也有持久无进展次数上限，耗尽后等待新修复计划或状态变化。 |
 | 监控 | 无写范围的 Monitor 保留 target digest、due/cadence/expiry 与上次摘要；合并错过的 tick；首次基线和未变化时静默，变化才通知，监控不消费推进 slot。 |
 | 证据与交接 | Progress 必须引用当前 Mission 内 Confirmed、claim 开始后观察到、未被其他结算接受的 Evidence。`MissionLoopHandoff` 从数据库重建目标、non-goals、下一步、gate、最近 32 条摘要与 claim。 |
 | 原子结算 | 同事务提交切片状态、accepted evidence、quota、摘要、operation receipt 和 Event/Outbox。原证据由既有 Application 命令持久化，不把模型回复或 Provider Receipt 直接当证据。 |
 | 去重与恢复 | operation id 绑定完整请求摘要；同请求回放只读，换内容复用 id 被拒绝。Claim 与 BeginExecution 分开持久化，重复 dispatch 被抑制。 |
 | 写回后崩溃 | `ReconcileSettlement` 在 operator 独立 readback 后用原 claim/证据补结算，不再次调用 host；来源或 steering 改变则拒绝。`ReconcileRetry` 另需证明可安全重试。 |
-| 运行时 | `run_mission_loop_slice` 只调用一个既有 runner；`bind_cordis_mission_loop_guard` 接入真实 `agent/pre-step`，每步重读 SQLCipher，读失败、锁占用、暂停、过期、改向均拒绝下一模型步骤。 |
-| 桌面与隐私 | `MissionProjection.loop_accounting` 和既有 Agent Operations 配额区展示真实消费、预留、待办、gate、uncertain 计数。目标、问题、工作区、工作标题不进入 Event/Outbox 或 handoff Debug。 |
+| 运行时 | `run_mission_loop_slice` 只调用一个既有 runner，dispatch 提交后再次用同一次最新 snapshot 检查 Task 可执行性，关闭的 Task 不进入 callback；`bind_cordis_mission_loop_guard` 接入真实 `agent/pre-step`，每步重读 SQLCipher，读失败、锁占用、暂停、过期、改向均拒绝下一模型步骤。 |
+| 桌面与隐私 | `MissionProjection.loop_accounting` 和既有 Agent Operations 配额区展示真实消费、预留、待办、gate、已持久标记 Uncertain 的计数；自然过期和 authority 变化是否需要核对，以当前 `LoopDecision.reconciliation_required` 为准，账本计数不代表执行许可。目标、问题、工作区、工作标题不进入 Event/Outbox 或 handoff Debug。 |
 
 代码入口：
 
@@ -95,14 +95,14 @@ cargo fmt --all -- --check
 
 测试依据：[Domain 行为矩阵](../../hartevo-rs/domain-kernel/src/mission_loop/tests.rs)、[Storage 并发/重开/故障注入/迁移](../../hartevo-rs/storage/src/mission_loop_store_tests.rs)、[Application 与真实 Cordis pre-step](../../hartevo-rs/application/src/mission_loop_tests.rs)。
 
-2026-09-07 本机验证（macOS，Rust 1.95.0）：
+2026-09-07 本机验证记录（macOS，Rust 1.95.0；完整回归后，审查修复按影响范围复测）：
 
 | 检查 | 结果 |
 | --- | --- |
 | Domain Kernel 完整 lib 回归 | 163 passed，0 failed。 |
 | Storage 完整 lib 回归 | 214 passed，0 failed；包含旧版本迁移与并发属性测试。 |
 | Application 完整 lib 回归 | 152 passed，0 failed，2 个既有实机测试 ignored。 |
-| 最终变更后的新增专项回归 | 28 passed：Domain 15、Storage 7、Application/Cordis 6。 |
+| 审查修复后的最终专项回归 | 30 passed：Domain 16、Storage 7、Application/Cordis 7，包含跨连接 Task 关闭后的 callback 抑制与 Repair/Replan 无进展上限。 |
 | 四个受影响 crate 的 all-targets Clippy | `-D warnings` 通过，包含 Desktop 类型检查。 |
 | 格式与文档机器事实 | `cargo fmt --all -- --check` 与 `check-docs-machine-truth.sh verify` 通过。 |
 

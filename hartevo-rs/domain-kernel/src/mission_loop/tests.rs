@@ -719,6 +719,58 @@ fn no_progress_requires_repair_instead_of_endless_model_turns() {
 }
 
 #[test]
+fn repair_and_replan_stop_after_their_own_bounded_unproductive_attempts() {
+    for kind in [LoopWorkKind::Repair, LoopWorkKind::Replan] {
+        for result in [
+            LoopTurnResult::NoProgress {
+                reason_digest: hash("nothing changed"),
+            },
+            LoopTurnResult::Failed {
+                evidence_digest: hash("known failure"),
+                uncertain: false,
+            },
+        ] {
+            let (mut state, mission) = fixture();
+            let mut spec = todo("bounded-recovery");
+            spec.kind = kind;
+            spec.task_id = None;
+            spec.capability = None;
+            add(&mut state, &mission, spec.clone());
+            for _ in 0..state.policy().stall_limit {
+                let active = begin(&mut state, &mission, &spec.id, "alice", now());
+                apply(
+                    &mut state,
+                    &mission,
+                    agent("alice"),
+                    LoopAction::Settle {
+                        claim: active,
+                        result: result.clone(),
+                    },
+                    now(),
+                );
+            }
+            let decision = state
+                .should_run(facts(&mission), &host("alice"), now())
+                .unwrap();
+            assert!(!decision.should_run());
+            assert_eq!(decision.mode, LoopMode::Replan);
+            assert_eq!(decision.wake, LoopWake::OnStateChange);
+            assert_eq!(state.spent_slots(), 0);
+            spec.id = "new-recovery-plan".into();
+            add(&mut state, &mission, spec);
+            assert_eq!(
+                state
+                    .should_run(facts(&mission), &host("alice"), now())
+                    .unwrap()
+                    .selected_todo
+                    .as_deref(),
+                Some("new-recovery-plan")
+            );
+        }
+    }
+}
+
+#[test]
 fn monitor_coalesces_missed_ticks_and_notifies_only_on_change_without_spending() {
     let (mut state, mission) = fixture();
     let mut monitor = todo("monitor");

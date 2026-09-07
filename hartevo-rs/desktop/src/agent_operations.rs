@@ -311,13 +311,15 @@ fn mission_control_projection(
                     OperationsStatus::RecoveryRequired
                 } else if accounting.paused || accounting.spent_slots >= accounting.slot_limit {
                     OperationsStatus::WaitingUser
+                } else if accounting.claimed_slices > 0 {
+                    OperationsStatus::Active
                 } else {
                     OperationsStatus::Ready
                 },
                 used: accounting.spent_slots.to_string(),
                 limit: accounting.slot_limit.to_string(),
                 detail: format!(
-                    "已验证推进 {} 次，预留 {} 次；{} 个待办，{} 个待决策，{} 个结果待核对。",
+                    "已验证推进 {} 次，预留 {} 次；{} 个待办，{} 个待决策，已标记需核对 {} 项。",
                     accounting.spent_slots,
                     accounting.reserved_slots,
                     accounting.open_slices,

@@ -147,6 +147,11 @@ impl ApplicationService {
             .todos()
             .get(&claim.todo_id)
             .ok_or(LoopError::ClaimLost)?;
+        if todo.execution_started {
+            snapshot
+                .state
+                .require_execution(snapshot.facts(), claim, now)?;
+        }
         let handoff = MissionLoopHandoff {
             project_id: project_id.clone(),
             mission_id: mission_id.clone(),

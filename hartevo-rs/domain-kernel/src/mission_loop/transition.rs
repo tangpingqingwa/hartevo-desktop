@@ -90,6 +90,7 @@ impl MissionLoop {
                         status: LoopTodoStatus::Open,
                         claim: None,
                         execution_started: false,
+                        no_progress_attempts: 0,
                         last_observation_digest: None,
                     },
                 );
@@ -437,6 +438,7 @@ impl MissionLoop {
                     return Err(LoopError::InvalidState);
                 }
                 run.evidence_digest.clone_from(reason_digest);
+                todo.no_progress_attempts = todo.no_progress_attempts.saturating_add(1);
                 self.no_progress_streak = self.no_progress_streak.saturating_add(1);
                 todo.status = LoopTodoStatus::Open;
             }
@@ -449,6 +451,7 @@ impl MissionLoop {
                 }
                 run.evidence_digest.clone_from(evidence_digest);
                 run.notify = true;
+                todo.no_progress_attempts = todo.no_progress_attempts.saturating_add(1);
                 self.no_progress_streak = self.no_progress_streak.saturating_add(1);
                 todo.status = if *uncertain {
                     LoopTodoStatus::Uncertain

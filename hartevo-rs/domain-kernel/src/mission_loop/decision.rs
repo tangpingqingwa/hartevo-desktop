@@ -213,6 +213,12 @@ impl MissionLoop {
                 reasons.push(reason);
                 continue;
             }
+            if matches!(todo.spec.kind, LoopWorkKind::Repair | LoopWorkKind::Replan)
+                && todo.no_progress_attempts >= self.policy.stall_limit
+            {
+                reasons.push(LoopMode::Replan);
+                continue;
+            }
             if self.no_progress_streak >= self.policy.stall_limit
                 && !matches!(todo.spec.kind, LoopWorkKind::Repair | LoopWorkKind::Replan)
             {

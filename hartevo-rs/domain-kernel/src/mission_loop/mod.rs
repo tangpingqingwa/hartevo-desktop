@@ -136,6 +136,7 @@ pub struct LoopTodo {
     pub status: LoopTodoStatus,
     pub claim: Option<LoopClaim>,
     pub execution_started: bool,
+    pub no_progress_attempts: u16,
     pub last_observation_digest: Option<String>,
 }
 
@@ -321,6 +322,8 @@ pub struct LoopAccounting {
     pub spent_slots: u32,
     pub reserved_slots: usize,
     pub claimed_slices: usize,
+    /// Persistently marked uncertainty. Expiry and changed authority also need
+    /// reconciliation; read a current LoopDecision for those live conditions.
     pub uncertain_slices: usize,
     pub open_slices: usize,
     pub open_gates: usize,
