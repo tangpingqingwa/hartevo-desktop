@@ -6,6 +6,10 @@
 
 本文定义 Rust Hartevo Desktop 的组件所有权、进程边界、数据流和安全不变量。产品行为以交互规格与 v12 原型为准；上游采用理由以 Rust/OpenInterpreter RFC 为准。
 
+## LoopX 长期任务控制面（2026-09-07）
+
+`hartevo-domain-kernel::mission_loop` 为既有 Mission 增加有限切片、peer claim、scoped user gate、quota、monitor 与 typed continuation；Mission/Operating Contract 仍拥有业务状态和完成条件。SQLCipher v52 同事务保存 loop revision、operation receipt、验证后的推进结算和 Event/Outbox。Application 通过 `run_mission_loop_slice` 调用既有 runner，`bind_cordis_mission_loop_guard` 将持久边界接入 Cordis `agent/pre-step`。桌面只消费 `MissionProjection.loop_accounting`，不拥有配额或租约。接入步骤、验证和限制见 [LoopX Rust 接入清单](../research/LOOPX-RUST-CONTROL-PLANE-INTAKE.md)。
+
 ## 1. 架构目标
 
 Hartevo Desktop 必须把自然语言目标持续推进为可验证的业务结果：

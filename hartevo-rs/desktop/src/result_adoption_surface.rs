@@ -278,6 +278,7 @@ mod tests {
             static_site_preview: None,
         };
         let mission = MissionProjection {
+            loop_accounting: None,
             surface: "mission".into(),
             project_id: project_id.clone(),
             mission_id,
