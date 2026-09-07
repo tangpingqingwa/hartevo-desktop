@@ -1581,6 +1581,7 @@ impl DesktopCordisCoordinator {
             .context()
             .sessions::<SessionStore>()
             .ok_or(DesktopAgentTurnError::MissingSessionStore)?;
+        self.session_persistence.claim_write(&request.session_id)?;
         let session = sessions.get_or_create(request.session_id.clone())?;
         let events = session.events()?;
         if runtime_open_turn(&events).is_some() || !session.inbox().next_step()?.is_empty() {
@@ -1716,7 +1717,9 @@ impl DesktopCordisCoordinator {
             .context()
             .sessions::<SessionStore>()
             .ok_or(DesktopSessionPersistenceError::MissingSessionStore)?;
-        let session = sessions.get_or_create(SessionId::new(transcript.session_id.clone())?)?;
+        let session_id = SessionId::new(transcript.session_id.clone())?;
+        self.session_persistence.claim_write(&session_id)?;
+        let session = sessions.get_or_create(session_id)?;
         let user = runtime_user_message(&transcript.runtime_turn_id, transcript.user_body);
         let assistant_chunks = transcript.assistant_chunks;
         let partial_body = assistant_chunks.concat();
@@ -2216,6 +2219,18 @@ struct DesktopSessionPersistence {
 }
 
 impl DesktopSessionPersistence {
+    fn claim_write(&self, id: &SessionId) -> Result<(), DesktopSessionPersistenceError> {
+        let mut state = self
+            .store
+            .lock()
+            .map_err(|_| DesktopSessionPersistenceError::StatePoisoned)?;
+        state
+            .as_mut()
+            .ok_or(DesktopSessionPersistenceError::Unbound)?
+            .claim_session_write(id.as_str())?;
+        Ok(())
+    }
+
     fn mount(&self, host: &mut CordisHost) -> Result<(), CordisError> {
         let observed = Arc::clone(&self.observed);
         host.context_mut().on_emit(
@@ -2244,8 +2259,30 @@ impl DesktopSessionPersistence {
         mut store: ProjectStore,
         sessions: &SessionStore,
     ) -> Result<usize, DesktopSessionPersistenceError> {
+        let mut bound = self
+            .store
+            .lock()
+            .map_err(|_| DesktopSessionPersistenceError::StatePoisoned)?;
+        if let Some(current) = bound.as_mut()
+            && current.same_session_database(&store)
+        {
+            // Normal desktop reload opens a fresh SQLCipher connection.
+            // Keep the existing owner while validating fresh durable
+            // history; dropping its locks would allow a competing writer
+            // to overtake the still-live Session memory.
+            return Self::restore_owned(current, sessions);
+        }
+        let restored = Self::restore_owned(&mut store, sessions)?;
+        *bound = Some(store);
+        Ok(restored)
+    }
+
+    fn restore_owned(
+        store: &mut ProjectStore,
+        sessions: &SessionStore,
+    ) -> Result<usize, DesktopSessionPersistenceError> {
         let checkpoints = store
-            .load_session_checkpoints()?
+            .load_owned_session_checkpoints()?
             .into_iter()
             .map(decode_checkpoint)
             .collect::<Result<Vec<_>, _>>()?;
@@ -2283,10 +2320,6 @@ impl DesktopSessionPersistence {
                 restored += 1;
             }
         }
-        *self
-            .store
-            .lock()
-            .map_err(|_| DesktopSessionPersistenceError::StatePoisoned)? = Some(store);
         Ok(restored)
     }
 
@@ -2346,6 +2379,8 @@ pub(crate) enum DesktopAgentTurnError {
     },
     #[error("Desktop Cordis Session persistence is unavailable")]
     PersistenceUnavailable,
+    #[error(transparent)]
+    Persistence(#[from] DesktopSessionPersistenceError),
     #[error("Cordis turn failed ({run}) and its terminal flush also failed ({flush})")]
     RunAndFlush {
         run: Box<CordisError>,
@@ -3596,7 +3631,7 @@ mod tests {
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
     use hartevo_storage::{
         PersistedAgentInboxOutcome, PersistedAgentInboxTarget, PersistedSessionEvent,
-        PersistedSessionEventKind, ProjectStore,
+        PersistedSessionEventKind, ProjectStore, StorageError,
     };
     #[cfg(target_os = "macos")]
     use zeroize::Zeroizing;
@@ -4351,6 +4386,216 @@ mod tests {
             now(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_session_writer_blocks_restore_and_adapter_before_publication() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("sessions.sqlite");
+        let key = hartevo_storage::DatabaseKey::new([44; 32]).unwrap();
+        let make_host = || {
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured)).unwrap()
+        };
+        let mut owner = make_host();
+        owner
+            .bind_session_persistence(ProjectStore::open(&path, &key).unwrap())
+            .unwrap();
+        let mut contender = make_host();
+        contender
+            .bind_session_persistence(ProjectStore::open(&path, &key).unwrap())
+            .unwrap();
+        approve_agent_turn(&mut contender);
+        let request = desktop_turn_request();
+        let session = owner
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .create(request.session_id.clone())
+            .unwrap();
+        session.start_turn().unwrap();
+        owner.session_persistence.persist_live(&session).unwrap();
+        let durable = encode_checkpoint(&SessionCheckpoint {
+            header: session.header().unwrap(),
+            events: session.events().unwrap(),
+        })
+        .unwrap();
+        let (adapter, probe) = desktop_turn_adapter(Arc::new(AtomicUsize::new(0)));
+        let error = contender
+            .run_agent_turn(request, adapter, &LifecycleCancellation::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            super::DesktopAgentTurnError::Persistence(
+                super::DesktopSessionPersistenceError::Storage(StorageError::SessionAlreadyOwned(
+                    _
+                ))
+            )
+        ));
+        assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            contender
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .is_empty()
+                .unwrap()
+        );
+        let mut cold = make_host();
+        assert!(matches!(
+            cold.bind_session_persistence(ProjectStore::open(&path, &key).unwrap()),
+            Err(super::DesktopSessionPersistenceError::Storage(
+                StorageError::SessionAlreadyOwned(_)
+            ))
+        ));
+        assert!(
+            cold.context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .is_empty()
+                .unwrap()
+        );
+        assert_eq!(
+            ProjectStore::open(&path, &key)
+                .unwrap()
+                .load_session_checkpoints()
+                .unwrap(),
+            vec![durable]
+        );
+        // Ordinary host shutdown releases ownership without reaching into
+        // the persistence adapter or explicitly unlocking its files.
+        drop(owner);
+        assert_eq!(
+            cold.bind_session_persistence(ProjectStore::open(&path, &key).unwrap())
+                .unwrap(),
+            1
+        );
+        let restored = cold
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(session.id())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            restored.events().unwrap().last().map(|event| &event.kind),
+            Some(SessionEventKind::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn desktop_session_rebind_retains_the_current_writer_and_never_repairs_its_open_turn() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("sessions.sqlite");
+        let key = hartevo_storage::DatabaseKey::new([46; 32]).unwrap();
+        let mut host =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        host.bind_session_persistence(ProjectStore::open(&path, &key).unwrap())
+            .unwrap();
+        let session = host
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .create(SessionId::new("rebind-live").unwrap())
+            .unwrap();
+        session.start_turn().unwrap();
+        host.session_persistence.persist_live(&session).unwrap();
+        let before = session.events().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                host.bind_session_persistence(ProjectStore::open(&path, &key).unwrap())
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(session.events().unwrap(), before);
+        let mut competitor = ProjectStore::open(&path, &key).unwrap();
+        assert!(matches!(
+            competitor.load_owned_session_checkpoints(),
+            Err(StorageError::SessionAlreadyOwned(_))
+        ));
+        assert_eq!(
+            competitor.load_session_checkpoints().unwrap()[0]
+                .events
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_cancelled_visible_prefix_survives_sqlcipher_reopen() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("sessions.sqlite");
+        let key = hartevo_storage::DatabaseKey::new([45; 32]).unwrap();
+        let mut live =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        live.bind_session_persistence(ProjectStore::open(&path, &key).unwrap())
+            .unwrap();
+        approve_agent_turn(&mut live);
+        let cancellation = LifecycleCancellation::default();
+        let trigger = cancellation.clone();
+        live.host
+            .context_mut()
+            .on_emit(session_events::SESSION_EVENT, move |record| {
+                if matches!(
+                    &record.event.kind,
+                    SessionEventKind::AssistantChunk {
+                        chunk: SessionStreamChunk::TextDelta { .. },
+                        ..
+                    }
+                ) {
+                    trigger.cancel_with(hartevo_cordis::SessionCancelCause::User);
+                }
+            })
+            .unwrap();
+        let request = desktop_turn_request();
+        let id = request.session_id.clone();
+        let (adapter, _) = desktop_turn_adapter(Arc::new(AtomicUsize::new(0)));
+        let outcome = live
+            .run_agent_turn(request, adapter, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.reason(),
+            TurnEndReason::Aborted(hartevo_cordis::SessionCancelCause::User)
+        );
+        let original = live
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .unwrap();
+        let expected = original.events().unwrap();
+        drop(live.session_persistence.store.lock().unwrap().take());
+        let mut cold =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(
+            cold.bind_session_persistence(ProjectStore::open(&path, &key).unwrap())
+                .unwrap(),
+            1
+        );
+        let restored = cold
+            .context()
+            .sessions::<SessionStore>()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.events().unwrap(), expected);
+        assert_eq!(
+            restored.derive_messages().unwrap().last().unwrap().content,
+            vec![SessionContentBlock::Text {
+                text: "desktop response".into()
+            }]
+        );
     }
 
     fn seed_desktop_compaction(
@@ -5795,19 +6040,18 @@ mod tests {
 
         assert!(matches!(
             error,
-            DesktopAgentTurnError::Session(SessionError::FlushFailed { .. })
+            DesktopAgentTurnError::Persistence(DesktopSessionPersistenceError::Unbound)
         ));
         assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 0);
         assert_eq!(probe.stream_calls.load(Ordering::SeqCst), 0);
-        let session = live
-            .context()
-            .sessions::<SessionStore>()
-            .unwrap()
-            .get(&SessionId::new("desktop-agent-session").unwrap())
-            .unwrap()
-            .unwrap();
-        assert_eq!(session.inbox().next_turn().unwrap().len(), 1);
-        assert!(runtime_open_turn(&session.events().unwrap()).is_none());
+        assert!(
+            live.context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new("desktop-agent-session").unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -5820,6 +6064,8 @@ mod tests {
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap();
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
         let (adapter, probe) = desktop_turn_adapter(Arc::new(AtomicUsize::new(0)));
 
         let error = live
@@ -5853,6 +6099,8 @@ mod tests {
         let mut live =
             mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
                 .unwrap();
+        live.bind_session_persistence(ProjectStore::in_memory().unwrap())
+            .unwrap();
         let request = desktop_turn_request();
         let session = live
             .context()

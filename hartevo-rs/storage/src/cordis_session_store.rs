@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ProjectStore, StorageError};
 
+/// This is Hartevo's SQLCipher log format, not the upstream JSONL generation.
+const PERSISTED_SESSION_FORMAT_VERSION: u32 = 0;
+
+#[cfg(test)]
+#[path = "cordis_session_ownership_tests.rs"]
+mod ownership_tests;
+
 const SESSION_HEADER_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS cordis_session_headers (
   id TEXT PRIMARY KEY CHECK (length(id) > 0),
   format_version INTEGER NOT NULL CHECK (
@@ -266,6 +273,20 @@ pub struct PersistedSessionCheckpoint {
 }
 
 impl ProjectStore {
+    /// Whether two opened stores address the same canonical on-disk Session
+    /// database. Independent in-memory databases never share this identity.
+    #[must_use]
+    pub fn same_session_database(&self, other: &Self) -> bool {
+        self.session_ownership
+            .same_database(&other.session_ownership)
+    }
+
+    /// Reserve this Session for the store's lifetime before publishing a live
+    /// agent. Repeated claims by the same store validate the held lock.
+    pub fn claim_session_write(&mut self, id: &str) -> Result<(), StorageError> {
+        self.session_ownership.claim(id)
+    }
+
     /// Durably extend one exact Session prefix in a single SQLCipher transaction.
     ///
     /// Returns `true` when the durable prefix advanced or the header was first
@@ -275,6 +296,7 @@ impl ProjectStore {
         checkpoint: &PersistedSessionCheckpoint,
     ) -> Result<bool, StorageError> {
         validate_checkpoint(checkpoint)?;
+        self.session_ownership.claim(&checkpoint.header.id)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -352,61 +374,90 @@ impl ProjectStore {
     pub fn load_session_checkpoints(
         &self,
     ) -> Result<Vec<PersistedSessionCheckpoint>, StorageError> {
-        let mut statement = self.connection.prepare(
-            "SELECT format_version, id, created_at_ms, parent_session_id,
-                    delegation_depth, seed_length, event_count
-             FROM cordis_session_headers
-             ORDER BY created_at_ms, id",
+        load_session_checkpoints(&self.connection)
+    }
+
+    /// Acquire ownership before publishing or repairing restored Sessions.
+    ///
+    /// The short SQLite transaction freezes discovery while nonblocking
+    /// kernel locks are taken. Other readers remain allowed. The locks stay
+    /// with this store, including when the store moves into another host.
+    pub fn load_owned_session_checkpoints(
+        &mut self,
+    ) -> Result<Vec<PersistedSessionCheckpoint>, StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkpoints = load_session_checkpoints(&transaction)?;
+        self.session_ownership.claim_all(
+            &checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.header.id.clone())
+                .collect::<Vec<_>>(),
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })?;
-        let mut checkpoints = Vec::new();
-        for row in rows {
-            let (
-                version,
-                id,
-                created_at_ms,
-                parent_session,
-                delegation_depth,
-                seed_length,
-                event_count,
-            ) = row?;
-            let header = decode_header(
-                version,
-                id,
-                created_at_ms,
-                parent_session,
-                delegation_depth,
-                seed_length,
-            )?;
-            let events = load_events(&self.connection, &header.id)?;
-            let expected_count = usize::try_from(event_count).map_err(|_| {
-                StorageError::DomainDecode("Cordis Session event count does not fit memory".into())
-            })?;
-            if events.len() != expected_count {
-                return Err(StorageError::DomainDecode(format!(
-                    "Cordis Session {} event count does not match its rows",
-                    header.id
-                )));
-            }
-            let checkpoint = PersistedSessionCheckpoint { header, events };
-            validate_checkpoint(&checkpoint)?;
-            checkpoints.push(checkpoint);
-        }
+        transaction.commit()?;
         Ok(checkpoints)
     }
 }
 
+fn load_session_checkpoints(
+    connection: &Connection,
+) -> Result<Vec<PersistedSessionCheckpoint>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT format_version, id, created_at_ms, parent_session_id,
+                    delegation_depth, seed_length, event_count
+             FROM cordis_session_headers
+             ORDER BY created_at_ms, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut checkpoints = Vec::new();
+    for row in rows {
+        let (
+            version,
+            id,
+            created_at_ms,
+            parent_session,
+            delegation_depth,
+            seed_length,
+            event_count,
+        ) = row?;
+        let header = decode_header(
+            version,
+            id,
+            created_at_ms,
+            parent_session,
+            delegation_depth,
+            seed_length,
+        )?;
+        let events = load_events(connection, &header.id)?;
+        let expected_count = usize::try_from(event_count).map_err(|_| {
+            StorageError::DomainDecode("Cordis Session event count does not fit memory".into())
+        })?;
+        if events.len() != expected_count {
+            return Err(StorageError::DomainDecode(format!(
+                "Cordis Session {} event count does not match its rows",
+                header.id
+            )));
+        }
+        let checkpoint = PersistedSessionCheckpoint { header, events };
+        validate_checkpoint(&checkpoint)?;
+        checkpoints.push(checkpoint);
+    }
+    Ok(checkpoints)
+}
+
 fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), StorageError> {
+    require_session_format(checkpoint.header.version)?;
     if checkpoint.header.id.is_empty() {
         return Err(StorageError::InvalidSessionCheckpoint(
             "session id must not be empty",
@@ -464,6 +515,16 @@ fn validate_checkpoint(checkpoint: &PersistedSessionCheckpoint) -> Result<(), St
         }
     }
     sqlite_usize(checkpoint.events.len(), "event count")?;
+    Ok(())
+}
+
+fn require_session_format(actual: u32) -> Result<(), StorageError> {
+    if actual != PERSISTED_SESSION_FORMAT_VERSION {
+        return Err(StorageError::UnsupportedSessionFormat {
+            actual,
+            supported: PERSISTED_SESSION_FORMAT_VERSION,
+        });
+    }
     Ok(())
 }
 
@@ -901,10 +962,13 @@ fn decode_header(
     delegation_depth: i64,
     seed_length: Option<i64>,
 ) -> Result<PersistedSessionHeader, StorageError> {
+    let version = u32::try_from(version).map_err(|_| {
+        StorageError::DomainDecode("Cordis Session format version is invalid".into())
+    })?;
+    // Refuse a newer generation before interpreting its event vocabulary.
+    require_session_format(version)?;
     Ok(PersistedSessionHeader {
-        version: u32::try_from(version).map_err(|_| {
-            StorageError::DomainDecode("Cordis Session format version is invalid".into())
-        })?,
+        version,
         id,
         created_at_ms,
         parent_session,

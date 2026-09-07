@@ -20,8 +20,12 @@ Pinned source provenance for this target contract:
 
 - Cordis: cordiverse/cordis@8cc9e33fab69e2d0476d126baaf2acb24e6a6ab4
   (MIT).
-- DeepSeek Harness: deepseek-ai/deepseek-harness@cd5ef8148158c3a752a658978873241fdf8e2bbc
-  (MIT).
+- DeepSeek Harness: deepseek-ai/deepseek-harness@d347e703908d0406b7a7ef80e3a0e594d86b2215
+  (`0.1.3-alpha.1`, MIT). The previous reference was
+  `cd5ef8148158c3a752a658978873241fdf8e2bbc` (`0.1.2-alpha.1`).
+  [Rust update decisions and compatibility boundaries](research/DEEPSEEK-HARNESS-0.1.3-RUST-UPDATE.md)
+  identify which newer contracts are implemented; the reference pin is not
+  a claim of upstream JSONL v2 or whole-product compatibility.
 
 Hartevo reimplements the pinned primer behavior in Rust. It does not vendor or
 run the TypeScript/Node cores, and it does not add a Node/Electron/React/Python
