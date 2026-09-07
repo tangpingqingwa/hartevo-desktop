@@ -1,5 +1,9 @@
 /* Product work surfaces. Diagnostics remain available through disclosure. */
 :root { --product-content-width: 1040px; }
+.workspace-opening { min-height:100vh; display:flex; flex-direction:column; justify-content:center; max-width:600px; margin:auto; padding:48px; }
+.workspace-opening-brand { color:#285a43; font-size:18px; font-weight:650; margin-bottom:22px; }
+.workspace-opening h1 { font-size:24px; font-weight:600; line-height:1.5; }
+.workspace-opening p { color:#616c65; font-size:14px; line-height:1.8; }
 .desktop-shell:not(:has(.workpad)) .app-chrome { grid-template-columns: var(--side-w) minmax(0,1fr) auto; }
 .desktop-shell:not(:has(.workpad)) .document-bar .surface-chrome { display:none; }
 .desktop-shell:not(:has(.workpad)) .mission-bar { border-right:0; }

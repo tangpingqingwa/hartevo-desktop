@@ -1255,6 +1255,44 @@ fn scoped_runtime_render_projection<'a>(
 
 #[component]
 pub fn App() -> Element {
+    let mut initial_model = use_signal(|| None::<DesktopUiModel>);
+    use_future(move || async move {
+        initial_model.set(Some(load_desktop_ui_model().await));
+    });
+    rsx! {
+        document::Title { "Hartevo Desktop" }
+        document::Stylesheet { href: MAIN_CSS }
+        document::Stylesheet { href: PRODUCT_CSS }
+        if let Some(model) = initial_model() {
+            DesktopWorkspace { initial_model: model }
+        } else {
+            main { class: "workspace-opening", aria_busy: true,
+                span { class: "workspace-opening-brand", "Hartevo" }
+                h1 { "正在打开工作空间" }
+                p { role: "status", "正在读取本机加密数据。如果 macOS 弹出钥匙串提示，请在系统窗口中完成授权。" }
+            }
+        }
+    }
+}
+
+async fn load_desktop_ui_model() -> DesktopUiModel {
+    // OS Vault access may wait for system authentication. Keep it off the
+    // native event loop so the window can paint and remain responsive.
+    tokio::task::spawn_blocking(DesktopUiModel::load)
+        .await
+        .unwrap_or_else(|_| DesktopUiModel {
+            backend: DesktopBackendState::Failed(UiFailure::coded(
+                "WORKSPACE_LOAD_FAILED",
+                "工作空间读取失败。请确认系统授权后重新读取。",
+            )),
+            selected_project_id: None,
+            selected_mission_id: None,
+            notice: None,
+        })
+}
+
+#[component]
+fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     let desktop_context = dioxus::desktop::use_window();
     let visual_zoom = active_visual_zoom();
     let visual_fixture_mode = active_visual_fixture_id().is_some();
@@ -1291,7 +1329,8 @@ pub fn App() -> Element {
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
     let mut mission_list_filter = use_signal(product_experience::TaskFilter::default);
-    let mut model = use_signal(DesktopUiModel::load);
+    let mut model = use_signal(move || initial_model);
+    let mut reloading_workspace = use_signal(|| false);
     let mut draft = use_signal(String::new);
     let mut catalog_manifest_id = use_signal(String::new);
     let mut catalog_mode = use_signal(String::new);
@@ -3562,12 +3601,24 @@ pub fn App() -> Element {
                                     id: "current-object-menu-first",
                                     autofocus: true,
                                     role: "menuitem",
+                                    disabled: reloading_workspace(),
                                     onclick: move |_| {
-                                        model.set(DesktopUiModel::load());
+                                        reloading_workspace.set(true);
                                         current_object_menu.set(false);
+                                        spawn(async move {
+                                            let mut reloaded = load_desktop_ui_model().await;
+                                            {
+                                                let current = model.peek();
+                                                reloaded.selected_project_id = current.selected_project_id.clone();
+                                                reloaded.selected_mission_id = current.selected_mission_id.clone();
+                                            }
+                                            reloaded.restore_valid_selection(false);
+                                            model.set(reloaded);
+                                            reloading_workspace.set(false);
+                                        });
                                     },
                                     UiIcon { name: UiIconName::Refresh, size: 13 }
-                                    "重新读取持久状态"
+                                    if reloading_workspace() { "正在读取…" } else { "重新读取持久状态" }
                                 }
                                 button {
                                     role: "menuitem",
