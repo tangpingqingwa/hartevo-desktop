@@ -6,10 +6,12 @@ use hartevo_domain_kernel::{
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use crate::aggregate::{AtomicMutation, PendingEvent, append_events};
+use crate::aggregate::{
+    AtomicMutation, PendingEvent, append_events, require_application_source_fence,
+};
 use crate::mission_conversation_store::update_mission_conversation_append;
 use crate::normalized::{decode_enum, enum_name, update_mission_normalized_cas};
-use crate::{ProjectStore, StorageError};
+use crate::{ApplicationSourceRevisionFence, ProjectStore, StorageError};
 use crate::{
     context_collaboration_store::{update_context_branch_row, update_worker_handle_row},
     context_store::{update_context_capsule_row, update_worker_lease_row},
@@ -253,6 +255,27 @@ impl ProjectStore {
             expected_mission_revision,
             manifest,
             None,
+            &[],
+            events,
+        )
+    }
+
+    /// Creates an Application-built artifact while fencing the exact external
+    /// Project sources used to produce it in the same transaction.
+    pub fn create_work_product_manifest_with_source_fences_atomic(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        manifest: &WorkProductManifest,
+        source_fences: &[ApplicationSourceRevisionFence],
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        self.persist_work_product_manifest_atomic(
+            mission,
+            expected_mission_revision,
+            manifest,
+            None,
+            source_fences,
             events,
         )
     }
@@ -270,6 +293,7 @@ impl ProjectStore {
             expected_mission_revision,
             manifest,
             Some(expected_manifest_version),
+            &[],
             events,
         )
     }
@@ -377,6 +401,7 @@ impl ProjectStore {
         expected_mission_revision: u64,
         manifest: &WorkProductManifest,
         expected_manifest_version: Option<u64>,
+        source_fences: &[ApplicationSourceRevisionFence],
         events: &[PendingEvent],
     ) -> Result<AtomicMutation, StorageError> {
         if mission.revision <= expected_mission_revision {
@@ -392,6 +417,25 @@ impl ProjectStore {
         manifest.validate_against(work_product)?;
 
         let transaction = self.connection.transaction()?;
+        let mut unique_fences = std::collections::BTreeSet::new();
+        for fence in source_fences {
+            if fence.id.trim().is_empty()
+                || fence
+                    .expected_revision
+                    .is_some_and(|revision| revision == 0)
+                || !unique_fences.insert((fence.kind, fence.id.as_str()))
+            {
+                return Err(StorageError::DomainDecode(
+                    "invalid artifact source fence".into(),
+                ));
+            }
+            require_application_source_fence(
+                &transaction,
+                mission.tenant_id.as_str(),
+                mission.project_id.as_str(),
+                fence,
+            )?;
+        }
         validate_manifest_dependencies(&transaction, mission, manifest)?;
         let existing = load_work_product_manifest(
             &transaction,
@@ -824,6 +868,80 @@ mod tests {
         let fact = truth_fact(project.tenant_id, project.id);
         let manifest = work_product_manifest(&mission, &product, fact.id.clone(), task_id);
         (store, mission, manifest, fact)
+    }
+
+    #[test]
+    fn generated_manifest_rejects_stale_project_without_partial_writes() {
+        let (mut store, mission, manifest, fact) = setup();
+        store
+            .create_truth_fact(&fact, "truth.created", &json!({}), now())
+            .unwrap();
+        let project = store.load_project(&mission.project_id).unwrap();
+        let mut revised = project.clone();
+        revised.update_metadata("Revised source", "").unwrap();
+        store
+            .update_project_atomic(
+                &revised,
+                project.revision,
+                &[PendingEvent::new(
+                    "project.metadata_updated",
+                    json!({}),
+                    now(),
+                )],
+            )
+            .unwrap();
+        let events = store.events_for_project(&project.id).unwrap();
+        let event = PendingEvent::new("work_product.created", json!({}), now());
+        assert!(matches!(
+            store.create_work_product_manifest_with_source_fences_atomic(
+                &mission,
+                1,
+                &manifest,
+                &[ApplicationSourceRevisionFence::present(
+                    crate::ApplicationSourceKind::Project,
+                    project.id.to_string(),
+                    project.revision
+                )],
+                std::slice::from_ref(&event)
+            ),
+            Err(StorageError::OptimisticConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .load_mission(&project.id, &mission.id)
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(
+            store
+                .load_work_product_manifest(&project.id, &manifest.work_product_id)
+                .is_err()
+        );
+        assert_eq!(store.events_for_project(&project.id).unwrap(), events);
+        store
+            .create_work_product_manifest_with_source_fences_atomic(
+                &mission,
+                1,
+                &manifest,
+                &[ApplicationSourceRevisionFence::present(
+                    crate::ApplicationSourceKind::Project,
+                    project.id.to_string(),
+                    revised.revision,
+                )],
+                &[event],
+            )
+            .expect("current source commits artifact and Mission together");
+        assert_eq!(
+            store.load_mission(&project.id, &mission.id).unwrap(),
+            mission
+        );
+        assert_eq!(
+            store
+                .load_work_product_manifest(&project.id, &manifest.work_product_id)
+                .unwrap(),
+            manifest
+        );
     }
 
     #[test]

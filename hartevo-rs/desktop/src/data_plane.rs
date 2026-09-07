@@ -15866,6 +15866,41 @@ sleep 30"#
     }
 
     #[cfg(unix)]
+    fn artifact_runtime_fixture_source(body: String) -> DesktopRuntimeSource {
+        DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(move |root, runtime_home| {
+                let mut command = completed_runtime_fixture_command(root, runtime_home);
+                let middle = body
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .find(|index| *index >= body.len() / 2)
+                    .unwrap_or(body.len());
+                let chunks = body.split_at(middle);
+                let mut deltas = [chunks.0, chunks.1].into_iter();
+                for argument in &mut command.args {
+                    let Ok(mut event) = serde_json::from_str::<serde_json::Value>(argument) else {
+                        continue;
+                    };
+                    match event["method"].as_str() {
+                        Some("item/agentMessage/delta") => {
+                            event["params"]["delta"] =
+                                deltas.next().expect("two artifact chunks").into();
+                        }
+                        Some("item/completed") => {
+                            event["params"]["item"]["text"] = body.clone().into();
+                        }
+                        _ => continue,
+                    }
+                    *argument = event.to_string();
+                }
+                command
+            }),
+        }
+    }
+
+    #[cfg(unix)]
     fn run_and_adopt_catalog_runtime_fixture(
         plane: &DesktopDataPlane,
         secrets: &MemorySecretStore,
@@ -16978,32 +17013,7 @@ sleep 30"#;
             "available": true, "autoRenew": false,
         })
         .to_string();
-        let quote_source = DesktopRuntimeSource::Fixture {
-            provider: "fixture-provider".into(),
-            model: "fixture-model".into(),
-            command_builder: Box::new(move |root, runtime_home| {
-                let mut command = completed_runtime_fixture_command(root, runtime_home);
-                let chunks = quote.split_at(quote.len() / 2);
-                let mut deltas = [chunks.0, chunks.1].into_iter();
-                for argument in &mut command.args {
-                    let Ok(mut event) = serde_json::from_str::<serde_json::Value>(argument) else {
-                        continue;
-                    };
-                    match event["method"].as_str() {
-                        Some("item/agentMessage/delta") => {
-                            event["params"]["delta"] =
-                                deltas.next().expect("two quote chunks").into();
-                        }
-                        Some("item/completed") => {
-                            event["params"]["item"]["text"] = quote.clone().into();
-                        }
-                        _ => continue,
-                    }
-                    *argument = event.to_string();
-                }
-                command
-            }),
-        };
+        let quote_source = artifact_runtime_fixture_source(quote);
         let submission = plane
             .start_catalog_mission_and_run_with(
                 &secrets,
@@ -17319,6 +17329,197 @@ sleep 30"#;
             Some("site_spec_and_claims")
         );
         assert_eq!(projection.verified_effect_count, 1);
+        for (index, checkpoint_id) in ["site_spec_and_claims", "sandbox_build"]
+            .into_iter()
+            .enumerate()
+        {
+            let step_at = observed_at() + Duration::minutes(10 + i64::try_from(index).unwrap() * 2);
+            let (service, _) = cold
+                .open_application_from_secret(&database_secret, step_at)
+                .unwrap();
+            let mission = service
+                .load_mission(&project_id, &submission.mission_id)
+                .unwrap();
+            assert_eq!(
+                mission
+                    .definition
+                    .as_ref()
+                    .unwrap()
+                    .current_checkpoint()
+                    .unwrap()
+                    .id,
+                checkpoint_id
+            );
+            let body = if checkpoint_id == "site_spec_and_claims" {
+                let project = service
+                    .list_projects()
+                    .unwrap()
+                    .into_iter()
+                    .find(|project| project.id == project_id)
+                    .unwrap();
+                serde_json::json!({
+                    "schemaVersion": "hartevo-site-spec/v1", "projectRevision": project.revision,
+                    "domainName": "private-desktop.example", "language": "en-US",
+                    "title": project.name, "description": project.description,
+                    "claimPolicy": "project_metadata_verbatim/v1",
+                })
+            } else {
+                let spec_checkpoint = mission
+                    .definition
+                    .as_ref()
+                    .unwrap()
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "site_spec_and_claims")
+                    .unwrap();
+                let spec_id = spec_checkpoint
+                    .completion
+                    .as_ref()
+                    .unwrap()
+                    .work_product_ids
+                    .first()
+                    .unwrap();
+                let spec = mission
+                    .work_products
+                    .iter()
+                    .find(|product| &product.id == spec_id)
+                    .unwrap();
+                serde_json::json!({
+                    "schemaVersion": "hartevo-static-site-build-plan/v1", "templateId": "static-first-party/v1",
+                    "siteSpecWorkProductId": spec.id, "siteSpecRevision": spec.revision, "siteSpecDigest": spec.content_digest,
+                })
+            };
+            drop(service);
+            let prepared = cold
+                .prepare_catalog_mission_runtime_resume_with(
+                    &secrets,
+                    &project_id,
+                    &submission.mission_id,
+                    step_at,
+                )
+                .unwrap();
+            let resumed = cold
+                .resume_catalog_mission_runtime_with_cancellation(
+                    &secrets,
+                    catalog_runtime_authority(prepared.handle),
+                    Some(artifact_runtime_fixture_source(body.to_string())),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    step_at + Duration::seconds(1),
+                )
+                .unwrap();
+            let DesktopMissionRuntimeOutcome::DraftReady { work_product_id } =
+                resumed.runtime_outcome
+            else {
+                panic!("site Runtime must return a reviewable draft")
+            };
+            let (service, _) = cold
+                .open_application_from_secret(&database_secret, step_at + Duration::seconds(2))
+                .unwrap();
+            let mission = service
+                .load_mission(&project_id, &submission.mission_id)
+                .unwrap();
+            let manifest = service
+                .load_work_product_manifest(&project_id, &work_product_id)
+                .unwrap();
+            drop(service);
+            cold.adopt_work_product_with(
+                &secrets,
+                DesktopWorkProductAdoptionRequest {
+                    project_id: project_id.clone(),
+                    mission_id: submission.mission_id.clone(),
+                    work_product_id,
+                    expected_mission_revision: mission.revision,
+                    expected_work_product_revision: manifest.work_product_revision,
+                    expected_manifest_version: manifest.version,
+                },
+                step_at + Duration::seconds(3),
+            )
+            .unwrap();
+        }
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(14))
+            .unwrap();
+        let mission = service
+            .load_mission(&project_id, &submission.mission_id)
+            .unwrap();
+        let checkpoint = mission
+            .definition
+            .as_ref()
+            .unwrap()
+            .current_checkpoint()
+            .unwrap();
+        assert_eq!(checkpoint.id, "quality_gate");
+        let quality_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: submission.mission_id.clone(),
+            checkpoint_id: checkpoint.id.clone(),
+            expected_mission_revision: mission.revision,
+            expected_checkpoint_revision: checkpoint.revision,
+        };
+        drop(service);
+        let built = cold
+            .execute_application_mission_checkpoint_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                observed_at() + Duration::minutes(14),
+            )
+            .expect("Cordis quality handler independently compiles static preview");
+        assert!(
+            matches!(built.runtime_outcome, DesktopMissionRuntimeOutcome::CheckpointRouted {
+            ref checkpoint_id, executor: MissionCheckpointExecutor::EffectBroker, ..
+        } if checkpoint_id == "preview_revision")
+        );
+        let (service, _) = cold
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(14))
+            .unwrap();
+        let built_mission = service
+            .load_mission(&project_id, &submission.mission_id)
+            .unwrap();
+        let completion = built_mission
+            .definition
+            .as_ref()
+            .unwrap()
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == "quality_gate")
+            .unwrap()
+            .completion
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            completion.application_evidence.as_ref().unwrap().handler_id,
+            "vm03.static-site-quality/v1"
+        );
+        assert_eq!(completion.work_product_ids.len(), 1);
+        let preview_id = completion.work_product_ids.first().unwrap();
+        let preview = built_mission
+            .work_products
+            .iter()
+            .find(|product| &product.id == preview_id)
+            .unwrap();
+        assert_eq!(
+            preview.status,
+            hartevo_domain_kernel::WorkProductStatus::ReadyForReview
+        );
+        let bundle: serde_json::Value = serde_json::from_str(&preview.body).unwrap();
+        assert_eq!(bundle["schemaVersion"], "hartevo-site-preview-bundle/v1");
+        assert_eq!(bundle["files"][0]["path"], "index.html");
+        assert_eq!(bundle["quality"]["deployed"], false);
+        let html = bundle["files"][0]["content"].as_str().unwrap();
+        assert!(html.starts_with("<!doctype html>"));
+        assert_eq!(
+            bundle["files"][0]["sha256"],
+            format!("{:x}", Sha256::digest(html.as_bytes()))
+        );
+        assert_eq!(
+            service
+                .load_work_product_manifest(&project_id, preview_id)
+                .unwrap()
+                .work_product_type,
+            "site_preview_bundle"
+        );
+        drop(service);
         let reopened = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("reopen after purchase");
         let (service, _) = reopened
@@ -17340,9 +17541,30 @@ sleep 30"#;
             .expect("expired quote must recover without repurchasing");
         assert_eq!(recovered.disposition, ExecutionDisposition::AlreadyVerified);
         assert_eq!((executor.calls, verifier.calls), (1, 1));
-        let (service, _) = reopened
+        let (mut service, _) = reopened
             .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(45))
             .expect("replayed Application");
+        assert_eq!(
+            service
+                .load_mission(&project_id, &submission.mission_id)
+                .unwrap(),
+            built_mission
+        );
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    quality_command,
+                    observed_at() + Duration::minutes(45)
+                )
+                .unwrap(),
+            ApplicationMissionCheckpointExecution::Completed { replayed: true, .. }
+        ));
+        assert_eq!(
+            service
+                .load_mission(&project_id, &submission.mission_id)
+                .unwrap(),
+            built_mission
+        );
         let events = service
             .mission_events(&project_id, &submission.mission_id)
             .expect("replayed events");

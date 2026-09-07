@@ -7,6 +7,7 @@ mod observation_evidence_pack;
 mod plugin_invocation_timeline;
 mod runtime_text_subscription;
 mod vm03_domain_purchase;
+mod vm03_site_build;
 mod work_product_outcome;
 
 pub use vm03_domain_purchase::{
@@ -3574,6 +3575,7 @@ enum CompiledApplicationCheckpointHandler {
     Vm01RankingTrafficReview,
     Vm01NextCycle,
     Vm03MinimumTruthReady,
+    Vm03SiteQuality,
     Vm04AccountScopeProbe,
     Vm04EngagementReferralReview,
     Vm04ChannelRebalance,
@@ -3605,6 +3607,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm01RankingTrafficReview => VM01_RANKING_TRAFFIC_REVIEW_HANDLER_ID,
             Self::Vm01NextCycle => VM01_NEXT_CYCLE_HANDLER_ID,
             Self::Vm03MinimumTruthReady => VM03_MINIMUM_TRUTH_READY_HANDLER_ID,
+            Self::Vm03SiteQuality => vm03_site_build::HANDLER_ID,
             Self::Vm04AccountScopeProbe => VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID,
             Self::Vm04EngagementReferralReview => VM04_ENGAGEMENT_REFERRAL_REVIEW_HANDLER_ID,
             Self::Vm04ChannelRebalance => VM04_CHANNEL_REBALANCE_HANDLER_ID,
@@ -3634,6 +3637,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::Vm01RankingTrafficReview => "url_link_readback",
             Self::Vm01NextCycle => "ranking_traffic_review",
             Self::Vm03MinimumTruthReady => "minimum_site_truth",
+            Self::Vm03SiteQuality => "site_quality_build",
             Self::Vm04AccountScopeProbe => "account_scope",
             Self::Vm04EngagementReferralReview => "provider_readback",
             Self::Vm04ChannelRebalance => "channel_rebalance",
@@ -3924,6 +3928,7 @@ fn compiled_application_checkpoint_handler(
         VM03_MINIMUM_TRUTH_READY_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady)
         }
+        vm03_site_build::HANDLER_ID => Some(CompiledApplicationCheckpointHandler::Vm03SiteQuality),
         VM04_ACCOUNT_SCOPE_PROBE_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe)
         }
@@ -8308,6 +8313,37 @@ fn execute_project_application_checkpoint(
     if mission.stage == MissionStage::Blocked {
         mission.resume(now)?;
     }
+    let vm03_site_build = if handler == CompiledApplicationCheckpointHandler::Vm03SiteQuality {
+        match vm03_site_build::prepare(store, &mut mission, now) {
+            Ok(prepared) => Some(prepared),
+            Err(
+                ApplicationError::Vm03SiteBuildMismatch
+                | ApplicationError::Vm03DomainPurchaseMismatch,
+            ) => {
+                return persist_vm00_source_block(
+                    store,
+                    &mut mission,
+                    expected_mission_revision,
+                    &command,
+                    dispatch,
+                    vm03_site_build::HANDLER_ID,
+                    "site_quality_build",
+                    "vm03_site_quality_failed",
+                    "The adopted site specification or build plan does not match the verified domain and current Project metadata. No preview was built or published.",
+                    expected_mission_revision,
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Mission,
+                        command.mission_id.to_string(),
+                        expected_mission_revision,
+                    ),
+                    now,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
     let vm07_prioritized_experiments_manifest =
         if handler == CompiledApplicationCheckpointHandler::Vm07PrioritizedExperiments {
             Some(prepare_vm07_prioritized_experiments_manifest(
@@ -8696,6 +8732,17 @@ fn execute_project_application_checkpoint(
         CompiledApplicationCheckpointHandler::Vm01WorkQueue => {
             vm01_work_queue_application_evidence(store, &mission, &route, &command, now)?
         }
+        CompiledApplicationCheckpointHandler::Vm03SiteQuality => {
+            vm03_site_build::application_evidence(
+                &mission,
+                &route,
+                &command,
+                vm03_site_build
+                    .as_ref()
+                    .ok_or(ApplicationError::Vm03SiteBuildMismatch)?,
+                now,
+            )?
+        }
         CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview => {
             vm01_ranking_traffic_review_application_evidence(
                 store, &mission, &route, &command, now,
@@ -8764,6 +8811,12 @@ fn execute_project_application_checkpoint(
     validate_application_evidence_against_registry(&application_evidence)?;
     let evidence_digest = application_evidence.digest();
     let work_product_ids = match handler {
+        CompiledApplicationCheckpointHandler::Vm03SiteQuality => BTreeSet::from([vm03_site_build
+            .as_ref()
+            .ok_or(ApplicationError::Vm03SiteBuildMismatch)?
+            .manifest
+            .work_product_id
+            .clone()]),
         CompiledApplicationCheckpointHandler::Vm01WorkQueue => {
             let source = application_evidence
                 .sources
@@ -9036,7 +9089,25 @@ fn execute_project_application_checkpoint(
             now,
         ));
     }
-    if let Some(schedule) = &next_cycle_schedule {
+    if let Some(prepared) = &vm03_site_build {
+        events.push(PendingEvent::new(
+            "mission.vm03_static_preview_built",
+            serde_json::json!({
+                "missionId": mission.id, "workProductId": prepared.manifest.work_product_id,
+                "manifestDigest": prepared.manifest.manifest_digest, "fileCount": 1,
+                "compiler": "static-first-party/v1", "scriptExecution": false,
+                "providerExecuted": false, "deployed": false,
+            }),
+            now,
+        ));
+        store.create_work_product_manifest_with_source_fences_atomic(
+            &mission,
+            expected_mission_revision,
+            &prepared.manifest,
+            &source_fences,
+            &events,
+        )?;
+    } else if let Some(schedule) = &next_cycle_schedule {
         store.update_mission_and_create_schedule_atomic(
             &mission,
             expected_mission_revision,
@@ -15001,6 +15072,7 @@ impl ApplicationService {
                 | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
                 | CompiledApplicationCheckpointHandler::Vm01NextCycle
                 | CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady
+                | CompiledApplicationCheckpointHandler::Vm03SiteQuality
                 | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
                 | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
                 | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -15863,6 +15935,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
             | CompiledApplicationCheckpointHandler::Vm01NextCycle
             | CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady
+            | CompiledApplicationCheckpointHandler::Vm03SiteQuality
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -16006,6 +16079,7 @@ impl ApplicationService {
             | CompiledApplicationCheckpointHandler::Vm01RankingTrafficReview
             | CompiledApplicationCheckpointHandler::Vm01NextCycle
             | CompiledApplicationCheckpointHandler::Vm03MinimumTruthReady
+            | CompiledApplicationCheckpointHandler::Vm03SiteQuality
             | CompiledApplicationCheckpointHandler::Vm04AccountScopeProbe
             | CompiledApplicationCheckpointHandler::Vm04EngagementReferralReview
             | CompiledApplicationCheckpointHandler::Vm04ChannelRebalance
@@ -21838,8 +21912,21 @@ impl ApplicationService {
         {
             summary_value["artifactContract"] = vm03_domain_purchase::QUOTE_OUTPUT_CONTRACT.into();
         }
+        let site_source = if compaction {
+            None
+        } else {
+            vm03_site_build::runtime_source(&self.store, &mission, now)?
+        };
+        if let Some(site_source) = &site_source {
+            summary_value["siteSource"] = site_source.clone();
+        }
         let summary = Zeroizing::new(serde_json::to_string(&summary_value)?);
-        let source = Zeroizing::new(serde_json::to_string(&(&mission, &conversation))?);
+        let source = Zeroizing::new(match site_source {
+            Some(site_source) => serde_json::to_string(&serde_json::json!({
+                "mission": &mission, "conversation": &conversation, "siteSource": site_source,
+            }))?,
+            None => serde_json::to_string(&(&mission, &conversation))?,
+        });
         let summary_token_count = tokenizer.count_tokens(summary.as_str())?;
         let source_token_count = tokenizer.count_tokens(source.as_str())?;
         if source_token_count <= summary_token_count {
@@ -32131,6 +32218,8 @@ pub enum ApplicationError {
         "VM-03 domain purchase requires the exact current route, accepted bounded quote, live registrar Connection, and frozen payment authority"
     )]
     Vm03DomainPurchaseMismatch,
+    #[error("VM-03 static site specification, build plan or source identity is invalid")]
+    Vm03SiteBuildMismatch,
     #[error(
         "VM-04 publication requires an exact selected WorkProduct, live Connection, and Mission/Checkpoint source revisions"
     )]

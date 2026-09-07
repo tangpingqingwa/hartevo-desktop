@@ -188,6 +188,27 @@ fn mismatch() -> ApplicationError {
     ApplicationError::Vm03DomainPurchaseMismatch
 }
 
+pub(super) fn purchased_domain_name(mission: &Mission) -> Result<String, ApplicationError> {
+    let checkpoint = purchase_checkpoint(mission)?;
+    let completion = checkpoint.completion.as_ref().ok_or_else(mismatch)?;
+    if checkpoint.status != MissionCheckpointStatus::Completed
+        || completion.effect_ids.len() != 1
+        || !completion.work_product_ids.is_empty()
+        || completion.application_evidence.is_some()
+        || !is_sha256_text(&completion.evidence_digest)
+        || completion.oracle_ids
+            != BTreeSet::from(["decision".into(), "effect".into(), "operating_state".into()])
+    {
+        return Err(mismatch());
+    }
+    let effect = mission.effect(completion.effect_ids.first().ok_or_else(mismatch)?)?;
+    let (_, verification) = vm03_domain_purchase_verified_receipt(mission, effect)?;
+    if completion.verified_at != verification.observed_at {
+        return Err(mismatch());
+    }
+    Ok(selected_quote(mission)?.1.domain_name)
+}
+
 fn purchase_checkpoint(mission: &Mission) -> Result<&MissionCheckpoint, ApplicationError> {
     let definition = mission.definition.as_ref().ok_or_else(mismatch)?;
     let checkpoint = definition
