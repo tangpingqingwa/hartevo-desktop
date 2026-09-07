@@ -10633,6 +10633,8 @@ pub struct WorkProductProjection {
     pub adoption_status: WorkProductStatus,
     pub editable_scope_count: usize,
     pub evidence_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_site_preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -26844,6 +26846,8 @@ fn mission_projection(
                 return Err(WorkProductManifestError::InvalidManifest.into());
             }
             manifest.validate_against(work_product)?;
+            let static_site_preview =
+                vm03_site_build::preview_projection(store, &mission, work_product, &manifest)?;
             work_products.push(WorkProductProjection {
                 work_product_id: work_product.id.clone(),
                 title: work_product.title.clone(),
@@ -26857,6 +26861,7 @@ fn mission_projection(
                 adoption_status: manifest.adoption_status,
                 editable_scope_count: manifest.editable_scopes.len(),
                 evidence_count: manifest.dependencies.evidence_ids.len(),
+                static_site_preview,
             });
         }
     }

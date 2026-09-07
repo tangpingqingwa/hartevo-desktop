@@ -644,6 +644,7 @@ fn mission_projection(project_id: &ProjectId, source: VisualMission) -> MissionP
             adoption_status: WorkProductStatus::Draft,
             editable_scope_count: 1,
             evidence_count: 0,
+            static_site_preview: None,
         }
         })
         .collect::<Vec<_>>();

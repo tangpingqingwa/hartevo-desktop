@@ -205,6 +205,110 @@ fn compile_preview(spec: &SiteSpec, project: &Project) -> Result<String, Applica
     ))
 }
 
+pub(super) fn preview_projection(
+    store: &ProjectStore,
+    mission: &Mission,
+    product: &WorkProduct,
+    manifest: &WorkProductManifest,
+) -> Result<Option<String>, ApplicationError> {
+    if manifest.work_product_type != "site_preview_bundle"
+        || !matches!(
+            product.status,
+            WorkProductStatus::ReadyForReview | WorkProductStatus::Accepted
+        )
+    {
+        return Ok(None);
+    }
+    let Some(definition) = mission.definition.as_ref() else {
+        return Ok(None);
+    };
+    let completion = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| {
+            checkpoint.id == "quality_gate"
+                && checkpoint.status == MissionCheckpointStatus::Completed
+        })
+        .and_then(|checkpoint| checkpoint.completion.as_ref());
+    let Some(completion) = completion else {
+        return Ok(None);
+    };
+    if definition.manifest_id != "VM-03"
+        || definition.manifest_version != 3
+        || completion.work_product_ids != BTreeSet::from([product.id.clone()])
+        || !completion
+            .application_evidence
+            .as_ref()
+            .is_some_and(|evidence| {
+                evidence.handler_id == HANDLER_ID
+                    && evidence.sources.iter().any(|source| {
+                        source.source_kind == "site_quality_build"
+                            && source.source_id == product.id.as_str()
+                    })
+            })
+    {
+        return Ok(None);
+    }
+    let (spec_product, _, _) = match runtime_product(
+        store,
+        mission,
+        "site_spec_and_claims",
+        completion.verified_at,
+    ) {
+        Ok(source) => source,
+        Err(ApplicationError::Vm03SiteBuildMismatch) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Ok(spec) = serde_json::from_str::<SiteSpec>(&spec_product.body) else {
+        return Ok(None);
+    };
+    let project = store.load_project(&mission.project_id)?;
+    if project.tenant_id != mission.tenant_id
+        || spec.domain_name != super::vm03_domain_purchase::purchased_domain_name(mission)?
+    {
+        return Ok(None);
+    }
+    // Recompile the fixed template; never pass arbitrary WorkProduct HTML to a WebView.
+    let Ok(html) = compile_preview(&spec, &project) else {
+        return Ok(None);
+    };
+    let Ok(bundle) = serde_json::from_str::<serde_json::Value>(&product.body) else {
+        return Ok(None);
+    };
+    Ok(
+        bundle_matches_preview(&bundle, product.id.as_str(), &spec.domain_name, &html)
+            .then_some(html),
+    )
+}
+
+fn bundle_matches_preview(
+    bundle: &serde_json::Value,
+    product_id: &str,
+    domain: &str,
+    html: &str,
+) -> bool {
+    let Some(source_digest) = bundle["sourceDigest"].as_str() else {
+        return false;
+    };
+    bundle["schemaVersion"] == "hartevo-site-preview-bundle/v1"
+        && bundle["templateId"] == TEMPLATE_ID
+        && is_sha256_text(source_digest)
+        && product_id == format!("vm03-static-preview:{source_digest}")
+        && bundle["domainName"] == domain
+        && bundle["files"]
+            .as_array()
+            .is_some_and(|files| files.len() == 1)
+        && bundle["files"][0]["path"] == "index.html"
+        && bundle["files"][0]["mediaType"] == "text/html"
+        && bundle["files"][0]["content"] == html
+        && bundle["files"][0]["sha256"] == format!("{:x}", Sha256::digest(html.as_bytes()))
+        && bundle["quality"]["compiler"] == "rust_static_template"
+        && bundle["quality"]["claims"] == "adopted_project_metadata_verbatim"
+        && bundle["quality"]["scriptExecution"] == false
+        && bundle["quality"]["formDeliveryVerified"] == false
+        && bundle["quality"]["deployed"] == false
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "source validation and artifact preparation stay together before the single atomic commit"
@@ -449,6 +553,52 @@ mod tests {
         assert!(html.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
         assert!(!html.contains("<script>"));
         assert!(html.contains("form-action 'none'"));
+        let source_digest = "d".repeat(64);
+        let product_id = format!("vm03-static-preview:{source_digest}");
+        let mut bundle = serde_json::json!({
+            "schemaVersion": "hartevo-site-preview-bundle/v1", "templateId": TEMPLATE_ID,
+            "sourceDigest": source_digest, "domainName": spec.domain_name,
+            "files": [{"path": "index.html", "mediaType": "text/html", "content": html,
+                "sha256": format!("{:x}", Sha256::digest(html.as_bytes()))}],
+            "quality": {"compiler": "rust_static_template", "claims": "adopted_project_metadata_verbatim",
+                "scriptExecution": false, "formDeliveryVerified": false, "deployed": false},
+        });
+        assert!(bundle_matches_preview(
+            &bundle,
+            &product_id,
+            &spec.domain_name,
+            &html
+        ));
+        assert!(!bundle_matches_preview(
+            &bundle,
+            "another-product",
+            &spec.domain_name,
+            &html
+        ));
+        assert!(!bundle_matches_preview(
+            &bundle,
+            &product_id,
+            "another.example",
+            &html
+        ));
+        bundle["files"][0]["content"] = "<script>unsafe()</script>".into();
+        bundle["files"][0]["sha256"] =
+            format!("{:x}", Sha256::digest(b"<script>unsafe()</script>")).into();
+        assert!(!bundle_matches_preview(
+            &bundle,
+            &product_id,
+            &spec.domain_name,
+            &html
+        ));
+        bundle["files"][0]["content"] = html.clone().into();
+        bundle["files"][0]["sha256"] = format!("{:x}", Sha256::digest(html.as_bytes())).into();
+        bundle["quality"]["deployed"] = true.into();
+        assert!(!bundle_matches_preview(
+            &bundle,
+            &product_id,
+            &spec.domain_name,
+            &html
+        ));
         spec.description.push_str(" invented claim");
         assert!(compile_preview(&spec, &project).is_err());
         spec.description = project.description.clone();

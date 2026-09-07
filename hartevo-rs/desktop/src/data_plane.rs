@@ -17508,6 +17508,27 @@ sleep 30"#;
         assert_eq!(bundle["quality"]["deployed"], false);
         let html = bundle["files"][0]["content"].as_str().unwrap();
         assert!(html.starts_with("<!doctype html>"));
+        let projected_preview = built.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .unwrap()
+            .work_products
+            .iter()
+            .find(|product| &product.work_product_id == preview_id)
+            .unwrap();
+        assert_eq!(projected_preview.static_site_preview.as_deref(), Some(html));
+        let metadata = service
+            .projection(
+                &project_id,
+                &submission.mission_id,
+                hartevo_application::WorkSurface::Orchestrator,
+            )
+            .unwrap();
+        assert!(
+            metadata.work_products.is_empty(),
+            "locked metadata cannot contain preview HTML"
+        );
         assert_eq!(
             bundle["files"][0]["sha256"],
             format!("{:x}", Sha256::digest(html.as_bytes()))
@@ -17539,6 +17560,16 @@ sleep 30"#;
                 observed_at() + Duration::minutes(45),
             )
             .expect("expired quote must recover without repurchasing");
+        let cold_preview = recovered.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .unwrap()
+            .work_products
+            .iter()
+            .find(|product| &product.work_product_id == preview_id)
+            .unwrap();
+        assert_eq!(cold_preview.static_site_preview.as_deref(), Some(html));
         assert_eq!(recovered.disposition, ExecutionDisposition::AlreadyVerified);
         assert_eq!((executor.calls, verifier.calls), (1, 1));
         let (mut service, _) = reopened

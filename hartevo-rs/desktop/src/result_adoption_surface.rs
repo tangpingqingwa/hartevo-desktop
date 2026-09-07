@@ -275,6 +275,7 @@ mod tests {
             adoption_status: status,
             editable_scope_count: 1,
             evidence_count: 4,
+            static_site_preview: None,
         };
         let mission = MissionProjection {
             surface: "mission".into(),

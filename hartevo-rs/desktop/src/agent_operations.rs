@@ -1326,6 +1326,7 @@ mod tests {
             adoption_status: WorkProductStatus::ReadyForReview,
             editable_scope_count: 0,
             evidence_count: 1,
+            static_site_preview: None,
         };
         let binding = ResultBinding {
             tenant_id: "tenant".into(),

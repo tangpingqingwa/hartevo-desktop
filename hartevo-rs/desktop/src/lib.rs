@@ -10825,6 +10825,19 @@ fn Workpad(
                                     em { "{work_product_status_label(&product.adoption_status)}" }
                                 }
                                 p { "{product.preview_text}" }
+                                if let Some(html) = product.static_site_preview.as_deref() {
+                                    iframe {
+                                        class: "static-site-preview",
+                                        title: "静态站点预览（未部署、无脚本、无表单）",
+                                        "sandbox": "",
+                                        referrerpolicy: "no-referrer",
+                                        srcdoc: "{html}",
+                                        style: "width:100%;min-height:420px;border:1px solid #dde3df;border-radius:12px;background:#faf9f6",
+                                    }
+                                    small { "仅本地静态预览 · 未部署 · 无脚本或表单送达" }
+                                } else if product.work_product_type == "site_preview_bundle" {
+                                    p { "源资料已变化或预览未通过校验；未加载 HTML。" }
+                                }
                                 footer {
                                     span { "{product.preview_media_type}" }
                                     span { "evidence {product.evidence_count}" }
@@ -13302,6 +13315,34 @@ mod tests {
         assert!(!proposal.contains("execute_vm04_publication"));
         assert!(!proposal.contains("execute_approved_effect"));
         assert!(!proposal.contains("resume_catalog_mission_runtime"));
+    }
+
+    #[test]
+    fn vm03_static_preview_window_is_sandboxed_and_projection_only() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("if let Some(html) = product.static_site_preview.as_deref()")
+            .unwrap();
+        let end = source[start..].find("footer {").unwrap();
+        let frame = &source[start..start + end];
+        for required in [
+            "iframe {",
+            "\"sandbox\": \"\"",
+            "referrerpolicy: \"no-referrer\"",
+            "srcdoc: \"{html}\"",
+            "未部署",
+        ] {
+            assert!(frame.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            "allow-scripts",
+            "allow-same-origin",
+            "dangerous_inner_html",
+            "http://",
+            "https://",
+        ] {
+            assert!(!frame.contains(forbidden), "unexpected {forbidden}");
+        }
     }
 
     #[test]
