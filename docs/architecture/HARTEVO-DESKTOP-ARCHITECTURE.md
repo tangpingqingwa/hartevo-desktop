@@ -10,6 +10,14 @@
 
 `hartevo-domain-kernel::mission_loop` 为既有 Mission 增加有限切片、peer claim、scoped user gate、quota、monitor 与 typed continuation；Mission/Operating Contract 仍拥有业务状态和完成条件。SQLCipher v52 同事务保存 loop revision、operation receipt、验证后的推进结算和 Event/Outbox。Application 通过 `run_mission_loop_slice` 调用既有 runner，`bind_cordis_mission_loop_guard` 将持久边界接入 Cordis `agent/pre-step`。桌面只消费 `MissionProjection.loop_accounting`，不拥有配额或租约。接入步骤、验证和限制见 [LoopX Rust 接入清单](../research/LOOPX-RUST-CONTROL-PLANE-INTAKE.md)。
 
+## Mission 创意素材（2026-09-07）
+
+原生 `MediaWorkspace → DesktopDataPlane → Application → SQLCipher` 提供图片与短视频的生成、描述修改后再生成、预览和精确版本采纳。`hartevo-application::media_provider` 使用有界 HTTPS 调用，生产路径不运行 Python。schema v53 增加 `media_generations`，把请求、原 Provider job ID、历史资产字节保存在本地加密数据库；符合格式的资产与 WorkProduct、Manifest、Mission revision 同事务提交。描述属于私有正文，Event/Outbox 只记录生成 ID、状态和 revision。
+
+网络 POST 前持久化一次性 claim。同 ID 重开或重复操作不增加 POST；已获得视频 ID 的恢复只发 GET。返回后发现旧版本被采纳、Mission 终止或 Context 撤销，保存隔离素材而不覆盖现有 WorkProduct；撤销期间只结算原请求回执，恢复权限后才能读取。桌面采纳同时校验生成 ID、字节摘要与当前 Mission/WorkProduct/Manifest revision；通用文本采用入口不接受生成媒体。图片要求真实 PNG/JPEG 解码与 1024×1024，视频要求 MP4 视频轨、480×480 与约 3 秒时长，并由原生播放器检查实际解码。
+
+这是既有 Mission 的创意准备入口；尚未注册自动调用的 Cordis 媒体工具，不变更 VM-04 Catalog checkpoint、Application handler 数量、发布权限或 Release Evidence。资产暂不进入 Cell 同步；当前下载器只允许配置连接的相同 HTTPS origin，其他资产域名和重定向明确拒绝。操作与实测边界见 [原生媒体验证](../quality/LIVE-MODEL-JOURNEYS.md#native-media-workspace)。
+
 ## 1. 架构目标
 
 Hartevo Desktop 必须把自然语言目标持续推进为可验证的业务结果：

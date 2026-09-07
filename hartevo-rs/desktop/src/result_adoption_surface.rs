@@ -149,8 +149,12 @@ impl SelectedResultProjection {
         ResultSurfaceAction::OpenArtifact(self.binding.clone())
     }
 
-    pub(crate) const fn can_adopt(&self) -> bool {
+    pub(crate) fn can_adopt(&self) -> bool {
         matches!(self.adoption_status, WorkProductStatus::ReadyForReview)
+            && !matches!(
+                self.result_type.as_str(),
+                "generated_image" | "generated_video"
+            )
     }
 
     pub(crate) const fn provenance_label() -> &'static str {
@@ -254,6 +258,21 @@ mod tests {
     use super::*;
     use hartevo_application::{DesktopProjectProjection, MissionProjection};
     use hartevo_domain_kernel::{ProjectEncryptionMode, StorageMode};
+
+    #[test]
+    fn generated_media_requires_its_preview_adoption_surface() {
+        let (mut project, mut mission) = project_and_mission(WorkProductStatus::ReadyForReview);
+        for kind in ["generated_image", "generated_video"] {
+            mission.work_products[0].work_product_type = kind.into();
+            project.missions[0] = mission.clone();
+            let selected = selected_result_projection(&project, &mission, None).unwrap();
+            assert!(!selected.can_adopt());
+            assert!(matches!(
+                selected.open_artifact_action(),
+                ResultSurfaceAction::OpenArtifact(_)
+            ));
+        }
+    }
 
     fn project_and_mission(
         status: WorkProductStatus,

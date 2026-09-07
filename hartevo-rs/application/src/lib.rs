@@ -3,6 +3,8 @@
 pub mod connectors;
 pub mod llm_deepseek;
 pub mod llm_openai;
+pub mod media_generation;
+pub mod media_provider;
 
 pub mod mission_loop;
 mod observation_evidence_pack;

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+pub mod media;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -3741,6 +3742,16 @@ impl DesktopDataPlane {
         request: DesktopWorkProductAdoptionRequest,
         now: DateTime<Utc>,
     ) -> Result<DesktopSnapshot, DesktopDataError> {
+        self.adopt_work_product_or_media_with(secret_store, request, now, None)
+    }
+
+    fn adopt_work_product_or_media_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+        media_generation_id: Option<&str>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
         if request.expected_mission_revision == 0
             || request.expected_work_product_revision == 0
             || request.expected_manifest_version == 0
@@ -3765,6 +3776,26 @@ impl DesktopDataPlane {
         let read_manifest = read_service
             .load_work_product_manifest(&request.project_id, &request.work_product_id)?;
         if read_manifest.version != request.expected_manifest_version {
+            return Err(DesktopDataError::WorkProductActionStale);
+        }
+        if matches!(
+            read_manifest.work_product_type.as_str(),
+            "generated_image" | "generated_video"
+        ) {
+            let id = media_generation_id.ok_or(DesktopDataError::WorkProductActionStale)?;
+            let job =
+                read_service.media_generation(&request.project_id, &request.mission_id, id)?;
+            if job.state != hartevo_domain_kernel::media_generation::MediaGenerationState::Ready
+                || job.work_product_id != request.work_product_id
+                || read_manifest.file_digest.as_ref()
+                    != job.asset.as_ref().map(|asset| &asset.sha256)
+                || serde_json::from_str::<serde_json::Value>(&read_product.body)
+                    .ok()
+                    .is_none_or(|body| body["generationId"].as_str() != Some(id))
+            {
+                return Err(DesktopDataError::WorkProductActionStale);
+            }
+        } else if media_generation_id.is_some() {
             return Err(DesktopDataError::WorkProductActionStale);
         }
         let (mut service, runtime_reconciliation, _context_session) =
@@ -13408,6 +13439,8 @@ impl From<CordisError> for DesktopShopifyReadbackError {
 
 #[derive(Debug, Error)]
 pub enum DesktopDataError {
+    #[error("{0}")]
+    Media(String),
     #[error("Desktop data root must be an absolute non-symlink directory: {0}")]
     InvalidDataRoot(PathBuf),
     #[error("the platform data directory could not be resolved")]
@@ -13650,6 +13683,7 @@ impl From<DesktopCordisApprovalDecisionError> for DesktopDataError {
 #[cfg(test)]
 mod tests {
     mod live_models;
+    mod media;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{
         Arc, Mutex,

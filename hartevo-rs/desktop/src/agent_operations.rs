@@ -610,7 +610,10 @@ fn artifact_projection(
     };
     let adopt_status = if result_binding.is_some()
         && matches!(product.adoption_status, WorkProductStatus::ReadyForReview)
-    {
+        && !matches!(
+            product.work_product_type.as_str(),
+            "generated_image" | "generated_video"
+        ) {
         OperationsStatus::Ready
     } else {
         OperationsStatus::Empty
@@ -626,7 +629,14 @@ fn artifact_projection(
             "{} evidence references · Mission-owned lineage",
             product.evidence_count
         ),
-        preview: product.preview_text.clone(),
+        preview: if matches!(
+            product.work_product_type.as_str(),
+            "generated_image" | "generated_video"
+        ) {
+            "请在创意素材中查看图片或播放视频后采用。".into()
+        } else {
+            product.preview_text.clone()
+        },
         evidence_count: product.evidence_count,
         status: artifact_status(&product.adoption_status),
         actions: ArtifactActionsProjection {
@@ -1388,6 +1398,13 @@ mod tests {
         assert_eq!(unbound.actions.open, OperationsStatus::Empty);
         assert_eq!(unbound.actions.adopt, OperationsStatus::Empty);
         assert!(unbound.result_binding.is_none());
+        for kind in ["generated_image", "generated_video"] {
+            product.work_product_type = kind.into();
+            let media = artifact_projection(&product, Some(binding.clone()));
+            assert_eq!(media.actions.open, OperationsStatus::Ready);
+            assert_eq!(media.actions.adopt, OperationsStatus::Empty);
+            assert_eq!(media.preview, "请在创意素材中查看图片或播放视频后采用。");
+        }
     }
 
     #[test]
