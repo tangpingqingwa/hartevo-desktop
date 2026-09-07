@@ -2094,16 +2094,25 @@ where
             })?;
         match run() {
             Ok((completion, chunks)) => {
-                if completion.user_interrupt_sent {
-                    cordis_cancellation.cancel_with(SessionCancelCause::User);
-                }
+                let user_interrupt_sent = completion.user_interrupt_sent;
                 *self.completion.lock().map_err(|_| {
                     desktop_live_agent_failure(
                         "DESKTOP_RUNTIME_COMPLETION_POISONED",
                         "Desktop Application Runtime completion state is unavailable",
                     )
                 })? = Some(Ok(completion));
-                Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+                Ok(Box::pin(stream::iter(chunks.into_iter().map(
+                    move |chunk| {
+                        // Runtime has already persisted this bounded prefix.
+                        // Deliver it before projecting its terminal interrupt
+                        // into the cancellation-first Cordis recorder.
+                        if user_interrupt_sent && matches!(chunk, SessionStreamChunk::Finish { .. })
+                        {
+                            cordis_cancellation.cancel_with(SessionCancelCause::User);
+                        }
+                        Ok(chunk)
+                    },
+                ))))
             }
             Err(error) => {
                 *self.completion.lock().map_err(|_| {
@@ -10034,14 +10043,14 @@ impl DesktopDataPlane {
             max_tokens: None,
             stop: None,
         };
-        let cordis_cancellation = cancellation
-            .filter(|control| !control.is_requested())
-            .map_or_else(
-                LifecycleCancellation::default,
-                DesktopRuntimeCancellation::cordis_cancellation,
-            );
         let cordis_approval = cancellation.map(DesktopRuntimeCancellation::cordis_approval_bridge);
         if let DesktopMissionProvider::NativeDeepSeek(adapter) = &mission_provider {
+            let cordis_cancellation = cancellation
+                .filter(|control| !control.is_requested())
+                .map_or_else(
+                    LifecycleCancellation::default,
+                    DesktopRuntimeCancellation::cordis_cancellation,
+                );
             let adapter = adapter.clone();
             let browser_read_authority = permit.browser_read_authority()?;
             let browser_project_id = project_id.clone();
@@ -10217,6 +10226,10 @@ impl DesktopDataPlane {
         let DesktopMissionProvider::ApplicationRuntime(runtime_command) = mission_provider else {
             unreachable!("native provider returned above")
         };
+        // Application Runtime observes the external stop itself. Its adapter
+        // projects that stop after delivering the already-durable prefix;
+        // sharing the immediate native-provider token would truncate it.
+        let cordis_cancellation = LifecycleCancellation::default();
         let prepared = prepared.ok_or(ApplicationError::LocalRuntimeContextConflict)?;
         let turn_id = followup.map_or_else(RuntimeTurnAttemptId::new, |followup| followup.turn_id);
         let message_id = format!("runtime:{}:user", turn_id.as_str());
@@ -17059,6 +17072,8 @@ sleep 30"#;
             )
         );
 
+        // A cold restart closes the old Session writer before restoring.
+        drop(plane);
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
@@ -19483,6 +19498,7 @@ sleep 30"#;
 
             let cold_after_publication = DesktopDataPlane::at_data_root(reopened.data_root.clone())
                 .expect("cold Desktop after VM-04 publication");
+            drop(reopened);
             assert!(matches!(
                 cold_after_publication
                     .load_with(&secrets, handoff_now + Duration::seconds(25))
@@ -19618,8 +19634,10 @@ sleep 30"#;
                 "the paint-authorized readback route runs exactly one Runtime attempt"
             );
 
-            let cold_after_readback = DesktopDataPlane::at_data_root(reopened.data_root.clone())
-                .expect("cold Desktop after provider-readback Runtime");
+            let cold_after_readback =
+                DesktopDataPlane::at_data_root(cold_after_publication.data_root.clone())
+                    .expect("cold Desktop after provider-readback Runtime");
+            drop(cold_after_publication);
             let (readback_service, _) = cold_after_readback
                 .open_application_from_secret(&database_secret, handoff_now + Duration::seconds(28))
                 .expect("cold Application after provider-readback Runtime");
@@ -23864,6 +23882,8 @@ sleep 30"#;
         assert!(!event_json.contains(private_goal));
         assert!(!event_json.contains(private_draft));
 
+        // A cold restart closes the old Session writer before restoring.
+        drop(plane);
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
@@ -24090,6 +24110,8 @@ sleep 30"#;
             assert!(!event_json.contains(private_text));
         }
 
+        // A cold restart closes the old Session writer before restoring.
+        drop(plane);
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
@@ -24246,6 +24268,8 @@ sleep 30"#;
             );
         });
 
+        // A cold restart closes the old Session writer before restoring.
+        drop(plane);
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
@@ -24478,6 +24502,8 @@ sleep 30"#;
         );
         drop(service);
 
+        // A cold restart closes the old Session writer before restoring.
+        drop(plane);
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
@@ -24736,6 +24762,8 @@ sleep 30"#;
         );
         drop(replay_service);
 
+        // A cold restart closes the old Session writer before restoring.
+        drop(plane);
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
@@ -24952,6 +24980,8 @@ sleep 30"#;
                 .is_empty()
         );
 
+        // A cold restart closes the old Session writer before restoring.
+        drop(plane);
         let cold = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("cold Desktop plane");
         assert!(matches!(
@@ -25548,7 +25578,7 @@ sleep 30"#;
             )
         }));
 
-        plane.with_cordis_host(|host| {
+        let (expected_events, expected_messages) = plane.with_cordis_host(|host| {
             let session = host
                 .context()
                 .sessions::<SessionStore>()
@@ -25557,7 +25587,7 @@ sleep 30"#;
                 .unwrap()
                 .expect("closed Session");
             let events = session.events().unwrap();
-            assert_eq!(events.len(), 13);
+            assert_eq!(events.len(), 14);
             assert_eq!(
                 session
                     .assistant_chunks(1, 1)
@@ -25591,23 +25621,34 @@ sleep 30"#;
                     },
                 ]
             );
-            assert_eq!(session.derive_messages().unwrap().len(), 1);
-            assert!(
-                events.iter().all(|event| {
-                    !matches!(event.kind, SessionEventKind::AssistantMessage { .. })
-                })
+            let messages = session.derive_messages().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[1].role, SessionMessageRole::Assistant);
+            assert_eq!(
+                messages[1].content,
+                vec![SessionContentBlock::Text {
+                    text: "Reviewable local runtime ".into(),
+                }]
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+                    .count(),
+                1
             );
             assert!(matches!(
-                &events[11].kind,
+                &events[12].kind,
                 SessionEventKind::StepEnd { turn: 1, step: 1 }
             ));
             assert!(matches!(
-                &events[12].kind,
+                &events[13].kind,
                 SessionEventKind::TurnEnd {
                     turn: 1,
                     reason: TurnEndReason::Aborted(SessionCancelCause::User),
                 }
             ));
+            (events, messages)
         });
 
         let secret = secrets
@@ -25621,7 +25662,26 @@ sleep 30"#;
             .into_iter()
             .find(|checkpoint| checkpoint.header.id == mission_id.as_str())
             .expect("closed durable Session");
-        assert_eq!(restored.events.len(), 13);
+        assert_eq!(restored.events.len(), 14);
+        let cold = DesktopDataPlane::at_data_root(plane.data_root.clone())
+            .expect("cold Desktop after partial Runtime cancellation");
+        drop(plane);
+        assert!(matches!(
+            cold.load_with(&secrets, observed_at() + Duration::minutes(5))
+                .expect("restore the cancelled Runtime prefix"),
+            DesktopLoadState::Ready(_)
+        ));
+        cold.with_cordis_host(|host| {
+            let session = host
+                .context()
+                .sessions::<SessionStore>()
+                .unwrap()
+                .get(&SessionId::new(mission_id.as_str()).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.events().unwrap(), expected_events);
+            assert_eq!(session.derive_messages().unwrap(), expected_messages);
+        });
     }
 
     #[cfg(unix)]
@@ -26347,7 +26407,10 @@ sleep 30"#;
         .with_session_id(SessionId::new("non-user-interrupt").unwrap())
         .with_cancellation(cancellation.clone());
 
-        let _stream = adapter.stream(request).unwrap();
+        let chunks = futures_executor::block_on(futures_util::StreamExt::collect::<Vec<_>>(
+            adapter.stream(request).unwrap(),
+        ));
+        assert!(chunks.into_iter().all(|chunk| chunk.is_ok()));
 
         assert!(!cancellation.is_cancelled());
         assert_eq!(cancellation.cause(), None);

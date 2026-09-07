@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
 use chrono::{Duration, TimeZone, Utc};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use hartevo_cordis::{
     AgentBuildAdmission, AgentCallAdmission, AgentInboxTarget, AgentLoop, AgentPreStepDecision,
     AgentRef, AgentRequestAdmission, AgentRequestErrorAction, AgentRequestLogState, AgentStep,
@@ -1882,6 +1882,291 @@ fn provider_abort_without_retry_is_a_structured_error_and_skips_stopping_steerin
             ..
         })
     ));
+}
+
+fn cancellable_visible_prefix_chunks() -> Vec<SessionStreamChunk> {
+    vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Reasoning,
+        },
+        SessionStreamChunk::ReasoningDelta {
+            index: 0,
+            text: "分析中".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Reasoning {
+                text: "已整理线索".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 1,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::ToolCallDelta {
+            index: 1,
+            id: "never-dispatch".into(),
+            name: Some("write".into()),
+            arguments_delta: "{}".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 1,
+            block: SessionContentBlock::ToolCall {
+                id: "never-dispatch".into(),
+                name: "write".into(),
+                arguments: "{}".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 2,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::TextDelta {
+            index: 2,
+            text: "已经".into(),
+        },
+        SessionStreamChunk::TextDelta {
+            index: 2,
+            text: "可见。".into(),
+        },
+        SessionStreamChunk::TextDelta {
+            index: 2,
+            text: "must not consume after cancellation".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 2,
+            block: SessionContentBlock::Text {
+                text: "must not consume".into(),
+            },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::ToolCalls,
+            replay_state: None,
+        },
+    ]
+}
+
+#[test]
+fn cancellation_preserves_visible_prefix_without_tool_calls_and_replays_exactly() {
+    let mut ctx = mapped();
+    let cancellation = LifecycleCancellation::default();
+    let trigger = cancellation.clone();
+    ctx.on_emit(session_events::SESSION_EVENT, move |record| {
+        if matches!(&record.event.kind, SessionEventKind::AssistantChunk {
+            chunk: SessionStreamChunk::TextDelta { text, .. }, ..
+        } if text == "可见。")
+        {
+            trigger.cancel_with(SessionCancelCause::User);
+        }
+    })
+    .unwrap();
+    let (adapter, seen) = sequenced_adapter(vec![cancellable_visible_prefix_chunks()]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("cancel-prefix").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("input", "run"))
+        .unwrap();
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &cancellation,
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::User)
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let messages = session.derive_messages().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[1].content,
+        vec![
+            SessionContentBlock::Reasoning {
+                text: "已整理线索".into()
+            },
+            SessionContentBlock::Text {
+                text: "已经可见。".into()
+            },
+        ]
+    );
+    let events = session.events().unwrap();
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        SessionEventKind::ToolCall { .. } | SessionEventKind::ToolResult { .. }
+    )));
+    assert!(!events.iter().any(|event| matches!(&event.kind, SessionEventKind::AssistantChunk { chunk: SessionStreamChunk::TextDelta { text, .. }, .. } if text.contains("must not consume"))));
+    let mut restored =
+        hartevo_cordis::SessionLog::restore(session.header().unwrap(), events.clone()).unwrap();
+    assert!(!restored.repair_interrupted_tail().unwrap());
+    assert_eq!(restored.events(), events);
+    assert_eq!(restored.derive_messages(), messages);
+}
+
+#[test]
+fn cancellation_with_only_tools_or_whitespace_creates_no_assistant_message() {
+    let mut ctx = mapped();
+    let cancellation = LifecycleCancellation::default();
+    let trigger = cancellation.clone();
+    ctx.on_emit(session_events::SESSION_EVENT, move |record| {
+        if matches!(
+            &record.event.kind,
+            SessionEventKind::AssistantChunk {
+                chunk: SessionStreamChunk::BlockEnd { index: 1, .. },
+                ..
+            }
+        ) {
+            trigger.cancel_with(SessionCancelCause::Parent);
+        }
+    })
+    .unwrap();
+    let (adapter, _) = sequenced_adapter(vec![vec![
+        SessionStreamChunk::BlockStart {
+            index: 0,
+            block_type: SessionStreamBlockType::Text,
+        },
+        SessionStreamChunk::TextDelta {
+            index: 0,
+            text: " \n\t".into(),
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 0,
+            block: SessionContentBlock::Text {
+                text: " \n\t".into(),
+            },
+        },
+        SessionStreamChunk::BlockStart {
+            index: 1,
+            block_type: SessionStreamBlockType::ToolCall,
+        },
+        SessionStreamChunk::BlockEnd {
+            index: 1,
+            block: SessionContentBlock::ToolCall {
+                id: "never-dispatch".into(),
+                name: "write".into(),
+                arguments: "{}".into(),
+            },
+        },
+        SessionStreamChunk::Finish {
+            reason: SessionFinishReason::ToolCalls,
+            replay_state: None,
+        },
+    ]]);
+    register_llm_adapter(&mut ctx, ["mock"], adapter).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("cancel-no-text").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("input", "run"))
+        .unwrap();
+    let outcome = run_agent_turn(
+        &mut ctx,
+        session.id(),
+        call_config("mock", "model"),
+        &cancellation,
+    )
+    .now_or_never()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::Parent)
+    );
+    assert_eq!(session.derive_messages().unwrap().len(), 1);
+    assert!(!session.events().unwrap().iter().any(|event| matches!(
+        event.kind,
+        SessionEventKind::AssistantMessage { .. }
+            | SessionEventKind::ToolCall { .. }
+            | SessionEventKind::ToolResult { .. }
+    )));
+}
+
+#[tokio::test]
+async fn cancellation_after_terminal_before_eof_preserves_text_without_a_second_finish() {
+    struct CancelAfterFinish;
+    impl LlmAdapter for CancelAfterFinish {
+        fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
+            Ok(LlmResolvedModel::new(provider, model))
+        }
+
+        fn stream(
+            &self,
+            request: LlmGenerateRequest,
+        ) -> Result<LlmAdapterStream, SessionLlmFailure> {
+            let cancellation = request.cancellation().clone();
+            let chunks = text_finish_chunks("already complete", SessionFinishReason::Stop);
+            Ok(Box::pin(
+                futures_util::stream::iter(chunks.into_iter().map(Ok)).chain(
+                    futures_util::stream::poll_fn(move |_| {
+                        // This transport remains open after its terminal item.
+                        // Cancel only once the consumer actually awaits its EOF.
+                        cancellation.cancel_with(SessionCancelCause::User);
+                        Poll::Pending
+                    }),
+                ),
+            ))
+        }
+    }
+    let mut ctx = mapped();
+    register_llm_adapter(&mut ctx, ["mock"], CancelAfterFinish).unwrap();
+    let session = ctx
+        .sessions::<SessionStore>()
+        .unwrap()
+        .create(SessionId::new("cancel-after-finish").unwrap())
+        .unwrap();
+    session
+        .inbox()
+        .append_next_turn(user_message("input", "run"))
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_agent_turn(
+            &mut ctx,
+            session.id(),
+            call_config("mock", "model"),
+            &LifecycleCancellation::default(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        outcome.reason(),
+        TurnEndReason::Aborted(SessionCancelCause::User)
+    );
+    assert_eq!(
+        session.derive_messages().unwrap()[1].content,
+        vec![SessionContentBlock::Text {
+            text: "already complete".into()
+        }]
+    );
+    assert_eq!(
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                SessionEventKind::AssistantChunk {
+                    chunk: SessionStreamChunk::Finish { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
 }
 
 #[test]

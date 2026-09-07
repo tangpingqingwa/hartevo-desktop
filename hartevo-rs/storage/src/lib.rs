@@ -14,6 +14,7 @@ mod context_foundation_store;
 mod context_material_store;
 mod context_store;
 mod context_worker_graph_store;
+mod cordis_session_ownership;
 mod cordis_session_store;
 mod creator;
 mod creator_hiring_store;
@@ -146,6 +147,7 @@ impl Drop for DatabaseKey {
 #[derive(Debug)]
 pub struct ProjectStore {
     connection: Connection,
+    session_ownership: cordis_session_ownership::SessionWriteOwnership,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -214,7 +216,10 @@ impl ProjectStore {
         if existing_version > 0 && existing_version < STORAGE_SCHEMA_VERSION {
             create_encrypted_backup(&connection, &path, key, existing_version)?;
         }
-        let mut store = Self { connection };
+        let mut store = Self {
+            connection,
+            session_ownership: cordis_session_ownership::SessionWriteOwnership::for_database(&path),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -222,7 +227,10 @@ impl ProjectStore {
     pub fn in_memory() -> Result<Self, StorageError> {
         let connection = Connection::open_in_memory()?;
         configure_connection(&connection)?;
-        let mut store = Self { connection };
+        let mut store = Self {
+            connection,
+            session_ownership: cordis_session_ownership::SessionWriteOwnership::default(),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -4677,6 +4685,22 @@ pub enum StorageError {
     MissionLoopReplayConflict,
     #[error("Cordis Session checkpoint is invalid: {0}")]
     InvalidSessionCheckpoint(&'static str),
+    #[error(
+        "Cordis Session {0} already has a live writer; close that session's owning process before resuming"
+    )]
+    SessionAlreadyOwned(String),
+    #[error(
+        "Cordis Session {0} lost write ownership; close and reload its durable history before resuming"
+    )]
+    SessionOwnershipLost(String),
+    #[error("Cordis Session ownership requires a private directory and regular lock file")]
+    InvalidSessionOwnershipPath,
+    #[error("Cordis Session ownership I/O failed: {0}")]
+    SessionOwnershipIo(#[from] std::io::Error),
+    #[error(
+        "Cordis Session format {actual} is unsupported by this build (current Rust format: {supported}); upgrade the application or use an explicit supported importer"
+    )]
+    UnsupportedSessionFormat { actual: u32, supported: u32 },
     #[error("TikTok read checkpoint is invalid: {0}")]
     InvalidTiktokReadCheckpoint(&'static str),
     #[error("key bootstrap operation is malformed or has an invalid terminal state")]

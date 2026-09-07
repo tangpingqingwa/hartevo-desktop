@@ -458,7 +458,17 @@ pub struct AgentStreamCommit {
 }
 
 impl AgentStreamCommit {
-    /// Successful provider attempts commit one message, including an empty one.
+    fn without_message(finish: SessionFinishReason, usage: Option<SessionTokenUsage>) -> Self {
+        Self {
+            message: None,
+            usage,
+            finish,
+            replay_state: None,
+        }
+    }
+
+    /// Successful attempts commit one message, including an empty one.
+    /// Lifecycle cancellation can also retain a nonempty visible prefix.
     #[must_use]
     pub const fn message(&self) -> Option<&SessionMessage> {
         self.message.as_ref()
@@ -1139,9 +1149,8 @@ async fn run_agent_turn_step(
             return Ok(Some(cancelled_turn_reason(cancellation)));
         }
         let mut recorded = record_agent_stream(ctx, &logged).await?;
-        if cancellation.is_cancelled() {
-            return Ok(Some(cancelled_turn_reason(cancellation)));
-        }
+        // Cancellation still settles the already-visible text before the
+        // turn closes. No tool scheduling happens after this boundary.
         let committed = commit_agent_stream(ctx, &logged, &mut recorded)?;
         if cancellation.is_cancelled() {
             return Ok(Some(cancelled_turn_reason(cancellation)));
@@ -1328,13 +1337,18 @@ pub async fn record_agent_stream(
     loop {
         let (chunk, interrupted) = tokio::select! {
             biased;
+            () = cancellation.cancelled() => {
+                if grammar.finish.is_some() {
+                    break;
+                }
+                (cancelled_stream_finish(), true)
+            },
             chunk = stream.next() => {
                 let Some(chunk) = chunk else {
                     break;
                 };
                 (chunk, false)
             }
-            () = cancellation.cancelled() => (cancelled_stream_finish(), true),
         };
         let terminal = matches!(chunk, SessionStreamChunk::Finish { .. });
         grammar.accept(&chunk)?;
@@ -1379,8 +1393,9 @@ fn cancelled_stream_finish() -> SessionStreamChunk {
 /// Assemble one N48-recorded stream and commit its successful assistant message.
 ///
 /// The exact durable chunk provenance is replayed and revalidated before any
-/// message append. Error and aborted finishes remain message-less for the
-/// later request-error/retry boundary, and the open step is never closed here.
+/// message append. Provider failures remain message-less. User/lifecycle
+/// cancellation preserves only nonempty text/reasoning already received,
+/// with exact chunk provenance; incomplete tool calls never enter history.
 pub fn commit_agent_stream(
     ctx: &Context,
     logged: &LoggedAgentCall,
@@ -1436,20 +1451,24 @@ pub fn commit_agent_stream(
         .into());
     }
     let usage = assembler.usage.clone();
-
-    if matches!(
-        finish,
-        SessionFinishReason::Error { .. } | SessionFinishReason::Aborted { .. }
-    ) {
-        return Ok(AgentStreamCommit {
-            message: None,
-            usage,
+    let interrupted = request.cancellation().is_cancelled();
+    if !interrupted
+        && matches!(
             finish,
-            replay_state: None,
-        });
+            SessionFinishReason::Error { .. } | SessionFinishReason::Aborted { .. }
+        )
+    {
+        return Ok(AgentStreamCommit::without_message(finish, usage));
     }
 
-    let (content, replay_state) = assembler.assemble_success(&finish)?;
+    let (content, replay_state) = if interrupted {
+        (assembler.assemble_interrupted(), None)
+    } else {
+        assembler.assemble_success(&finish)?
+    };
+    if interrupted && content.is_empty() {
+        return Ok(AgentStreamCommit::without_message(finish, usage));
+    }
     let finish_seq = recorded.chunk_seqs.last().copied().ok_or_else(|| {
         invalid_stream_protocol("a durable terminal finish sequence before message commit")
     })?;
@@ -2404,6 +2423,7 @@ fn tool_call_prefix_matches(
 struct AgentBlockAssembler {
     order: Vec<u64>,
     blocks: HashMap<u64, Option<SessionContentBlock>>,
+    partial: HashMap<u64, SessionContentBlock>,
     usage: Option<SessionTokenUsage>,
     replay_state: Option<SessionReplayEnvelope>,
 }
@@ -2411,10 +2431,29 @@ struct AgentBlockAssembler {
 impl AgentBlockAssembler {
     fn push(&mut self, chunk: &SessionStreamChunk) {
         match chunk {
-            SessionStreamChunk::BlockStart { index, .. } => {
+            SessionStreamChunk::BlockStart { index, block_type } => {
                 if !self.blocks.contains_key(index) {
                     self.order.push(*index);
                     self.blocks.insert(*index, None);
+                    match block_type {
+                        SessionStreamBlockType::Text => {
+                            self.partial.insert(
+                                *index,
+                                SessionContentBlock::Text {
+                                    text: String::new(),
+                                },
+                            );
+                        }
+                        SessionStreamBlockType::Reasoning => {
+                            self.partial.insert(
+                                *index,
+                                SessionContentBlock::Reasoning {
+                                    text: String::new(),
+                                },
+                            );
+                        }
+                        SessionStreamBlockType::ToolCall => {}
+                    }
                 }
             }
             SessionStreamChunk::BlockEnd { index, block } => {
@@ -2428,10 +2467,40 @@ impl AgentBlockAssembler {
             SessionStreamChunk::Finish { replay_state, .. } => {
                 self.replay_state.clone_from(replay_state);
             }
-            SessionStreamChunk::TextDelta { .. }
-            | SessionStreamChunk::ReasoningDelta { .. }
-            | SessionStreamChunk::ToolCallDelta { .. } => {}
+            SessionStreamChunk::TextDelta { index, text }
+            | SessionStreamChunk::ReasoningDelta { index, text } => {
+                if let Some(
+                    SessionContentBlock::Text { text: accumulated }
+                    | SessionContentBlock::Reasoning { text: accumulated },
+                ) = self.partial.get_mut(index)
+                {
+                    accumulated.push_str(text);
+                }
+            }
+            SessionStreamChunk::ToolCallDelta { .. } => {}
         }
+    }
+
+    fn assemble_interrupted(self) -> Vec<SessionContentBlock> {
+        self.order
+            .iter()
+            .filter_map(|index| {
+                let block = self
+                    .blocks
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .or_else(|| self.partial.get(index))?;
+                match block {
+                    SessionContentBlock::Text { text }
+                    | SessionContentBlock::Reasoning { text }
+                        if !text.trim().is_empty() =>
+                    {
+                        Some(block.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     fn assemble_success(
