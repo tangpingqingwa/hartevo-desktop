@@ -42,6 +42,7 @@ use zeroize::Zeroizing;
 mod agent_operations;
 mod cordis_host;
 pub mod data_plane;
+mod media_workspace;
 #[cfg(feature = "native-journey")]
 pub mod native_runtime_journey;
 mod result_adoption_surface;
@@ -5715,6 +5716,7 @@ pub fn App() -> Element {
                             mission: mission.clone(),
                             selected_work_product_id: selected_result_id.read().clone(),
                             context_access: context_access.clone(),
+                            on_changed: move |snapshot| model.write().set_ready(snapshot, false),
                             on_close: move |()| workpad_open.set(false),
                         }
                     }
@@ -10779,6 +10781,7 @@ fn Workpad(
     mission: Option<MissionProjection>,
     selected_work_product_id: Option<WorkProductId>,
     context_access: Option<ProjectContextAccessProjection>,
+    on_changed: EventHandler<DesktopSnapshot>,
     on_close: EventHandler<()>,
 ) -> Element {
     #[cfg(feature = "visual-fixtures")]
@@ -10805,6 +10808,11 @@ fn Workpad(
                 } else if let Some(mission) = mission {
                     div { class: "document-kicker", "MISSION · REVISION {mission.revision}" }
                     h2 { "{mission.title}" }
+                    {rsx! { media_workspace::MediaWorkspace {
+                            key: "media-{mission.project_id}-{mission.mission_id}",
+                            mission: mission.clone(),
+                            on_changed,
+                    } }}
                     if mission.work_product_count == 0 {
                         p { class: "document-lead", "EMPTY：当前 Mission 没有持久 WorkProductManifest。页面不会填充示例报告。" }
                     } else {
@@ -10824,7 +10832,9 @@ fn Workpad(
                                     }
                                     em { "{work_product_status_label(&product.adoption_status)}" }
                                 }
-                                p { "{product.preview_text}" }
+                                if matches!(product.work_product_type.as_str(), "generated_image" | "generated_video") {
+                                    p { "素材已保存，可在上方「创意素材」中预览和修改。" }
+                                } else { p { "{product.preview_text}" } }
                                 if let Some(html) = product.static_site_preview.as_deref() {
                                     iframe {
                                         class: "static-site-preview",

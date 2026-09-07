@@ -1806,6 +1806,14 @@
           </div>
         </header>
         <div class="artifact-scroll">
+          <details class="document" aria-label="Mission 创意素材交互原型">
+            <summary>创意素材</summary>
+            <p>为当前任务生成图片或短视频，查看画面后采用。</p>
+            <div class="editor-field"><label for="prototypeMediaModel">生成模型</label><select class="editor-select" id="prototypeMediaModel"><option>Grok · 图片 1024 × 1024</option><option>GPT · 图片 1024 × 1024</option><option>Grok · 视频 3 秒 / 480p</option></select></div>
+            <div class="editor-field"><label for="prototypeMediaPrompt">描述画面与要求</label><textarea class="editor-textarea" id="prototypeMediaPrompt" maxlength="4096" placeholder="绿色水瓶置于浅色石面，柔和自然光，不出现文字或标志。"></textarea></div>
+            <button class="settings-button" type="button" disabled>生成素材</button>
+            <p>生成后查看图片或播放视频；修改描述会生成新版本并保留旧素材。只采用当前已加载版本，播放失败时不能采用。视频任务可在重开后继续取回，采用不会自动发布。</p>
+          </details>
           <div class="document-view" data-view="capabilities">
             <article class="document">
               <div class="registry-head">

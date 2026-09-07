@@ -1430,7 +1430,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::CordisSessionPersistence(_)
         | DesktopDataError::ObservationPipeline(_)
         | DesktopDataError::Tiktok(_)
-        | DesktopDataError::Cordis(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
+        | DesktopDataError::Cordis(_)
+        | DesktopDataError::Media(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
     };
     NativeJourneyError::new(code)
 }

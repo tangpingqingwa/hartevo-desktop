@@ -2187,6 +2187,7 @@ dependencies = [
 name = "hartevo-application"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "futures-executor",
  "futures-util",
@@ -2202,6 +2203,7 @@ dependencies = [
  "hartevo-runtime-adapter",
  "hartevo-storage",
  "hex",
+ "image",
  "ring",
  "rust_decimal",
  "serde",

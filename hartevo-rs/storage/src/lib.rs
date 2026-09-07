@@ -24,6 +24,7 @@ mod effect_ledger;
 mod identity_store;
 mod key_bootstrap_store;
 mod keyring_store;
+mod media_generation_store;
 mod mission_conversation_store;
 mod mission_loop_store;
 mod mission_recovery_store;
@@ -105,8 +106,9 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 52;
+pub const STORAGE_SCHEMA_VERSION: i64 = 53;
 
+pub use media_generation_store::MediaWorkProductCommit;
 pub use mission_loop_store::MissionLoopSnapshot;
 
 pub struct DatabaseKey([u8; 32]);
@@ -4471,6 +4473,13 @@ impl ProjectStore {
             record_migration(&transaction, 52)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 53 {
+            let transaction = self.connection.transaction()?;
+            media_generation_store::install_schema(&transaction)?;
+            record_migration(&transaction, 53)?;
+            transaction.commit()?;
+        }
+        media_generation_store::verify_schema(&self.connection)?;
         mission_loop_store::verify_schema(&self.connection)?;
         provider_recovery_store::verify_provider_recovery_schema(&self.connection)?;
         cordis_session_store::verify_cordis_session_schema(&self.connection)?;

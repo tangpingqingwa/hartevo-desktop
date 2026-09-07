@@ -18,6 +18,7 @@ mod identity_team_plugin;
 mod ids;
 mod key_management;
 mod market_evidence;
+pub mod media_generation;
 mod mission;
 mod mission_conversation;
 pub mod mission_loop;

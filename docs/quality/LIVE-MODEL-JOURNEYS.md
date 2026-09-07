@@ -34,7 +34,7 @@ python3 scripts/run-live-model-journeys.py \
   --mode media --allow-paid
 ```
 
-This makes one image request each to `gpt-image-2` and `grok-imagine-image-2.0`, and one three-second `grok-imagine-video-1.5` request. These are **provider probes**, not Desktop media-flow tests. Media generation and import are not being added to the Mission tool menu by this change. Endpoint aliases and reported model names are evidence of the configured gateway's behavior, not independent attestation of its upstream model.
+This makes one image request each to `gpt-image-2` and `grok-imagine-image-2.0`, and one three-second `grok-imagine-video-1.5` request. These remain **provider probes**, separate from the native workspace journey below. Endpoint aliases and reported model names are evidence of the configured gateway's behavior, not independent attestation of its upstream model.
 
 Image receipts verify PNG/JPEG dimensions against the requested size/aspect ratio; an image that exists but violates those constraints is retained as a failed artifact. Video receipts verify an MP4 signature and record provider-reported duration. Decode video tracks/frames and visually inspect prompt compliance separately before accepting creative assets; successful transport does not establish visual correctness.
 
@@ -52,3 +52,25 @@ Recovery preserves the initial receipt and writes a separate recovery receipt wi
 Run offline runner checks with `python3 scripts/test-live-model-journeys.py`. They cover missing/false receipts, modified artifacts, configuration parsing, real-world image dimension mismatch, credential origin boundaries and GET-only video recovery.
 
 API references: [OpenAI image generation](https://developers.openai.com/api/docs/guides/image-generation), [xAI image generation](https://docs.x.ai/developers/model-capabilities/images/generation), [xAI video generation](https://docs.x.ai/developers/model-capabilities/video/generation). Product acceptance still follows the repository's Mission and Release contracts.
+
+## Native media workspace
+
+The normal Dioxus app now exposes explicit media generation within a Mission Workpad. The Rust transport is used for all generation and polling. Generation request, provider video ID and exact asset bytes persist in SQLCipher schema v53; successful format validation commits the WorkProduct and manifest atomically. Revisions regenerate from edited text and preserve the prior candidate. A stale preview cannot adopt a newer candidate. No Cordis media tool, pixel-preserving image edit, channel publication, Cell media sync or business completion is asserted.
+
+Configure `HARTEVO_MEDIA_API_BASE` (fallback `HARTEVO_RUNTIME_API_BASE`). `HARTEVO_MEDIA_GPT_KEY_ENV` and `HARTEVO_MEDIA_GROK_KEY_ENV` name credential variables, defaulting to `HARTEVO_GPT_API_KEY` and `HARTEVO_GROK_API_KEY`. Model overrides are `HARTEVO_MEDIA_GPT_IMAGE_MODEL`, `HARTEVO_MEDIA_GROK_IMAGE_MODEL` and `HARTEVO_MEDIA_GROK_VIDEO_MODEL`, defaulting to the probe aliases above. The native downloader accepts only the configured HTTPS origin, including root-relative authenticated gateway assets; cross-origin URLs and redirects are unsupported and rejected. Errors never expose raw provider bodies or signed URLs.
+
+```sh
+python3 scripts/run-native-media-workspace.py prepare --output /absolute/path/to/new-private-run
+dx build --package hartevo-desktop --locked
+python3 scripts/run-native-media-workspace.py launch \
+  --output /absolute/path/to/new-private-run --env-file /absolute/path/to/.env \
+  --app /absolute/path/to/HartevoDesktop.app/Contents/MacOS/hartevo-desktop --allow-paid
+```
+
+The preparation step creates a synthetic project and Mission through production APIs, using the OS vault. Its private recovery file is test-only user-export evidence; the product database and logs do not retain that key. The launcher parses `.env` as data and passes credentials only in the child environment. It does not generate assets. In the normal app, open the Mission Workpad, explicitly generate, inspect the image or play the video, change the description, generate a revision and adopt the displayed version. Also close/reopen the Workpad while a request is in flight, repeat “View” on the same preview, and restart the app while a video is Submitted before retrieving that exact job. Do not submit another POST to recover an uncertain synchronous request.
+
+```sh
+python3 scripts/run-native-media-workspace.py inspect --output /absolute/path/to/new-private-run
+```
+
+Inspection is read-only: it exports exact stored assets and content-free `media-receipts.json`, including current manifest linkage and adoption status, and asserts that no publication Effects were created. Keep screenshots, playback observations and binary/source hashes with the receipt. A successful API reply is not visual acceptance: incorrect dimensions or duration are retained as Rejected, and unwanted lettering or other prompt violations need human review. MP4 metadata tests do not prove playable codec frames; the actual native video element must load and play. These private opt-in checks are ignored in ordinary Cargo/CI runs and do not raise Release Evidence or any Mission E-level.

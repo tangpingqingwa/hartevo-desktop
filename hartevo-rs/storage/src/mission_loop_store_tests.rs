@@ -399,7 +399,7 @@ fn mission_loop_migration_v51_preserves_mission_and_is_transactional_on_collisio
     let path = directory.path().join("migration.sqlite3");
     let mut store = ProjectStore::open(&path, &key()).unwrap();
     let mission = seed(&mut store);
-    store.connection.execute_batch("DROP TABLE mission_loop_operations; DROP TABLE mission_loops; DELETE FROM schema_migrations WHERE version = 52; CREATE TABLE mission_loop_operations (collision TEXT)").unwrap();
+    store.connection.execute_batch("DROP TABLE media_generations; DROP TABLE mission_loop_operations; DROP TABLE mission_loops; DELETE FROM schema_migrations WHERE version >= 52; CREATE TABLE mission_loop_operations (collision TEXT)").unwrap();
     drop(store);
     assert!(ProjectStore::open(&path, &key()).is_err());
     let connection = Connection::open(&path).unwrap();
@@ -429,7 +429,10 @@ fn mission_loop_migration_v51_preserves_mission_and_is_transactional_on_collisio
         .unwrap();
     drop(connection);
     let reopened = ProjectStore::open(&path, &key()).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 52);
+    assert_eq!(
+        reopened.schema_version().unwrap(),
+        crate::STORAGE_SCHEMA_VERSION
+    );
     assert_eq!(
         reopened
             .load_mission(&mission.project_id, &mission.id)
