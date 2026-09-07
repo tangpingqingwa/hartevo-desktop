@@ -1461,6 +1461,7 @@ pub fn App() -> Element {
                         runtime_text_stream,
                         runtime_follow_latest,
                         runtime_has_unseen,
+                        RuntimeTextUpdateMode::Restore,
                     );
                 }
                 Ok(Err(error)) => {
@@ -5134,6 +5135,8 @@ pub fn App() -> Element {
                                                         model,
                                                         project_id.clone(),
                                                         mission_id.clone(),
+                                                        legacy_runtime_scope,
+                                                        cancellation.clone(),
                                                         runtime_text_stream,
                                                         runtime_text_error,
                                                         runtime_follow_latest,
@@ -5518,6 +5521,8 @@ pub fn App() -> Element {
                                                         model,
                                                         request.project_id.clone(),
                                                         request.mission_id.clone(),
+                                                        legacy_runtime_scope,
+                                                        cancellation.clone(),
                                                         runtime_text_stream,
                                                         runtime_text_error,
                                                         runtime_follow_latest,
@@ -11535,11 +11540,44 @@ fn browser_workspace_control_request(
         })
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeTextUpdateMode {
+    Restore,
+    Live { can_follow: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeTextViewportEffect {
+    Preserve,
+    Follow,
+    MarkUnseen,
+}
+
+fn runtime_text_viewport_effect(
+    mode: RuntimeTextUpdateMode,
+    follow_latest: bool,
+    received_new_text: bool,
+) -> RuntimeTextViewportEffect {
+    match mode {
+        RuntimeTextUpdateMode::Live { can_follow: true } if follow_latest => {
+            RuntimeTextViewportEffect::Follow
+        }
+        RuntimeTextUpdateMode::Live { .. } if received_new_text => {
+            RuntimeTextViewportEffect::MarkUnseen
+        }
+        // Reading history must never move the viewport or present old text as a new event.
+        RuntimeTextUpdateMode::Restore | RuntimeTextUpdateMode::Live { .. } => {
+            RuntimeTextViewportEffect::Preserve
+        }
+    }
+}
+
 fn update_runtime_text_stream(
     projection: Option<DesktopRuntimeTextStreamProjection>,
     mut stream: Signal<Option<DesktopRuntimeTextStreamProjection>>,
     follow_latest: Signal<bool>,
     mut has_unseen: Signal<bool>,
+    mode: RuntimeTextUpdateMode,
 ) {
     if stream.peek().as_ref() == projection.as_ref() {
         return;
@@ -11554,10 +11592,10 @@ fn update_runtime_text_stream(
     let received_new_text = next_sequence
         .is_some_and(|sequence| previous_sequence.is_none_or(|previous| sequence > previous));
     stream.set(projection);
-    if *follow_latest.peek() {
-        scroll_mission_thread_to_latest();
-    } else if received_new_text {
-        has_unseen.set(true);
+    match runtime_text_viewport_effect(mode, *follow_latest.peek(), received_new_text) {
+        RuntimeTextViewportEffect::Follow => scroll_mission_thread_to_latest(),
+        RuntimeTextViewportEffect::MarkUnseen => has_unseen.set(true),
+        RuntimeTextViewportEffect::Preserve => {}
     }
 }
 
@@ -11572,6 +11610,8 @@ fn begin_runtime_text_stream_monitor(
     model: Signal<DesktopUiModel>,
     project_id: ProjectId,
     mission_id: MissionId,
+    owner: Signal<Option<product_experience::TaskScope>>,
+    cancellation: DesktopRuntimeCancellation,
     mut stream: Signal<Option<DesktopRuntimeTextStreamProjection>>,
     mut stream_error: Signal<Option<UiFailure>>,
     follow_latest: Signal<bool>,
@@ -11595,7 +11635,22 @@ fn begin_runtime_text_stream_monitor(
             match result {
                 Ok(Ok(projection)) => {
                     stream_error.set(None);
-                    update_runtime_text_stream(projection, stream, follow_latest, has_unseen);
+                    // Selection alone is not execution authority. This monitor follows only
+                    // its original command, and never scrolls past a pending approval.
+                    let active_owner = (*submitting.peek() || *retrying.peek())
+                        && owner.peek().as_ref().is_some_and(|(project, mission)| {
+                            project == &project_id && mission == &mission_id
+                        });
+                    let mode = if active_owner {
+                        RuntimeTextUpdateMode::Live {
+                            can_follow: !cancellation.is_requested()
+                                && cancellation.held_local_approval().is_none()
+                                && cancellation.held_cordis_approval().is_none(),
+                        }
+                    } else {
+                        RuntimeTextUpdateMode::Restore
+                    };
+                    update_runtime_text_stream(projection, stream, follow_latest, has_unseen, mode);
                 }
                 Ok(Err(error)) => {
                     stream.set(None);
@@ -12425,6 +12480,39 @@ mod tests {
     use sha2::Digest as _;
 
     use super::*;
+
+    #[test]
+    fn restoring_history_preserves_results_while_live_text_respects_attention_and_scroll() {
+        use RuntimeTextViewportEffect::{Follow, MarkUnseen, Preserve};
+
+        // Cold startup has no prior sequence and defaults to follow_latest=true.
+        // Loading its persisted text is nevertheless a restore, not a live event.
+        for follow_latest in [true, false] {
+            assert_eq!(
+                runtime_text_viewport_effect(RuntimeTextUpdateMode::Restore, follow_latest, true),
+                Preserve,
+            );
+        }
+        assert_eq!(
+            runtime_text_viewport_effect(
+                RuntimeTextUpdateMode::Live { can_follow: true },
+                true,
+                true,
+            ),
+            Follow,
+        );
+        // A held approval or a user's scroll position must stay in view.
+        for (can_follow, follow_latest) in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                runtime_text_viewport_effect(
+                    RuntimeTextUpdateMode::Live { can_follow },
+                    follow_latest,
+                    true,
+                ),
+                MarkUnseen,
+            );
+        }
+    }
 
     fn execution_digest(character: char) -> String {
         character.to_string().repeat(64)
