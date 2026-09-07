@@ -3609,8 +3609,8 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                             let mut reloaded = load_desktop_ui_model().await;
                                             {
                                                 let current = model.peek();
-                                                reloaded.selected_project_id = current.selected_project_id.clone();
-                                                reloaded.selected_mission_id = current.selected_mission_id.clone();
+                                                reloaded.selected_project_id.clone_from(&current.selected_project_id);
+                                                reloaded.selected_mission_id.clone_from(&current.selected_mission_id);
                                             }
                                             reloaded.restore_valid_selection(false);
                                             model.set(reloaded);
