@@ -24,6 +24,7 @@ mod identity_store;
 mod key_bootstrap_store;
 mod keyring_store;
 mod mission_conversation_store;
+mod mission_loop_store;
 mod mission_recovery_store;
 mod mission_schedule_store;
 mod normalized;
@@ -103,7 +104,9 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 51;
+pub const STORAGE_SCHEMA_VERSION: i64 = 52;
+
+pub use mission_loop_store::MissionLoopSnapshot;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4453,6 +4456,14 @@ impl ProjectStore {
             record_migration(&transaction, 51)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 52 {
+            let transaction = self.connection.transaction()?;
+            mission_loop_store::install_schema(&transaction)?;
+            mission_loop_store::verify_schema(&transaction)?;
+            record_migration(&transaction, 52)?;
+            transaction.commit()?;
+        }
+        mission_loop_store::verify_schema(&self.connection)?;
         provider_recovery_store::verify_provider_recovery_schema(&self.connection)?;
         cordis_session_store::verify_cordis_session_schema(&self.connection)?;
         tiktok_read_checkpoint_store::verify_tiktok_read_checkpoint_schema(&self.connection)?;
@@ -4660,6 +4671,10 @@ pub enum StorageError {
     InvalidProviderRecoveryTransition { state: String },
     #[error("stored domain data could not be decoded: {0}")]
     DomainDecode(String),
+    #[error(transparent)]
+    MissionLoop(#[from] hartevo_domain_kernel::mission_loop::LoopError),
+    #[error("Mission loop operation id was reused with different content")]
+    MissionLoopReplayConflict,
     #[error("Cordis Session checkpoint is invalid: {0}")]
     InvalidSessionCheckpoint(&'static str),
     #[error("TikTok read checkpoint is invalid: {0}")]

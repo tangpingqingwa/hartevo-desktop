@@ -3,6 +3,7 @@
 pub mod connectors;
 pub mod llm_deepseek;
 
+pub mod mission_loop;
 mod observation_evidence_pack;
 mod plugin_invocation_timeline;
 mod runtime_text_subscription;
@@ -10429,6 +10430,8 @@ fn persist_application_checkpoint_block(
 #[serde(rename_all = "camelCase")]
 pub struct MissionProjection {
     pub surface: String,
+    #[serde(default)]
+    pub loop_accounting: Option<hartevo_domain_kernel::mission_loop::LoopAccounting>,
     pub project_id: ProjectId,
     pub mission_id: MissionId,
     pub title: String,
@@ -27023,6 +27026,7 @@ fn mission_projection(
         None
     };
     Ok(MissionProjection {
+        loop_accounting: store.mission_loop_accounting(&mission.project_id, &mission.id)?,
         surface: match surface {
             WorkSurface::Orchestrator => "orchestrator",
             WorkSurface::ChannelOperations => "channel_operations",

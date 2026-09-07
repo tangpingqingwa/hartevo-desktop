@@ -303,13 +303,33 @@ fn mission_control_projection(
         current_gate,
         next_todos,
         active_claims,
-        quota: quota_not_available(),
+        quota: mission
+            .loop_accounting
+            .as_ref()
+            .map_or_else(quota_not_available, |accounting| QuotaProjection {
+                status: if accounting.uncertain_slices > 0 {
+                    OperationsStatus::RecoveryRequired
+                } else if accounting.paused || accounting.spent_slots >= accounting.slot_limit {
+                    OperationsStatus::WaitingUser
+                } else {
+                    OperationsStatus::Ready
+                },
+                used: accounting.spent_slots.to_string(),
+                limit: accounting.slot_limit.to_string(),
+                detail: format!(
+                    "已验证推进 {} 次，预留 {} 次；{} 个待办，{} 个待决策，{} 个结果待核对。",
+                    accounting.spent_slots,
+                    accounting.reserved_slots,
+                    accounting.open_slices,
+                    accounting.open_gates,
+                    accounting.uncertain_slices
+                ),
+            }),
         evidence: EvidenceChangeProjection {
             evidence_count: mission.evidence_count,
             work_product_count: mission.work_product_count,
             verified_effect_count: mission.verified_effect_count,
-            detail: "计数来自当前 Mission projection；quota delta 等待 CTX-01/OI-01 read model。"
-                .into(),
+            detail: "证据和工作产物来自当前 Mission；推进配额只在验证写回后记账。".into(),
         },
         stage: mission_stage_label(&mission.stage),
     }
@@ -508,6 +528,15 @@ fn worker_projection(
     let Some(mission) = mission else {
         return Vec::new();
     };
+    let budget = mission.loop_accounting.as_ref().map_or_else(
+        || "未配置长期任务配额".into(),
+        |accounting| {
+            format!(
+                "已验证推进 {}/{} 次，预留 {} 次",
+                accounting.spent_slots, accounting.slot_limit, accounting.reserved_slots
+            )
+        },
+    );
     let Some(activity) = runtime_activity else {
         return vec![WorkerProjection {
             worker_type: "Mission coordinator".into(),
@@ -515,7 +544,7 @@ fn worker_projection(
             lease: "No active lease".into(),
             generation: "Worker generation pending CTX-01".into(),
             progress: "等待持久 Runtime 状态".into(),
-            budget: "Quota read model pending".into(),
+            budget,
             handoff: "User remains in control".into(),
             recovery: "No recovery record".into(),
             status: OperationsStatus::Empty,
@@ -544,7 +573,7 @@ fn worker_projection(
         progress: activity
             .turn_status
             .map_or_else(|| "No active turn".into(), turn_status_detail),
-        budget: "Quota read model pending CTX-01/OI-01".into(),
+        budget,
         handoff: if activity.requires_reconciliation {
             "Handoff held until exact recovery".into()
         } else {
@@ -936,10 +965,10 @@ fn recovery_projection(runtime_activity: Option<&MissionRuntimeProjection>) -> R
 
 fn quota_not_available() -> QuotaProjection {
     QuotaProjection {
-        status: OperationsStatus::NotImplemented,
+        status: OperationsStatus::Empty,
         used: "—".into(),
-        limit: "Not available".into(),
-        detail: "Quota/claim accounting waits for the CTX-01 and OI-01 typed read models.".into(),
+        limit: "未配置".into(),
+        detail: "当前任务尚未配置长期推进配额。".into(),
     }
 }
 
@@ -1164,6 +1193,7 @@ mod tests {
     )]
     fn browser_ownership_controls_follow_durable_state() {
         let mission = MissionProjection {
+            loop_accounting: None,
             surface: "orchestrator".into(),
             project_id: "project".into(),
             mission_id: "mission".into(),

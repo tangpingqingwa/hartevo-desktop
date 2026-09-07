@@ -649,6 +649,7 @@ fn mission_projection(project_id: &ProjectId, source: VisualMission) -> MissionP
         })
         .collect::<Vec<_>>();
     MissionProjection {
+        loop_accounting: None,
         surface: "orchestrator".into(),
         project_id: project_id.clone(),
         mission_id: mission_id.clone(),

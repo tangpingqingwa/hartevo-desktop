@@ -551,7 +551,7 @@ pub(crate) fn insert_mission_conversation_message(
     Ok(())
 }
 
-fn load_mission_conversation_record(
+pub(crate) fn load_mission_conversation_record(
     connection: &Connection,
     project_id: &ProjectId,
     mission_id: &MissionId,

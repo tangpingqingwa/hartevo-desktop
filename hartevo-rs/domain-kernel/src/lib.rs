@@ -20,6 +20,7 @@ mod key_management;
 mod market_evidence;
 mod mission;
 mod mission_conversation;
+pub mod mission_loop;
 mod mission_schedule;
 mod money;
 mod outcome;

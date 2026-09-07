@@ -6,6 +6,7 @@
 
 | 问题 | 权威文件 |
 | --- | --- |
+| LoopX 长期任务决策、认领、人工决策、监控、配额和恢复的 Rust 接入 | `/docs/research/LOOPX-RUST-CONTROL-PLANE-INTAKE.md` 与 `hartevo-domain-kernel::mission_loop` |
 | 产品为谁服务、解决什么问题 | `/PRODUCT.md` |
 | 新 Mac 怎样准备环境、克隆仓库和完成首个 Bootstrap PR | `/DEVELOPMENT.md` |
 | 下一轮 bounded merge-train 与 Cordis/Rust 插件宿主合同 | `/docs/BUILD.md`（Target Contract，不是实现证明） |
