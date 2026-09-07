@@ -321,6 +321,8 @@ Provider + Model + Harness + Reasoning Effort + Service Tier
 
 Hartevo 保存的是用户可理解的 preset 与底层版本化配置，不把“快速/深度”硬编码成某个永久模型。
 
+当前 Rust 原生模型入口除 `deepseek-official` 外，可显式选择 `openai-compatible` 与 `grok-compatible`。这两条路由由 Application 持有 HTTPS endpoint、凭据名称和 Chat Completions 适配器，Desktop 经同一 Cordis Mission、追问、压缩及产物采纳链路执行；不会把兼容流量记录为 DeepSeek，也不要求 OpenInterpreter 子进程。凭据按请求解析，模型上下文与输出上限使用显式配置，未声明的推理级别不发送。当前配置入口与真实开发验证范围见 [Live model journeys](../quality/LIVE-MODEL-JOURNEYS.md)；该入口不代表图片、视频已接入 Mission 工具或完成原生界面验收。
+
 ## 7. 本地与云数据边界
 
 项目支持：已有本地文件夹、新建本地文件夹、本地加密同步、云端工作区。

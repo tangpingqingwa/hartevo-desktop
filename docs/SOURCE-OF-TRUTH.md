@@ -6,6 +6,7 @@
 
 | 问题 | 权威文件 |
 | --- | --- |
+| GPT/Grok 原生兼容路由、真实模型开发测试与媒体接口验证边界 | `/docs/quality/LIVE-MODEL-JOURNEYS.md` 与对应 Rust 适配器、测试回执 |
 | DeepSeek Harness 0.1.3 的 Rust 跟进、Session 写入所有权与格式边界 | `/docs/research/DEEPSEEK-HARNESS-0.1.3-RUST-UPDATE.md` 与对应 Rust 代码/回归 |
 | LoopX 长期任务决策、认领、人工决策、监控、配额和恢复的 Rust 接入 | `/docs/research/LOOPX-RUST-CONTROL-PLANE-INTAKE.md` 与 `hartevo-domain-kernel::mission_loop` |
 | 产品为谁服务、解决什么问题 | `/PRODUCT.md` |

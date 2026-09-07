@@ -23,6 +23,8 @@ use thiserror::Error;
 use url::Url;
 use zeroize::Zeroizing;
 
+use crate::llm_openai::ChatCompletionsProvider;
+
 pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek-official";
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/";
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
@@ -253,7 +255,7 @@ impl DeepSeekTransport for UreqDeepSeekTransport {
         cancellation: &LifecycleCancellation,
     ) -> Result<DeepSeekWireResponse, SessionLlmFailure> {
         if cancellation.is_cancelled() {
-            return Err(failure("ABORTED", "DeepSeek request cancelled", None, None));
+            return Err(failure("ABORTED", "Model request cancelled", None, None));
         }
         let endpoint = connection.endpoint().map_err(config_failure)?;
         let authorization = Zeroizing::new(format!("Bearer {api_key}"));
@@ -274,7 +276,7 @@ impl DeepSeekTransport for UreqDeepSeekTransport {
             .send_json(request)
             .map_err(|error| transport_failure(&error))?;
         if cancellation.is_cancelled() {
-            return Err(failure("ABORTED", "DeepSeek request cancelled", None, None));
+            return Err(failure("ABORTED", "Model request cancelled", None, None));
         }
         let status = response.status().as_u16();
         let request_id = bounded_header(&response, "x-request-id")
@@ -294,7 +296,7 @@ impl DeepSeekTransport for UreqDeepSeekTransport {
             let code = http_error_code(status, &body);
             return Err(failure(
                 &code,
-                "DeepSeek provider rejected the request",
+                "Model provider rejected the request",
                 Some(u64::from(status)),
                 request_id,
             )
@@ -306,7 +308,7 @@ impl DeepSeekTransport for UreqDeepSeekTransport {
         }) {
             return Err(failure(
                 "MALFORMED_RESPONSE",
-                "DeepSeek response is not an event stream",
+                "Model response is not an event stream",
                 Some(u64::from(status)),
                 request_id,
             ));
@@ -314,7 +316,7 @@ impl DeepSeekTransport for UreqDeepSeekTransport {
         if cancellation.is_cancelled() {
             return Err(failure(
                 "ABORTED",
-                "DeepSeek request cancelled",
+                "Model request cancelled",
                 None,
                 request_id,
             ));
@@ -342,13 +344,14 @@ pub struct DeepSeekAdapter {
     connection: Arc<dyn DeepSeekConnectionResolver>,
     credentials: Arc<dyn DeepSeekCredentialResolver>,
     transport: Arc<dyn DeepSeekTransport>,
+    compatible_provider: Option<ChatCompletionsProvider>,
 }
 
 impl fmt::Debug for DeepSeekAdapter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DeepSeekAdapter")
-            .field("provider", &DEEPSEEK_PROVIDER_ID)
+            .field("provider", &self.provider_id())
             .finish_non_exhaustive()
     }
 }
@@ -364,6 +367,7 @@ impl DeepSeekAdapter {
             connection: Arc::new(connection),
             credentials: Arc::new(credentials),
             transport: Arc::new(transport),
+            compatible_provider: None,
         }
     }
 
@@ -378,6 +382,16 @@ impl DeepSeekAdapter {
         )
     }
 
+    pub(crate) fn with_compatible_provider(mut self, provider: ChatCompletionsProvider) -> Self {
+        self.compatible_provider = Some(provider);
+        self
+    }
+
+    fn provider_id(&self) -> &str {
+        self.compatible_provider
+            .map_or(DEEPSEEK_PROVIDER_ID, ChatCompletionsProvider::id)
+    }
+
     fn connection(&self) -> Result<DeepSeekConnection, SessionLlmFailure> {
         self.connection.resolve().map_err(config_failure)
     }
@@ -385,11 +399,11 @@ impl DeepSeekAdapter {
 
 impl LlmAdapter for DeepSeekAdapter {
     fn prepare_model(&self, provider: &str, model: &str) -> Result<LlmResolvedModel, LlmError> {
-        if provider != DEEPSEEK_PROVIDER_ID || !bounded_identifier(model, MAX_IDENTIFIER_BYTES) {
+        if provider != self.provider_id() || !bounded_identifier(model, MAX_IDENTIFIER_BYTES) {
             return Err(LlmError::InvalidModelInfo {
                 provider: provider.to_owned(),
                 model: model.to_owned(),
-                expected: "a bounded model on the deepseek-official route",
+                expected: "a bounded model on the configured chat-completions route",
             });
         }
         let connection = self
@@ -412,36 +426,42 @@ impl LlmAdapter for DeepSeekAdapter {
             30_000,
             0.2,
         )?;
-        Ok(LlmResolvedModel::new(provider, model)
+        let resolved = LlmResolvedModel::new(provider, model)
             .with_context_window(connection.context_window())
             .with_default_max_tokens(connection.max_tokens())
-            .with_reasoning(LlmModelReasoning::new(
+            .with_retry_policy(retry_policy);
+        // Compatible providers negotiate their own reasoning defaults. Do not
+        // send DeepSeek's thinking extension or claim model-specific levels.
+        Ok(if self.compatible_provider.is_some() {
+            resolved
+        } else {
+            resolved.with_reasoning(LlmModelReasoning::new(
                 vec!["off".into(), "low".into(), "high".into(), "max".into()],
                 Some("high".into()),
             ))
-            .with_retry_policy(retry_policy))
+        })
     }
 
     fn stream(&self, request: LlmGenerateRequest) -> Result<LlmAdapterStream, SessionLlmFailure> {
-        if request.config().provider != DEEPSEEK_PROVIDER_ID
+        if request.config().provider != self.provider_id()
             || !bounded_identifier(&request.config().model, MAX_IDENTIFIER_BYTES)
         {
             return Err(failure(
                 "INVALID_MODEL",
-                "DeepSeek request route does not match the adapter",
+                "Model request route does not match the adapter",
                 None,
                 None,
             ));
         }
         if request.cancellation().is_cancelled() {
-            return Err(failure("ABORTED", "DeepSeek request cancelled", None, None));
+            return Err(failure("ABORTED", "Model request cancelled", None, None));
         }
         let connection = self.connection()?;
-        let wire_request = serialize_request(&request)?;
+        let wire_request = serialize_request(&request, self.compatible_provider)?;
         let request_bytes = serde_json::to_vec(&wire_request).map_err(|_| {
             failure(
                 "INVALID_REQUEST",
-                "DeepSeek request could not be encoded",
+                "Model request could not be encoded",
                 None,
                 None,
             )
@@ -449,13 +469,13 @@ impl LlmAdapter for DeepSeekAdapter {
         if request_bytes.len() > MAX_REQUEST_BYTES {
             return Err(failure(
                 "INVALID_REQUEST",
-                "DeepSeek request exceeds the transport bound",
+                "Model request exceeds the transport bound",
                 None,
                 None,
             ));
         }
         if request.cancellation().is_cancelled() {
-            return Err(failure("ABORTED", "DeepSeek request cancelled", None, None));
+            return Err(failure("ABORTED", "Model request cancelled", None, None));
         }
         let credential = self
             .credentials
@@ -476,7 +496,10 @@ impl LlmAdapter for DeepSeekAdapter {
     }
 }
 
-fn serialize_request(request: &LlmGenerateRequest) -> Result<Value, SessionLlmFailure> {
+fn serialize_request(
+    request: &LlmGenerateRequest,
+    compatible_provider: Option<ChatCompletionsProvider>,
+) -> Result<Value, SessionLlmFailure> {
     let mut messages = Vec::new();
     if let Some(system) = request.system() {
         messages.push(json!({"role": "system", "content": system}));
@@ -518,6 +541,14 @@ fn serialize_request(request: &LlmGenerateRequest) -> Result<Value, SessionLlmFa
             ),
         );
     }
+    if compatible_provider.is_some() && request.config().reasoning_effort.is_some() {
+        return Err(failure(
+            "UNSUPPORTED_REASONING_EFFORT",
+            "Compatible provider reasoning is model-managed",
+            None,
+            None,
+        ));
+    }
     match request.config().reasoning_effort.as_deref() {
         None => {}
         Some("off") => {
@@ -540,7 +571,12 @@ fn serialize_request(request: &LlmGenerateRequest) -> Result<Value, SessionLlmFa
         body.insert("temperature".into(), Value::Number(temperature.clone()));
     }
     if let Some(max_tokens) = request.config().max_tokens {
-        body.insert("max_tokens".into(), Value::from(max_tokens));
+        let field = if compatible_provider == Some(ChatCompletionsProvider::OpenAi) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body.insert(field.into(), Value::from(max_tokens));
     }
     if let Some(stop) = request.config().stop.as_ref() {
         body.insert(
@@ -632,7 +668,7 @@ fn flatten_tool_result(content: &[SessionContentBlock]) -> Result<String, Sessio
 fn unsupported_history() -> SessionLlmFailure {
     failure(
         "UNSUPPORTED_CONTENT",
-        "DeepSeek request history contains an unsupported block placement",
+        "Model request history contains an unsupported block placement",
         None,
         None,
     )
@@ -656,7 +692,7 @@ struct OpenBlock {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one state machine keeps DeepSeek SSE block ordering and terminal validation explicit"
+    reason = "one state machine keeps Model SSE block ordering and terminal validation explicit"
 )]
 fn translate_payloads(
     payloads: &[String],
@@ -705,7 +741,7 @@ fn translate_payloads(
                     reason: SessionFinishReason::Error {
                         failure: failure(
                             "EMPTY_RESPONSE",
-                            "DeepSeek returned no model content",
+                            "Model returned no model content",
                             None,
                             request_id.map(str::to_owned),
                         ),
@@ -722,7 +758,7 @@ fn translate_payloads(
         }
 
         let value: Value = serde_json::from_str(payload)
-            .map_err(|_| malformed("DeepSeek SSE payload is malformed", request_id))?;
+            .map_err(|_| malformed("Model SSE payload is malformed", request_id))?;
         if let Some(choices) = value.get("choices") {
             let choices = choices
                 .as_array()
@@ -829,7 +865,7 @@ fn translate_payloads(
         }
     }
     Err(malformed(
-        "DeepSeek SSE stream ended before [DONE]",
+        "Model SSE stream ended before [DONE]",
         request_id,
     ))
 }
@@ -947,7 +983,7 @@ fn required_u64(
 
 fn parse_sse(body: &[u8]) -> Result<Vec<String>, SessionLlmFailure> {
     let text = std::str::from_utf8(body)
-        .map_err(|_| malformed("DeepSeek SSE is not UTF-8", None))?
+        .map_err(|_| malformed("Model SSE is not UTF-8", None))?
         .strip_prefix('\u{feff}')
         .unwrap_or_else(|| std::str::from_utf8(body).expect("validated UTF-8"));
     let mut payloads = Vec::new();
@@ -981,7 +1017,7 @@ fn parse_sse(body: &[u8]) -> Result<Vec<String>, SessionLlmFailure> {
     }
     if !data.is_empty() || !terminated {
         return Err(malformed(
-            "DeepSeek SSE stream ended before a terminated [DONE] event",
+            "Model SSE stream ended before a terminated [DONE] event",
             None,
         ));
     }
@@ -1077,7 +1113,7 @@ fn malformed(message: &str, request_id: Option<&str>) -> SessionLlmFailure {
 fn response_too_large(request_id: Option<&str>) -> SessionLlmFailure {
     failure(
         "RESPONSE_TOO_LARGE",
-        "DeepSeek response exceeds the transport bound",
+        "Model response exceeds the transport bound",
         None,
         request_id.map(str::to_owned),
     )
@@ -1111,7 +1147,7 @@ fn body_failure(error: &ureq::Error) -> SessionLlmFailure {
         ureq::Error::BodyExceedsLimit(_) => "RESPONSE_TOO_LARGE",
         _ => "TRANSPORT",
     };
-    failure(code, "DeepSeek response body failed", None, None)
+    failure(code, "Model response body failed", None, None)
 }
 
 #[cfg(test)]
