@@ -130,6 +130,25 @@
 .workpad-body > .document-kicker { font-family:inherit; font-size:11px; color:#6b766d; }
 .workpad-body .document-lead { font-size:13px; line-height:1.7; }
 .work-product-preview p { font-size:14px; line-height:1.8; white-space:pre-wrap; }
+.work-product-preview > header strong { font-size:14px; }
+.work-product-preview > header small,.work-product-preview > header em { font-size:11px; }
+.draft-preview { color:var(--ink-2); font-family:inherit; font-size:14px; line-height:1.75; overflow-wrap:anywhere; }
+.work-product-preview > .draft-preview { padding:16px; }
+.draft-preview p { margin:0 0 12px; white-space:pre-wrap; font-family:inherit; }
+.draft-fields { margin:0; }
+.draft-field { margin:0 0 18px; }
+.draft-field > dt { margin:0 0 6px; font-size:12px; font-weight:600; color:var(--ink); }
+.draft-field > dd { margin:0; }
+.draft-items { margin:0; padding-left:22px; }
+.draft-items > li { padding:4px 0 14px 4px; margin:0 0 14px; border-bottom:1px solid var(--line); }
+.draft-items > li::marker { color:var(--green); font-weight:600; }
+.draft-items > li:last-child { border-bottom:0; margin-bottom:0; padding-bottom:0; }
+.draft-original,.work-product-provenance { margin-top:12px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; }
+.draft-original > summary,.work-product-provenance > summary { display:list-item; padding:10px 0; cursor:pointer; }
+.draft-original pre { max-height:320px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.6; background:#fafafb; padding:12px; border-radius:6px; }
+.work-product-provenance { margin:0; padding:0 16px; }
+.work-product-provenance p,.work-product-provenance code { font-size:11px; }
+.work-product-provenance[open] { padding-bottom:14px; }
 .missions-surface .surface-head p { font-size:14px; }
 .missions-surface .surface-eyebrow { font-family:inherit; font-size:12px; letter-spacing:0; }
 .mission-list-tools { display:flex; align-items:center; justify-content:space-between; gap:18px; border-bottom:1px solid #e2e7df; margin:20px 0 0; }

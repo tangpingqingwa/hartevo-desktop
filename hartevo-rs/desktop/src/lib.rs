@@ -42,6 +42,7 @@ use zeroize::Zeroizing;
 mod agent_operations;
 mod cordis_host;
 pub mod data_plane;
+mod draft_preview;
 mod media_workspace;
 #[cfg(feature = "native-journey")]
 pub mod native_runtime_journey;
@@ -8377,9 +8378,7 @@ fn PersistedConversationMessages(
                                 time { "{recorded_time}" }
                             }
                             div { class: "assistant-copy persisted-assistant-copy",
-                                for (index, paragraph) in runtime_stream_paragraphs(&message.body).into_iter().enumerate() {
-                                    p { key: "{message_key}-p-{index}", "{paragraph}" }
-                                }
+                                draft_preview::DraftPreview { text: message.body.clone() }
                             }
                             if replayed {
                                 if let Some(stream) = runtime_text_stream.as_ref() {
@@ -11037,14 +11036,14 @@ fn Workpad(
                                 header {
                                     span { class: "file-mark", "WP" }
                                     span {
-                                        strong { "{product.title}" }
-                                        small { "{product.work_product_type} · manifest v{product.manifest_version} · product r{product.work_product_revision}" }
+                                        strong { "{draft_preview::product_title(&product)}" }
+                                        small { "版本 {product.work_product_revision}" }
                                     }
-                                    em { "{work_product_status_label(&product.adoption_status)}" }
+                                    em { "{product_experience::result_status(&product.adoption_status)}" }
                                 }
                                 if matches!(product.work_product_type.as_str(), "generated_image" | "generated_video") {
                                     p { "素材已保存，可在上方「创意素材」中预览和修改。" }
-                                } else { p { "{product.preview_text}" } }
+                                } else { draft_preview::DraftPreview { text: product.preview_text.clone() } }
                                 if let Some(html) = product.static_site_preview.as_deref() {
                                     iframe {
                                         class: "static-site-preview",
@@ -11058,10 +11057,10 @@ fn Workpad(
                                 } else if product.work_product_type == "site_preview_bundle" {
                                     p { "源资料已变化或预览未通过校验；未加载 HTML。" }
                                 }
-                                footer {
-                                    span { "{product.preview_media_type}" }
-                                    span { "evidence {product.evidence_count}" }
-                                    span { "editable {product.editable_scope_count}" }
+                                details { class: "work-product-provenance",
+                                    summary { "来源与技术信息" }
+                                    p { "{product.work_product_type} · manifest v{product.manifest_version} · {product.preview_media_type}" }
+                                    p { "evidence {product.evidence_count} · editable {product.editable_scope_count}" }
                                     code { title: "{product.manifest_digest}", "manifest {short_digest(&product.manifest_digest)}" }
                                 }
                             }
@@ -11582,7 +11581,9 @@ fn begin_read_only_runtime_subscription_monitor(
                         && !a.waiting_for_approval
                 }),
             );
-            match ui.paint.read().poll_disposition(&selection) {
+            // Drop the signal read before yielding; navigation must be able to reconcile it.
+            let disposition = ui.paint.read().poll_disposition(&selection);
+            match disposition {
                 DesktopRuntimePollDisposition::Stale
                 | DesktopRuntimePollDisposition::ReadyToFinalize
                 | DesktopRuntimePollDisposition::Complete => break,

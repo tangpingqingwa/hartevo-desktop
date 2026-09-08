@@ -255,12 +255,12 @@ pub(crate) fn MissionOverview(
                                             } else {
                                                 div {class:"mission-result-excerpt",
                                                     UiIcon {name:UiIconName::FileText,size:20}
-                                                    p { "{product.preview_text}" }
+                                                    p { "{crate::draft_preview::excerpt(&product.preview_text)}" }
                                                 }
                                             }
                                         }
                                         footer {
-                                            div {strong { "{product.title}" } span { "{status}" } }
+                                            div {strong { "{crate::draft_preview::product_title(&product)}" } span { "{status}" } }
                                             button {class:"task-secondary-action",onclick:move |_|on_result_action.call(open.clone()),"打开成果"}
                                         }
                                     }
