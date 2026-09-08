@@ -128,8 +128,13 @@ fn export_bytes(
     Ok(bytes)
 }
 
-fn export_asset(job: MediaGeneration, mut notice: Signal<String>) {
+fn export_asset(
+    job: MediaGeneration,
+    selected: Signal<Option<String>>,
+    mut notice: Signal<String>,
+) {
     spawn(async move {
+        let generation_id = job.request.id.clone();
         let Some(metadata) = job.asset else {
             return;
         };
@@ -170,11 +175,13 @@ fn export_asset(job: MediaGeneration, mut notice: Signal<String>) {
                 .map_err(|_| "无法保存到所选位置，请检查文件夹权限。".to_owned())
         })
         .await;
-        notice.set(match result {
-            Ok(Ok(())) => "素材已导出。".into(),
-            Ok(Err(error)) => error,
-            Err(_) => "导出未完成，请重试。".into(),
-        });
+        if selected.peek().as_ref() == Some(&generation_id) {
+            notice.set(match result {
+                Ok(Ok(())) => "素材已导出。".into(),
+                Ok(Err(error)) => error,
+                Err(_) => "导出未完成，请重试。".into(),
+            });
+        }
     });
 }
 
@@ -275,7 +282,7 @@ pub(crate) fn MediaWorkspace(
     let selected = use_signal(|| None::<String>);
     let mut selected_writer = selected;
     let busy = use_signal(|| false);
-    let notice = use_signal(String::new);
+    let mut notice = use_signal(String::new);
     let mut refresh = use_signal(|| 0u64);
     let mut viewed = use_signal(|| None::<String>);
     let mut show_generator = use_signal(|| false);
@@ -372,7 +379,7 @@ pub(crate) fn MediaWorkspace(
                             let status = current_product(&mission,&job).map_or_else(||state_label(job.state), |p| crate::product_experience::result_status(&p.adoption_status));
                             let kind = if job.request.kind == MediaKind::Image {"图片"} else {"视频"};
                             rsx! {button {class:if selected {"active"} else {""},aria_pressed:selected,onclick:move |_|{
-                                if selected_writer.peek().as_ref() != Some(&id) {viewed.set(None);selected_writer.set(Some(id.clone()));}
+                                if selected_writer.peek().as_ref() != Some(&id) {viewed.set(None);notice.set(String::new());selected_writer.set(Some(id.clone()));}
                             },strong {"{kind}"} span {"{status}"}}}
                         }
                     }
@@ -408,7 +415,7 @@ pub(crate) fn MediaWorkspace(
                             if let Some(code) = &job.failure_code {p {class:"media-status error",role:"status","{media_failure_message(code)}"}}
                             div {class:"media-actions",
                                 if job.asset.is_some() {
-                                    button {class:"task-secondary-action",disabled:busy(),onclick:move |_|export_asset(export_job.clone(),notice),"导出素材"}
+                                    button {class:"task-secondary-action",disabled:busy(),onclick:move |_|export_asset(export_job.clone(),selected,notice),"导出素材"}
                                 }
                                 if adoption.is_some() {
                                     button {class:"task-primary-action",disabled:!adopt_enabled,aria_label:"采用预览素材",onclick:move |_|{
@@ -466,7 +473,7 @@ pub(crate) fn MediaWorkspace(
                             let id = job.request.id.clone();
                             let status = if job.state == MediaGenerationState::Ready {"历史版本"} else {state_label(job.state)};
                             rsx! {button {class:"media-history-row",onclick:move |_|{
-                                if selected_writer.peek().as_ref() != Some(&id) {viewed.set(None);selected_writer.set(Some(id.clone()));}
+                                if selected_writer.peek().as_ref() != Some(&id) {viewed.set(None);notice.set(String::new());selected_writer.set(Some(id.clone()));}
                             },strong {"{job.request.model}"} span {"{status}"} small {{job.created_at.format("%m-%d %H:%M").to_string()}}}}
                         }
                     }

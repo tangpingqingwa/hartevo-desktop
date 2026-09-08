@@ -3560,7 +3560,11 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                     i { class: "mission-indicator" }
                     div { class: "mission-copy",
                         strong { "{surface_heading}" }
-                        span { "{status}" }
+                        span {
+                            if current_surface == Surface::Orchestrator { "{status}" }
+                            else if let Some(project) = &project { "{project.name}" }
+                            else { "本机工作空间" }
+                        }
                     }
                     div { class: "mission-actions",
                         button {
@@ -3896,7 +3900,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                         strong { "{surface_context}" }
                     }
                     span { class: "conversation-hint",
-                        if current_surface == Surface::Orchestrator { "进展、成果与后续沟通都保留在这里" } else { "变化回写同一 Project / Mission Truth" }
+                        if current_surface == Surface::Orchestrator { "进展、成果与后续沟通都保留在这里" } else { "当前项目的工作与成果" }
                     }
                     if let Some(fixture_id) = &visual_fixture_id {
                         span { class: "visual-fixture-indicator", "VISUAL_FIXTURE · {fixture_id}" }
@@ -7963,6 +7967,8 @@ fn OrchestratorSurface(
                 runtime_text_stream.is_some() && replayed_message_sequence.is_none();
             let runtime_fixture_copy = runtime_fixture_state
                 .map(|state| (state.label(), visual_runtime_state_copy(state)));
+            let has_conversation_content =
+                !mission.conversation_messages.is_empty() || runtime_text_stream.is_some();
             let follow_existing_conversation = runtime_busy
                 && runtime_follow_latest
                 && operations.approvals.cordis_allow_once_status != OperationsStatus::Ready
@@ -8125,7 +8131,7 @@ fn OrchestratorSurface(
                             ContextAccessCard { access: context_access }
                         }
                     }
-                    if !runtime_follow_latest {
+                    if has_conversation_content && !runtime_follow_latest {
                         button {
                             class: if runtime_has_unseen { "mission-follow-latest has-unseen" } else { "mission-follow-latest" },
                             aria_label: if runtime_has_unseen { "有新的 Runtime 正文，回到最新" } else { "回到 Mission Conversation 最新位置" },
@@ -9884,7 +9890,7 @@ fn SettingsSurface(
         .unwrap_or_else(|| "deepseek-chat".to_owned());
     let mut native_model = use_signal(move || initial_native_model);
     let mut native_credential = use_signal(SensitiveProviderCredential::default);
-    let runtime_status = runtime.as_ref().map_or("数据层未就绪", |runtime| {
+    let runtime_status = runtime.as_ref().map_or("工作空间尚未打开", |runtime| {
         runtime_availability_label(runtime.status)
     });
     let provider = runtime
@@ -9959,10 +9965,10 @@ fn SettingsSurface(
                         section { class: "settings-section",
                             h2 { "当前状态" }
                             div { class: "settings-group",
-                                SettingsRow { title: "Runtime", detail: "当前应用检测到的连接状态。", value: runtime_status }
-                                SettingsRow { title: "Provider", detail: "当前使用的模型服务。", value: provider }
-                                SettingsRow { title: "Model", detail: "新消息使用的模型。", value: model }
-                                SettingsRow { title: "凭据来源", detail: "仅展示来源类型，不回读凭据或 Secret Store 引用。", value: credential_source }
+                                SettingsRow { title: "配置状态", detail: "当前应用检测到的本机配置。", value: runtime_status }
+                                SettingsRow { title: "模型服务", detail: "当前使用的服务提供方。", value: provider }
+                                SettingsRow { title: "当前模型", detail: "新消息使用的模型。", value: model }
+                                SettingsRow { title: "密钥来源", detail: "仅展示配置来源，不显示密钥。", value: credential_source }
                             }
                         }
                         section { class: "settings-section",
@@ -9978,7 +9984,7 @@ fn SettingsSurface(
                                         oninput: move |event| native_model.set(event.value()),
                                     }
                                 }
-                                SettingsControlRow { title: "DeepSeek API key", detail: "仅写入当前数据目录绑定的 OS Secret Store；保存后不会回读或显示。",
+                                SettingsControlRow { title: "DeepSeek API key", detail: "保存在本机凭据存储中，保存后不会显示密钥。",
                                     input {
                                         r#type: "password",
                                         value: "{native_credential.read().expose_for_input()}",
@@ -10017,7 +10023,7 @@ fn SettingsSurface(
                                     }
                                 }
                             }
-                            p { class: "settings-boundary", span { class: "honesty-badge", "NO PROVIDER CALL" } " 保存或清除只更新本机配置与 Runtime 投影，不会启动 Provider 请求、Runtime turn、Domain 写入或 Effect。" }
+                            p { class: "settings-boundary", "保存或清除配置不会发送消息，也不会产生模型调用费用。" }
                         }
                     }
                 } else if active_panel() == "shortcuts" {
@@ -11027,7 +11033,7 @@ fn initial_workpad_open() -> bool {
             Some("mission-workpad" | "mission-inspector")
         );
     }
-    true
+    false
 }
 
 #[cfg(feature = "visual-fixtures")]
@@ -12072,9 +12078,9 @@ fn status_label(model: &DesktopUiModel, executing: bool) -> String {
         DesktopBackendState::Ready(_) => model.current_mission().map_or_else(
             || {
                 if model.current_project().is_some() {
-                    "等待持久 Mission".into()
+                    "准备开始新任务".into()
                 } else {
-                    "没有宣发项目".into()
+                    "尚未创建项目".into()
                 }
             },
             |mission| product_experience::task_status(mission, executing).into(),
@@ -12320,14 +12326,14 @@ fn vm03_domain_purchase_proposal(
 
 fn runtime_availability_label(status: DesktopRuntimeAvailabilityStatus) -> &'static str {
     match status {
-        DesktopRuntimeAvailabilityStatus::NotConfigured => "NOT_CONFIGURED",
-        DesktopRuntimeAvailabilityStatus::ConfigurationRequired => "CONFIGURATION_REQUIRED",
-        DesktopRuntimeAvailabilityStatus::EvidenceMissing => "EVIDENCE_MISSING",
-        DesktopRuntimeAvailabilityStatus::ReadyDevelopment => "DEV_READY",
-        DesktopRuntimeAvailabilityStatus::ReadyDistribution => "DISTRIBUTION_READY",
-        DesktopRuntimeAvailabilityStatus::BlockedEnvironment => "BLOCKED_ENV",
-        DesktopRuntimeAvailabilityStatus::IntegrityError => "INTEGRITY_ERROR",
-        DesktopRuntimeAvailabilityStatus::UnsupportedHost => "UNSUPPORTED_HOST",
+        DesktopRuntimeAvailabilityStatus::NotConfigured
+        | DesktopRuntimeAvailabilityStatus::ConfigurationRequired => "待配置",
+        DesktopRuntimeAvailabilityStatus::EvidenceMissing => "运行组件不完整",
+        DesktopRuntimeAvailabilityStatus::ReadyDevelopment => "已配置 · 开发模式",
+        DesktopRuntimeAvailabilityStatus::ReadyDistribution => "已配置",
+        DesktopRuntimeAvailabilityStatus::BlockedEnvironment => "当前环境不可用",
+        DesktopRuntimeAvailabilityStatus::IntegrityError => "配置校验失败",
+        DesktopRuntimeAvailabilityStatus::UnsupportedHost => "当前系统不支持",
     }
 }
 
@@ -14363,7 +14369,7 @@ mod tests {
             "SensitiveProviderCredential([REDACTED])",
             "r#type: \"password\"",
             "autocomplete: \"new-password\"",
-            "NO PROVIDER CALL",
+            "保存或清除配置不会发送消息",
             "native_credential_source_label",
             "native_profile_clear_enabled",
             "DesktopNativeCredentialSource::DesktopProfile",
@@ -14399,11 +14405,11 @@ mod tests {
     fn runtime_labels_never_collapse_uncertain_or_failed_into_success() {
         assert_eq!(
             runtime_availability_label(DesktopRuntimeAvailabilityStatus::ReadyDevelopment),
-            "DEV_READY"
+            "已配置 · 开发模式"
         );
         assert_eq!(
             runtime_availability_label(DesktopRuntimeAvailabilityStatus::EvidenceMissing),
-            "EVIDENCE_MISSING"
+            "运行组件不完整"
         );
         assert_eq!(
             runtime_turn_status_label(RuntimeTurnStatus::Uncertain),
