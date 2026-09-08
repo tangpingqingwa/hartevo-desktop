@@ -51,6 +51,7 @@ mod runtime_plane;
 mod runtime_subscription;
 mod sandbox_provider;
 pub mod shopify_readback;
+mod task_entry;
 pub mod tiktok_read;
 #[cfg(feature = "visual-fixtures")]
 mod visual_fixture;
@@ -168,7 +169,7 @@ enum AppShortcut {
     DismissOverlays,
     GlobalSearch,
     NewTask,
-    ProjectDispatcher,
+    QuickEntry,
     Settings,
 }
 
@@ -928,10 +929,7 @@ impl DesktopUiModel {
             return;
         };
         self.selected_project_id = Some(project.project_id.clone());
-        self.selected_mission_id = project
-            .missions
-            .last()
-            .map(|mission| mission.mission_id.clone());
+        self.selected_mission_id = None;
         self.notice = None;
     }
 
@@ -1340,7 +1338,17 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     let mut mission_list_filter = use_signal(product_experience::TaskFilter::default);
     let mut model = use_signal(move || initial_model);
     let mut reloading_workspace = use_signal(|| false);
-    let mut draft = use_signal(String::new);
+    let composer_drafts = use_signal(task_entry::ComposerDrafts::default);
+    let draft_handle = use_memo(move || {
+        let current = model.read();
+        let scope = (
+            current.selected_project_id.clone(),
+            current.selected_mission_id.clone(),
+        );
+        task_entry::DraftHandle::bind(composer_drafts, scope)
+    });
+    let mut draft = draft_handle();
+    let mut task_drafts = use_signal(task_entry::TaskDrafts::new);
     let mut catalog_manifest_id = use_signal(String::new);
     let mut catalog_mode = use_signal(String::new);
     let mut catalog_market = use_signal(String::new);
@@ -1428,11 +1436,18 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
         }
         let selection_change = {
             let mut paint = runtime_execution_paint.write();
-            paint.reconcile_selection(
+            let was_awaiting_paint = paint.pending_paint_commit().is_some();
+            let change = paint.reconcile_selection(
                 selected_scope
                     .as_ref()
                     .map(|(project_id, mission_id)| (project_id, mission_id)),
-            )
+            );
+            if was_awaiting_paint && paint.pending_paint_commit().is_none() {
+                mission_submitting.set(false);
+                runtime_retrying.set(false);
+                pending_catalog_continuation.write().take();
+            }
+            change
         };
         let selection_change = match selection_change {
             Ok(change) => change,
@@ -1666,7 +1681,11 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
         .as_ref()
         .map_or_else(|| "项目总调度".to_owned(), |item| item.title.clone());
     let surface_heading = surface_heading(current_surface, &mission_title);
-    let surface_context = surface_context_label(current_surface);
+    let surface_context = if current_surface == Surface::Orchestrator && mission.is_none() {
+        "项目总调度"
+    } else {
+        surface_context_label(current_surface)
+    };
     let workpad_visible =
         workpad_open() && current_surface == Surface::Orchestrator && mission.is_some();
     let selected_result_id_value = selected_result_id.read().clone();
@@ -1875,7 +1894,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     let catalog_contract_ready = !selected_manifest_id.is_empty()
         && selected_mode_is_allowed
         && operating_mode_from_catalog_name(&selected_mode).is_some()
-        && !draft.read().trim().is_empty()
+        && !draft.get().trim().is_empty()
         && mission_specific_contract_ready
         && (vm11_selected
             || (!market_value.trim().is_empty()
@@ -2111,12 +2130,12 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
         project_can_start_mission && human_route_active && !runtime_busy;
     let can_submit_human_confirmation = can_edit_human_confirmation
         && !vm11_outcome_decision_active
-        && !draft.read().trim().is_empty()
+        && !draft.get().trim().is_empty()
         && (!human_requires_work_product || !selected_human_work_product_ids.is_empty());
     let can_submit_vm11_outcome_decision = can_edit_human_confirmation
         && vm11_outcome_decision_active
         && selected_vm11_action_available
-        && !draft.read().trim().is_empty();
+        && !draft.get().trim().is_empty();
     let can_execute_application_route =
         project_can_start_mission && application_route_active && !runtime_busy;
     let can_resolve_vm11_next_contract =
@@ -2187,13 +2206,13 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
             )
         })
         && !runtime_busy;
-    let composer_human_command = is_desktop_human_command(&draft());
+    let composer_human_command = is_desktop_human_command(&draft.get());
     let can_write_composer = can_edit_catalog
         || can_edit_continuation
         || can_edit_human_confirmation
         || can_edit_human_command;
     let can_submit_human_command = can_edit_human_command && composer_human_command;
-    let can_submit_continuation = can_edit_continuation && !draft.read().trim().is_empty();
+    let can_submit_continuation = can_edit_continuation && !draft.get().trim().is_empty();
     let runtime_projection = match &view.backend {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
@@ -3372,6 +3391,98 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
         )
     });
     let can_retry_runtime = runtime_retry_needed && runtime_environment_ready && !runtime_busy;
+    let request_create_task = move |request: DesktopCatalogMissionRequest| {
+        let allowed = {
+            let current = model.read();
+            current.selected_project_id.as_ref() == Some(&request.project_id)
+                && current.selected_mission_id.is_none()
+                && current.can_start_mission()
+        };
+        if !allowed || mission_submitting() || runtime_retrying() {
+            return;
+        }
+        let submitted_project = request.project_id.clone();
+        let submitted_goal = request.goal.clone();
+        runtime_cancellation.set(None);
+        legacy_runtime_scope.set(None);
+        runtime_stop_requested.set(false);
+        runtime_progress.set(Vec::new());
+        mission_submitting.set(true);
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::persistent()
+                    .and_then(|plane| plane.start_catalog_mission_execution_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(started)) => {
+                    task_entry::clear_created_draft(
+                        &mut task_drafts.write(),
+                        &submitted_project,
+                        &submitted_goal,
+                    );
+                    let follow_created = {
+                        let current = model.read();
+                        current.selected_project_id.as_ref() == Some(&submitted_project)
+                            && current.selected_mission_id.is_none()
+                            && surface() == Surface::Orchestrator
+                    };
+                    model.write().set_ready(started.snapshot, false);
+                    if follow_created {
+                        model
+                            .write()
+                            .select_mission(started.handle.mission_id().clone());
+                    }
+                    let commit = {
+                        let current = model.read();
+                        commit_created_task_if_selected(
+                            &mut runtime_execution_paint.write(),
+                            started.handle,
+                            current.selected_project_id.as_ref(),
+                            current.selected_mission_id.as_ref(),
+                        )
+                    };
+                    match commit {
+                        Ok(Some(commit)) => {
+                            let scope = &commit.selection().scope;
+                            runtime_text_scope.set(Some((
+                                scope.project_id().clone(),
+                                scope.mission_id().clone(),
+                            )));
+                            runtime_text_stream.set(None);
+                            runtime_text_error.set(None);
+                            runtime_follow_latest.set(true);
+                            runtime_has_unseen.set(false);
+                            composer_expanded.set(false);
+                            // The existing post-render fence owns Runtime dispatch.
+                        }
+                        Ok(None) => {
+                            // The user left during creation. Keep the durable task
+                            // recoverable without stealing their current workspace.
+                            mission_submitting.set(false);
+                        }
+                        Err(error) => {
+                            runtime_text_error
+                                .set(Some(UiFailure::from_runtime_subscription_error(error)));
+                            mission_submitting.set(false);
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    model.write().set_notice(&error);
+                    mission_submitting.set(false);
+                }
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "CATALOG_START_COORDINATOR_FAILED".into(),
+                        message: "任务创建未完成，已保留你的目标与范围，请重试。".into(),
+                    });
+                    mission_submitting.set(false);
+                }
+            }
+        });
+    };
+
     let keyboard_has_project = project.is_some();
     let visual_fixture_id = active_visual_fixture_id();
     let visual_fixture_active = visual_fixture_id.is_some();
@@ -3490,17 +3601,17 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                         if keyboard_has_project {
                             model.write().select_dispatcher();
                             surface.set(Surface::Orchestrator);
-                            catalog_contract_expanded.set(true);
+                            catalog_contract_expanded.set(false);
                             composer_expanded.set(true);
+                            workpad_open.set(false);
                             let _ = dioxus::document::eval(
                                 "requestAnimationFrame(() => document.getElementById('mission-composer-input')?.focus())",
                             );
                         }
                     }
-                    Some(AppShortcut::ProjectDispatcher) => {
+                    Some(AppShortcut::QuickEntry) => {
                         event.prevent_default();
                         if keyboard_has_project {
-                            model.write().select_dispatcher();
                             active_overlay.set(ActiveOverlay::None);
                             surface.set(Surface::Orchestrator);
                             composer_expanded.set(true);
@@ -3685,7 +3796,10 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                         onclick: move |_| {
                             model.write().select_dispatcher();
                             surface.set(Surface::Orchestrator);
-                            catalog_contract_expanded.set(true);
+                            catalog_contract_expanded.set(false);
+                            composer_expanded.set(true);
+                            workpad_open.set(false);
+                            restore_ui_focus("mission-composer-input");
                         },
                         UiIcon { name: UiIconName::Plus, size: 15 }
                         span { "新任务" }
@@ -3837,7 +3951,8 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                     onclick: move |_| {
                                                         model.write().select_project(&project_id);
                                                         active_overlay.set(ActiveOverlay::None);
-                                                        surface.set(Surface::Current);
+                                                        workpad_open.set(false);
+                                                        surface.set(Surface::Orchestrator);
                                                     },
                                                     i { class: "project-mark", "{project_initials(&item.name)}" }
                                                     span { strong { "{item.name}" } small { "revision {item.revision} · {encryption_short_label(&item.encryption)}" } }
@@ -4082,7 +4197,26 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                             EmptyState { code: "INTEGRITY_ERROR", title: "机器合同不可用", detail: "Catalog 未通过加载与验证，能力声明已停止显示。" }
                         }
 
-                        if current_surface == Surface::Orchestrator && !visual_fixture_mode && product_experience::legacy_media_entry_available(mission.as_ref(), runtime_busy, runtime_retry_needed) {
+                        if current_surface == Surface::Orchestrator && mission.is_none() && project.is_some() && !visual_fixture_mode {
+                            task_entry::NewTaskEntry {
+                                key: "{project.as_ref().unwrap().project_id}",
+                                project_id: project.as_ref().unwrap().project_id.clone(),
+                                project_name: project_name.clone(),
+                                routes: catalog_routes.clone(),
+                                parents: parent_mission_candidates.clone(),
+                                available: project_can_start_mission,
+                                model_ready: runtime_environment_ready,
+                                model_label: runtime_chip.clone(),
+                                submitting: runtime_busy,
+                                drafts: task_drafts,
+                                expanded: composer_expanded,
+                                on_create: request_create_task,
+                                on_open_settings: move |()| {
+                                    surface_before_settings.set(current_surface);
+                                    surface.set(Surface::Settings);
+                                },
+                            }
+                        } else if current_surface == Surface::Orchestrator && !visual_fixture_mode && product_experience::legacy_media_entry_available(mission.as_ref(), runtime_busy, runtime_retry_needed) {
                             div { class: "task-creation-bar",
                                 div { strong { "继续准备创意素材" } small { "这条旧任务尚不支持对话。你可以在工作台修改描述、生成新版本和导出成果。" } }
                                 button { class: "task-primary-action", onclick: move |_| workpad_open.set(true), "打开创意工作台" }
@@ -4578,7 +4712,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                 }
                                 textarea {
                                     id: "mission-composer-input",
-                                    value: "{draft}",
+                                    value: if project_can_start_mission { draft.get() } else { String::new() },
                                     disabled: !can_write_composer,
                                     aria_label: "任务要求与补充说明",
                                     placeholder: if mission.is_some() {
@@ -5274,7 +5408,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                             "desktop-human-command:{}",
                                                             command_nonce.as_str(),
                                                         ),
-                                                        line: draft(),
+                                                        line: draft.get(),
                                                     };
                                                     let cancellation = LifecycleCancellation::default();
                                                     human_command_result.set(None);
@@ -5283,6 +5417,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                     runtime_stop_requested.set(false);
                                                     runtime_progress.set(Vec::new());
                                                     mission_submitting.set(true);
+                                                    let submitted_draft = draft.submission();
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::persistent().and_then(|plane| {
@@ -5302,7 +5437,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                 );
                                                                 human_command_result.set(Some(result));
                                                                 if succeeded {
-                                                                    draft.set(String::new());
+                                                                    submitted_draft.clear();
                                                                 }
                                                             }
                                                             Ok(Ok(DesktopHumanCommandDispatch::NotCommand)) => {
@@ -5371,7 +5506,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                 mission_id,
                                                                 action,
                                                                 message_id: message_id.clone(),
-                                                                rationale: draft(),
+                                                                rationale: draft.get(),
                                                                 idempotency_key: format!("desktop-vm11-outcome-decision:{}", message_id.as_str()),
                                                                 expected_review_projection_digest,
                                                                 expected_review_completion_digest,
@@ -5380,7 +5515,8 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                 expected_conversation_revision,
                                                             };
                                                             mission_submitting.set(true);
-                                                            spawn(async move {
+                                                            let submitted_draft = draft.submission();
+                                                    spawn(async move {
                                                                 let result = tokio::task::spawn_blocking(move || {
                                                                     DesktopDataPlane::persistent().and_then(|plane| {
                                                                         plane.decide_vm11_outcome_review_os(request, Utc::now())
@@ -5390,7 +5526,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                 match result {
                                                                     Ok(Ok(snapshot)) => {
                                                                         model.write().set_ready(snapshot, false);
-                                                                        draft.set(String::new());
+                                                                        submitted_draft.clear();
                                                                         vm11_outcome_action.set(None);
                                                                     }
                                                                     Ok(Err(error)) => model.write().set_notice(&error),
@@ -5448,7 +5584,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                 mission_id,
                                                                 checkpoint_id,
                                                                 message_id: message_id.clone(),
-                                                                body: draft(),
+                                                                body: draft.get(),
                                                                 idempotency_key: format!("desktop-human-confirmation:{}", message_id.as_str()),
                                                                 work_product_ids: selected_human_work_product_ids.clone(),
                                                                 expected_mission_revision,
@@ -5456,7 +5592,8 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                 expected_conversation_revision,
                                                             };
                                                             mission_submitting.set(true);
-                                                            spawn(async move {
+                                                            let submitted_draft = draft.submission();
+                                                    spawn(async move {
                                                                 let result = tokio::task::spawn_blocking(move || {
                                                                     DesktopDataPlane::persistent().and_then(|plane| {
                                                                         plane.confirm_human_mission_checkpoint_os(request, Utc::now())
@@ -5466,7 +5603,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                 match result {
                                                                     Ok(Ok(snapshot)) => {
                                                                         model.write().set_ready(snapshot, false);
-                                                                        draft.set(String::new());
+                                                                        submitted_draft.clear();
                                                                         human_work_product_selection.write().clear();
                                                                     }
                                                                     Ok(Err(error)) => model.write().set_notice(&error),
@@ -5522,7 +5659,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                         idempotency_key: format!("desktop-message:{}", message_id.as_str()),
                                                         message_id,
                                                         kind: MissionConversationMessageKind::Steering,
-                                                        body: draft(),
+                                                        body: draft.get(),
                                                         expected_conversation_revision: expected_revision,
                                                     };
                                                     if is_catalog {
@@ -5590,6 +5727,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                         mission_submitting,
                                                         runtime_retrying,
                                                     );
+                                                    let submitted_draft = draft.submission();
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::persistent().and_then(|plane| {
@@ -5604,7 +5742,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                         match result {
                                                             Ok(Ok(submission)) => {
                                                                 model.write().set_ready(submission.snapshot, false);
-                                                                draft.set(String::new());
+                                                                submitted_draft.clear();
                                                             }
                                                             Ok(Err(error)) => model.write().set_notice(&error),
                                                             Err(_) => {
@@ -5631,7 +5769,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                     let project_id = model.read().selected_project_id.clone();
                                                     let manifest_id = catalog_manifest_id();
                                                     let mode = operating_mode_from_catalog_name(&catalog_mode());
-                                                    let goal = draft();
+                                                    let goal = draft.get();
                                                     let market = catalog_market();
                                                     let language = catalog_language();
                                                     let audience = catalog_audience();
@@ -5682,6 +5820,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                     runtime_stop_requested.set(false);
                                                     runtime_progress.set(Vec::new());
                                                     mission_submitting.set(true);
+                                                    let submitted_draft = draft.submission();
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::persistent().and_then(|plane| {
@@ -5709,7 +5848,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                         runtime_text_error.set(None);
                                                                         runtime_follow_latest.set(true);
                                                                         runtime_has_unseen.set(false);
-                                                                        draft.set(String::new());
+                                                                        submitted_draft.clear();
                                                                         catalog_manifest_id.set(String::new());
                                                                         catalog_mode.set(String::new());
                                                                         catalog_parent_mission_id.set(String::new());
@@ -5861,7 +6000,8 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                     on_project: move |project_id| {
                         model.write().select_project(&project_id);
                         active_overlay.set(ActiveOverlay::None);
-                        surface.set(Surface::Current);
+                        workpad_open.set(false);
+                        surface.set(Surface::Orchestrator);
                     },
                     on_mission: move |(project_id, mission_id)| {
                         model.write().select_project(&project_id);
@@ -11167,8 +11307,9 @@ fn begin_catalog_continuation_after_paint(
     launch: DesktopRuntimeExecutionLaunch,
     request: DesktopMissionContinuationRequest,
     ui: RuntimeExecutionUiSignals,
-    draft_to_clear: Signal<String>,
+    draft_to_clear: task_entry::DraftHandle,
 ) {
+    let draft_to_clear = draft_to_clear.submission_for(request.body.clone());
     let selection = launch.selection().clone();
     let identity = launch.identity().clone();
     begin_runtime_execution_progress_monitor(ui, identity.clone());
@@ -11193,7 +11334,7 @@ async fn coordinate_runtime_and_subscription(
     mut ui: RuntimeExecutionUiSignals,
     identity: DesktopRuntimeCommandIdentity,
     runtime_task: tokio::task::JoinHandle<Result<DesktopMissionSubmission, DesktopDataError>>,
-    draft_to_clear: Option<Signal<String>>,
+    draft_to_clear: Option<task_entry::DraftSubmission>,
 ) {
     let mut runtime_task = Some(runtime_task);
     let mut runtime_result = None::<DesktopRuntimeTaskResult>;
@@ -11291,7 +11432,7 @@ fn finish_catalog_runtime_execution(
     mut ui: RuntimeExecutionUiSignals,
     identity: &DesktopRuntimeCommandIdentity,
     runtime_result: Option<DesktopRuntimeTaskResult>,
-    draft_to_clear: Option<Signal<String>>,
+    draft_to_clear: Option<task_entry::DraftSubmission>,
 ) {
     sync_runtime_execution_progress(ui.text.paint, identity, ui.progress);
     let Some(runtime_result) = runtime_result else {
@@ -11324,8 +11465,8 @@ fn finish_catalog_runtime_execution(
             match runtime_result {
                 Ok(Ok(submission)) => {
                     ui.model.write().set_ready(submission.snapshot, false);
-                    if let Some(mut draft) = draft_to_clear {
-                        draft.set(String::new());
+                    if let Some(submitted_draft) = draft_to_clear {
+                        submitted_draft.clear();
                     }
                 }
                 Ok(Err(error)) => ui.model.write().set_notice(&error),
@@ -11870,7 +12011,7 @@ fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<AppShortcut> {
     if character.eq_ignore_ascii_case("p") {
         Some(AppShortcut::GlobalSearch)
     } else if character.eq_ignore_ascii_case("k") {
-        Some(AppShortcut::ProjectDispatcher)
+        Some(AppShortcut::QuickEntry)
     } else if character.eq_ignore_ascii_case("n") {
         Some(AppShortcut::NewTask)
     } else if character == "," {
@@ -11905,8 +12046,9 @@ fn cycle_dialog_focus(selector: &str, reverse: bool) {
 }
 
 fn restore_ui_focus(element_id: &str) {
-    let script =
-        format!("requestAnimationFrame(() => document.getElementById({element_id:?})?.focus())");
+    let script = format!(
+        "requestAnimationFrame(() => {{ const element = document.getElementById({element_id:?}); const details = element?.closest('details'); if (details) details.open = true; element?.focus(); }})"
+    );
     let _ = dioxus::document::eval(&script);
 }
 
@@ -12006,6 +12148,18 @@ fn settings_panel_label(panel: &str) -> &'static str {
         "usage" => "用量",
         _ => "设置",
     }
+}
+
+fn commit_created_task_if_selected(
+    paint: &mut DesktopRuntimeExecutionPaintState,
+    handle: hartevo_application::CatalogMissionExecutionHandle,
+    project_id: Option<&ProjectId>,
+    mission_id: Option<&MissionId>,
+) -> Result<Option<DesktopRuntimePaintCommit>, RuntimeSubscriptionError> {
+    if project_id != Some(handle.project_id()) || mission_id != Some(handle.mission_id()) {
+        return Ok(None);
+    }
+    paint.commit_catalog_start(handle).map(Some)
 }
 
 fn status_label(model: &DesktopUiModel, executing: bool) -> String {
@@ -12926,6 +13080,35 @@ mod tests {
         (paint, handle, selection, identity)
     }
 
+    #[test]
+    fn navigating_during_creation_leaves_paint_idle_and_allows_a_later_start() {
+        let mut paint = DesktopRuntimeExecutionPaintState::default();
+        let handle = execution_paint_handle();
+        let other_project = ProjectId::from("other-project");
+        let other_mission = MissionId::from("other-mission");
+        for (project, mission) in [
+            (Some(&other_project), None),
+            (Some(handle.project_id()), Some(&other_mission)),
+            (Some(handle.project_id()), None),
+        ] {
+            assert!(
+                commit_created_task_if_selected(&mut paint, handle.clone(), project, mission)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(paint.pending_paint_commit().is_none());
+        }
+        let commit = commit_created_task_if_selected(
+            &mut paint,
+            handle.clone(),
+            Some(handle.project_id()),
+            Some(handle.mission_id()),
+        )
+        .unwrap()
+        .expect("reselected task can be prepared");
+        assert!(acknowledge_runtime_paint_for_dispatch(&mut paint, &commit).is_ok());
+    }
+
     fn execution_turn_value(
         revision: u64,
         status: RuntimeTurnStatus,
@@ -13288,7 +13471,7 @@ mod tests {
         );
         assert_eq!(
             app_shortcut(&Key::Character("k".into()), Modifiers::META),
-            Some(AppShortcut::ProjectDispatcher)
+            Some(AppShortcut::QuickEntry)
         );
         assert_eq!(
             app_shortcut(&Key::Character("N".into()), Modifiers::CONTROL),
