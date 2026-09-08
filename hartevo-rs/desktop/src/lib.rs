@@ -7976,7 +7976,7 @@ fn OrchestratorSurface(
                 return rsx! {
                     div { class: "surface-scroll",
                         ProjectDispatcherSurface { project, live_attention, on_select_mission }
-                        details { class: "persisted-state-details",
+                        details { class: "persisted-state-details dispatcher-diagnostics",
                             summary { "运行详情" }
                         AgentOperationsWorkbench {
                             projection: operations.clone(),

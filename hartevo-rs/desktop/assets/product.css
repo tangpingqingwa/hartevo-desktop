@@ -29,6 +29,8 @@
 .task-entry-fields label > span { font-weight:550; }
 .task-entry-fields .task-entry-wide { grid-column:1 / -1; }
 .task-entry-fields input,.task-entry-fields select { width:100%; min-height:38px; padding:8px 10px; border:1px solid #dedee1; border-radius:6px; background:#fafafb; color:var(--ink); font:inherit; font-size:13px; }
+.task-entry-fields select { height:38px; }
+.dispatcher-diagnostics > summary { display:flex; font-size:12px; }
 .task-entry-fields input::placeholder { color:#85868b; }
 .task-entry-fields input[aria-invalid="true"],.task-entry-fields select[aria-invalid="true"] { border-color:var(--red); }
 .task-entry-fields small { color:#73747a; line-height:1.6; }

@@ -462,21 +462,22 @@ pub(crate) fn NewTaskEntry(
                             span { "任务方向" }
                             select { id: "task-entry-route", value: "{state.route}", disabled: scope_locked,
                                 aria_invalid: invalid("task-entry-route"),
+                                onmounted: move |_| restore_ui_focus("task-entry-route"),
                                 onchange: move |event| {
                                     let id = event.value();
                                     let mode = route_choices.iter().find(|route| route.mission_id == id).and_then(|route| route.modes.first()).cloned().unwrap_or_default();
                                     let mut current = form.write(); current.route = id; current.mode = mode; current.parent.clear();
                                 },
-                                option { value: "", "选择要推进的工作…" }
-                                for route in routes { option { value: "{route.mission_id}", "{route_label(&route.mission_id)}" } }
+                                option { value: "", selected: state.route.is_empty(), "选择要推进的工作…" }
+                                for route in routes { option { value: "{route.mission_id}", selected: state.route == route.mission_id, "{route_label(&route.mission_id)}" } }
                             }
                         }
                         if state.route == "VM-11" {
                             label { class: "task-entry-wide", r#for: "task-entry-parent", span { "要复盘的任务" }
                                 select { id: "task-entry-parent", value: "{state.parent}", disabled: scope_locked,
                                     aria_invalid: invalid("task-entry-parent"), onchange: move |event| form.write().parent = event.value(),
-                                    option { value: "", "选择当前项目中的任务…" }
-                                    for (id, label) in parents { option { value: "{id}", "{label}" } }
+                                    option { value: "", selected: state.parent.is_empty(), "选择当前项目中的任务…" }
+                                    for (id, label) in parents { option { value: "{id}", selected: state.parent == id.as_str(), "{label}" } }
                                 }
                                 small { "沿用原任务的市场、预算与衡量标准。" }
                             }
@@ -486,9 +487,9 @@ pub(crate) fn NewTaskEntry(
                             }
                             label { r#for: "task-entry-language", span { "内容语言" }
                                 select { id: "task-entry-language", value: "{state.language}", disabled: scope_locked, onchange: move |event| form.write().language = event.value(),
-                                    option { value: "zh-CN", "简体中文" } option { value: "en-US", "英语" }
-                                    option { value: "de-DE", "德语" } option { value: "ja-JP", "日语" }
-                                    option { value: "fr-FR", "法语" } option { value: "es-ES", "西班牙语" }
+                                    for (id, label) in [("zh-CN", "简体中文"), ("en-US", "英语"), ("de-DE", "德语"), ("ja-JP", "日语"), ("fr-FR", "法语"), ("es-ES", "西班牙语")] {
+                                        option { value: id, selected: state.language == id, "{label}" }
+                                    }
                                 }
                             }
                             label { class: "task-entry-wide", r#for: "task-entry-audience", span { "面向谁" }
@@ -502,13 +503,15 @@ pub(crate) fn NewTaskEntry(
                             label { class: "task-entry-wide", r#for: "task-entry-mode", span { "运行方式" }
                                 select { id: "task-entry-mode", value: "{state.mode}", disabled: scope_locked, onchange: move |event| form.write().mode = event.value(),
                                     if modes.is_empty() { option { value: "", "先选择任务方向" } }
-                                    for mode in modes { option { value: "{mode}", "{mode_label(&mode)}" } }
+                                    for mode in modes { option { value: "{mode}", selected: state.mode == mode, "{mode_label(&mode)}" } }
                                 }
                             }
                             if state.route != "VM-11" {
                                 label { r#for: "task-entry-currency", span { "预算币种" }
                                     select { id: "task-entry-currency", value: "{state.currency}", disabled: scope_locked, onchange: move |event| form.write().currency = event.value(),
-                                        option { value: "USD", "美元 USD" } option { value: "CNY", "人民币 CNY" } option { value: "EUR", "欧元 EUR" } option { value: "GBP", "英镑 GBP" } option { value: "JPY", "日元 JPY" }
+                                        for (id, label) in [("USD", "美元 USD"), ("CNY", "人民币 CNY"), ("EUR", "欧元 EUR"), ("GBP", "英镑 GBP"), ("JPY", "日元 JPY")] {
+                                            option { value: id, selected: state.currency == id, "{label}" }
+                                        }
                                     }
                                 }
                                 label { r#for: "task-entry-budget", span { "预算上限（{state.currency}）" }
@@ -516,7 +519,9 @@ pub(crate) fn NewTaskEntry(
                                 }
                                 label { r#for: "task-entry-metric", span { "衡量指标" }
                                     select { id: "task-entry-metric", value: "{state.metric}", disabled: scope_locked, onchange: move |event| form.write().metric = event.value(),
-                                        option { value: "work_product_count", "可审阅成果数" } option { value: "lead_qualified_count", "合格线索数" } option { value: "conversion_count", "转化数" }
+                                        for (id, label) in [("work_product_count", "可审阅成果数"), ("lead_qualified_count", "合格线索数"), ("conversion_count", "转化数")] {
+                                            option { value: id, selected: state.metric == id, "{label}" }
+                                        }
                                     }
                                 }
                                 label { r#for: "task-entry-target", span { "至少达到" }
