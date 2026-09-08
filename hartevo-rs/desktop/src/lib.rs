@@ -1616,7 +1616,12 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                         mission_submitting.set(false);
                         return;
                     }
-                    begin_catalog_continuation_after_paint(launch, pending.request, ui, draft);
+                    begin_catalog_continuation_after_paint(
+                        launch,
+                        pending.request,
+                        ui,
+                        pending.draft,
+                    );
                 } else {
                     begin_catalog_runtime_execution_after_paint(launch, ui);
                 }
@@ -2179,7 +2184,10 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     let can_edit_continuation = project_can_start_mission
         && !human_route_active
         && !waiting_approval_grant_active
-        && catalog_continuation_handle_ready
+        && (catalog_continuation_handle_ready
+            || mission.as_ref().is_some_and(|mission| {
+                can_restore_catalog_continuation(mission, runtime_activity.as_ref())
+            }))
         && mission.as_ref().is_some_and(|mission| {
             mission.conversation_revision.is_some()
                 && matches!(
@@ -5641,12 +5649,13 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                         mission.mission_id.clone(),
                                                                         revision,
                                                                         mission.manifest_id.is_some(),
+                                                                        ContinuationRestoreFence::from(mission),
                                                                     )
                                                                 })
                                                             }),
                                                         )
                                                     };
-                                                    let Some((project_id, (mission_id, expected_revision, is_catalog))) = selection else {
+                                                    let Some((project_id, (mission_id, expected_revision, is_catalog, restore_fence))) = selection else {
                                                         model.write().notice = Some(UiFailure {
                                                             code: "NOT_IMPLEMENTED".into(),
                                                             message: "该 Mission 没有持久 Conversation；legacy bootstrap 不会伪装成可续写会话。".into(),
@@ -5664,6 +5673,85 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                         expected_conversation_revision: expected_revision,
                                                     };
                                                     if is_catalog {
+                                                        let handle_ready = runtime_execution_paint.peek()
+                                                            .catalog_continuation_ready_for_selection(&project_id, &mission_id);
+                                                        if !handle_ready {
+                                                            // Explicit Send after a cold open: reacquire a signed
+                                                            // handle without running the previous goal. The pending
+                                                            // continuation still needs the normal rendered-paint ack.
+                                                            mission_submitting.set(true);
+                                                            spawn(async move {
+                                                                let result = tokio::task::spawn_blocking(move || {
+                                                                    DesktopDataPlane::persistent().and_then(|plane| {
+                                                                        plane.prepare_catalog_mission_runtime_resume_os(&project_id, &mission_id, Utc::now())
+                                                                    })
+                                                                }).await;
+                                                                match result {
+                                                                    Ok(Ok(started)) => {
+                                                                        let still_selected = {
+                                                                            let current = model.peek();
+                                                                            current.can_start_mission()
+                                                                                && current.selected_project_id.as_ref() == Some(&request.project_id)
+                                                                                && current.selected_mission_id.as_ref() == Some(&request.mission_id)
+                                                                                && *surface.peek() == Surface::Orchestrator
+                                                                        };
+                                                                        if !still_selected {
+                                                                            mission_submitting.set(false);
+                                                                            return;
+                                                                        }
+                                                                        model.write().set_ready(started.snapshot, false);
+                                                                        let scope_ready = {
+                                                                            let current = model.peek();
+                                                                            current.can_start_mission() && current.current_mission().is_some_and(|mission| {
+                                                                                restore_fence == ContinuationRestoreFence::from(mission)
+                                                                                    && mission.conversation_revision == Some(request.expected_conversation_revision)
+                                                                                    && can_restore_catalog_continuation(mission, current.current_runtime_activity())
+                                                                            })
+                                                                        };
+                                                                        if !scope_ready {
+                                                                            model.write().notice = Some(UiFailure {
+                                                                                code: "CONVERSATION_CHANGED".into(),
+                                                                                message: "任务状态已更新，草稿已保留。请检查最新进展后重新发送。".into(),
+                                                                            });
+                                                                            mission_submitting.set(false);
+                                                                            return;
+                                                                        }
+                                                                        let commit = runtime_execution_paint.write().commit_catalog_start(started.handle);
+                                                                        match commit {
+                                                                            Ok(commit) => {
+                                                                                pending_catalog_continuation.set(Some(PendingCatalogContinuation {
+                                                                                    identity: commit.identity().clone(), request, draft,
+                                                                                }));
+                                                                                let scope = &commit.selection().scope;
+                                                                                runtime_text_scope.set(Some((scope.project_id().clone(), scope.mission_id().clone())));
+                                                                                runtime_text_stream.set(None);
+                                                                                runtime_text_error.set(None);
+                                                                                runtime_follow_latest.set(true);
+                                                                                runtime_has_unseen.set(false);
+                                                                                runtime_stop_requested.set(false);
+                                                                                runtime_progress.set(Vec::new());
+                                                                            }
+                                                                            Err(error) => {
+                                                                                model.write().notice = Some(UiFailure::from_runtime_subscription_error(error));
+                                                                                mission_submitting.set(false);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Ok(Err(error)) => {
+                                                                        model.write().set_notice(&error);
+                                                                        mission_submitting.set(false);
+                                                                    }
+                                                                    Err(_) => {
+                                                                        model.write().notice = Some(UiFailure {
+                                                                            code: "CONTINUATION_RESTORE_FAILED".into(),
+                                                                            message: "暂时无法恢复任务，草稿已保留，请重试。".into(),
+                                                                        });
+                                                                        mission_submitting.set(false);
+                                                                    }
+                                                                }
+                                                            });
+                                                            return;
+                                                        }
                                                         let commit = runtime_execution_paint
                                                             .write()
                                                             .commit_catalog_continuation_for_selection(
@@ -5676,6 +5764,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                     PendingCatalogContinuation {
                                                                         identity: commit.identity().clone(),
                                                                         request,
+                                                                        draft,
                                                                     },
                                                                 ));
                                                                 let scope = &commit.selection().scope;
@@ -11222,6 +11311,30 @@ struct RuntimeExecutionUiSignals {
 struct PendingCatalogContinuation {
     identity: DesktopRuntimeCommandIdentity,
     request: DesktopMissionContinuationRequest,
+    draft: task_entry::DraftHandle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContinuationRestoreFence {
+    project_id: ProjectId,
+    mission_id: MissionId,
+    mission_revision: u64,
+    conversation_revision: Option<u64>,
+    checkpoint_id: Option<String>,
+    checkpoint_revision: Option<u64>,
+}
+
+impl From<&MissionProjection> for ContinuationRestoreFence {
+    fn from(mission: &MissionProjection) -> Self {
+        Self {
+            project_id: mission.project_id.clone(),
+            mission_id: mission.mission_id.clone(),
+            mission_revision: mission.revision,
+            conversation_revision: mission.conversation_revision,
+            checkpoint_id: mission.current_checkpoint_id.clone(),
+            checkpoint_revision: mission.current_checkpoint_revision,
+        }
+    }
 }
 
 type DesktopRuntimeTaskResult =
@@ -12573,6 +12686,25 @@ fn runtime_activity_note(activity: &MissionRuntimeProjection, work_product_count
         }
         None => "NOT_STARTED：尚无 Runtime ledger；没有 Work Product 或完成声明。".into(),
     }
+}
+
+fn can_restore_catalog_continuation(
+    mission: &MissionProjection,
+    activity: Option<&MissionRuntimeProjection>,
+) -> bool {
+    mission.manifest_id.is_some()
+        && mission.conversation_revision.is_some()
+        && mission.stage == MissionStage::Running
+        && mission.current_checkpoint_status == Some(MissionCheckpointStatus::Running)
+        && mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Runtime)
+        && mission.current_checkpoint_completion_policy
+            == Some(MissionCheckpointCompletionPolicy::WorkProduct)
+        && activity.is_none_or(|activity| {
+            !activity.requires_reconciliation
+                && !activity
+                    .turn_status
+                    .is_some_and(RuntimeTurnStatus::is_active)
+        })
 }
 
 fn mission_runtime_retry_needed(
@@ -14581,6 +14713,86 @@ mod tests {
             assert!(
                 !source.contains(&forbidden),
                 "settings source contains forbidden credential rendering"
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_restore_rejects_advanced_or_different_task_state() {
+        let (_, mission) =
+            result_adoption_surface::tests::project_and_mission(WorkProductStatus::ReadyForReview);
+        let frozen = ContinuationRestoreFence::from(&mission);
+        assert_eq!(frozen, ContinuationRestoreFence::from(&mission.clone()));
+        for change in 0..6 {
+            let mut changed = mission.clone();
+            match change {
+                0 => changed.project_id = ProjectId::from("different-project"),
+                1 => changed.mission_id = MissionId::from("different-task"),
+                2 => changed.revision += 1,
+                3 => {
+                    changed.conversation_revision =
+                        Some(mission.conversation_revision.unwrap_or(0) + 1);
+                }
+                4 => changed.current_checkpoint_id = Some("next-checkpoint".into()),
+                _ => {
+                    changed.current_checkpoint_revision =
+                        Some(mission.current_checkpoint_revision.unwrap_or(0) + 1);
+                }
+            }
+            assert_ne!(
+                frozen,
+                ContinuationRestoreFence::from(&changed),
+                "accepted drift {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_continuation_only_prepares_idle_runtime_work_product_checkpoints() {
+        let (_, mut mission) =
+            result_adoption_surface::tests::project_and_mission(WorkProductStatus::ReadyForReview);
+        mission.manifest_id = Some("VM-04".into());
+        mission.conversation_revision = Some(2);
+        mission.stage = MissionStage::Running;
+        mission.current_checkpoint_status = Some(MissionCheckpointStatus::Running);
+        mission.current_checkpoint_executor = Some(MissionCheckpointExecutor::Runtime);
+        mission.current_checkpoint_completion_policy =
+            Some(MissionCheckpointCompletionPolicy::WorkProduct);
+        let mut activity = MissionRuntimeProjection {
+            project_id: mission.project_id.clone(),
+            mission_id: mission.mission_id.clone(),
+            process_claim_status: Some(RuntimeProcessClaimStatus::Terminated),
+            process_cleanup_attempt_count: 0,
+            recovery_status: Some(RuntimeRecoveryStatus::Attached),
+            recovery_failure_count: 0,
+            recovery_process_attempt: Some(1),
+            turn_status: Some(RuntimeTurnStatus::Completed),
+            turn_failure_count: 0,
+            turn_evidence_count: 1,
+            last_updated_at: Some(Utc::now()),
+            requires_reconciliation: false,
+        };
+        assert!(can_restore_catalog_continuation(&mission, Some(&activity)));
+        activity.turn_status = Some(RuntimeTurnStatus::Running);
+        assert!(!can_restore_catalog_continuation(&mission, Some(&activity)));
+        activity.turn_status = Some(RuntimeTurnStatus::Completed);
+        activity.requires_reconciliation = true;
+        assert!(!can_restore_catalog_continuation(&mission, Some(&activity)));
+        for change in 0..5 {
+            let mut changed = mission.clone();
+            match change {
+                0 => changed.current_checkpoint_executor = Some(MissionCheckpointExecutor::Human),
+                1 => {
+                    changed.current_checkpoint_completion_policy =
+                        Some(MissionCheckpointCompletionPolicy::HumanConfirmation);
+                }
+                2 => changed.stage = MissionStage::Completed,
+                3 => changed.manifest_id = None,
+                _ => changed.conversation_revision = None,
+            }
+            assert!(
+                !can_restore_catalog_continuation(&changed, None),
+                "accepted route {change}"
             );
         }
     }
