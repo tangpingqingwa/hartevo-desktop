@@ -5699,23 +5699,28 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                                             mission_submitting.set(false);
                                                                             return;
                                                                         }
-                                                                        model.write().set_ready(started.snapshot, false);
-                                                                        let scope_ready = {
+                                                                        let prepared_view = {
                                                                             let current = model.peek();
-                                                                            current.can_start_mission() && current.current_mission().is_some_and(|mission| {
-                                                                                restore_fence == ContinuationRestoreFence::from(mission)
+                                                                            let mut prepared = current.clone();
+                                                                            prepared.set_ready(started.snapshot, false);
+                                                                            let valid = current.can_start_mission() && prepared.can_start_mission()
+                                                                                && current.current_mission().zip(prepared.current_mission()).is_some_and(|(current_mission, mission)| {
+                                                                                restore_fence.matches_current_and_prepared(current_mission, mission)
                                                                                     && mission.conversation_revision == Some(request.expected_conversation_revision)
-                                                                                    && can_restore_catalog_continuation(mission, current.current_runtime_activity())
+                                                                                    && can_restore_catalog_continuation(mission, prepared.current_runtime_activity())
                                                                             })
+                                                                            ;
+                                                                            valid.then_some(prepared)
                                                                         };
-                                                                        if !scope_ready {
+                                                                        let Some(prepared_view) = prepared_view else {
                                                                             model.write().notice = Some(UiFailure {
                                                                                 code: "CONVERSATION_CHANGED".into(),
                                                                                 message: "任务状态已更新，草稿已保留。请检查最新进展后重新发送。".into(),
                                                                             });
                                                                             mission_submitting.set(false);
                                                                             return;
-                                                                        }
+                                                                        };
+                                                                        model.set(prepared_view);
                                                                         let commit = runtime_execution_paint.write().commit_catalog_start(started.handle);
                                                                         match commit {
                                                                             Ok(commit) => {
@@ -11337,6 +11342,16 @@ impl From<&MissionProjection> for ContinuationRestoreFence {
     }
 }
 
+impl ContinuationRestoreFence {
+    fn matches_current_and_prepared(
+        &self,
+        current: &MissionProjection,
+        prepared: &MissionProjection,
+    ) -> bool {
+        self == &Self::from(current) && self == &Self::from(prepared)
+    }
+}
+
 type DesktopRuntimeTaskResult =
     Result<Result<DesktopMissionSubmission, DesktopDataError>, tokio::task::JoinError>;
 
@@ -14745,6 +14760,21 @@ mod tests {
                 "accepted drift {change}"
             );
         }
+    }
+
+    #[test]
+    fn continuation_restore_does_not_replace_newer_current_state_with_an_old_preparation() {
+        let (_, prepared_a) =
+            result_adoption_surface::tests::project_and_mission(WorkProductStatus::ReadyForReview);
+        let frozen = ContinuationRestoreFence::from(&prepared_a);
+        let mut current_b = prepared_a.clone();
+        current_b.revision += 1;
+        current_b.current_checkpoint_id = Some("next-checkpoint".into());
+        let before = current_b.clone();
+        assert!(!frozen.matches_current_and_prepared(&current_b, &prepared_a));
+        assert_eq!(current_b, before);
+        assert!(!frozen.matches_current_and_prepared(&prepared_a, &current_b));
+        assert!(frozen.matches_current_and_prepared(&prepared_a, &prepared_a));
     }
 
     #[test]
