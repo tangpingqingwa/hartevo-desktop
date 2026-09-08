@@ -475,3 +475,8 @@ P0 本地使用 Fixture 和 Simulator，不依赖生产凭据或真实外部写�
 4. 通用公开基准、垂直开发集、私有 Holdout 与冻结后新鲜集有独立版本、权限、污染记录和样本外报告；
 5. Capability、UI、Runtime、Worker、Browser 和 Provider Trace 能回到具体 Mission/Checkpoint；
 6. 报告能回答 Hartevo 正在替用户经营什么、依据是什么、执行了什么、指标如何变化、何时暂停或进入下一周期。
+
+
+## 默认任务与创意成果体验整改（2026-09-07）
+
+场景、验证要求和当前缺口见 [原生产品体验整改](PRODUCT-EXPERIENCE-REBUILD.md)。必须分别验证真实首屏、当前素材选择、精确采用、系统导出、任务过滤和重开恢复；单元测试不能替代原生窗口验收。此开发体验回归不改变 Release Evidence 或业务效果认证。

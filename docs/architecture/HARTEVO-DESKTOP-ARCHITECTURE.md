@@ -10,6 +10,14 @@
 
 `hartevo-domain-kernel::mission_loop` 为既有 Mission 增加有限切片、peer claim、scoped user gate、quota、monitor 与 typed continuation；Mission/Operating Contract 仍拥有业务状态和完成条件。SQLCipher v52 同事务保存 loop revision、operation receipt、验证后的推进结算和 Event/Outbox。Application 通过 `run_mission_loop_slice` 调用既有 runner，`bind_cordis_mission_loop_guard` 将持久边界接入 Cordis `agent/pre-step`。桌面只消费 `MissionProjection.loop_accounting`，不拥有配额或租约。接入步骤、验证和限制见 [LoopX Rust 接入清单](../research/LOOPX-RUST-CONTROL-PLANE-INTAKE.md)。
 
+## 用户任务与成果呈现（2026-09-07）
+
+`desktop::product_experience` 是既有 Application 投影的呈现层：任务筛选、目标/成果概览与中文状态不写入 Domain，也不创建第二套 Agent loop。默认页面将 `AgentOperationsWorkbench` 放入 disclosure；待确认操作仍通过原 EventHandler 绑定精确请求。活动执行状态限定在当前项目/任务，不能因其他任务运行而闪烁。
+
+`MediaWorkspace` 用 WorkProduct ID 与 manifest 中的 generation ID 共同确定初始选择。预览通过 `DesktopDataPlane::media_preview_os` 打开已有加密素材；采用继续由原 Application media adoption 校验。文件导出使用既有桌面依赖 rfd 的系统保存对话框，路径确认后重新读取 Context，并校验元数据与摘要才写入用户所选文件。导出不修改 Mission、WorkProduct 或外部 Effect。
+
+视觉层使用现有品牌色与原生 Dioxus 框架，`assets/product.css` 覆盖默认工作面的信息层级与尺寸。行为验收和未补全的产品链路见[体验整改验收](../quality/PRODUCT-EXPERIENCE-REBUILD.md)。
+
 ## Mission 创意素材（2026-09-07）
 
 原生 `MediaWorkspace → DesktopDataPlane → Application → SQLCipher` 提供图片与短视频的生成、描述修改后再生成、预览和精确版本采纳。`hartevo-application::media_provider` 使用有界 HTTPS 调用，生产路径不运行 Python。schema v53 增加 `media_generations`，把请求、原 Provider job ID、历史资产字节保存在本地加密数据库；符合格式的资产与 WorkProduct、Manifest、Mission revision 同事务提交。描述属于私有正文，Event/Outbox 只记录生成 ID、状态和 revision。

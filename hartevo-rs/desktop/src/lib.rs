@@ -45,6 +45,7 @@ pub mod data_plane;
 mod media_workspace;
 #[cfg(feature = "native-journey")]
 pub mod native_runtime_journey;
+mod product_experience;
 mod result_adoption_surface;
 mod runtime_plane;
 mod runtime_subscription;
@@ -93,6 +94,7 @@ use runtime_subscription::{
 
 static MAIN_CSS: Asset = asset!("/assets/main.css");
 static PROTOTYPE_CSS: Asset = asset!("/assets/prototype.css");
+static PRODUCT_CSS: Asset = asset!("/assets/product.css");
 const DESKTOP_TIKTOK_READ_MAX_PAGES: u16 = MAX_VIDEO_SEQUENCE_PAGES;
 #[allow(
     dead_code,
@@ -847,7 +849,7 @@ impl DesktopUiModel {
                     selected_mission_id: None,
                     notice: None,
                 };
-                model.restore_valid_selection(false);
+                model.restore_valid_selection(true);
                 model
             }
             Err(error) => Self {
@@ -906,19 +908,11 @@ impl DesktopUiModel {
             self.selected_mission_id = None;
             return;
         };
-        let existing_is_valid = !select_latest_mission
-            && self.selected_mission_id.as_ref().is_some_and(|id| {
-                project
-                    .missions
-                    .iter()
-                    .any(|mission| &mission.mission_id == id)
-            });
-        if !existing_is_valid {
-            self.selected_mission_id = project
-                .missions
-                .last()
-                .map(|mission| mission.mission_id.clone());
-        }
+        self.selected_mission_id = restored_mission_selection(
+            project,
+            self.selected_mission_id.as_ref(),
+            select_latest_mission,
+        );
     }
 
     fn select_project(&mut self, project_id: &ProjectId) {
@@ -1251,8 +1245,63 @@ fn scoped_runtime_render_projection<'a>(
     }
 }
 
+fn restored_mission_selection(
+    project: &DesktopProjectProjection,
+    selected: Option<&MissionId>,
+    select_latest: bool,
+) -> Option<MissionId> {
+    // None is an intentional dispatcher/new-task selection, not a stale task.
+    // Only cold startup or an explicit request should select the latest task.
+    if !select_latest
+        && selected.is_none_or(|id| project.missions.iter().any(|m| &m.mission_id == id))
+    {
+        selected.cloned()
+    } else {
+        project.missions.last().map(|m| m.mission_id.clone())
+    }
+}
+
 #[component]
 pub fn App() -> Element {
+    let mut initial_model = use_signal(|| None::<DesktopUiModel>);
+    use_future(move || async move {
+        initial_model.set(Some(load_desktop_ui_model().await));
+    });
+    rsx! {
+        document::Title { "Hartevo Desktop" }
+        document::Stylesheet { href: MAIN_CSS }
+        document::Stylesheet { href: PROTOTYPE_CSS }
+        document::Stylesheet { href: PRODUCT_CSS }
+        if let Some(model) = initial_model() {
+            DesktopWorkspace { initial_model: model }
+        } else {
+            main { class: "workspace-opening", aria_busy: true,
+                span { class: "workspace-opening-brand", "Hartevo" }
+                h1 { "正在打开工作空间" }
+                p { role: "status", "正在读取本机加密数据。如果 macOS 弹出钥匙串提示，请在系统窗口中完成授权。" }
+            }
+        }
+    }
+}
+
+async fn load_desktop_ui_model() -> DesktopUiModel {
+    // OS Vault access may wait for system authentication. Keep it off the
+    // native event loop so the window can paint and remain responsive.
+    tokio::task::spawn_blocking(DesktopUiModel::load)
+        .await
+        .unwrap_or_else(|_| DesktopUiModel {
+            backend: DesktopBackendState::Failed(UiFailure::coded(
+                "WORKSPACE_LOAD_FAILED",
+                "工作空间读取失败。请确认系统授权后重新读取。",
+            )),
+            selected_project_id: None,
+            selected_mission_id: None,
+            notice: None,
+        })
+}
+
+#[component]
+fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     let desktop_context = dioxus::desktop::use_window();
     let visual_zoom = active_visual_zoom();
     let visual_fixture_mode = active_visual_fixture_id().is_some();
@@ -1288,7 +1337,9 @@ pub fn App() -> Element {
         initial_visual_runtime_progress(visual_runtime_state, legacy_visual_streaming_fixture);
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
-    let mut model = use_signal(DesktopUiModel::load);
+    let mut mission_list_filter = use_signal(product_experience::TaskFilter::default);
+    let mut model = use_signal(move || initial_model);
+    let mut reloading_workspace = use_signal(|| false);
     let mut draft = use_signal(String::new);
     let mut catalog_manifest_id = use_signal(String::new);
     let mut catalog_mode = use_signal(String::new);
@@ -1311,6 +1362,7 @@ pub fn App() -> Element {
         (legacy_visual_streaming_fixture || visual_runtime_stop_available)
             .then(DesktopRuntimeCancellation::default)
     });
+    let mut legacy_runtime_scope = use_signal(|| None::<product_experience::TaskScope>);
     let mut human_command_cancellation = use_signal(|| None::<LifecycleCancellation>);
     let mut human_command_result = use_signal(|| None::<DesktopHumanCommandResult>);
     let mut runtime_stop_requested = use_signal(|| false);
@@ -1457,6 +1509,7 @@ pub fn App() -> Element {
                         runtime_text_stream,
                         runtime_follow_latest,
                         runtime_has_unseen,
+                        RuntimeTextUpdateMode::Restore,
                     );
                 }
                 Ok(Err(error)) => {
@@ -1612,7 +1665,6 @@ pub fn App() -> Element {
     let mission_title = mission
         .as_ref()
         .map_or_else(|| "项目总调度".to_owned(), |item| item.title.clone());
-    let status = status_label(&view);
     let surface_heading = surface_heading(current_surface, &mission_title);
     let surface_context = surface_context_label(current_surface);
     let workpad_visible =
@@ -1625,6 +1677,32 @@ pub fn App() -> Element {
             selected_result_projection(project, mission, selected_result_id_value.as_ref())
         });
     let runtime_busy = mission_submitting() || runtime_retrying();
+    let live_activity = runtime_execution_paint.read().live_activity();
+    let execution_owner = live_activity
+        .as_ref()
+        .map(|a| (a.project_id.clone(), a.mission_id.clone()))
+        .or_else(|| {
+            if runtime_busy {
+                legacy_runtime_scope()
+            } else {
+                None
+            }
+        });
+    let live_attention = live_activity
+        .as_ref()
+        .filter(|a| a.waiting_for_approval)
+        .map(|a| (a.project_id.clone(), a.mission_id.clone()))
+        .or_else(|| {
+            runtime_cancellation
+                .read()
+                .as_ref()
+                .filter(|c| c.held_local_approval().is_some() || c.held_cordis_approval().is_some())
+                .and_then(|_| legacy_runtime_scope())
+        });
+    let selected_task_executing = mission
+        .as_ref()
+        .is_some_and(|m| product_experience::scope_matches(m, execution_owner.as_ref()));
+
     let human_command_running = human_command_cancellation.read().is_some();
     let composer_human_command_feedback = {
         let result = human_command_result.read();
@@ -1674,6 +1752,14 @@ pub fn App() -> Element {
             projection.fallback_scope_matches,
         )
     };
+    let status = if mission
+        .as_ref()
+        .is_some_and(|m| product_experience::scope_matches(m, live_attention.as_ref()))
+    {
+        "等待确认".into()
+    } else {
+        status_label(&view, selected_task_executing)
+    };
     let runtime_waiting_for_turn = selected_runtime_execution_paint
         .as_ref()
         .is_some_and(DesktopRuntimeExecutionPaintView::awaiting_turn)
@@ -1708,9 +1794,9 @@ pub fn App() -> Element {
         .as_ref()
         .map_or("本地数据层未就绪", project_storage_label);
     let composer_target = if mission.is_some() {
-        "当前 Mission 持久会话"
+        "任务沟通"
     } else {
-        "项目总调度 · 新建 Catalog Mission"
+        "描述新任务"
     };
     let catalog_routes = evidence
         .as_ref()
@@ -2415,7 +2501,17 @@ pub fn App() -> Element {
                 .zip(mission.as_ref())
                 .map(|(project, mission)| (&project.project_id, &mission.mission_id)),
         )
-        .or_else(|| runtime_cancellation.read().clone());
+        .or_else(|| {
+            let matches = project
+                .as_ref()
+                .zip(mission.as_ref())
+                .is_some_and(|(_, m)| {
+                    product_experience::scope_matches(m, legacy_runtime_scope.read().as_ref())
+                });
+            matches
+                .then(|| runtime_cancellation.read().clone())
+                .flatten()
+        });
     let held_local_approval = live_runtime_cancellation
         .as_ref()
         .and_then(DesktopRuntimeCancellation::held_local_approval);
@@ -3201,6 +3297,7 @@ pub fn App() -> Element {
                         Ok(Ok((_snapshot, Ok(Some(prepared))))) => {
                             model.write().set_ready(prepared.snapshot, false);
                             runtime_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                             runtime_stop_requested.set(false);
                             runtime_progress.set(Vec::new());
                             match runtime_execution_paint
@@ -3250,10 +3347,10 @@ pub fn App() -> Element {
             }
         }
     };
-    let runtime_chip = runtime_projection.as_ref().map_or_else(
-        || "Runtime · 数据层未就绪".to_owned(),
-        |runtime| format!("Runtime · {}", runtime_availability_label(runtime.status)),
-    );
+    let runtime_chip = runtime_projection
+        .as_ref()
+        .and_then(|runtime| runtime.model.clone())
+        .unwrap_or_else(|| "设置模型".to_owned());
     let provider_chip = runtime_projection.as_ref().map_or_else(
         || "Provider · 未配置".to_owned(),
         |runtime| {
@@ -3299,14 +3396,8 @@ pub fn App() -> Element {
                 "结果区只是结构预览；你可以返回审批或写下下一步判断",
                 "写下下一步",
             ),
-            _ if mission.is_some() => (
-                "继续说，随时调整当前 Mission 的范围、优先级或停止条件",
-                "调整方向",
-            ),
-            _ => (
-                "你可以随时创建、暂停或重排多个任务，不需要先选择功能模块",
-                "描述任务",
-            ),
+            _ if mission.is_some() => ("补充要求或调整方向", "调整方向"),
+            _ => ("今天想推进什么？", "描述任务"),
         };
     let composer_guidance_visible = !composer_guidance_dismissed()
         && !composer_expanded()
@@ -3343,19 +3434,14 @@ pub fn App() -> Element {
             .missions
             .iter()
             .filter(|mission| {
-                matches!(
-                    mission.stage,
-                    MissionStage::WaitingUser | MissionStage::WaitingApproval
-                )
+                product_experience::TaskFilter::Waiting
+                    .matches_with_attention(mission, live_attention.as_ref())
             })
             .count()
     });
     let mission_count = project.as_ref().map_or(0, |project| project.missions.len());
 
     rsx! {
-        document::Title { "Hartevo Desktop" }
-        document::Stylesheet { href: MAIN_CSS }
-        document::Stylesheet { href: PROTOTYPE_CSS }
         div {
             class: "desktop-shell",
             tabindex: "-1",
@@ -3474,7 +3560,11 @@ pub fn App() -> Element {
                     i { class: "mission-indicator" }
                     div { class: "mission-copy",
                         strong { "{surface_heading}" }
-                        span { "{status}" }
+                        span {
+                            if current_surface == Surface::Orchestrator { "{status}" }
+                            else if let Some(project) = &project { "{project.name}" }
+                            else { "本机工作空间" }
+                        }
                     }
                     div { class: "mission-actions",
                         button {
@@ -3520,12 +3610,24 @@ pub fn App() -> Element {
                                     id: "current-object-menu-first",
                                     autofocus: true,
                                     role: "menuitem",
+                                    disabled: reloading_workspace(),
                                     onclick: move |_| {
-                                        model.set(DesktopUiModel::load());
+                                        reloading_workspace.set(true);
                                         current_object_menu.set(false);
+                                        spawn(async move {
+                                            let mut reloaded = load_desktop_ui_model().await;
+                                            {
+                                                let current = model.peek();
+                                                reloaded.selected_project_id.clone_from(&current.selected_project_id);
+                                                reloaded.selected_mission_id.clone_from(&current.selected_mission_id);
+                                            }
+                                            reloaded.restore_valid_selection(false);
+                                            model.set(reloaded);
+                                            reloading_workspace.set(false);
+                                        });
                                     },
                                     UiIcon { name: UiIconName::Refresh, size: 13 }
-                                    "重新读取持久状态"
+                                    if reloading_workspace() { "正在读取…" } else { "重新读取持久状态" }
                                 }
                                 button {
                                     role: "menuitem",
@@ -3592,10 +3694,10 @@ pub fn App() -> Element {
                 }
                 nav { class: "primary-nav prototype-primary-nav", aria_label: "项目工作面",
                     div { class: "nav-label", "工作" }
-                    NavButton { label: "总调度", meta: "运行中", icon: UiIconName::Sparkles, active: current_surface == Surface::Orchestrator && view.selected_mission_id.is_none(), onclick: move |_| { model.write().select_dispatcher(); surface.set(Surface::Orchestrator); } }
-                    NavButton { label: "当前状态", meta: "Project", icon: UiIconName::Home, active: current_surface == Surface::Current, onclick: move |_| surface.set(Surface::Current) }
-                    NavButton { label: "全部任务", meta: "{mission_count}", icon: UiIconName::List, active: current_surface == Surface::Missions, onclick: move |_| surface.set(Surface::Missions) }
-                    NavButton { label: "待确认", meta: "{waiting_count}", icon: UiIconName::Shield, active: false, onclick: move |_| surface.set(Surface::Missions) }
+                    NavButton { label: "总调度", meta: "", icon: UiIconName::Sparkles, active: current_surface == Surface::Orchestrator && view.selected_mission_id.is_none(), onclick: move |_| { model.write().select_dispatcher(); surface.set(Surface::Orchestrator); } }
+                    NavButton { label: "项目概览", meta: "", icon: UiIconName::Home, active: current_surface == Surface::Current, onclick: move |_| surface.set(Surface::Current) }
+                    NavButton { label: "全部任务", meta: "{mission_count}", icon: UiIconName::List, active: current_surface == Surface::Missions && mission_list_filter() != product_experience::TaskFilter::Waiting, onclick: move |_| { mission_list_filter.set(product_experience::TaskFilter::All); surface.set(Surface::Missions); } }
+                    NavButton { label: "待确认", meta: "{waiting_count}", icon: UiIconName::Shield, active: current_surface == Surface::Missions && mission_list_filter() == product_experience::TaskFilter::Waiting, onclick: move |_| { mission_list_filter.set(product_experience::TaskFilter::Waiting); surface.set(Surface::Missions); } }
 
                     if !running_missions.is_empty() {
                         div { class: "nav-label mission-group-label", span { "任务 · 进行中" } em { "{running_missions.len()}" } }
@@ -3606,6 +3708,8 @@ pub fn App() -> Element {
                                     && view.selected_mission_id.as_ref() == Some(&mission_id);
                                 rsx! {
                                     MissionNavRow {
+                                        executing: product_experience::scope_matches(&item,execution_owner.as_ref()),
+                                        live_attention: live_attention.clone(),
                                         mission: item,
                                         active: selected,
                                         menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
@@ -3638,6 +3742,8 @@ pub fn App() -> Element {
                                     && view.selected_mission_id.as_ref() == Some(&mission_id);
                                 rsx! {
                                     MissionNavRow {
+                                        executing: product_experience::scope_matches(&item,execution_owner.as_ref()),
+                                        live_attention: live_attention.clone(),
                                         mission: item,
                                         active: selected,
                                         menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
@@ -3662,12 +3768,12 @@ pub fn App() -> Element {
                     }
 
                     div { class: "nav-label", "成果与工作面" }
-                    NavButton { label: "成果与循环", meta: "Outcome", icon: UiIconName::Chart, active: current_surface == Surface::Outcomes, onclick: move |_| surface.set(Surface::Outcomes) }
-                    NavButton { label: "渠道运营", meta: "Channel", icon: UiIconName::Mail, active: current_surface == Surface::ChannelOperations, onclick: move |_| surface.set(Surface::ChannelOperations) }
-                    NavButton { label: "关系与 CRM", meta: "CRM", icon: UiIconName::Contact, active: current_surface == Surface::Relationships, onclick: move |_| surface.set(Surface::Relationships) }
-                    NavButton { label: "达人与联盟", meta: "Partner", icon: UiIconName::Handshake, active: current_surface == Surface::Partners, onclick: move |_| surface.set(Surface::Partners) }
-                    NavButton { label: "连接中心", meta: "Probe", icon: UiIconName::Plug, active: current_surface == Surface::Connections, onclick: move |_| surface.set(Surface::Connections) }
-                    NavButton { label: "能力与证据", meta: "E0–E5", icon: UiIconName::Blocks, active: current_surface == Surface::CapabilityEvidence, onclick: move |_| surface.set(Surface::CapabilityEvidence) }
+                    NavButton { label: "成果与效果", meta: "", icon: UiIconName::Chart, active: current_surface == Surface::Outcomes, onclick: move |_| surface.set(Surface::Outcomes) }
+                    NavButton { label: "渠道运营", meta: "", icon: UiIconName::Mail, active: current_surface == Surface::ChannelOperations, onclick: move |_| surface.set(Surface::ChannelOperations) }
+                    NavButton { label: "关系与 CRM", meta: "", icon: UiIconName::Contact, active: current_surface == Surface::Relationships, onclick: move |_| surface.set(Surface::Relationships) }
+                    NavButton { label: "达人与联盟", meta: "", icon: UiIconName::Handshake, active: current_surface == Surface::Partners, onclick: move |_| surface.set(Surface::Partners) }
+                    NavButton { label: "连接中心", meta: "", icon: UiIconName::Plug, active: current_surface == Surface::Connections, onclick: move |_| surface.set(Surface::Connections) }
+                    NavButton { label: "能力与证据", meta: "", icon: UiIconName::Blocks, active: current_surface == Surface::CapabilityEvidence, onclick: move |_| surface.set(Surface::CapabilityEvidence) }
                 }
 
                 footer { class: "workspace-switcher",
@@ -3783,7 +3889,7 @@ pub fn App() -> Element {
                         span { strong { "{project_name}" } small { b { "{project_storage_status}" } } }
                         UiIcon { name: UiIconName::ChevronDown, size: 14 }
                     }
-                    div { class: "local-path", "路径只用于本机数据层，不进入日志或 Release Evidence" }
+                    div { class: "local-path", "项目内容保存在本机" }
                 }
             }
 
@@ -3794,7 +3900,7 @@ pub fn App() -> Element {
                         strong { "{surface_context}" }
                     }
                     span { class: "conversation-hint",
-                        if current_surface == Surface::Orchestrator { "可以随时改变方向；不会扩大 Capability" } else { "变化回写同一 Project / Mission Truth" }
+                        if current_surface == Surface::Orchestrator { "进展、成果与后续沟通都保留在这里" } else { "当前项目的工作与成果" }
                     }
                     if let Some(fixture_id) = &visual_fixture_id {
                         span { class: "visual-fixture-indicator", "VISUAL_FIXTURE · {fixture_id}" }
@@ -3824,7 +3930,8 @@ pub fn App() -> Element {
                                 runtime_text_error: rendered_runtime_text_error.clone(),
                                 runtime_fixture_state: visual_runtime_state,
                                 runtime_transport_caught_up: rendered_runtime_transport_caught_up,
-                                runtime_busy,
+                                runtime_busy: selected_task_executing,
+                                live_attention: live_attention.clone(),
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
                                 runtime_has_unseen: rendered_runtime_has_unseen,
@@ -3851,6 +3958,10 @@ pub fn App() -> Element {
                                 on_error: move |error| model.write().set_notice(&error),
                                 on_select_mission: move |mission_id| model.write().select_mission(mission_id),
                                 on_open_workpad: move |()| workpad_open.set(true),
+                                on_open_settings: move |()| {
+                                    surface_before_settings.set(current_surface);
+                                    surface.set(Surface::Settings);
+                                },
                                 on_quick_entry: move |()| {
                                     composer_expanded.set(true);
                                     restore_ui_focus("mission-composer-input");
@@ -3918,7 +4029,7 @@ pub fn App() -> Element {
                         } else if current_surface == Surface::Current {
                             CurrentSurface { project: project.clone(), context_access: context_access.clone() }
                         } else if current_surface == Surface::Missions {
-                            MissionsSurface { project: project.clone(), selected_mission_id: view.selected_mission_id.clone(), on_select: move |mission_id| {
+                            product_experience::TaskList { executing_mission_id: execution_owner.as_ref().filter(|(id,_)| project.as_ref().is_some_and(|p| &p.project_id == id)).map(|(_,id)|id.clone()), live_attention: live_attention.clone(), project: project.clone(), selected_mission_id: view.selected_mission_id.clone(), filter: mission_list_filter(), on_filter: move |filter| mission_list_filter.set(filter), on_select: move |mission_id| {
                                 model.write().select_mission(mission_id);
                                 surface.set(Surface::Orchestrator);
                             } }
@@ -3971,7 +4082,12 @@ pub fn App() -> Element {
                             EmptyState { code: "INTEGRITY_ERROR", title: "机器合同不可用", detail: "Catalog 未通过加载与验证，能力声明已停止显示。" }
                         }
 
-                        if current_surface == Surface::Orchestrator {
+                        if current_surface == Surface::Orchestrator && !visual_fixture_mode && product_experience::legacy_media_entry_available(mission.as_ref(), runtime_busy, runtime_retry_needed) {
+                            div { class: "task-creation-bar",
+                                div { strong { "继续准备创意素材" } small { "这条旧任务尚不支持对话。你可以在工作台修改描述、生成新版本和导出成果。" } }
+                                button { class: "task-primary-action", onclick: move |_| workpad_open.set(true), "打开创意工作台" }
+                            }
+                        } else if current_surface == Surface::Orchestrator {
                             section {
                                 class: if composer_expanded()
                                     || fixture_attachment_visible()
@@ -4062,7 +4178,7 @@ pub fn App() -> Element {
                                                 aria_expanded: catalog_contract_expanded(),
                                                 aria_controls: "operating-contract-fields",
                                                 onclick: move |_| catalog_contract_expanded.set(!catalog_contract_expanded()),
-                                                span { "Operating Contract" }
+                                                span { "任务范围" }
                                                 UiIcon { name: UiIconName::ChevronDown, size: 12 }
                                             }
                                         }
@@ -4319,11 +4435,6 @@ pub fn App() -> Element {
                                         span { "{route.mission_id} · {route.default_cadence}" }
                                         span { "当前 Release Evidence {mission_evidence_status_label(route.status)} / {evidence_level_label(route.evidence_level)}" }
                                     }
-                                } else if mission.is_some() {
-                                    div { class: "catalog-route-note",
-                                        span { "Mission Conversation revision {mission.as_ref().and_then(|mission| mission.conversation_revision).unwrap_or_default()}" }
-                                        span { "消息会写入同一 Mission Stream；不会另建 Mission，也不会修改 Operating Contract 权限。" }
-                                    }
                                 }
                                 if application_route_not_implemented || application_route_catalog_mismatch {
                                     div { class: "catalog-route-note application-handler-boundary", role: "status",
@@ -4469,11 +4580,11 @@ pub fn App() -> Element {
                                     id: "mission-composer-input",
                                     value: "{draft}",
                                     disabled: !can_write_composer,
-                                    aria_label: "Operating Contract 目标、约束与停止条件",
+                                    aria_label: "任务要求与补充说明",
                                     placeholder: if mission.is_some() {
-                                        if vm11_outcome_decision_active { "写下选择该动作的理由、风险与停止条件；正文只进入加密 Mission Conversation…" } else if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "继续当前 Mission，或输入 /compact 压缩当前 Cordis Session…" } else if can_edit_human_command { "可输入 /compact 压缩当前 Cordis Session；普通续写仍需持久 Conversation" } else { "当前 Mission 状态不接受续写" }
+                                        if vm11_outcome_decision_active { "写下选择该动作的理由、风险与停止条件；正文只进入加密 Mission Conversation…" } else if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "补充要求，或告诉我哪里需要修改…" } else if can_edit_human_command { "描述你想调整的内容…" } else { "当前 Mission 状态不接受续写" }
                                     } else if project_can_start_mission {
-                                        "写明目标、硬约束、非目标与停止条件…"
+                                        "告诉我你想达成什么，例如：为新产品准备一周社媒内容…"
                                     } else {
                                         "项目加密与 Context 就绪后才能创建 Mission"
                                     },
@@ -4577,19 +4688,21 @@ pub fn App() -> Element {
                                                 UiIcon { name: UiIconName::ChevronDown, size: 11 }
                                             }
                                             if runtime_profile_open() {
-                                                section { class: "runtime-profile-menu", role: "dialog", aria_label: "Runtime 与权限边界",
-                                                    header { strong { "Runtime Profile" } small { "模型 × Mission 最小能力" } }
+                                                section { class: "runtime-profile-menu", role: "dialog", aria_label: "模型与连接",
+                                                    header { strong { "当前模型" } }
                                                     div { span { "执行环境" } b { "{runtime_chip}" } }
                                                     div { span { "Provider route" } b { "{provider_chip}" } }
                                                     div { span { "外部 Effect" } b { "必须独立审批" } }
-                                                    footer { "切换模型不能扩大 Capability、Consent 或账号范围。" }
+                                                    button { class: "task-primary-action", onclick: move |_| {
+                                                        runtime_profile_open.set(false);
+                                                        surface_before_settings.set(current_surface);
+                                                        surface.set(Surface::Settings);
+                                                    }, "打开模型设置" }
+                                                    footer { "连接与调用权限分开管理。" }
                                                 }
                                             }
                                         }
-                                        span { class: "honesty-chip", "{provider_chip}" }
-                                        if runtime_projection.as_ref().is_some_and(|runtime| !runtime.exact_tokenizer_evidence) {
-                                            span { class: "honesty-chip", "Tokenizer · DEV_FALLBACK" }
-                                        }
+
                                     }
                                     div { class: "composer-actions",
                                         if vm03_domain_purchase_route_active
@@ -4928,6 +5041,7 @@ pub fn App() -> Element {
                                                                 model.select_mission(target_mission_id);
                                                                 drop(model);
                                                                 runtime_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                                                                 runtime_stop_requested.set(false);
                                                                 runtime_progress.set(Vec::new());
                                                                 match runtime_execution_paint
@@ -5003,6 +5117,7 @@ pub fn App() -> Element {
                                                     let Some((project_id, mission_id, catalog)) = selection else { return; };
                                                     if catalog {
                                                         runtime_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                                                         runtime_stop_requested.set(false);
                                                         runtime_progress.set(Vec::new());
                                                         runtime_retrying.set(true);
@@ -5065,6 +5180,7 @@ pub fn App() -> Element {
                                                         return;
                                                     }
                                                     let cancellation = DesktopRuntimeCancellation::default();
+                                                    legacy_runtime_scope.set(Some((project_id.clone(),mission_id.clone())));
                                                     runtime_cancellation.set(Some(cancellation.clone()));
                                                     runtime_stop_requested.set(false);
                                                     runtime_progress.set(Vec::new());
@@ -5079,6 +5195,8 @@ pub fn App() -> Element {
                                                         model,
                                                         project_id.clone(),
                                                         mission_id.clone(),
+                                                        legacy_runtime_scope,
+                                                        cancellation.clone(),
                                                         runtime_text_stream,
                                                         runtime_text_error,
                                                         runtime_follow_latest,
@@ -5111,6 +5229,7 @@ pub fn App() -> Element {
                                                             }
                                                         }
                                                         runtime_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                                                         runtime_stop_requested.set(false);
                                                         runtime_retrying.set(false);
                                                     });
@@ -5159,6 +5278,7 @@ pub fn App() -> Element {
                                                     };
                                                     let cancellation = LifecycleCancellation::default();
                                                     human_command_result.set(None);
+                                                    legacy_runtime_scope.set(Some((request.project_id.clone(),request.mission_id.clone())));
                                                     human_command_cancellation.set(Some(cancellation.clone()));
                                                     runtime_stop_requested.set(false);
                                                     runtime_progress.set(Vec::new());
@@ -5200,6 +5320,7 @@ pub fn App() -> Element {
                                                             }
                                                         }
                                                         human_command_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                                                         runtime_stop_requested.set(false);
                                                         mission_submitting.set(false);
                                                     });
@@ -5425,6 +5546,7 @@ pub fn App() -> Element {
                                                                     scope.mission_id().clone(),
                                                                 )));
                                                                 runtime_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                                                                 runtime_stop_requested.set(false);
                                                                 runtime_progress.set(Vec::new());
                                                                 runtime_text_stream.set(None);
@@ -5444,6 +5566,7 @@ pub fn App() -> Element {
                                                         return;
                                                     }
                                                     let cancellation = DesktopRuntimeCancellation::default();
+                                                    legacy_runtime_scope.set(Some((project_id.clone(),mission_id.clone())));
                                                     runtime_cancellation.set(Some(cancellation.clone()));
                                                     runtime_stop_requested.set(false);
                                                     runtime_progress.set(Vec::new());
@@ -5458,6 +5581,8 @@ pub fn App() -> Element {
                                                         model,
                                                         request.project_id.clone(),
                                                         request.mission_id.clone(),
+                                                        legacy_runtime_scope,
+                                                        cancellation.clone(),
                                                         runtime_text_stream,
                                                         runtime_text_error,
                                                         runtime_follow_latest,
@@ -5490,6 +5615,7 @@ pub fn App() -> Element {
                                                             }
                                                         }
                                                         runtime_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                                                         runtime_stop_requested.set(false);
                                                         mission_submitting.set(false);
                                                     });
@@ -5552,6 +5678,7 @@ pub fn App() -> Element {
                                                         currency,
                                                     };
                                                     runtime_cancellation.set(None);
+                            legacy_runtime_scope.set(None);
                                                     runtime_stop_requested.set(false);
                                                     runtime_progress.set(Vec::new());
                                                     mission_submitting.set(true);
@@ -5614,9 +5741,9 @@ pub fn App() -> Element {
                                                 if mission_submitting() {
                                                     "正在固化合同与首个 Checkpoint…"
                                                 } else if !catalog_contract_ready {
-                                                    "确认完整合同后创建"
+                                                    "请补全任务范围"
                                                 } else {
-                                                    "创建 Catalog Mission"
+                                                    "创建任务"
                                                 }
                                             }
                                         }
@@ -5782,12 +5909,18 @@ fn NavButton(
 fn MissionNavRow(
     mission: MissionProjection,
     active: bool,
+    #[props(default = false)] executing: bool,
+    live_attention: Option<product_experience::TaskScope>,
     menu_open: bool,
     onclick: EventHandler<MouseEvent>,
     on_menu: EventHandler<MissionId>,
 ) -> Element {
     let dot = dispatcher_stage_dot(&mission.stage);
-    let stage = mission_stage_label(&mission.stage);
+    let stage = if product_experience::scope_matches(&mission, live_attention.as_ref()) {
+        "等待确认"
+    } else {
+        product_experience::task_status(&mission, executing)
+    };
     let cadence = if mission.stage == MissionStage::Scheduled {
         "持续运行".to_owned()
     } else if mission.current_checkpoint_id.is_some() {
@@ -5815,7 +5948,7 @@ fn MissionNavRow(
                     strong { "{mission.title}" }
                     small { "{cadence}" }
                 }
-                em { "{mission.revision}" }
+                if mission.work_product_count > 0 { em { "{mission.work_product_count}" } }
             }
             button {
                 id: "{trigger_id}",
@@ -6964,113 +7097,63 @@ fn StateCoverageSurface() -> Element {
 #[component]
 fn ProjectDispatcherSurface(
     project: DesktopProjectProjection,
+    live_attention: Option<product_experience::TaskScope>,
     on_select_mission: EventHandler<MissionId>,
 ) -> Element {
-    let running = project
+    let active = project
         .missions
         .iter()
-        .filter(|mission| mission.stage == MissionStage::Running)
+        .filter(|m| !m.stage.is_terminal())
         .count();
     let waiting = project
         .missions
         .iter()
-        .filter(|mission| {
-            matches!(
-                mission.stage,
-                MissionStage::WaitingUser | MissionStage::WaitingApproval
-            )
+        .filter(|m| {
+            product_experience::TaskFilter::Waiting
+                .matches_with_attention(m, live_attention.as_ref())
         })
         .count();
-    let scheduled = project
+    let results = project
         .missions
         .iter()
-        .filter(|mission| mission.stage == MissionStage::Scheduled)
+        .flat_map(|m| &m.work_products)
+        .filter(|p| p.adoption_status != WorkProductStatus::Superseded)
         .count();
-    let priority = project
-        .missions
-        .iter()
-        .filter(|mission| mission.stage != MissionStage::Scheduled)
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>();
-    let waiting_missions = project
-        .missions
-        .iter()
-        .filter(|mission| {
-            matches!(
-                mission.stage,
-                MissionStage::WaitingUser | MissionStage::WaitingApproval
-            )
-        })
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut missions = project.missions.clone();
+    missions.sort_by_key(|m| {
+        (
+            !product_experience::TaskFilter::Waiting
+                .matches_with_attention(m, live_attention.as_ref()),
+            m.stage.is_terminal(),
+        )
+    });
     rsx! {
-        article { class: "dispatcher-overview",
-            header { class: "dispatcher-hero",
-                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
-                div {
-                    h1 { "{project.name} · 总调度" }
-                    p { "{project.description}" }
-                }
-                span { class: "projection-chip", "APPLICATION PROJECTION" }
+        article {class:"dispatcher-overview product-dispatcher",
+            header {class:"dispatcher-hero",
+                img {src:BRAND_MARK_DATA_URL.as_str(),alt:""}
+                div {h1 {"{project.name}"} p {"描述新的工作目标，或继续下面的任务。每项工作的进展与成果都会保留。"}}
             }
-            section { class: "dispatcher-stats", aria_label: "项目任务摘要",
-                div { strong { "{running}" } small { "进行中的任务" } }
-                div { strong { "{waiting}" } small { "等待确认" } }
-                div { strong { "{scheduled}" } small { "自动任务" } }
-                div { strong { "{project.revision}" } small { "Project revision" } }
+            section {class:"dispatcher-stats",aria_label:"项目任务摘要",
+                div {strong {"{active}"} small {"未结束任务"}}
+                div {strong {"{waiting}"} small {"需要你确认"}}
+                div {strong {"{results}"} small {"已保存成果"}}
             }
-            section { class: "dispatcher-priority",
-                header { h2 { "现在优先处理" } span { "按状态与项目顺序投影" } }
-                if priority.is_empty() {
-                    div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } p { "当前没有非排期 Mission。" } }
+            section {class:"dispatcher-priority",
+                header {h2 {"继续工作"} span {"需要确认的任务排在前面"}}
+                if missions.is_empty() {
+                    p {class:"task-empty","还没有任务。在下方描述目标，并补全任务范围后开始。"}
                 } else {
-                    for mission in priority {
+                    for mission in missions.into_iter().take(6) {
                         {
-                            let mission_id = mission.mission_id.clone();
-                            rsx! {
-                                button { class: "dispatcher-mission-row", onclick: move |_| on_select_mission.call(mission_id.clone()),
-                                    i { class: dispatcher_stage_dot(&mission.stage) }
-                                    span { strong { "{mission.title}" } small { "{dispatcher_mission_detail(&mission)}" } }
-                                    em { "{mission.completed_checkpoint_count}/{mission.checkpoint_count}" }
-                                    b { "打开" }
-                                }
-                            }
+                            let id = mission.mission_id.clone();
+                            let needs_attention = product_experience::TaskFilter::Waiting.matches_with_attention(&mission,live_attention.as_ref());
+                            let count = mission.work_products.iter().filter(|p|p.adoption_status != WorkProductStatus::Superseded).count();
+                            rsx! {button {class:"dispatcher-mission-row",onclick:move |_|on_select_mission.call(id.clone()),
+                                span {strong {"{mission.title}"} small {"{count} 份成果"}}
+                                if needs_attention {em {"待确认"}}
+                                b {"打开 →"}
+                            }}
                         }
-                    }
-                }
-            }
-            div { class: "dispatcher-lower-grid",
-                section { class: "dispatcher-waiting",
-                    header { h2 { "等待你" } span { "只显示持久等待状态" } }
-                    if waiting_missions.is_empty() {
-                        div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } p { "没有等待用户或审批的 Mission。" } }
-                    } else {
-                        for mission in waiting_missions {
-                            {
-                                let mission_id = mission.mission_id.clone();
-                                rsx! {
-                                    button { class: "dispatcher-waiting-row", onclick: move |_| on_select_mission.call(mission_id.clone()),
-                                        i { class: dispatcher_stage_dot(&mission.stage) }
-                                        span { strong { "{mission.title}" } small { "{mission_stage_label(&mission.stage)}" } }
-                                        em { "处理" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                section { class: "dispatcher-update",
-                    header {
-                        img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
-                        span { strong { "Hartevo · 刚刚" } small { "调度更新" } }
-                    }
-                    p { "任务、工作面变化与审批会汇总到同一 Project/Mission Truth；这里不会从页面样例推导 Provider 成功。" }
-                    ul {
-                        li { "{running} 个 Mission 正在运行" }
-                        li { "{waiting} 个 Mission 等待你的明确输入" }
-                        li { "{scheduled} 个周期任务保持排期；Provider readback 未接入时不声称已执行" }
                     }
                 }
             }
@@ -7637,6 +7720,7 @@ fn OrchestratorSurface(
     runtime_fixture_state: Option<VisualRuntimeFixtureState>,
     runtime_transport_caught_up: bool,
     runtime_busy: bool,
+    live_attention: Option<product_experience::TaskScope>,
     runtime_stream_is_fixture: bool,
     runtime_follow_latest: bool,
     runtime_has_unseen: bool,
@@ -7662,6 +7746,7 @@ fn OrchestratorSurface(
     on_error: EventHandler<DesktopDataError>,
     on_select_mission: EventHandler<MissionId>,
     on_open_workpad: EventHandler<()>,
+    on_open_settings: EventHandler<()>,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
     on_approve_local_runtime: EventHandler<()>,
@@ -7750,6 +7835,9 @@ fn OrchestratorSurface(
             let Some(mission) = mission else {
                 return rsx! {
                     div { class: "surface-scroll",
+                        ProjectDispatcherSurface { project, live_attention, on_select_mission }
+                        details { class: "persisted-state-details",
+                            summary { "运行详情" }
                         AgentOperationsWorkbench {
                             projection: operations.clone(),
                             result_action_pending,
@@ -7773,7 +7861,8 @@ fn OrchestratorSurface(
                             on_reject_cordis,
                             on_result_action,
                         }
-                        ProjectDispatcherSurface { project, on_select_mission }
+                        }
+
                     }
                 };
             };
@@ -7878,52 +7967,70 @@ fn OrchestratorSurface(
                 runtime_text_stream.is_some() && replayed_message_sequence.is_none();
             let runtime_fixture_copy = runtime_fixture_state
                 .map(|state| (state.label(), visual_runtime_state_copy(state)));
+            let has_conversation_content =
+                !mission.conversation_messages.is_empty() || runtime_text_stream.is_some();
+            let follow_existing_conversation = runtime_busy
+                && runtime_follow_latest
+                && operations.approvals.cordis_allow_once_status != OperationsStatus::Ready
+                && operations.approvals.local_runtime_approve_status != OperationsStatus::Ready;
             rsx! {
                 div {
                     id: "persisted-mission-thread",
                     class: "surface-scroll persisted-mission-thread",
-                    aria_label: "持久 Mission Conversation",
-                    onmounted: move |_| scroll_mission_thread_to_latest(),
+                    aria_label: "任务会话",
+                    onmounted: move |_| { if follow_existing_conversation { scroll_mission_thread_to_latest(); } },
                     onscroll: move |event| {
                         let remaining = f64::from(
                             event.data.scroll_height() - event.data.client_height(),
                         ) - event.data.scroll_top();
                         on_runtime_scroll.call(remaining <= 96.0);
                     },
-                    AgentOperationsWorkbench {
-                        projection: operations,
-                        result_action_pending,
-                        browser_workspace_create_pending,
-                        browser_workspace_mount_pending,
-                        browser_public_source_read_pending,
-                        browser_public_source_observation,
-                        interrupt_available,
-                        interrupt_requested,
-                        on_quick_entry,
-                        on_interrupt,
-                        on_create_browser_workspace,
-                        on_mount_browser_workspace,
-                        on_read_browser_public_source,
-                        on_take_over_browser_workspace,
-                        on_continue_browser_workspace,
-                        on_pause_browser_workspace,
-                        on_resume_browser_workspace,
-                        on_approve_local_runtime,
-                        on_allow_cordis_once,
-                        on_reject_cordis,
-                        on_result_action,
+                    product_experience::MissionOverview {
+                        project: project.clone(), mission: mission.clone(),
+                        executing: runtime_busy,
+                        awaiting_confirmation: operations.approvals.cordis_allow_once_status == OperationsStatus::Ready || operations.approvals.local_runtime_approve_status == OperationsStatus::Ready,
+                        model_ready: operations.runtime.status == OperationsStatus::Ready,
+                        on_open_workpad, on_open_settings, on_result_action,
+                    }
+                    if operations.approvals.cordis_allow_once_status == OperationsStatus::Ready {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "需要你确认工具操作" } p { "{operations.approvals.cordis_tool_detail}" } }
+                            div { class: "task-attention-actions",
+                                button { class: "task-primary-action", onclick: move |_| on_allow_cordis_once.call(()), "仅允许这一次" }
+                                button { class: "task-secondary-action", onclick: move |_| on_reject_cordis.call(()), "拒绝" }
+                            }
+                        }
+                    }
+                    if operations.approvals.local_runtime_approve_status == OperationsStatus::Ready {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "需要确认本地文件写入" } p { "{operations.approvals.local_runtime_detail}" } }
+                            button { class: "task-primary-action", onclick: move |_| on_approve_local_runtime.call(()), "允许本次写入" }
+                        }
+                    }
+                    if mission.pending_approval_count > 0 {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "有 {mission.pending_approval_count} 项操作等待确认" } p { "请查看任务下方的确认内容。确认前，这些操作不会执行。" } }
+                            button { class: "task-secondary-action", onclick: move |_| on_quick_entry.call(()), "查看确认内容" }
+                        }
+                    }
+                    if operations.browser.status == OperationsStatus::WaitingUser {
+                        div { class: "task-attention", role: "status",
+                            div { strong { "浏览器需要你的操作" } p { "{operations.browser.next_action}" } }
+                            if operations.browser.continue_status == OperationsStatus::Ready {
+                                button { class: "task-primary-action", onclick: move |_| on_continue_browser_workspace.call(()), "交还任务继续" }
+                            }
+                            if operations.browser.resume_status == OperationsStatus::Ready {
+                                button { class: "task-secondary-action", onclick: move |_| on_resume_browser_workspace.call(()), "恢复浏览器" }
+                            }
+                        }
+                    }
+                    if !mission.conversation_messages.is_empty() {
+                        div { class: "mission-chat-nav", button { class: "task-text-action", onclick: move |_| on_follow_latest.call(()), "查看最新消息" } }
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
-                    }
-                    if let Some(result) = selected_result {
-                        SelectedResultSurface {
-                            result,
-                            action_pending: result_action_pending,
-                            on_action: on_result_action,
-                        }
                     }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
@@ -7958,21 +8065,51 @@ fn OrchestratorSurface(
                             }
                         }
                     }
+                    details { class: "persisted-state-details",
+                        summary {
+                            UiIcon { name: UiIconName::Workflow, size: 14 }
+                            span {
+                                strong { "运行详情" }
+                                small { "处理记录、权限与技术信息" }
+                            }
+                            em { "按需展开" }
+                            UiIcon { name: UiIconName::ChevronDown, size: 12 }
+                        }
+                    AgentOperationsWorkbench {
+                        projection: operations,
+                        result_action_pending,
+                        browser_workspace_create_pending,
+                        browser_workspace_mount_pending,
+                        browser_public_source_read_pending,
+                        browser_public_source_observation,
+                        interrupt_available,
+                        interrupt_requested,
+                        on_quick_entry,
+                        on_interrupt,
+                        on_create_browser_workspace,
+                        on_mount_browser_workspace,
+                        on_read_browser_public_source,
+                        on_take_over_browser_workspace,
+                        on_continue_browser_workspace,
+                        on_pause_browser_workspace,
+                        on_resume_browser_workspace,
+                        on_approve_local_runtime,
+                        on_allow_cordis_once,
+                        on_reject_cordis,
+                        on_result_action,
+                    }
+                    if let Some(result) = selected_result {
+                        SelectedResultSurface {
+                            result,
+                            action_pending: result_action_pending,
+                            on_action: on_result_action,
+                        }
+                    }
                     PersistedMissionProcessDensity {
                         mission: mission.clone(),
                         visual_fixture: runtime_stream_is_fixture,
                         on_open_workpad,
                     }
-                    details { class: "persisted-state-details",
-                        summary {
-                            UiIcon { name: UiIconName::Workflow, size: 14 }
-                            span {
-                                strong { "任务边界与持久状态" }
-                                small { "{mission_stage_label(&mission.stage)} · revision {mission.revision} · {mission.completed_checkpoint_count}/{mission.checkpoint_count} Checkpoints" }
-                            }
-                            em { "按需展开" }
-                            UiIcon { name: UiIconName::ChevronDown, size: 12 }
-                        }
                         article { class: "assistant-turn persisted-state-turn",
                             header { class: "assistant-byline",
                                 img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
@@ -7994,7 +8131,7 @@ fn OrchestratorSurface(
                             ContextAccessCard { access: context_access }
                         }
                     }
-                    if !runtime_follow_latest {
+                    if has_conversation_content && !runtime_follow_latest {
                         button {
                             class: if runtime_has_unseen { "mission-follow-latest has-unseen" } else { "mission-follow-latest" },
                             aria_label: if runtime_has_unseen { "有新的 Runtime 正文，回到最新" } else { "回到 Mission Conversation 最新位置" },
@@ -8069,18 +8206,7 @@ fn PersistedConversationMessages(
     replayed_message_sequence: Option<u64>,
 ) -> Element {
     if mission.conversation_messages.is_empty() {
-        return rsx! {
-            article { class: "assistant-turn persisted-assistant-turn conversation-empty",
-                header { class: "assistant-byline",
-                    img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
-                    strong { "Hartevo" }
-                    time { "Mission 已持久化" }
-                }
-                div { class: "assistant-copy",
-                    p { "当前 Mission 还没有可展示的 Conversation 正文。你可以从下方输入目标或纠正；未开始的 Runtime 不会被绘制成答案。" }
-                }
-            }
-        };
+        return rsx! {};
     }
     rsx! {
         for message in mission.conversation_messages.clone() {
@@ -9261,59 +9387,6 @@ fn CurrentSurface(
 }
 
 #[component]
-fn MissionsSurface(
-    project: Option<DesktopProjectProjection>,
-    selected_mission_id: Option<MissionId>,
-    on_select: EventHandler<MissionId>,
-) -> Element {
-    let Some(project) = project else {
-        return rsx! { EmptyState { code: "EMPTY", title: "没有 Mission 项目范围", detail: "选择项目后，Missions 只显示该项目的持久 Application projection。" } };
-    };
-    rsx! {
-        div { class: "surface-scroll business-surface missions-surface",
-            header { class: "surface-head",
-                div { class: "surface-head-copy",
-                    span { class: "surface-eyebrow", "MISSIONS · APPLICATION PROJECTION" }
-                    h1 { "全部任务" }
-                    p { "一次选择会继续原来的 Mission Conversation，不创建第二套页面状态。" }
-                }
-                span { class: "sync-chip", "{project.name} · {project.missions.len()} Missions" }
-            }
-            nav { class: "surface-tabs", aria_label: "Mission 视图",
-                button { class: "active", "全部" }
-                button { disabled: true, "进行中" }
-                button { disabled: true, "自动任务" }
-                button { disabled: true, "历史" }
-            }
-            section { class: "surface-section mission-table-section",
-                if project.missions.is_empty() {
-                    div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } h2 { "尚无持久 Mission" } p { "返回总调度，选择 VM-00～VM-11 并完成 Operating Contract。" } }
-                } else {
-                    div { class: "mission-table", role: "list",
-                        for mission in project.missions {
-                            {
-                                let mission_id = mission.mission_id.clone();
-                                let selected = selected_mission_id.as_ref() == Some(&mission_id);
-                                rsx! {
-                                    button { class: if selected { "mission-table-row active" } else { "mission-table-row" }, onclick: move |_| on_select.call(mission_id.clone()),
-                                        span { class: "mission-table-status", i { class: if mission.stage.is_terminal() { "" } else { "live" } } }
-                                        span { class: "mission-table-copy", strong { "{mission.title}" } small { "{mission.goal}" } }
-                                        span { strong { "{mission_stage_label(&mission.stage)}" } small { "状态" } }
-                                        span { strong { "{mission.completed_checkpoint_count}/{mission.checkpoint_count}" } small { "Checkpoint" } }
-                                        span { strong { "{mission.pending_approval_count}" } small { "待审批" } }
-                                        span { class: "mission-table-action", "继续 →" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
 fn ChannelSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
@@ -9808,11 +9881,7 @@ fn SettingsSurface(
     on_clear_native_provider: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
-    let initial_panel = if active_visual_surface_variant().as_deref() == Some("settings-models") {
-        "models"
-    } else {
-        "general"
-    };
+    let initial_panel = "models";
     let mut active_panel = use_signal(move || initial_panel);
     let mut settings_query = use_signal(String::new);
     let initial_native_model = runtime
@@ -9821,7 +9890,7 @@ fn SettingsSurface(
         .unwrap_or_else(|| "deepseek-chat".to_owned());
     let mut native_model = use_signal(move || initial_native_model);
     let mut native_credential = use_signal(SensitiveProviderCredential::default);
-    let runtime_status = runtime.as_ref().map_or("数据层未就绪", |runtime| {
+    let runtime_status = runtime.as_ref().map_or("工作空间尚未打开", |runtime| {
         runtime_availability_label(runtime.status)
     });
     let provider = runtime
@@ -9876,7 +9945,7 @@ fn SettingsSurface(
                         }
                     }
                 }
-                div { class: "settings-version", "Hartevo Desktop" small { "UI baseline · prototype v12" } }
+                div { class: "settings-version", "Hartevo Desktop" small { "本地桌面应用" } }
             }
             main { class: "settings-content",
                 if active_panel() == "general" {
@@ -9890,32 +9959,32 @@ fn SettingsSurface(
                 } else if active_panel() == "models" {
                     section { class: "settings-panel", aria_busy: action_busy,
                         header {
-                            h1 { "模型与 Runtime" }
-                            p { "为 Cordis 原生路径配置 DeepSeek。模型选择不会改变 Mission Capability、预算或审批边界。" }
+                            h1 { "模型连接" }
+                            p { "连接对话模型后，可以开始和继续任务。图片、视频使用各自的生成模型连接。" }
                         }
                         section { class: "settings-section",
                             h2 { "当前状态" }
                             div { class: "settings-group",
-                                SettingsRow { title: "Runtime", detail: "来自 DesktopRuntimeProjection。", value: runtime_status }
-                                SettingsRow { title: "Provider", detail: "没有真实配置时不显示可用。", value: provider }
-                                SettingsRow { title: "Model", detail: "只展示当前生效投影。", value: model }
-                                SettingsRow { title: "凭据来源", detail: "仅展示来源类型，不回读凭据或 Secret Store 引用。", value: credential_source }
+                                SettingsRow { title: "配置状态", detail: "当前应用检测到的本机配置。", value: runtime_status }
+                                SettingsRow { title: "模型服务", detail: "当前使用的服务提供方。", value: provider }
+                                SettingsRow { title: "当前模型", detail: "新消息使用的模型。", value: model }
+                                SettingsRow { title: "密钥来源", detail: "仅展示配置来源，不显示密钥。", value: credential_source }
                             }
                         }
                         section { class: "settings-section",
-                            h2 { "Cordis 原生配置" }
+                            h2 { "DeepSeek 连接" }
                             div { class: "settings-group",
-                                SettingsControlRow { title: "DeepSeek model", detail: "保存后用于新的 Cordis Session；不会改写既有 Mission 合同。",
+                                SettingsControlRow { title: "模型名称", detail: "例如 deepseek-chat。保存后用于新会话。",
                                     input {
                                         value: "{native_model}",
                                         disabled: !actions_enabled || action_busy,
                                         autocomplete: "off",
                                         spellcheck: "false",
-                                        aria_label: "DeepSeek model",
+                                        aria_label: "模型名称",
                                         oninput: move |event| native_model.set(event.value()),
                                     }
                                 }
-                                SettingsControlRow { title: "DeepSeek API key", detail: "仅写入当前数据目录绑定的 OS Secret Store；保存后不会回读或显示。",
+                                SettingsControlRow { title: "DeepSeek API key", detail: "保存在本机凭据存储中，保存后不会显示密钥。",
                                     input {
                                         r#type: "password",
                                         value: "{native_credential.read().expose_for_input()}",
@@ -9949,12 +10018,12 @@ fn SettingsSurface(
                                                 let credential = native_credential.write().take();
                                                 on_configure_native_provider.call((native_model(), credential));
                                             },
-                                            if action_busy { "正在更新…" } else { "保存并刷新 Runtime" }
+                                            if action_busy { "正在更新…" } else { "保存连接" }
                                         }
                                     }
                                 }
                             }
-                            p { class: "settings-boundary", span { class: "honesty-badge", "NO PROVIDER CALL" } " 保存或清除只更新本机配置与 Runtime 投影，不会启动 Provider 请求、Runtime turn、Domain 写入或 Effect。" }
+                            p { class: "settings-boundary", "保存或清除配置不会发送消息，也不会产生模型调用费用。" }
                         }
                     }
                 } else if active_panel() == "shortcuts" {
@@ -10797,7 +10866,7 @@ fn Workpad(
     rsx! {
         aside { class: "workpad", aria_label: "任务工作台",
             header {
-                span { strong { "工作产物" } small { "Application projection" } }
+                span { strong { "成果工作台" } }
                 button { class: "icon-button", aria_label: "收起工作台", onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::Panel, size: 14 } }
             }
             div { class: "workpad-body",
@@ -10809,15 +10878,16 @@ fn Workpad(
                     div { class: "document-kicker", "MISSION · REVISION {mission.revision}" }
                     h2 { "{mission.title}" }
                     {rsx! { media_workspace::MediaWorkspace {
-                            key: "media-{mission.project_id}-{mission.mission_id}",
+                            key: "media-{mission.project_id}-{mission.mission_id}-{selected_work_product_id:?}",
+                            initial_work_product_id: selected_work_product_id.clone().filter(|id| mission.work_products.iter().any(|p| &p.work_product_id == id && product_experience::media_identity(p).is_some())),
                             mission: mission.clone(),
                             on_changed,
                     } }}
                     if mission.work_product_count == 0 {
-                        p { class: "document-lead", "EMPTY：当前 Mission 没有持久 WorkProductManifest。页面不会填充示例报告。" }
+                        p { class: "document-lead", "还没有成果。生成素材后，可以在这里预览、修改和采用。" }
                     } else {
-                        p { class: "document-lead", "以下 Preview 来自 SQLCipher 中通过 Application 完整校验的 WorkProductManifest；不是页面生成的示例内容。" }
-                        for product in mission.work_products {
+
+                        for product in mission.work_products.into_iter().filter(|p| !matches!(p.work_product_type.as_str(), "generated_image" | "generated_video")) {
                             {
                                 let selected = selected_work_product_id
                                     .as_ref()
@@ -10897,9 +10967,9 @@ fn surface_heading(surface: Surface, mission_title: &str) -> String {
 
 const fn surface_context_label(surface: Surface) -> &'static str {
     match surface {
-        Surface::Orchestrator => "Mission Conversation",
+        Surface::Orchestrator => "任务会话",
         Surface::Current => "Project Current",
-        Surface::Missions => "Mission Inventory",
+        Surface::Missions => "全部任务",
         Surface::ChannelOperations => "Growth Operations",
         Surface::Relationships => "Relationships",
         Surface::Partners => "Partner Operations",
@@ -10963,7 +11033,7 @@ fn initial_workpad_open() -> bool {
             Some("mission-workpad" | "mission-inspector")
         );
     }
-    true
+    false
 }
 
 #[cfg(feature = "visual-fixtures")]
@@ -11171,7 +11241,14 @@ async fn coordinate_runtime_and_subscription(
                             current_selection.scope.project_id(),
                             current_selection.scope.mission_id(),
                         );
-                        apply_runtime_reducer_visual_effect(&effect);
+                        apply_runtime_reducer_visual_effect(
+                            &effect,
+                            ui.text.paint.read().live_activity().is_some_and(|a| {
+                                a.project_id == *current_selection.scope.project_id()
+                                    && a.mission_id == *current_selection.scope.mission_id()
+                                    && !a.waiting_for_approval
+                            }),
+                        );
                     }
                 }
                 Err(failure) => {
@@ -11356,7 +11433,14 @@ fn begin_read_only_runtime_subscription_monitor(
                 selection.scope.project_id(),
                 selection.scope.mission_id(),
             );
-            apply_runtime_reducer_visual_effect(&effect);
+            apply_runtime_reducer_visual_effect(
+                &effect,
+                ui.paint.read().live_activity().is_some_and(|a| {
+                    a.project_id == *selection.scope.project_id()
+                        && a.mission_id == *selection.scope.mission_id()
+                        && !a.waiting_for_approval
+                }),
+            );
             match ui.paint.read().poll_disposition(&selection) {
                 DesktopRuntimePollDisposition::Stale
                 | DesktopRuntimePollDisposition::ReadyToFinalize
@@ -11391,7 +11475,10 @@ fn sync_runtime_execution_paint_controls(
     }
 }
 
-fn apply_runtime_reducer_visual_effect(effect: &DesktopRuntimeReducerEffect) {
+fn apply_runtime_reducer_visual_effect(
+    effect: &DesktopRuntimeReducerEffect,
+    follow_active_task: bool,
+) {
     let should_scroll = matches!(
         effect,
         &DesktopRuntimeReducerEffect::Reset {
@@ -11402,7 +11489,7 @@ fn apply_runtime_reducer_visual_effect(effect: &DesktopRuntimeReducerEffect) {
             ..
         }
     );
-    if should_scroll {
+    if should_scroll && follow_active_task {
         scroll_mission_thread_to_latest();
     }
 }
@@ -11515,11 +11602,44 @@ fn browser_workspace_control_request(
         })
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeTextUpdateMode {
+    Restore,
+    Live { can_follow: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeTextViewportEffect {
+    Preserve,
+    Follow,
+    MarkUnseen,
+}
+
+fn runtime_text_viewport_effect(
+    mode: RuntimeTextUpdateMode,
+    follow_latest: bool,
+    received_new_text: bool,
+) -> RuntimeTextViewportEffect {
+    match mode {
+        RuntimeTextUpdateMode::Live { can_follow: true } if follow_latest => {
+            RuntimeTextViewportEffect::Follow
+        }
+        RuntimeTextUpdateMode::Live { .. } if received_new_text => {
+            RuntimeTextViewportEffect::MarkUnseen
+        }
+        // Reading history must never move the viewport or present old text as a new event.
+        RuntimeTextUpdateMode::Restore | RuntimeTextUpdateMode::Live { .. } => {
+            RuntimeTextViewportEffect::Preserve
+        }
+    }
+}
+
 fn update_runtime_text_stream(
     projection: Option<DesktopRuntimeTextStreamProjection>,
     mut stream: Signal<Option<DesktopRuntimeTextStreamProjection>>,
     follow_latest: Signal<bool>,
     mut has_unseen: Signal<bool>,
+    mode: RuntimeTextUpdateMode,
 ) {
     if stream.peek().as_ref() == projection.as_ref() {
         return;
@@ -11534,10 +11654,10 @@ fn update_runtime_text_stream(
     let received_new_text = next_sequence
         .is_some_and(|sequence| previous_sequence.is_none_or(|previous| sequence > previous));
     stream.set(projection);
-    if *follow_latest.peek() {
-        scroll_mission_thread_to_latest();
-    } else if received_new_text {
-        has_unseen.set(true);
+    match runtime_text_viewport_effect(mode, *follow_latest.peek(), received_new_text) {
+        RuntimeTextViewportEffect::Follow => scroll_mission_thread_to_latest(),
+        RuntimeTextViewportEffect::MarkUnseen => has_unseen.set(true),
+        RuntimeTextViewportEffect::Preserve => {}
     }
 }
 
@@ -11552,6 +11672,8 @@ fn begin_runtime_text_stream_monitor(
     model: Signal<DesktopUiModel>,
     project_id: ProjectId,
     mission_id: MissionId,
+    owner: Signal<Option<product_experience::TaskScope>>,
+    cancellation: DesktopRuntimeCancellation,
     mut stream: Signal<Option<DesktopRuntimeTextStreamProjection>>,
     mut stream_error: Signal<Option<UiFailure>>,
     follow_latest: Signal<bool>,
@@ -11575,7 +11697,22 @@ fn begin_runtime_text_stream_monitor(
             match result {
                 Ok(Ok(projection)) => {
                     stream_error.set(None);
-                    update_runtime_text_stream(projection, stream, follow_latest, has_unseen);
+                    // Selection alone is not execution authority. This monitor follows only
+                    // its original command, and never scrolls past a pending approval.
+                    let active_owner = (*submitting.peek() || *retrying.peek())
+                        && owner.peek().as_ref().is_some_and(|(project, mission)| {
+                            project == &project_id && mission == &mission_id
+                        });
+                    let mode = if active_owner {
+                        RuntimeTextUpdateMode::Live {
+                            can_follow: !cancellation.is_requested()
+                                && cancellation.held_local_approval().is_none()
+                                && cancellation.held_cordis_approval().is_none(),
+                        }
+                    } else {
+                        RuntimeTextUpdateMode::Restore
+                    };
+                    update_runtime_text_stream(projection, stream, follow_latest, has_unseen, mode);
                 }
                 Ok(Err(error)) => {
                     stream.set(None);
@@ -11847,19 +11984,6 @@ fn dispatcher_stage_dot(stage: &MissionStage) -> &'static str {
     }
 }
 
-fn dispatcher_mission_detail(mission: &MissionProjection) -> String {
-    let checkpoint = mission
-        .current_checkpoint_id
-        .as_deref()
-        .unwrap_or("unbound");
-    format!(
-        "{} · {} · cycle {}",
-        mission_stage_label(&mission.stage),
-        checkpoint,
-        mission.cycle
-    )
-}
-
 fn project_initials(name: &str) -> String {
     let initials = name
         .split_whitespace()
@@ -11884,7 +12008,7 @@ fn settings_panel_label(panel: &str) -> &'static str {
     }
 }
 
-fn status_label(model: &DesktopUiModel) -> String {
+fn status_label(model: &DesktopUiModel, executing: bool) -> String {
     if let Some(notice) = &model.notice {
         return format!("{} · 已停止", notice.code);
     }
@@ -11906,7 +12030,7 @@ fn status_label(model: &DesktopUiModel) -> String {
     if let Some(activity) = model.current_runtime_activity() {
         match activity.process_claim_status {
             Some(RuntimeProcessClaimStatus::Blocked) => {
-                return "Runtime process BLOCKED · 禁止重复启动".into();
+                return "上次执行需要检查".into();
             }
             Some(
                 status @ (RuntimeProcessClaimStatus::Prepared | RuntimeProcessClaimStatus::Spawned),
@@ -11920,16 +12044,32 @@ fn status_label(model: &DesktopUiModel) -> String {
             | None => {}
         }
         if activity.requires_reconciliation {
-            return "Runtime UNCERTAIN · 禁止自动重放".into();
+            return "正在等待上次执行结果确认".into();
         }
         if let Some(status) = activity.turn_status {
-            return format!(
-                "Runtime {} · Mission 未自完成",
-                runtime_turn_status_label(status)
-            );
+            let label = match status {
+                RuntimeTurnStatus::WaitingLocalApproval | RuntimeTurnStatus::ApprovalResponding => {
+                    Some("等待操作确认")
+                }
+                RuntimeTurnStatus::InterruptRequested => Some("正在停止"),
+                RuntimeTurnStatus::Interrupted => Some("已暂停"),
+                RuntimeTurnStatus::Failed => Some("本次处理失败"),
+                RuntimeTurnStatus::Uncertain => Some("执行结果待确认"),
+                RuntimeTurnStatus::Prepared
+                | RuntimeTurnStatus::Dispatching
+                | RuntimeTurnStatus::Running => Some(if executing {
+                    "正在处理"
+                } else {
+                    "上次处理待恢复"
+                }),
+                RuntimeTurnStatus::Completed => None,
+            };
+            if let Some(label) = label {
+                return label.into();
+            }
         }
         if activity.recovery_status == Some(RuntimeRecoveryStatus::Failed) {
-            return "Runtime recovery FAILED · 等待安全重建".into();
+            return "恢复未完成，需要处理".into();
         }
     }
     match &model.backend {
@@ -11938,12 +12078,12 @@ fn status_label(model: &DesktopUiModel) -> String {
         DesktopBackendState::Ready(_) => model.current_mission().map_or_else(
             || {
                 if model.current_project().is_some() {
-                    "等待持久 Mission".into()
+                    "准备开始新任务".into()
                 } else {
-                    "没有宣发项目".into()
+                    "尚未创建项目".into()
                 }
             },
-            |mission| mission_stage_label(&mission.stage).into(),
+            |mission| product_experience::task_status(mission, executing).into(),
         ),
     }
 }
@@ -12186,14 +12326,14 @@ fn vm03_domain_purchase_proposal(
 
 fn runtime_availability_label(status: DesktopRuntimeAvailabilityStatus) -> &'static str {
     match status {
-        DesktopRuntimeAvailabilityStatus::NotConfigured => "NOT_CONFIGURED",
-        DesktopRuntimeAvailabilityStatus::ConfigurationRequired => "CONFIGURATION_REQUIRED",
-        DesktopRuntimeAvailabilityStatus::EvidenceMissing => "EVIDENCE_MISSING",
-        DesktopRuntimeAvailabilityStatus::ReadyDevelopment => "DEV_READY",
-        DesktopRuntimeAvailabilityStatus::ReadyDistribution => "DISTRIBUTION_READY",
-        DesktopRuntimeAvailabilityStatus::BlockedEnvironment => "BLOCKED_ENV",
-        DesktopRuntimeAvailabilityStatus::IntegrityError => "INTEGRITY_ERROR",
-        DesktopRuntimeAvailabilityStatus::UnsupportedHost => "UNSUPPORTED_HOST",
+        DesktopRuntimeAvailabilityStatus::NotConfigured
+        | DesktopRuntimeAvailabilityStatus::ConfigurationRequired => "待配置",
+        DesktopRuntimeAvailabilityStatus::EvidenceMissing => "运行组件不完整",
+        DesktopRuntimeAvailabilityStatus::ReadyDevelopment => "已配置 · 开发模式",
+        DesktopRuntimeAvailabilityStatus::ReadyDistribution => "已配置",
+        DesktopRuntimeAvailabilityStatus::BlockedEnvironment => "当前环境不可用",
+        DesktopRuntimeAvailabilityStatus::IntegrityError => "配置校验失败",
+        DesktopRuntimeAvailabilityStatus::UnsupportedHost => "当前系统不支持",
     }
 }
 
@@ -12402,6 +12542,61 @@ mod tests {
     use sha2::Digest as _;
 
     use super::*;
+
+    #[test]
+    fn workspace_refresh_preserves_new_task_selection_and_validates_existing_task_ids() {
+        let (project, mission) =
+            result_adoption_surface::tests::project_and_mission(WorkProductStatus::Accepted);
+        // A refresh started in a task must respect a later switch to New Task.
+        assert_eq!(restored_mission_selection(&project, None, false), None);
+        assert_eq!(
+            restored_mission_selection(&project, Some(&mission.mission_id), false),
+            Some(mission.mission_id.clone()),
+        );
+        let missing = MissionId::from("deleted-task");
+        assert_eq!(
+            restored_mission_selection(&project, Some(&missing), false),
+            Some(mission.mission_id.clone()),
+        );
+        // Cold startup still deliberately restores the latest task.
+        assert_eq!(
+            restored_mission_selection(&project, None, true),
+            Some(mission.mission_id),
+        );
+    }
+
+    #[test]
+    fn restoring_history_preserves_results_while_live_text_respects_attention_and_scroll() {
+        use RuntimeTextViewportEffect::{Follow, MarkUnseen, Preserve};
+
+        // Cold startup has no prior sequence and defaults to follow_latest=true.
+        // Loading its persisted text is nevertheless a restore, not a live event.
+        for follow_latest in [true, false] {
+            assert_eq!(
+                runtime_text_viewport_effect(RuntimeTextUpdateMode::Restore, follow_latest, true),
+                Preserve,
+            );
+        }
+        assert_eq!(
+            runtime_text_viewport_effect(
+                RuntimeTextUpdateMode::Live { can_follow: true },
+                true,
+                true,
+            ),
+            Follow,
+        );
+        // A held approval or a user's scroll position must stay in view.
+        for (can_follow, follow_latest) in [(false, true), (true, false), (false, false)] {
+            assert_eq!(
+                runtime_text_viewport_effect(
+                    RuntimeTextUpdateMode::Live { can_follow },
+                    follow_latest,
+                    true,
+                ),
+                MarkUnseen,
+            );
+        }
+    }
 
     fn execution_digest(character: char) -> String {
         character.to_string().repeat(64)
@@ -14174,7 +14369,7 @@ mod tests {
             "SensitiveProviderCredential([REDACTED])",
             "r#type: \"password\"",
             "autocomplete: \"new-password\"",
-            "NO PROVIDER CALL",
+            "保存或清除配置不会发送消息",
             "native_credential_source_label",
             "native_profile_clear_enabled",
             "DesktopNativeCredentialSource::DesktopProfile",
@@ -14210,11 +14405,11 @@ mod tests {
     fn runtime_labels_never_collapse_uncertain_or_failed_into_success() {
         assert_eq!(
             runtime_availability_label(DesktopRuntimeAvailabilityStatus::ReadyDevelopment),
-            "DEV_READY"
+            "已配置 · 开发模式"
         );
         assert_eq!(
             runtime_availability_label(DesktopRuntimeAvailabilityStatus::EvidenceMissing),
-            "EVIDENCE_MISSING"
+            "运行组件不完整"
         );
         assert_eq!(
             runtime_turn_status_label(RuntimeTurnStatus::Uncertain),

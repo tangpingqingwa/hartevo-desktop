@@ -254,7 +254,7 @@ fn short_digest(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hartevo_application::{DesktopProjectProjection, MissionProjection};
     use hartevo_domain_kernel::{ProjectEncryptionMode, StorageMode};
@@ -274,7 +274,7 @@ mod tests {
         }
     }
 
-    fn project_and_mission(
+    pub(crate) fn project_and_mission(
         status: WorkProductStatus,
     ) -> (DesktopProjectProjection, MissionProjection) {
         let project_id = ProjectId::from("project-result-surface");

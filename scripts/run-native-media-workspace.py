@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--app", type=Path)
     parser.add_argument("--allow-paid", action="store_true")
+    parser.add_argument("--text-provider", choices=("openai", "grok"))
+    parser.add_argument("--text-model", help="Exact model id for the optional conversation connection")
     args = parser.parse_args()
     os.umask(0o077)
     root = Path(__file__).resolve().parent.parent
@@ -57,6 +59,16 @@ def main():
                   "HARTEVO_GPT_API_KEY": config["gpt_api"], "HARTEVO_GROK_API_KEY": config["grok_api"],
                   "HARTEVO_MEDIA_GPT_KEY_ENV": "HARTEVO_GPT_API_KEY",
                   "HARTEVO_MEDIA_GROK_KEY_ENV": "HARTEVO_GROK_API_KEY"})
+    if args.text_provider:
+        if not args.text_model:
+            parser.error("--text-provider requires --text-model")
+        key_name = "HARTEVO_GPT_API_KEY" if args.text_provider == "openai" else "HARTEVO_GROK_API_KEY"
+        child.update({"HARTEVO_RUNTIME_PROVIDER": args.text_provider + "-compatible",
+                      "HARTEVO_RUNTIME_MODEL": args.text_model,
+                      "HARTEVO_RUNTIME_API_BASE": config["api_base"],
+                      "HARTEVO_RUNTIME_API_KEY_ENV": key_name,
+                      "HARTEVO_RUNTIME_CONTEXT_TOKENS": "32768",
+                      "HARTEVO_RUNTIME_MAX_TOKENS": "4096"})
     app = args.app.resolve()
     with (output / "desktop.log").open("ab") as log:
         process = subprocess.Popen([str(app)], cwd=root, env=child, stdout=log,
