@@ -247,7 +247,7 @@ pub(crate) fn MissionOverview(
                                 let status = result_status(&product.adoption_status);
                                 let identity = media_identity(&product);
                                 rsx! {
-                                    article {key:"result-{product.work_product_id}",class:"mission-result-card",
+                                    article {key:"result-{product.work_product_id}",class:"mission-result-card", "data-motion-enter":"result",
                                         div {class:"mission-result-preview",
                                             if let Some((id,kind)) = identity {
                                                 MediaAssetPreview {key:"{id}",project_id:mission.project_id.clone(),mission_id:mission.mission_id.clone(),id,kind,

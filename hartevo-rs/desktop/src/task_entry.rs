@@ -447,6 +447,7 @@ pub(crate) fn NewTaskEntry(
         section {
             class: if reviewing { "task-entry is-reviewing" } else if expanded() { "task-entry is-expanded" } else { "task-entry" },
             aria_label: "描述并确认新任务",
+            "data-agent-state": if submitting { "preparing" } else { "idle" },
             header { class: "task-entry-context",
                 span { i {} "{project_name}" }
                 small { if reviewing { "确认任务范围" } else { "新任务" } }
@@ -454,8 +455,11 @@ pub(crate) fn NewTaskEntry(
                     button { class: "task-text-action", onclick: move |_| { form.write().reviewing = false; restore_ui_focus("mission-composer-input"); }, "修改目标" }
                 }
             }
+            if submitting {
+                crate::agent_motion::AgentActivity { state: crate::agent_motion::AgentMotionState::Preparing }
+            }
             if reviewing {
-                div { class: "task-entry-review",
+                div { class: "task-entry-review", "data-motion-enter": "review",
                     p { class: "task-entry-goal", "{state.goal}" }
                     div { class: "task-entry-fields",
                         label { class: "task-entry-wide", r#for: "task-entry-route",

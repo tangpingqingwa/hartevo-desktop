@@ -39,6 +39,7 @@ use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
+mod agent_motion;
 mod agent_operations;
 mod cordis_host;
 pub mod data_plane;
@@ -97,6 +98,8 @@ use runtime_subscription::{
 static MAIN_CSS: Asset = asset!("/assets/main.css");
 static PROTOTYPE_CSS: Asset = asset!("/assets/prototype.css");
 static PRODUCT_CSS: Asset = asset!("/assets/product.css");
+static AGENT_MOTION_CSS: Asset = asset!("/assets/agent-motion.css");
+static AGENT_MOTION_JS: Asset = asset!("/assets/agent-motion.js");
 const DESKTOP_TIKTOK_READ_MAX_PAGES: u16 = MAX_VIDEO_SEQUENCE_PAGES;
 #[allow(
     dead_code,
@@ -1271,10 +1274,13 @@ pub fn App() -> Element {
         document::Stylesheet { href: MAIN_CSS }
         document::Stylesheet { href: PROTOTYPE_CSS }
         document::Stylesheet { href: PRODUCT_CSS }
+        document::Stylesheet { href: AGENT_MOTION_CSS }
+        document::Script { src: AGENT_MOTION_JS.to_string() }
         if let Some(model) = initial_model() {
             DesktopWorkspace { initial_model: model }
         } else {
             main { class: "workspace-opening", aria_busy: true,
+                agent_motion::AgentOrb { state: agent_motion::AgentMotionState::Preparing }
                 span { class: "workspace-opening-brand", "Hartevo" }
                 h1 { "正在打开工作空间" }
                 p { role: "status", "正在读取本机加密数据。如果 macOS 弹出钥匙串提示，请在系统窗口中完成授权。" }
@@ -1635,6 +1641,10 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     });
     let view = model.read().clone();
     let current_surface = surface();
+    let motion_surface_key = format!(
+        "{current_surface:?}/{:?}/{:?}",
+        view.selected_project_id, view.selected_mission_id
+    );
     let project = view.current_project().cloned();
     let mission = view.current_mission().cloned();
     let context_access = view.current_context_access().cloned();
@@ -2028,6 +2038,22 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
             .cloned()
     });
     let runtime_progress_events = runtime_progress.read().clone();
+    let agent_motion_state = agent_motion::AgentMotionState::from_observation(
+        selected_task_executing || visual_runtime_busy,
+        mission
+            .as_ref()
+            .is_some_and(|m| product_experience::scope_matches(m, live_attention.as_ref())),
+        selected_task_executing && runtime_stop_requested(),
+        (selected_task_executing || runtime_fallback_scope_matches || visual_runtime_busy)
+            .then(|| runtime_progress_events.last().map(|event| event.phase))
+            .flatten(),
+        rendered_runtime_text_stream
+            .as_ref()
+            .map(|stream| stream.turn_status),
+        rendered_runtime_text_stream
+            .as_ref()
+            .is_some_and(|stream| stream.items.iter().any(|item| !item.text.is_empty())),
+    );
     let recent_runtime_progress = runtime_progress_events
         .iter()
         .rev()
@@ -3581,6 +3607,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                 ActiveOverlay::GlobalSearch => Some("global-search-trigger".to_owned()),
                                 ActiveOverlay::Notifications => Some("notification-center-trigger".to_owned()),
                                 ActiveOverlay::ProjectSwitcher => Some("project-switcher-trigger".to_owned()),
+                                ActiveOverlay::None if workpad_visible => Some("workpad-toggle-trigger".to_owned()),
                                 ActiveOverlay::None => None,
                             }
                         };
@@ -3594,6 +3621,9 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                             "document.getElementById('mission-composer-input')?.blur()",
                         );
                         if let Some(focus_target) = focus_target {
+                            if focus_target == "workpad-toggle-trigger" {
+                                workpad_open.set(false);
+                            }
                             restore_ui_focus(&focus_target);
                         }
                         if current_surface == Surface::Settings {
@@ -3787,6 +3817,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                         strong { "{surface_heading}" }
                     }
                     button {
+                        id: "workpad-toggle-trigger",
                         class: if workpad_visible { "workpad-chrome-button active" } else { "workpad-chrome-button" },
                         aria_label: if workpad_visible { "收起任务工作台" } else { "打开任务工作台" },
                         aria_pressed: workpad_visible,
@@ -4039,7 +4070,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                 }
 
                 div { class: if workpad_visible { "workspace-grid workpad-visible" } else { "workspace-grid" },
-                    section { class: "main-surface",
+                    section { class: "main-surface", "data-motion-surface": motion_surface_key,
                         if let Some(notice) = &view.notice {
                             IntegrityBanner { failure: notice.clone() }
                         }
@@ -4054,7 +4085,8 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                 runtime_text_error: rendered_runtime_text_error.clone(),
                                 runtime_fixture_state: visual_runtime_state,
                                 runtime_transport_caught_up: rendered_runtime_transport_caught_up,
-                                runtime_busy: selected_task_executing,
+                                runtime_busy: selected_task_executing || visual_runtime_busy,
+                                runtime_motion: Some(agent_motion_state),
                                 live_attention: live_attention.clone(),
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
@@ -4327,7 +4359,12 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                         }
                                     }
                                 }
-                                if runtime_busy {
+                                if agent_motion_state != agent_motion::AgentMotionState::Idle {
+                                    agent_motion::AgentActivity { state: agent_motion_state, fixture: visual_fixture_mode }
+                                }
+                                if runtime_busy && (selected_task_executing || visual_runtime_busy) {
+                                    details { class: "agent-activity-details",
+                                        summary { "处理详情" }
                                     div {
                                         class: if runtime_stop_requested() { "live-operation-strip stop-requested" } else { "live-operation-strip" },
                                         role: "status",
@@ -4367,6 +4404,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                                 }
                                             }
                                         }
+                                    }
                                     }
                                 }
                                 if visual_fixture_id.is_some() && fixture_attachment_visible() {
@@ -6040,8 +6078,13 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                         button {
                             class: "workpad-compact-backdrop",
                             aria_label: "收起任务工作台",
-                            onclick: move |_| workpad_open.set(false),
+                            onclick: move |_| {
+                                workpad_open.set(false);
+                                restore_ui_focus("workpad-toggle-trigger");
+                            },
                         }
+                    }
+                    agent_motion::WorkpadPresence { open: workpad_visible,
                         div {
                             id: "workpad-resize-handle",
                             class: "workpad-resize-handle",
@@ -6078,7 +6121,10 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                             selected_work_product_id: selected_result_id.read().clone(),
                             context_access: context_access.clone(),
                             on_changed: move |snapshot| model.write().set_ready(snapshot, false),
-                            on_close: move |()| workpad_open.set(false),
+                            on_close: move |()| {
+                                workpad_open.set(false);
+                                restore_ui_focus("workpad-toggle-trigger");
+                            },
                         }
                     }
                 }
@@ -7955,6 +8001,7 @@ fn OrchestratorSurface(
     runtime_fixture_state: Option<VisualRuntimeFixtureState>,
     runtime_transport_caught_up: bool,
     runtime_busy: bool,
+    runtime_motion: Option<agent_motion::AgentMotionState>,
     live_attention: Option<product_experience::TaskScope>,
     runtime_stream_is_fixture: bool,
     runtime_follow_latest: bool,
@@ -8284,6 +8331,7 @@ fn OrchestratorSurface(
                             PersistedRuntimeStreamTurn {
                                 stream,
                                 runtime_busy,
+                                observed_motion: runtime_motion,
                                 visual_fixture: runtime_stream_is_fixture,
                                 transport_caught_up: runtime_transport_caught_up,
                             }
@@ -8504,11 +8552,11 @@ fn PersistedConversationMessages(
 #[component]
 fn PersistedRuntimeAwaitingTurn() -> Element {
     rsx! {
-        article { class: "assistant-turn persisted-assistant-turn runtime-stream-turn is-streaming",
+        article { class: "assistant-turn persisted-assistant-turn runtime-stream-turn is-streaming", "data-motion-enter": "turn",
             header { class: "assistant-byline",
-                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                agent_motion::AgentOrb { state: agent_motion::AgentMotionState::Preparing }
                 strong { "Hartevo" }
-                time { "等待 Runtime" }
+                time { "正在准备回复" }
             }
             div {
                 class: "assistant-copy runtime-stream-copy",
@@ -8516,13 +8564,16 @@ fn PersistedRuntimeAwaitingTurn() -> Element {
                 aria_atomic: "false",
                 aria_busy: "true",
                 p { class: "runtime-stream-waiting",
-                    "Mission 与 exact 执行句柄已持久化；尚未收到首个 Runtime turn"
+                    "任务已保存，正在等待开始回复。"
                     i { class: "runtime-stream-caret", aria_hidden: "true" }
                 }
             }
-            footer { class: "runtime-stream-receipt",
-                UiIcon { name: UiIconName::FileCheck, size: 12 }
-                span { "AWAITING_TURN · 未据此声明 Runtime 或 Mission 完成" }
+            details { class: "runtime-stream-details",
+                summary { "回复记录" }
+                footer { class: "runtime-stream-receipt",
+                    UiIcon { name: UiIconName::FileCheck, size: 12 }
+                    span { "AWAITING_TURN · 未据此声明 Runtime 或 Mission 完成" }
+                }
             }
         }
     }
@@ -8532,29 +8583,43 @@ fn PersistedRuntimeAwaitingTurn() -> Element {
 fn PersistedRuntimeStreamTurn(
     stream: DesktopRuntimeTextStreamProjection,
     runtime_busy: bool,
+    observed_motion: Option<agent_motion::AgentMotionState>,
     visual_fixture: bool,
     transport_caught_up: bool,
 ) -> Element {
-    let stream_active = stream.turn_status.is_active();
+    let stream_motion = observed_motion.unwrap_or_else(|| {
+        agent_motion::AgentMotionState::from_observation(
+            runtime_busy,
+            stream.turn_status == RuntimeTurnStatus::WaitingLocalApproval,
+            stream.turn_status == RuntimeTurnStatus::InterruptRequested,
+            None,
+            Some(stream.turn_status),
+            stream.items.iter().any(|item| !item.text.is_empty()),
+        )
+    });
+    let stream_active = stream_motion.animated();
     let last_item_index = stream.items.len().saturating_sub(1);
     rsx! {
         article { class: if stream_active { "assistant-turn persisted-assistant-turn runtime-stream-turn is-streaming" } else { "assistant-turn persisted-assistant-turn runtime-stream-turn" },
             header { class: "assistant-byline",
-                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                agent_motion::AgentOrb { state: stream_motion }
                 strong { "Hartevo" }
                 time {
-                    if stream_active || runtime_busy { "正在响应" } else { "已从本机恢复" }
+                    if stream_motion == agent_motion::AgentMotionState::Idle { "已从本机恢复" }
+                    else { "{stream_motion.label()}" }
                 }
             }
             div {
                 class: "assistant-copy runtime-stream-copy",
                 aria_live: "polite",
                 aria_atomic: "false",
-                aria_busy: stream_active || runtime_busy,
+                aria_busy: stream_active,
                 if stream.items.is_empty() && (stream_active || runtime_busy) {
                     p { class: "runtime-stream-waiting",
-                        "正在等待首个持久正文增量"
-                        i { class: "runtime-stream-caret", aria_hidden: "true" }
+                        if stream_active {
+                            "正在处理，收到内容后会直接显示。"
+                            i { class: "runtime-stream-caret", aria_hidden: "true" }
+                        } else { "{stream_motion.label()}" }
                     }
                 }
                 for (item_index, item) in stream.items.clone().into_iter().enumerate() {
@@ -8563,7 +8628,7 @@ fn PersistedRuntimeStreamTurn(
                         let paragraphs = runtime_stream_paragraphs(&item.text);
                         let last_paragraph_index = paragraphs.len().saturating_sub(1);
                         rsx! {
-                            section { key: "{item_key}", class: "runtime-stream-item",
+                            section { key: "{item_key}", class: "runtime-stream-item", "data-motion-enter": "item",
                                 for (paragraph_index, paragraph) in paragraphs.into_iter().enumerate() {
                                     p { key: "{item_key}-p-{paragraph_index}",
                                         "{paragraph}"
@@ -8577,21 +8642,24 @@ fn PersistedRuntimeStreamTurn(
                     }
                 }
             }
-            footer { class: "runtime-stream-receipt",
-                UiIcon { name: UiIconName::FileCheck, size: 12 }
-                span {
-                    if visual_fixture {
-                        "VISUAL_FIXTURE · 模拟 {stream.delta_count} 个正文增量；未读取 SQLCipher"
-                    } else if stream_active {
-                        "已持久化 {stream.delta_count} 个正文增量"
-                    } else {
-                        "从 SQLCipher 重放 {stream.delta_count} 个正文增量"
+            details { class: "runtime-stream-details",
+                summary { "回复记录" }
+                footer { class: "runtime-stream-receipt",
+                    UiIcon { name: UiIconName::FileCheck, size: 12 }
+                    span {
+                        if visual_fixture {
+                            "VISUAL_FIXTURE · 模拟 {stream.delta_count} 个正文增量；未读取 SQLCipher"
+                        } else if stream_active {
+                            "已持久化 {stream.delta_count} 个正文增量"
+                        } else {
+                            "从 SQLCipher 重放 {stream.delta_count} 个正文增量"
+                        }
                     }
+                    if transport_caught_up {
+                        b { class: "runtime-transport-state", "CAUGHT_UP · 仅传输" }
+                    }
+                    em { "{runtime_turn_status_label(stream.turn_status)} · cursor {stream.last_evidence_sequence.unwrap_or_default()}" }
                 }
-                if transport_caught_up {
-                    b { class: "runtime-transport-state", "CAUGHT_UP · 仅传输" }
-                }
-                em { "{runtime_turn_status_label(stream.turn_status)} · cursor {stream.last_evidence_sequence.unwrap_or_default()}" }
             }
         }
     }
@@ -12176,7 +12244,7 @@ fn cycle_dialog_focus(selector: &str, reverse: bool) {
 
 fn restore_ui_focus(element_id: &str) {
     let script = format!(
-        "requestAnimationFrame(() => {{ const element = document.getElementById({element_id:?}); const details = element?.closest('details'); if (details) details.open = true; element?.focus(); }})"
+        "(() => {{ const focus = () => {{ const element = document.getElementById({element_id:?}); const details = element?.closest('details'); if (details) details.open = true; element?.focus(); }}; if (document.hidden) setTimeout(focus, 0); else requestAnimationFrame(focus); }})()"
     );
     let _ = dioxus::document::eval(&script);
 }
