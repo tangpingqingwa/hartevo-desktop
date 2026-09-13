@@ -1,0 +1,79 @@
+{
+  "schema": "hartevo-ui-component-license-manifest/v1",
+  "components": [
+    {
+      "name": "thinking-orbs geometry and presets",
+      "source": "https://github.com/Jakubantalik/Libraries.dev",
+      "revision": "422180dd7a5ac646c85deedc65500c4a74339127",
+      "retrieved": "2026-09-13",
+      "license": "MIT",
+      "tier": "free",
+      "licenseFile": "third_party/thinking-orbs/LICENSE",
+      "purpose": "Canvas geometry port for Rust-owned activity states; no React runtime",
+      "files": [
+        {
+          "path": "third_party/thinking-orbs/LICENSE",
+          "sha256": "915a283980628a0ca9e7b423ebafc6f3a0fa1e630ff17d34e59034808d92011c"
+        },
+        {
+          "path": "third_party/thinking-orbs/src/engine/core.ts",
+          "sha256": "05aa3d5f24c1c35e5fcfd6c804204f0cab3ca7909a6e9089dee3673cbe28e1cc"
+        },
+        {
+          "path": "third_party/thinking-orbs/src/engine/lattice.ts",
+          "sha256": "785e03ee9dc7ddc955952f666c8b269351571dffc96fb0ddc4050e5718444397"
+        },
+        {
+          "path": "third_party/thinking-orbs/src/engine/ribbon.ts",
+          "sha256": "a79cc262b42f3f12f5d4a108e7cf9710938d5fb1f6166c9fa789f02d4e0679c4"
+        },
+        {
+          "path": "third_party/thinking-orbs/src/engine/web.ts",
+          "sha256": "1dc2e38e9d01298ebf32744a3569f4e3234ba4af61cc64c5089511f7a9b7369d"
+        },
+        {
+          "path": "third_party/thinking-orbs/src/engine/profiles.ts",
+          "sha256": "a092bef089437cc7fce681ca6f9af24a831191d77e91814ad6b66cbb1d8fab01"
+        },
+        {
+          "path": "third_party/thinking-orbs/src/presets.ts",
+          "sha256": "a06ab0dea139a735ef9ac212965dc86dc7be60bc3bfd9e3cd9e93b9701faae31"
+        }
+      ]
+    },
+    {
+      "name": "Lucide preview state icons",
+      "source": "https://github.com/lucide-icons/lucide",
+      "revision": "56e49f12166312f04af4cfd862621c93cf583979",
+      "retrieved": "2026-09-13",
+      "license": "ISC",
+      "tier": "free",
+      "licenseFile": "prototype/motion-icons/LICENSE-LUCIDE",
+      "purpose": "Preview copies of the existing dioxus-icons 0.1.0 production icons",
+      "files": [
+        {
+          "path": "prototype/motion-icons/LICENSE-LUCIDE",
+          "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57"
+        },
+        {
+          "path": "prototype/motion-icons/check.svg",
+          "sha256": "6a8d1091dcbe978d35c98a58e955e5cb60e140c4794b9d5a79875a6b7d7ee699"
+        },
+        {
+          "path": "prototype/motion-icons/shield_check.svg",
+          "sha256": "9ff180543c625057bbef1aa0af13432b44de203014093427931fde74d4c26a05"
+        }
+      ]
+    }
+  ],
+  "interactionReferences": [
+    {
+      "url": "https://transitions.dev/detail.html?t=thinking-states",
+      "use": "Public preview: status continuity and compact transitions; no source copied"
+    },
+    {
+      "url": "https://libraries.dev/orbs",
+      "use": "Public preview and MIT geometry adaptation"
+    }
+  ]
+}

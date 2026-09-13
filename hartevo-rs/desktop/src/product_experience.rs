@@ -247,7 +247,7 @@ pub(crate) fn MissionOverview(
                                 let status = result_status(&product.adoption_status);
                                 let identity = media_identity(&product);
                                 rsx! {
-                                    article {key:"result-{product.work_product_id}",class:"mission-result-card",
+                                    article {key:"result-{product.work_product_id}",class:"mission-result-card", "data-motion-enter":"result",
                                         div {class:"mission-result-preview",
                                             if let Some((id,kind)) = identity {
                                                 MediaAssetPreview {key:"{id}",project_id:mission.project_id.clone(),mission_id:mission.mission_id.clone(),id,kind,
@@ -255,12 +255,12 @@ pub(crate) fn MissionOverview(
                                             } else {
                                                 div {class:"mission-result-excerpt",
                                                     UiIcon {name:UiIconName::FileText,size:20}
-                                                    p { "{product.preview_text}" }
+                                                    p { "{crate::draft_preview::excerpt(&product.preview_text)}" }
                                                 }
                                             }
                                         }
                                         footer {
-                                            div {strong { "{product.title}" } span { "{status}" } }
+                                            div {strong { "{crate::draft_preview::product_title(&product)}" } span { "{status}" } }
                                             button {class:"task-secondary-action",onclick:move |_|on_result_action.call(open.clone()),"打开成果"}
                                         }
                                     }

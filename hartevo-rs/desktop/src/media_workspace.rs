@@ -366,6 +366,13 @@ pub(crate) fn MediaWorkspace(
     });
     rsx! {
         section {class:"media-workspace",aria_label:"创意素材",
+            if busy() {
+                crate::agent_motion::AgentActivity {
+                    state: crate::agent_motion::AgentMotionState::Preparing,
+                    title: "正在处理素材",
+                    detail: "完成后会更新这里的结果；已有素材仍然保留。",
+                }
+            }
             div {class:"media-workspace-heading",
                 h3 {"创意素材"}
                 button {class:"task-text-action",disabled:busy(),onclick:move |_|{revises.set(None);prompt.set(String::new());show_generator.set(true);},"＋ 新建素材"}
@@ -405,7 +412,7 @@ pub(crate) fn MediaWorkspace(
                     let job_choice = match (job.request.kind,job.request.provider) {(MediaKind::Video,_)=>"grok-video",(_,MediaProvider::OpenAi)=>"gpt-image",_=>"grok-image"};
                     let scope = (mission.project_id.clone(),mission.mission_id.clone());
                     rsx! {
-                        article {class:"media-selected-result",key:"selected-{id}",
+                        article {class:"media-selected-result",key:"selected-{id}", "data-motion-enter":"media",
                             div {class:"media-selected-meta",strong {"{status}"} span {{job.created_at.format("%m月%d日 %H:%M").to_string()}}}
                             if job.asset.is_some() {
                                 MediaAssetPreview {key:"{id}",project_id:mission.project_id.clone(),mission_id:mission.mission_id.clone(),id:id.clone(),kind:job.request.kind,

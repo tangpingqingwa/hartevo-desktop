@@ -1,0 +1,124 @@
+/* Hartevo motion language. Rust owns states; this sheet only presents them. */
+:root {
+  --motion-press: 100ms;
+  --motion-enter: 260ms;
+  --motion-exit: 180ms;
+  --motion-panel: 240ms;
+  --motion-ease-out: cubic-bezier(.16, 1, .3, 1);
+  --motion-ease-in-out: cubic-bezier(.4, 0, .2, 1);
+}
+
+.agent-activity {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 62px;
+  padding: 12px 15px;
+  overflow: hidden;
+  color: var(--ink-2);
+  background: var(--color-bg-surface);
+  border-bottom: 1px solid var(--line);
+  border-radius: 11px 11px 0 0;
+  transition: background-color var(--motion-normal), border-color var(--motion-normal);
+}
+.agent-activity-copy { display: grid; gap: 4px; min-width: 0; }
+.agent-activity-copy strong { display: block; font-size: 13px; line-height: 1.5; font-weight: 600; animation: agent-status-in var(--motion-enter) var(--motion-ease-out); }
+.agent-activity-copy small { font-size: 11px; line-height: 1.6; color: var(--muted); overflow-wrap: anywhere; }
+.agent-activity-fixture { margin-left: auto; font-size: 10px; color: var(--muted); white-space: nowrap; }
+.agent-activity[data-agent-state='waiting'],
+.agent-activity[data-agent-state='uncertain'] { background: var(--gold-soft); }
+.agent-activity[data-agent-state='failed'] { background: var(--red-soft); }
+.agent-activity[data-agent-state='complete'] { background: var(--green-soft); }
+.agent-activity:is([data-agent-state='preparing'], [data-agent-state='thinking'], [data-agent-state='composing'])::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 40%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--green), transparent);
+  animation: agent-activity-sweep 3.6s var(--motion-ease-in-out) infinite;
+  pointer-events: none;
+}
+.agent-orb { position: relative; display: inline-grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; color: var(--green); vertical-align: middle; }
+.agent-orb-canvas { position: absolute; inset: 0; color: inherit; opacity: 0; }
+.agent-orb-canvas canvas { display: block; width: 32px; height: 32px; }
+.agent-orb-symbol { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 50%; background: var(--green-soft); opacity: 1; transform: scale(1); transition: transform var(--motion-enter) var(--motion-ease-out), background-color var(--motion-normal); }
+.agent-orb:is([data-agent-state='preparing'], [data-agent-state='thinking'], [data-agent-state='composing']):has([data-orb-ready]) .agent-orb-canvas { opacity: 1; }
+.agent-orb:is([data-agent-state='preparing'], [data-agent-state='thinking'], [data-agent-state='composing']):has([data-orb-ready]) .agent-orb-symbol { opacity: 0; transform: scale(.65); }
+.agent-orb:is([data-agent-state='waiting'], [data-agent-state='uncertain']) { color: var(--gold-strong); }
+.agent-orb:is([data-agent-state='waiting'], [data-agent-state='uncertain']) .agent-orb-symbol { background: var(--gold-soft); }
+.agent-orb[data-agent-state='failed'] { color: var(--red); }
+.agent-orb[data-agent-state='failed'] .agent-orb-symbol { background: var(--red-soft); }
+.agent-orb:is([data-agent-state='stopping'], [data-agent-state='cancelled'], [data-agent-state='idle']) { color: var(--muted); }
+.agent-orb:is([data-agent-state='stopping'], [data-agent-state='cancelled'], [data-agent-state='idle']) .agent-orb-symbol { background: var(--hover); }
+.agent-activity-details { margin: 0; padding: 0 15px; border-bottom: 1px solid var(--line); }
+.agent-activity-details > summary { padding: 7px 0; font-size: 11px; color: var(--muted); cursor: pointer; }
+.agent-activity-details .live-operation-strip { margin: 0 0 10px; border-radius: var(--radius-sm); }
+.agent-activity-details .live-operation-strip > i { animation: none; }
+.agent-activity-details .live-operation-strip small { overflow-wrap: anywhere; }
+.assistant-byline .agent-orb { margin-right: 0; }
+.workspace-opening > .agent-orb { width: 48px; height: 48px; margin-bottom: 14px; }
+.workspace-opening > .agent-orb .agent-orb-canvas { inset: 8px; }
+
+/* Entry and response never delay readable text or replay on token updates. */
+.composer-zone, .task-entry { transition: border-color var(--motion-normal), box-shadow var(--motion-normal); }
+.composer-zone.runtime-active { border-color: var(--line-strong); box-shadow: 0 4px 20px rgb(30 51 40 / 5%); }
+.task-entry-review { transform-origin: bottom center; }
+.runtime-stream-copy p { overflow-wrap: anywhere; }
+.runtime-stream-details > summary { color: var(--muted); font-size: 11px; padding: 8px 0; cursor: pointer; }
+.runtime-stream-caret { width: 3px; height: 1em; border-radius: 3px; background: var(--green); vertical-align: -.12em; }
+.mission-result-card { transition: border-color var(--motion-normal), box-shadow var(--motion-normal), transform var(--motion-enter) var(--motion-ease-out); }
+.mission-result-card:focus-within { border-color: var(--green); box-shadow: 0 0 0 2px var(--green-soft); }
+.mission-result-card:has(.mission-result-excerpt) .mission-result-preview { min-height: 0; aspect-ratio: auto; place-items: stretch; }
+.mission-result-card:has(.mission-result-excerpt) .mission-result-excerpt { padding: 20px; }
+.mission-result-card:has(.mission-result-excerpt) .mission-result-excerpt > p { margin-bottom: 0; }
+.mission-result-gallery:has(> .mission-result-card:only-child:has(.mission-result-excerpt)) { grid-template-columns: minmax(0, 1fr); }
+.mission-result-card:has(.mission-result-excerpt):only-child { max-width: 660px; }
+
+:is(.task-primary-action, .task-secondary-action, .task-text-action, .new-task, .icon-button, .workpad-chrome-button, .runtime-profile-toggle) {
+  transition: transform var(--motion-press), color var(--motion-fast), background-color var(--motion-fast), border-color var(--motion-fast), box-shadow var(--motion-fast);
+}
+:is(.task-primary-action, .task-secondary-action, .new-task, .icon-button):enabled:active { transform: translateY(1px) scale(.985); }
+.prototype-mission-row, .side-nav-button { transition: background-color var(--motion-normal), color var(--motion-normal); }
+.prototype-mission-row.active { box-shadow: inset 2px 0 var(--green); }
+
+/* A stable slot preserves both entrance and exit. Inert applies immediately
+   on close; the Rust presence component releases the slot after 240ms. */
+.workspace-grid { display: flex; }
+.workspace-grid > .main-surface { flex: 1 1 0; }
+.workpad-motion-slot { position: relative; display: grid; grid-template-columns: 6px minmax(0, 1fr); flex: 0 0 auto; width: 0; min-width: 0; min-height: 0; opacity: 0; overflow: hidden; transition: width var(--motion-panel) var(--motion-ease-out), opacity var(--motion-exit); }
+.workpad-motion-slot[data-open='true'] { width: max(0px, calc(100% - var(--chat-w))); opacity: 1; }
+.workpad-motion-slot > .workpad { width: 100%; min-width: 0; height: 100%; }
+body.resizing-workpad .workpad-motion-slot { transition: none; }
+/* A background WebKit document can freeze at the starting style. Keep its
+   final layout visible; only foreground windows use the entrance width. */
+@starting-style { html[data-motion-visibility='visible'] .workpad-motion-slot[data-open='true'] { width: 0; opacity: .75; } }
+
+@keyframes agent-status-in { from { opacity: .75; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes agent-activity-sweep { 0%, 10% { transform: translateX(-110%); } 75%, 100% { transform: translateX(350%); } }
+
+@media (max-width: 1120px) {
+  .workpad-motion-slot, .workpad-motion-slot[data-open='true'] { position: fixed; z-index: var(--z-drawer); top: 52px; right: 0; bottom: 0; width: min(720px, calc(100vw - var(--side-w) - 24px)); display: block; transform: translateX(24px); transition: transform var(--motion-panel) var(--motion-ease-out), opacity var(--motion-exit); box-shadow: -12px 0 28px rgb(29 29 31 / 12%); }
+  .workpad-motion-slot[data-open='true'] { transform: translateX(0); }
+  .workspace-grid .workpad-motion-slot .workpad { position: relative; inset: auto; width: 100%; height: 100%; animation: none; box-shadow: none; }
+  .workpad-motion-slot .workpad-compact-backdrop { display: none; }
+  @starting-style { html[data-motion-visibility='visible'] .workpad-motion-slot[data-open='true'] { width: min(720px, calc(100vw - var(--side-w) - 24px)); opacity: .75; transform: translateX(24px); } }
+}
+
+html[data-motion-visibility='hidden'] :is(.desktop-shell, .workspace-opening) *,
+html[data-motion-visibility='hidden'] :is(.desktop-shell, .workspace-opening) *::before,
+html[data-motion-visibility='hidden'] :is(.desktop-shell, .workspace-opening) *::after {
+  animation: none !important; transition: none !important;
+}
+
+/* Motion is optional information: text, icons, focus and controls remain. */
+@media (prefers-reduced-motion: reduce) {
+  .desktop-shell *, .desktop-shell *::before, .desktop-shell *::after,
+  .workspace-opening *, .workspace-opening *::before, .workspace-opening *::after {
+    animation: none !important; transition: none !important; scroll-behavior: auto !important;
+  }
+  .agent-activity::after { display: none; }
+  .runtime-stream-caret { opacity: .65; }
+}
