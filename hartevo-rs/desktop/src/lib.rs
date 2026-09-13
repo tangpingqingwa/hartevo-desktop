@@ -1372,6 +1372,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
     let mut catalog_kpi_direction = use_signal(|| "at_least".to_owned());
     let mut catalog_contract_expanded = use_signal(|| false);
     let mut mission_submitting = use_signal(move || visual_streaming_fixture);
+    let mut task_creation_project = use_signal(|| None::<ProjectId>);
     let mut runtime_retrying = use_signal(|| false);
     let mut runtime_cancellation = use_signal(move || {
         (legacy_visual_streaming_fixture || visual_runtime_stop_available)
@@ -3433,11 +3434,16 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                 && current.selected_mission_id.is_none()
                 && current.can_start_mission()
         };
-        if !allowed || mission_submitting() || runtime_retrying() {
+        if !allowed
+            || mission_submitting()
+            || runtime_retrying()
+            || task_creation_project.peek().is_some()
+        {
             return;
         }
         let submitted_project = request.project_id.clone();
         let submitted_goal = request.goal.clone();
+        task_creation_project.set(Some(submitted_project.clone()));
         runtime_cancellation.set(None);
         legacy_runtime_scope.set(None);
         runtime_stop_requested.set(false);
@@ -3449,6 +3455,7 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                     .and_then(|plane| plane.start_catalog_mission_execution_os(request, Utc::now()))
             })
             .await;
+            task_creation_project.set(None);
             match result {
                 Ok(Ok(started)) => {
                     task_entry::clear_created_draft(
@@ -4248,7 +4255,11 @@ fn DesktopWorkspace(initial_model: DesktopUiModel) -> Element {
                                 available: project_can_start_mission,
                                 model_ready: runtime_environment_ready,
                                 model_label: runtime_chip.clone(),
-                                submitting: runtime_busy,
+                                activity: task_entry::TaskEntryActivity::for_project(
+                                    &project.as_ref().unwrap().project_id,
+                                    task_creation_project.read().as_ref(),
+                                    runtime_busy,
+                                ),
                                 drafts: task_drafts,
                                 expanded: composer_expanded,
                                 on_create: request_create_task,

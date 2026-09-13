@@ -12,6 +12,29 @@ use crate::{
 
 type ComposerScope = (Option<ProjectId>, Option<MissionId>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskEntryActivity {
+    Idle,
+    Creating,
+    ExecutionBusy,
+}
+
+impl TaskEntryActivity {
+    pub(crate) fn for_project(
+        project: &ProjectId,
+        creating_project: Option<&ProjectId>,
+        runtime_busy: bool,
+    ) -> Self {
+        if creating_project == Some(project) {
+            Self::Creating
+        } else if runtime_busy || creating_project.is_some() {
+            Self::ExecutionBusy
+        } else {
+            Self::Idle
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ComposerDrafts {
     // Slots never move, so an in-flight completion retains its original scope.
@@ -373,7 +396,7 @@ pub(crate) fn NewTaskEntry(
     available: bool,
     model_ready: bool,
     model_label: String,
-    submitting: bool,
+    activity: TaskEntryActivity,
     mut drafts: Signal<TaskDrafts>,
     mut expanded: Signal<bool>,
     on_create: EventHandler<DesktopCatalogMissionRequest>,
@@ -410,7 +433,10 @@ pub(crate) fn NewTaskEntry(
     let action_routes = routes.clone();
     let action_parents = parents.clone();
     let has_errors = !errors.is_empty();
+    let submitting = activity == TaskEntryActivity::Creating;
+    let execution_busy = activity == TaskEntryActivity::ExecutionBusy;
     let scope_locked = !available || submitting;
+    let start_waiting = execution_busy && reviewing && model_ready && !has_errors;
     let invalid = |id: &str| state.show_errors && errors.iter().any(|(field, _)| *field == id);
     let act = move |_| {
         if scope_locked {
@@ -436,6 +462,9 @@ pub(crate) fn NewTaskEntry(
             on_open_settings.call(());
             return;
         }
+        if execution_busy {
+            return;
+        }
         if let Some(request) =
             form.peek()
                 .request(project_id.clone(), &action_routes, &action_parents)
@@ -452,7 +481,7 @@ pub(crate) fn NewTaskEntry(
                 span { i {} "{project_name}" }
                 small { if reviewing { "确认任务范围" } else { "新任务" } }
                 if reviewing {
-                    button { class: "task-text-action", onclick: move |_| { form.write().reviewing = false; restore_ui_focus("mission-composer-input"); }, "修改目标" }
+                    button { class: "task-text-action", disabled: scope_locked, onclick: move |_| { form.write().reviewing = false; restore_ui_focus("mission-composer-input"); }, "修改目标" }
                 }
             }
             if submitting {
@@ -581,9 +610,9 @@ pub(crate) fn NewTaskEntry(
                     span { if model_ready { "{model_label}" } else { "连接模型" } }
                     UiIcon { name: UiIconName::ChevronDown, size: 11 }
                 }
-                small { if !available { "解锁当前项目后即可创建任务" } else if reviewing && model_ready { "开始任务可能产生模型调用费用" } else if reviewing { "连接模型后回到这里继续" } else { "Enter 继续 · Shift Enter 换行" } }
-                button { id: "mission-composer-send", class: "task-primary-action", disabled: scope_locked || state.goal.trim().is_empty(), onclick: act,
-                    if submitting { "正在创建…" } else if !reviewing { "继续" } else if !model_ready && !has_errors { "设置模型并继续" } else { "确认并开始" }
+                small { if !available { "解锁当前项目后即可创建任务" } else if execution_busy { "已有任务正在处理，你可以先完善这份草稿。" } else if reviewing && model_ready { "开始任务可能产生模型调用费用" } else if reviewing { "连接模型后回到这里继续" } else { "Enter 继续 · Shift Enter 换行" } }
+                button { id: "mission-composer-send", class: "task-primary-action", disabled: scope_locked || state.goal.trim().is_empty() || start_waiting, onclick: act,
+                    if submitting { "正在创建…" } else if !reviewing { "继续" } else if !model_ready && !has_errors { "设置模型并继续" } else if start_waiting { "等待运行结束" } else { "确认并开始" }
                     if !submitting { UiIcon { name: UiIconName::ArrowUp, size: 14 } }
                 }
             }
@@ -604,6 +633,123 @@ mod tests {
             evidence_level: hartevo_catalog::EvidenceLevel::E0,
             status: hartevo_catalog::MissionEvidenceStatus::NotImplemented,
             failure_count: 0,
+        }
+    }
+
+    #[test]
+    fn background_execution_allows_preparing_a_draft_but_blocks_final_creation() {
+        use dioxus::dioxus_core::{AttributeValue, DynamicNode, TemplateAttribute, TemplateNode};
+        fn field_disabled(node: &VNode, dom: &VirtualDom, target: &str) -> Option<bool> {
+            node.template
+                .roots
+                .iter()
+                .find_map(|root| template_field_disabled(root, node, dom, target))
+        }
+        fn template_field_disabled(
+            template: &TemplateNode,
+            node: &VNode,
+            dom: &VirtualDom,
+            target: &str,
+        ) -> Option<bool> {
+            match template {
+                TemplateNode::Element {
+                    attrs, children, ..
+                } => {
+                    let attribute = |name: &str| {
+                        attrs.iter().find_map(|attr| match attr {
+                            TemplateAttribute::Static {
+                                name: key, value, ..
+                            } if *key == name => Some(AttributeValue::Text((*value).into())),
+                            TemplateAttribute::Dynamic { id } => node.dynamic_attrs[*id]
+                                .iter()
+                                .find(|attr| attr.name == name)
+                                .map(|attr| attr.value.clone()),
+                            _ => None,
+                        })
+                    };
+                    if matches!(attribute("id"), Some(AttributeValue::Text(id)) if id == target) {
+                        return Some(matches!(
+                            attribute("disabled"),
+                            Some(AttributeValue::Bool(true))
+                        ));
+                    }
+                    children
+                        .iter()
+                        .find_map(|child| template_field_disabled(child, node, dom, target))
+                }
+                TemplateNode::Dynamic { id } => match &node.dynamic_nodes[*id] {
+                    DynamicNode::Component(component) => component
+                        .mounted_scope(*id, node, dom)
+                        .and_then(|scope| field_disabled(scope.root_node(), dom, target)),
+                    DynamicNode::Fragment(children) => children
+                        .iter()
+                        .find_map(|child| field_disabled(child, dom, target)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        fn entry((activity, reviewing): (TaskEntryActivity, bool)) -> Element {
+            let drafts = use_signal(move || {
+                let mut draft = TaskDraft {
+                    goal: "准备社媒内容".into(),
+                    market: "美国".into(),
+                    audience: "户外消费者".into(),
+                    ..TaskDraft::default()
+                };
+                draft.prepare(&[route()]);
+                draft.reviewing = reviewing;
+                TaskDrafts::from([(ProjectId::from("b"), draft)])
+            });
+            let expanded = use_signal(|| true);
+            rsx! { NewTaskEntry {
+                project_id: ProjectId::from("b"), project_name: "第二个项目".to_owned(),
+                routes: vec![route()], parents: vec![], available: true, model_ready: true,
+                model_label: "model".to_owned(), activity, drafts, expanded,
+                on_create: |_| {}, on_open_settings: |()| {},
+            } }
+        }
+        let a = ProjectId::from("a");
+        let b = ProjectId::from("b");
+        assert_eq!(
+            TaskEntryActivity::for_project(&a, Some(&a), true),
+            TaskEntryActivity::Creating
+        );
+        assert_eq!(
+            TaskEntryActivity::for_project(&b, Some(&a), true),
+            TaskEntryActivity::ExecutionBusy
+        );
+        assert_eq!(
+            TaskEntryActivity::for_project(&b, None, true),
+            TaskEntryActivity::ExecutionBusy
+        );
+        assert_eq!(
+            TaskEntryActivity::for_project(&b, None, false),
+            TaskEntryActivity::Idle
+        );
+        for (activity, reviewing, fields_locked, send_locked) in [
+            (TaskEntryActivity::ExecutionBusy, false, false, false),
+            (TaskEntryActivity::ExecutionBusy, true, false, true),
+            (TaskEntryActivity::Creating, true, true, true),
+            (TaskEntryActivity::Idle, true, false, false),
+        ] {
+            let mut dom = VirtualDom::new_with_props(entry, (activity, reviewing));
+            dom.rebuild_to_vec();
+            let field = if reviewing {
+                "task-entry-route"
+            } else {
+                "mission-composer-input"
+            };
+            assert_eq!(
+                field_disabled(dom.base_scope().root_node(), &dom, field),
+                Some(fields_locked),
+                "{activity:?}"
+            );
+            assert_eq!(
+                field_disabled(dom.base_scope().root_node(), &dom, "mission-composer-send"),
+                Some(send_locked),
+                "{activity:?}"
+            );
         }
     }
 
@@ -720,7 +866,7 @@ mod tests {
             rsx! { NewTaskEntry {
                 project_id: ProjectId::from("private-project"), project_name: "private-project-secret".to_owned(),
                 routes: vec![route()], parents: vec![], available: false, model_ready: true,
-                model_label: "model".to_owned(), submitting: false, drafts, expanded,
+                model_label: "model".to_owned(), activity: TaskEntryActivity::Idle, drafts, expanded,
                 on_create: |_| {}, on_open_settings: |()| {},
             } }
         }
