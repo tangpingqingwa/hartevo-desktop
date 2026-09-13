@@ -8337,7 +8337,7 @@ fn OrchestratorSurface(
                             }
                         }
                     } else if runtime_waiting_for_turn {
-                        PersistedRuntimeAwaitingTurn {}
+                        PersistedRuntimeAwaitingTurn { runtime_busy, observed_motion: runtime_motion }
                     }
                     if let Some(failure) = runtime_text_error {
                         div { class: "runtime-stream-error", role: "status",
@@ -8550,22 +8550,35 @@ fn PersistedConversationMessages(
 }
 
 #[component]
-fn PersistedRuntimeAwaitingTurn() -> Element {
+fn PersistedRuntimeAwaitingTurn(
+    runtime_busy: bool,
+    observed_motion: Option<agent_motion::AgentMotionState>,
+) -> Element {
+    let motion = observed_motion.unwrap_or(if runtime_busy {
+        agent_motion::AgentMotionState::Preparing
+    } else {
+        agent_motion::AgentMotionState::Idle
+    });
+    let active = motion.animated();
     rsx! {
-        article { class: "assistant-turn persisted-assistant-turn runtime-stream-turn is-streaming", "data-motion-enter": "turn",
+        article { class: if active { "assistant-turn persisted-assistant-turn runtime-stream-turn is-streaming" } else { "assistant-turn persisted-assistant-turn runtime-stream-turn" }, "data-motion-enter": "turn",
             header { class: "assistant-byline",
-                agent_motion::AgentOrb { state: agent_motion::AgentMotionState::Preparing }
+                agent_motion::AgentOrb { state: motion }
                 strong { "Hartevo" }
-                time { "正在准备回复" }
+                time { "{motion.label()}" }
             }
             div {
                 class: "assistant-copy runtime-stream-copy",
                 aria_live: "polite",
                 aria_atomic: "false",
-                aria_busy: "true",
+                aria_busy: active,
                 p { class: "runtime-stream-waiting",
-                    "任务已保存，正在等待开始回复。"
-                    i { class: "runtime-stream-caret", aria_hidden: "true" }
+                    if active {
+                        "任务已保存，正在等待开始回复。"
+                        i { class: "runtime-stream-caret", aria_hidden: "true" }
+                    } else if motion == agent_motion::AgentMotionState::Idle {
+                        "尚未收到回复，可以补充要求后继续。"
+                    } else { "{motion.label()}" }
                 }
             }
             details { class: "runtime-stream-details",

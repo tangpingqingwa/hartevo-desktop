@@ -98,7 +98,7 @@ impl AgentMotionState {
             Self::Composing => "正在整理回复",
             Self::Waiting => "等待你确认",
             Self::Stopping => "正在停止",
-            Self::Complete => "本次回复已保存",
+            Self::Complete => "本次处理已结束",
             Self::Cancelled => "本次处理已停止",
             Self::Failed => "这次处理未完成",
             Self::Uncertain => "处理结果待核实",
@@ -113,7 +113,7 @@ impl AgentMotionState {
             Self::Composing => "内容会持续更新，你可以先阅读已出现的部分。",
             Self::Waiting => "查看待确认事项后，再决定是否继续。",
             Self::Stopping => "已提交停止请求，正在等待执行结果。",
-            Self::Complete => "可以审阅成果，或补充下一步修改要求。",
+            Self::Complete => "可以查看处理记录，或补充下一步要求。",
             Self::Cancelled => "已保存的内容仍然保留，可以调整要求后继续。",
             Self::Failed => "请查看错误说明；你的输入和已有成果会保留。",
             Self::Uncertain => "结果尚未确认，请先核实，再决定下一步。",
@@ -301,6 +301,76 @@ mod tests {
             assert!(!output.contains("runtime-stream-caret"), "{status:?}");
             assert!(!output.contains("正在响应"), "{status:?}");
         }
+    }
+
+    #[test]
+    fn awaiting_first_turn_uses_observed_state_and_restores_history_without_motion() {
+        for (runtime_busy, observed_motion, expected) in [
+            (true, None, AgentMotionState::Preparing),
+            (false, None, AgentMotionState::Idle),
+            (
+                true,
+                Some(AgentMotionState::Stopping),
+                AgentMotionState::Stopping,
+            ),
+            (
+                true,
+                Some(AgentMotionState::Waiting),
+                AgentMotionState::Waiting,
+            ),
+            (
+                false,
+                Some(AgentMotionState::Failed),
+                AgentMotionState::Failed,
+            ),
+        ] {
+            let mut dom = VirtualDom::new_with_props(
+                crate::PersistedRuntimeAwaitingTurn,
+                crate::PersistedRuntimeAwaitingTurnProps {
+                    runtime_busy,
+                    observed_motion,
+                },
+            );
+            dom.rebuild_to_vec();
+            let output = rendered(&dom);
+            assert!(output.contains(expected.label()), "{expected:?}");
+            assert_eq!(
+                output.contains("runtime-stream-caret"),
+                expected.animated(),
+                "{expected:?}"
+            );
+            assert_eq!(
+                output.contains("is-streaming"),
+                expected.animated(),
+                "{expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_without_reply_does_not_claim_saved_content() {
+        let state = AgentMotionState::from_observation(
+            false,
+            false,
+            false,
+            None,
+            Some(RuntimeTurnStatus::Completed),
+            false,
+        );
+        let mut dom = VirtualDom::new_with_props(
+            AgentActivity,
+            AgentActivityProps {
+                state,
+                fixture: false,
+                title: None,
+                detail: None,
+            },
+        );
+        dom.rebuild_to_vec();
+        let output = rendered(&dom);
+        assert!(output.contains("本次处理已结束"));
+        assert!(!output.contains("回复已保存"));
+        assert!(!output.contains("审阅成果"));
     }
 
     #[tokio::test]
