@@ -636,59 +636,60 @@ mod tests {
         }
     }
 
+    use dioxus::dioxus_core::{AttributeValue, DynamicNode, TemplateAttribute, TemplateNode};
+    fn field_disabled(node: &VNode, dom: &VirtualDom, target: &str) -> Option<bool> {
+        node.template
+            .roots
+            .iter()
+            .find_map(|root| template_field_disabled(root, node, dom, target))
+    }
+    fn template_field_disabled(
+        template: &TemplateNode,
+        node: &VNode,
+        dom: &VirtualDom,
+        target: &str,
+    ) -> Option<bool> {
+        match template {
+            TemplateNode::Element {
+                attrs, children, ..
+            } => {
+                let attribute = |name: &str| {
+                    attrs.iter().find_map(|attr| match attr {
+                        TemplateAttribute::Static {
+                            name: key, value, ..
+                        } if *key == name => Some(AttributeValue::Text((*value).into())),
+                        TemplateAttribute::Dynamic { id } => node.dynamic_attrs[*id]
+                            .iter()
+                            .find(|attr| attr.name == name)
+                            .map(|attr| attr.value.clone()),
+                        TemplateAttribute::Static { .. } => None,
+                    })
+                };
+                if matches!(attribute("id"), Some(AttributeValue::Text(id)) if id == target) {
+                    return Some(matches!(
+                        attribute("disabled"),
+                        Some(AttributeValue::Bool(true))
+                    ));
+                }
+                children
+                    .iter()
+                    .find_map(|child| template_field_disabled(child, node, dom, target))
+            }
+            TemplateNode::Dynamic { id } => match &node.dynamic_nodes[*id] {
+                DynamicNode::Component(component) => component
+                    .mounted_scope(*id, node, dom)
+                    .and_then(|scope| field_disabled(scope.root_node(), dom, target)),
+                DynamicNode::Fragment(children) => children
+                    .iter()
+                    .find_map(|child| field_disabled(child, dom, target)),
+                _ => None,
+            },
+            TemplateNode::Text { .. } => None,
+        }
+    }
+
     #[test]
     fn background_execution_allows_preparing_a_draft_but_blocks_final_creation() {
-        use dioxus::dioxus_core::{AttributeValue, DynamicNode, TemplateAttribute, TemplateNode};
-        fn field_disabled(node: &VNode, dom: &VirtualDom, target: &str) -> Option<bool> {
-            node.template
-                .roots
-                .iter()
-                .find_map(|root| template_field_disabled(root, node, dom, target))
-        }
-        fn template_field_disabled(
-            template: &TemplateNode,
-            node: &VNode,
-            dom: &VirtualDom,
-            target: &str,
-        ) -> Option<bool> {
-            match template {
-                TemplateNode::Element {
-                    attrs, children, ..
-                } => {
-                    let attribute = |name: &str| {
-                        attrs.iter().find_map(|attr| match attr {
-                            TemplateAttribute::Static {
-                                name: key, value, ..
-                            } if *key == name => Some(AttributeValue::Text((*value).into())),
-                            TemplateAttribute::Dynamic { id } => node.dynamic_attrs[*id]
-                                .iter()
-                                .find(|attr| attr.name == name)
-                                .map(|attr| attr.value.clone()),
-                            _ => None,
-                        })
-                    };
-                    if matches!(attribute("id"), Some(AttributeValue::Text(id)) if id == target) {
-                        return Some(matches!(
-                            attribute("disabled"),
-                            Some(AttributeValue::Bool(true))
-                        ));
-                    }
-                    children
-                        .iter()
-                        .find_map(|child| template_field_disabled(child, node, dom, target))
-                }
-                TemplateNode::Dynamic { id } => match &node.dynamic_nodes[*id] {
-                    DynamicNode::Component(component) => component
-                        .mounted_scope(*id, node, dom)
-                        .and_then(|scope| field_disabled(scope.root_node(), dom, target)),
-                    DynamicNode::Fragment(children) => children
-                        .iter()
-                        .find_map(|child| field_disabled(child, dom, target)),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
         fn entry((activity, reviewing): (TaskEntryActivity, bool)) -> Element {
             let drafts = use_signal(move || {
                 let mut draft = TaskDraft {
